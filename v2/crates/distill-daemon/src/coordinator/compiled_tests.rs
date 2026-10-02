@@ -297,3 +297,434 @@ fn readers_writers_and_build_workers_see_a_configuration_only_once_it_commits() 
     assert!(Arc::ptr_eq(&coordinator.compiled_at(&old_snapshot).unwrap(), &old));
     assert!(!optimized(&coordinator.compiled_at(&old_snapshot).unwrap()));
 }
+
+const BYTES_TYPE: TypeUuid = TypeUuid([0x61; 16]);
+const EDITED_TYPE: TypeUuid = TypeUuid([0x62; 16]);
+
+/// An authority over two asset types, each a struct of one `u8`; the
+/// second's field names a previous name when `edited` (an edit its
+/// logical hash does not see, but its tag epoch does).
+fn typed_authority(edited: bool) -> Arc<ProjectSchemaAuthority> {
+    use distill_schema::ngp_schema::{
+        Field, FieldAttrs, FieldIdentifier, FieldLayout, PrimitiveType, SchemaTypeId, TypeAttrs,
+        TypeDef, TypeLayout, TypePath,
+    };
+    let path = |krate: &str, name: &str| TypePath {
+        name: Some(name.to_owned()),
+        containing_type: None,
+        modules: Vec::new(),
+        krate: krate.to_owned(),
+    };
+    let def = |id: usize, kind, path, uuid, fields| TypeDef {
+        id: SchemaTypeId(id),
+        kind,
+        path,
+        uuid,
+        attrs: TypeAttrs::default(),
+        fields,
+        generic_parameters: Vec::new(),
+        generic_argument_ids: Vec::new(),
+        generic_const_arguments: Vec::new(),
+        has_default: id == 1,
+        has_explicit_discriminants: false,
+    };
+    let field = |edited: bool| {
+        vec![Field {
+            id: FieldIdentifier::Name("value".to_owned()),
+            type_id: SchemaTypeId(1),
+            attrs: FieldAttrs {
+                renamed_from: edited.then(|| "previous".to_owned()),
+                ..FieldAttrs::default()
+            },
+        }]
+    };
+    let layout = |fields| TypeLayout {
+        size: Some(1),
+        align: Some(1),
+        layout_complete: true,
+        tag_encoding: None,
+        fields,
+    };
+    let slot = || {
+        vec![FieldLayout {
+            offset: Some(0),
+            field_size: Some(1),
+        }]
+    };
+    Arc::new(
+        ProjectSchemaAuthority::from_schema(
+            Schema {
+                source_hashes: BTreeMap::new(),
+                type_ops_hash: String::new(),
+                layout_hashes: Default::default(),
+                rustc_version: String::new(),
+                types: vec![
+                    def(0, PrimitiveType::Struct, path("game", "Bytes"), Some(BYTES_TYPE), field(false)),
+                    def(1, PrimitiveType::U8, path("core", "u8"), None, Vec::new()),
+                    def(2, PrimitiveType::Struct, path("game", "Tagged"), Some(EDITED_TYPE), field(edited)),
+                ],
+                layouts: vec![SchemaLayouts {
+                    identity: layout_identity(),
+                    layouts: vec![layout(slot()), layout(Vec::new()), layout(slot())],
+                }],
+            },
+            [u8::from(edited) + 10; 32],
+        )
+        .unwrap(),
+    )
+}
+
+/// A bundle of one `type_uuid` asset at the authority's current schema.
+fn typed_bundle(authority: &ProjectSchemaAuthority, type_uuid: TypeUuid, index: u32) -> Vec<u8> {
+    let project = authority.project_type(type_uuid).unwrap();
+    let mut uuid = [type_uuid.0[0]; 16];
+    uuid[..4].copy_from_slice(&index.to_le_bytes());
+    distill_bundle::write_bundle(&Bundle {
+        format_version: 1,
+        uuid: BundleUuid(uuid),
+        primary: Some("entry".into()),
+        schemas: BTreeMap::from([(project.logical_hash, project.logical_schema.clone())]),
+        assets: BTreeMap::from([(
+            "entry".into(),
+            AssetEntry {
+                uuid: AssetUuid(uuid),
+                type_uuid,
+                schema_hash: project.logical_hash,
+                authoring_only: false,
+                data: AuthoredValue::Object(BTreeMap::from([(
+                    "value".to_owned(),
+                    AuthoredValue::UInt(u128::from(index % 7)),
+                )])),
+            },
+        )]),
+    })
+    .unwrap()
+}
+
+/// Pages the configuration publication of a schema edit to the edited type
+/// reads and writes beside `filler` bundles of the other type, and the
+/// pages a candidate changing nothing costs there.
+fn schema_edit_pages(filler: u32) -> (u64, u64) {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::create_dir_all(temp.path().join("extra")).unwrap();
+    let authority = typed_authority(false);
+    for index in 0..filler {
+        let directory = assets.join(format!("bytes/d{}", index % 40));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join(format!("b{index}.bundle")),
+            typed_bundle(&authority, BYTES_TYPE, index),
+        )
+        .unwrap();
+    }
+    for index in 0..3 {
+        std::fs::write(
+            assets.join(format!("edited{index}.bundle")),
+            typed_bundle(&authority, EDITED_TYPE, index),
+        )
+        .unwrap();
+    }
+    let mut config = StoreConfig::new(temp.path().join("state"));
+    config.parallelism = 1;
+    let coordinator = Arc::new(
+        DaemonCoordinator::open(config, vec![AssetRoot::new("main", &assets)], vec![rpc_target(false)], 8)
+            .unwrap(),
+    );
+    let writer = coordinator.open_writer().unwrap();
+    let mut fixture = Fixture {
+        temp,
+        coordinator: Arc::clone(&coordinator),
+        writer,
+    };
+    coordinator.reconcile_full_scan(&mut fixture.writer).unwrap();
+    let publish = |fixture: &mut Fixture, edited| {
+        let mut candidate = fixture.candidate(false, false);
+        candidate.schema_authority = typed_authority(edited);
+        let before = fixture.writer.pages_fetched().unwrap();
+        coordinator
+            .publish_configuration_candidate(&mut fixture.writer, candidate)
+            .unwrap();
+        fixture.writer.pages_fetched().unwrap() - before
+    };
+    publish(&mut fixture, false);
+    let asset = |type_uuid: TypeUuid, index: u32| {
+        let mut uuid = [type_uuid.0[0]; 16];
+        uuid[..4].copy_from_slice(&index.to_le_bytes());
+        AssetUuid(uuid)
+    };
+    // The refined row's epoch column is the source of the authority it
+    // was refined under.
+    let refined_under = |asset| {
+        let reader = coordinator.open_reader().unwrap();
+        assert!(reader.stale_tag_index_assets(None).unwrap().is_empty());
+        reader.tag_index_state(asset).unwrap().unwrap().tag_epoch[0]
+    };
+    assert_eq!(refined_under(asset(EDITED_TYPE, 2)), 10);
+    let edit = publish(&mut fixture, true);
+    assert_eq!(refined_under(asset(EDITED_TYPE, 2)), 11, "the edited type's rows were refined again");
+    assert_eq!(refined_under(asset(BYTES_TYPE, 0)), 10, "the other type's rows were kept");
+    let unchanged = publish(&mut fixture, true);
+    (edit, unchanged)
+}
+
+/// A schema edit to one type republishes that type's rows; a candidate
+/// changing nothing republishes nothing. Neither reads the bundles of the
+/// other type.
+#[test]
+fn a_schema_edit_reads_independent_of_other_types() {
+    // Both namespaces are large enough that their indexes are as deep: the
+    // comparison sees the rows read, not a level of B-tree.
+    let (small_edit, small_unchanged) = schema_edit_pages(1000);
+    let (large_edit, large_unchanged) = schema_edit_pages(8000);
+    println!(
+        "schema edit: {small_edit} pages beside 1000 bundles, {large_edit} beside 8000; \
+         unchanged candidate: {small_unchanged} and {large_unchanged}"
+    );
+    assert!(large_edit <= small_edit + 16, "{small_edit} beside 1000, {large_edit} beside 8000");
+    assert!(
+        large_unchanged <= small_unchanged + 16,
+        "{small_unchanged} beside 1000, {large_unchanged} beside 8000"
+    );
+}
+
+/// An authority knowing only the bytes type: the edited type's bundles
+/// parse, but a malformed one has no validated skeleton.
+fn bytes_only_authority() -> Arc<ProjectSchemaAuthority> {
+    let full = typed_authority(false);
+    let mut schema = full.schema().clone();
+    schema.types.truncate(2);
+    schema.layouts[0].layouts.truncate(2);
+    Arc::new(ProjectSchemaAuthority::from_schema(schema, [20; 32]).unwrap())
+}
+
+/// The projection under which the bytes type cooks to `terminal`, or to
+/// itself.
+fn bytes_projection(terminal: Option<TypeUuid>) -> PipelineProjection {
+    use distill_build::outputs::OutputDecls;
+    use distill_build::pipeline::TargetSelector;
+    let descriptors = terminal
+        .map(|terminal| crate::callbacks::ProcessorDescriptor {
+            id: "processor".to_owned(),
+            version: 1,
+            input: BYTES_TYPE,
+            selector: TargetSelector::new(None, None).unwrap(),
+            outputs: OutputDecls::new(terminal, Vec::new()).unwrap(),
+        })
+        .into_iter()
+        .collect();
+    PipelineProjection::build(
+        descriptors,
+        [9; 32],
+        &BTreeMap::from([("dev".to_owned(), build_target(false))]),
+        [BYTES_TYPE, EDITED_TYPE],
+    )
+    .unwrap()
+}
+
+/// A pipeline epoch of module `dylib` over `authority`'s types.
+fn pipeline_publication(authority: &ProjectSchemaAuthority, dylib: u8) -> ConfigurationPipelinePublication {
+    use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
+    ConfigurationPipelinePublication::Epoch {
+        epoch: ValidatedPipelineEpoch::validate(distill_store::state::PipelineEpoch {
+            dylib_hash: [dylib; 32],
+            target_set: CanonicalTargetSet::canonical(vec![TargetSetRow {
+                name: "dev".into(),
+                target_definition_hash: distill_build::keys::target_definition_hash(&build_target(false)),
+            }])
+            .unwrap(),
+            schema_registry: authority.logical_registry().unwrap(),
+            registrations: Vec::new(),
+        })
+        .unwrap(),
+        tools: BTreeMap::new(),
+    }
+}
+
+struct Configuration {
+    authority: Arc<ProjectSchemaAuthority>,
+    projection: PipelineProjection,
+    pipeline: ConfigurationPipelinePublication,
+}
+
+/// Publish the scan of `scanner` completely under `configuration`, as a
+/// root replacement does, with the tag epochs its refinement records.
+fn publish_completely(
+    store: &mut Store,
+    scanner: &RootedScanner,
+    configuration: &Configuration,
+    retyped: &BTreeSet<TypeUuid>,
+) {
+    let authority = &*configuration.authority;
+    let candidate = ScanCandidate::build(scanner.scan().unwrap(), Some(authority)).unwrap();
+    let claims = bundle_claims(candidate.scan.bundle_rows(), &configuration.projection, Some(authority)).unwrap();
+    let base = store.input_version();
+    publish_scan(
+        store,
+        base,
+        candidate,
+        true,
+        Some(&configuration.pipeline),
+        &configuration.projection,
+        retyped,
+        authority.source_hash(),
+        &claims,
+    )
+    .unwrap();
+    store
+        .replace_tag_epochs(&crate::build::type_tag_epochs(authority))
+        .unwrap();
+}
+
+/// The tables a configuration publication writes, as rows.
+fn published_tables(store: &Store) -> BTreeMap<&'static str, Vec<String>> {
+    [
+        "files",
+        "bundle_files",
+        "directories",
+        "source_claims",
+        "claim_collisions",
+        "claim_pending",
+        "dirty_files",
+        "bundles",
+        "bundle_path_refs",
+        "assets",
+        "asset_tags",
+        "tag_epochs",
+        "path_index",
+        "schemas",
+        "derived_outputs",
+        "pipeline_state",
+        "pipeline_schema_registry",
+        "configuration_state",
+        "errors",
+    ]
+    .into_iter()
+    .map(|table| (table, store.table_rows(table).unwrap()))
+    .collect()
+}
+
+/// Publish `before` completely into two stores, then `after` into one
+/// completely (the oracle: every source parsed and claimed again) and into
+/// the other as a candidate with unchanged roots does. Both must hold the
+/// same rows, and the second must have refined at least the tag rows the
+/// oracle would. Returns the sources the incremental publication claimed.
+fn assert_reconfiguration_matches_oracle(before: &Configuration, after: &Configuration) -> usize {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    let authority = typed_authority(false);
+    for index in 0..3 {
+        std::fs::write(assets.join(format!("bytes{index}.bundle")), typed_bundle(&authority, BYTES_TYPE, index))
+            .unwrap();
+    }
+    for index in 0..2 {
+        std::fs::write(assets.join(format!("edited{index}.bundle")), typed_bundle(&authority, EDITED_TYPE, index))
+            .unwrap();
+    }
+    // A malformed bundle whose skeleton validates only under an authority
+    // knowing its type.
+    let malformed = typed_bundle(&authority, EDITED_TYPE, 7);
+    let mut value = distill_json::parse(std::str::from_utf8(&malformed).unwrap()).unwrap();
+    let AuthoredValue::Object(envelope) = &mut value else {
+        panic!("a bundle envelope is an object");
+    };
+    envelope.insert("future-extension".to_owned(), AuthoredValue::UInt(1));
+    std::fs::write(assets.join("malformed.bundle"), distill_json::write(&value).unwrap()).unwrap();
+    // Two bundles claiming one asset.
+    let mut shared = distill_bundle::parse_bundle(&typed_bundle(&authority, BYTES_TYPE, 8)).unwrap();
+    std::fs::write(assets.join("shared-a.bundle"), distill_bundle::write_bundle(&shared).unwrap()).unwrap();
+    shared.uuid = BundleUuid([0x99; 16]);
+    std::fs::write(assets.join("shared-b.bundle"), distill_bundle::write_bundle(&shared).unwrap()).unwrap();
+
+    let scanner = RootedScanner::new([AssetRoot::new("main", &assets)]).unwrap();
+    let mut oracle = Store::open(StoreConfig::new(temp.path().join("oracle"))).unwrap();
+    let mut store = Store::open(StoreConfig::new(temp.path().join("store"))).unwrap();
+    let retyped = after.projection.retyped(&before.projection);
+    publish_completely(&mut oracle, &scanner, before, &BTreeSet::new());
+    publish_completely(&mut store, &scanner, before, &BTreeSet::new());
+    assert_eq!(published_tables(&oracle), published_tables(&store));
+
+    publish_completely(&mut oracle, &scanner, after, &retyped);
+    BUNDLE_READS.with(|reads| reads.set(0));
+    publish_reconfiguration(
+        &mut store,
+        &after.pipeline,
+        &after.projection,
+        &retyped,
+        &after.authority,
+        after.authority.source_hash(),
+    )
+    .unwrap();
+    store
+        .replace_tag_epochs(&crate::build::type_tag_epochs(&after.authority))
+        .unwrap();
+    let (oracle_tables, tables) = (published_tables(&oracle), published_tables(&store));
+    for (table, rows) in &oracle_tables {
+        assert_eq!(&tables[table], rows, "{table} differs from the oracle's");
+    }
+    let refined = store.stale_tag_index_assets(None).unwrap();
+    for asset in oracle.stale_tag_index_assets(None).unwrap().keys() {
+        assert!(refined.contains_key(asset), "{asset} is pending in the oracle only");
+    }
+    BUNDLE_READS.with(Cell::get)
+}
+
+thread_local! {
+    static BUNDLE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+use std::cell::Cell;
+
+/// Called once per source a configuration publication reads and claims
+/// again.
+pub(super) fn source_reclaimed() {
+    BUNDLE_READS.with(|reads| reads.set(reads.get() + 1));
+}
+
+/// A candidate with unchanged roots publishes exactly what a complete
+/// publication of the same configuration would, for each kind of change,
+/// reading only the sources the change reaches.
+#[test]
+fn a_reconfiguration_publishes_what_a_complete_publication_does() {
+    let configuration = |authority: Arc<ProjectSchemaAuthority>, terminal, dylib| Configuration {
+        projection: bytes_projection(terminal),
+        pipeline: pipeline_publication(&authority, dylib),
+        authority,
+    };
+    const TERMINAL: TypeUuid = TypeUuid([0x63; 16]);
+    // No change: nothing is read.
+    let reads = assert_reconfiguration_matches_oracle(
+        &configuration(typed_authority(false), None, 1),
+        &configuration(typed_authority(false), None, 1),
+    );
+    assert_eq!(reads, 0, "an unchanged configuration read a bundle");
+    // A module change: its migrated tag rows are the refinement's.
+    let reads = assert_reconfiguration_matches_oracle(
+        &configuration(typed_authority(false), None, 1),
+        &configuration(typed_authority(false), None, 2),
+    );
+    assert_eq!(reads, 0, "a module change read a bundle");
+    // A projection change: the retyped type's three bundles and the two
+    // colliding sources (the malformed bundle's skeleton is valid here,
+    // its asset the edited type's).
+    let reads = assert_reconfiguration_matches_oracle(
+        &configuration(typed_authority(false), None, 1),
+        &configuration(typed_authority(false), Some(TERMINAL), 1),
+    );
+    assert_eq!(reads, 5);
+    // A schema change that gives the malformed bundle a skeleton: it, the
+    // colliding sources; the edited type's healthy bundles keep their rows.
+    let reads = assert_reconfiguration_matches_oracle(
+        &configuration(bytes_only_authority(), None, 1),
+        &configuration(typed_authority(true), None, 1),
+    );
+    assert_eq!(reads, 3);
+    // A schema edit of one type: its one poisoned bundle and the colliding
+    // sources; its healthy bundles keep their rows.
+    let reads = assert_reconfiguration_matches_oracle(
+        &configuration(typed_authority(false), None, 1),
+        &configuration(typed_authority(true), None, 1),
+    );
+    assert_eq!(reads, 3);
+}

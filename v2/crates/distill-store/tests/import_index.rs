@@ -24,6 +24,13 @@ fn source(path: &str, bundle: u8, reads: Vec<ImportReadKey>) -> ImportIndexSourc
     }
 }
 
+fn sources(paths: &[&str]) -> Vec<(String, String)> {
+    paths
+        .iter()
+        .map(|path| ("main".to_owned(), (*path).to_owned()))
+        .collect()
+}
+
 fn bundles(rows: Vec<WatchedImport>) -> Vec<u8> {
     rows.into_iter().map(|row| row.bundle.0[0]).collect()
 }
@@ -33,7 +40,7 @@ fn dirty_paths_join_the_read_sets_that_observed_them() {
     let (_d, mut store) = store();
     store
         .replace_import_index(
-            None,
+            &sources(&["a.bundle", "b.bundle", "c.bundle"]),
             &[
                 source("a.bundle", 1, vec![ImportReadKey::Path("tex/a.png".to_owned())]),
                 source("b.bundle", 2, vec![ImportReadKey::Listing]),
@@ -63,7 +70,7 @@ fn a_source_replacement_drops_only_that_source() {
     let (_d, mut store) = store();
     store
         .replace_import_index(
-            None,
+            &sources(&["a.bundle", "b.bundle"]),
             &[
                 source("a.bundle", 1, vec![ImportReadKey::Path("x".to_owned())]),
                 source("b.bundle", 2, vec![ImportReadKey::Path("x".to_owned())]),
@@ -71,54 +78,17 @@ fn a_source_replacement_drops_only_that_source() {
         )
         .unwrap();
     store
-        .replace_import_index(Some(&[("main".to_owned(), "a.bundle".to_owned())]), &[])
+        .replace_import_index(&[("main".to_owned(), "a.bundle".to_owned())], &[])
         .unwrap();
     assert_eq!(bundles(store.watched_imports_reading(["x"], false).unwrap()), [2]);
     assert!(store.directory_rule_sources_at("main", "a.bundle").unwrap().is_empty());
     // A bundle that moved replaces its old row.
     store
         .replace_import_index(
-            Some(&[("main".to_owned(), "c.bundle".to_owned())]),
+            &[("main".to_owned(), "c.bundle".to_owned())],
             &[source("c.bundle", 2, vec![ImportReadKey::Path("y".to_owned())])],
         )
         .unwrap();
     assert!(store.watched_imports_reading(["x"], false).unwrap().is_empty());
     assert_eq!(bundles(store.watched_imports_reading(["y"], false).unwrap()), [2]);
-}
-
-#[test]
-fn the_built_marker_commits_and_rolls_back_with_the_complete_index() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = StoreConfig::new(dir.path().join(".distill"));
-    {
-        let mut store = Store::open(config.clone()).unwrap();
-        assert!(!store.import_index_built().unwrap());
-        // A per-source replacement is not the complete index.
-        store
-            .replace_import_index(Some(&[("main".to_owned(), "a.bundle".to_owned())]), &[])
-            .unwrap();
-        assert!(!store.import_index_built().unwrap());
-        // A complete build whose transaction rolls back marks nothing.
-        let rolled_back: Result<(), distill_store::StoreError> = store.write_transaction_with(
-            |error| error,
-            |store| {
-                store.replace_import_index(None, &[source("a.bundle", 1, Vec::new())])?;
-                assert!(store.import_index_built()?);
-                Err(distill_store::StoreError::Rejected {
-                    detail: "rolled back".to_owned(),
-                })
-            },
-        );
-        assert!(rolled_back.is_err());
-        assert!(!store.import_index_built().unwrap());
-        assert!(store.watched_imports().unwrap().is_empty());
-        store
-            .replace_import_index(None, &[source("a.bundle", 1, Vec::new())])
-            .unwrap();
-        assert!(store.import_index_built().unwrap());
-    }
-    // A restart sees the built index.
-    let store = Store::open(config).unwrap();
-    assert!(store.import_index_built().unwrap());
-    assert_eq!(bundles(store.watched_imports().unwrap()), [1]);
 }

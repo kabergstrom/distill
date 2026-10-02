@@ -49,7 +49,7 @@
 
 use std::collections::BTreeSet;
 
-use distill_store::files::ObservedDiagnostic;
+use distill_store::files::{ObservedDiagnostic, ObservedFile};
 
 use super::*;
 use crate::importer::{FileOverlay, ImportRun, PassImport, PassOutput, PassPublication, PlannedImport};
@@ -91,7 +91,6 @@ pub(super) enum ScanStep {
 }
 
 pub(super) struct IncrementalStep {
-    baseline: ScanSnapshot,
     delta: ScanDelta,
     claims: Vec<SourceClaims>,
     renames: Vec<LogicalRename>,
@@ -105,10 +104,6 @@ pub(super) struct FullStep {
     candidate: ScanCandidate,
     claims: Vec<SourceClaims>,
     tags: TagInputs,
-    /// The scan observed every root: the publication heals the pending scan
-    /// rejection.
-    heals: bool,
-    source_error: SourceError,
 }
 
 pub(super) struct RejectionStep {
@@ -116,14 +111,6 @@ pub(super) struct RejectionStep {
     /// The scan observed every root: its rejection replaces the pending
     /// one instead of joining it.
     replaces_pending: bool,
-}
-
-/// What a step does to the configuration source's stored error.
-#[derive(Clone)]
-pub(super) enum SourceError {
-    Keep,
-    Set(ConfigurationError),
-    Heal,
 }
 
 /// What a scan publication pins for its projection and tag index: the
@@ -674,14 +661,27 @@ impl DaemonCoordinator {
     ) -> Result<(PlannedImports, Option<FileOverlay>), CoordinatorError> {
         let publication =
             |error: String| CoordinatorError::Coordinated(CoordinatedCommitError::Publication(error));
+        // A complete scan's overlay is the rows it changes, compared with
+        // the committed rows before its input writes them.
+        let mut overlay = match step {
+            ScanStep::Full(step) => Some(FileOverlay::differences(
+                store,
+                step.candidate
+                    .scan
+                    .file_observations()
+                    .map(|((root_name, path), file)| ObservedFile {
+                        root_name: root_name.clone(),
+                        path: path.clone(),
+                        file,
+                    }),
+            )?),
+            _ => None,
+        };
         self.in_plan_input(store, base, step, |store| {
-            let overlay = match step {
-                ScanStep::Incremental(step) => {
-                    Some(FileOverlay::capture(store, Some(step.delta.affected_prefixes()))?)
-                }
-                ScanStep::Full(_) => Some(FileOverlay::capture(store, None)?),
-                _ => None,
-            };
+            if let ScanStep::Incremental(step) = step {
+                overlay = Some(FileOverlay::capture(store, step.delta.affected_prefixes())?);
+            }
+            let overlay = overlay.take();
             let work = match scope.affected.and_then(|affected| affected.work) {
                 Some(work) => work.clone(),
                 None => store.pending_file_work()?,
@@ -824,29 +824,24 @@ impl DaemonCoordinator {
                 }
             }
         }
-        let (delta, baseline) = {
+        let delta = {
             let stored = StoredBaseline::new(store);
             let delta = scanner.scan_incremental_delta(&stored, &scan_paths);
             stored.finish()?;
             match delta {
                 Ok(None) => return Ok(ScanStep::Unchanged),
-                // The published rows the delta replaces.
-                Ok(Some(delta)) => {
-                    let baseline = ScanSnapshot::load_under(store, delta.affected_prefixes())?;
-                    (delta, baseline)
-                }
+                Ok(Some(delta)) => delta,
                 Err(error) => return self.rejection_step(compiled, &error, heals),
             }
         };
         // A rename from a path never observed (the temporary file of an
         // atomic write, the daemon's own included) moves no identity: the
         // echo of an import's bundle write publishes nothing.
-        if delta.is_same_namespace_observation(&baseline)
-            && renames.iter().all(|rename| {
-                delta.rename_moves_nothing(&baseline, &rename.root_name, &rename.from_path)
-            })
-            && healthy
-        {
+        let mut echo = healthy && delta.matches_published(store)?;
+        for rename in &renames {
+            echo = echo && delta.rename_moves_nothing(store, &rename.root_name, &rename.from_path)?;
+        }
+        if echo {
             // Diagnostics are replaced with their affected subtree even when
             // the authored namespace itself did not change.
             return Ok(ScanStep::Diagnostics {
@@ -863,7 +858,6 @@ impl DaemonCoordinator {
             tags.authority().as_deref(),
         )?;
         Ok(ScanStep::Incremental(Box::new(IncrementalStep {
-            baseline,
             delta,
             claims,
             renames,
@@ -891,28 +885,20 @@ impl DaemonCoordinator {
                         rows: scan.encoded_diagnostic_rows(),
                     })
                 } else {
-                    self.candidate_step(compiled, scan, &[], true, SourceError::Keep)
+                    self.candidate_step(compiled, scan)
                 }
             }
-            Ok(scan) => self.candidate_step(compiled, scan, &[], true, SourceError::Keep),
+            Ok(scan) => self.candidate_step(compiled, scan),
             Err(error) => self.rejection_step(compiled, &error, true),
         }
     }
 
-    /// The step publishing `scan` as the complete namespace. `heals` when
-    /// it observed every root.
-    pub(super) fn candidate_step(
-        &self,
-        compiled: &Arc<Compiled>,
-        scan: ScanSnapshot,
-        renames: &[LogicalRename],
-        heals: bool,
-        source_error: SourceError,
-    ) -> Result<ScanStep, CoordinatorError> {
+    /// The step publishing `scan`, which observed every root, as the
+    /// complete namespace: it heals the pending scan rejection.
+    fn candidate_step(&self, compiled: &Arc<Compiled>, scan: ScanSnapshot) -> Result<ScanStep, CoordinatorError> {
         let tags = self.tag_inputs(compiled);
         let authority = tags.authority();
-        let mut candidate = ScanCandidate::build(scan, authority.as_deref())?;
-        candidate.renames.extend_from_slice(renames);
+        let candidate = ScanCandidate::build(scan, authority.as_deref())?;
         let claims = bundle_claims(
             candidate.scan.bundle_rows(),
             compiled.projection(),
@@ -922,8 +908,6 @@ impl DaemonCoordinator {
             candidate,
             claims,
             tags,
-            heals,
-            source_error,
         })))
     }
 
@@ -992,7 +976,6 @@ impl DaemonCoordinator {
                 let mut commit = publish_incremental_scan(
                     store,
                     store.input_version(),
-                    &step.baseline,
                     &step.delta,
                     &step.claims,
                     &inputs,
@@ -1002,44 +985,25 @@ impl DaemonCoordinator {
                 )
                 .map_err(|error| error.to_string())?;
                 if let Some(authority) = authority.filter(|_| refine_tags) {
-                    let affected = commit_affected_asset_bundles(&commit);
-                    if !affected.is_empty() {
-                        crate::build::refine_published_tag_index_incremental(
-                            crate::build::OpenInput::new(store)
-                                .expect("tag-index refinement runs inside its input"),
-                            tags.compiled.scanner().clone(),
-                            authority,
-                            tags.compiled.pipeline_snapshot(),
-                            tags.compiled.build_targets(),
-                            tags.max_dependency_depth,
-                            &affected,
-                        )
-                        .apply_incremental(&mut commit);
-                    }
+                    crate::build::refine_tag_index(
+                        crate::build::OpenInput::new(store)
+                            .expect("tag-index refinement runs inside its input"),
+                        tags.compiled.scanner().clone(),
+                        authority,
+                        tags.compiled.pipeline_snapshot(),
+                        tags.compiled.build_targets(),
+                        tags.max_dependency_depth,
+                        &mut commit,
+                        false,
+                    )?;
                 }
                 Ok(Some(commit))
             }
             ScanStep::Full(step) => {
                 let tags = &step.tags;
-                if step.heals || !matches!(step.source_error, SourceError::Keep) {
-                    store
-                        .input_transaction(|transaction| {
-                            if step.heals {
-                                transaction.set_scan_rejection(None)?;
-                            }
-                            match &step.source_error {
-                                SourceError::Keep => {}
-                                SourceError::Set(error) => {
-                                    transaction.set_configuration_source_error(Some(error))?
-                                }
-                                SourceError::Heal => {
-                                    transaction.set_configuration_source_error(None)?
-                                }
-                            }
-                            Ok(())
-                        })
-                        .map_err(|error| error.to_string())?;
-                }
+                store
+                    .input_transaction(|transaction| transaction.set_scan_rejection(None))
+                    .map_err(|error| error.to_string())?;
                 let authority = tags.authority().filter(|_| refine_tags);
                 let mut commit = publish_scan(
                     store,
@@ -1048,12 +1012,13 @@ impl DaemonCoordinator {
                     false,
                     None,
                     tags.compiled.projection(),
+                    &BTreeSet::new(),
                     tags.tag_epoch,
                     &step.claims,
                 )
                 .map_err(|error| error.to_string())?;
                 if let Some(authority) = authority {
-                    crate::build::refine_published_tag_index(
+                    crate::build::refine_tag_index(
                         crate::build::OpenInput::new(store)
                             .expect("tag-index refinement runs inside its input"),
                         tags.compiled.scanner().clone(),
@@ -1061,8 +1026,9 @@ impl DaemonCoordinator {
                         tags.compiled.pipeline_snapshot(),
                         tags.compiled.build_targets(),
                         tags.max_dependency_depth,
-                    )?
-                    .apply(&mut commit);
+                        &mut commit,
+                        true,
+                    )?;
                 }
                 Ok(Some(commit))
             }
@@ -1095,15 +1061,7 @@ impl DaemonCoordinator {
                 let claims_errors = store
                     .claims_namespace_errors()
                     .map_err(|error| error.to_string())?;
-                let generation = match store
-                    .configuration_state()
-                    .map_err(|error| error.to_string())?
-                {
-                    ConfigurationState::Ready(epoch) => epoch.generation,
-                    ConfigurationState::Failed { last_good, .. } => {
-                        last_good.map_or(0, |epoch| epoch.generation)
-                    }
-                };
+                let generation = configuration_generation(store).map_err(|error| error.to_string())?;
                 let (configuration, _) = store
                     .input_transaction(|transaction| {
                         transaction.set_namespace_errors(claims_errors)?;

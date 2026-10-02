@@ -566,6 +566,44 @@ impl Store {
             Ok(())
         })
     }
+
+    /// Record `epochs` as the tag epoch of every authored type, inside the
+    /// open input, and mark pending the tag rows of each type whose epoch
+    /// changed (see [`StoreReader::tag_epoch_changes`]): a refinement in the
+    /// same input redoes exactly those. Returns the changed types. It costs
+    /// the authored types plus the assets of the changed ones.
+    pub fn replace_tag_epochs(
+        &mut self,
+        epochs: &BTreeMap<TypeUuid, [u8; 32]>,
+    ) -> Result<BTreeSet<TypeUuid>, StoreError> {
+        let changed = self.tag_epoch_changes(epochs)?;
+        if changed.is_empty() {
+            return Ok(changed);
+        }
+        self.write_txn(|store| {
+            let txn = store.read.conn.savepoint()?;
+            for type_uuid in &changed {
+                let type_uuid_bytes = type_uuid.0.as_slice();
+                txn.execute(
+                    "UPDATE asset_tag_index
+                     SET planner_version = NULL, dylib_hash = NULL, trace = X'',
+                         poison = 'tag indexing pending'
+                     WHERE asset_uuid IN (SELECT asset_uuid FROM assets WHERE type_uuid = ?1)",
+                    [type_uuid_bytes],
+                )?;
+                txn.execute("DELETE FROM tag_epochs WHERE type_uuid = ?1", [type_uuid_bytes])?;
+                if let Some(epoch) = epochs.get(type_uuid) {
+                    txn.execute(
+                        "INSERT INTO tag_epochs(type_uuid, epoch) VALUES (?1, ?2)",
+                        rusqlite::params![type_uuid_bytes, epoch.as_slice()],
+                    )?;
+                }
+            }
+            txn.commit()?;
+            Ok(())
+        })?;
+        Ok(changed)
+    }
 }
 
 impl StoreReader {
@@ -645,6 +683,23 @@ impl StoreReader {
             [],
             bundle_meta_row,
         )
+    }
+
+    /// Visit every bundle row with its root's name, by bundle UUID: one
+    /// streamed join, for a complete scan's publication.
+    pub fn for_each_bundle_with_root_name(
+        &self,
+        mut visit: impl FnMut(String, BundleMeta) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        let mut statement = self.conn.prepare_cached(&format!(
+            "SELECT {BUNDLE_COLUMNS}, r.name FROM bundles JOIN roots r USING (root_id)
+             ORDER BY bundle_uuid"
+        ))?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            visit(row.get(9)?, bundle_meta_row(row)?)?;
+        }
+        Ok(())
     }
 
     /// The bundle rows at logical `path` in any root, by bundle UUID.
@@ -893,10 +948,95 @@ impl StoreReader {
             .map_err(StoreError::from)
     }
 
+    /// The tag-index rows a refinement under the pipeline module
+    /// `dylib_hash` (none when no module is loaded) must redo, each with its
+    /// asset's bundle: poisoned rows (pending ones included, among them the
+    /// rows of every type whose tag epoch changed, see
+    /// [`Store::replace_tag_epochs`]) and migrated rows of another module.
+    /// Every other row already holds what refining it would write. Each kind
+    /// is one search of its index, so this costs the rows it returns.
+    pub fn stale_tag_index_assets(
+        &self,
+        dylib_hash: Option<[u8; 32]>,
+    ) -> Result<BTreeMap<AssetUuid, BundleUuid>, StoreError> {
+        // No module: every migrated row is stale, and every blob sorts
+        // after the empty one.
+        let module = dylib_hash.map_or_else(Vec::new, |hash| hash.to_vec());
+        let mut statement = self.conn.prepare_cached(
+            "SELECT i.asset_uuid, a.bundle_uuid
+             FROM asset_tag_index i JOIN assets a USING (asset_uuid)
+             WHERE i.poison IS NOT NULL
+             UNION SELECT i.asset_uuid, a.bundle_uuid
+             FROM asset_tag_index i JOIN assets a USING (asset_uuid)
+             WHERE i.dylib_hash < ?1
+             UNION SELECT i.asset_uuid, a.bundle_uuid
+             FROM asset_tag_index i JOIN assets a USING (asset_uuid)
+             WHERE i.dylib_hash > ?1",
+        )?;
+        let rows = statement.query_map(rusqlite::params![module], |row| {
+            Ok((
+                AssetUuid(blob16(row.get::<_, Vec<u8>>(0)?)),
+                BundleUuid(blob16(row.get::<_, Vec<u8>>(1)?)),
+            ))
+        })?;
+        rows.collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// The types whose tag epoch in `epochs` differs from the one their tag
+    /// rows were refined under; a type on one side only differs. One read of
+    /// `tag_epochs`, whose size is the number of authored types.
+    pub fn tag_epoch_changes(
+        &self,
+        epochs: &BTreeMap<TypeUuid, [u8; 32]>,
+    ) -> Result<BTreeSet<TypeUuid>, StoreError> {
+        let mut statement = self
+            .conn
+            .prepare_cached("SELECT type_uuid, epoch FROM tag_epochs")?;
+        let stored = statement
+            .query_map([], |row| {
+                Ok((
+                    TypeUuid(blob16(row.get::<_, Vec<u8>>(0)?)),
+                    blob32(row.get::<_, Vec<u8>>(1)?),
+                ))
+            })?
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        Ok(stored
+            .keys()
+            .chain(epochs.keys())
+            .filter(|type_uuid| stored.get(type_uuid) != epochs.get(type_uuid))
+            .copied()
+            .collect())
+    }
+
+    /// The (root, path) of every bundle holding an asset of `type_uuid`
+    /// (only the poisoned bundles when `poisoned`): one search of
+    /// `assets_by_type`, so it costs that type's assets.
+    pub fn bundle_sources_of_type(
+        &self,
+        type_uuid: TypeUuid,
+        poisoned: bool,
+    ) -> Result<BTreeSet<(String, String)>, StoreError> {
+        let sql = if poisoned {
+            "SELECT r.name, b.path FROM assets a JOIN bundles b USING (bundle_uuid)
+             JOIN roots r USING (root_id)
+             WHERE a.type_uuid = ?1 AND b.poison IS NOT NULL"
+        } else {
+            "SELECT r.name, b.path FROM assets a JOIN bundles b USING (bundle_uuid)
+             JOIN roots r USING (root_id)
+             WHERE a.type_uuid = ?1"
+        };
+        let mut statement = self.conn.prepare_cached(sql)?;
+        let rows = statement.query_map([type_uuid.0.as_slice()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<BTreeSet<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     /// Raw deterministic asset-to-bundle projection, including poisoned
-    /// skeleton rows. A whole-namespace bulk read: only a failed complete
-    /// tag-index refinement (a full rescan or configuration publication)
-    /// reads it, inside its open input, to poison every asset's tags.
+    /// skeleton rows. A whole-namespace bulk read no publication makes: the
+    /// tests compare the bounded reads against it.
     pub fn all_asset_bundles(&self) -> Result<BTreeMap<AssetUuid, BundleUuid>, StoreError> {
         let mut statement = self
             .conn

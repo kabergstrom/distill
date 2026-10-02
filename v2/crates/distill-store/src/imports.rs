@@ -219,46 +219,35 @@ pub struct ImportIndexSource {
 }
 
 impl Store {
-    /// Replace the import index rows of the bundle sources at `sources`
-    /// (every source when `None`) with `rows`. The index is derived state,
-    /// so this publishes no input version.
+    /// Replace the import index rows of the bundle sources at `sources` with
+    /// `rows`. The index is derived state, so this publishes no input
+    /// version. It is kept by source: every bundle publication queues its
+    /// paths as dirty work, and the import pass reindexes the dirty bundle
+    /// sources before it acknowledges that work.
     pub fn replace_import_index(
         &mut self,
-        sources: Option<&[(String, String)]>,
+        sources: &[(String, String)],
         rows: &[ImportIndexSource],
     ) -> Result<(), StoreError> {
         self.write_txn(|store| {
             let transaction = store.read.conn.savepoint()?;
-            match sources {
-                None => {
-                    transaction.execute_batch(
-                        "DELETE FROM import_reads; DELETE FROM import_records;
-                         DELETE FROM directory_rule_sources;",
+            for (root, path) in sources {
+                let params = rusqlite::params![root, path];
+                transaction.execute(
+                    "DELETE FROM import_reads WHERE bundle_uuid IN (
+                       SELECT t.bundle_uuid FROM import_records t JOIN roots r USING (root_id)
+                       WHERE r.name = ?1 AND t.path = ?2)",
+                    params,
+                )?;
+                for table in ["import_records", "directory_rule_sources"] {
+                    transaction.execute(
+                        &format!(
+                            "DELETE FROM {table} WHERE rowid IN (
+                               SELECT t.rowid FROM {table} t JOIN roots r USING (root_id)
+                               WHERE r.name = ?1 AND t.path = ?2)"
+                        ),
+                        params,
                     )?;
-                    // The complete index is built: the marker commits or
-                    // rolls back with its rows.
-                    crate::db::meta_set_u64(&transaction, "import_index_built", 1)?;
-                }
-                Some(sources) => {
-                    for (root, path) in sources {
-                        let params = rusqlite::params![root, path];
-                        transaction.execute(
-                            "DELETE FROM import_reads WHERE bundle_uuid IN (
-                               SELECT t.bundle_uuid FROM import_records t JOIN roots r USING (root_id)
-                               WHERE r.name = ?1 AND t.path = ?2)",
-                            params,
-                        )?;
-                        for table in ["import_records", "directory_rule_sources"] {
-                            transaction.execute(
-                                &format!(
-                                    "DELETE FROM {table} WHERE rowid IN (
-                                       SELECT t.rowid FROM {table} t JOIN roots r USING (root_id)
-                                       WHERE r.name = ?1 AND t.path = ?2)"
-                                ),
-                                params,
-                            )?;
-                        }
-                    }
                 }
             }
             for row in rows {

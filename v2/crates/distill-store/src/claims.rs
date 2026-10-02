@@ -209,7 +209,7 @@ impl InputTxn<'_> {
                     let mut select = conn.prepare_cached(&format!(
                         "SELECT t.kind, t.subject FROM source_claims t JOIN roots r USING (root_id)
                          WHERE {}",
-                        crate::files::UNDER
+                        crate::files::under_sql(prefix)
                     ))?;
                     let rows = select.query_map(rusqlite::params![root, prefix], |row| {
                         Ok((row.get(0)?, row.get(1)?))
@@ -222,7 +222,7 @@ impl InputTxn<'_> {
                             "DELETE FROM source_claims WHERE rowid IN (
                                SELECT t.rowid FROM source_claims t JOIN roots r USING (root_id)
                                WHERE {})",
-                            crate::files::UNDER
+                            crate::files::under_sql(prefix)
                         ),
                         rusqlite::params![root, prefix],
                     )?;
@@ -392,6 +392,26 @@ impl StoreReader {
             errors.push(namespace_error.map_err(invalid_namespace_error)?);
         }
         NamespaceError::canonical_set(errors).map_err(invalid_namespace_error)
+    }
+
+    /// The (root, path) of every source whose claims do not publish as they
+    /// stand: a malformed source (no complete skeleton) and every source
+    /// claiming a colliding bundle or asset. Searches of
+    /// `source_claims_by_subject`, so it costs the defects, not the
+    /// namespace.
+    pub fn unpublished_claim_sources(&self) -> Result<BTreeSet<(String, String)>, StoreError> {
+        Ok(self
+            .query_rows(
+                "SELECT r.name, t.path FROM source_claims t JOIN roots r USING (root_id)
+                 WHERE t.kind = 5
+                 UNION SELECT r.name, t.path FROM claim_collisions c
+                 CROSS JOIN source_claims t ON t.kind IN (0, 1, 2) AND t.subject = c.subject
+                 JOIN roots r ON r.root_id = t.root_id",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .into_iter()
+            .collect())
     }
 
     /// The distinct sources claiming `bundle`.

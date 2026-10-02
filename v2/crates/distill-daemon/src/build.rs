@@ -111,17 +111,9 @@ impl PublishedTagIndex {
         }
     }
 
-    pub(crate) fn apply(self, commit: &mut Commit) {
-        for mutation in &mut commit.authoring {
-            if let AuthoringMutation::Set(entry) = mutation {
-                entry.tags = self.tags.get(&entry.uuid).cloned().unwrap_or_default();
-            }
-        }
-        commit.tag_projection = Some(self.tags);
-        commit.tag_poisons = Some(self.poisons);
-    }
-
-    pub(crate) fn apply_incremental(self, commit: &mut Commit) {
+    /// Carry the refined tags in `commit`: the tags of the entries it sets,
+    /// and a tag and tag-poison mutation for each asset refined or removed.
+    fn apply(self, commit: &mut Commit) {
         for mutation in &mut commit.authoring {
             if let AuthoringMutation::Set(entry) = mutation {
                 if let Some(tags) = self.tags.get(&entry.uuid) {
@@ -1550,83 +1542,240 @@ pub(crate) fn doctor_verify_builds(
     Ok(defects)
 }
 
+/// Each authored type's tag epoch under `authority`: a digest of the
+/// type's logical hash and of every schema type its value can reach, with
+/// their attributes (tag markers and renames included), numbered in the
+/// order the walk reaches them so an unrelated type elsewhere in the schema
+/// leaves it unchanged. Tag extraction and `load_current` read nothing else
+/// of the authority, so a type whose epoch holds keeps its tag rows.
+pub(crate) fn type_tag_epochs(authority: &ProjectSchemaAuthority) -> BTreeMap<TypeUuid, [u8; 32]> {
+    use distill_schema::ngp_schema::SchemaTypeId;
+    let types = &authority.schema().types;
+    authority
+        .project_types()
+        .iter()
+        .map(|(type_uuid, project)| {
+            let mut order = vec![project.schema_type];
+            let mut local = BTreeMap::from([(project.schema_type, 0usize)]);
+            let mut next = 0;
+            while let Some(id) = order.get(next).copied() {
+                next += 1;
+                let Some(ty) = types.get(id.0) else { continue };
+                for reached in ty
+                    .fields
+                    .iter()
+                    .map(|field| field.type_id)
+                    .chain(ty.generic_argument_ids.iter().copied())
+                {
+                    if !local.contains_key(&reached) {
+                        local.insert(reached, order.len());
+                        order.push(reached);
+                    }
+                }
+            }
+            let renumber = |id: SchemaTypeId| SchemaTypeId(local[&id]);
+            let epoch = distill_core::canonical::domain_digest(*b"DSTE", 1, |encoder| {
+                encoder.raw(&type_uuid.0);
+                encoder.raw(&project.logical_hash.0);
+                for id in &order {
+                    let Some(ty) = types.get(id.0) else {
+                        encoder.str("");
+                        continue;
+                    };
+                    let mut ty = ty.clone();
+                    ty.id = renumber(ty.id);
+                    for field in &mut ty.fields {
+                        field.type_id = renumber(field.type_id);
+                    }
+                    for argument in &mut ty.generic_argument_ids {
+                        *argument = renumber(*argument);
+                    }
+                    encoder.str(&serde_json::to_string(&ty).expect("a schema type serializes"));
+                }
+            });
+            (*type_uuid, epoch)
+        })
+        .collect()
+}
+
 /// Finish §10 tag indexing against a namespace that has advanced durably but
-/// is not yet served: the open input applies its RPC delta afterwards.
+/// is not yet served, inside the open input that publishes `commit`, and
+/// carry the refined tags in `commit`.
 ///
-/// A whole-namespace bulk operation, run only by publications that replace
-/// the complete namespace (a full rescan, a configuration candidate): it
-/// reindexes every asset row and replaces the served tag projection. If
-/// indexing fails, every asset row the input now holds is poisoned with its
-/// bundle, read from the input only then; a failure of that read fails the
-/// publication, which then commits nothing.
-pub(crate) fn refine_published_tag_index(
+/// It refines the assets `commit` sets and, when `stale`, every tag row the
+/// store holds that refining would change: it first records each authored
+/// type's tag epoch under `authority`, which marks pending the rows of the
+/// types whose epoch changed ([`Store::replace_tag_epochs`]), then takes the
+/// pending or poisoned rows and the migrated rows of another pipeline module
+/// (see [`StoreReader::stale_tag_index_assets`]). Every other row already holds
+/// what refining it would write, so a publication costs the rows it changed.
+/// Assets `commit` removes become tag removals. If refining fails, every
+/// asset it set out to refine is poisoned, in the store and in `commit`
+/// alike; a failure to write that poison fails the publication.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn refine_tag_index(
     input: OpenInput<'_>,
     scanner: RootedScanner,
     authority: Arc<ProjectSchemaAuthority>,
     pipeline: PipelineSnapshot,
     targets: &BTreeMap<String, Target>,
     max_depth: usize,
-) -> Result<PublishedTagIndex, String> {
-    match try_refine_published_tag_index(
-        &mut *input.0,
+    commit: &mut Commit,
+    stale: bool,
+) -> Result<(), String> {
+    let store = input.0;
+    let tag_epoch = authority.source_hash();
+    let mut assets = BTreeMap::new();
+    let mut removed = BTreeSet::new();
+    for mutation in &commit.authoring {
+        match mutation {
+            AuthoringMutation::Set(entry) => {
+                assets.insert(entry.uuid, entry.bundle);
+            }
+            AuthoringMutation::Remove { uuid } => {
+                removed.insert(*uuid);
+            }
+        }
+    }
+    if stale {
+        let module = match (pipeline.epoch(), targets.values().next()) {
+            (Ok(epoch), Some(_)) => Some(epoch.dylib_hash()),
+            _ => None,
+        };
+        store
+            .replace_tag_epochs(&type_tag_epochs(&authority))
+            .map_err(|error| format!("record the tag epochs: {error}"))?;
+        assets.extend(
+            store
+                .stale_tag_index_assets(module)
+                .map_err(|error| format!("find the stale tag-index rows: {error}"))?,
+        );
+    }
+    if assets.is_empty() && removed.is_empty() {
+        return Ok(());
+    }
+    let mut indexed = match try_refine_tag_index(
+        &mut *store,
         scanner,
         authority,
         pipeline,
         targets,
         max_depth,
-        None,
+        &assets,
     ) {
-        Ok(indexed) => Ok(indexed),
-        Err(_) => input
-            .0
-            .all_asset_bundles()
-            .map(|assets| PublishedTagIndex::conservatively_poisoned(&assets))
-            .map_err(|error| format!("read the assets to poison their tags: {error}")),
+        Ok(indexed) => indexed,
+        Err(error) => poison_tag_index(store, &assets, tag_epoch, &error)?,
+    };
+    indexed.removed = removed;
+    indexed.apply(commit);
+    Ok(())
+}
+
+/// The conservative half of a failed refinement, in the store and in the
+/// served projection alike: every asset of `assets` loses its tags and
+/// carries the failure as its tag poison, under `tag_epoch`.
+fn poison_tag_index(
+    store: &mut Store,
+    assets: &BTreeMap<AssetUuid, BundleUuid>,
+    tag_epoch: [u8; 32],
+    error: &str,
+) -> Result<PublishedTagIndex, String> {
+    let updates = assets
+        .keys()
+        .map(|asset| TagIndexUpdate {
+            asset: *asset,
+            tags: BTreeMap::new(),
+            tag_epoch,
+            planner_version: None,
+            dylib_hash: None,
+            trace: Vec::new(),
+            poison: Some(format!("tag indexing failed: {error}")),
+        })
+        .collect::<Vec<_>>();
+    store
+        .refine_unpublished_tag_index(store.input_version(), &updates)
+        .map_err(|error| format!("poison the tag index: {error}"))?;
+    Ok(PublishedTagIndex::conservatively_poisoned(assets))
+}
+
+/// The bundle a refinement read last: its assets are refined together, so
+/// each bundle is read, checked and parsed once.
+#[derive(Default)]
+struct TagBundle(Option<(BundleUuid, Result<Arc<Bundle>, BuildError>)>);
+
+impl TagBundle {
+    /// `asset`'s entry and its parsed bundle, the bundle's file checked
+    /// against the bundle row as [`load_asset`] checks it.
+    fn load(
+        &mut self,
+        store: &StoreReader,
+        scanner: &RootedScanner,
+        asset: AssetUuid,
+    ) -> Result<(EntryMeta, Arc<Bundle>, AssetEntry), BuildError> {
+        let meta = store
+            .entry(asset)
+            .map_err(BuildError::failed)?
+            .ok_or_else(|| BuildError::Failed(format!("asset {asset} is missing")))?;
+        if self.0.as_ref().is_none_or(|(bundle, _)| *bundle != meta.bundle) {
+            #[cfg(test)]
+            tests::TAG_BUNDLE_LOADS.with(|loads| loads.set(loads.get() + 1));
+            self.0 = Some((meta.bundle, read_tag_bundle(store, scanner, meta.bundle)));
+        }
+        let bundle = match &self.0 {
+            Some((_, Ok(bundle))) => Arc::clone(bundle),
+            Some((_, Err(error))) => return Err(error.clone()),
+            None => unreachable!("the bundle was just read"),
+        };
+        let (local_id, entry) =
+            find_bundle_asset(&bundle, asset).ok_or(BuildError::Drifted(DriftedInput::Asset(asset)))?;
+        if local_id != meta.local_id
+            || entry.type_uuid != meta.type_uuid
+            || entry.schema_hash != meta.logical_hash
+        {
+            return Err(BuildError::Drifted(DriftedInput::Asset(asset)));
+        }
+        let entry = entry.clone();
+        Ok((meta, bundle, entry))
     }
 }
 
-/// Reindex only identities whose authored rows changed in the same input
-/// publication. Deleted identities become bounded removals; unrelated tag
-/// rows and cached traces are not enumerated.
-pub(crate) fn refine_published_tag_index_incremental(
-    input: OpenInput<'_>,
-    scanner: RootedScanner,
-    authority: Arc<ProjectSchemaAuthority>,
-    pipeline: PipelineSnapshot,
-    targets: &BTreeMap<String, Target>,
-    max_depth: usize,
-    affected: &BTreeMap<AssetUuid, Option<BundleUuid>>,
-) -> PublishedTagIndex {
-    let current = affected
-        .iter()
-        .filter_map(|(asset, bundle)| bundle.map(|bundle| (*asset, bundle)))
-        .collect::<BTreeMap<_, _>>();
-    let assets = current.keys().copied().collect::<Vec<_>>();
-    let mut indexed = try_refine_published_tag_index(
-        input.0,
-        scanner,
-        authority,
-        pipeline,
-        targets,
-        max_depth,
-        Some(assets),
-    )
-    .unwrap_or_else(|_| PublishedTagIndex::conservatively_poisoned(&current));
-    indexed.removed = affected
-        .iter()
-        .filter_map(|(asset, bundle)| bundle.is_none().then_some(*asset))
-        .collect();
-    indexed
+fn read_tag_bundle(
+    store: &StoreReader,
+    scanner: &RootedScanner,
+    bundle: BundleUuid,
+) -> Result<Arc<Bundle>, BuildError> {
+    let bundle_meta = store
+        .bundle(bundle)
+        .map_err(BuildError::infrastructure)?
+        .ok_or_else(|| BuildError::Infrastructure("asset owner bundle is missing".to_owned()))?;
+    let root = store
+        .root_name(bundle_meta.root)
+        .map_err(BuildError::infrastructure)?
+        .ok_or_else(|| BuildError::Infrastructure("bundle root identity is missing".to_owned()))?;
+    let path = scanner
+        .physical_path(&root, &bundle_meta.path)
+        .map_err(BuildError::infrastructure)?;
+    let bytes = scanner
+        .read_identity_checked(&path)
+        .map_err(|_| BuildError::Drifted(DriftedInput::File(bundle_meta.path.clone())))?;
+    if ContentHash(*blake3::hash(&bytes).as_bytes()) != bundle_meta.content_hash {
+        return Err(BuildError::Drifted(DriftedInput::File(bundle_meta.path)));
+    }
+    let parsed = distill_bundle::parse_bundle(&bytes).map_err(BuildError::failed)?;
+    if parsed.uuid != bundle {
+        return Err(BuildError::Drifted(DriftedInput::File(bundle_meta.path)));
+    }
+    Ok(Arc::new(parsed))
 }
 
-fn try_refine_published_tag_index(
+fn try_refine_tag_index(
     store: &mut Store,
     scanner: RootedScanner,
     authority: Arc<ProjectSchemaAuthority>,
     pipeline: PipelineSnapshot,
     targets: &BTreeMap<String, Target>,
     max_depth: usize,
-    requested_assets: Option<Vec<AssetUuid>>,
+    assets: &BTreeMap<AssetUuid, BundleUuid>,
 ) -> Result<PublishedTagIndex, String> {
     let tag_epoch = authority.source_hash();
     #[cfg(test)]
@@ -1634,12 +1783,12 @@ fn try_refine_published_tag_index(
         return Err("injected tag-index refinement failure".to_owned());
     }
     let basis = store.input_version();
-    let assets = match requested_assets {
-        Some(assets) => assets,
-        None => store
-            .all_asset_ids()
-            .map_err(|error| format!("enumerate tag-index assets: {error}"))?,
-    };
+    // A bundle's assets one after another, so each bundle is parsed once.
+    let mut order = assets
+        .iter()
+        .map(|(asset, bundle)| (*bundle, *asset))
+        .collect::<Vec<_>>();
+    order.sort_unstable();
     let env = match (pipeline.epoch(), targets.values().next()) {
         (Ok(_), Some(target)) => Some(
             NodeEnv::new(
@@ -1655,7 +1804,8 @@ fn try_refine_published_tag_index(
 
     let mut tags = BTreeMap::new();
     let mut poisons = BTreeMap::new();
-    let mut updates = Vec::with_capacity(assets.len());
+    let mut updates = Vec::with_capacity(order.len());
+    let mut loaded = TagBundle::default();
     if let Some(env) = env {
         let dylib_hash = env.dylib_hash;
         let mut context = BuildContext::new(
@@ -1667,14 +1817,13 @@ fn try_refine_published_tag_index(
             "tag-index-runs",
         )
         .map_err(|error| format!("pin tag-index tools: {error:?}"))?;
-        for asset in assets {
-            let indexed = index_one_tag_entry(&mut context, asset, tag_epoch);
-            match indexed {
+        for (bundle, asset) in order {
+            match index_one_tag_entry(&mut context, &mut loaded, asset, tag_epoch) {
                 Ok(update) => {
                     tags.insert(asset, update.tags.clone());
                     updates.push(update);
                 }
-                Err((bundle, error, trace, migrated)) => {
+                Err((error, trace, migrated)) => {
                     poisons.insert(asset, bundle);
                     updates.push(TagIndexUpdate {
                         asset,
@@ -1693,33 +1842,22 @@ fn try_refine_published_tag_index(
             || "no build target is published".to_owned(),
             |error| error.to_string(),
         );
-        for asset in assets {
+        for (bundle, asset) in order {
             let direct = (|| {
-                let loaded = load_asset(store, &scanner, asset)
-                    .map_err(|error| (BundleUuid([0; 16]), format!("{error:?}"), false))?;
-                let bundle = loaded.meta.bundle;
-                let project = authority
-                    .project_type(loaded.entry.type_uuid)
-                    .ok_or_else(|| {
-                        (
-                            bundle,
-                            format!(
-                                "type {} has no project schema authority",
-                                loaded.entry.type_uuid
-                            ),
-                            false,
-                        )
-                    })?;
-                let migrated = loaded.entry.schema_hash != project.logical_hash;
-                if migrated {
-                    return Err((bundle, format!("tag load unavailable: {unavailable}"), true));
+                let (_, _, entry) = loaded
+                    .load(store, &scanner, asset)
+                    .map_err(|error| (format!("{error:?}"), false))?;
+                let project = authority.project_type(entry.type_uuid).ok_or_else(|| {
+                    (
+                        format!("type {} has no project schema authority", entry.type_uuid),
+                        false,
+                    )
+                })?;
+                if entry.schema_hash != project.logical_hash {
+                    return Err((format!("tag load unavailable: {unavailable}"), true));
                 }
-                distill_schema::extract_search_tags(
-                    authority.schema(),
-                    project.schema_type,
-                    &loaded.entry.data,
-                )
-                .map_err(|error| (bundle, error.to_string(), false))
+                distill_schema::extract_search_tags(authority.schema(), project.schema_type, &entry.data)
+                    .map_err(|error| (error.to_string(), false))
             })();
             match direct {
                 Ok(extracted) => {
@@ -1738,7 +1876,7 @@ fn try_refine_published_tag_index(
                         poison: None,
                     });
                 }
-                Err((bundle, error, migrated)) => {
+                Err((error, migrated)) => {
                     poisons.insert(asset, bundle);
                     updates.push(TagIndexUpdate {
                         asset,
@@ -1765,57 +1903,44 @@ fn try_refine_published_tag_index(
 
 fn index_one_tag_entry(
     context: &mut BuildContext,
+    loaded: &mut TagBundle,
     asset: AssetUuid,
     tag_epoch: [u8; 32],
-) -> Result<TagIndexUpdate, (BundleUuid, String, Vec<u8>, bool)> {
-    let loaded = {
-        let store = lock_build_store(context)
-            .map_err(|error| (BundleUuid([0; 16]), format!("{error:?}"), Vec::new(), false))?;
-        load_asset(&store, &context.scanner, asset)
-            .map_err(|error| (BundleUuid([0; 16]), format!("{error:?}"), Vec::new(), false))?
+) -> Result<TagIndexUpdate, (String, Vec<u8>, bool)> {
+    let (_, bundle, entry) = {
+        let store = lock_build_store(context).map_err(|error| (format!("{error:?}"), Vec::new(), false))?;
+        loaded
+            .load(&store, &context.scanner, asset)
+            .map_err(|error| (format!("{error:?}"), Vec::new(), false))?
     };
-    let bundle = loaded.meta.bundle;
-    let Some(project) = context
-        .env.authority
-        .project_type(loaded.entry.type_uuid)
-        .cloned()
-    else {
+    let Some(project) = context.env.authority.project_type(entry.type_uuid).cloned() else {
         return Err((
-            bundle,
-            format!(
-                "type {} has no project schema authority",
-                loaded.entry.type_uuid
-            ),
+            format!("type {} has no project schema authority", entry.type_uuid),
             Vec::new(),
             false,
         ));
     };
-    let migrated = loaded.entry.schema_hash != project.logical_hash;
-    let current_load = current_load(context)
-        .map_err(|error| (bundle, format!("{error:?}"), Vec::new(), migrated))?;
+    let migrated = entry.schema_hash != project.logical_hash;
+    let current_load =
+        current_load(context).map_err(|error| (format!("{error:?}"), Vec::new(), migrated))?;
     let mut trace = Vec::new();
-    let current =
-        load_current_value(context, &loaded, &project, current_load, &mut trace).map_err(|error| {
-            (
-                bundle,
-                format!("{error:?}"),
-                trace_payload_bytes(&trace),
-                migrated,
-            )
-        })?;
+    let current = load_current_entry(
+        &context.env.pipeline,
+        &entry,
+        &bundle,
+        &project.logical_schema,
+        project.logical_hash,
+        &project.renamed_from,
+        current_load,
+        &mut trace,
+    )
+    .map_err(|error| (format!("{error:?}"), trace_payload_bytes(&trace), migrated))?;
     let extracted = distill_schema::extract_search_tags(
         context.env.authority.schema(),
         project.schema_type,
         &current,
     )
-    .map_err(|error| {
-        (
-            bundle,
-            error.to_string(),
-            trace_payload_bytes(&trace),
-            migrated,
-        )
-    })?
+    .map_err(|error| (error.to_string(), trace_payload_bytes(&trace), migrated))?
     .into_iter()
     .map(|(name, value)| (name, Some(value)))
     .collect();
@@ -4121,6 +4246,9 @@ mod tests {
         /// Fail the next tag-index refinement on this thread.
         pub(super) static FAIL_TAG_REFINEMENT: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
+        /// Bundles tag-index refinements on this thread read and parsed.
+        pub(super) static TAG_BUNDLE_LOADS: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
     }
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -4781,13 +4909,15 @@ mod tests {
         ));
         let pipeline = coordinator.compiled_at(&writer).unwrap().pipeline_snapshot();
         writer.open_input().unwrap();
-        refine_published_tag_index(
+        refine_tag_index(
             OpenInput::new(&mut writer).unwrap(),
             coordinator.scanner(),
             Arc::clone(&authority),
             pipeline,
             &BTreeMap::from([("dev".to_owned(), build_target)]),
             64,
+            &mut Commit::default(),
+            true,
         )
         .unwrap();
         writer.finish_input(true).unwrap();
@@ -5048,11 +5178,9 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    /// A requester's answer comes from the compiled state its own snapshot
-    /// sees: a snapshot older than a pipeline failure still answers from its
-    /// epoch, while a newer one sees the failure.
-    /// A complete refinement that fails poisons the tags of every asset row
-    /// its open input holds, each with its bundle, read only then.
+    /// A complete refinement redoes only the stale rows: none, once every
+    /// row is refined. One that fails poisons the rows it set out to
+    /// refine, in the store as in its commit, each with its bundle.
     #[test]
     fn a_failed_complete_tag_refinement_poisons_every_asset_of_its_input() {
         let temp = tempfile::tempdir().unwrap();
@@ -5061,23 +5189,132 @@ mod tests {
             .compiled_at(&coordinator.open_reader().unwrap())
             .unwrap();
         let mut writer = coordinator.open_writer().unwrap();
-        writer.open_input().unwrap();
+        let refine = |writer: &mut distill_store::StoreWriter| {
+            let mut commit = Commit::default();
+            writer.open_input().unwrap();
+            refine_tag_index(
+                OpenInput::new(writer).unwrap(),
+                compiled.scanner().clone(),
+                compiled.schema_authority().unwrap(),
+                compiled.pipeline_snapshot(),
+                compiled.build_targets(),
+                64,
+                &mut commit,
+                true,
+            )
+            .unwrap();
+            let state = writer.tag_index_state(ASSET).unwrap().unwrap();
+            writer.finish_input(true).unwrap();
+            (commit, state)
+        };
+        let (commit, before) = refine(&mut writer);
+        assert_eq!(before.poison, None, "{before:?}");
+        assert_eq!(commit.tag_projection_mutations.len(), 1);
+        let (commit, _) = refine(&mut writer);
+        assert!(commit.tag_projection_mutations.is_empty(), "nothing was stale");
+
+        // A publication marks the row pending; its refinement fails.
+        let epoch = compiled.schema_authority().unwrap().source_hash();
+        writer
+            .input_transaction(|txn| txn.set_tag_index_pending(ASSET, epoch))
+            .unwrap();
         FAIL_TAG_REFINEMENT.with(|fail| fail.set(true));
-        let indexed = refine_published_tag_index(
+        let (commit, after) = refine(&mut writer);
+        // The store says what the served projection says: no reader trusts
+        // the row the failed refinement left.
+        assert!(
+            after.poison.as_deref().is_some_and(|poison| poison.starts_with("tag indexing failed")),
+            "{after:?}"
+        );
+        assert_eq!(
+            commit.tag_poison_mutations,
+            [TagPoisonMutation::Set {
+                asset: ASSET,
+                bundle: BUNDLE
+            }]
+        );
+        assert_eq!(
+            commit.tag_projection_mutations,
+            [TagProjectionMutation::Set {
+                asset: ASSET,
+                tags: BTreeMap::new()
+            }]
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A full step refines only the rows its publication made pending, and
+    /// reads and parses each of their bundles once, however many assets it
+    /// holds.
+    #[test]
+    fn a_full_step_refines_its_pending_rows_one_parse_per_bundle() {
+        let temp = tempfile::tempdir().unwrap();
+        let (coordinator, _request, _calls) = identity_fixture(&temp);
+        let mut writer = coordinator.open_writer().unwrap();
+        // The fixture published its asset before the tag authority: refine it.
+        let compiled = coordinator.compiled_at(&writer).unwrap();
+        writer.open_input().unwrap();
+        refine_tag_index(
             OpenInput::new(&mut writer).unwrap(),
             compiled.scanner().clone(),
             compiled.schema_authority().unwrap(),
             compiled.pipeline_snapshot(),
             compiled.build_targets(),
             64,
+            &mut Commit::default(),
+            true,
         )
         .unwrap();
-        writer.finish_input(false).unwrap();
-        assert_eq!(indexed.poisons, BTreeMap::from([(ASSET, BUNDLE)]));
-        assert_eq!(indexed.tags, BTreeMap::from([(ASSET, BTreeMap::new())]));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        writer.finish_input(true).unwrap();
+        let authority = authority();
+        let project = authority.project_type(TYPE).unwrap();
+        let many = (0..4u8).map(|index| AssetUuid([90 + index; 16])).collect::<Vec<_>>();
+        let bundle = Bundle {
+            format_version: 1,
+            uuid: BundleUuid([89; 16]),
+            primary: None,
+            schemas: BTreeMap::from([(project.logical_hash, project.logical_schema.clone())]),
+            assets: many
+                .iter()
+                .enumerate()
+                .map(|(index, asset)| {
+                    (
+                        format!("entry{index}"),
+                        AssetEntry {
+                            uuid: *asset,
+                            type_uuid: TYPE,
+                            schema_hash: project.logical_hash,
+                            authoring_only: false,
+                            data: AuthoredValue::Object(BTreeMap::from([(
+                                "value".to_owned(),
+                                AuthoredValue::UInt(index as u128),
+                            )])),
+                        },
+                    )
+                })
+                .collect(),
+        };
+        std::fs::write(
+            temp.path().join("assets/many.bundle"),
+            distill_bundle::write_bundle(&bundle).unwrap(),
+        )
+        .unwrap();
+        let unchanged = writer.tag_index_state(ASSET).unwrap().unwrap();
+        assert_eq!(unchanged.poison, None);
+
+        TAG_BUNDLE_LOADS.with(|loads| loads.set(0));
+        coordinator.reconcile_full_scan(&mut writer).unwrap();
+        assert_eq!(TAG_BUNDLE_LOADS.with(std::cell::Cell::get), 1, "one parse of many.bundle");
+        for asset in &many {
+            let state = writer.tag_index_state(*asset).unwrap().unwrap();
+            assert_eq!(state.poison, None, "{state:?}");
+        }
+        assert_eq!(writer.tag_index_state(ASSET).unwrap().unwrap(), unchanged);
     }
 
+    /// A requester's answer comes from the compiled state its own snapshot
+    /// sees: a snapshot older than a pipeline failure still answers from its
+    /// epoch, while a newer one sees the failure.
     #[test]
     fn a_build_answers_under_the_compiled_state_of_its_snapshot() {
         let temp = tempfile::tempdir().unwrap();

@@ -326,6 +326,16 @@ fn scan_structure_is_replaced_per_subtree() {
         store.directory_by_canonical(b"/project/ab").unwrap(),
         Some(directory("ab"))
     );
+    // Two directories never share a canonical path.
+    let mut alias = directory("c");
+    alias.canonical_path = directory("ab").canonical_path;
+    assert!(store
+        .input_transaction(|txn| txn.replace_scan_structure(
+            Some(&[("main".to_owned(), "c".to_owned())]),
+            &[alias.clone()],
+            &[],
+        ))
+        .is_err());
     store
         .replace_scan_diagnostics(None, &[diagnostic("c")])
         .unwrap();

@@ -12,6 +12,7 @@ use rusqlite::Connection;
 
 use crate::bundles::{
     AssetFilter, AssetRecord, BundleMeta, NamespaceSkeleton, ServedAuthoring, SkeletonEntry,
+    TagIndexUpdate,
 };
 use crate::db::{ReaderConn, StoreReader};
 use crate::files::{path_name, FileKind, FileObservation, FileState, PathSelection};
@@ -660,4 +661,450 @@ fn reading_bundle_file_hashes_skips_their_bytes() {
     println!("hashes: {hash_read} bytes read; bundle bytes: {bytes_read}");
     assert!(hash_read <= 512 * 1024, "{hash_read} bytes read");
     assert!(bytes_read >= 20 * hash_read, "{hash_read} against {bytes_read} bytes read");
+}
+
+/// Scan-structure and claim rows under every scanned bundle's directory,
+/// and a symlink beside every hundredth bundle, for the subtree reads.
+fn populate_scan_structure(store: &mut Store, count: u32) {
+    let mut directories = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut claims = Vec::new();
+    for index in 0..count {
+        let root = ["main", "alt"][(index % 2) as usize].to_owned();
+        let path = bundle_path(index);
+        directories.push(crate::files::ObservedDirectory {
+            root_name: root.clone(),
+            path: format!("{path}.d"),
+            canonical_path: format!("/c/{index}").into_bytes(),
+            physical_path: format!("/p/{index}").into_bytes(),
+        });
+        diagnostics.push(crate::files::ObservedDiagnostic {
+            root_name: root.clone(),
+            path: format!("{path}.x"),
+            detail: Vec::new(),
+        });
+        claims.push(crate::claims::SourceClaims {
+            root_name: root,
+            path: path.clone(),
+            claims: vec![crate::claims::SourceClaim::PrimaryPath {
+                path,
+                asset: asset_uuid(index, 1),
+            }],
+        });
+    }
+    store
+        .input_transaction(|txn| {
+            let version = txn.version();
+            txn.replace_scan_structure(None, &directories, &diagnostics)?;
+            txn.replace_source_claims(None, &claims)?;
+            let root = txn.intern_root("main")?;
+            for index in (0..count).step_by(100) {
+                txn.upsert_file(
+                    root,
+                    &format!("links/l{index:05}"),
+                    &FileObservation {
+                        state: FileState {
+                            mtime: 0,
+                            size: 0,
+                            kind: FileKind::Symlink,
+                            content_hash: None,
+                        },
+                        raw_path: Vec::new(),
+                        symlink_target: Some(format!("/t/d{:02}/x{index}", index % 50).into_bytes()),
+                    },
+                    version,
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// The statements `run` issues that read a subtree of one root (they join
+/// `roots` by name), each with its plan.
+fn subtree_plans(store: &mut Store, run: impl FnOnce(&mut Store)) -> Vec<(String, Vec<String>)> {
+    store.read.conn.trace(Some(trace));
+    run(store);
+    store.read.conn.trace(None);
+    let statements = std::mem::take(&mut *TRACED.lock().unwrap());
+    statements
+        .into_iter()
+        .filter(|sql| sql.contains("JOIN roots r USING (root_id)") || sql.contains("symlink_target >="))
+        .map(|sql| {
+            let plan = explain(&store.read.conn, &sql);
+            (sql, plan)
+        })
+        .collect()
+}
+
+/// A subtree read (the scan baseline of a watcher batch or an RPC write, the
+/// structure and claims it replaces, a pass's file overlay) is one range
+/// search of its table's `(root_id, path)` key; a whole-root read is one
+/// search of the root's rows. Symlinks targeting a path are one range of
+/// their target index.
+#[test]
+fn subtree_reads_search_one_key_range() {
+    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, mut store) = store_with(200);
+    populate_scan_structure(&mut store, 200);
+    let roots = "SEARCH r USING COVERING INDEX sqlite_autoindex_roots_1 (name=?)";
+    for (prefix, key) in [("d07", "root_id=? AND path>? AND path<?"), ("", "root_id=?")] {
+        let search = |table: &str, covering: bool| {
+            let index = if covering { "COVERING INDEX" } else { "INDEX" };
+            format!("SEARCH t USING {index} sqlite_autoindex_{table}_1 ({key})")
+        };
+        let read = |table: &str| vec![roots.to_owned(), search(table, false)];
+        let delete = |table: &str| {
+            vec![
+                format!("SEARCH {table} USING INTEGER PRIMARY KEY (rowid=?)"),
+                "LIST SUBQUERY 1".to_owned(),
+                roots.to_owned(),
+                search(table, true),
+            ]
+        };
+        let reads = subtree_plans(&mut store, |store| {
+            store.observed_files_under("main", prefix).unwrap();
+            store.observed_directories_under("main", prefix).unwrap();
+            store.scan_diagnostics_under("main", prefix).unwrap();
+            store.bundle_file_hashes_under("main", prefix).unwrap();
+        });
+        let plans = reads.iter().map(|(_, plan)| plan.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            plans,
+            ["files", "directories", "scan_diagnostics", "bundle_files"].map(read),
+            "{prefix:?}: {reads:#?}"
+        );
+        let exists = subtree_plans(&mut store, |store| {
+            store.observes_under("main", prefix).unwrap();
+        });
+        assert_eq!(exists.len(), 1);
+        assert_eq!(
+            exists[0].1,
+            [
+                "SCAN CONSTANT ROW".to_owned(),
+                "SCALAR SUBQUERY 1".to_owned(),
+                roots.to_owned(),
+                search("files", true),
+                "SCALAR SUBQUERY 2".to_owned(),
+                roots.to_owned(),
+                search("directories", true),
+            ],
+            "{prefix:?}: {exists:#?}"
+        );
+        let under = [("main".to_owned(), prefix.to_owned())];
+        let writes = subtree_plans(&mut store, |store| {
+            store.replace_scan_diagnostics(Some(&under), &[]).unwrap();
+            store
+                .input_transaction(|txn| {
+                    txn.replace_scan_structure(Some(&under), &[], &[])?;
+                    txn.replace_source_claims(Some(&under), &[])
+                })
+                .unwrap();
+        });
+        let plans = writes.iter().map(|(_, plan)| plan.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            plans,
+            [
+                delete("scan_diagnostics"),
+                delete("directories"),
+                delete("scan_diagnostics"),
+                vec![roots.to_owned(), search("source_claims", true)],
+                delete("source_claims"),
+            ],
+            "{prefix:?}: {writes:#?}"
+        );
+    }
+    let links = subtree_plans(&mut store, |store| {
+        let rows = store.symlinks_targeting(b"/t/d07").unwrap();
+        assert_eq!(rows.len(), 0);
+        let rows = store.symlinks_targeting(b"/t/d00").unwrap();
+        assert_eq!(rows.len(), 2);
+    });
+    for (sql, plan) in links {
+        assert_eq!(
+            plan,
+            [
+                "SEARCH t USING INDEX files_by_symlink_target (symlink_target>? AND symlink_target<?)",
+                "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)",
+            ],
+            "{sql}"
+        );
+    }
+    // The incremental scan's alias check: one probe of the unique index.
+    let canonical = subtree_plans(&mut store, |store| {
+        assert!(store.directory_by_canonical(b"/c/7").unwrap().is_some());
+    });
+    assert_eq!(canonical.len(), 1);
+    assert_eq!(
+        canonical[0].1,
+        [
+            "SEARCH t USING INDEX directories_by_canonical (canonical_path=?)",
+            "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)",
+        ],
+        "{canonical:#?}"
+    );
+}
+
+/// Reading one subtree of a large root fetches pages for its rows, not the
+/// root's.
+#[test]
+fn a_subtree_read_of_a_large_root_touches_its_rows() {
+    let (_dir, mut store) = store_with(20_000);
+    populate_scan_structure(&mut store, 20_000);
+    let reader = store.reader().unwrap();
+    // "d08" holds every 50th bundle, all even, so all "main"'s: 400 of its
+    // 10,000, each with a directory and a diagnostic row below it.
+    let mut rows = 0;
+    let narrow = pages(&reader, || {
+        rows = reader.observed_files_under("main", "d08").unwrap().len();
+        rows += reader.observed_directories_under("main", "d08").unwrap().len();
+        rows += reader.scan_diagnostics_under("main", "d08").unwrap().len();
+        rows += reader.bundle_file_hashes_under("main", "d08").unwrap().len();
+    });
+    let whole = pages(&reader, || {
+        drop(reader.observed_files_under("main", "").unwrap());
+        drop(reader.observed_directories_under("main", "").unwrap());
+        drop(reader.scan_diagnostics_under("main", "").unwrap());
+        drop(reader.bundle_file_hashes_under("main", "").unwrap());
+    });
+    println!("subtree: {rows} rows in {narrow} pages (whole root: {whole} pages)");
+    assert_eq!(rows, 4 * 400);
+    assert!(narrow <= 16 + 2 * rows as u64, "{narrow} pages for {rows} rows");
+    assert!(whole >= 10 * narrow, "{narrow} pages against {whole}");
+}
+
+/// A complete scan's old bundle summaries are one streamed join of the
+/// bundle rows with their roots, never a root-name lookup per bundle.
+#[test]
+fn bundles_with_root_names_are_one_join() {
+    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, mut store) = store_with(200);
+    let plans = subtree_plans(&mut store, |store| {
+        let mut count = 0;
+        store
+            .for_each_bundle_with_root_name(|root_name, _| {
+                assert!(root_name == "main" || root_name == "alt");
+                count += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(count, 200);
+    });
+    assert_eq!(plans.len(), 1, "{plans:#?}");
+    assert_eq!(
+        plans[0].1,
+        [
+            "SCAN bundles USING INDEX sqlite_autoindex_bundles_1",
+            "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)",
+        ],
+        "{plans:#?}"
+    );
+}
+
+/// A refinement finds the tag rows it must redo by one search of an index
+/// per kind of staleness (poisoned, among them pending; another module's
+/// migration), never by walking every row; and finds exactly those.
+#[test]
+fn stale_tag_rows_are_index_searches() {
+    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, mut store) = store_with(200);
+    let (module, old_module) = ([9; 32], [8; 32]);
+    let updates = (0..200)
+        .map(|index| {
+            let (dylib_hash, poison) = match index % 50 {
+                0 => (None, Some("tag indexing pending".to_owned())),
+                2 => (Some(old_module), None),
+                3 => (Some(module), None),
+                _ => (None, None),
+            };
+            TagIndexUpdate {
+                asset: asset_uuid(index, 1),
+                tags: BTreeMap::new(),
+                tag_epoch: [7; 32],
+                planner_version: None,
+                dylib_hash,
+                trace: Vec::new(),
+                poison,
+            }
+        })
+        .collect::<Vec<_>>();
+    let version = store.input_version();
+    store.refine_unpublished_tag_index(version, &updates).unwrap();
+    let stale = |module| {
+        store
+            .stale_tag_index_assets(module)
+            .unwrap()
+            .into_iter()
+            .map(|(asset, bundle)| {
+                let index = (0..200).find(|index| asset_uuid(*index, 1) == asset).unwrap();
+                assert_eq!(bundle, bundle_uuid(index));
+                index % 50
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut kinds = stale(Some(module));
+    kinds.sort_unstable();
+    assert_eq!(kinds, [0, 0, 0, 0, 2, 2, 2, 2]);
+    let mut kinds = stale(None);
+    kinds.sort_unstable();
+    assert_eq!(kinds, [0, 0, 0, 0, 2, 2, 2, 2, 3, 3, 3, 3]);
+
+    store.read.conn.trace(Some(trace));
+    store.stale_tag_index_assets(Some(module)).unwrap();
+    store.read.conn.trace(None);
+    let statements = std::mem::take(&mut *TRACED.lock().unwrap());
+    let sql = statements
+        .iter()
+        .find(|sql| sql.contains("asset_tag_index i"))
+        .unwrap();
+    let plan = explain(&store.read.conn, sql);
+    let assets = "SEARCH a USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)";
+    assert_eq!(
+        plan,
+        [
+            "COMPOUND QUERY",
+            "LEFT-MOST SUBQUERY",
+            "SCAN i USING INDEX asset_tag_index_poisoned",
+            assets,
+            "UNION USING TEMP B-TREE",
+            "SEARCH i USING INDEX asset_tag_index_migrated (dylib_hash<?)",
+            assets,
+            "UNION USING TEMP B-TREE",
+            "SEARCH i USING INDEX asset_tag_index_migrated (dylib_hash>?)",
+            assets,
+        ],
+        "{sql}"
+    );
+}
+
+/// The statements a configuration change issues, with their plans.
+fn configuration_plans(store: &mut Store, run: impl FnOnce(&mut Store)) -> Vec<(String, Vec<String>)> {
+    store.read.conn.trace(Some(trace));
+    run(store);
+    store.read.conn.trace(None);
+    let statements = std::mem::take(&mut *TRACED.lock().unwrap());
+    statements
+        .into_iter()
+        .filter(|sql| !sql.starts_with("SAVEPOINT") && !sql.starts_with("RELEASE"))
+        .map(|sql| {
+            let plan = explain(&store.read.conn, &sql);
+            (sql, plan)
+        })
+        .filter(|(_, plan)| !plan.is_empty())
+        .collect()
+}
+
+/// A type whose tag epoch changes has exactly its rows marked pending, by
+/// one search of `assets_by_type`; an unchanged epoch marks nothing; the
+/// epochs are one read of the per-type table.
+#[test]
+fn a_changed_tag_epoch_marks_only_its_types_rows() {
+    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, mut store) = store_with(200);
+    let refined = |store: &mut Store| {
+        let version = store.input_version();
+        let updates = [asset_uuid(3, 1), asset_uuid(3, 2), asset_uuid(4, 1)]
+            .into_iter()
+            .map(|asset| TagIndexUpdate {
+                asset,
+                tags: BTreeMap::new(),
+                tag_epoch: [7; 32],
+                planner_version: None,
+                dylib_hash: None,
+                trace: Vec::new(),
+                poison: None,
+            })
+            .collect::<Vec<_>>();
+        store.refine_unpublished_tag_index(version, &updates).unwrap();
+    };
+    let epochs = |record: u8| BTreeMap::from([(RUNTIME_TYPE, [1; 32]), (RECORD_TYPE, [record; 32])]);
+    let pending = |store: &Store| {
+        [asset_uuid(3, 1), asset_uuid(3, 2), asset_uuid(4, 1)]
+            .into_iter()
+            .filter(|asset| store.stale_tag_index_assets(None).unwrap().contains_key(asset))
+            .collect::<Vec<_>>()
+    };
+    let mark = |store: &mut Store, epochs: &BTreeMap<TypeUuid, [u8; 32]>| {
+        store.replace_tag_epochs(epochs).unwrap()
+    };
+    refined(&mut store);
+    assert!(pending(&store).is_empty());
+    // Every type is new to an empty table.
+    assert_eq!(
+        mark(&mut store, &epochs(2)),
+        std::collections::BTreeSet::from([RUNTIME_TYPE, RECORD_TYPE])
+    );
+    assert_eq!(pending(&store).len(), 3);
+    refined(&mut store);
+    assert!(mark(&mut store, &epochs(2)).is_empty());
+    assert!(pending(&store).is_empty());
+
+    let plans = configuration_plans(&mut store, |store| {
+        assert_eq!(
+            store.replace_tag_epochs(&epochs(3)).unwrap(),
+            std::collections::BTreeSet::from([RECORD_TYPE])
+        );
+    });
+    assert_eq!(pending(&store), [asset_uuid(3, 2)]);
+    let plans = plans.iter().map(|(_, plan)| plan.clone()).collect::<Vec<_>>();
+    assert_eq!(
+        plans,
+        [
+            vec!["SCAN tag_epochs".to_owned()],
+            vec![
+                "SEARCH asset_tag_index USING COVERING INDEX sqlite_autoindex_asset_tag_index_1 (asset_uuid=?)"
+                    .to_owned(),
+                "LIST SUBQUERY 1".to_owned(),
+                "SEARCH assets USING INDEX assets_by_type (type_uuid=?)".to_owned(),
+            ],
+            vec!["SEARCH tag_epochs USING PRIMARY KEY (type_uuid=?)".to_owned()],
+        ],
+        "{plans:#?}"
+    );
+}
+
+/// A configuration change finds the sources it claims again by searches:
+/// the bundles of a type (or only its poisoned ones) through
+/// `assets_by_type`, and the malformed and colliding sources through
+/// `source_claims_by_subject`.
+#[test]
+fn reconfigured_sources_are_index_searches() {
+    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, mut store) = store_with(1000);
+    let plans = configuration_plans(&mut store, |store| {
+        let records = store.bundle_sources_of_type(RECORD_TYPE, false).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records.iter().all(|(_, path)| *path == bundle_path(3)));
+        let poisoned = store.bundle_sources_of_type(RUNTIME_TYPE, true).unwrap();
+        assert_eq!(
+            poisoned.into_iter().map(|(_, path)| path).collect::<Vec<_>>(),
+            [bundle_path(199), bundle_path(699)]
+        );
+        store.unpublished_claim_sources().unwrap();
+    });
+    let plans = plans.iter().map(|(_, plan)| plan.clone()).collect::<Vec<_>>();
+    let source_type = [
+        "SEARCH a USING INDEX assets_by_type (type_uuid=?)",
+        "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)",
+        "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)",
+    ];
+    assert_eq!(
+        plans,
+        [
+            source_type.to_vec(),
+            source_type.to_vec(),
+            vec![
+                "COMPOUND QUERY",
+                "LEFT-MOST SUBQUERY",
+                "SEARCH t USING INDEX source_claims_by_subject (kind=?)",
+                "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)",
+                "UNION USING TEMP B-TREE",
+                // The collisions: the defects, never the namespace's claims.
+                "SCAN c",
+                "SEARCH t USING INDEX source_claims_by_subject (kind=? AND subject=?)",
+                "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)",
+            ],
+        ],
+        "{plans:#?}"
+    );
 }

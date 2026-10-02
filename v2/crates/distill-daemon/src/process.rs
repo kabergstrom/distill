@@ -37,7 +37,7 @@ use crate::watcher::{
 };
 use distill_store::config::RestartOnlyChange;
 use distill_store::cas::SegmentSweeper;
-use distill_store::{Store, StoreWriter};
+use distill_store::{Store, StoreReader, StoreWriter};
 use distill_store::state::{ConfigurationSourceFailureCode, ConfigurationSourcePath, DscpV1};
 
 /// A failed pass, or a failed codegen run, is retried this much later.
@@ -738,7 +738,9 @@ struct ConfigWatch {
     observed_pipeline: Option<ArtifactSourceState>,
     cached_schema: Option<SchemaObservation>,
     cached_pipeline: Option<ArtifactSourceState>,
-    rejected: bool,
+    /// Whether the configuration source error the store holds (see
+    /// [`rejected`]) came from observing the source itself rather than
+    /// from staging a parsed candidate: `staged` then is not the source's.
     source_rejected: bool,
     /// Runs the active configuration's `[[rebuild]]` jobs.
     rebuilder: Option<crate::rebuild::Rebuilder>,
@@ -755,7 +757,6 @@ impl ConfigWatch {
             observed_pipeline: None,
             cached_schema: None,
             cached_pipeline: None,
-            rejected: false,
             source_rejected: false,
             rebuilder: None,
         }
@@ -815,7 +816,7 @@ impl ConfigWatch {
             .replace_paths(self.control_paths())
             .map_err(CoordinatorError::InvalidManifest)?;
         if !invalidation.configuration {
-            if self.rejected && self.source_rejected {
+            if self.source_rejected && rejected(store)? {
                 self.refresh_cached_artifacts(invalidation);
                 return Ok(false);
             }
@@ -845,7 +846,6 @@ impl ConfigWatch {
                     "configuration rejected; the active one (and its rebuild jobs) stays"
                 );
                 coordinator.publish_configuration_rejection(store, reason, message)?;
-                self.rejected = true;
                 self.source_rejected = true;
                 self.observed = Some(observation.state);
                 Ok(false)
@@ -883,6 +883,7 @@ impl ConfigWatch {
         candidate: DaemonConfig,
         invalidation: ControlInvalidation,
     ) -> Result<bool, CoordinatorError> {
+        let rejected = rejected(store)?;
         if invalidation.configuration {
             self.adopt_watch_and_rebuild(&candidate);
             watcher
@@ -910,14 +911,14 @@ impl ConfigWatch {
         let config_changed = self.observed.as_ref() != Some(&config_state);
         let schema_changed = self.observed_schema.as_ref() != Some(&schema.state);
         let pipeline_changed = self.observed_pipeline.as_ref() != Some(&pipeline_state);
-        if !config_changed && !schema_changed && !pipeline_changed && !self.rejected {
+        if !config_changed && !schema_changed && !pipeline_changed && !rejected {
             return Ok(false);
         }
         tracing::debug!(
             config_changed,
             schema_changed,
             pipeline_changed,
-            rejected = self.rejected,
+            rejected = rejected,
             ?invalidation,
             ?pipeline_state,
             "configuration inputs observed"
@@ -927,7 +928,7 @@ impl ConfigWatch {
         // source-walk catching up after an ahead-of-walk adoption, in either
         // order with the dylib event) are observed without republishing: no
         // second epoch, no loader reconnects, no reimport.
-        if !config_changed && !self.rejected {
+        if !config_changed && !rejected {
             if let (Ok(authority), ArtifactSourceState::Bytes(dylib_hash)) =
                 (&schema.outcome, &pipeline_state)
             {
@@ -946,7 +947,7 @@ impl ConfigWatch {
         // serving, that is not a failure: the observed state stays, so the
         // module's reappearance (or any other write) retries the candidate.
         if !config_changed
-            && !self.rejected
+            && !rejected
             && pipeline_state == ArtifactSourceState::Missing
             && coordinator.has_ready_pipeline()
         {
@@ -960,7 +961,7 @@ impl ConfigWatch {
             || input_configuration_changed(&self.active, &candidate)
             || schema_changed
             || pipeline_changed
-            || self.rejected;
+            || rejected;
 
         match &schema.outcome {
             Err(message) if input_changed => {
@@ -971,19 +972,18 @@ impl ConfigWatch {
                     message.clone(),
                 )
                 .expect("schema candidate failure tuple is valid");
-                if self.rejected {
+                if rejected {
                     coordinator.publish_pipeline_rejection_healing_configuration(store, failure)?;
                 } else {
                     coordinator.publish_pipeline_rejection(store, failure)?;
                 }
-                if self.rejected {
+                if rejected {
                     self.staged = candidate;
                     self.observed = Some(config_state);
                     self.observed_schema = Some(schema.state.clone());
                     self.observed_pipeline = Some(pipeline_state.clone());
                     self.cached_schema = Some(schema);
                     self.cached_pipeline = Some(pipeline_state);
-                    self.rejected = false;
                     self.source_rejected = false;
                     return Ok(true);
                 }
@@ -1014,7 +1014,6 @@ impl ConfigWatch {
                         self.observed_pipeline = Some(pipeline_state.clone());
                         self.cached_schema = Some(schema);
                         self.cached_pipeline = Some(pipeline_state);
-                        self.rejected = true;
                         self.source_rejected = false;
                         return Ok(false);
                     }
@@ -1046,7 +1045,7 @@ impl ConfigWatch {
                     }
                 }
             }
-            Ok(_) if self.rejected => {
+            Ok(_) if rejected => {
                 coordinator.heal_configuration_rejection(store)?;
             }
             Ok(_) => {}
@@ -1073,7 +1072,6 @@ impl ConfigWatch {
         self.observed_pipeline = Some(pipeline_state.clone());
         self.cached_schema = Some(schema);
         self.cached_pipeline = Some(pipeline_state);
-        self.rejected = false;
         self.source_rejected = false;
         // Any accepted input candidate can replace the effective importer
         // registry or its capabilities, including a candidate whose module
@@ -1081,6 +1079,15 @@ impl ConfigWatch {
         // operational-only edit as an asset-filesystem change.
         Ok(input_changed)
     }
+}
+
+/// Whether the store holds a configuration source error: the last observed
+/// configuration, or its staging, was rejected.
+fn rejected(store: &StoreReader) -> Result<bool, CoordinatorError> {
+    store
+        .configuration_source_error()
+        .map(|error| error.is_some())
+        .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
 }
 
 fn control_invalidation_for(

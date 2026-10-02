@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 37;
+pub const SCHEMA_VERSION: u32 = 38;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -71,6 +71,8 @@ CREATE TABLE bundle_files (
     PRIMARY KEY (root_id, path)
 );
 -- Every traversed directory (the root itself at path ''), for alias checks.
+-- Two directories never share a canonical path: the scanner rejects an
+-- alias before publishing, and the unique index enforces it at write.
 CREATE TABLE directories (
     root_id        INTEGER NOT NULL,
     path           TEXT NOT NULL,
@@ -78,7 +80,7 @@ CREATE TABLE directories (
     physical_path  BLOB NOT NULL,
     PRIMARY KEY (root_id, path)
 );
-CREATE INDEX directories_by_canonical ON directories(canonical_path);
+CREATE UNIQUE INDEX directories_by_canonical ON directories(canonical_path);
 -- Non-fatal scan exclusions, keyed by rooted path; `detail` is the
 -- daemon's encoding.
 CREATE TABLE scan_diagnostics (
@@ -258,6 +260,18 @@ CREATE TABLE asset_tag_index (
 -- candidates; this lists exactly the poisoned rows.
 CREATE INDEX asset_tag_index_poisoned ON asset_tag_index(asset_uuid)
     WHERE poison IS NOT NULL;
+-- A refinement redoes the migrated rows (those a pipeline module's
+-- migration produced) of another module.
+CREATE INDEX asset_tag_index_migrated ON asset_tag_index(dylib_hash)
+    WHERE dylib_hash IS NOT NULL;
+-- Per authored type, the tag epoch its tag rows were refined under: a
+-- digest of what the schema authority says about the type (see the
+-- daemon's `type_tag_epochs`). A type whose epoch changes has every row
+-- of its assets marked pending in the input that changes it.
+CREATE TABLE tag_epochs (
+    type_uuid BLOB NOT NULL PRIMARY KEY,
+    epoch     BLOB NOT NULL
+) WITHOUT ROWID;
 CREATE TABLE path_index (
     path       TEXT NOT NULL,
     root_id    INTEGER NOT NULL,
@@ -1049,6 +1063,27 @@ impl StoreReader {
         Ok(details)
     }
 
+    /// Test hook: every row of `table`, each column debug-formatted, in
+    /// sorted order: two stores compare equal table by table.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn table_rows(&self, table: &str) -> Result<Vec<String>, StoreError> {
+        let mut statement = self.conn.prepare(&format!("SELECT * FROM {table}"))?;
+        let columns = statement.column_count();
+        let mut rows = statement.raw_query();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let values = (0..columns)
+                .map(|index| {
+                    row.get::<_, rusqlite::types::Value>(index)
+                        .map(|value| format!("{value:?}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            out.push(values.join(" | "));
+        }
+        out.sort();
+        Ok(out)
+    }
+
     pub fn instance_id(&self) -> StoreInstanceId {
         self.instance_id
     }
@@ -1124,11 +1159,6 @@ impl StoreReader {
         Ok(meta_get_u64(&self.conn, "compiled_version")?.map(InputVersion))
     }
 
-    /// Whether the complete import index has been built: written in the
-    /// transaction that writes the index rows, so it rolls back with them.
-    pub fn import_index_built(&self) -> Result<bool, StoreError> {
-        Ok(meta_get_u64(&self.conn, "import_index_built")?.is_some_and(|built| built != 0))
-    }
 }
 
 

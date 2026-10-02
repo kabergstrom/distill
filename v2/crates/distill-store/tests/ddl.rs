@@ -78,6 +78,7 @@ fn every_section_13_table_exists() {
         "assets",
         "asset_tags",
         "asset_tag_index",
+        "tag_epochs",
         "path_index",
         "deps",
         "schemas",
