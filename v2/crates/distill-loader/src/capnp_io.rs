@@ -51,13 +51,19 @@
 //!
 //! Requests queue in `RpcIo` and start (as tasks) only while the in-flight
 //! count is under `max_in_flight_requests`, and fetches also under
-//! `max_in_flight_fetches`. A fetch's payload bytes are reserved against
-//! `fetch_memory_budget` until the loader takes the payload from `poll`;
-//! a payload that does not fit spools to disk instead of waiting.
+//! `max_in_flight_fetches`. A started fetch learns its payload size from
+//! the daemon's answer and reserves it against `fetch_memory_budget`
+//! ([`crate::admission`]) before it reads the payload stream; a reservation
+//! that does not fit waits in FIFO order, holding its fetch slot but
+//! reading nothing (the chunk stream is pulled, so the daemon sends nothing
+//! meanwhile). A reservation ends when the loader takes the payload from
+//! `poll`, which admits the next waiters; the engine itself never waits on
+//! admission. Payloads are held only in memory.
 //! `end_sweep` cancels by dropping: queued requests are removed, running
 //! tasks are aborted (the `LocalSet` drops them at its next turn, releasing
-//! their admission slot, snapshot reference, partial payload, and spool
-//! file), and undelivered answers are discarded. `bind_target` does the
+//! their admission slot, their place in the admission queue or their
+//! reservation, their snapshot reference, and their partial payload), and
+//! undelivered answers are discarded. `bind_target` does the
 //! same for everything of the old connection, which fences the old
 //! connection: no event from it can follow a rebind. Dropping `RpcIo` drops
 //! every task without running it.
@@ -65,10 +71,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::io::Write;
 use std::net::SocketAddr;
-use std::ops::Range;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -88,16 +91,15 @@ use distill_rpc::{
 use distill_store::state::{InputVersion, SnapshotStamp};
 use tokio::task::{AbortHandle, LocalSet};
 
-use crate::admission::FetchAdmission;
+use crate::admission::{FetchAdmission, Reservation};
 use crate::io::{
     AssetDeltaState, AssetPath, DriftedInput, IoEvent, LoaderIO, PathResolveResult,
     ReconnectReason, ReqId, ResolveResult, RuntimeTarget,
 };
-use crate::rpc_decode::{fetched_artifact, fetched_artifact_backed, io_basis};
+use crate::rpc_decode::{fetched_artifact, io_basis};
 use crate::IoBasis;
 
 const DEFAULT_FETCH_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
-const DEFAULT_SPOOL_THRESHOLD: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 256;
 const DEFAULT_MAX_IN_FLIGHT_FETCHES: usize = 32;
 const DEFAULT_STEP_BUDGET: Duration = Duration::from_millis(2);
@@ -118,11 +120,10 @@ const DEFAULT_TARGET_REJECTION_AFTER: u32 = 3;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcIoConfig {
     /// Fetched payload bytes RpcIO holds in memory, in flight or awaiting
-    /// `poll`. A payload that does not fit spools to disk.
+    /// `poll`. A fetch whose payload does not fit waits, without reading
+    /// it, until earlier payloads are taken; a payload larger than the
+    /// whole budget is admitted once nothing else is held.
     pub fetch_memory_budget: usize,
-    /// A payload larger than this always spools.
-    pub spool_threshold: usize,
-    pub spool_directory: Option<PathBuf>,
     /// Consecutive failed rebind attempts after which `TargetRejected` is
     /// reported (once per rebind). Retries continue either way.
     pub target_rejection_after: u32,
@@ -143,8 +144,6 @@ impl Default for RpcIoConfig {
     fn default() -> Self {
         Self {
             fetch_memory_budget: DEFAULT_FETCH_MEMORY_BUDGET,
-            spool_threshold: DEFAULT_SPOOL_THRESHOLD,
-            spool_directory: None,
             target_rejection_after: DEFAULT_TARGET_REJECTION_AFTER,
             max_in_flight_requests: DEFAULT_MAX_IN_FLIGHT_REQUESTS,
             max_in_flight_fetches: DEFAULT_MAX_IN_FLIGHT_FETCHES,
@@ -186,7 +185,10 @@ pub struct RpcIoStats {
     pub queued_requests: usize,
     /// Request tasks alive, fetches included.
     pub in_flight_requests: usize,
+    /// Fetches running, those waiting for admission included.
     pub in_flight_fetches: usize,
+    /// Fetches waiting for their payload to fit the memory budget.
+    pub waiting_fetches: usize,
     /// Events waiting for the next `poll`.
     pub undelivered_events: usize,
     /// Fetched payload bytes reserved in memory.
@@ -282,6 +284,7 @@ impl RpcIo {
             in_flight_requests: shared.in_flight.borrow().len(),
             in_flight_fetches: shared.in_flight_fetches.get(),
             undelivered_events: shared.completions.borrow().len(),
+            waiting_fetches: shared.admission.waiting(),
             resident_fetch_bytes: shared.admission.resident(),
             held_snapshots: shared.snapshots.borrow().held.len(),
             control_tasks: shared
@@ -519,7 +522,8 @@ impl LoaderIO for RpcIo {
     fn poll(&mut self) -> Vec<IoEvent> {
         self.step();
         let completions = std::mem::take(&mut *self.shared.completions.borrow_mut());
-        // Each payload's memory reservation ends here: the loader owns it.
+        // Each payload's memory reservation ends here (the loader owns it);
+        // the fetches it admits run at the next step.
         completions
             .into_iter()
             .map(|completion| completion.event)
@@ -549,8 +553,7 @@ impl Wake for TurnWaker {
 struct Shared {
     address: SocketAddr,
     target_name: String,
-    admission: Rc<FetchAdmission>,
-    spool_directory: Option<PathBuf>,
+    admission: FetchAdmission,
     target_rejection_after: u32,
     snapshot_refresh_after: Duration,
     completions: RefCell<VecDeque<Completion>>,
@@ -710,35 +713,6 @@ struct Completion {
     _reservation: Option<Reservation>,
 }
 
-/// Fetched payload bytes held in memory against the budget.
-struct Reservation {
-    admission: Rc<FetchAdmission>,
-    bytes: usize,
-}
-
-impl Reservation {
-    fn admit(admission: &Rc<FetchAdmission>, bytes: usize) -> Option<Self> {
-        (admission.admit(bytes) == crate::admission::Admission::Memory).then(|| Self {
-            admission: Rc::clone(admission),
-            bytes,
-        })
-    }
-
-    fn grow(&mut self, bytes: usize) -> bool {
-        let grown = self.admission.grow(self.bytes, bytes);
-        if grown {
-            self.bytes += bytes;
-        }
-        grown
-    }
-}
-
-impl Drop for Reservation {
-    fn drop(&mut self) {
-        self.admission.release(self.bytes);
-    }
-}
-
 /// Removes its request from the in-flight table when the task ends,
 /// whether it completed or was dropped.
 struct InFlightGuard {
@@ -784,11 +758,7 @@ impl Shared {
         Self {
             address,
             target_name,
-            admission: Rc::new(FetchAdmission::new(
-                config.fetch_memory_budget,
-                config.spool_threshold,
-            )),
-            spool_directory: config.spool_directory.clone(),
+            admission: FetchAdmission::new(config.fetch_memory_budget),
             target_rejection_after: config.target_rejection_after.max(1),
             snapshot_refresh_after: config.snapshot_refresh_after,
             completions: RefCell::new(VecDeque::new()),
@@ -1284,8 +1254,10 @@ async fn path_event(
     }
 }
 
-/// Fetch one artifact and its DSWL tree; the reservation covers the
-/// payload while it is in memory and travels with the event.
+/// Fetch one artifact and its DSWL tree. The payload's size is reserved
+/// before its stream is read, waiting unread while it does not fit; the
+/// reservation grows by the DSWL tree once that arrives and travels with
+/// the event until the loader takes it.
 async fn fetch_event(
     shared: &Shared,
     hub: &RemoteHub,
@@ -1305,35 +1277,27 @@ async fn fetch_event(
     let Ok(total_bytes) = usize::try_from(terminal.value.total_bytes()) else {
         return fail("fetched artifact is too large for this client".into());
     };
-    let mut reservation = Reservation::admit(&shared.admission, total_bytes);
-    let directory = shared.spool_directory.as_deref();
-    let payload = if reservation.is_some() {
-        match collect_remote_chunks(&mut terminal.value, total_bytes).await {
-            Ok((structural, blobs)) => FetchPayload::Memory { structural, blobs },
-            Err(error) => return fail(error),
-        }
-    } else {
-        match spool_remote_chunks(&mut terminal.value, total_bytes, directory).await {
-            Ok(payload) => payload,
-            Err(error) => return fail(error),
-        }
-    };
-    let layout_hash = match payload.layout_hash() {
-        Ok(layout_hash) => layout_hash,
+    let mut reservation = shared.admission.admit(total_bytes).await;
+    let (structural, blobs) = match collect_remote_chunks(&mut terminal.value, total_bytes).await {
+        Ok(payload) => payload,
         Err(error) => return fail(error),
+    };
+    // The layout hash the artifact header declares. The loader
+    // authenticates the artifact itself (content hash, structure) when it
+    // parses it; hashing every byte here as well would double that cost on
+    // the engine thread.
+    let layout_hash = match distill_wire::artifact::artifact_header_layout_hash(&structural) {
+        Ok(layout_hash) => layout_hash,
+        Err(error) => return fail(format!("invalid fetched artifact: {error}")),
     };
     let wire_layout = match hub.wire_tree(layout_hash).await {
         Ok(RemoteCall::Success(bytes)) => bytes,
         Ok(call) => return (remote_request_event(call, req, request_basis.clone()), None),
         Err(error) => return fail(error.to_string()),
     };
-    let in_memory = reservation
-        .as_mut()
-        .is_some_and(|reservation| reservation.grow(wire_layout.len()));
-    if !in_memory {
-        reservation = None;
-    }
-    match payload.finish(layout_hash, load_edges, wire_layout, !in_memory, directory) {
+    reservation.grow(wire_layout.len());
+    let wire_layout = memory_wire_blob(wire_layout);
+    match fetched_artifact(layout_hash, structural, blobs, load_edges, wire_layout) {
         Ok(artifact) => (
             IoEvent::Fetched {
                 req,
@@ -1341,7 +1305,7 @@ async fn fetch_event(
                 artifact,
                 basis,
             },
-            reservation,
+            Some(reservation),
         ),
         Err(error) => fail(error),
     }
@@ -1390,242 +1354,10 @@ async fn collect_remote_chunks(
     }
 }
 
-enum FetchPayload {
-    Memory {
-        structural: Vec<u8>,
-        blobs: Vec<Vec<u8>>,
-    },
-    Spool {
-        file: tempfile::NamedTempFile,
-        structural: Range<usize>,
-        blobs: Vec<Range<usize>>,
-    },
-}
-
-type ArcMappedSpool = std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>;
-
-impl FetchPayload {
-    /// The layout hash the artifact header declares. The loader
-    /// authenticates the artifact itself (content hash, structure) when it
-    /// parses it; hashing every byte here as well would double that cost on
-    /// the engine thread.
-    fn layout_hash(&self) -> Result<distill_core::id::LayoutHash, String> {
-        let header = |structural: &[u8]| {
-            distill_wire::artifact::artifact_header_layout_hash(structural)
-                .map_err(|error| format!("invalid fetched artifact: {error}"))
-        };
-        match self {
-            Self::Memory { structural, .. } => header(structural),
-            Self::Spool {
-                file, structural, ..
-            } => {
-                // Safety: the temporary is flushed before this point and no
-                // writer runs while this short-lived validation map exists.
-                let mapping = unsafe { memmap2::MmapOptions::new().map(file.as_file()) }
-                    .map_err(|error| format!("cannot map fetch spool: {error}"))?;
-                let bytes = mapping
-                    .get(structural.clone())
-                    .ok_or_else(|| "spooled structural range is out of bounds".to_owned())?;
-                header(bytes)
-            }
-        }
-    }
-
-    fn finish(
-        self,
-        layout_hash: distill_core::id::LayoutHash,
-        load_edges: Vec<distill_rpc::ServedLoadEdge>,
-        wire_layout: std::sync::Arc<[u8]>,
-        spool: bool,
-        spool_directory: Option<&std::path::Path>,
-    ) -> Result<crate::FetchedArtifact, String> {
-        match self {
-            Self::Memory { structural, blobs } if !spool => fetched_artifact(
-                layout_hash,
-                structural,
-                blobs,
-                load_edges,
-                memory_wire_blob(wire_layout),
-            ),
-            Self::Memory { structural, blobs } => spool_complete_payload(
-                layout_hash,
-                structural,
-                blobs,
-                load_edges,
-                &wire_layout,
-                spool_directory,
-            ),
-            Self::Spool {
-                mut file,
-                structural,
-                blobs,
-            } => {
-                let wire_start = structural.len() + blobs.iter().map(Range::len).sum::<usize>();
-                file.write_all(&wire_layout)
-                    .map_err(|error| format!("cannot write DSWL fetch spool: {error}"))?;
-                file.flush()
-                    .map_err(|error| format!("cannot flush fetch spool: {error}"))?;
-                let backing = map_spool(file)?;
-                let wire = distill_wire::exec::Blob::new(
-                    std::sync::Arc::clone(&backing),
-                    wire_start,
-                    wire_layout.len(),
-                );
-                fetched_artifact_backed(layout_hash, backing, structural, blobs, load_edges, wire)
-            }
-        }
-    }
-}
-
 fn memory_wire_blob(bytes: std::sync::Arc<[u8]>) -> distill_wire::exec::Blob {
     let len = bytes.len();
-    let backing: ArcMappedSpool = std::sync::Arc::new(bytes);
+    let backing: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync> = std::sync::Arc::new(bytes);
     distill_wire::exec::Blob::new(backing, 0, len)
-}
-
-fn spool_complete_payload(
-    layout_hash: distill_core::id::LayoutHash,
-    structural: Vec<u8>,
-    blobs: Vec<Vec<u8>>,
-    load_edges: Vec<distill_rpc::ServedLoadEdge>,
-    wire_layout: &[u8],
-    directory: Option<&std::path::Path>,
-) -> Result<crate::FetchedArtifact, String> {
-    let mut file = create_spool(directory)?;
-    file.write_all(&structural)
-        .map_err(|error| format!("cannot write fetch spool: {error}"))?;
-    let structural_range = 0..structural.len();
-    let mut cursor = structural.len();
-    let mut blob_ranges = Vec::with_capacity(blobs.len());
-    for blob in blobs {
-        let end = cursor
-            .checked_add(blob.len())
-            .ok_or_else(|| "fetch spool length overflow".to_owned())?;
-        file.write_all(&blob)
-            .map_err(|error| format!("cannot write fetch spool: {error}"))?;
-        blob_ranges.push(cursor..end);
-        cursor = end;
-    }
-    let wire_start = cursor;
-    file.write_all(wire_layout)
-        .map_err(|error| format!("cannot write DSWL fetch spool: {error}"))?;
-    file.flush()
-        .map_err(|error| format!("cannot flush fetch spool: {error}"))?;
-    let backing = map_spool(file)?;
-    let wire = distill_wire::exec::Blob::new(
-        std::sync::Arc::clone(&backing),
-        wire_start,
-        wire_layout.len(),
-    );
-    fetched_artifact_backed(
-        layout_hash,
-        backing,
-        structural_range,
-        blob_ranges,
-        load_edges,
-        wire,
-    )
-}
-
-struct MappedSpool {
-    mapping: memmap2::Mmap,
-    _file: tempfile::NamedTempFile,
-}
-
-impl AsRef<[u8]> for MappedSpool {
-    fn as_ref(&self) -> &[u8] {
-        &self.mapping
-    }
-}
-
-async fn spool_remote_chunks(
-    stream: &mut distill_rpc::capnp_loader::RemoteChunkStream,
-    total_bytes: usize,
-    directory: Option<&std::path::Path>,
-) -> Result<FetchPayload, String> {
-    if total_bytes == 0 {
-        return Err("artifact stream cannot be empty".into());
-    }
-    let mut file = create_spool(directory)?;
-    let mut structural = 0usize..0usize;
-    let mut blobs = Vec::<Range<usize>>::new();
-    let mut total = 0usize;
-    let mut current_blob = None;
-    loop {
-        let chunk = match stream.next_chunk().await {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) => break,
-            Err(error) => return Err(error.to_string()),
-        };
-        let bytes = chunk.bytes.as_ref();
-        match chunk.kind {
-            distill_rpc::ArtifactChunkKind::Structural => {
-                if current_blob.is_some() || chunk.offset != structural.len() as u64 {
-                    return Err("artifact chunks are not contiguous".into());
-                }
-                structural.end = structural
-                    .end
-                    .checked_add(bytes.len())
-                    .ok_or_else(|| "artifact stream length overflow".to_owned())?;
-            }
-            distill_rpc::ArtifactChunkKind::Blob { index } => {
-                let index = usize::try_from(index)
-                    .map_err(|_| "artifact blob index does not fit this client")?;
-                if current_blob.is_none() || current_blob != Some(index) {
-                    if index != blobs.len() {
-                        return Err("artifact blob chunk indices are not contiguous".into());
-                    }
-                    current_blob = Some(index);
-                    blobs.push(total..total);
-                }
-                let range = &mut blobs[index];
-                if chunk.offset != range.len() as u64 {
-                    return Err("artifact chunks are not contiguous".into());
-                }
-                range.end = range
-                    .end
-                    .checked_add(bytes.len())
-                    .ok_or_else(|| "artifact stream length overflow".to_owned())?;
-            }
-        }
-        total = total
-            .checked_add(bytes.len())
-            .ok_or_else(|| "artifact stream length overflow".to_owned())?;
-        if total > total_bytes {
-            return Err("artifact stream exceeds its authenticated total".into());
-        }
-        file.write_all(bytes)
-            .map_err(|error| format!("cannot write fetch spool: {error}"))?;
-    }
-    if total != total_bytes {
-        return Err("artifact stream length differs from its authenticated total".into());
-    }
-    file.flush()
-        .map_err(|error| format!("cannot flush fetch spool: {error}"))?;
-    Ok(FetchPayload::Spool {
-        file,
-        structural,
-        blobs,
-    })
-}
-
-fn create_spool(directory: Option<&std::path::Path>) -> Result<tempfile::NamedTempFile, String> {
-    match directory {
-        Some(directory) => tempfile::NamedTempFile::new_in(directory),
-        None => tempfile::NamedTempFile::new(),
-    }
-    .map_err(|error| format!("cannot create fetch spool: {error}"))
-}
-
-fn map_spool(file: tempfile::NamedTempFile) -> Result<ArcMappedSpool, String> {
-    // Safety: the file is retained by MappedSpool and is never mutated after
-    // this point. Every exposed range is checked before Blob construction.
-    let mapping = unsafe { memmap2::MmapOptions::new().map(file.as_file()) }
-        .map_err(|error| format!("cannot map fetch spool: {error}"))?;
-    Ok(std::sync::Arc::new(MappedSpool {
-        mapping,
-        _file: file,
-    }))
 }
 
 fn connection_lost() -> IoEvent {

@@ -6086,14 +6086,19 @@ are part of the contract:
 
 - **The engine never waits on IO.** No `LoaderIO` call blocks on the
   daemon; a frame pays at most the step budget plus one bounded turn.
-- **IO never waits on the engine.** Nothing the IO does is gated on the
-  loader draining it: answers queue, and memory pressure spools rather
-  than waits.
+- **IO never blocks on the engine.** Answers queue for `poll`; the one
+  thing gated on the loader draining them is reading a fetched payload
+  that does not fit the memory budget, which waits until `poll` hands
+  earlier payloads over. The engine waits on nothing the IO holds, so
+  there is no cycle.
 - **Limits are applied at admission.** Requests queue in RpcIO and start
   only while fewer than a configured number are in flight (fetches under
-  a lower cap within it); a fetched payload reserves its bytes against
-  the memory budget when its size is known. Work beyond a limit is not
-  started, rather than started and parked.
+  a lower cap within it); requests beyond a limit are not started. A
+  started fetch reserves its payload's bytes against the memory budget as
+  soon as the daemon reports its size, before reading any of it; one that
+  does not fit waits, in FIFO order, with its stream unread (the chunk
+  stream is pulled, so the daemon sends nothing meanwhile). Payloads are
+  held only in memory, never spilled to disk.
 
 A sweep holds its basis, a snapshot capability, from `begin_sweep` until
 `end_sweep`; `begin_sweep` returns the newest snapshot RpcIO already holds
@@ -6102,10 +6107,10 @@ the loader start a new round (a delta, a `Drifted` resolve, an expired
 snapshot) is published only once a snapshot that answers it is held, and
 an idle snapshot is renewed well inside the daemon's TTL. `end_sweep`
 cancels by dropping: the sweep's queued and running requests are dropped
-with their partial payloads, spool files, and admission, no answer to them
-is delivered, and the snapshot is released unless it is still current. A
-rebind does the same for everything of the old connection, which fences
-it: nothing from the old connection follows a rebind. **Completions
+with their partial payloads, admission waits, and reservations, no answer
+to them is delivered, and the snapshot is released unless it is still
+current. A rebind does the same for everything of the old connection,
+which fences it: nothing from the old connection follows a rebind. **Completions
 correlate by request generation, never by name**: every command carries
 a loader-minted, never-reused `ReqId` (declared below) that its
 completion echoes; the loader keeps (handle, purpose, snapshot basis,
@@ -6136,10 +6141,14 @@ fixup plans registered by the asset-types crate. Fetched payload memory
 is bounded by config: payload bytes held in memory (in flight or awaiting
 `poll`) reserve against one aggregate budget until the loader takes them.
 Admission for oversized payloads is pinned (§13's oversize records): a
-payload beyond the pinned spool threshold, or one that does not fit what
-is left of the budget, streams to a temporary spool file and the loader
-gets a mapped buffer — never an unbounded in-memory copy, and never a
-wait for memory the engine would have to free.
+payload larger than the whole budget is admitted alone, once nothing else
+is held, and is read into memory like any other; admission is FIFO, so
+later small payloads never overtake (and starve) a waiting large one. The
+DSWL tree that completes a payload grows its reservation without waiting,
+even past the budget, which then holds later admissions back until it is
+released. Nothing spills to disk. Memory is freed only by the loader
+taking payloads in `poll`, or by a fetch being dropped; the engine never
+waits for admission, so a waiting fetch cannot stall a frame.
 
 ```rust
 /// Loader-minted request generation: unique per command, never reused.
@@ -6160,8 +6169,8 @@ pub trait LoaderIO {                     // RpcIO (dev) | PackfileIO (ship), no 
     fn begin_sweep(&mut self) -> IoBasis;
     /// The sweep is complete or abandoned: requests issued under `basis`
     /// are cancelled (no answer is delivered for them) and what the IO
-    /// held for them — snapshot, payloads, spool files, admission — is
-    /// released. The loader retires their outstanding entries itself.
+    /// held for them — snapshot, payloads, admission waits and reservations —
+    /// is released. The loader retires their outstanding entries itself.
     fn end_sweep(&mut self, basis: &IoBasis);
     fn resolve(&mut self, req: ReqId, uuid: AssetUuid, basis: &IoBasis);
                                          // RpcIO: snapshot-pinned, retry-refreshed;
@@ -8677,9 +8686,12 @@ put production image codecs, mesh optimization, or shader compilers in core.
   manifest), and RpcIO's admission rule is pinned: an oversized fetch
   is admitted alone against the bounded budget, and beyond a pinned
   threshold responses stream/spool to disk rather than buffer in
-  memory. (Refined with the single-threaded RpcIO, §15 Plumbing: a
-  payload that does not fit the remaining budget spools instead of
-  waiting for it, so admission never waits on the engine.)
+  memory. (Refined with the single-threaded RpcIO, §15 Plumbing: nothing
+  spools. A fetch reserves its payload before reading it and waits,
+  unread, in FIFO order while it does not fit; an oversized payload is
+  admitted alone once nothing else is held. Only the loader taking
+  payloads in `poll` frees memory, and the engine never waits on
+  admission.)
 - **Manifest fields cross-check headers, both ways** (§13, §16): the
   manifest duplicates authored/terminal types, logical hash, and load
   deps from artifact headers with no required comparison — a generator

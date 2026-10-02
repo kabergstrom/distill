@@ -138,7 +138,6 @@ fn rpc_io_drives_the_same_loader_boundary_on_the_callers_thread() {
         epoch: distill_loader::GameModuleEpoch(1),
         target_definition_hash: request.target_definition_hash.0,
     };
-    let spool = tempfile::tempdir().unwrap();
     let budget = artifact_bytes * 2;
     assert!(wire_bytes > budget);
     let mut io = RpcIo::connect_with_config(
@@ -146,8 +145,6 @@ fn rpc_io_drives_the_same_loader_boundary_on_the_callers_thread() {
         request,
         RpcIoConfig {
             fetch_memory_budget: budget,
-            spool_threshold: budget,
-            spool_directory: Some(spool.path().to_owned()),
             ..RpcIoConfig::default()
         },
     )
@@ -165,8 +162,8 @@ fn rpc_io_drives_the_same_loader_boundary_on_the_callers_thread() {
 
     io.fetch(ReqId(10), hash, &basis);
     io.fetch(ReqId(11), hash, &basis);
-    // The DSWL tree does not fit the budget: both payloads spool rather
-    // than wait for memory.
+    // The DSWL trees overflow the budget: growing an admitted payload never
+    // waits, and both payloads stay in memory until `poll` hands them over.
     let both = poll_until(&mut io, 2);
     assert_eq!(
         both.iter()
@@ -176,9 +173,7 @@ fn rpc_io_drives_the_same_loader_boundary_on_the_callers_thread() {
         "{both:?}"
     );
     assert_eq!(io.stats().resident_fetch_bytes, 0);
-    assert_eq!(std::fs::read_dir(spool.path()).unwrap().count(), 2);
     drop(both);
-    assert_eq!(std::fs::read_dir(spool.path()).unwrap().count(), 0);
 
     io.resolve(ReqId(1), asset, &basis);
     io.fetch(ReqId(2), hash, &basis);
@@ -204,7 +199,6 @@ fn rpc_io_drives_the_same_loader_boundary_on_the_callers_thread() {
             && artifact.blobs[0].as_bytes() == [0x5a; 64]
             && event_basis == &basis
     )));
-    assert_eq!(std::fs::read_dir(spool.path()).unwrap().count(), 1);
     assert!(events.iter().any(|event| matches!(
         event,
         IoEvent::PathResolved {
@@ -234,7 +228,6 @@ fn rpc_io_drives_the_same_loader_boundary_on_the_callers_thread() {
     )));
 
     drop(events);
-    assert_eq!(std::fs::read_dir(spool.path()).unwrap().count(), 0);
     drop(io);
     server_thread.join().unwrap();
 }

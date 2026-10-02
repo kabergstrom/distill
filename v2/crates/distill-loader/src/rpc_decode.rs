@@ -1,6 +1,5 @@
 //! Shared authentication helpers for the concrete RPC loader transport.
 
-use std::ops::Range;
 use std::sync::Arc;
 
 use distill_core::id::LayoutHash;
@@ -34,35 +33,6 @@ pub(crate) fn fetched_artifact(
         .collect();
     Ok(FetchedArtifact {
         structural: Arc::from(structural),
-        blobs,
-        load_edges,
-        wire_layout,
-    })
-}
-
-pub(crate) fn fetched_artifact_backed(
-    layout_hash: LayoutHash,
-    backing: Arc<dyn AsRef<[u8]> + Send + Sync>,
-    structural: Range<usize>,
-    blob_ranges: Vec<Range<usize>>,
-    load_edges: Vec<distill_rpc::ServedLoadEdge>,
-    wire_layout: Blob,
-) -> Result<FetchedArtifact, String> {
-    verify_wire_layout(layout_hash, wire_layout.as_bytes())?;
-    let structural_bytes = backing
-        .as_ref()
-        .as_ref()
-        .get(structural)
-        .ok_or_else(|| "spooled structural range is out of bounds".to_owned())?;
-    let blobs = blob_ranges
-        .into_iter()
-        .map(|range| {
-            let len = range.end.saturating_sub(range.start);
-            Blob::new(Arc::clone(&backing), range.start, len)
-        })
-        .collect();
-    Ok(FetchedArtifact {
-        structural: Arc::from(structural_bytes),
         blobs,
         load_edges,
         wire_layout,

@@ -18,8 +18,8 @@ use distill_asset::{AssetType, ErasedValue, ModuleEpochToken};
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash, TypeUuid};
 use distill_loader::{
     AdoptionId, AssetStorage, GameModuleEpoch, HandleId, IoBasis, IoEvent, LoadStatus, Loader,
-    LoaderIO, ManifestHash, PendingState, PendingToken, ReqId, RpcIo, RpcIoConfig, RuntimeTarget,
-    StorageError, UpdateResult,
+    LoaderIO, ManifestHash, PendingState, PendingToken, ReqId, RpcIo, RpcIoConfig, RpcIoStats,
+    RuntimeTarget, StorageError, UpdateResult,
 };
 use distill_rpc::capnp_transport::StagedListener;
 use distill_rpc::{
@@ -77,6 +77,12 @@ struct Daemon {
 }
 
 fn serve(count: u16, blob_len: usize) -> Daemon {
+    serve_sized(&vec![blob_len; usize::from(count)])
+}
+
+/// A daemon serving one built `A` asset per entry of `blob_lens`, with one
+/// blob of that many bytes when nonzero.
+fn serve_sized(blob_lens: &[usize]) -> Daemon {
     let target = TargetDefinition::new("dev", TargetDefinitionHash(TARGET_HASH));
     let server = Server::new(StoreInstanceId([6; 16]), vec![target]).unwrap();
     let wire = WireNode::Struct {
@@ -89,16 +95,16 @@ fn serve(count: u16, blob_len: usize) -> Daemon {
     server
         .install_wire_tree(layout_hash, Arc::from(dswl_bytes(&wire).unwrap()))
         .unwrap();
-    let blob = vec![0x5a; blob_len];
-    let blobs = if blob_len == 0 {
-        Vec::new()
-    } else {
-        vec![(Vec::new(), blob.as_slice())]
-    };
     let mut assets = Vec::new();
     let mut mutations = Vec::new();
-    for seed in 0..count {
-        let uuid = asset(seed);
+    for (seed, &blob_len) in blob_lens.iter().enumerate() {
+        let uuid = asset(u16::try_from(seed).unwrap());
+        let blob = vec![0x5a; blob_len];
+        let blobs = if blob_len == 0 {
+            Vec::new()
+        } else {
+            vec![(Vec::new(), blob.as_slice())]
+        };
         let bytes = write_artifact(
             &ArtifactHeader {
                 asset_uuid: uuid,
@@ -334,6 +340,31 @@ fn stale() -> IoBasis {
     }
 }
 
+fn with_budget(fetch_memory_budget: usize) -> RpcIoConfig {
+    RpcIoConfig {
+        fetch_memory_budget,
+        ..RpcIoConfig::default()
+    }
+}
+
+/// The position of `req`'s `Fetched` event in `events`.
+fn fetched_at(events: &[IoEvent], req: ReqId) -> Option<usize> {
+    events
+        .iter()
+        .position(|event| matches!(event, IoEvent::Fetched { req: fetched, .. } if *fetched == req))
+}
+
+/// Step without taking anything (the engine is busy elsewhere) until
+/// `done` holds over the IO's stats.
+fn step_until(io: &mut RpcIo, limit: Duration, mut done: impl FnMut(RpcIoStats) -> bool) {
+    let deadline = Instant::now() + limit;
+    while !done(io.stats()) {
+        assert!(Instant::now() < deadline, "not reached: {:?}", io.stats());
+        api::step(io);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 // H1, H7: a backlog of superseded fetches never blocks the next sweep, and
 // ending the old sweep frees the IO for the new one.
 #[test]
@@ -447,21 +478,14 @@ fn fetch_throughput_is_not_one_per_two_frames() {
 }
 
 // H7: ending a sweep cancels its queued and running requests: nothing more
-// is delivered for them and the payloads, spool files, and admission they
-// held are released.
+// is delivered for them and the payloads, admission waits, and reservations
+// they held are released.
 #[test]
 fn ending_a_sweep_cancels_its_requests_and_releases_what_they_held() {
     watchdog(Duration::from_secs(20), || {
         let daemon = serve(1, 64 * 1024);
-        let spool = tempfile::tempdir().unwrap();
-        let (mut io, basis) = bound(
-            daemon.address,
-            RpcIoConfig {
-                spool_threshold: 0,
-                spool_directory: Some(spool.path().to_owned()),
-                ..RpcIoConfig::default()
-            },
-        );
+        // Room for one payload: the other running fetches wait for admission.
+        let (mut io, basis) = bound(daemon.address, with_budget(100 * 1024));
         let (uuid, hash) = daemon.assets[0];
         for req in 0..300 {
             io.fetch(ReqId(req), hash, &basis);
@@ -485,11 +509,7 @@ fn ending_a_sweep_cancels_its_requests_and_releases_what_they_held() {
         }
         assert_eq!(api::in_flight(&io), 0);
         assert_eq!(api::resident(&io), 0);
-        assert_eq!(
-            std::fs::read_dir(spool.path()).unwrap().count(),
-            0,
-            "a cancelled fetch kept its spool file"
-        );
+        assert_eq!(io.stats().waiting_fetches, 0, "a cancelled fetch kept its admission wait");
         // The IO still serves the next sweep.
         let next = io.begin_sweep();
         io.fetch(ReqId(5_000), hash, &next);
@@ -589,6 +609,222 @@ fn drop_is_prompt_with_a_stalled_daemon_and_a_backlog() {
     );
 }
 
+// Fetch admission ---------------------------------------------------------
+//
+// A fetch reserves its payload's bytes before reading its stream, and waits
+// (reading nothing) while they do not fit; payloads live only in memory.
+
+/// Poll as frames would until `count` fetches are delivered, recording the
+/// most payload bytes held and whether any fetch waited for admission.
+fn fetch_frames(io: &mut RpcIo, count: usize, limit: Duration) -> (Vec<IoEvent>, usize, bool) {
+    let deadline = Instant::now() + limit;
+    let mut events = Vec::new();
+    let mut peak = 0;
+    let mut waited = false;
+    while self::count(&events, is_fetched) < count {
+        assert!(
+            Instant::now() < deadline,
+            "{}/{count} fetched: {:?}",
+            self::count(&events, is_fetched),
+            io.stats()
+        );
+        // Measure before `poll` takes (and releases) what was fetched.
+        api::step(io);
+        let stats = io.stats();
+        peak = peak.max(stats.resident_fetch_bytes);
+        waited |= stats.waiting_fetches > 0;
+        events.extend(io.poll());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    (events, peak, waited)
+}
+
+fn assert_blobs(events: &[IoEvent], len: usize) {
+    for event in events {
+        if let IoEvent::Fetched { artifact, .. } = event {
+            assert_eq!(artifact.blobs.len(), 1);
+            assert!(artifact.blobs[0].as_bytes() == vec![0x5a; len].as_slice());
+        }
+    }
+}
+
+/// Slack over the budget for the DSWL trees of admitted payloads, which
+/// grow a reservation without waiting.
+const DSWL_SLACK: usize = 4 * 1024;
+
+#[test]
+fn concurrent_small_fetches_under_a_tiny_budget_wait_their_turn_and_all_complete() {
+    watchdog(Duration::from_secs(30), || {
+        const BLOB: usize = 16 * 1024;
+        // Room for two payloads; 32 fetches run at once.
+        let budget = 40 * 1024;
+        let daemon = serve(8, BLOB);
+        let (mut io, basis) = bound(daemon.address, with_budget(budget));
+        for req in 0..200 {
+            io.fetch(ReqId(req), daemon.assets[req as usize % 8].1, &basis);
+        }
+        let (events, peak, waited) = fetch_frames(&mut io, 200, Duration::from_secs(20));
+        assert_eq!(events.len(), 200, "{events:?}");
+        assert!(waited, "no fetch ever waited for admission");
+        assert!(
+            peak <= budget + DSWL_SLACK,
+            "{peak} payload bytes held with a {budget} byte budget"
+        );
+        assert_blobs(&events, BLOB);
+        assert_eq!(api::resident(&io), 0);
+        assert_eq!(io.stats().waiting_fetches, 0);
+    });
+}
+
+#[test]
+fn a_payload_larger_than_the_whole_budget_is_fetched_alone() {
+    watchdog(Duration::from_secs(30), || {
+        const BLOB: usize = 256 * 1024;
+        let budget = 64 * 1024;
+        let daemon = serve(1, BLOB);
+        let (mut io, basis) = bound(daemon.address, with_budget(budget));
+        let hash = daemon.assets[0].1;
+        for req in 0..4 {
+            io.fetch(ReqId(req), hash, &basis);
+        }
+        let (events, peak, waited) = fetch_frames(&mut io, 4, Duration::from_secs(20));
+        assert_eq!(events.len(), 4, "{events:?}");
+        assert!(waited);
+        assert!(
+            peak >= BLOB && peak <= BLOB + DSWL_SLACK,
+            "{peak} payload bytes held: oversized payloads must be held one at a time"
+        );
+        assert_blobs(&events, BLOB);
+        assert_eq!(api::resident(&io), 0);
+    });
+}
+
+#[test]
+fn a_fetch_waiting_for_admission_resumes_once_poll_takes_the_held_payload() {
+    watchdog(Duration::from_secs(20), || {
+        let daemon = serve(2, 64 * 1024);
+        // Room for one payload.
+        let (mut io, basis) = bound(daemon.address, with_budget(100 * 1024));
+        io.fetch(ReqId(1), daemon.assets[0].1, &basis);
+        step_until(&mut io, Duration::from_secs(5), |stats| {
+            stats.undelivered_events == 1
+        });
+        io.fetch(ReqId(2), daemon.assets[1].1, &basis);
+        step_until(&mut io, Duration::from_secs(5), |stats| {
+            stats.waiting_fetches == 1
+        });
+        // However long the engine leaves the first payload untaken, the
+        // second fetch stays parked: nothing on the IO side frees memory.
+        for _ in 0..50 {
+            api::step(&mut io);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let stats = io.stats();
+        assert_eq!(stats.waiting_fetches, 1, "{stats:?}");
+        assert_eq!(stats.undelivered_events, 1, "{stats:?}");
+        assert_eq!(stats.in_flight_fetches, 1, "{stats:?}");
+        let first = io.poll();
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!(fetched_at(&first, ReqId(1)).is_some());
+        // Taking it released the budget: the waiter resumes.
+        assert_eq!(io.stats().waiting_fetches, 0);
+        frames_until(&mut io, Duration::from_secs(5), |events| {
+            fetched_at(events, ReqId(2)).is_some()
+        });
+        assert_eq!(api::resident(&io), 0);
+    });
+}
+
+#[test]
+fn ending_a_sweep_cancels_a_fetch_waiting_for_admission() {
+    watchdog(Duration::from_secs(20), || {
+        let daemon = serve(2, 64 * 1024);
+        let (mut io, basis) = bound(daemon.address, with_budget(100 * 1024));
+        io.fetch(ReqId(1), daemon.assets[0].1, &basis);
+        step_until(&mut io, Duration::from_secs(5), |stats| {
+            stats.undelivered_events == 1
+        });
+        io.fetch(ReqId(2), daemon.assets[1].1, &basis);
+        step_until(&mut io, Duration::from_secs(5), |stats| {
+            stats.waiting_fetches == 1
+        });
+        api::end_sweep(&mut io, &basis);
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < deadline {
+            let events = io.poll();
+            assert!(events.is_empty(), "delivered for an ended sweep: {events:?}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let stats = io.stats();
+        assert_eq!(stats.waiting_fetches, 0, "{stats:?}");
+        assert_eq!(stats.in_flight_fetches, 0, "{stats:?}");
+        assert_eq!(api::in_flight(&io), 0);
+        assert_eq!(api::resident(&io), 0);
+        let next = io.begin_sweep();
+        io.fetch(ReqId(3), daemon.assets[1].1, &next);
+        frames_until(&mut io, Duration::from_secs(5), |events| {
+            fetched_at(events, ReqId(3)).is_some()
+        });
+    });
+}
+
+#[test]
+fn dropping_the_io_with_fetches_waiting_for_admission_is_prompt() {
+    let elapsed = watchdog(Duration::from_secs(20), || {
+        let daemon = serve(1, 64 * 1024);
+        let (mut io, basis) = bound(daemon.address, with_budget(100 * 1024));
+        for req in 0..40 {
+            io.fetch(ReqId(req), daemon.assets[0].1, &basis);
+        }
+        step_until(&mut io, Duration::from_secs(5), |stats| {
+            stats.waiting_fetches >= 2
+        });
+        let started = Instant::now();
+        drop(io);
+        started.elapsed()
+    });
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "dropping RpcIO took {elapsed:?}"
+    );
+}
+
+#[test]
+fn a_large_waiting_payload_is_admitted_before_later_small_ones() {
+    watchdog(Duration::from_secs(20), || {
+        const KIB: usize = 1024;
+        let daemon = serve_sized(&[40 * KIB, 90 * KIB, 20 * KIB, 20 * KIB]);
+        let (mut io, basis) = bound(daemon.address, with_budget(100 * KIB));
+        io.fetch(ReqId(1), daemon.assets[0].1, &basis);
+        step_until(&mut io, Duration::from_secs(5), |stats| {
+            stats.undelivered_events == 1
+        });
+        io.fetch(ReqId(2), daemon.assets[1].1, &basis);
+        step_until(&mut io, Duration::from_secs(5), |stats| {
+            stats.waiting_fetches == 1
+        });
+        io.fetch(ReqId(3), daemon.assets[2].1, &basis);
+        io.fetch(ReqId(4), daemon.assets[3].1, &basis);
+        // The small payloads would fit beside the held 40 KiB, but they
+        // queue behind the large one.
+        step_until(&mut io, Duration::from_secs(5), |stats| {
+            stats.waiting_fetches == 3
+        });
+        for _ in 0..20 {
+            api::step(&mut io);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(io.stats().waiting_fetches, 3);
+        let (events, _) = frames_until(&mut io, Duration::from_secs(10), |events| {
+            count(events, is_fetched) == 4
+        });
+        let large = fetched_at(&events, ReqId(2)).unwrap();
+        assert!(fetched_at(&events, ReqId(1)).unwrap() < large);
+        assert!(large < fetched_at(&events, ReqId(3)).unwrap(), "{events:?}");
+        assert!(large < fetched_at(&events, ReqId(4)).unwrap(), "{events:?}");
+    });
+}
+
 // The loader end to end ---------------------------------------------------
 
 #[derive(Default)]
@@ -637,7 +873,11 @@ struct Game {
 
 impl Game {
     fn new(daemon: Daemon, address: SocketAddr) -> Self {
-        let io = RpcIo::connect(address, request()).unwrap();
+        Self::with_config(daemon, address, RpcIoConfig::default())
+    }
+
+    fn with_config(daemon: Daemon, address: SocketAddr, config: RpcIoConfig) -> Self {
+        let io = RpcIo::connect_with_config(address, request(), config).unwrap();
         let mut loader = Loader::new(io);
         loader
             .register_types(
@@ -727,6 +967,18 @@ fn loader_loads_everything_cold_without_churn() {
         let address = daemon.address;
         let mut game = Game::new(daemon, address);
         game.settle(Duration::from_secs(10));
+    });
+}
+
+// Admission through the orchestrator: with room for about one payload at a
+// time, fetches wait for the payloads the loader adopts and everything loads.
+#[test]
+fn loader_loads_everything_cold_with_a_tiny_fetch_budget() {
+    watchdog(Duration::from_secs(30), || {
+        let daemon = serve(64, 32 * 1024);
+        let address = daemon.address;
+        let mut game = Game::with_config(daemon, address, with_budget(40 * 1024));
+        game.settle(Duration::from_secs(20));
     });
 }
 

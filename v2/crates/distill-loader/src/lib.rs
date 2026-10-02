@@ -15,7 +15,7 @@ mod rpc_decode;
 pub mod runtime;
 pub mod storage;
 
-pub use admission::{Admission, FetchAdmission};
+pub use admission::{Admit, FetchAdmission, Reservation};
 pub use basis::{IoBasis, ManifestHash};
 pub use capnp_io::{RpcIo, RpcIoConfig, RpcIoInitError, RpcIoStats};
 pub use component::{
