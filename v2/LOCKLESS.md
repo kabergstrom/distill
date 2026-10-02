@@ -1056,6 +1056,12 @@ should reach zero by the end of phase 6.
   `DISTINCT … ORDER BY random()` over every holder. The prune is left to
   recovery, since release already deletes an extent with its last
   reference.
+- **Codegen runs when its inputs moved.** `CodegenCoordinator` keeps only
+  the installed trace, and `CodegenService` keeps that trace's pipeline
+  epoch. A new basis whose epoch is the same and whose installed trace still
+  holds (`holds`) skips the run and its publication.
+  - Removed: `last_failure`, the requeue counter and the `last_trace` getter.
+    They were written and never read outside tests.
 
 ## 7. Test baseline
 

@@ -96,11 +96,11 @@ pub enum CodegenPublication {
     PublicationFailed(PublicationError),
 }
 
+/// Keeps the trace of the last attempt whose outcome stands: its files were
+/// published, or it failed deterministically.
 #[derive(Debug, Default)]
 pub struct CodegenCoordinator {
-    last_trace: Vec<TraceOp>,
-    last_failure: Option<CodegenFailure>,
-    requeues: u64,
+    installed: Option<Vec<TraceOp>>,
 }
 
 impl CodegenCoordinator {
@@ -115,14 +115,12 @@ impl CodegenCoordinator {
         if world.current_basis() != attempt.basis
             || !attempt.trace.iter().all(|op| world.observe(op))
         {
-            self.requeues = self.requeues.saturating_add(1);
             return CodegenPublication::Requeued;
         }
 
         match attempt.outcome {
             AttemptOutcome::Failure(failure) => {
-                self.last_trace = attempt.trace;
-                self.last_failure = Some(failure.clone());
+                self.installed = Some(attempt.trace);
                 CodegenPublication::Failed(failure)
             }
             AttemptOutcome::Files(mut files) => {
@@ -134,23 +132,19 @@ impl CodegenCoordinator {
                 if let Err(error) = world.publish(&attempt.basis, &files) {
                     return CodegenPublication::PublicationFailed(error);
                 }
-                self.last_trace = attempt.trace;
-                self.last_failure = None;
+                self.installed = Some(attempt.trace);
                 CodegenPublication::Published { files: count }
             }
         }
     }
 
-    pub fn last_trace(&self) -> Vec<TraceOp> {
-        self.last_trace.clone()
-    }
-
-    pub fn last_failure(&self) -> Option<&CodegenFailure> {
-        self.last_failure.as_ref()
-    }
-
-    pub fn requeue_count(&self) -> u64 {
-        self.requeues
+    /// Whether the installed attempt's every observation still holds in
+    /// `world`: a run there would generate what stands, so it need not run.
+    /// `false` when nothing is installed.
+    pub fn holds<B, W: CodegenSnapshot<B>>(&self, world: &W) -> bool {
+        self.installed
+            .as_ref()
+            .is_some_and(|trace| trace.iter().all(|op| world.observe(op)))
     }
 }
 

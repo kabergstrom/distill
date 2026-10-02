@@ -7541,6 +7541,12 @@ including newly discovered membership, a previously missed dependency, or an
 event consumed while generation ran — it discards the whole proposed batch
 and outcome and requeues against the newest basis. No stale trace is published,
 and no filesystem mutation starts from bytes computed for a mismatched basis.
+The trace of the last attempt whose outcome stands (published, or failed
+deterministically) is kept with its pipeline epoch. At each new basis, the
+service revalidates that trace first. While the epoch is the same and every
+observation still holds, a run would generate what stands, so codegen does not
+run. Revalidation costs the trace's reads, and a run costs the codegens plus a
+publication over the whole namespace.
 
 Generated files are **daemon-owned, declared so**: `rs_mod_path` names a
 directory whose generated `<pipeline>.rs` files and `mod.rs` chain
