@@ -1,4 +1,4 @@
-//! DSBI/DSSI/DSIH key construction (§§8–9).
+//! DSBI/DSSI/DSIH/DSNK key construction (§§8–9).
 
 use distill_core::canonical::{domain_digest, CanonicalEncoder, DSSI, DSTG};
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
@@ -148,4 +148,105 @@ pub fn target_definition_hash(target: &Target) -> [u8; 32] {
         e.str(&identity.rustc);
         e.u32(identity.algorithm_version);
     })
+}
+
+const DSNK: [u8; 4] = *b"DSNK";
+
+/// One processor stage of a node's chain: its identity and the closed
+/// output table it declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeStage {
+    pub processor_id: String,
+    pub processor_version: u32,
+    pub primary: TypeUuid,
+    pub extras: Vec<(String, TypeUuid)>,
+}
+
+/// One type a node's chain names, with the schema identity its artifacts
+/// encode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeType {
+    pub type_uuid: TypeUuid,
+    pub logical: LogicalHash,
+    pub layout: LayoutHash,
+}
+
+/// The static inputs of one asset node: everything its served outputs are a
+/// function of besides the answers to the queries its build traces. Nothing
+/// here names an input version: two snapshots whose node inputs agree share
+/// one key, and the traced answers decide whether a result serves both.
+///
+/// The asset uuid is an input — the artifact header encodes it and derived
+/// outputs are named `UUIDv5(asset, key)`. The bundle is keyed by the
+/// recorded hash of its raw bytes, so keying reads no file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeInputs {
+    pub asset: AssetUuid,
+    pub bundle: BundleUuid,
+    pub local_id: String,
+    pub bundle_hash: ContentHash,
+    pub authored_type: TypeUuid,
+    pub authored_logical: LogicalHash,
+    pub target_def_hash: [u8; 32],
+    pub dylib_hash: [u8; 32],
+    /// Whether the pinned epoch registers a validator for the authored type.
+    pub validated: bool,
+    pub terminal_type: TypeUuid,
+    pub extras: Vec<(String, TypeUuid)>,
+    pub stages: Vec<NodeStage>,
+    pub types: Vec<NodeType>,
+    pub migration_planner_version: u32,
+    pub artifact_format_version: u32,
+}
+
+/// The `"DSNK"` node key.
+pub fn node_digest(inputs: &NodeInputs) -> [u8; 32] {
+    domain_digest(DSNK, 1, |e| encode_node(e, inputs))
+}
+
+/// Canonical DSNK body retained in the node's result record.
+pub fn node_canonical_bytes(inputs: &NodeInputs) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::new();
+    encode_node(&mut encoder, inputs);
+    encoder.into_bytes()
+}
+
+fn encode_node(e: &mut CanonicalEncoder, inputs: &NodeInputs) {
+    e.raw(&inputs.asset.0);
+    e.raw(&inputs.bundle.0);
+    e.str(&inputs.local_id);
+    e.raw(&inputs.bundle_hash.0);
+    e.raw(&inputs.authored_type.0);
+    e.raw(&inputs.authored_logical.0);
+    e.raw(&inputs.target_def_hash);
+    e.raw(&inputs.dylib_hash);
+    e.bool(inputs.validated);
+    e.raw(&inputs.terminal_type.0);
+    let mut extras = inputs.extras.clone();
+    extras.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    e.seq(&extras, |e, (key, type_uuid)| {
+        e.str(key);
+        e.raw(&type_uuid.0);
+    });
+    e.seq(&inputs.stages, |e, stage| {
+        e.str(&stage.processor_id);
+        e.u32(stage.processor_version);
+        e.raw(&stage.primary.0);
+        let mut extras = stage.extras.clone();
+        extras.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        e.seq(&extras, |e, (key, type_uuid)| {
+            e.str(key);
+            e.raw(&type_uuid.0);
+        });
+    });
+    let mut types = inputs.types.clone();
+    types.sort_by_key(|node_type| node_type.type_uuid);
+    types.dedup();
+    e.seq(&types, |e, node_type| {
+        e.raw(&node_type.type_uuid.0);
+        e.raw(&node_type.logical.0);
+        e.raw(&node_type.layout.0);
+    });
+    e.u32(inputs.migration_planner_version);
+    e.u32(inputs.artifact_format_version);
 }

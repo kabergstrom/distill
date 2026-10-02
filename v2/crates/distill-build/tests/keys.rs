@@ -185,3 +185,71 @@ fn target_definition_hash_binds_target_fields_and_layout_identity() {
         assert_ne!(base_hash, target_definition_hash(&variant));
     }
 }
+
+fn node_inputs() -> distill_build::keys::NodeInputs {
+    use distill_build::keys::{NodeInputs, NodeStage, NodeType};
+    NodeInputs {
+        asset: AssetUuid([1; 16]),
+        bundle: distill_core::id::BundleUuid([2; 16]),
+        local_id: "entry".to_owned(),
+        bundle_hash: ContentHash([3; 32]),
+        authored_type: TypeUuid([4; 16]),
+        authored_logical: LogicalHash([5; 32]),
+        target_def_hash: [6; 32],
+        dylib_hash: [7; 32],
+        validated: false,
+        terminal_type: TypeUuid([8; 16]),
+        extras: vec![("b".to_owned(), TypeUuid([9; 16])), ("a".to_owned(), TypeUuid([10; 16]))],
+        stages: vec![NodeStage {
+            processor_id: "cook".to_owned(),
+            processor_version: 1,
+            primary: TypeUuid([8; 16]),
+            extras: vec![("b".to_owned(), TypeUuid([9; 16]))],
+        }],
+        types: vec![
+            NodeType {
+                type_uuid: TypeUuid([8; 16]),
+                logical: LogicalHash([11; 32]),
+                layout: LayoutHash([12; 32]),
+            },
+            NodeType {
+                type_uuid: TypeUuid([4; 16]),
+                logical: LogicalHash([5; 32]),
+                layout: LayoutHash([13; 32]),
+            },
+        ],
+        migration_planner_version: 1,
+        artifact_format_version: 1,
+    }
+}
+
+#[test]
+fn the_node_key_covers_static_inputs_only_and_ignores_declaration_order() {
+    use distill_build::keys::{node_canonical_bytes, node_digest};
+    let inputs = node_inputs();
+    let key = node_digest(&inputs);
+    assert_eq!(key, node_digest(&inputs.clone()));
+
+    let mut reordered = inputs.clone();
+    reordered.types.reverse();
+    reordered.extras.reverse();
+    assert_eq!(node_digest(&reordered), key);
+
+    let mut other_asset = inputs.clone();
+    other_asset.asset = AssetUuid([99; 16]);
+    assert_ne!(node_digest(&other_asset), key, "the asset uuid is observable");
+
+    let mut edited = inputs.clone();
+    edited.bundle_hash = ContentHash([99; 32]);
+    assert_ne!(node_digest(&edited), key);
+
+    let mut rebuilt_pipeline = inputs.clone();
+    rebuilt_pipeline.dylib_hash = [99; 32];
+    assert_ne!(node_digest(&rebuilt_pipeline), key);
+
+    let mut relaid = inputs.clone();
+    relaid.types[0].layout = LayoutHash([99; 32]);
+    assert_ne!(node_digest(&relaid), key);
+
+    assert!(!node_canonical_bytes(&inputs).is_empty());
+}
