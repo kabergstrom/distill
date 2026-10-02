@@ -152,6 +152,7 @@ fn put_bundle(
         format_version: 1,
         content_hash: ContentHash([hash; 32]),
         origin: None,
+        import_watched: false,
     })
 }
 

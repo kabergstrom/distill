@@ -237,6 +237,7 @@ fn write_namespace(txn: &mut InputTxn<'_>, commit: &Commit) -> Result<(), ApplyE
                     format_version: 1,
                     content_hash: ContentHash([0; 32]),
                     origin: None,
+                    import_watched: false,
                 })?;
                 let schema = std::str::from_utf8(&entry.logical_schema).map_err(|_| {
                     AdminError::InvalidAuthoringValue {

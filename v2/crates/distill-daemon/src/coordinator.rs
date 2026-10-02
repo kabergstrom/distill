@@ -1660,7 +1660,7 @@ fn source_claims(
             }
         }
         Ok(bundle) => {
-            crate::importer::decoded_directory_origin(bundle).map_err(|error| {
+            crate::importer::decoded_record_facts(bundle).map_err(|error| {
                 CoordinatorError::InvalidManifest(format!(
                     "invalid import record in {}: {error:?}",
                     source.normalized_path
@@ -2035,6 +2035,7 @@ struct BundleSummary {
     format_version: u32,
     content_hash: ContentHash,
     origin: Option<distill_store::bundles::DirectoryOrigin>,
+    import_watched: bool,
 }
 
 impl BundleSummary {
@@ -2054,7 +2055,7 @@ fn candidate_bundle_summaries(
         let Ok(bundle) = &source.parsed else {
             continue;
         };
-        let origin = crate::importer::decoded_directory_origin(bundle).map_err(|error| {
+        let (origin, import_watched) = crate::importer::decoded_record_facts(bundle).map_err(|error| {
             StoreError::InvalidConfiguration {
                 error: format!(
                     "invalid import record in {}: {error:?}",
@@ -2070,6 +2071,7 @@ fn candidate_bundle_summaries(
                 format_version: bundle.format_version,
                 content_hash: ContentHash(source.file_hash.0),
                 origin,
+                import_watched,
             },
         );
     }
@@ -2082,6 +2084,7 @@ fn candidate_bundle_summaries(
                 format_version: poison.format_version,
                 content_hash: poison.content_hash,
                 origin: None,
+                import_watched: false,
             },
         );
     }
@@ -2258,6 +2261,7 @@ fn publish_scan(
                 format_version: bundle.format_version,
                 content_hash: bundle.content_hash,
                 origin: bundle.origin.clone(),
+                import_watched: bundle.import_watched,
             },
         );
     }
@@ -2397,6 +2401,7 @@ fn publish_scan(
                 format_version: bundle.format_version,
                 content_hash: ContentHash(source.file_hash.0),
                 origin: summary.origin.clone(),
+                import_watched: summary.import_watched,
             })?;
             transaction.set_bundle_path_refs(
                 bundle.uuid,
@@ -2616,6 +2621,7 @@ fn publish_incremental_scan(
                 format_version: bundle.format_version,
                 content_hash: ContentHash(source.file_hash.0),
                 origin: summary.origin,
+                import_watched: summary.import_watched,
             })?;
             transaction.set_bundle_path_refs(
                 bundle.uuid,
@@ -2719,6 +2725,7 @@ fn prepare_incremental_publication(
                     format_version: meta.format_version,
                     content_hash: meta.content_hash,
                     origin: meta.origin.clone(),
+                    import_watched: meta.import_watched,
                 })
             }
             None => None,
@@ -2755,6 +2762,7 @@ fn prepare_incremental_publication(
                 format_version: poison.format_version,
                 content_hash: poison.content_hash,
                 origin: None,
+                import_watched: false,
             })
         } else {
             source
@@ -2925,7 +2933,7 @@ fn bundle_summary(source: &ScannedBundle) -> Result<BundleSummary, StoreError> {
         .parsed
         .as_ref()
         .expect("indexed current bundle parsed successfully");
-    let origin = crate::importer::decoded_directory_origin(bundle).map_err(|error| {
+    let (origin, import_watched) = crate::importer::decoded_record_facts(bundle).map_err(|error| {
         StoreError::InvalidConfiguration {
             error: format!(
                 "invalid import record in {}: {error:?}",
@@ -2939,6 +2947,7 @@ fn bundle_summary(source: &ScannedBundle) -> Result<BundleSummary, StoreError> {
         format_version: bundle.format_version,
         content_hash: ContentHash(source.file_hash.0),
         origin,
+        import_watched,
     })
 }
 
@@ -3698,6 +3707,7 @@ mod publish_diff_tests {
                             format_version: 1,
                             content_hash: ContentHash([0; 32]),
                             origin: None,
+                            import_watched: false,
                         })?;
                         for entry in 0..random.next(3) {
                             txn.upsert_asset(&AssetRecord {

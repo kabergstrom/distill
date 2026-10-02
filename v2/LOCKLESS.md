@@ -1073,6 +1073,14 @@ should reach zero by the end of phase 6.
   ToolEpoch rows it read: `tool()` is one `tools` primary-key read
   (`TOOL_AT`, plan pinned) at the build's tool version each time.
   The version is pinned, so the read's answer cannot change during a build.
+- **The watch flag is a column.** Schema 38 adds `bundles.import_watched`
+  and the partial index `bundles_import_watched`. Publication writes the
+  flag from the `$record` it already decodes for the directory origin
+  (`decoded_record_facts`), and poison clears it. Doctor's fixpoint check
+  now gets the watched bundles in one partial-index walk
+  (`import_watched_bundles`). It used to parse every bundle that has a
+  `$record` row just to read the flag. Poisoned bundles are still read
+  from disk, and `bundles_with_reserved_entry` is gone.
 
 ## 7. Test baseline
 

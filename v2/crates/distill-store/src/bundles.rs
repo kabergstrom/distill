@@ -40,6 +40,9 @@ pub struct BundleMeta {
     /// `DirectoryOrigin` record riding in the bundle's `$record` entry,
     /// never from precious rows. `None` means explicit import.
     pub origin: Option<DirectoryOrigin>,
+    /// Whether the bundle's `$record` import record is watched (§8): derived
+    /// at scan from the record, like `origin`.
+    pub import_watched: bool,
 }
 
 /// A generated bundle's directory-import provenance (§2, §8, §13): who
@@ -204,8 +207,9 @@ impl InputTxn<'_> {
         self.clear_path_refs(meta.bundle)?;
         self.txn.execute(
             "INSERT INTO bundles(bundle_uuid, root_id, path, format_version, content_hash, poison,
-                                 origin_rules_bundle, origin_rule, origin_group_root, origin_group_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9)
+                                 origin_rules_bundle, origin_rule, origin_group_root, origin_group_path,
+                                 import_watched)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(bundle_uuid) DO UPDATE SET
                root_id = excluded.root_id, path = excluded.path,
                format_version = excluded.format_version,
@@ -213,7 +217,8 @@ impl InputTxn<'_> {
                origin_rules_bundle = excluded.origin_rules_bundle,
                origin_rule = excluded.origin_rule,
                origin_group_root = excluded.origin_group_root,
-               origin_group_path = excluded.origin_group_path",
+               origin_group_path = excluded.origin_group_path,
+               import_watched = excluded.import_watched",
             rusqlite::params![
                 meta.bundle.0.as_slice(),
                 meta.root.0,
@@ -224,6 +229,7 @@ impl InputTxn<'_> {
                 meta.origin.as_ref().map(|o| o.rule.0.as_slice()),
                 meta.origin.as_ref().map(|o| o.group_root.as_str()),
                 meta.origin.as_ref().map(|o| o.group_path.as_str()),
+                meta.import_watched,
             ],
         )?;
         Ok(())
@@ -448,7 +454,8 @@ impl InputTxn<'_> {
              ON CONFLICT(bundle_uuid) DO UPDATE SET
                root_id = excluded.root_id, path = excluded.path,
                format_version = excluded.format_version,
-               content_hash = excluded.content_hash, poison = excluded.poison",
+               content_hash = excluded.content_hash, poison = excluded.poison,
+               import_watched = 0",
             rusqlite::params![
                 skeleton.bundle.0.as_slice(),
                 skeleton.root.0,
@@ -654,26 +661,21 @@ impl StoreReader {
         )
     }
 
+    /// The bundles whose import record is watched, by UUID: a walk of the
+    /// partial `bundles_import_watched`.
+    pub fn import_watched_bundles(&self) -> Result<Vec<BundleUuid>, StoreError> {
+        self.bundle_ids(
+            "SELECT bundle_uuid FROM bundles INDEXED BY bundles_import_watched
+             WHERE import_watched ORDER BY bundle_uuid",
+            [],
+        )
+    }
+
     /// Every poisoned bundle, by UUID.
     pub fn poisoned_bundles(&self) -> Result<Vec<BundleUuid>, StoreError> {
         self.bundle_ids(
             "SELECT bundle_uuid FROM bundles WHERE poison IS NOT NULL ORDER BY bundle_uuid",
             [],
-        )
-    }
-
-    /// Every bundle holding an entry under the reserved (`$`-prefixed) local
-    /// id `local_id`, by UUID.
-    pub fn bundles_with_reserved_entry(&self, local_id: &str) -> Result<Vec<BundleUuid>, StoreError> {
-        if !local_id.starts_with('$') {
-            return Err(StoreError::InvalidConfiguration {
-                error: format!("{local_id:?} is not a reserved local id"),
-            });
-        }
-        self.bundle_ids(
-            "SELECT DISTINCT bundle_uuid FROM assets INDEXED BY assets_by_local_id
-             WHERE local_id = ?1 ORDER BY bundle_uuid",
-            [local_id],
         )
     }
 
@@ -1090,7 +1092,7 @@ impl StoreReader {
 }
 
 const BUNDLE_COLUMNS: &str = "bundle_uuid, root_id, path, format_version, content_hash,
-     origin_rules_bundle, origin_rule, origin_group_root, origin_group_path";
+     origin_rules_bundle, origin_rule, origin_group_root, origin_group_path, import_watched";
 
 fn bundle_meta_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BundleMeta> {
     let origin = match (
@@ -1114,6 +1116,7 @@ fn bundle_meta_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BundleMeta> {
         format_version: row.get(3)?,
         content_hash: ContentHash(blob32(row.get(4)?)),
         origin,
+        import_watched: row.get(9)?,
     })
 }
 

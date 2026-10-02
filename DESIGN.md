@@ -2389,6 +2389,11 @@ read-set reproduces it byte-identically. `doctor` and CI verify that
 fixpoint for every watched bundle, so the
 committed-the-source-but-not-the-bundle case fails loudly instead of
 churning working trees after checkout.
+Publication records each bundle's watch flag in its `bundles` row
+(`import_watched`, set when the bundle's `$record` is watched). `doctor`
+finds the watched bundles through that row's partial index, without parsing
+a bundle. A poisoned bundle's row cannot record the flag, so its file is read
+instead.
 
 The matching importer from the pipeline module (or a built-in) parses the
 external format and returns canonical asset values keyed by `local_id`; the

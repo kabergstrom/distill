@@ -110,6 +110,7 @@ fn populate(store: &mut Store, count: u32) {
                     format_version: 1,
                     content_hash: ContentHash(*blake3::hash(&bytes).as_bytes()),
                     origin: None,
+                    import_watched: index % 1000 == 7,
                 })?;
                 let mut tags = BTreeMap::from([(
                     "kind".to_owned(),
@@ -182,7 +183,7 @@ fn selective_reads(reader: &StoreReader) {
     reader.bundles_at_path(&path).unwrap();
     reader.poisoned_bundles().unwrap();
     reader.generated_bundles().unwrap();
-    reader.bundles_with_reserved_entry("$record").unwrap();
+    reader.import_watched_bundles().unwrap();
     reader.bundles_referencing_path(REFERENCED).unwrap();
     reader.asset_exists(asset_uuid(42, 1)).unwrap();
     reader.observed_files_in(PathSelection::Subtree("d07")).unwrap();
@@ -263,8 +264,9 @@ const NAMESPACE_TABLES: [&str; 8] = [
 ];
 
 /// Partial indexes: walking one visits only the rows it was declared for.
-const PARTIAL_INDEXES: [&str; 6] = [
+const PARTIAL_INDEXES: [&str; 7] = [
     "bundles_poisoned",
+    "bundles_import_watched",
     "assets_unhashed",
     "assets_authoring",
     "files_by_ext",
@@ -806,13 +808,13 @@ fn reading_bundle_file_hashes_skips_their_bytes() {
 
 /// Reads of rare rows walk their partial index, whatever order they answer
 /// in: the generated bundles (`bundles_by_origin`), the poisoned ones
-/// (`bundles_poisoned`).
+/// (`bundles_poisoned`), the watched imports' (`bundles_import_watched`).
 #[test]
 fn rare_row_reads_walk_their_partial_index() {
     let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, store) = store_with(200);
     let mut reader = store.reader().unwrap();
-    let cases: [(&dyn Fn(&StoreReader), &[&str]); 2] = [
+    let cases: [(&dyn Fn(&StoreReader), &[&str]); 3] = [
         (
             &|reader| drop(reader.generated_bundles().unwrap()),
             &[
@@ -823,6 +825,10 @@ fn rare_row_reads_walk_their_partial_index() {
         (
             &|reader| drop(reader.poisoned_bundles().unwrap()),
             &["SCAN bundles USING INDEX bundles_poisoned"],
+        ),
+        (
+            &|reader| drop(reader.import_watched_bundles().unwrap()),
+            &["SCAN bundles USING INDEX bundles_import_watched"],
         ),
     ];
     for (read, expected) in cases {

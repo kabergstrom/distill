@@ -2279,6 +2279,7 @@ mod query_tests {
                         format_version: 1,
                         content_hash: ContentHash([index as u8; 32]),
                         origin: None,
+                        import_watched: false,
                     })?;
                     for (entry, authoring_only) in [(1u8, false), (2, true)] {
                         let mut tags = BTreeMap::new();

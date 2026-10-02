@@ -1043,35 +1043,21 @@ impl AuthoringService {
     ) -> Result<Vec<BundleUuid>, RpcFailure> {
         let watched = {
             require_base(store, base)?;
-            let mut watched = Vec::new();
-            // Only a bundle with a `$record` entry row can hold an import
-            // record; a poisoned bundle has no rows, so its file is read as
-            // a full read would. Every other bundle would `continue` below.
-            let mut candidates = store
-                .bundles_with_reserved_entry("$record")
-                .map_err(invalid)?;
-            candidates.extend(store.poisoned_bundles().map_err(invalid)?);
-            candidates.sort();
-            candidates.dedup();
-            for bundle in candidates {
+            // Publication records whether a bundle's import is watched
+            // (`bundles.import_watched`). A poisoned bundle's row cannot
+            // say, so its file is read as a full read would.
+            let mut watched = store.import_watched_bundles().map_err(invalid)?;
+            for bundle in store.poisoned_bundles().map_err(invalid)? {
                 let meta = store
                     .bundle(bundle)
                     .map_err(invalid)?
-                    .ok_or_else(|| invalid(format!("bundle {bundle} has entry rows but no row")))?;
-                let bundle = self.cached_bundle(store, &meta)?;
-                let Some(record) = bundle.assets.get("$record") else {
-                    continue;
-                };
-                if record.type_uuid != IMPORT_RECORD_TYPE_UUID || !record.authoring_only {
-                    return Err(invalid(format!(
-                        "bundle {} has a malformed import record marker",
-                        meta.bundle
-                    )));
-                }
-                if decode_import_record(&record.data)?.watch {
+                    .ok_or_else(|| invalid(format!("poisoned bundle {bundle} has no row")))?;
+                let parsed = self.cached_bundle(store, &meta)?;
+                if decoded_import_record(&parsed)?.is_some_and(|record| record.watch) {
                     watched.push(meta.bundle);
                 }
             }
+            watched.sort();
             watched
         };
         let mut failed = Vec::new();
@@ -2750,17 +2736,21 @@ pub(crate) fn decoded_import_record(bundle: &Bundle) -> Result<Option<ImportReco
     decode_import_record(&record.data).map(Some)
 }
 
-pub(crate) fn decoded_directory_origin(
+/// What a bundle's `$record` gives its `bundles` row: its directory-import
+/// origin and whether the import is watched.
+pub(crate) fn decoded_record_facts(
     bundle: &Bundle,
-) -> Result<Option<distill_store::bundles::DirectoryOrigin>, RpcFailure> {
-    Ok(decoded_import_record(bundle)?
-        .and_then(|record| record.origin)
-        .map(|origin| distill_store::bundles::DirectoryOrigin {
-            rules_bundle: origin.rules_bundle,
-            rule: distill_store::bundles::DirectoryRuleId(origin.rule.0),
-            group_root: origin.group.root.0,
-            group_path: origin.group.path,
-        }))
+) -> Result<(Option<distill_store::bundles::DirectoryOrigin>, bool), RpcFailure> {
+    let Some(record) = decoded_import_record(bundle)? else {
+        return Ok((None, false));
+    };
+    let origin = record.origin.map(|origin| distill_store::bundles::DirectoryOrigin {
+        rules_bundle: origin.rules_bundle,
+        rule: distill_store::bundles::DirectoryRuleId(origin.rule.0),
+        group_root: origin.group.root.0,
+        group_path: origin.group.path,
+    });
+    Ok((origin, record.watch))
 }
 
 fn decode_file_dep(value: &AuthoredValue) -> Result<FileDep, RpcFailure> {

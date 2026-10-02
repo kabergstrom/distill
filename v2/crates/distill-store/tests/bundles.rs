@@ -62,6 +62,7 @@ fn bundle_meta(root: RootId, n: u8) -> BundleMeta {
         format_version: 1,
         content_hash: ContentHash([n; 32]),
         origin: None,
+        import_watched: false,
     }
 }
 
@@ -155,6 +156,30 @@ fn directory_origin_rides_in_the_bundle_row() {
     // The explicit import from seed() carries no origin.
     let explicit = store.bundle(BundleUuid([1u8; 16])).unwrap().unwrap();
     assert_eq!(explicit.origin, None);
+}
+
+#[test]
+fn the_watch_flag_rides_in_the_bundle_row_until_poison() {
+    // Publication records whether a bundle's import record is watched, so
+    // doctor verify names the watched bundles without parsing any.
+    let (_d, mut store) = store();
+    let root = seed(&mut store);
+    let mut watched = bundle_meta(root, 4);
+    watched.import_watched = true;
+    store
+        .input_transaction(|txn| txn.upsert_bundle(&watched))
+        .unwrap();
+    assert!(store.bundle(BundleUuid([4u8; 16])).unwrap().unwrap().import_watched);
+    assert_eq!(store.import_watched_bundles().unwrap(), [BundleUuid([4u8; 16])]);
+
+    // A poisoned bundle's row cannot say: the flag clears with the poison.
+    let mut poisoned = skeleton(root, vec![]);
+    poisoned.bundle = BundleUuid([4u8; 16]);
+    poisoned.path = "tex/4.bundle".to_owned();
+    store
+        .input_transaction(|txn| txn.poison_bundle(&poisoned, "truncated container"))
+        .unwrap();
+    assert!(store.import_watched_bundles().unwrap().is_empty());
 }
 
 #[test]
