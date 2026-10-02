@@ -9,10 +9,14 @@
 //! and [`tokio::task::LocalSet`] running that connection's `RpcSystem`.
 //! `RpcSystem` and every capability are `!Send` and stay on that thread,
 //! with the connection's front end (store reader, snapshots, subscription
-//! queue): nothing a connection does, a slow SQLite read included, waits on
-//! another connection. The listener itself needs no `LocalSet`. Threads are
-//! bounded by `max_connections` (one past it is closed unserved), exit when
-//! their connection closes, and are told to close by
+//! queue, and the store writer it opens on its first write): nothing a
+//! connection does, a slow SQLite read or a write waiting on the write lock
+//! included, waits on another connection. Writes, import publications and
+//! operation completions run inline on that writer; importer runs and lazy
+//! builds go to a blocking worker so the connection keeps serving. The
+//! listener itself needs no `LocalSet`. Threads are bounded by
+//! `max_connections` (one past it is closed unserved), exit when their
+//! connection closes, and are told to close by
 //! [`StagedListener::shutdown`]. Closing shuts the socket down and lets
 //! capnp-rpc run its disconnect, which releases every capability the
 //! connection's pending calls hold; dropping a live `RpcSystem` would leak
