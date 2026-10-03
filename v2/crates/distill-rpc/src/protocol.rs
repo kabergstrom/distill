@@ -1375,10 +1375,6 @@ pub struct Commit {
     /// fails instead of returning an under-approximation.
     pub tag_poisons: Option<BTreeMap<AssetUuid, BundleUuid>>,
     pub tag_poison_mutations: Vec<TagPoisonMutation>,
-    /// Complete value-bearing tag replacement independent of authored-value
-    /// mutations. Pipeline-only publications use this to reindex the current
-    /// namespace without replaying unrelated identity rows.
-    pub tag_projection: Option<BTreeMap<AssetUuid, BTreeMap<String, Option<String>>>>,
     pub tag_projection_mutations: Vec<TagProjectionMutation>,
     pub configuration: Option<ConfigurationStatus>,
     pub pipeline: Option<PipelineDiagnostic>,

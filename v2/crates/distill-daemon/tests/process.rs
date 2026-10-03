@@ -144,10 +144,10 @@ fn watcher_changes_wait_for_the_configured_quiet_window() {
         .coordinator()
         .open_reader()
         .unwrap()
-        .all_files()
+        .observed_files()
         .unwrap()
         .iter()
-        .any(|(_, path, _)| path == "source.txt"));
+        .any(|row| row.path == "source.txt"));
     assert!(process.last_background_error().is_none());
 }
 
@@ -206,10 +206,10 @@ fn a_write_whose_rows_were_never_committed_is_adopted_on_restart() {
             .coordinator()
             .open_reader()
             .unwrap()
-            .all_files()
+            .observed_files()
             .unwrap()
             .iter()
-            .any(|(_, path, state)| path == "pending.txt" && state.content_hash == Some(hash))
+            .any(|row| row.path == "pending.txt" && row.file.state.content_hash == Some(hash))
     };
     let process = DaemonProcess::start(config.clone()).unwrap();
     assert!(indexed(&process, old_hash));
@@ -258,10 +258,10 @@ fn disabled_existing_codegen_output_is_still_excluded() {
         .coordinator()
         .open_reader()
         .unwrap()
-        .all_files()
+        .observed_files()
         .unwrap()
         .iter()
-        .all(|(_, path, _)| !path.starts_with("generated-alias")));
+        .all(|row| !row.path.starts_with("generated-alias")));
     assert!(output.join("owned.rs").is_file());
 }
 
@@ -655,10 +655,10 @@ fn root_configuration_reconciles_new_namespace_in_the_same_version() {
                     .coordinator()
                     .open_reader()
                     .unwrap()
-                    .all_files()
+                    .observed_files()
                     .unwrap()
                     .iter()
-                    .any(|(_, path, _)| path == "new.txt")
+                    .any(|row| row.path == "new.txt")
         },
         "new root was not reconciled",
     );

@@ -123,7 +123,6 @@ CREATE TABLE errors (
     message    TEXT NOT NULL,
     PRIMARY KEY (family, identity)
 );
-CREATE INDEX errors_by_scope ON errors(scope_kind, scope_id);
 -- The physical subjects (platform path encoding) whose revalidation heals
 -- the pending scan rejection.
 CREATE TABLE scan_rejection_subjects (
@@ -253,8 +252,6 @@ CREATE INDEX assets_by_bundle ON assets(bundle_uuid, local_id, asset_uuid);
 -- Build traces query assets by authored and terminal type (§9).
 CREATE INDEX assets_by_type ON assets(type_uuid);
 CREATE INDEX assets_by_terminal_type ON assets(terminal_type) WHERE terminal_type IS NOT NULL;
--- Skeleton rows (and only they) lack a logical hash.
-CREATE INDEX assets_unhashed ON assets(asset_uuid) WHERE logical_hash IS NULL;
 -- Assets by local id alone: a reserved entry (`$record`, `$settings`)
 -- across bundles, or a query naming only a local id.
 CREATE INDEX assets_by_local_id ON assets(local_id);
@@ -298,13 +295,6 @@ CREATE TABLE path_index (
     PRIMARY KEY (path, root_id)
 );
 CREATE INDEX path_index_by_asset ON path_index(asset_uuid);
-CREATE TABLE deps (
-    src_uuid BLOB NOT NULL,
-    kind     INTEGER NOT NULL,
-    target   TEXT NOT NULL,
-    PRIMARY KEY (src_uuid, kind, target)
-);
-CREATE INDEX deps_by_target ON deps(kind, target);
 CREATE TABLE schemas (
     logical_hash BLOB NOT NULL PRIMARY KEY,
     schema_json  TEXT NOT NULL

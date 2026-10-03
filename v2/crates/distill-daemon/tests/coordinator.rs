@@ -689,10 +689,10 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
     ));
     assert!(store.entry(ordinary_asset).unwrap().is_some());
     assert!(store
-        .all_files()
+        .observed_files()
         .unwrap()
         .iter()
-        .all(|(_, path, _)| !path.starts_with("daemon-state-alias")));
+        .all(|row| !row.path.starts_with("daemon-state-alias")));
     drop(store);
     let version = coordinator.server().current_stamp().unwrap().version;
 

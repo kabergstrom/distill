@@ -80,7 +80,6 @@ fn every_section_13_table_exists() {
         "asset_tag_index",
         "tag_epochs",
         "path_index",
-        "deps",
         "schemas",
         "result_candidates",
         "derived_outputs",

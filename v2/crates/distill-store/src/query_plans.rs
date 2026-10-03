@@ -265,10 +265,9 @@ const NAMESPACE_TABLES: [&str; 8] = [
 ];
 
 /// Partial indexes: walking one visits only the rows it was declared for.
-const PARTIAL_INDEXES: [&str; 7] = [
+const PARTIAL_INDEXES: [&str; 6] = [
     "bundles_poisoned",
     "bundles_import_watched",
-    "assets_unhashed",
     "assets_authoring",
     "files_by_ext",
     "asset_tag_index_poisoned",

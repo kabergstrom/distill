@@ -702,17 +702,6 @@ pub trait ServedWrite {
         rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
     }
 
-    /// Every asset that carries a served authoring value.
-    fn txn_served_assets(&self) -> Result<Vec<AssetUuid>, StoreError> {
-        let mut statement = self.served_conn().prepare_cached(
-            "SELECT asset_uuid FROM assets WHERE authored_value IS NOT NULL ORDER BY asset_uuid",
-        )?;
-        let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
-        rows.map(|row| row.map(|bytes| AssetUuid(blob16(bytes))))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::from)
-    }
-
     /// Whether `asset` carries a served authoring value.
     fn txn_is_served_asset(&self, asset: AssetUuid) -> Result<bool, StoreError> {
         Ok(self.served_conn().query_row(

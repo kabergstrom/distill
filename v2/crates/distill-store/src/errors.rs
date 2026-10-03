@@ -184,18 +184,6 @@ impl StoreReader {
         )
     }
 
-    /// The namespace errors about `scope`.
-    pub fn namespace_errors_about(
-        &self,
-        scope: &ErrorScope,
-    ) -> Result<Vec<NamespaceError>, StoreError> {
-        self.decode_errors(
-            "SELECT record FROM errors
-             WHERE family IN (?1, ?2) AND scope_kind = ?3 AND scope_id = ?4",
-            rusqlite::params![NAMESPACE, SCAN_REJECTION, scope.kind(), scope.id()],
-        )
-    }
-
     /// The pending scan rejection, if a scan left one.
     pub fn scan_rejection(&self) -> Result<Option<ScanRejectionRecord>, StoreError> {
         let errors = self.decode_errors(

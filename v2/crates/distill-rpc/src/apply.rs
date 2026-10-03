@@ -272,12 +272,6 @@ fn write_namespace(txn: &mut InputTxn<'_>, commit: &Commit) -> Result<(), ApplyE
             AuthoringMutation::Remove { uuid } => txn.remove_served_asset(*uuid)?,
         }
     }
-    if let Some(projection) = &commit.tag_projection {
-        let empty = BTreeMap::new();
-        for asset in txn.txn_served_assets()? {
-            txn.set_served_tags(asset, projection.get(&asset).unwrap_or(&empty))?;
-        }
-    }
     for mutation in &commit.paths {
         match mutation {
             PathMutation::Set { path, candidates } => txn.set_served_path(path, candidates)?,

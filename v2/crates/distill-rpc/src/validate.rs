@@ -58,21 +58,6 @@ pub(crate) fn validate_commit(commit: &Commit) -> Result<(), AdminError> {
             });
         }
     }
-    if let Some(tag_projection) = &commit.tag_projection {
-        for (uuid, tags) in tag_projection {
-            if tags.iter().any(|(tag, value)| {
-                !valid_identifier(tag)
-                    || value
-                        .as_deref()
-                        .is_some_and(|value| !valid_identifier(value))
-            }) {
-                return Err(AdminError::InvalidAuthoringIdentity {
-                    uuid: *uuid,
-                    detail: "tag projection contains a noncanonical name or value".to_owned(),
-                });
-            }
-        }
-    }
     let mut tag_assets = BTreeSet::new();
     for mutation in &commit.tag_projection_mutations {
         let (asset, tags) = match mutation {

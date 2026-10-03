@@ -1038,6 +1038,9 @@ impl StoreReader {
         .transpose()
     }
 
+    /// Test hook: every tool's hash at `basis`, for a reference trace
+    /// index that checks the builds' own reads.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn tool_hashes_at(
         &self,
         basis: InputVersion,

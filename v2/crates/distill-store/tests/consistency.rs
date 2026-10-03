@@ -281,8 +281,8 @@ fn pure_metadata_reads_survive_a_pipeline_failure() {
     // CAS reads and path resolution still answer.
     assert_eq!(store.cas_read(&hash).unwrap(), vec![1u8; 64]);
     assert_eq!(
-        store.resolve_path("a.bundle").unwrap(),
-        Some(AssetUuid([2u8; 16]))
+        store.path_assets("a.bundle").unwrap(),
+        std::collections::BTreeSet::from([AssetUuid([2u8; 16])])
     );
     let _ = store.input_version().unwrap();
 }
@@ -304,7 +304,7 @@ fn namespace_errors_do_not_gate_the_namespace_or_the_pipeline() {
     // Pipeline healthy…
     assert!(store.pipeline_state().unwrap().unwrap().epoch().is_ok());
     // …and so is the namespace.
-    assert_eq!(store.resolve_path("x").unwrap(), None);
+    assert!(store.path_assets("x").unwrap().is_empty());
     assert!(store.entry(AssetUuid([1u8; 16])).unwrap().is_none());
     // CAS reads are pure metadata.
     commit(&mut store, 3);

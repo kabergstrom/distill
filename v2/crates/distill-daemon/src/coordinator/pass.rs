@@ -1213,10 +1213,6 @@ fn absorb_into(commit: &mut Commit, later: Commit) {
             | distill_rpc::TagPoisonMutation::Remove { asset } => *asset,
         },
     );
-    if later.tag_projection.is_some() {
-        commit.tag_projection = later.tag_projection;
-        commit.tag_projection_mutations.clear();
-    }
     keyed(
         &mut commit.tag_projection_mutations,
         later.tag_projection_mutations,

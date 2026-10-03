@@ -540,35 +540,6 @@ impl StoreReader {
         Ok(PendingFileWork { dirty, renames })
     }
 
-    /// Complete deterministic raw-tree projection used by startup
-    /// reconciliation. Root ids remain process-local; callers cross the
-    /// persistence boundary through [`Store::root_name`].
-    pub fn all_files(&self) -> Result<Vec<(RootId, String, FileState)>, StoreError> {
-        let mut statement = self.conn.prepare(
-            "SELECT root_id, path, mtime, size, kind, content_hash
-             FROM files ORDER BY root_id, path",
-        )?;
-        let rows = statement.query_map([], |row| {
-            let content_hash = row.get::<_, Option<Vec<u8>>>(5)?.map(|bytes| {
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(&bytes);
-                ContentHash(hash)
-            });
-            Ok((
-                RootId(row.get(0)?),
-                row.get(1)?,
-                FileState {
-                    mtime: row.get(2)?,
-                    size: row.get::<_, i64>(3)? as u64,
-                    kind: FileKind::from_i64(row.get(4)?),
-                    content_hash,
-                },
-            ))
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::from)
-    }
-
     /// The id a root name was interned as, if it was.
     pub fn root_id(&self, name: &str) -> Result<Option<RootId>, StoreError> {
         Ok(self
