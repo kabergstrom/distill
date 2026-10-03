@@ -1087,7 +1087,9 @@ impl DaemonCoordinator {
 /// The loop's CAS pass: evict to the cache limit and compact, unless neither
 /// the CAS (its write count) nor the limit changed since `swept`, the last
 /// pass that finished within the limit; then delete the dead segment files
-/// no read can reach any more.
+/// no read can reach any more. The pass is marked with the count read
+/// before it: a write that lands while it sweeps or compacts moves the
+/// count past the mark, so the next pass sweeps it.
 pub(crate) fn maintain_cas(
     store: &mut Store,
     sweeper: &mut distill_store::cas::SegmentSweeper,
@@ -1099,7 +1101,7 @@ pub(crate) fn maintain_cas(
         let sweep = store.enforce_cache_limit()?;
         store.compact()?;
         if sweep.live_bytes <= state.1 {
-            *swept = Some((store.cas_writes()?, state.1));
+            *swept = Some(state);
         }
     }
     sweeper.sweep(store)?;
@@ -1172,6 +1174,52 @@ mod cas_pass_tests {
         commit(&mut store, 250);
         let after_write = pass(&mut store, &mut swept);
         assert!(after_write.iter().any(|sql| sql.contains("SUM(len)")), "{after_write:?}");
+    }
+
+    /// The writer that commits while the pass compacts.
+    static LATE_WRITER: std::sync::Mutex<Option<Store>> = std::sync::Mutex::new(None);
+    static COMMITS_SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// After the sweep's transaction commits, the next statement (the
+    /// pass's compaction) lets another writer commit a build first.
+    fn commit_after_the_sweep(sql: &str) {
+        use std::sync::atomic::Ordering;
+        if sql == "COMMIT" {
+            COMMITS_SEEN.fetch_add(1, Ordering::SeqCst);
+        } else if COMMITS_SEEN.load(Ordering::SeqCst) == 1 {
+            if let Some(mut writer) = LATE_WRITER.lock().unwrap().take() {
+                commit(&mut writer, 99);
+            }
+        }
+    }
+
+    /// A build committed while the pass compacts was never swept: the next
+    /// pass sweeps again, so the CAS does not stay over its cap.
+    #[test]
+    fn a_write_during_compaction_is_swept_by_the_next_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StoreConfig::new(dir.path().join(".distill"));
+        let mut store = Store::open(config.clone()).unwrap();
+        commit(&mut store, 1);
+        commit(&mut store, 2);
+        let live = store.enforce_cache_limit().unwrap().live_bytes;
+        drop(store);
+        // Room for what is there, not for one more build.
+        config.cache_limit = live + 8;
+        let mut store = Store::open(config).unwrap();
+        *LATE_WRITER.lock().unwrap() = Some(store.open_writer().unwrap());
+        COMMITS_SEEN.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let mut swept = None;
+        let mut sweeper = SegmentSweeper::new(std::time::Duration::ZERO);
+        store.trace_statements(Some(commit_after_the_sweep));
+        maintain_cas(&mut store, &mut sweeper, &mut swept).unwrap();
+        store.trace_statements(None);
+        assert!(LATE_WRITER.lock().unwrap().is_none(), "the late write landed");
+
+        let next = pass(&mut store, &mut swept);
+        assert!(next.iter().any(|sql| sql.contains("SUM(")), "{next:?}");
+        assert!(store.enforce_cache_limit().unwrap().live_bytes <= live + 8);
     }
 }
 
