@@ -1143,6 +1143,16 @@ should reach zero by the end of phase 6.
   `errors_by_scope` and `assets_unhashed` are gone: nothing read them.
   `an_edit_pass_runs_the_same_statements_at_any_namespace_size` pins the
   per-edit statement count and bounds its page reads.
+- **A failed step commits nothing.** A write transaction nested in an
+  open one is a savepoint, so a failed nested step rolls back only its own
+  writes. An authoring backend's error (a write, an import, a deferred
+  operation) rolls its input back; a watched import's memoized failure is
+  returned as data (`ImportJob`'s `Ok(Err(failure))`) and commits alone.
+  A runtime pipeline failure and its served fence, and a staged restart and
+  its served keys, are one transaction each. The schema is created in one.
+  A configuration candidate reads its base before it scans. An unchanged
+  protocol epoch or target publishes no version, and a transient tag
+  refinement failure fails its input instead of poisoning.
 
 ## 7. Test baseline
 
@@ -1183,3 +1193,5 @@ Merge of reads-scan and reads-query (one schema 38), with a complete
 publication republishing the poisoned bundles of reschemaed types: 1217
 passed, no failures (12 from reads-scan, 8 from reads-query, 1 new: the
 complete publication's re-validated poisoned skeleton).
+Schema 39 (an edit costs its change, a failed step commits nothing):
+1227 passed, no failures.
