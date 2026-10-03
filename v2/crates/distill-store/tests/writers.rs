@@ -159,3 +159,74 @@ fn a_failed_nested_write_rolls_back_only_its_own_writes() {
         .collect::<Vec<_>>();
     assert_eq!(paths, ["kept"]);
 }
+
+/// An inline (doctor) build's flush nested in an open input: when it fails
+/// after its node row, the input that commits keeps none of the node, and
+/// its rolled-back segment row is no OPEN segment left behind.
+#[test]
+fn a_failed_inline_build_flush_commits_no_partial_node() {
+    use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
+    use distill_store::cas::record::KeyKind;
+    use distill_store::cas::{BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
+    use distill_store::StoreError;
+    use distill_wire::artifact::{write_artifact, ArtifactHeader};
+    use distill_wire::dswl::{dswl_bytes, dswl_hash};
+    use distill_wire::wire::WireNode;
+
+    let node_commit = |key: u8| {
+        let node = WireNode::Unit { offset: 0 };
+        let artifact = write_artifact(
+            &ArtifactHeader {
+                asset_uuid: AssetUuid([key; 16]),
+                authored_type: TypeUuid([1; 16]),
+                terminal_type: TypeUuid([2; 16]),
+                encoded_type: TypeUuid([3; 16]),
+                logical_hash: LogicalHash([4; 32]),
+                layout_hash: dswl_hash(&node).unwrap(),
+            },
+            &[AssetUuid([9; 16])],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        BuildCommit {
+            wire_trees: vec![dswl_bytes(&node).unwrap()],
+            key_kind: KeyKind::Node,
+            static_input_key: [key; 32],
+            asset_uuid: AssetUuid([key; 16]),
+            static_inputs_canonical: vec![],
+            trace: vec![key],
+            outcome: CommitOutcome::Success {
+                payload_kind: PayloadKind::ProcessorOutput,
+                outputs: vec![OutputSpec {
+                    output_key: String::new(),
+                    type_uuids: vec![],
+                    bytes: artifact,
+                }],
+                aux: vec![],
+            },
+        }
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(StoreConfig::new(dir.path().join("state"))).unwrap();
+    store.open_input().unwrap();
+    let flush = store.write_transaction(|store| {
+        store.commit_build(node_commit(3))?;
+        Err::<(), _>(StoreError::Rejected {
+            detail: "a later write of the node failed".to_owned(),
+        })
+    });
+    assert!(flush.is_err());
+    store.finish_input(true).unwrap();
+    assert!(store.candidate_rows(KeyKind::Node, &[3; 32]).unwrap().is_empty());
+
+    store
+        .write_transaction(|store| store.commit_build(node_commit(4)).map(drop))
+        .unwrap();
+    let conn = rusqlite::Connection::open(dir.path().join("state/meta.sqlite")).unwrap();
+    let open: i64 = conn
+        .query_row("SELECT COUNT(*) FROM cas_segments WHERE state = 0", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(open, 1, "only the live writer's segment is OPEN");
+}
