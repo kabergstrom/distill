@@ -1281,35 +1281,33 @@ fn create_dir(path: &Path) -> Result<(), StoreError> {
 
 pub(crate) fn meta_get_blob(conn: &Connection, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
     Ok(conn
-        .query_row("SELECT value FROM store_meta WHERE key = ?1", [key], |r| {
-            r.get(0)
-        })
+        .prepare_cached("SELECT value FROM store_meta WHERE key = ?1")?
+        .query_row([key], |r| r.get(0))
         .optional()?)
 }
 
 pub(crate) fn meta_set_blob(conn: &Connection, key: &str, value: &[u8]) -> Result<(), StoreError> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO store_meta(key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        rusqlite::params![key, value],
-    )?;
+    )?
+    .execute(rusqlite::params![key, value])?;
     Ok(())
 }
 
 pub(crate) fn meta_get_i64(conn: &Connection, key: &str) -> Result<Option<i64>, StoreError> {
     Ok(conn
-        .query_row("SELECT value FROM store_meta WHERE key = ?1", [key], |r| {
-            r.get(0)
-        })
+        .prepare_cached("SELECT value FROM store_meta WHERE key = ?1")?
+        .query_row([key], |r| r.get(0))
         .optional()?)
 }
 
 pub(crate) fn meta_set_i64(conn: &Connection, key: &str, value: i64) -> Result<(), StoreError> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO store_meta(key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        rusqlite::params![key, value],
-    )?;
+    )?
+    .execute(rusqlite::params![key, value])?;
     Ok(())
 }
 
