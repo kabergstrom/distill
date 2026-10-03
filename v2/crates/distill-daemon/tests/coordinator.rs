@@ -268,6 +268,74 @@ fn an_incremental_collision_withholds_the_asset_and_republishes_the_survivor_on_
     assert!(store.entry(AssetUuid([40; 16])).unwrap().is_some());
 }
 
+/// Claims are input state the publication that derived them commits, not
+/// process state: a restart keeps them. When the first scan after the
+/// restart is rejected, its namespace errors still name the stored
+/// collision, and an incremental heal of one claimant republishes the
+/// survivor from the stored claims of a bundle no scan of this process
+/// read.
+#[cfg(unix)]
+#[test]
+fn claims_survive_a_restart_whose_first_scan_is_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    {
+        let coordinator = collision_fixture(&temp, true);
+        let mut writer = coordinator.open_writer().unwrap();
+        coordinator.reconcile_full_scan(&mut writer).unwrap();
+        assert_only_the_shared_asset_is_withheld(&coordinator.open_reader().unwrap());
+    }
+    let outside = temp.path().join("outside");
+    std::fs::write(&outside, b"outside").unwrap();
+    let link = temp.path().join("assets/escape");
+    symlink(&outside, &link).unwrap();
+
+    let coordinator = coordinator(&temp);
+    let reader = coordinator.open_reader().unwrap();
+    let [stored] = <[_; 1]>::try_from(reader.claims_namespace_errors().unwrap()).unwrap();
+    assert!(matches!(
+        stored.detail,
+        NamespaceErrorV1::DuplicateAssetUuid { asset, .. } if asset == AssetUuid([40; 16])
+    ));
+    drop(reader);
+
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    let reader = coordinator.open_reader().unwrap();
+    assert!(reader.scan_rejection().unwrap().is_some(), "the first scan is rejected");
+    let errors = reader.namespace_errors().unwrap();
+    assert!(
+        errors.iter().any(|error| matches!(
+            error.detail,
+            NamespaceErrorV1::DuplicateAssetUuid { asset, .. } if asset == AssetUuid([40; 16])
+        )),
+        "{errors:?}"
+    );
+    assert!(errors
+        .iter()
+        .any(|error| matches!(error.detail, NamespaceErrorV1::UnreadableScanSubtree { .. })));
+    assert!(reader.entry(AssetUuid([40; 16])).unwrap().is_none());
+    drop(reader);
+
+    // One claimant leaves; the other's claims are the stored ones.
+    let second = temp.path().join("assets/second.bundle");
+    std::fs::remove_file(&second).unwrap();
+    std::fs::remove_file(&link).unwrap();
+    coordinator
+        .reconcile_incremental(&mut writer, &WatcherBatch {
+            paths: vec![second, link],
+            renames: Vec::new(),
+        })
+        .unwrap();
+    let store = coordinator.open_reader().unwrap();
+    assert_eq!(store.scan_rejection().unwrap(), None);
+    assert!(store.namespace_errors().unwrap().is_empty(), "{:?}", store.namespace_errors());
+    assert!(store.entry(AssetUuid([32; 16])).unwrap().is_some());
+    assert!(store.entry(AssetUuid([34; 16])).unwrap().is_none());
+    assert!(store.entry(AssetUuid([40; 16])).unwrap().is_some());
+}
+
 fn target() -> TargetDefinition {
     TargetDefinition::new("dev", TargetDefinitionHash([4; 32]))
 }

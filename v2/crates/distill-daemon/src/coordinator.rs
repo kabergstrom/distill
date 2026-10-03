@@ -173,10 +173,11 @@ impl DaemonCoordinator {
             module_state_path.join("modules"),
         )?;
         let target_set = distill_rpc::target_map(targets)?;
+        // Claims are input state: they describe the published namespace
+        // they were committed with, under the projection it was published
+        // under, and a publication under another projection replaces them
+        // in its own transaction. A restart keeps them.
         let mut opened_store = Store::open(store_config.clone())?;
-        // Claims follow the pipeline projection; the first full
-        // publication rewrites them.
-        opened_store.clear_source_claims()?;
         if opened_store.pending_restart()?.is_some() {
             opened_store.input_transaction(|transaction| {
                 transaction.adopt_pending_restart().map(|_| ())

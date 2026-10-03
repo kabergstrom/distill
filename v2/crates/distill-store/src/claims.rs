@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 use distill_core::canonical::CanonicalEncoder;
 use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
 
-use crate::db::{InputTxn, Store, StoreReader};
+use crate::db::{InputTxn, StoreReader};
 use crate::error::StoreError;
 use crate::state::{
     encode_asset_claimant, encode_bundle_source, AssetClaimant, ReadableBundleSource, NamespaceError, NamespaceErrorDecoder,
@@ -143,13 +143,6 @@ fn group_kinds(group: i64) -> &'static str {
     } else {
         "(1, 2)"
     }
-}
-
-fn clear_claims(conn: &rusqlite::Connection) -> Result<(), StoreError> {
-    conn.execute_batch(
-        "DELETE FROM source_claims; DELETE FROM claim_collisions; DELETE FROM claim_pending;",
-    )?;
-    Ok(())
 }
 
 /// An asset UUID started or stopped colliding: what publishes it (its
@@ -344,20 +337,6 @@ impl InputTxn<'_> {
     pub fn clear_pending_claims(&mut self) -> Result<(), StoreError> {
         self.txn.execute("DELETE FROM claim_pending", [])?;
         Ok(())
-    }
-}
-
-impl Store {
-    /// Drop every claim, collision and pending subject without publishing
-    /// an input version: claims are derived from the scan and the pipeline
-    /// projection, and the next full publication rewrites them.
-    pub fn clear_source_claims(&mut self) -> Result<(), StoreError> {
-        self.write_txn(|store| {
-            let transaction = store.read.conn.savepoint()?;
-            clear_claims(&transaction)?;
-            transaction.commit()?;
-            Ok(())
-        })
     }
 }
 
