@@ -446,7 +446,6 @@ impl ServerHandle {
 
 /// [`ServedWrite`] made object safe by delegation.
 trait ServedWriteObj {
-    fn runtime_failure(&mut self, failure: PipelineFailure) -> Result<bool, StoreError>;
     fn restart(&mut self, keys: &[String]) -> Result<bool, StoreError>;
     fn target(
         &mut self,
@@ -458,10 +457,6 @@ trait ServedWriteObj {
 }
 
 impl<W: ServedWrite> ServedWriteObj for W {
-    fn runtime_failure(&mut self, failure: PipelineFailure) -> Result<bool, StoreError> {
-        publish_runtime_pipeline_failure(self, failure)
-    }
-
     fn restart(&mut self, keys: &[String]) -> Result<bool, StoreError> {
         publish_restart_required(self, keys)
     }
@@ -779,21 +774,35 @@ impl ServerHandle {
         if failure.origin != PipelineFailureOrigin::PublishedRuntime {
             return Err("runtime failure publication requires PublishedRuntime origin".to_owned());
         }
-        let (_, current) = store
-            .served_blob(SERVED_PIPELINE)
-            .and_then(read_served_pipeline)
-            .map_err(|error| error.to_string())?;
-        match &current {
-            PipelineDiagnostic::Ready => {}
-            PipelineDiagnostic::Failed(existing) if existing == &failure => return Ok(()),
-            other => {
-                return Err(format!(
-                    "current RPC pipeline is not the observed ready epoch: {other:?}"
-                ))
-            }
+        // The durable failure and the served fence commit together.
+        let changed = store.write_transaction_with(
+            |error| error.to_string(),
+            |store| {
+                let (_, current) = store
+                    .served_blob(SERVED_PIPELINE)
+                    .and_then(read_served_pipeline)
+                    .map_err(|error| error.to_string())?;
+                match &current {
+                    PipelineDiagnostic::Ready => {}
+                    PipelineDiagnostic::Failed(existing) if existing == &failure => {
+                        return Ok(false)
+                    }
+                    other => {
+                        return Err(format!(
+                            "current RPC pipeline is not the observed ready epoch: {other:?}"
+                        ))
+                    }
+                }
+                persist(store)?;
+                store
+                    .served_transaction(|txn| publish_runtime_pipeline_failure(txn, failure))
+                    .map_err(|error| error.to_string())
+            },
+        )?;
+        // Inside an open input, readers are told once it commits.
+        if changed && !store.input_open() {
+            self.notify_published();
         }
-        persist(store)?;
-        self.write_served(store, false, move |txn| txn.runtime_failure(failure));
         Ok(())
     }
 

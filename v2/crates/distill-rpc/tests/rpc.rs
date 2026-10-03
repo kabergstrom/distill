@@ -2883,3 +2883,45 @@ fn a_failed_backend_step_commits_nothing_it_wrote() {
     );
     unchanged("partial-operation");
 }
+
+/// The durable runtime failure and the served fence are one transaction:
+/// when the served write fails, the persisted failure rolls back with it.
+#[test]
+fn a_runtime_pipeline_failure_persists_with_its_fence_or_not_at_all() {
+    let server = server_with(&[(1, false)]);
+    let failure = PipelineFailure::new(
+        PipelineFailureCode::PublishedCallbackPanic,
+        PipelineFailureOrigin::PublishedRuntime,
+        CleanupDisposition::PublishedEpochLeaked,
+        "processor callback panicked",
+    )
+    .unwrap();
+    // The served pipeline write fails.
+    let db = server.with_writer(|store| store.state_path().join("meta.sqlite"));
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_served_pipeline BEFORE INSERT ON store_meta
+             WHEN NEW.key = 'served_pipeline'
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .unwrap();
+    let published = server.coordinated_runtime_pipeline_failure(failure, |store| {
+        store
+            .write_transaction(|store| {
+                store.replace_scan_diagnostics(
+                    Some(&[]),
+                    &[distill_store::files::ObservedDiagnostic {
+                        root_name: "main".to_owned(),
+                        path: "persisted".to_owned(),
+                        detail: Vec::new(),
+                    }],
+                )
+            })
+            .map_err(|error| error.to_string())
+    });
+    assert!(published.is_err());
+    server.with_writer(|store| {
+        assert!(store.scan_diagnostics().unwrap().is_empty(), "the persisted half committed");
+    });
+}
