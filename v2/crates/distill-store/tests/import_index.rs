@@ -20,7 +20,11 @@ fn source(path: &str, bundle: u8, reads: Vec<ImportReadKey>) -> ImportIndexSourc
             basis: vec![bundle],
             reads,
         }),
-        directory_rules: vec![(BundleUuid([bundle; 16]), AssetUuid([bundle; 16]))],
+        directory_rules: vec![(
+            BundleUuid([bundle; 16]),
+            AssetUuid([bundle; 16]),
+            format!("dir{bundle}/"),
+        )],
     }
 }
 
@@ -77,9 +81,12 @@ fn a_source_replacement_drops_only_that_source() {
             ],
         )
         .unwrap();
-    store
+    let previous = store
         .replace_import_index(&[("main".to_owned(), "a.bundle".to_owned())], &[])
         .unwrap();
+    // The rules the replaced source held come back.
+    assert_eq!(previous.len(), 1);
+    assert_eq!(previous[0].rules_bundle, BundleUuid([1; 16]));
     assert_eq!(bundles(store.watched_imports_reading(["x"], false).unwrap()), [2]);
     assert!(store.directory_rule_sources_at("main", "a.bundle").unwrap().is_empty());
     // A bundle that moved replaces its old row.
@@ -91,4 +98,32 @@ fn a_source_replacement_drops_only_that_source() {
         .unwrap();
     assert!(store.watched_imports_reading(["x"], false).unwrap().is_empty());
     assert_eq!(bundles(store.watched_imports_reading(["y"], false).unwrap()), [2]);
+}
+
+#[test]
+fn rules_are_found_by_the_directories_a_path_is_under() {
+    let (_d, mut store) = store();
+    let mut whole_root = source("r.bundle", 3, Vec::new());
+    whole_root.directory_rules[0].2 = String::new();
+    store
+        .replace_import_index(
+            &sources(&["a.bundle", "b.bundle", "r.bundle"]),
+            &[
+                source("a.bundle", 1, Vec::new()),
+                source("b.bundle", 2, Vec::new()),
+                whole_root,
+            ],
+        )
+        .unwrap();
+    let found = |dirs: &[&str]| {
+        store
+            .directory_rule_sources_listing(dirs.iter().copied())
+            .unwrap()
+            .into_iter()
+            .map(|rule| rule.rules_bundle.0[0])
+            .collect::<Vec<_>>()
+    };
+    // `dir1/x.png` is under `""` and `dir1/`.
+    assert_eq!(found(&["", "dir1/"]), [1, 3]);
+    assert_eq!(found(&["", "elsewhere/"]), [3]);
 }

@@ -5,17 +5,21 @@
 //! rescan, or a scan rejection), then the imports it makes due, then the
 //! acknowledgement of the watcher work it consumed, and commits all of them
 //! as one input at the base it started from: one new input version, one
-//! publication notification, one change-log version. It runs in four
-//! phases:
+//! publication notification, one change-log version.
 //!
-//! 1. **Plan.** An input opened at the base applies the scan step, discovers
-//!    the directory imports and watched reimports due under it, plans their
-//!    invocations, captures the `files` rows the step observed, and rolls
-//!    back. Nothing it wrote is ever visible.
-//! 2. **Run.** The imports run in parallel outside any write, each reading
-//!    the committed `files` rows with the step's uncommitted ones over them
-//!    (`FileOverlay`): what the input will hold when it publishes them.
-//! 3. **Chain.** Imports that read the outputs of imports the pass runs
+//! An input opened at the base applies the scan step, brings the import
+//! index up to date for the pending watcher work, and discovers the
+//! directory imports and watched reimports due under it. When none is due
+//! (every pass but those that import), it refines the tag index,
+//! acknowledges the work and commits: the step is applied once. When some
+//! are, the pass plans their invocations, rolls the input back (nothing it
+//! wrote is ever visible) and runs in three more phases:
+//!
+//! 1. **Run.** The imports run in parallel outside any write, each reading
+//!    the committed `files` rows with the step's changed ones over them
+//!    (`FileOverlay`, which holds only the rows that differ): what the
+//!    input will hold when it publishes them.
+//! 2. **Chain.** Imports that read the outputs of imports the pass runs
 //!    (an imported bundle that is another import's source) run in levels
 //!    after them. For each level, a plan input at the base (rolled back like
 //!    the first) folds the last level's runs to the bundles they will
@@ -29,19 +33,21 @@
 //!    reported too, and the rest runs in the next pass (`more_work`). A
 //!    level runs only when the committed import index has an import that
 //!    may read one of the outputs.
-//! 4. **Apply.** One coordinated input at the same base applies the scan
-//!    step again, rediscovers the imports level by level (each level under
-//!    the paths the level before published), publishes each run whose
-//!    import is still due, acknowledges the work, and merges every step's
-//!    RPC delta into the one commit served for the new version. Each
-//!    chained run is revalidated against the outputs the input now holds,
-//!    so a run whose upstream published other bytes than planned drifts.
+//! 3. **Apply.** One coordinated input at the same base applies the scan
+//!    step again (the write lock is released while imports run, so the
+//!    first input cannot stay open), rediscovers the imports level by level
+//!    (each level under the paths the level before published), publishes
+//!    each run whose import is still due, acknowledges the work, and merges
+//!    every step's RPC delta into the one commit served for the new
+//!    version. Each chained run is revalidated against the outputs the input
+//!    now holds, so a run whose upstream published other bytes than planned
+//!    drifts.
 //!
-//! The write lock is held for the plans and the apply, never across an
-//! import run. A publication from elsewhere (an RPC write) that lands
-//! between the plan and the apply makes the apply's base check fail
-//! `Stale`: nothing of the pass is published, and the caller retries it from
-//! the new base, recomputing everything. Nothing is applied twice.
+//! The write lock is held for the inputs, never across an import run. A
+//! publication from elsewhere (an RPC write) that lands between the first
+//! input and the apply makes the apply's base check fail `Stale`: nothing
+//! of the pass is published, and the caller retries it from the new base,
+//! recomputing everything.
 //!
 //! A run whose read set moved before the apply, or an import the apply finds
 //! due that the plan did not, is left for another pass (`more_work`), with
@@ -210,6 +216,10 @@ impl<'a> Affected<'a> {
 
 type PlannedImports = Vec<(PassImport, Option<PlannedImport>)>;
 
+/// The first input's error when it planned imports: it rolls back, and the
+/// pass runs them (`DaemonCoordinator::pass_with_imports`).
+const PLANNED: &str = "the pass planned imports";
+
 /// One level of a pass's imports and their runs (`None`: deferred).
 type Level = Vec<(PassImport, Option<ImportRun>)>;
 
@@ -288,30 +298,14 @@ impl DaemonCoordinator {
         step: ScanStep,
         scope: ImportScope<'_>,
     ) -> Result<PassOutcome, CoordinatorError> {
-        // The import index is built in an input; one that rolls back takes
-        // the index rows and their built marker with it.
-        let (planned, overlay) = if self.needs_plan(store, &step, scope)? {
-            self.plan(store, base, &step, scope)?
-        } else {
-            (Vec::new(), None)
-        };
-        let mut levels = vec![self.run_level(planned, overlay.as_ref())?];
-        let mut chain = Chain::default();
-        if scope.imports() {
-            self.plan_chain(
-                store,
-                base,
-                &step,
-                scope,
-                overlay.unwrap_or_else(FileOverlay::empty),
-                &mut levels,
-                &mut chain,
-            )?;
-        }
-
-        let mut more_work = chain.truncated;
-        let mut failures = chain.failures;
-        let mut imported = Vec::new();
+        // The first input applies the step and discovers the imports due
+        // under it. With none to run (the common case) it is the pass's
+        // input: it refines the tag index, acknowledges the work and
+        // commits, and the step is applied once. Otherwise it plans them and
+        // rolls back (taking the index rows it built with it), and the
+        // imports run outside any write.
+        let mut planned = None;
+        let mut more_work = false;
         let published = self.server.coordinated_maybe_commit(store, base, |store| {
             if scope.loop_pass {
                 // First: the scan's commit carries the pipeline diagnostic
@@ -319,10 +313,77 @@ impl DaemonCoordinator {
                 self.sync_runtime_pipeline_failure(store)
                     .map_err(|error| error.to_string())?;
             }
-            let mut commit = self.apply_scan_step(store, &step, true)?;
-            if !scope.imports() {
-                return Ok(commit);
+            let mut commit = self.apply_scan_step(store, &step)?;
+            if scope.imports() {
+                let work = match scope.affected.and_then(|affected| affected.work) {
+                    Some(work) => work.clone(),
+                    None => store.pending_file_work().map_err(|error| error.to_string())?,
+                };
+                let imports = self.discover(store, &work, scope, None)?;
+                if !imports.is_empty() {
+                    let mut plans = Vec::with_capacity(imports.len());
+                    for import in imports {
+                        let plan = self
+                            .authoring
+                            .plan_pass_import(store, &import)
+                            .map_err(|error| format!("{error:?}"))?;
+                        plans.push((import, plan));
+                    }
+                    planned = Some(plans);
+                    return Err(PLANNED.to_owned());
+                }
+                self.refine_scan_tags(store, &step, &mut commit)?;
+                if scope.loop_pass && !work.is_empty() {
+                    // A path whose observation moved on has more work queued
+                    // behind it: it stays pending.
+                    more_work = !store
+                        .acknowledge_file_work(&work)
+                        .map_err(|error| error.to_string())?;
+                }
+            } else {
+                self.refine_scan_tags(store, &step, &mut commit)?;
             }
+            Ok(commit)
+        });
+        if let Some(planned) = planned {
+            return self.pass_with_imports(store, base, step, scope, planned);
+        }
+        let published = published.map_err(CoordinatorError::Coordinated)?;
+        self.finish_scan_step(&step);
+        Ok(PassOutcome {
+            stamp: published.unwrap_or_else(|| self.server.stamp_of(store)),
+            more_work,
+            failures: Vec::new(),
+            imported: Vec::new(),
+        })
+    }
+
+    /// The rest of a pass whose first input planned imports (see the module
+    /// docs): run them and the imports chained to them, then apply the step
+    /// again in the publishing input, with the runs still due.
+    fn pass_with_imports(
+        &self,
+        store: &mut Store,
+        base: InputVersion,
+        step: ScanStep,
+        scope: ImportScope<'_>,
+        planned: PlannedImports,
+    ) -> Result<PassOutcome, CoordinatorError> {
+        let overlay = self.step_overlay(store, &step)?;
+        let mut levels = vec![self.run_level(planned, Some(&overlay))?];
+        let mut chain = Chain::default();
+        self.plan_chain(store, base, &step, scope, overlay, &mut levels, &mut chain)?;
+
+        let mut more_work = chain.truncated;
+        let mut failures = chain.failures;
+        let mut imported = Vec::new();
+        let published = self.server.coordinated_maybe_commit(store, base, |store| {
+            if scope.loop_pass {
+                self.sync_runtime_pipeline_failure(store)
+                    .map_err(|error| error.to_string())?;
+            }
+            let mut commit = self.apply_scan_step(store, &step)?;
+            self.refine_scan_tags(store, &step, &mut commit)?;
             let work = match scope.affected.and_then(|affected| affected.work) {
                 Some(work) => work.clone(),
                 None => store.pending_file_work().map_err(|error| error.to_string())?,
@@ -409,6 +470,27 @@ impl DaemonCoordinator {
             more_work,
             failures,
             imported,
+        })
+    }
+
+    /// The `files` rows `step` changes, as the overlay its imports run
+    /// under: only the rows that differ from the committed ones, read
+    /// outside any input (the step's input rolled back).
+    fn step_overlay(&self, store: &StoreReader, step: &ScanStep) -> Result<FileOverlay, CoordinatorError> {
+        Ok(match step {
+            ScanStep::Full(step) => FileOverlay::differences(
+                store,
+                step.candidate
+                    .scan
+                    .file_observations()
+                    .map(|((root_name, path), file)| ObservedFile {
+                        root_name: root_name.clone(),
+                        path: path.clone(),
+                        file,
+                    }),
+            )?,
+            ScanStep::Incremental(step) => incremental_overlay(store, &step.delta)?,
+            _ => FileOverlay::empty(),
         })
     }
 
@@ -613,7 +695,7 @@ impl DaemonCoordinator {
                     observed,
                 }));
             }
-            self.apply_scan_step(store, step, false).map_err(publication)?;
+            self.apply_scan_step(store, step).map_err(publication)?;
             plan(store)
         }));
         let rolled_back = store.finish_input(false);
@@ -623,79 +705,6 @@ impl DaemonCoordinator {
         };
         rolled_back.map_err(|error| publication(error.to_string()))?;
         planned
-    }
-
-    /// Whether a pass needs its plan phase: a pass with no imports to
-    /// consider has nothing to run.
-    fn needs_plan(
-        &self,
-        store: &mut Store,
-        step: &ScanStep,
-        scope: ImportScope<'_>,
-    ) -> Result<bool, CoordinatorError> {
-        if !scope.imports() {
-            return Ok(false);
-        }
-        let Some(affected) = scope.affected else {
-            return Ok(true);
-        };
-        if affected.capabilities_changed
-            || matches!(step, ScanStep::Incremental(_) | ScanStep::Full(_))
-        {
-            return Ok(true);
-        }
-        Ok(match affected.work {
-            Some(work) => !work.is_empty(),
-            None => !store.pending_file_work()?.is_empty(),
-        })
-    }
-
-    /// The plan phase: apply `step` and discover and plan the imports due
-    /// under it, in an input at `base` that always rolls back.
-    fn plan(
-        &self,
-        store: &mut Store,
-        base: InputVersion,
-        step: &ScanStep,
-        scope: ImportScope<'_>,
-    ) -> Result<(PlannedImports, Option<FileOverlay>), CoordinatorError> {
-        let publication =
-            |error: String| CoordinatorError::Coordinated(CoordinatedCommitError::Publication(error));
-        // A complete scan's overlay is the rows it changes, compared with
-        // the committed rows before its input writes them.
-        let mut overlay = match step {
-            ScanStep::Full(step) => Some(FileOverlay::differences(
-                store,
-                step.candidate
-                    .scan
-                    .file_observations()
-                    .map(|((root_name, path), file)| ObservedFile {
-                        root_name: root_name.clone(),
-                        path: path.clone(),
-                        file,
-                    }),
-            )?),
-            _ => None,
-        };
-        self.in_plan_input(store, base, step, |store| {
-            if let ScanStep::Incremental(step) = step {
-                overlay = Some(FileOverlay::capture(store, step.delta.affected_prefixes())?);
-            }
-            let overlay = overlay.take();
-            let work = match scope.affected.and_then(|affected| affected.work) {
-                Some(work) => work.clone(),
-                None => store.pending_file_work()?,
-            };
-            let mut planned = Vec::new();
-            for import in self.discover(store, &work, scope, None).map_err(publication)? {
-                let plan = self
-                    .authoring
-                    .plan_pass_import(store, &import)
-                    .map_err(|error| publication(format!("{error:?}")))?;
-                planned.push((import, plan));
-            }
-            Ok((planned, overlay))
-        })
     }
 
     /// The imports due under `work`: directory imports first, then watched
@@ -710,19 +719,26 @@ impl DaemonCoordinator {
         outputs: Option<&FileOverlay>,
     ) -> Result<Vec<PassImport>, String> {
         let failure = |error: RpcFailure| format!("{error:?}");
+        // The index is refreshed once, for both kinds: the bundle sources
+        // `work` names, parsed once each.
+        let refreshed = self
+            .authoring
+            .refresh_import_index(store, &work.dirty)
+            .map_err(failure)?;
+        // `None` revalidates every import.
+        let affected = scope.affected.map(|affected| {
+            (
+                (&work.dirty[..], &work.renames[..]),
+                affected.capabilities_changed,
+            )
+        });
         let mut imports = Vec::new();
         let mut regenerated = BTreeSet::new();
         if scope.directories {
-            let tasks = match scope.affected {
-                None => self.authoring.directory_import_tasks(store),
-                Some(affected) if affected.capabilities_changed => self
-                    .authoring
-                    .directory_import_tasks_affected_by_capabilities(store, &work.dirty, &work.renames),
-                Some(_) => self
-                    .authoring
-                    .directory_import_tasks_affected_by(store, &work.dirty, &work.renames, outputs),
-            }
-            .map_err(failure)?;
+            let tasks = self
+                .authoring
+                .directory_import_tasks(store, &refreshed, affected, outputs)
+                .map_err(failure)?;
             for task in tasks {
                 if let Some(bundle) = self
                     .authoring
@@ -735,16 +751,10 @@ impl DaemonCoordinator {
             }
         }
         if scope.watched {
-            let bundles = match scope.affected {
-                None => self.authoring.watched_imports_needing_reimport(store),
-                Some(affected) if affected.capabilities_changed => self
-                    .authoring
-                    .watched_imports_affected_by_capabilities(store, &work.dirty, &work.renames),
-                Some(_) => self
-                    .authoring
-                    .watched_imports_affected_by(store, &work.dirty, &work.renames, outputs),
-            }
-            .map_err(failure)?;
+            let bundles = self
+                .authoring
+                .watched_imports_due(store, affected, outputs)
+                .map_err(failure)?;
             imports.extend(
                 bundles
                     .into_iter()
@@ -944,13 +954,41 @@ impl DaemonCoordinator {
         }
     }
 
-    /// Apply `step` inside the input open on `store`, refining the published
-    /// tag index when `refine_tags`. Returns its RPC delta, if it publishes.
+    /// Refine the tag index of the assets `commit`, the RPC delta of
+    /// `step` applied inside the input open on `store`, publishes (a full
+    /// step's every stale row).
+    fn refine_scan_tags(
+        &self,
+        store: &mut Store,
+        step: &ScanStep,
+        commit: &mut Option<Commit>,
+    ) -> Result<(), String> {
+        let (tags, full) = match step {
+            ScanStep::Incremental(step) => (&step.tags, false),
+            ScanStep::Full(step) => (&step.tags, true),
+            _ => return Ok(()),
+        };
+        let (Some(authority), Some(commit)) = (tags.authority(), commit.as_mut()) else {
+            return Ok(());
+        };
+        crate::build::refine_tag_index(
+            crate::build::OpenInput::new(store).expect("tag-index refinement runs inside its input"),
+            tags.compiled.scanner().clone(),
+            authority,
+            tags.compiled.pipeline_snapshot(),
+            tags.compiled.build_targets(),
+            tags.max_dependency_depth,
+            commit,
+            full,
+        )
+    }
+
+    /// Apply `step` inside the input open on `store`. Returns its RPC
+    /// delta, if it publishes.
     fn apply_scan_step(
         &self,
         store: &mut Store,
         step: &ScanStep,
-        refine_tags: bool,
     ) -> Result<Option<Commit>, String> {
         match step {
             ScanStep::Unchanged => Ok(None),
@@ -973,7 +1011,7 @@ impl DaemonCoordinator {
                     authority: authority.as_deref(),
                     fresh: fresh_bundles(&step.delta),
                 };
-                let mut commit = publish_incremental_scan(
+                let commit = publish_incremental_scan(
                     store,
                     store.input_version(),
                     &step.delta,
@@ -984,19 +1022,6 @@ impl DaemonCoordinator {
                     tags.tag_epoch,
                 )
                 .map_err(|error| error.to_string())?;
-                if let Some(authority) = authority.filter(|_| refine_tags) {
-                    crate::build::refine_tag_index(
-                        crate::build::OpenInput::new(store)
-                            .expect("tag-index refinement runs inside its input"),
-                        tags.compiled.scanner().clone(),
-                        authority,
-                        tags.compiled.pipeline_snapshot(),
-                        tags.compiled.build_targets(),
-                        tags.max_dependency_depth,
-                        &mut commit,
-                        false,
-                    )?;
-                }
                 Ok(Some(commit))
             }
             ScanStep::Full(step) => {
@@ -1004,8 +1029,7 @@ impl DaemonCoordinator {
                 store
                     .input_transaction(|transaction| transaction.set_scan_rejection(None))
                     .map_err(|error| error.to_string())?;
-                let authority = tags.authority().filter(|_| refine_tags);
-                let mut commit = publish_scan(
+                let commit = publish_scan(
                     store,
                     store.input_version(),
                     step.candidate.clone(),
@@ -1018,19 +1042,6 @@ impl DaemonCoordinator {
                     &step.claims,
                 )
                 .map_err(|error| error.to_string())?;
-                if let Some(authority) = authority {
-                    crate::build::refine_tag_index(
-                        crate::build::OpenInput::new(store)
-                            .expect("tag-index refinement runs inside its input"),
-                        tags.compiled.scanner().clone(),
-                        authority,
-                        tags.compiled.pipeline_snapshot(),
-                        tags.compiled.build_targets(),
-                        tags.max_dependency_depth,
-                        &mut commit,
-                        true,
-                    )?;
-                }
                 Ok(Some(commit))
             }
             ScanStep::Rejection(step) => {
@@ -1119,14 +1130,15 @@ fn published_paths_work(
     paths: &[(String, String)],
 ) -> Result<PendingFileWork, String> {
     let mut dirty = Vec::with_capacity(paths.len());
-    for (root, path) in paths {
+    for (root_name, path) in paths {
         let root = store
-            .root_id(root)
+            .root_id(root_name)
             .map_err(|error| error.to_string())?
-            .ok_or_else(|| format!("import output root {root:?} is not interned"))?;
+            .ok_or_else(|| format!("import output root {root_name:?} is not interned"))?;
         dirty.push(distill_store::files::DirtyEntry {
             seq: 0,
             root,
+            root_name: root_name.clone(),
             path: path.clone(),
             exists: true,
             observation: store.input_version(),

@@ -2671,6 +2671,45 @@ mod tests {
         snapshot
     }
 
+    /// An incremental pass's import overlay holds the rows its delta
+    /// changes, not the subtree it rescanned: one edit under a root-wide
+    /// prefix gives the same overlay at 100 files as at 3000.
+    #[test]
+    fn an_incremental_overlay_holds_only_the_changed_rows_at_any_size() {
+        let overlay_len = |n: usize| {
+            let files = (0..n)
+                .map(|i| scanned(&format!("d{}/f{i}", i % 10), ScannedFileKind::File, 1))
+                .collect::<Vec<_>>();
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = distill_store::Store::open(distill_store::StoreConfig::new(
+                dir.path().join(".distill"),
+            ))
+            .unwrap();
+            let published = snapshot(files.clone());
+            store
+                .input_transaction(|txn| {
+                    let version = txn.version();
+                    let root = txn.intern_root("main")?;
+                    for (key, file) in published.file_observations() {
+                        txn.upsert_file(root, &key.1, &file, version)?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let mut observed = files;
+            observed[0] = scanned(&observed[0].0 .1.clone(), ScannedFileKind::File, 2);
+            let delta = ScanDelta {
+                affected: vec![("main".to_owned(), String::new())],
+                observed: snapshot(observed),
+            };
+            crate::coordinator::incremental_overlay(&store.reader().unwrap(), &delta)
+                .unwrap()
+                .len()
+        };
+        assert_eq!(overlay_len(100), 1);
+        assert_eq!(overlay_len(3000), 1);
+    }
+
     /// `dir.txt` and `dir-old` sort between `dir` and `dir/child`; a subtree
     /// walk that stops at the first key outside `dir` never reaches the child.
     #[test]

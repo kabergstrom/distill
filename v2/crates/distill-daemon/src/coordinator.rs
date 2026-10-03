@@ -42,7 +42,7 @@ use distill_store::served::{encode_authored_value, ResolutionRow};
 use distill_store::state::{
     AssetClaimant, CleanupDisposition, ConfigurationState, DirectoryAliasSide, DscpV1,
     InputVersion, PipelineFailure, PipelineFailureCode, PipelineFailureOrigin,
-    PipelineState as StoredPipelineState, ReadableBundleSource, ScanFailureCode, ScanSubject,
+    ReadableBundleSource, ScanFailureCode, ScanSubject,
     SkeletonFailureCode,
 };
 use distill_store::{Store, StoreConfig, StoreError, StoreOpener, StoreReader, StoreWriter};
@@ -3071,6 +3071,26 @@ fn prepare_incremental_publication(
 
 /// The `files` rows `delta` writes or removes: its observation against the
 /// published rows under its affected prefixes, read from `published`.
+/// What `delta` changes against `published`, as an import overlay: only
+/// the rows that differ.
+pub(crate) fn incremental_overlay(
+    published: &StoreReader,
+    delta: &ScanDelta,
+) -> Result<crate::importer::FileOverlay, StoreError> {
+    Ok(crate::importer::FileOverlay::of_changes(
+        incremental_file_mutations(published, delta)?
+            .into_iter()
+            .map(|mutation| {
+                let row = mutation.file.map(|file| distill_store::files::ObservedFile {
+                    root_name: mutation.root_name.clone(),
+                    path: mutation.path.clone(),
+                    file,
+                });
+                ((mutation.root_name, mutation.path), row)
+            }),
+    ))
+}
+
 fn incremental_file_mutations(
     published: &StoreReader,
     delta: &ScanDelta,
@@ -3129,7 +3149,7 @@ fn bundle_summary(source: &ScannedBundle) -> Result<BundleSummary, StoreError> {
     })
 }
 
-fn pipeline_diagnostic(failure: Option<distill_store::state::PipelineFailure>) -> PipelineDiagnostic {
+fn pipeline_diagnostic(failure: Option<PipelineFailure>) -> PipelineDiagnostic {
     match failure {
         None => PipelineDiagnostic::Ready,
         Some(error) => PipelineDiagnostic::Failed(error),

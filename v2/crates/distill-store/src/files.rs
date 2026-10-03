@@ -73,6 +73,8 @@ pub enum LogicalPathState {
 pub struct DirtyEntry {
     pub seq: i64,
     pub root: RootId,
+    /// The name `root` was interned from.
+    pub root_name: String,
     pub path: String,
     /// `true` = the path exists (create/update); `false` = deleted.
     pub exists: bool,
@@ -85,6 +87,8 @@ pub struct DirtyEntry {
 pub struct RenameEvent {
     pub seq: i64,
     pub root: RootId,
+    /// The name `root` was interned from.
+    pub root_name: String,
     pub from_path: String,
     pub to_path: String,
 }
@@ -161,7 +165,7 @@ pub struct ObservedBundleFile {
 impl InputTxn<'_> {
     /// Intern a root name to its process-local id, creating it if new.
     pub fn intern_root(&mut self, name: &str) -> Result<RootId, StoreError> {
-        intern_root(&self.txn, name)
+        interned_root(&self.txn, &mut self.roots, name)
     }
 
     /// Record the scanner's observation of one (root, path).
@@ -236,7 +240,7 @@ impl InputTxn<'_> {
     ) -> Result<(), StoreError> {
         clear_structure(&self.txn, under, true)?;
         for directory in directories {
-            let root = intern_root(&self.txn, &directory.root_name)?;
+            let root = interned_root(&self.txn, &mut self.roots, &directory.root_name)?;
             self.txn.execute(
                 "INSERT INTO directories(root_id, path, canonical_path, physical_path)
                  VALUES (?1, ?2, ?3, ?4)",
@@ -248,7 +252,7 @@ impl InputTxn<'_> {
                 ],
             )?;
         }
-        insert_diagnostics(&self.txn, diagnostics)
+        insert_diagnostics(&self.txn, &mut self.roots, diagnostics)
     }
 
     /// Queue pending work (§13's `dirty_files`).
@@ -279,15 +283,28 @@ impl InputTxn<'_> {
 
 pub(crate) fn intern_root(conn: &rusqlite::Connection, name: &str) -> Result<RootId, StoreError> {
     if let Some(id) = conn
-        .query_row("SELECT root_id FROM roots WHERE name = ?1", [name], |r| {
-            r.get(0)
-        })
+        .prepare_cached("SELECT root_id FROM roots WHERE name = ?1")?
+        .query_row([name], |r| r.get(0))
         .optional()?
     {
         return Ok(RootId(id));
     }
     conn.execute("INSERT INTO roots(name) VALUES (?1)", [name])?;
     Ok(RootId(conn.last_insert_rowid()))
+}
+
+/// [`intern_root`] through `memo`, the ids one transaction already holds.
+pub(crate) fn interned_root(
+    conn: &rusqlite::Connection,
+    memo: &mut std::collections::BTreeMap<String, RootId>,
+    name: &str,
+) -> Result<RootId, StoreError> {
+    if let Some(id) = memo.get(name) {
+        return Ok(*id);
+    }
+    let id = intern_root(conn, name)?;
+    memo.insert(name.to_owned(), id);
+    Ok(id)
 }
 
 /// The predicate selecting the rows of a table (aliased `t`, joined to
@@ -342,10 +359,11 @@ fn clear_structure(
 
 fn insert_diagnostics(
     conn: &rusqlite::Connection,
+    roots: &mut std::collections::BTreeMap<String, RootId>,
     diagnostics: &[ObservedDiagnostic],
 ) -> Result<(), StoreError> {
     for diagnostic in diagnostics {
-        let root = intern_root(conn, &diagnostic.root_name)?;
+        let root = interned_root(conn, roots, &diagnostic.root_name)?;
         conn.execute(
             "INSERT INTO scan_diagnostics(root_id, path, detail) VALUES (?1, ?2, ?3)
              ON CONFLICT(root_id, path) DO UPDATE SET detail = excluded.detail",
@@ -367,7 +385,7 @@ impl Store {
         self.write_txn(|store| {
             let transaction = store.read.conn.savepoint()?;
             clear_structure(&transaction, under, false)?;
-            insert_diagnostics(&transaction, diagnostics)?;
+            insert_diagnostics(&transaction, &mut Default::default(), diagnostics)?;
             transaction.commit()?;
             Ok(())
         })
@@ -427,17 +445,18 @@ impl StoreReader {
     pub fn pending_file_work(&self) -> Result<PendingFileWork, StoreError> {
         let mut dirty = Vec::new();
         {
-            let mut statement = self.conn.prepare(
-                "SELECT seq, root_id, path, exists_flag, observation
-                 FROM dirty_files ORDER BY seq ASC",
+            let mut statement = self.conn.prepare_cached(
+                "SELECT d.seq, d.root_id, r.name, d.path, d.exists_flag, d.observation
+                 FROM dirty_files d JOIN roots r USING (root_id) ORDER BY d.seq ASC",
             )?;
             let rows = statement.query_map([], |row| {
                 Ok(DirtyEntry {
                     seq: row.get(0)?,
                     root: RootId(row.get(1)?),
-                    path: row.get(2)?,
-                    exists: row.get::<_, i64>(3)? != 0,
-                    observation: InputVersion(row.get::<_, i64>(4)? as u64),
+                    root_name: row.get(2)?,
+                    path: row.get(3)?,
+                    exists: row.get::<_, i64>(4)? != 0,
+                    observation: InputVersion(row.get::<_, i64>(5)? as u64),
                 })
             })?;
             for row in rows {
@@ -446,15 +465,17 @@ impl StoreReader {
         }
         let mut renames = Vec::new();
         {
-            let mut statement = self.conn.prepare(
-                "SELECT seq, root_id, from_path, to_path FROM rename_events ORDER BY seq ASC",
+            let mut statement = self.conn.prepare_cached(
+                "SELECT e.seq, e.root_id, r.name, e.from_path, e.to_path
+                 FROM rename_events e JOIN roots r USING (root_id) ORDER BY e.seq ASC",
             )?;
             let rows = statement.query_map([], |row| {
                 Ok(RenameEvent {
                     seq: row.get(0)?,
                     root: RootId(row.get(1)?),
-                    from_path: row.get(2)?,
-                    to_path: row.get(3)?,
+                    root_name: row.get(2)?,
+                    from_path: row.get(3)?,
+                    to_path: row.get(4)?,
                 })
             })?;
             for row in rows {

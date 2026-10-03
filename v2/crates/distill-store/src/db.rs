@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 38;
+pub const SCHEMA_VERSION: u32 = 39;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -158,9 +158,13 @@ CREATE TABLE directory_rule_sources (
     rules_asset  BLOB NOT NULL,
     root_id      INTEGER NOT NULL,
     path         TEXT NOT NULL,
+    -- The directory, ending in `/` (`''` for the whole root), that every
+    -- path the rules' listing matches is under.
+    listing_dir  TEXT NOT NULL,
     PRIMARY KEY (rules_bundle, rules_asset)
 );
 CREATE INDEX directory_rule_sources_by_source ON directory_rule_sources(root_id, path);
+CREATE INDEX directory_rule_sources_by_listing ON directory_rule_sources(listing_dir);
 CREATE TABLE dirty_files (
     seq         INTEGER PRIMARY KEY AUTOINCREMENT,
     root_id     INTEGER NOT NULL,
@@ -826,6 +830,7 @@ impl Store {
             version,
             state_path,
             config,
+            roots: std::collections::BTreeMap::new(),
         };
         let out = f(&mut input_txn)?;
         if keep {
@@ -1185,6 +1190,10 @@ pub struct InputTxn<'a> {
     version: InputVersion,
     pub(crate) state_path: PathBuf,
     config: Arc<StoreConfig>,
+    /// The root ids this transaction interned or looked up, by name: a
+    /// memo of this transaction only (it rolls back with it), so a
+    /// publication's rows name their root without a lookup each.
+    pub(crate) roots: std::collections::BTreeMap<String, crate::files::RootId>,
 }
 
 impl InputTxn<'_> {
