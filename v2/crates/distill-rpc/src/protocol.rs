@@ -14,8 +14,10 @@ pub use distill_store::state::{
 
 /// 10: `Hub.importFailures`. 11: snapshot `runtimeTypePolicy`, batch-class
 /// `resolve`, `ASSET_NOT_FOUND` (pack over RPC). 12: snapshot
-/// `resolveNamed` (an asset by path and local id).
-pub const PROTOCOL_VERSION: u32 = 12;
+/// `resolveNamed` (an asset by path and local id). 13: the doctor request
+/// is `Verify` alone, a read-only report that publishes no version
+/// (`RebuildIndexes`, tag 3, is gone).
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// A watched import whose latest attempt failed. The bundle keeps serving its
 /// last good contents; the failure clears when a later import succeeds.
@@ -483,11 +485,11 @@ pub struct RenameWithFixupsRequest {
     pub destination_path: String,
 }
 
-/// Closed maintenance request carried by [`LongRunningOp::Doctor`].
+/// Closed request carried by [`LongRunningOp::Doctor`]. Doctor reports;
+/// it never changes the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DoctorRequest {
     Verify,
-    RebuildIndexes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -539,7 +541,6 @@ impl DoctorRequest {
         let mut reader = OperationPayloadReader::new(bytes)?;
         let request = match reader.u8()? {
             1 => Self::Verify,
-            3 => Self::RebuildIndexes,
             tag => return Err(OperationPayloadError::InvalidTag(tag)),
         };
         reader.finish()?;
@@ -549,7 +550,6 @@ impl DoctorRequest {
     const fn tag(self) -> u8 {
         match self {
             Self::Verify => 1,
-            Self::RebuildIndexes => 3,
         }
     }
 }

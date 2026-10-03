@@ -369,10 +369,6 @@ impl OperationRuntime {
                 defects.extend(build_defects);
                 (!defects.is_empty()).then(|| defects.join("; "))
             }
-            DoctorRequest::RebuildIndexes => {
-                store.rebuild_indexes().map_err(|error| error.to_string())?;
-                None
-            }
         };
         self.advance_empty(store, base, terminal_error)
     }

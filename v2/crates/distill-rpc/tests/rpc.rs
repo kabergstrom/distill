@@ -2407,18 +2407,22 @@ fn long_running_operation_payloads_are_canonical_and_closed() {
         rename
     );
 
-    for request in [DoctorRequest::Verify, DoctorRequest::RebuildIndexes] {
-        assert_eq!(DoctorRequest::decode(&request.encode()).unwrap(), request);
-    }
+    assert_eq!(
+        DoctorRequest::decode(&DoctorRequest::Verify.encode()).unwrap(),
+        DoctorRequest::Verify
+    );
     assert_eq!(
         DoctorRequest::decode(&[1, 99]),
         Err(OperationPayloadError::InvalidTag(99))
     );
-    // Tag 2 was the retired displaced-inode clean.
-    assert_eq!(
-        DoctorRequest::decode(&[1, 2]),
-        Err(OperationPayloadError::InvalidTag(2))
-    );
+    // Tag 2 was the retired displaced-inode clean, tag 3 the retired
+    // index rebuild: doctor only reports.
+    for retired in [2, 3] {
+        assert_eq!(
+            DoctorRequest::decode(&[1, retired]),
+            Err(OperationPayloadError::InvalidTag(retired))
+        );
+    }
 }
 
 #[test]

@@ -223,9 +223,6 @@ fn a_reader_connection_observes_each_commit_and_cannot_write() {
     let (_, version) = store.input_transaction(|_txn| Ok(())).unwrap();
     assert_eq!(reader.input_version().unwrap(), version, "no cached counter");
     assert_eq!(reader.stamp().unwrap(), store.stamp().unwrap());
-
-    // The reader is a read-only SQLite connection, not a second writer.
-    assert!(reader.rebuild_indexes().is_err());
 }
 
 #[test]

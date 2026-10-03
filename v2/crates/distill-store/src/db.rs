@@ -1095,14 +1095,6 @@ impl StoreReader {
         &self.config
     }
 
-    /// Rebuild every SQLite index from authoritative table rows. This is a
-    /// maintenance action only; callers publish its input-version event in the
-    /// same transaction boundary as their other doctor result state.
-    pub fn rebuild_indexes(&self) -> Result<(), StoreError> {
-        self.conn.execute_batch("REINDEX")?;
-        Ok(())
-    }
-
     /// Test hook: call `hook` with each SQL statement this reader's own
     /// connection runs, its parameters expanded; `None` stops.
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1355,5 +1347,19 @@ fn meta_get_u64_or_init(conn: &Connection, key: &str) -> Result<u64, StoreError>
             meta_set_u64(conn, key, 0)?;
             Ok(0)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reader is a read-only SQLite connection, not a second writer.
+    #[test]
+    fn a_reader_connection_cannot_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreConfig::new(dir.path().join("state"))).unwrap();
+        let reader = store.reader().unwrap();
+        assert!(reader.conn.execute_batch("CREATE TABLE written (x)").is_err());
     }
 }
