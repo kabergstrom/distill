@@ -2355,7 +2355,7 @@ fn publish_scan(
         derived_outputs.clone(),
         &rpc_publishable_bundles,
     )?;
-    let mut next_pipeline = pipeline_diagnostic(store.pipeline_state()?);
+    let mut next_pipeline = pipeline_diagnostic(store.pipeline_failure()?);
     let mut configuration = None;
     store.input_transaction(|transaction| {
         // Rows are labelled with the version the input publishes, which a
@@ -2915,11 +2915,10 @@ fn prepare_incremental_publication(
         .keys()
         .map(|child| Ok((*child, store.derived_output_row(*child)?)))
         .collect::<Result<BTreeMap<_, _>, StoreError>>()?;
-    let stored_pipeline = store.pipeline_state()?;
     let mut commit = Commit {
         // Selected from the store's errors in the publishing input.
         configuration: None,
-        pipeline: Some(pipeline_diagnostic(stored_pipeline)),
+        pipeline: Some(pipeline_diagnostic(store.pipeline_failure()?)),
         namespace_errors: Some(plan.namespace_errors.clone()),
         tag_poisons: Some(BTreeMap::new()),
         ..Commit::default()
@@ -3130,10 +3129,10 @@ fn bundle_summary(source: &ScannedBundle) -> Result<BundleSummary, StoreError> {
     })
 }
 
-fn pipeline_diagnostic(state: Option<StoredPipelineState>) -> PipelineDiagnostic {
-    match state {
-        Some(StoredPipelineState::Ready(_)) | None => PipelineDiagnostic::Ready,
-        Some(StoredPipelineState::Failed { error, .. }) => PipelineDiagnostic::Failed(error),
+fn pipeline_diagnostic(failure: Option<distill_store::state::PipelineFailure>) -> PipelineDiagnostic {
+    match failure {
+        None => PipelineDiagnostic::Ready,
+        Some(error) => PipelineDiagnostic::Failed(error),
     }
 }
 

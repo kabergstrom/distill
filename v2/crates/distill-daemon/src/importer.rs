@@ -2669,13 +2669,10 @@ fn current_type_schema(
     if let Some(project) = authority.and_then(|authority| authority.project_type(type_uuid)) {
         return Ok((project.logical_hash, project.logical_schema.clone()));
     }
-    let hash = match store.pipeline_state().map_err(invalid)? {
-        Some(distill_store::state::PipelineState::Ready(epoch)) => {
-            epoch.schema_registry.get(&type_uuid).copied()
-        }
-        _ => None,
-    }
-    .ok_or_else(|| invalid(format!("output type {type_uuid} has no current schema")))?;
+    let hash = store
+        .ready_schema_hash(type_uuid)
+        .map_err(invalid)?
+        .ok_or_else(|| invalid(format!("output type {type_uuid} has no current schema")))?;
     let snapshot = store
         .schema(hash)
         .map_err(invalid)?
