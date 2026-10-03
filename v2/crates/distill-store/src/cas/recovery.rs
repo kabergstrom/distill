@@ -114,10 +114,9 @@ impl Store {
                     .conn
                     .execute("DELETE FROM cas_segments WHERE segment_id = ?1", [*id as i64])?;
             }
-            store.conn.execute(
-                "UPDATE cas_segments SET state = ?1 WHERE state = ?2",
-                [SEGMENT_SEALED, SEGMENT_OPEN],
-            )?;
+            store.conn
+                .prepare_cached("UPDATE cas_segments SET state = ?1 WHERE state = ?2")?
+                .execute([SEGMENT_SEALED, SEGMENT_OPEN])?;
             Ok(())
         })?;
 

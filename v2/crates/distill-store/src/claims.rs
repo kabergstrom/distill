@@ -163,24 +163,27 @@ fn mark_asset_dependents_pending(
     };
     for claimant in claimants {
         if let AssetClaimant::Authored { bundle, .. } = decode_asset_claimant(&claimant)? {
-            conn.execute(
-                "INSERT OR IGNORE INTO claim_pending(kind, subject) VALUES (?1, ?2)",
-                rusqlite::params![BUNDLE, bundle.0.as_slice()],
-            )?;
+            conn
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO claim_pending(kind, subject) VALUES (?1, ?2)",
+                )?
+                .execute(rusqlite::params![BUNDLE, bundle.0.as_slice()])?;
         }
     }
-    conn.execute(
-        "INSERT OR IGNORE INTO claim_pending(kind, subject)
+    conn
+        .prepare_cached(
+            "INSERT OR IGNORE INTO claim_pending(kind, subject)
          SELECT ?1, ?2 WHERE EXISTS (
              SELECT 1 FROM source_claims WHERE kind = ?1 AND subject = ?2)",
-        rusqlite::params![DERIVED, asset],
-    )?;
+        )?
+        .execute(rusqlite::params![DERIVED, asset])?;
     // `OR IGNORE` drops the repeats.
-    conn.execute(
-        "INSERT OR IGNORE INTO claim_pending(kind, subject)
+    conn
+        .prepare_cached(
+            "INSERT OR IGNORE INTO claim_pending(kind, subject)
          SELECT kind, subject FROM source_claims WHERE kind = ?1 AND claimant = ?2",
-        rusqlite::params![PRIMARY_PATH, asset],
-    )?;
+        )?
+        .execute(rusqlite::params![PRIMARY_PATH, asset])?;
     Ok(())
 }
 
@@ -239,10 +242,11 @@ impl InputTxn<'_> {
         for (kind, subject) in &touched {
             if let Some(group) = collision_group(*kind) {
                 if refreshed.insert((group, subject.clone())) {
-                    let collided = conn.execute(
-                        "DELETE FROM claim_collisions WHERE grp = ?1 AND subject = ?2",
-                        rusqlite::params![group, subject],
-                    )? > 0;
+                    let collided = conn
+                        .prepare_cached(
+                            "DELETE FROM claim_collisions WHERE grp = ?1 AND subject = ?2",
+                        )?
+                        .execute(rusqlite::params![group, subject])? > 0;
                     let claimants: i64 = conn.query_row(
                         &format!(
                             "SELECT COUNT(DISTINCT claimant) FROM source_claims
@@ -253,10 +257,11 @@ impl InputTxn<'_> {
                         |row| row.get(0),
                     )?;
                     if claimants > 1 {
-                        conn.execute(
-                            "INSERT INTO claim_collisions(grp, subject) VALUES (?1, ?2)",
-                            rusqlite::params![group, subject],
-                        )?;
+                        conn
+                            .prepare_cached(
+                                "INSERT INTO claim_collisions(grp, subject) VALUES (?1, ?2)",
+                            )?
+                            .execute(rusqlite::params![group, subject])?;
                     }
                     if group == ASSET_GROUP && collided != (claimants > 1) {
                         mark_asset_dependents_pending(conn, subject)?;
@@ -264,10 +269,11 @@ impl InputTxn<'_> {
                 }
             }
             if matches!(*kind, BUNDLE | DERIVED | PRIMARY_PATH) {
-                conn.execute(
-                    "INSERT OR IGNORE INTO claim_pending(kind, subject) VALUES (?1, ?2)",
-                    rusqlite::params![kind, subject],
-                )?;
+                conn
+                    .prepare_cached(
+                        "INSERT OR IGNORE INTO claim_pending(kind, subject) VALUES (?1, ?2)",
+                    )?
+                    .execute(rusqlite::params![kind, subject])?;
             }
         }
         Ok(())
@@ -330,12 +336,16 @@ impl InputTxn<'_> {
                  GROUP BY g, subject HAVING COUNT(DISTINCT claimant) > 1;",
             )?;
         }
-        conn.execute("DELETE FROM claim_pending", [])?;
+        conn
+            .prepare_cached("DELETE FROM claim_pending")?
+            .execute([])?;
         Ok(())
     }
 
     pub fn clear_pending_claims(&mut self) -> Result<(), StoreError> {
-        self.txn.execute("DELETE FROM claim_pending", [])?;
+        self.txn
+            .prepare_cached("DELETE FROM claim_pending")?
+            .execute([])?;
         Ok(())
     }
 }

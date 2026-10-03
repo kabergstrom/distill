@@ -368,13 +368,16 @@ impl StoreReader {
         let Some(meta) = self.served_entry_meta(asset)? else {
             return Ok(None);
         };
-        let (schema_json, authored_value) = self.conn.query_row(
-            "SELECT s.schema_json, a.authored_value
+        let (schema_json, authored_value) = self.conn
+            .prepare_cached(
+                "SELECT s.schema_json, a.authored_value
              FROM assets a JOIN schemas s ON s.logical_hash = a.logical_hash
              WHERE a.asset_uuid = ?1",
-            [asset.0.as_slice()],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
-        )?;
+            )?
+            .query_row(
+                [asset.0.as_slice()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )?;
         Ok(Some(ServedEntry {
             meta,
             schema_json,
@@ -636,11 +639,12 @@ impl StoreReader {
 
     /// Whether the CAS indexes this hash.
     pub fn cas_contains(&self, hash: &[u8; 32]) -> Result<bool, StoreError> {
-        Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM cas_extents WHERE content_hash = ?1)",
-            [hash.as_slice()],
-            |row| row.get(0),
-        )?)
+        Ok(self.conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM cas_extents WHERE content_hash = ?1)")?
+            .query_row(
+                [hash.as_slice()],
+                |row| row.get(0),
+            )?)
     }
 }
 
@@ -794,10 +798,9 @@ pub trait ServedWrite {
     ) -> Result<(), StoreError> {
         let conn = self.served_conn();
         let Some(row) = row else {
-            conn.execute(
-                "DELETE FROM asset_resolutions WHERE asset_uuid = ?1",
-                [asset.0.as_slice()],
-            )?;
+            conn
+                .prepare_cached("DELETE FROM asset_resolutions WHERE asset_uuid = ?1")?
+                .execute([asset.0.as_slice()])?;
             return Ok(());
         };
         let (kind, hash, detail, deleted): (i64, Option<Vec<u8>>, Option<Vec<u8>>, Option<i64>) =
@@ -808,14 +811,15 @@ pub trait ServedWrite {
                 ResolutionRow::Failed(error) => (3, None, Some(error.clone().into_bytes()), None),
                 ResolutionRow::Deleted(version) => (4, None, None, Some(version.0 as i64)),
             };
-        conn.execute(
-            "INSERT INTO asset_resolutions(asset_uuid, kind, content_hash, detail, deleted_version)
+        conn
+            .prepare_cached(
+                "INSERT INTO asset_resolutions(asset_uuid, kind, content_hash, detail, deleted_version)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(asset_uuid) DO UPDATE SET
                kind = excluded.kind, content_hash = excluded.content_hash,
                detail = excluded.detail, deleted_version = excluded.deleted_version",
-            rusqlite::params![asset.0.as_slice(), kind, hash, detail, deleted],
-        )?;
+            )?
+            .execute(rusqlite::params![asset.0.as_slice(), kind, hash, detail, deleted])?;
         Ok(())
     }
 
@@ -824,26 +828,29 @@ pub trait ServedWrite {
         let conn = self.served_conn();
         let version = version.0 as i64;
         match change {
-            Change::Asset { asset, state } => conn.execute(
-                "INSERT INTO change_log(version, kind, asset_uuid, state) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![version, CHANGE_ASSET, asset.0.as_slice(), *state as i64],
-            )?,
-            Change::Path { path } => conn.execute(
-                "INSERT INTO change_log(version, kind, subject) VALUES (?1, ?2, ?3)",
-                rusqlite::params![version, CHANGE_PATH, path],
-            )?,
-            Change::ReconnectAll { reason } => conn.execute(
-                "INSERT INTO change_log(version, kind, state) VALUES (?1, ?2, ?3)",
-                rusqlite::params![version, CHANGE_RECONNECT_ALL, *reason as i64],
-            )?,
-            Change::ReconnectTarget { target, reason } => conn.execute(
-                "INSERT INTO change_log(version, kind, state, subject) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![version, CHANGE_RECONNECT_TARGET, *reason as i64, target],
-            )?,
-            Change::RestartRequired { keys } => conn.execute(
-                "INSERT INTO change_log(version, kind, detail) VALUES (?1, ?2, ?3)",
-                rusqlite::params![version, CHANGE_RESTART, encode_keys(keys)],
-            )?,
+            Change::Asset { asset, state } => conn
+                .prepare_cached(
+                    "INSERT INTO change_log(version, kind, asset_uuid, state) VALUES (?1, ?2, ?3, ?4)",
+                )?
+                .execute(rusqlite::params![version, CHANGE_ASSET, asset.0.as_slice(), *state as i64])?,
+            Change::Path { path } => conn
+                .prepare_cached(
+                    "INSERT INTO change_log(version, kind, subject) VALUES (?1, ?2, ?3)",
+                )?
+                .execute(rusqlite::params![version, CHANGE_PATH, path])?,
+            Change::ReconnectAll { reason } => conn
+                .prepare_cached("INSERT INTO change_log(version, kind, state) VALUES (?1, ?2, ?3)")?
+                .execute(rusqlite::params![version, CHANGE_RECONNECT_ALL, *reason as i64])?,
+            Change::ReconnectTarget { target, reason } => conn
+                .prepare_cached(
+                    "INSERT INTO change_log(version, kind, state, subject) VALUES (?1, ?2, ?3, ?4)",
+                )?
+                .execute(rusqlite::params![version, CHANGE_RECONNECT_TARGET, *reason as i64, target])?,
+            Change::RestartRequired { keys } => conn
+                .prepare_cached(
+                    "INSERT INTO change_log(version, kind, detail) VALUES (?1, ?2, ?3)",
+                )?
+                .execute(rusqlite::params![version, CHANGE_RESTART, encode_keys(keys)])?,
         };
         Ok(())
     }
@@ -855,7 +862,9 @@ pub trait ServedWrite {
         let oldest = meta_get_u64(conn, CHANGE_LOG_OLDEST)?.unwrap_or(0);
         let floor = current.0.saturating_sub(retained);
         if floor > oldest {
-            conn.execute("DELETE FROM change_log WHERE version <= ?1", [floor as i64])?;
+            conn
+                .prepare_cached("DELETE FROM change_log WHERE version <= ?1")?
+                .execute([floor as i64])?;
             meta_set_u64(conn, CHANGE_LOG_OLDEST, floor)?;
         }
         Ok(())
@@ -865,10 +874,9 @@ pub trait ServedWrite {
     /// cursor.
     fn discard_change_log_before(&mut self, oldest: InputVersion) -> Result<(), StoreError> {
         let conn = self.served_conn();
-        conn.execute(
-            "DELETE FROM change_log WHERE version <= ?1",
-            [oldest.0 as i64],
-        )?;
+        conn
+            .prepare_cached("DELETE FROM change_log WHERE version <= ?1")?
+            .execute([oldest.0 as i64])?;
         meta_set_u64(conn, CHANGE_LOG_OLDEST, oldest.0)
     }
 
@@ -887,7 +895,9 @@ pub trait ServedWrite {
         match value {
             Some(value) => meta_set_blob(conn, key, value),
             None => {
-                conn.execute("DELETE FROM store_meta WHERE key = ?1", [key])?;
+                conn
+                    .prepare_cached("DELETE FROM store_meta WHERE key = ?1")?
+                    .execute([key])?;
                 Ok(())
             }
         }
@@ -924,17 +934,19 @@ pub trait ServedWrite {
         match existing {
             Some((hash, _)) if hash == definition_hash => Ok(false),
             Some((_, generation)) => {
-                conn.execute(
-                    "UPDATE rpc_targets SET definition_hash = ?2, generation = ?3 WHERE name = ?1",
-                    rusqlite::params![name, definition_hash.as_slice(), generation + 1],
-                )?;
+                conn
+                    .prepare_cached(
+                        "UPDATE rpc_targets SET definition_hash = ?2, generation = ?3 WHERE name = ?1",
+                    )?
+                    .execute(rusqlite::params![name, definition_hash.as_slice(), generation + 1])?;
                 Ok(true)
             }
             None => {
-                conn.execute(
-                    "INSERT INTO rpc_targets(name, definition_hash, generation) VALUES (?1, ?2, 0)",
-                    rusqlite::params![name, definition_hash.as_slice()],
-                )?;
+                conn
+                    .prepare_cached(
+                        "INSERT INTO rpc_targets(name, definition_hash, generation) VALUES (?1, ?2, 0)",
+                    )?
+                    .execute(rusqlite::params![name, definition_hash.as_slice()])?;
                 Ok(false)
             }
         }
@@ -992,12 +1004,15 @@ pub trait ServedWrite {
     /// own synthetic root row; no roles are checked (embedded RPC stores).
     fn set_served_path(&mut self, path: &str, candidates: &BTreeSet<AssetUuid>) -> Result<(), StoreError> {
         let conn = self.served_conn();
-        conn.execute("DELETE FROM path_index WHERE path = ?1", [path])?;
+        conn
+            .prepare_cached("DELETE FROM path_index WHERE path = ?1")?
+            .execute([path])?;
         for (root, asset) in candidates.iter().enumerate() {
-            conn.execute(
-                "INSERT INTO path_index(path, root_id, asset_uuid) VALUES (?1, ?2, ?3)",
-                rusqlite::params![path, root as i64, asset.0.as_slice()],
-            )?;
+            conn
+                .prepare_cached(
+                    "INSERT INTO path_index(path, root_id, asset_uuid) VALUES (?1, ?2, ?3)",
+                )?
+                .execute(rusqlite::params![path, root as i64, asset.0.as_slice()])?;
         }
         Ok(())
     }
@@ -1010,23 +1025,25 @@ pub trait ServedWrite {
     ) -> Result<(), StoreError> {
         let conn = self.served_conn();
         match row {
-            Some(row) => conn.execute(
-                "INSERT INTO derived_outputs(child_uuid, parent_uuid, output_key, terminal_type)
+            Some(row) => conn
+                .prepare_cached(
+                    "INSERT INTO derived_outputs(child_uuid, parent_uuid, output_key, terminal_type)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(child_uuid) DO UPDATE SET
                    parent_uuid = excluded.parent_uuid, output_key = excluded.output_key,
                    terminal_type = excluded.terminal_type",
-                rusqlite::params![
-                    child.0.as_slice(),
-                    row.parent.0.as_slice(),
-                    row.output_key,
-                    row.terminal_type.0.as_slice()
-                ],
-            )?,
-            None => conn.execute(
-                "DELETE FROM derived_outputs WHERE child_uuid = ?1",
-                [child.0.as_slice()],
-            )?,
+                )?
+                .execute(
+                    rusqlite::params![
+                        child.0.as_slice(),
+                        row.parent.0.as_slice(),
+                        row.output_key,
+                        row.terminal_type.0.as_slice()
+                    ],
+                )?,
+            None => conn
+                .prepare_cached("DELETE FROM derived_outputs WHERE child_uuid = ?1")?
+                .execute([child.0.as_slice()])?,
         };
         Ok(())
     }
@@ -1043,15 +1060,15 @@ pub trait ServedWrite {
         tags: &BTreeMap<String, Option<String>>,
     ) -> Result<(), StoreError> {
         let conn = self.served_conn();
-        conn.execute(
-            "DELETE FROM asset_tags WHERE asset_uuid = ?1",
-            [asset.0.as_slice()],
-        )?;
+        conn
+            .prepare_cached("DELETE FROM asset_tags WHERE asset_uuid = ?1")?
+            .execute([asset.0.as_slice()])?;
         for (tag, value) in tags {
-            conn.execute(
-                "INSERT INTO asset_tags(asset_uuid, tag, value) VALUES (?1, ?2, ?3)",
-                rusqlite::params![asset.0.as_slice(), tag, value],
-            )?;
+            conn
+                .prepare_cached(
+                    "INSERT INTO asset_tags(asset_uuid, tag, value) VALUES (?1, ?2, ?3)",
+                )?
+                .execute(rusqlite::params![asset.0.as_slice(), tag, value])?;
         }
         Ok(())
     }
@@ -1064,18 +1081,18 @@ pub trait ServedWrite {
     ) -> Result<(), StoreError> {
         let conn = self.served_conn();
         match poison {
-            Some(poison) => conn.execute(
-                "INSERT INTO asset_tag_index(asset_uuid, type_uuid, tag_epoch, trace, poison)
+            Some(poison) => conn
+                .prepare_cached(
+                    "INSERT INTO asset_tag_index(asset_uuid, type_uuid, tag_epoch, trace, poison)
                  VALUES (?1, (SELECT type_uuid FROM assets WHERE asset_uuid = ?1), zeroblob(32),
                          X'', ?2)
                  ON CONFLICT(asset_uuid) DO UPDATE SET
                    type_uuid = excluded.type_uuid, poison = excluded.poison",
-                rusqlite::params![asset.0.as_slice(), poison],
-            )?,
-            None => conn.execute(
-                "UPDATE asset_tag_index SET poison = NULL WHERE asset_uuid = ?1",
-                [asset.0.as_slice()],
-            )?,
+                )?
+                .execute(rusqlite::params![asset.0.as_slice(), poison])?,
+            None => conn
+                .prepare_cached("UPDATE asset_tag_index SET poison = NULL WHERE asset_uuid = ?1")?
+                .execute([asset.0.as_slice()])?,
         };
         Ok(())
     }

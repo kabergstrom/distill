@@ -567,8 +567,9 @@ impl InputTxn<'_> {
     ) -> Result<(), StoreError> {
         validate_target_set(&epoch.target_set)?;
         validate_bootstrap_schema_registry(&epoch.schema_registry)?;
-        self.txn.execute(
-            "INSERT INTO pipeline_state(
+        self.txn
+            .prepare_cached(
+                "INSERT INTO pipeline_state(
                  id, dylib_hash, input_version,
                  poison_code, poison_origin, poison_cleanup, poison_identity, poison_message
              ) VALUES (0, ?1, ?2, NULL, NULL, NULL, NULL, NULL)
@@ -580,18 +581,21 @@ impl InputTxn<'_> {
                poison_cleanup = NULL,
                poison_identity = NULL,
                poison_message = NULL",
-            rusqlite::params![epoch.dylib_hash.as_slice(), self.version().0 as i64,],
-        )?;
-        self.txn.execute("DELETE FROM registrations", [])?;
+            )?
+            .execute(rusqlite::params![epoch.dylib_hash.as_slice(), self.version().0 as i64,])?;
+        self.txn
+            .prepare_cached("DELETE FROM registrations")?
+            .execute([])?;
         for reg in &epoch.registrations {
             let kind = match reg.kind {
                 RegistrationKind::Importer => 0i64,
                 RegistrationKind::Processor => 1i64,
             };
-            self.txn.execute(
-                "INSERT INTO registrations(kind, reg_id, version) VALUES (?1, ?2, ?3)",
-                rusqlite::params![kind, reg.id, reg.version],
-            )?;
+            self.txn
+                .prepare_cached(
+                    "INSERT INTO registrations(kind, reg_id, version) VALUES (?1, ?2, ?3)",
+                )?
+                .execute(rusqlite::params![kind, reg.id, reg.version])?;
         }
         replace_schema_registry(&self.txn, &epoch.schema_registry)?;
         replace_target_set(&self.txn, &epoch.target_set)?;
@@ -609,8 +613,9 @@ impl InputTxn<'_> {
         failure
             .validate()
             .map_err(StoreError::InvalidPipelineFailure)?;
-        self.txn.execute(
-            "INSERT INTO pipeline_state(
+        self.txn
+            .prepare_cached(
+                "INSERT INTO pipeline_state(
                  id, dylib_hash, input_version,
                  poison_code, poison_origin, poison_cleanup, poison_identity, poison_message
              ) VALUES (0, NULL, ?1, ?2, ?3, ?4, ?5, ?6)
@@ -621,15 +626,17 @@ impl InputTxn<'_> {
                poison_cleanup = excluded.poison_cleanup,
                poison_identity = excluded.poison_identity,
                poison_message = excluded.poison_message",
-            rusqlite::params![
-                self.version().0 as i64,
-                failure.code as u16,
-                failure.origin as u16,
-                failure.cleanup as u16,
-                failure.identity.as_slice(),
-                failure.message,
-            ],
-        )?;
+            )?
+            .execute(
+                rusqlite::params![
+                    self.version().0 as i64,
+                    failure.code as u16,
+                    failure.origin as u16,
+                    failure.cleanup as u16,
+                    failure.identity.as_slice(),
+                    failure.message,
+                ],
+            )?;
         Ok(())
     }
 
@@ -684,20 +691,23 @@ impl InputTxn<'_> {
                 None
             }
         };
-        self.txn.execute(
-            "INSERT INTO tools(tool_key, present, identity_object, tool_hash, input_version)
+        self.txn
+            .prepare_cached(
+                "INSERT INTO tools(tool_key, present, identity_object, tool_hash, input_version)
              VALUES (?1, 1, ?2, ?3, ?4)
              ON CONFLICT(tool_key, input_version) DO UPDATE SET
                present = 1,
                identity_object = excluded.identity_object,
                tool_hash = excluded.tool_hash",
-            rusqlite::params![
-                key,
-                identity_object,
-                tool_hash.as_slice(),
-                self.version().0 as i64,
-            ],
-        )?;
+            )?
+            .execute(
+                rusqlite::params![
+                    key,
+                    identity_object,
+                    tool_hash.as_slice(),
+                    self.version().0 as i64,
+                ],
+            )?;
         Ok(RegisteredTool {
             key: key.to_owned(),
             root,
@@ -741,15 +751,16 @@ impl InputTxn<'_> {
         }
         let current = tools.keys().cloned().collect::<BTreeSet<_>>();
         for removed in previous.difference(&current) {
-            self.txn.execute(
-                "INSERT INTO tools(tool_key, present, identity_object, tool_hash, input_version)
+            self.txn
+                .prepare_cached(
+                    "INSERT INTO tools(tool_key, present, identity_object, tool_hash, input_version)
                  VALUES (?1, 0, X'', ?2, ?3)
                  ON CONFLICT(tool_key, input_version) DO UPDATE SET
                    present = 0,
                    identity_object = X'',
                    tool_hash = excluded.tool_hash",
-                rusqlite::params![removed, [0_u8; 32].as_slice(), self.version().0 as i64,],
-            )?;
+                )?
+                .execute(rusqlite::params![removed, [0_u8; 32].as_slice(), self.version().0 as i64,])?;
         }
         Ok(staged)
     }
@@ -783,12 +794,15 @@ fn replace_schema_registry(
     conn: &rusqlite::Connection,
     registry: &BTreeMap<TypeUuid, LogicalHash>,
 ) -> Result<(), StoreError> {
-    conn.execute("DELETE FROM pipeline_schema_registry", [])?;
+    conn
+        .prepare_cached("DELETE FROM pipeline_schema_registry")?
+        .execute([])?;
     for (type_uuid, logical_hash) in registry {
-        conn.execute(
-            "INSERT INTO pipeline_schema_registry(type_uuid, logical_hash) VALUES (?1, ?2)",
-            rusqlite::params![type_uuid.0.as_slice(), logical_hash.0.as_slice()],
-        )?;
+        conn
+            .prepare_cached(
+                "INSERT INTO pipeline_schema_registry(type_uuid, logical_hash) VALUES (?1, ?2)",
+            )?
+            .execute(rusqlite::params![type_uuid.0.as_slice(), logical_hash.0.as_slice()])?;
     }
     Ok(())
 }
@@ -873,12 +887,15 @@ fn replace_target_set(
     target_set: &CanonicalTargetSet,
 ) -> Result<(), StoreError> {
     validate_target_set(target_set)?;
-    conn.execute("DELETE FROM pipeline_target_set", [])?;
+    conn
+        .prepare_cached("DELETE FROM pipeline_target_set")?
+        .execute([])?;
     for row in &target_set.rows {
-        conn.execute(
-            "INSERT INTO pipeline_target_set(name, target_definition_hash) VALUES (?1, ?2)",
-            rusqlite::params![row.name, row.target_definition_hash.as_slice()],
-        )?;
+        conn
+            .prepare_cached(
+                "INSERT INTO pipeline_target_set(name, target_definition_hash) VALUES (?1, ?2)",
+            )?
+            .execute(rusqlite::params![row.name, row.target_definition_hash.as_slice()])?;
     }
     Ok(())
 }
@@ -950,23 +967,26 @@ impl Store {
                     already_unavailable,
                 });
             }
-            let changed = transaction.execute(
-                "UPDATE pipeline_state SET
+            let changed = transaction
+                .prepare_cached(
+                    "UPDATE pipeline_state SET
                      poison_code = ?1,
                      poison_origin = ?2,
                      poison_cleanup = ?3,
                      poison_identity = ?4,
                      poison_message = ?5
                  WHERE id = 0 AND dylib_hash = ?6 AND poison_code IS NULL",
-                rusqlite::params![
-                    failure.code as u16,
-                    failure.origin as u16,
-                    failure.cleanup as u16,
-                    failure.identity.as_slice(),
-                    failure.message,
-                    expected_dylib_hash.as_slice(),
-                ],
-            )?;
+                )?
+                .execute(
+                    rusqlite::params![
+                        failure.code as u16,
+                        failure.origin as u16,
+                        failure.cleanup as u16,
+                        failure.identity.as_slice(),
+                        failure.message,
+                        expected_dylib_hash.as_slice(),
+                    ],
+                )?;
             if changed != 1 {
                 return Err(StoreError::StalePublishedPipeline {
                     expected: expected_dylib_hash,

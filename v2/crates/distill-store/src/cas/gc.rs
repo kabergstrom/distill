@@ -219,7 +219,9 @@ impl Store {
         let cache_limit = self.config.cache_limit;
         self.write_txn(|store| {
             let txn = &*store.conn;
-            let mut live_bytes = txn.query_row(LIVE_BYTES, [], |r| r.get::<_, i64>(0))? as u64;
+            let mut live_bytes = txn
+                .prepare_cached(LIVE_BYTES)?
+                .query_row([], |r| r.get::<_, i64>(0))? as u64;
             let mut evicted = 0usize;
             while live_bytes > cache_limit && evicted < MAX_VICTIMS {
                 let sample = |sql| {
@@ -526,10 +528,11 @@ impl SegmentSweeper {
         fsync_dir(&store.cas.dir)?;
         store.write_txn(|store| {
             for id in &deleted {
-                store.conn.execute(
-                    "DELETE FROM cas_segments WHERE segment_id = ?1 AND state = ?2",
-                    rusqlite::params![*id as i64, SEGMENT_DEAD],
-                )?;
+                store.conn
+                    .prepare_cached(
+                        "DELETE FROM cas_segments WHERE segment_id = ?1 AND state = ?2",
+                    )?
+                    .execute(rusqlite::params![*id as i64, SEGMENT_DEAD])?;
             }
             Ok(())
         })?;

@@ -1050,6 +1050,7 @@ impl StoreReader {
                 | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
         let found: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if found != SCHEMA_VERSION {
             return Err(StoreError::SchemaVersionMismatch {
@@ -1244,12 +1245,20 @@ impl InputTxn<'_> {
     }
 }
 
+/// Prepared statements a connection keeps. Every fixed statement the store
+/// runs is prepared once per connection and reused: a per-row write in a
+/// publication loop costs its execution, not a parse. Larger than the
+/// store's distinct fixed statements, so a loop's statements never evict
+/// one another.
+const STATEMENT_CACHE_CAPACITY: usize = 512;
+
 /// A write connection: WAL, a busy timeout (writers queue on SQLite's write
 /// lock), foreign keys, and FULL sync.
 fn open_writer_connection(db_path: &Path) -> Result<Connection, StoreError> {
     let conn = Connection::open(db_path)?;
     conn.pragma_update(None, "journal_mode", "wal")?;
     conn.busy_timeout(WRITER_BUSY_TIMEOUT)?;
+    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
     conn.pragma_update(None, "foreign_keys", "ON")?;
     // FULL: every committed transaction is durable; §13's index rows
     // must never lead the segment fsync they follow.

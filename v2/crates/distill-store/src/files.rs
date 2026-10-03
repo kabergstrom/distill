@@ -177,8 +177,9 @@ impl InputTxn<'_> {
         observation: InputVersion,
     ) -> Result<(), StoreError> {
         let state = &file.state;
-        self.txn.execute(
-            "INSERT INTO files(root_id, path, mtime, size, kind, content_hash, observation,
+        self.txn
+            .prepare_cached(
+                "INSERT INTO files(root_id, path, mtime, size, kind, content_hash, observation,
                                raw_path, symlink_target)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(root_id, path) DO UPDATE SET
@@ -186,32 +187,32 @@ impl InputTxn<'_> {
                kind = excluded.kind, content_hash = excluded.content_hash,
                observation = excluded.observation, raw_path = excluded.raw_path,
                symlink_target = excluded.symlink_target",
-            rusqlite::params![
-                root.0,
-                path,
-                state.mtime,
-                state.size as i64,
-                state.kind.to_i64(),
-                state.content_hash.as_ref().map(|h| h.0.as_slice()),
-                observation.0 as i64,
-                file.raw_path,
-                file.symlink_target,
-            ],
-        )?;
+            )?
+            .execute(
+                rusqlite::params![
+                    root.0,
+                    path,
+                    state.mtime,
+                    state.size as i64,
+                    state.kind.to_i64(),
+                    state.content_hash.as_ref().map(|h| h.0.as_slice()),
+                    observation.0 as i64,
+                    file.raw_path,
+                    file.symlink_target,
+                ],
+            )?;
         Ok(())
     }
 
     /// Remove a (root, path) row and its bundle bytes; `Ok(false)` when it
     /// was absent.
     pub fn remove_file(&mut self, root: RootId, path: &str) -> Result<bool, StoreError> {
-        self.txn.execute(
-            "DELETE FROM bundle_files WHERE root_id = ?1 AND path = ?2",
-            rusqlite::params![root.0, path],
-        )?;
-        let n = self.txn.execute(
-            "DELETE FROM files WHERE root_id = ?1 AND path = ?2",
-            rusqlite::params![root.0, path],
-        )?;
+        self.txn
+            .prepare_cached("DELETE FROM bundle_files WHERE root_id = ?1 AND path = ?2")?
+            .execute(rusqlite::params![root.0, path])?;
+        let n = self.txn
+            .prepare_cached("DELETE FROM files WHERE root_id = ?1 AND path = ?2")?
+            .execute(rusqlite::params![root.0, path])?;
         Ok(n > 0)
     }
 
@@ -222,11 +223,12 @@ impl InputTxn<'_> {
         path: &str,
         bytes: &[u8],
     ) -> Result<(), StoreError> {
-        self.txn.execute(
-            "INSERT INTO bundle_files(root_id, path, bytes, hash) VALUES (?1, ?2, ?3, ?4)
+        self.txn
+            .prepare_cached(
+                "INSERT INTO bundle_files(root_id, path, bytes, hash) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(root_id, path) DO UPDATE SET bytes = excluded.bytes, hash = excluded.hash",
-            rusqlite::params![root.0, path, bytes, blake3::hash(bytes).as_bytes().as_slice()],
-        )?;
+            )?
+            .execute(rusqlite::params![root.0, path, bytes, blake3::hash(bytes).as_bytes().as_slice()])?;
         Ok(())
     }
 
@@ -244,16 +246,19 @@ impl InputTxn<'_> {
         clear_structure(&self.txn, under, true)?;
         for directory in directories {
             let root = interned_root(&self.txn, &mut self.roots, &directory.root_name)?;
-            self.txn.execute(
-                "INSERT INTO directories(root_id, path, canonical_path, physical_path)
+            self.txn
+                .prepare_cached(
+                    "INSERT INTO directories(root_id, path, canonical_path, physical_path)
                  VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![
-                    root.0,
-                    directory.path,
-                    directory.canonical_path,
-                    directory.physical_path
-                ],
-            )?;
+                )?
+                .execute(
+                    rusqlite::params![
+                        root.0,
+                        directory.path,
+                        directory.canonical_path,
+                        directory.physical_path
+                    ],
+                )?;
         }
         insert_diagnostics(&self.txn, &mut self.roots, diagnostics)
     }
@@ -320,20 +325,22 @@ impl InputTxn<'_> {
         exists: bool,
         observation: InputVersion,
     ) -> Result<(), StoreError> {
-        self.txn.execute(
-            "INSERT INTO dirty_files(root_id, path, exists_flag, observation)
+        self.txn
+            .prepare_cached(
+                "INSERT INTO dirty_files(root_id, path, exists_flag, observation)
              VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![root.0, path, exists as i64, observation.0 as i64],
-        )?;
+            )?
+            .execute(rusqlite::params![root.0, path, exists as i64, observation.0 as i64])?;
         Ok(())
     }
 
     /// Append to the ordered rename log (§13's `rename_events`).
     pub fn push_rename(&mut self, root: RootId, from: &str, to: &str) -> Result<(), StoreError> {
-        self.txn.execute(
-            "INSERT INTO rename_events(root_id, from_path, to_path) VALUES (?1, ?2, ?3)",
-            rusqlite::params![root.0, from, to],
-        )?;
+        self.txn
+            .prepare_cached(
+                "INSERT INTO rename_events(root_id, from_path, to_path) VALUES (?1, ?2, ?3)",
+            )?
+            .execute(rusqlite::params![root.0, from, to])?;
         Ok(())
     }
 }
@@ -346,7 +353,9 @@ pub(crate) fn intern_root(conn: &rusqlite::Connection, name: &str) -> Result<Roo
     {
         return Ok(RootId(id));
     }
-    conn.execute("INSERT INTO roots(name) VALUES (?1)", [name])?;
+    conn
+        .prepare_cached("INSERT INTO roots(name) VALUES (?1)")?
+        .execute([name])?;
     Ok(RootId(conn.last_insert_rowid()))
 }
 
@@ -421,11 +430,12 @@ fn insert_diagnostics(
 ) -> Result<(), StoreError> {
     for diagnostic in diagnostics {
         let root = interned_root(conn, roots, &diagnostic.root_name)?;
-        conn.execute(
-            "INSERT INTO scan_diagnostics(root_id, path, detail) VALUES (?1, ?2, ?3)
+        conn
+            .prepare_cached(
+                "INSERT INTO scan_diagnostics(root_id, path, detail) VALUES (?1, ?2, ?3)
              ON CONFLICT(root_id, path) DO UPDATE SET detail = excluded.detail",
-            rusqlite::params![root.0, diagnostic.path, diagnostic.detail],
-        )?;
+            )?
+            .execute(rusqlite::params![root.0, diagnostic.path, diagnostic.detail])?;
     }
     Ok(())
 }
@@ -486,7 +496,9 @@ impl Store {
                 }
             }
             if let Some(last) = work.renames.last() {
-                transaction.execute("DELETE FROM rename_events WHERE seq <= ?1", [last.seq])?;
+                transaction
+                    .prepare_cached("DELETE FROM rename_events WHERE seq <= ?1")?
+                    .execute([last.seq])?;
             }
             transaction.commit()?;
             Ok(complete)

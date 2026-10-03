@@ -19,7 +19,9 @@ impl Store {
             if &read_outputs(transaction)? != expected {
                 return Err(StoreError::CodegenStateDrift);
             }
-            transaction.execute("DELETE FROM codegen_outputs", [])?;
+            transaction
+                .prepare_cached("DELETE FROM codegen_outputs")?
+                .execute([])?;
             let mut insert = transaction.prepare(
                 "INSERT INTO codegen_outputs(relative_path, content_hash) VALUES (?1, ?2)",
             )?;

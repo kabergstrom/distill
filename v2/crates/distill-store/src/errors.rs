@@ -63,12 +63,13 @@ impl InputTxn<'_> {
             SCAN_REJECTION_CONFIGURATION,
             rejection.configuration.as_ref(),
         )?;
-        self.txn.execute("DELETE FROM scan_rejection_subjects", [])?;
+        self.txn
+            .prepare_cached("DELETE FROM scan_rejection_subjects")?
+            .execute([])?;
         for subject in &rejection.subjects {
-            self.txn.execute(
-                "INSERT OR IGNORE INTO scan_rejection_subjects(path) VALUES (?1)",
-                [subject],
-            )?;
+            self.txn
+                .prepare_cached("INSERT OR IGNORE INTO scan_rejection_subjects(path) VALUES (?1)")?
+                .execute([subject])?;
         }
         Ok(())
     }
@@ -112,19 +113,22 @@ impl InputTxn<'_> {
                 error: error.to_string(),
             })?;
         let scope = ErrorScope::Configuration;
-        self.txn.execute(
-            "INSERT INTO errors(family, scope_kind, scope_id, identity, code, record, message)
+        self.txn
+            .prepare_cached(
+                "INSERT INTO errors(family, scope_kind, scope_id, identity, code, record, message)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                family,
-                scope.kind(),
-                scope.id(),
-                error.reason_hash.as_slice(),
-                error.code as u16,
-                error.detail.canonical_detail_bytes(),
-                error.message,
-            ],
-        )?;
+            )?
+            .execute(
+                rusqlite::params![
+                    family,
+                    scope.kind(),
+                    scope.id(),
+                    error.reason_hash.as_slice(),
+                    error.code as u16,
+                    error.detail.canonical_detail_bytes(),
+                    error.message,
+                ],
+            )?;
         Ok(())
     }
 

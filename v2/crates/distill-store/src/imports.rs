@@ -71,8 +71,9 @@ impl Store {
         let basis = failure.basis.clone();
         let message = failure.message.clone();
         let (_, sequence) = self.memo_transaction(|transaction, sequence| {
-            transaction.execute(
-                "INSERT INTO watched_import_failures(
+            transaction
+                .prepare_cached(
+                    "INSERT INTO watched_import_failures(
                      bundle_uuid, attempted_input_version, basis,
                      terminal_kind, terminal_code, message, memo_seq
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -83,16 +84,18 @@ impl Store {
                    terminal_code = excluded.terminal_code,
                    message = excluded.message,
                    memo_seq = excluded.memo_seq",
-                rusqlite::params![
-                    bundle.0.as_slice(),
-                    version.0 as i64,
-                    basis,
-                    terminal_kind,
-                    terminal_code,
-                    message,
-                    sequence.0 as i64,
-                ],
-            )?;
+                )?
+                .execute(
+                    rusqlite::params![
+                        bundle.0.as_slice(),
+                        version.0 as i64,
+                        basis,
+                        terminal_kind,
+                        terminal_code,
+                        message,
+                        sequence.0 as i64,
+                    ],
+                )?;
             Ok(())
         })?;
         Ok(sequence)
@@ -104,10 +107,9 @@ impl Store {
                 return Ok(false);
             }
             let (removed, _) = store.memo_transaction(|transaction, _| {
-                Ok(transaction.execute(
-                    "DELETE FROM watched_import_failures WHERE bundle_uuid = ?1",
-                    [bundle.0.as_slice()],
-                )? > 0)
+                Ok(transaction
+                    .prepare_cached("DELETE FROM watched_import_failures WHERE bundle_uuid = ?1")?
+                    .execute([bundle.0.as_slice()])? > 0)
             })?;
             Ok(removed)
         })

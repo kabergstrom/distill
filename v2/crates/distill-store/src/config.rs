@@ -205,19 +205,23 @@ impl Store {
                     )
                     .optional()?
                     .unwrap_or(0) as u64;
-                let prior = store.conn.query_row(
-                    "SELECT COALESCE(MAX(generation), 0) FROM pending_restart",
-                    [],
-                    |r| r.get::<_, i64>(0),
-                )? as u64;
+                let prior = store.conn
+                    .prepare_cached("SELECT COALESCE(MAX(generation), 0) FROM pending_restart")?
+                    .query_row(
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )? as u64;
                 let generation = active.max(prior) + 1;
-                store.conn.execute("DELETE FROM pending_restart", [])?;
+                store.conn
+                    .prepare_cached("DELETE FROM pending_restart")?
+                    .execute([])?;
                 for (key, value) in &rows {
-                    store.conn.execute(
-                        "INSERT INTO pending_restart(generation, config_key, config_value)
+                    store.conn
+                        .prepare_cached(
+                            "INSERT INTO pending_restart(generation, config_key, config_value)
                          VALUES (?1, ?2, ?3)",
-                        rusqlite::params![generation as i64, key, value],
-                    )?;
+                        )?
+                        .execute(rusqlite::params![generation as i64, key, value])?;
                 }
                 Ok(generation)
             })
@@ -232,7 +236,9 @@ impl Store {
     /// active startup values. This is not an input event.
     pub fn clear_pending_restart(&mut self) -> Result<(), StoreError> {
         self.write_txn(|store| {
-            store.conn.execute("DELETE FROM pending_restart", [])?;
+            store.conn
+                .prepare_cached("DELETE FROM pending_restart")?
+                .execute([])?;
             Ok(())
         })
     }
@@ -363,8 +369,9 @@ impl InputTxn<'_> {
     /// while retaining the active generation selected by the configuration
     /// coordinator.
     pub fn publish_configuration_ready(&mut self, generation: u64) -> Result<(), StoreError> {
-        self.txn.execute(
-            "INSERT INTO configuration_state(
+        self.txn
+            .prepare_cached(
+                "INSERT INTO configuration_state(
                  id, active_generation, input_version,
                  poison_code, poison_detail_version, poison_detail,
                  poison_reason_hash, poison_message
@@ -376,8 +383,8 @@ impl InputTxn<'_> {
                poison_detail = NULL,
                poison_reason_hash = NULL,
                poison_message = NULL",
-            rusqlite::params![generation as i64, self.version().0 as i64],
-        )?;
+            )?
+            .execute(rusqlite::params![generation as i64, self.version().0 as i64])?;
         Ok(())
     }
 
@@ -393,8 +400,9 @@ impl InputTxn<'_> {
                 error: error.to_string(),
             })?;
         let detail = error.detail.canonical_detail_bytes();
-        self.txn.execute(
-            "INSERT INTO configuration_state(
+        self.txn
+            .prepare_cached(
+                "INSERT INTO configuration_state(
                  id, active_generation, input_version,
                  poison_code, poison_detail_version, poison_detail,
                  poison_reason_hash, poison_message
@@ -405,14 +413,16 @@ impl InputTxn<'_> {
                poison_detail = excluded.poison_detail,
                poison_reason_hash = excluded.poison_reason_hash,
                poison_message = excluded.poison_message",
-            rusqlite::params![
-                self.version().0 as i64,
-                error.code as u16,
-                detail,
-                error.reason_hash.as_slice(),
-                error.message,
-            ],
-        )?;
+            )?
+            .execute(
+                rusqlite::params![
+                    self.version().0 as i64,
+                    error.code as u16,
+                    detail,
+                    error.reason_hash.as_slice(),
+                    error.message,
+                ],
+            )?;
         Ok(())
     }
 
@@ -427,8 +437,9 @@ impl InputTxn<'_> {
         let generation = generation.ok_or_else(|| StoreError::InvalidConfiguration {
             error: "no pending-restart generation to adopt".to_owned(),
         })?;
-        self.txn.execute(
-            "INSERT INTO configuration_state(
+        self.txn
+            .prepare_cached(
+                "INSERT INTO configuration_state(
                  id, active_generation, input_version,
                  poison_code, poison_detail_version, poison_detail,
                  poison_reason_hash, poison_message
@@ -440,9 +451,11 @@ impl InputTxn<'_> {
                poison_detail = NULL,
                poison_reason_hash = NULL,
                poison_message = NULL",
-            rusqlite::params![generation, self.version().0 as i64],
-        )?;
-        self.txn.execute("DELETE FROM pending_restart", [])?;
+            )?
+            .execute(rusqlite::params![generation, self.version().0 as i64])?;
+        self.txn
+            .prepare_cached("DELETE FROM pending_restart")?
+            .execute([])?;
         Ok(generation as u64)
     }
 }

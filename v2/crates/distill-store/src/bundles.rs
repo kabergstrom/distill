@@ -186,8 +186,9 @@ impl InputTxn<'_> {
         }
         // The caller republishes the references of the bytes it indexes.
         self.clear_path_refs(meta.bundle)?;
-        self.txn.execute(
-            "INSERT INTO bundles(bundle_uuid, root_id, path, format_version, content_hash, poison,
+        self.txn
+            .prepare_cached(
+                "INSERT INTO bundles(bundle_uuid, root_id, path, format_version, content_hash, poison,
                                  origin_rules_bundle, origin_rule, origin_group_root, origin_group_path,
                                  import_watched)
              VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10)
@@ -200,19 +201,21 @@ impl InputTxn<'_> {
                origin_group_root = excluded.origin_group_root,
                origin_group_path = excluded.origin_group_path,
                import_watched = excluded.import_watched",
-            rusqlite::params![
-                meta.bundle.0.as_slice(),
-                meta.root.0,
-                meta.path,
-                meta.format_version,
-                meta.content_hash.0.as_slice(),
-                meta.origin.as_ref().map(|o| o.rules_bundle.0.as_slice().to_vec()),
-                meta.origin.as_ref().map(|o| o.rule.0.as_slice()),
-                meta.origin.as_ref().map(|o| o.group_root.as_str()),
-                meta.origin.as_ref().map(|o| o.group_path.as_str()),
-                meta.import_watched,
-            ],
-        )?;
+            )?
+            .execute(
+                rusqlite::params![
+                    meta.bundle.0.as_slice(),
+                    meta.root.0,
+                    meta.path,
+                    meta.format_version,
+                    meta.content_hash.0.as_slice(),
+                    meta.origin.as_ref().map(|o| o.rules_bundle.0.as_slice().to_vec()),
+                    meta.origin.as_ref().map(|o| o.rule.0.as_slice()),
+                    meta.origin.as_ref().map(|o| o.group_root.as_str()),
+                    meta.origin.as_ref().map(|o| o.group_path.as_str()),
+                    meta.import_watched,
+                ],
+            )?;
         Ok(())
     }
 
@@ -221,10 +224,9 @@ impl InputTxn<'_> {
     pub fn remove_bundle(&mut self, bundle: BundleUuid) -> Result<bool, StoreError> {
         self.remove_owned_asset_rows(bundle)?;
         self.clear_path_refs(bundle)?;
-        let n = self.txn.execute(
-            "DELETE FROM bundles WHERE bundle_uuid = ?1",
-            [bundle.0.as_slice()],
-        )?;
+        let n = self.txn
+            .prepare_cached("DELETE FROM bundles WHERE bundle_uuid = ?1")?
+            .execute([bundle.0.as_slice()])?;
         Ok(n > 0)
     }
 
@@ -238,50 +240,53 @@ impl InputTxn<'_> {
     ) -> Result<(), StoreError> {
         self.clear_path_refs(bundle)?;
         for target in targets {
-            self.txn.execute(
-                "INSERT OR IGNORE INTO bundle_path_refs(bundle_uuid, target) VALUES (?1, ?2)",
-                rusqlite::params![bundle.0.as_slice(), target],
-            )?;
+            self.txn
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO bundle_path_refs(bundle_uuid, target) VALUES (?1, ?2)",
+                )?
+                .execute(rusqlite::params![bundle.0.as_slice(), target])?;
         }
         Ok(())
     }
 
     fn clear_path_refs(&mut self, bundle: BundleUuid) -> Result<(), StoreError> {
-        self.txn.execute(
-            "DELETE FROM bundle_path_refs WHERE bundle_uuid = ?1",
-            [bundle.0.as_slice()],
-        )?;
+        self.txn
+            .prepare_cached("DELETE FROM bundle_path_refs WHERE bundle_uuid = ?1")?
+            .execute([bundle.0.as_slice()])?;
         Ok(())
     }
 
     /// Drop every asset row a bundle owns, with tags and path-index rows.
     fn remove_owned_asset_rows(&mut self, bundle: BundleUuid) -> Result<(), StoreError> {
-        self.txn.execute(
-            "DELETE FROM path_index WHERE asset_uuid IN
+        self.txn
+            .prepare_cached(
+                "DELETE FROM path_index WHERE asset_uuid IN
                (SELECT asset_uuid FROM assets WHERE bundle_uuid = ?1)",
-            [bundle.0.as_slice()],
-        )?;
-        self.txn.execute(
-            "DELETE FROM asset_tags WHERE asset_uuid IN
+            )?
+            .execute([bundle.0.as_slice()])?;
+        self.txn
+            .prepare_cached(
+                "DELETE FROM asset_tags WHERE asset_uuid IN
                (SELECT asset_uuid FROM assets WHERE bundle_uuid = ?1)",
-            [bundle.0.as_slice()],
-        )?;
-        self.txn.execute(
-            "DELETE FROM asset_tag_index WHERE asset_uuid IN
+            )?
+            .execute([bundle.0.as_slice()])?;
+        self.txn
+            .prepare_cached(
+                "DELETE FROM asset_tag_index WHERE asset_uuid IN
                (SELECT asset_uuid FROM assets WHERE bundle_uuid = ?1)",
-            [bundle.0.as_slice()],
-        )?;
-        self.txn.execute(
-            "DELETE FROM assets WHERE bundle_uuid = ?1",
-            [bundle.0.as_slice()],
-        )?;
+            )?
+            .execute([bundle.0.as_slice()])?;
+        self.txn
+            .prepare_cached("DELETE FROM assets WHERE bundle_uuid = ?1")?
+            .execute([bundle.0.as_slice()])?;
         Ok(())
     }
 
     /// Publish (or republish) an asset row; tags replace wholesale.
     pub fn upsert_asset(&mut self, rec: &AssetRecord) -> Result<(), StoreError> {
-        self.txn.execute(
-            "INSERT INTO assets(
+        self.txn
+            .prepare_cached(
+                "INSERT INTO assets(
                  asset_uuid, bundle_uuid, local_id, type_uuid, logical_hash, authoring_only,
                  authored_value, terminal_type
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -291,33 +296,34 @@ impl InputTxn<'_> {
                authoring_only = excluded.authoring_only,
                authored_value = excluded.authored_value,
                terminal_type = excluded.terminal_type",
-            rusqlite::params![
-                rec.asset.0.as_slice(),
-                rec.bundle.0.as_slice(),
-                rec.local_id,
-                rec.type_uuid.0.as_slice(),
-                rec.logical_hash.0.as_slice(),
-                i64::from(rec.authoring_only),
-                rec.served.as_ref().map(|served| served.authored_value.as_slice()),
-                rec.served
-                    .as_ref()
-                    .map(|served| served.terminal_type.0.to_vec()),
-            ],
-        )?;
-        self.txn.execute(
-            "DELETE FROM asset_tags WHERE asset_uuid = ?1",
-            [rec.asset.0.as_slice()],
-        )?;
-        for (tag, value) in &rec.tags {
-            self.txn.execute(
-                "INSERT OR REPLACE INTO asset_tags(asset_uuid, tag, value) VALUES (?1, ?2, ?3)",
-                rusqlite::params![rec.asset.0.as_slice(), tag, value],
+            )?
+            .execute(
+                rusqlite::params![
+                    rec.asset.0.as_slice(),
+                    rec.bundle.0.as_slice(),
+                    rec.local_id,
+                    rec.type_uuid.0.as_slice(),
+                    rec.logical_hash.0.as_slice(),
+                    i64::from(rec.authoring_only),
+                    rec.served.as_ref().map(|served| served.authored_value.as_slice()),
+                    rec.served
+                        .as_ref()
+                        .map(|served| served.terminal_type.0.to_vec()),
+                ],
             )?;
+        self.txn
+            .prepare_cached("DELETE FROM asset_tags WHERE asset_uuid = ?1")?
+            .execute([rec.asset.0.as_slice()])?;
+        for (tag, value) in &rec.tags {
+            self.txn
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO asset_tags(asset_uuid, tag, value) VALUES (?1, ?2, ?3)",
+                )?
+                .execute(rusqlite::params![rec.asset.0.as_slice(), tag, value])?;
         }
-        self.txn.execute(
-            "DELETE FROM asset_tag_index WHERE asset_uuid = ?1",
-            [rec.asset.0.as_slice()],
-        )?;
+        self.txn
+            .prepare_cached("DELETE FROM asset_tag_index WHERE asset_uuid = ?1")?
+            .execute([rec.asset.0.as_slice()])?;
         Ok(())
     }
 
@@ -329,8 +335,9 @@ impl InputTxn<'_> {
         asset: AssetUuid,
         tag_epoch: [u8; 32],
     ) -> Result<(), StoreError> {
-        self.txn.execute(
-            "INSERT INTO asset_tag_index(
+        self.txn
+            .prepare_cached(
+                "INSERT INTO asset_tag_index(
                 asset_uuid, type_uuid, tag_epoch, planner_version, dylib_hash, trace, poison
              ) VALUES (
                 ?1, (SELECT type_uuid FROM assets WHERE asset_uuid = ?1), ?2, NULL, NULL, X'',
@@ -343,8 +350,8 @@ impl InputTxn<'_> {
                 dylib_hash = NULL,
                 trace = X'',
                 poison = excluded.poison",
-            rusqlite::params![asset.0.as_slice(), tag_epoch.as_slice()],
-        )?;
+            )?
+            .execute(rusqlite::params![asset.0.as_slice(), tag_epoch.as_slice()])?;
         Ok(())
     }
 
@@ -366,22 +373,24 @@ impl InputTxn<'_> {
         if role == Some(1) {
             return Err(StoreError::RoleIneligible { asset });
         }
-        self.txn.execute(
-            "INSERT INTO path_index(path, root_id, asset_uuid) VALUES (?1, ?2, ?3)
+        self.txn
+            .prepare_cached(
+                "INSERT INTO path_index(path, root_id, asset_uuid) VALUES (?1, ?2, ?3)
              ON CONFLICT(path, root_id) DO UPDATE SET asset_uuid = excluded.asset_uuid",
-            rusqlite::params![path, root.0, asset.0.as_slice()],
-        )?;
+            )?
+            .execute(rusqlite::params![path, root.0, asset.0.as_slice()])?;
         Ok(())
     }
 
     /// Cache a schema by logical hash (§13's `schemas` — rebuilt from
     /// bundle snapshots, never precious).
     pub fn put_schema(&mut self, hash: LogicalHash, json: &str) -> Result<(), StoreError> {
-        self.txn.execute(
-            "INSERT INTO schemas(logical_hash, schema_json) VALUES (?1, ?2)
+        self.txn
+            .prepare_cached(
+                "INSERT INTO schemas(logical_hash, schema_json) VALUES (?1, ?2)
              ON CONFLICT(logical_hash) DO UPDATE SET schema_json = excluded.schema_json",
-            rusqlite::params![hash.0.as_slice(), json],
-        )?;
+            )?
+            .execute(rusqlite::params![hash.0.as_slice(), json])?;
         Ok(())
     }
 
@@ -402,45 +411,52 @@ impl InputTxn<'_> {
         // Replace, never retain: the prior rows describe the old bytes.
         self.remove_owned_asset_rows(skeleton.bundle)?;
         self.clear_path_refs(skeleton.bundle)?;
-        self.txn.execute(
-            "INSERT INTO bundles(bundle_uuid, root_id, path, format_version, content_hash, poison)
+        self.txn
+            .prepare_cached(
+                "INSERT INTO bundles(bundle_uuid, root_id, path, format_version, content_hash, poison)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(bundle_uuid) DO UPDATE SET
                root_id = excluded.root_id, path = excluded.path,
                format_version = excluded.format_version,
                content_hash = excluded.content_hash, poison = excluded.poison,
                import_watched = 0",
-            rusqlite::params![
-                skeleton.bundle.0.as_slice(),
-                skeleton.root.0,
-                skeleton.path,
-                skeleton.format_version,
-                skeleton.content_hash.0.as_slice(),
-                error,
-            ],
-        )?;
+            )?
+            .execute(
+                rusqlite::params![
+                    skeleton.bundle.0.as_slice(),
+                    skeleton.root.0,
+                    skeleton.path,
+                    skeleton.format_version,
+                    skeleton.content_hash.0.as_slice(),
+                    error,
+                ],
+            )?;
         for entry in &skeleton.entries {
             // Plain INSERT: a skeleton UUID colliding with another
             // bundle's row is a cross-file identity collision — §7 keeps
             // a namespace error for those, and the constraint
             // failure surfaces rather than silently reassigning the row.
-            self.txn.execute(
-                "INSERT INTO assets(
+            self.txn
+                .prepare_cached(
+                    "INSERT INTO assets(
                      asset_uuid, bundle_uuid, local_id, type_uuid, logical_hash, authoring_only
                  ) VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
-                rusqlite::params![
-                    entry.asset.0.as_slice(),
-                    skeleton.bundle.0.as_slice(),
-                    entry.local_id,
-                    entry.type_uuid.0.as_slice(),
-                    i64::from(entry.authoring_only),
-                ],
-            )?;
-            for (tag, value) in &entry.tags {
-                self.txn.execute(
-                    "INSERT OR REPLACE INTO asset_tags(asset_uuid, tag, value) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![entry.asset.0.as_slice(), tag, value],
+                )?
+                .execute(
+                    rusqlite::params![
+                        entry.asset.0.as_slice(),
+                        skeleton.bundle.0.as_slice(),
+                        entry.local_id,
+                        entry.type_uuid.0.as_slice(),
+                        i64::from(entry.authoring_only),
+                    ],
                 )?;
+            for (tag, value) in &entry.tags {
+                self.txn
+                    .prepare_cached(
+                        "INSERT OR REPLACE INTO asset_tags(asset_uuid, tag, value) VALUES (?1, ?2, ?3)",
+                    )?
+                    .execute(rusqlite::params![entry.asset.0.as_slice(), tag, value])?;
             }
         }
         Ok(())
@@ -471,11 +487,12 @@ impl Store {
                         error: format!("duplicate tag-index update for {}", update.asset),
                     });
                 }
-                let exists: bool = txn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM assets WHERE asset_uuid = ?1)",
-                    [update.asset.0.as_slice()],
-                    |row| row.get(0),
-                )?;
+                let exists: bool = txn
+                    .prepare_cached("SELECT EXISTS(SELECT 1 FROM assets WHERE asset_uuid = ?1)")?
+                    .query_row(
+                        [update.asset.0.as_slice()],
+                        |row| row.get(0),
+                    )?;
                 if !exists {
                     return Err(StoreError::InvalidConfiguration {
                         error: format!("tag-index update names missing asset {}", update.asset),
@@ -486,18 +503,19 @@ impl Store {
                         error: format!("poisoned tag-index update {} carried tags", update.asset),
                     });
                 }
-                txn.execute(
-                    "DELETE FROM asset_tags WHERE asset_uuid = ?1",
-                    [update.asset.0.as_slice()],
-                )?;
+                txn
+                    .prepare_cached("DELETE FROM asset_tags WHERE asset_uuid = ?1")?
+                    .execute([update.asset.0.as_slice()])?;
                 for (tag, value) in &update.tags {
-                    txn.execute(
-                        "INSERT INTO asset_tags(asset_uuid, tag, value) VALUES (?1, ?2, ?3)",
-                        rusqlite::params![update.asset.0.as_slice(), tag, value],
-                    )?;
+                    txn
+                        .prepare_cached(
+                            "INSERT INTO asset_tags(asset_uuid, tag, value) VALUES (?1, ?2, ?3)",
+                        )?
+                        .execute(rusqlite::params![update.asset.0.as_slice(), tag, value])?;
                 }
-                txn.execute(
-                    "INSERT INTO asset_tag_index(
+                txn
+                    .prepare_cached(
+                        "INSERT INTO asset_tag_index(
                         asset_uuid, type_uuid, tag_epoch, planner_version, dylib_hash, trace,
                         poison
                      ) VALUES (
@@ -511,15 +529,17 @@ impl Store {
                         dylib_hash = excluded.dylib_hash,
                         trace = excluded.trace,
                         poison = excluded.poison",
-                    rusqlite::params![
-                        update.asset.0.as_slice(),
-                        update.tag_epoch.as_slice(),
-                        update.planner_version.map(i64::from),
-                        update.dylib_hash.map(|hash| hash.to_vec()),
-                        update.trace,
-                        update.poison,
-                    ],
-                )?;
+                    )?
+                    .execute(
+                        rusqlite::params![
+                            update.asset.0.as_slice(),
+                            update.tag_epoch.as_slice(),
+                            update.planner_version.map(i64::from),
+                            update.dylib_hash.map(|hash| hash.to_vec()),
+                            update.trace,
+                            update.poison,
+                        ],
+                    )?;
             }
             txn.commit()?;
             Ok(())
@@ -543,19 +563,21 @@ impl Store {
             let txn = store.read.conn.savepoint()?;
             for type_uuid in &changed {
                 let type_uuid_bytes = type_uuid.0.as_slice();
-                txn.execute(
-                    "UPDATE asset_tag_index
+                txn
+                    .prepare_cached(
+                        "UPDATE asset_tag_index
                      SET planner_version = NULL, dylib_hash = NULL, trace = X'',
                          poison = 'tag indexing pending'
                      WHERE asset_uuid IN (SELECT asset_uuid FROM assets WHERE type_uuid = ?1)",
-                    [type_uuid_bytes],
-                )?;
-                txn.execute("DELETE FROM tag_epochs WHERE type_uuid = ?1", [type_uuid_bytes])?;
+                    )?
+                    .execute([type_uuid_bytes])?;
+                txn
+                    .prepare_cached("DELETE FROM tag_epochs WHERE type_uuid = ?1")?
+                    .execute([type_uuid_bytes])?;
                 if let Some(epoch) = epochs.get(type_uuid) {
-                    txn.execute(
-                        "INSERT INTO tag_epochs(type_uuid, epoch) VALUES (?1, ?2)",
-                        rusqlite::params![type_uuid_bytes, epoch.as_slice()],
-                    )?;
+                    txn
+                        .prepare_cached("INSERT INTO tag_epochs(type_uuid, epoch) VALUES (?1, ?2)")?
+                        .execute(rusqlite::params![type_uuid_bytes, epoch.as_slice()])?;
                 }
             }
             txn.commit()?;

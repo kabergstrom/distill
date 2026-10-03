@@ -313,10 +313,11 @@ pub(crate) fn insert_ref(
     holder: &[u8],
     hash: &[u8; 32],
 ) -> Result<(), StoreError> {
-    txn.execute(
-        "INSERT OR IGNORE INTO cas_refs(holder_kind, holder, content_hash) VALUES (?1, ?2, ?3)",
-        rusqlite::params![holder_kind, holder, hash.as_slice()],
-    )?;
+    txn
+        .prepare_cached(
+            "INSERT OR IGNORE INTO cas_refs(holder_kind, holder, content_hash) VALUES (?1, ?2, ?3)",
+        )?
+        .execute(rusqlite::params![holder_kind, holder, hash.as_slice()])?;
     Ok(())
 }
 
@@ -396,11 +397,12 @@ impl Store {
         let id = meta_get_u64(&self.conn, "next_segment_id")?.unwrap_or(0);
         meta_set_u64(&self.conn, "next_segment_id", id + 1)?;
         let name = segment_file_name(id, kind);
-        self.conn.execute(
-            "INSERT INTO cas_segments(segment_id, file_name, segment_kind, indexed_len, state, owner)
+        self.conn
+            .prepare_cached(
+                "INSERT INTO cas_segments(segment_id, file_name, segment_kind, indexed_len, state, owner)
              VALUES (?1, ?2, ?3, 0, ?4, ?5)",
-            rusqlite::params![id as i64, name, kind as i64, state, self.cas.owner],
-        )?;
+            )?
+            .execute(rusqlite::params![id as i64, name, kind as i64, state, self.cas.owner])?;
         let path = self.cas.dir.join(&name);
         let f = std::fs::File::create(&path).map_err(io_err(&path))?;
         f.sync_all().map_err(io_err(&path))?;
