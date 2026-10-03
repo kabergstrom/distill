@@ -609,12 +609,12 @@ fn load_authored_asset(
     scanner: &RootedScanner,
     asset: AssetUuid,
 ) -> Result<Option<(BundleFileHash, CodegenAsset)>, String> {
-    let Some(entry) = store.entry(asset).map_err(|error| error.to_string())? else {
+    let Some((entry, bundle_meta)) =
+        store.entry_with_bundle(asset).map_err(|error| error.to_string())?
+    else {
         return Ok(None);
     };
-    let bundle_meta = store
-        .bundle(entry.bundle)
-        .map_err(|error| error.to_string())?
+    let bundle_meta = bundle_meta
         .ok_or_else(|| format!("asset {asset} has no owning bundle row"))?;
     let root = store
         .root_name(bundle_meta.root)

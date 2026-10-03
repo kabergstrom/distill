@@ -1026,80 +1026,73 @@ impl StoreReader {
         Ok(out)
     }
 
-    fn bundle_poison(&self, bundle: &[u8]) -> Result<Option<String>, StoreError> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT poison FROM bundles WHERE bundle_uuid = ?1",
-                [bundle],
-                |r| r.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .flatten())
-    }
-
     /// §13 `MetadataSnapshot::entry` semantics: `Ok(None)` is a
     /// recordable miss; a namespace error or a poisoned owning bundle is
     /// `Err`, never last-good metadata.
     pub fn entry(&self, asset: AssetUuid) -> Result<Option<EntryMeta>, StoreError> {
-        let row = self
-            .conn
-            .query_row(
-                "SELECT bundle_uuid, local_id, type_uuid, logical_hash, authoring_only FROM assets
-                 WHERE asset_uuid = ?1",
-                [asset.0.as_slice()],
-                |r| {
-                    Ok((
-                        r.get::<_, Vec<u8>>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Vec<u8>>(2)?,
-                        // NULL only on a skeleton row (§7), whose owning
-                        // bundle is poisoned — the poison gate below
-                        // fires before this is ever consumed.
-                        r.get::<_, Option<Vec<u8>>>(3)?,
-                        r.get::<_, i64>(4)? != 0,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((bundle_bytes, local_id, type_bytes, hash_bytes, authoring_only)) = row else {
+        Ok(self.entry_with_bundle(asset)?.map(|(entry, _)| entry))
+    }
+
+    /// [`Self::entry`] with its owning bundle's row (`None` when the asset
+    /// row names a bundle with no row), in one statement ([`ENTRY`]).
+    pub fn entry_with_bundle(
+        &self,
+        asset: AssetUuid,
+    ) -> Result<Option<(EntryMeta, Option<BundleMeta>)>, StoreError> {
+        let mut statement = self.conn.prepare_cached(ENTRY)?;
+        debug_assert_eq!(statement.column_count(), BUNDLE_COLUMN_COUNT + 7);
+        let mut rows = statement.query([asset.0.as_slice()])?;
+        let Some(row) = rows.next()? else {
             return Ok(None);
         };
-        if let Some(error) = self.bundle_poison(&bundle_bytes)? {
-            return Err(StoreError::BundlePoisoned {
-                bundle: BundleUuid(blob16(bundle_bytes)),
-                error,
-            });
+        let at = |column: usize| BUNDLE_COLUMN_COUNT + column;
+        // `bundle_uuid` is the asset row's (USING); `root_id` is the
+        // bundle row's, NULL when it has none.
+        let bundle = BundleUuid(blob16(row.get(0)?));
+        let bundle_meta = match row.get::<_, Option<i64>>(1)? {
+            Some(_) => Some(bundle_meta_row(row)?),
+            None => None,
+        };
+        if let Some(error) = row.get::<_, Option<String>>(at(4))? {
+            return Err(StoreError::BundlePoisoned { bundle, error });
         }
-        // Not poisoned ⇒ never a skeleton row: the hash is present by
-        // the healing invariant (upsert_bundle drops skeleton rows
-        // whenever a poison clears). A NULL here is store corruption and
-        // surfaces as a typed column error, never a panic.
-        let hash_bytes = hash_bytes.ok_or_else(|| {
+        let local_id: String = row.get(at(0))?;
+        let type_uuid = TypeUuid(blob16(row.get(at(1))?));
+        // NULL only on a skeleton row (§7), whose owning bundle is
+        // poisoned: the poison gate above fires first. Not poisoned ⇒
+        // never a skeleton row, by the healing invariant (upsert_bundle
+        // drops skeleton rows whenever a poison clears). A NULL here is
+        // store corruption and surfaces as a typed column error, never a
+        // panic.
+        let logical_hash = row.get::<_, Option<Vec<u8>>>(at(2))?.ok_or_else(|| {
             StoreError::Sqlite(rusqlite::Error::InvalidColumnType(
-                3,
+                at(2),
                 "logical_hash".to_owned(),
                 rusqlite::types::Type::Null,
             ))
         })?;
-        let tags: BTreeMap<String, Option<String>> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT tag, value FROM asset_tags WHERE asset_uuid = ?1 ORDER BY tag")?;
-            let rows = stmt.query_map([asset.0.as_slice()], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
-            })?;
-            rows.collect::<Result<_, _>>()?
-        };
-        Ok(Some(EntryMeta {
-            asset,
-            bundle: BundleUuid(blob16(bundle_bytes)),
-            local_id,
-            type_uuid: TypeUuid(blob16(type_bytes)),
-            logical_hash: LogicalHash(blob32(hash_bytes)),
-            authoring_only,
-            tags,
-        }))
+        let authoring_only = row.get::<_, i64>(at(3))? != 0;
+        // One row per tag, by tag; a single row of NULLs when untagged.
+        let mut tags = BTreeMap::new();
+        let mut row = Some(row);
+        while let Some(current) = row {
+            if let Some(tag) = current.get::<_, Option<String>>(at(5))? {
+                tags.insert(tag, current.get::<_, Option<String>>(at(6))?);
+            }
+            row = rows.next()?;
+        }
+        Ok(Some((
+            EntryMeta {
+                asset,
+                bundle,
+                local_id,
+                type_uuid,
+                logical_hash: LogicalHash(blob32(logical_hash)),
+                authoring_only,
+                tags,
+            },
+            bundle_meta,
+        )))
     }
 
     /// Runtime direct-UUID lookup. Authoring/control rows remain visible to
@@ -1233,11 +1226,26 @@ impl StoreReader {
     }
 }
 
-const BUNDLE_COLUMNS: &str = "bundle_uuid, root_id, path, format_version, content_hash,
-     origin_rules_bundle, origin_rule, origin_group_root, origin_group_path, import_watched";
+macro_rules! bundle_columns {
+    () => {
+        "bundle_uuid, root_id, path, format_version, content_hash,
+     origin_rules_bundle, origin_rule, origin_group_root, origin_group_path, import_watched"
+    };
+}
+const BUNDLE_COLUMNS: &str = bundle_columns!();
 /// The number of columns in [`BUNDLE_COLUMNS`]; a column selected after them
 /// has this index.
 const BUNDLE_COLUMN_COUNT: usize = 10;
+/// An asset's entry: its owning bundle's row (NULL columns when it has
+/// none, `bundle_uuid` the asset row's by USING), its own columns, the
+/// bundle's poison and one row per tag (NULLs when untagged), by tag.
+pub(crate) const ENTRY: &str = concat!(
+    "SELECT ",
+    bundle_columns!(),
+    ", local_id, type_uuid, logical_hash, authoring_only, poison, tag, value
+     FROM assets LEFT JOIN bundles USING (bundle_uuid) LEFT JOIN asset_tags USING (asset_uuid)
+     WHERE asset_uuid = ?1 ORDER BY tag"
+);
 
 fn bundle_meta_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BundleMeta> {
     let origin = match (

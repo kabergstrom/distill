@@ -1594,3 +1594,38 @@ fn subscription_history_searches_one_subject() {
         ["SEARCH change_log USING INDEX change_log_paths (subject=? AND version>? AND version<?)"]
     );
 }
+
+/// A build node's entry and owning bundle are one statement of key
+/// searches: the asset, its bundle, its tags.
+#[test]
+fn an_entry_and_its_bundle_are_one_statement() {
+    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, store) = store_with(1000);
+    let mut reader = store.reader().unwrap();
+    connection(&mut reader).trace(Some(trace));
+    let (entry, bundle) = reader.entry_with_bundle(asset_uuid(7, 1)).unwrap().unwrap();
+    let untagged = reader.entry(asset_uuid(8, 1)).unwrap().unwrap();
+    let poisoned = reader.entry(asset_uuid(199, 1));
+    connection(&mut reader).trace(None);
+    let statements = std::mem::take(&mut *TRACED.lock().unwrap());
+    assert_eq!(statements.len(), 3, "{statements:?}");
+    assert_eq!(bundle.map(|bundle| bundle.bundle), Some(bundle_uuid(7)));
+    assert_eq!(entry.bundle, bundle_uuid(7));
+    assert_eq!(
+        entry.tags,
+        BTreeMap::from([
+            ("kind".to_owned(), Some("texture".to_owned())),
+            ("rare".to_owned(), Some("yes".to_owned())),
+        ])
+    );
+    assert_eq!(untagged.tags.len(), 1);
+    assert!(matches!(poisoned, Err(crate::StoreError::BundlePoisoned { .. })), "{poisoned:?}");
+    assert_eq!(
+        store.query_plan_details(crate::bundles::ENTRY).unwrap(),
+        [
+            "SEARCH assets USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)",
+            "SEARCH bundles USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?) LEFT-JOIN",
+            "SEARCH asset_tags USING INDEX sqlite_autoindex_asset_tags_1 (asset_uuid=?) LEFT-JOIN",
+        ]
+    );
+}

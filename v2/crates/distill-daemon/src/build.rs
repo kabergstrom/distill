@@ -603,12 +603,13 @@ fn node_key(
     reader: &StoreReader,
     asset: AssetUuid,
 ) -> Result<Option<NodeKey>, BuildError> {
-    let Some(meta) = reader.entry(asset).map_err(BuildError::infrastructure)? else {
+    let Some((meta, bundle)) = reader
+        .entry_with_bundle(asset)
+        .map_err(BuildError::infrastructure)?
+    else {
         return Ok(None);
     };
-    let bundle = reader
-        .bundle(meta.bundle)
-        .map_err(BuildError::infrastructure)?
+    let bundle = bundle
         .ok_or_else(|| BuildError::Infrastructure("asset owner bundle is missing".to_owned()))?;
     let chain = env
         .registry
@@ -4121,13 +4122,11 @@ fn load_asset(
     scanner: &RootedScanner,
     asset: AssetUuid,
 ) -> Result<LoadedAsset, BuildError> {
-    let meta = store
-        .entry(asset)
+    let (meta, bundle_meta) = store
+        .entry_with_bundle(asset)
         .map_err(BuildError::failed)?
         .ok_or_else(|| BuildError::Failed(format!("asset {asset} is missing")))?;
-    let bundle_meta = store
-        .bundle(meta.bundle)
-        .map_err(BuildError::infrastructure)?
+    let bundle_meta = bundle_meta
         .ok_or_else(|| BuildError::Infrastructure("asset owner bundle is missing".to_owned()))?;
     let root = store
         .root_name(bundle_meta.root)
