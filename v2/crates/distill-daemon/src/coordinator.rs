@@ -638,6 +638,10 @@ impl DaemonCoordinator {
             mut requirements,
             schema_authority,
         } = candidate;
+        // The version the candidate is derived from, read before its scan:
+        // a publication that commits while it scans makes it stale, so it
+        // never republishes rows its scan read before that write.
+        let base = self.server.stamp_of(store)?.version;
         // The candidate's own scanner: its roots never change, and it becomes
         // the candidate's compiled state.
         let scanner = self
@@ -661,6 +665,8 @@ impl DaemonCoordinator {
         } else {
             None
         };
+        #[cfg(test)]
+        compiled_tests::candidate_scanned().map_err(CoordinatorError::InvalidManifest)?;
         let mut runtime = lock_pipeline(&self.pipeline);
         let prepared_epoch = {
             let CoordinatedPipelineRuntime { host, loader, .. } = &mut *runtime;
@@ -761,7 +767,6 @@ impl DaemonCoordinator {
         };
         let tag_epoch = schema_authority.source_hash();
         let max_dependency_depth = self.operational_configuration().max_dependency_depth;
-        let base = self.server.stamp_of(store)?.version;
         let mut staged: Option<StagedCompiled<'_>> = None;
         let mut published_pipeline = None;
         let result = self
