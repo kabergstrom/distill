@@ -88,7 +88,7 @@ fn published_runtime_failure_is_durable_without_a_new_input_version() {
     store
         .input_transaction(|txn| txn.publish_pipeline_epoch(&ready))
         .unwrap();
-    let version = store.input_version();
+    let version = store.input_version().unwrap();
     let failure = PipelineFailure::new(
         PipelineFailureCode::PublishedCallbackPanic,
         PipelineFailureOrigin::PublishedRuntime,
@@ -99,7 +99,7 @@ fn published_runtime_failure_is_durable_without_a_new_input_version() {
     store
         .fail_published_pipeline_epoch(ready.dylib_hash, &failure)
         .unwrap();
-    assert_eq!(store.input_version(), version);
+    assert_eq!(store.input_version().unwrap(), version);
     assert!(matches!(
         store.pipeline_state().unwrap(),
         Some(PipelineState::Failed {
@@ -414,12 +414,12 @@ fn invalid_package_registration_publishes_nothing() {
         unreachable!();
     };
     files[0].path = "../tool".into();
-    let before = store.input_version();
+    let before = store.input_version().unwrap();
     assert!(matches!(
         store.input_transaction(|txn| txn.register_tool("tool", package)),
         Err(StoreError::InvalidToolIdentity(_))
     ));
-    assert_eq!(store.input_version(), before);
+    assert_eq!(store.input_version().unwrap(), before);
     assert!(store.tool("tool").unwrap().is_none());
 }
 

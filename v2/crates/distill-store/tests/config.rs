@@ -76,20 +76,20 @@ fn operational_store_values_apply_without_copying_restart_state() {
     assert_eq!(applied.cache_limit, 8192);
     assert_eq!(applied.parallelism, 3);
     assert_eq!(applied.batch_reserved_workers, 2);
-    assert_eq!(store.input_version().0, 0);
+    assert_eq!(store.input_version().unwrap().0, 0);
 }
 
 #[test]
 fn restart_only_changes_stage_without_advancing_or_replacing_active_values() {
     let (_dir, mut store) = open();
-    let before = store.input_version();
+    let before = store.input_version().unwrap();
     let pending = store
         .stage_pending_restart(&[
             RestartOnlyChange::Address(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999)),
             RestartOnlyChange::AutoCodegen(false),
         ])
         .unwrap();
-    assert_eq!(store.input_version(), before);
+    assert_eq!(store.input_version().unwrap(), before);
     assert_eq!(pending.generation, 1);
     assert_eq!(pending.keys, ["codegen.auto_codegen", "daemon.address"]);
     assert_eq!(store.pending_restart().unwrap(), Some(pending.clone()));
@@ -117,9 +117,9 @@ fn a_reverted_restart_candidate_clears_pending_state_without_advancing() {
     store
         .stage_pending_restart(&[RestartOnlyChange::AutoCodegen(true)])
         .unwrap();
-    let before = store.input_version();
+    let before = store.input_version().unwrap();
     store.clear_pending_restart().unwrap();
-    assert_eq!(store.input_version(), before);
+    assert_eq!(store.input_version().unwrap(), before);
     assert!(store.pending_restart().unwrap().is_none());
 }
 
@@ -132,7 +132,7 @@ fn invalid_restart_value_is_rejected_before_pending_state_exists() {
         .unwrap_err();
     assert!(matches!(err, ConfigValidationError::NonLoopbackAddress(a) if a == non_loopback));
     assert!(store.pending_restart().unwrap().is_none());
-    assert_eq!(store.input_version().0, 0);
+    assert_eq!(store.input_version().unwrap().0, 0);
 }
 
 #[test]

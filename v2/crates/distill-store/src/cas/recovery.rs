@@ -303,7 +303,7 @@ impl Store {
             .filter(|hash| !covered.contains(*hash))
             .count();
 
-        let mut memo_counter = self.memo_seq().0;
+        let mut memo_counter = self.memo_seq()?.0;
         let mut adopted = 0usize;
         self.write_txn(|store| {
             let transaction = &*store.conn;

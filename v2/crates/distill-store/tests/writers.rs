@@ -45,7 +45,7 @@ fn concurrent_writers_lose_no_update_and_log_in_commit_order() {
     }
 
     let total = (THREADS * EACH) as u64;
-    assert_eq!(store.input_version(), InputVersion(total));
+    assert_eq!(store.input_version().unwrap(), InputVersion(total));
     let log = store.change_log_after(0).unwrap();
     assert_eq!(log.len(), THREADS * EACH);
     // Sequence order is commit order: the n-th row belongs to version n.
@@ -69,25 +69,25 @@ fn an_open_input_is_seen_through_its_writer_and_by_no_other_connection() {
         .input_transaction(|txn| txn.set_clean_watermark(7))
         .unwrap();
     // The owner reads its open input through its writer.
-    assert_eq!(writer.input_version(), InputVersion(1));
+    assert_eq!(writer.input_version().unwrap(), InputVersion(1));
     assert_eq!(writer.clean_watermark().unwrap(), Some(7));
     // Another thread's reader, and another writer, see none of it.
     let other = {
         let opener = Arc::clone(&opener);
         std::thread::spawn(move || {
             let read = opener.open_reader().unwrap();
-            (read.input_version(), read.clean_watermark().unwrap())
+            (read.input_version().unwrap(), read.clean_watermark().unwrap())
         })
         .join()
         .unwrap()
     };
     assert_eq!(other, (InputVersion(0), None));
-    assert_eq!(store.input_version(), InputVersion(0));
+    assert_eq!(store.input_version().unwrap(), InputVersion(0));
 
     assert_eq!(writer.finish_input(true).unwrap(), InputVersion(1));
     let other = {
         let opener = Arc::clone(&opener);
-        std::thread::spawn(move || opener.open_reader().unwrap().input_version())
+        std::thread::spawn(move || opener.open_reader().unwrap().input_version().unwrap())
             .join()
             .unwrap()
     };

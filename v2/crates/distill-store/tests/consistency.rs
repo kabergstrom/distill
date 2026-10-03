@@ -100,8 +100,8 @@ fn the_two_sequencing_domains_are_independent() {
     store.input_transaction(|_| Ok(())).unwrap();
     commit(&mut store, 3);
 
-    assert_eq!(store.input_version().0, 2, "two input events");
-    assert_eq!(store.memo_seq().0, 3, "three memo commits");
+    assert_eq!(store.input_version().unwrap().0, 2, "two input events");
+    assert_eq!(store.memo_seq().unwrap().0, 3, "three memo commits");
 
     // The memo committed under version 1 is readable at version 2 — an
     // old basis's memo read by a newer version is the memoization
@@ -181,7 +181,7 @@ fn multi_table_input_transactions_are_all_or_nothing() {
 
     // None of it published — readers observe all metadata for a given
     // tree state, or none of it.
-    assert_eq!(store.input_version().0, 0);
+    assert_eq!(store.input_version().unwrap().0, 0);
     assert!(store.entry(AssetUuid([2u8; 16])).unwrap().is_none());
     assert!(store.bundle(BundleUuid([1u8; 16])).unwrap().is_none());
     assert!(store.tool("tool").unwrap().is_none());
@@ -284,7 +284,7 @@ fn pure_metadata_reads_survive_a_pipeline_failure() {
         store.resolve_path("a.bundle").unwrap(),
         Some(AssetUuid([2u8; 16]))
     );
-    let _ = store.input_version();
+    let _ = store.input_version().unwrap();
 }
 
 #[test]
@@ -319,13 +319,13 @@ fn memo_state_is_monotone_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
     commit(&mut store, 1);
-    let seq_before = store.memo_seq();
+    let seq_before = store.memo_seq().unwrap();
     drop(store);
     let mut store = Store::open(cfg(&dir)).unwrap();
-    assert_eq!(store.memo_seq(), seq_before);
+    assert_eq!(store.memo_seq().unwrap(), seq_before);
     commit(&mut store, 2);
     assert!(
-        store.memo_seq() > seq_before,
+        store.memo_seq().unwrap() > seq_before,
         "the memo sequence never rewinds"
     );
 }

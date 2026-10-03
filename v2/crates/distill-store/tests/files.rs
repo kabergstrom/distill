@@ -190,11 +190,11 @@ fn pending_file_work_acknowledges_only_the_observed_sequence_prefix() {
             transaction.push_rename(root, "later.bundle", "last.bundle")
         })
         .unwrap();
-    let version = store.input_version();
+    let version = store.input_version().unwrap();
     let acknowledged = store.acknowledge_file_work(&observed).unwrap();
     assert!(acknowledged);
     assert_eq!(
-        store.input_version(),
+        store.input_version().unwrap(),
         version,
         "internal queue acknowledgement is unversioned"
     );

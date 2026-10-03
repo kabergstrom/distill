@@ -249,7 +249,7 @@ impl DaemonCoordinator {
         capabilities_changed: bool,
     ) -> Result<PassOutcome, CoordinatorError> {
         let compiled = self.loop_compiled(store)?;
-        let base = self.server.stamp_of(store).version;
+        let base = self.server.stamp_of(store)?.version;
         let step = self.incremental_step(&compiled, store, batch)?;
         self.pass(
             store,
@@ -274,7 +274,7 @@ impl DaemonCoordinator {
         loop {
             let compiled = self.loop_compiled(store)?;
             queue.arm_scan();
-            let base = self.server.stamp_of(store).version;
+            let base = self.server.stamp_of(store)?.version;
             let step = self.full_step(&compiled, store);
             let action = queue.finish_scan();
             if let WatcherAction::FullRescan = action {
@@ -351,7 +351,10 @@ impl DaemonCoordinator {
         let published = published.map_err(CoordinatorError::Coordinated)?;
         self.finish_scan_step(&step);
         Ok(PassOutcome {
-            stamp: published.unwrap_or_else(|| self.server.stamp_of(store)),
+            stamp: match published {
+                Some(stamp) => stamp,
+                None => self.server.stamp_of(store)?,
+            },
             more_work,
             failures: Vec::new(),
             imported: Vec::new(),
@@ -466,7 +469,10 @@ impl DaemonCoordinator {
         let published = published.map_err(CoordinatorError::Coordinated)?;
         self.finish_scan_step(&step);
         Ok(PassOutcome {
-            stamp: published.unwrap_or_else(|| self.server.stamp_of(store)),
+            stamp: match published {
+                Some(stamp) => stamp,
+                None => self.server.stamp_of(store)?,
+            },
             more_work,
             failures,
             imported,
@@ -1013,7 +1019,7 @@ impl DaemonCoordinator {
                 };
                 let commit = publish_incremental_scan(
                     store,
-                    store.input_version(),
+                    store.input_version().map_err(|error| error.to_string())?,
                     &step.delta,
                     &step.claims,
                     &inputs,
@@ -1031,7 +1037,7 @@ impl DaemonCoordinator {
                     .map_err(|error| error.to_string())?;
                 let commit = publish_scan(
                     store,
-                    store.input_version(),
+                    store.input_version().map_err(|error| error.to_string())?,
                     step.candidate.clone(),
                     false,
                     None,
@@ -1141,7 +1147,7 @@ fn published_paths_work(
             root_name: root_name.clone(),
             path: path.clone(),
             exists: true,
-            observation: store.input_version(),
+            observation: store.input_version().map_err(|error| error.to_string())?,
         });
     }
     Ok(PendingFileWork {

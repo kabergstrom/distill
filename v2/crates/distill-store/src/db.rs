@@ -659,8 +659,8 @@ impl Store {
         let recovery = store.recover_cas()?;
         tracing::info!(
             path = %store.config.state_path.display(),
-            input_version = store.input_version().0,
-            memo_seq = store.memo_seq().0,
+            input_version = store.input_version()?.0,
+            memo_seq = store.memo_seq()?.0,
             recovery = ?recovery,
             "store opened"
         );
@@ -897,11 +897,11 @@ impl Store {
         let state = std::mem::replace(&mut self.input, InputState::Closed);
         let InputState::Begun { base } = state else {
             assert_eq!(state, InputState::Armed, "an input is armed");
-            return Ok(self.input_version());
+            return Ok(self.input_version()?);
         };
         if keep {
             match self.read.conn.execute_batch("COMMIT") {
-                Ok(()) => return Ok(self.input_version()),
+                Ok(()) => return Ok(self.input_version()?),
                 Err(error) => {
                     let _ = self.read.conn.execute_batch("ROLLBACK");
                     self.cas.forget_active();
@@ -1140,35 +1140,22 @@ impl StoreReader {
     }
 
     /// The committed input version visible to this connection.
-    ///
-    /// Infallible for now: the phase-3+ rewrites of its callers make it
-    /// return `Result`. A failing single-row read of `store_meta` on an
-    /// open connection means the database is gone or corrupt.
-    pub fn input_version(&self) -> InputVersion {
-        InputVersion(
-            meta_get_u64(&self.conn, "input_version")
-                .expect("store_meta.input_version is readable")
-                .unwrap_or(0),
-        )
+    pub fn input_version(&self) -> Result<InputVersion, StoreError> {
+        Ok(InputVersion(meta_get_u64(&self.conn, "input_version")?.unwrap_or(0)))
     }
 
-    /// The committed memo sequence visible to this connection. See
-    /// [`StoreReader::input_version`] on infallibility.
-    pub fn memo_seq(&self) -> MemoSeq {
-        MemoSeq(
-            meta_get_u64(&self.conn, "memo_seq")
-                .expect("store_meta.memo_seq is readable")
-                .unwrap_or(0),
-        )
+    /// The committed memo sequence visible to this connection.
+    pub fn memo_seq(&self) -> Result<MemoSeq, StoreError> {
+        Ok(MemoSeq(meta_get_u64(&self.conn, "memo_seq")?.unwrap_or(0)))
     }
 
     /// The instance-qualified current version (§13): what crosses the
     /// RPC boundary.
-    pub fn stamp(&self) -> SnapshotStamp {
-        SnapshotStamp {
+    pub fn stamp(&self) -> Result<SnapshotStamp, StoreError> {
+        Ok(SnapshotStamp {
             instance: self.instance_id,
-            version: self.input_version(),
-        }
+            version: self.input_version()?,
+        })
     }
 
     /// §14's clean watermark: the newest mtime observed under active

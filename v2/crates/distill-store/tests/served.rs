@@ -36,7 +36,7 @@ fn snapshot_keeps_its_version_while_the_writer_publishes() {
         snapshot.asset_resolution(ASSET).unwrap(),
         Some(ResolutionRow::Missing)
     );
-    assert_eq!(snapshot.input_version(), InputVersion(1));
+    assert_eq!(snapshot.input_version().unwrap(), InputVersion(1));
     assert!(snapshot.change_log_after(0).unwrap().is_empty());
     let reader = snapshot.into_reader().unwrap();
     assert_eq!(
@@ -117,8 +117,8 @@ fn embedded_identity_applies_only_to_fresh_stores() {
     store
         .adopt_embedded_identity(instance, InputVersion(40))
         .unwrap();
-    assert_eq!(store.stamp().instance, instance);
-    assert_eq!(store.reader().unwrap().stamp().version, InputVersion(40));
+    assert_eq!(store.stamp().unwrap().instance, instance);
+    assert_eq!(store.reader().unwrap().stamp().unwrap().version, InputVersion(40));
     assert!(store
         .adopt_embedded_identity(instance, InputVersion(41))
         .is_err());

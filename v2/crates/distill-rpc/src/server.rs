@@ -364,7 +364,7 @@ impl ServerHandle {
                 }
                 ApplyError::Store(error) => error,
             };
-            let observed = store.input_version();
+            let observed = store.input_version().map_err(PublishError::Store)?;
             let base = base.unwrap_or(observed);
             let result = if full || observed == base {
                 let mode = if full { ApplyMode::Full } else { ApplyMode::Delta };
@@ -711,7 +711,7 @@ impl Server {
         self.inner.handle.instance
     }
 
-    pub fn current_stamp(&self) -> SnapshotStamp {
+    pub fn current_stamp(&self) -> Result<SnapshotStamp, StoreError> {
         self.inner.current_stamp()
     }
 
@@ -798,17 +798,24 @@ impl ServerHandle {
     }
 
     /// The version `store` is at, as this server stamps it.
-    pub fn stamp_of(&self, store: &StoreReader) -> SnapshotStamp {
-        SnapshotStamp {
+    pub fn stamp_of(&self, store: &StoreReader) -> Result<SnapshotStamp, StoreError> {
+        Ok(SnapshotStamp {
             instance: self.instance,
-            version: store.input_version(),
-        }
+            version: store.input_version()?,
+        })
     }
 
     /// Advance the protocol epoch and fence every existing connection.
     pub fn replace_protocol_epoch(&self, store: &mut Store, protocol_epoch: u32) -> SnapshotStamp {
         self.write_served(store, true, move |txn| txn.protocol_epoch(protocol_epoch));
+        self.written_stamp(store)
+    }
+
+    /// The version `store` is at after [`Self::write_served`], under its
+    /// policy: a store that fails the write's own read is a failed write.
+    fn written_stamp(&self, store: &StoreReader) -> SnapshotStamp {
         self.stamp_of(store)
+            .unwrap_or_else(|error| panic!("RPC store read failed: {error}"))
     }
 
     /// Validate and publish one artifact with its typed direct load edges.
@@ -1112,19 +1119,19 @@ impl ServerHandle {
         })?;
         match known {
             None => return Err(AdminError::UnknownTarget { target: name }),
-            Some(row) if row.definition_hash == hash.0 => return Ok(self.stamp_of(store)),
+            Some(row) if row.definition_hash == hash.0 => return Ok(self.written_stamp(store)),
             Some(_) => {}
         }
         let changed = self.write_served(store, true, move |txn| txn.target(&name, hash));
         debug_assert_eq!(changed, Some(true));
-        Ok(self.stamp_of(store))
+        Ok(self.written_stamp(store))
     }
 
     /// Stage a valid restart-only edit. This does not advance the input
     /// version or mutate active configuration values.
     pub fn restart_required(&self, store: &mut Store, keys: Vec<String>) -> SnapshotStamp {
         self.write_served(store, false, move |txn| txn.restart(&keys));
-        self.stamp_of(store)
+        self.written_stamp(store)
     }
 }
 
@@ -1525,11 +1532,11 @@ impl Inner {
         job(writer)
     }
 
-    pub(crate) fn current_stamp(&self) -> SnapshotStamp {
-        SnapshotStamp {
+    pub(crate) fn current_stamp(&self) -> Result<SnapshotStamp, StoreError> {
+        Ok(SnapshotStamp {
             instance: self.handle.instance,
-            version: self.reader.input_version(),
-        }
+            version: self.reader.input_version()?,
+        })
     }
 
     /// Read several facts from one committed version.
@@ -1544,7 +1551,7 @@ impl Inner {
     /// version on this front end share it; each new version opens a read
     /// transaction on a connection of its own.
     pub(crate) fn current_snapshot(&self) -> Result<Rc<SnapshotTxn>, StoreError> {
-        let current = self.reader.input_version();
+        let current = self.reader.input_version()?;
         if let Some(txn) = self.current_txn.borrow().upgrade() {
             if txn.stamp.version == current {
                 return Ok(txn);

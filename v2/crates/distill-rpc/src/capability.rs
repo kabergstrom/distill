@@ -581,7 +581,10 @@ fn authoring_gate(
     if let Some(reason) = server.inner.generation_fence(connection) {
         return Some(AuthoringGate::Reconnect(reason));
     }
-    let current = server.inner.current_stamp().version;
+    let current = match server.inner.current_stamp() {
+        Ok(stamp) => stamp.version,
+        Err(error) => return Some(AuthoringGate::Failure(store_failure(error))),
+    };
     if base != current {
         return Some(AuthoringGate::Failure(RpcFailure::StaleInputVersion {
             expected: current,
@@ -1412,7 +1415,7 @@ impl Hub {
         }
         let inner = &self.server.inner;
         let (stamp, head, oldest, history, restart) = rpc_try!(inner.read_consistent(|reader| {
-            let stamp = reader.stamp();
+            let stamp = reader.stamp()?;
             let history = if since < stamp.version {
                 reader.change_log_history(since, stamp.version)?
             } else {
@@ -1949,9 +1952,9 @@ impl Snapshot {
                 }
                 ResolveResult::Built { content_hash }
             }
-            Some(VersionResolve::Drifted(input)) => ResolveResult::Drifted {
-                input,
-                current: self.server.inner.current_stamp(),
+            Some(VersionResolve::Drifted(input)) => match self.server.inner.current_stamp() {
+                Ok(current) => ResolveResult::Drifted { input, current },
+                Err(error) => return done(RpcResult::Failure(store_failure(error))),
             },
             Some(VersionResolve::Failed(error)) => ResolveResult::Failed { error },
             Some(VersionResolve::Deleted(at)) => ResolveResult::Deleted {
@@ -2022,9 +2025,9 @@ impl Snapshot {
                 value: match answer {
                     BuildAnswer::Built { content_hash } => ResolveResult::Built { content_hash },
                     BuildAnswer::Failed { error } => ResolveResult::Failed { error },
-                    BuildAnswer::Drifted { input } => ResolveResult::Drifted {
-                        input,
-                        current: self.server.inner.current_stamp(),
+                    BuildAnswer::Drifted { input } => match self.server.inner.current_stamp() {
+                        Ok(current) => ResolveResult::Drifted { input, current },
+                        Err(error) => return RpcResult::Failure(store_failure(error)),
                     },
                 },
             }),

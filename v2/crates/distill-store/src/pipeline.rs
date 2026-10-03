@@ -1068,7 +1068,7 @@ impl StoreReader {
 
     /// Resolve a tool key through the ToolEpoch table (§13).
     pub fn tool(&self, key: &str) -> Result<Option<RegisteredTool>, StoreError> {
-        self.tool_at(key, self.input_version())
+        self.tool_at(key, self.input_version()?)
     }
 
     /// Resolve the last ToolEpoch mapping visible at an exact pinned input

@@ -256,12 +256,12 @@ impl Cells {
 
     /// Commit `uuid`'s new authored `value`: a new store version.
     fn commit_value(&mut self, uuid: AssetUuid, value: u8) {
-        let before = self.coordinator.server().current_stamp();
+        let before = self.coordinator.server().current_stamp().unwrap();
         self.write_bundle(uuid, value);
         self.coordinator
             .reconcile_full_scan(&mut self.writer)
             .unwrap();
-        assert_ne!(self.coordinator.server().current_stamp(), before);
+        assert_ne!(self.coordinator.server().current_stamp().unwrap(), before);
     }
 
     fn request(&self, uuid: AssetUuid, class: BuildWorkClass) -> BuildRequest {

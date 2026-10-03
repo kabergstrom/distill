@@ -298,14 +298,14 @@ fn startup_adopts_the_pending_restart_generation_before_rpc_construction() {
 
     let coordinator = coordinator(&temp);
     let store = coordinator.open_reader().unwrap();
-    assert_eq!(store.input_version(), InputVersion(1));
+    assert_eq!(store.input_version().unwrap(), InputVersion(1));
     assert!(store.pending_restart().unwrap().is_none());
     assert!(matches!(
         store.configuration_state().unwrap(),
         ConfigurationState::Ready(epoch) if epoch.generation == pending_generation
     ));
     assert_eq!(
-        coordinator.server().current_stamp().version,
+        coordinator.server().current_stamp().unwrap().version,
         InputVersion(1)
     );
 }
@@ -320,9 +320,9 @@ fn full_scan_publishes_one_store_and_rpc_version() {
 
     let stamp = coordinator.reconcile_full_scan(&mut writer).unwrap();
     assert_eq!(stamp.version, InputVersion(1));
-    assert_eq!(coordinator.server().current_stamp(), stamp);
+    assert_eq!(coordinator.server().current_stamp().unwrap(), stamp);
     let store = coordinator.open_reader().unwrap();
-    assert_eq!(store.input_version(), InputVersion(1));
+    assert_eq!(store.input_version().unwrap(), InputVersion(1));
     assert!(store.bundle(bundle).unwrap().is_some());
     assert_eq!(store.entry(asset).unwrap().unwrap().local_id, "entry");
     assert!(matches!(
@@ -363,7 +363,7 @@ fn watcher_trigger_reconciles_an_offline_delete_in_exactly_one_version() {
     let store = coordinator.open_reader().unwrap();
     assert!(store.bundle(bundle).unwrap().is_none());
     assert!(store.entry(asset).unwrap().is_none());
-    assert_eq!(store.input_version(), InputVersion(2));
+    assert_eq!(store.input_version().unwrap(), InputVersion(2));
 }
 
 #[test]
@@ -408,7 +408,7 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
     let rewritten = distill_bundle::parse_bundle(&std::fs::read(&bundle_path).unwrap()).unwrap();
     assert_eq!(rewritten.assets["entry"].data, AuthoredValue::UInt(9));
     assert_eq!(
-        coordinator.open_reader().unwrap().input_version(),
+        coordinator.open_reader().unwrap().input_version().unwrap(),
         InputVersion(2)
     );
 
@@ -424,7 +424,7 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
     assert_eq!(stamp.version, InputVersion(3));
     assert!(!bundle_path.exists());
     let store = coordinator.open_reader().unwrap();
-    assert_eq!(store.input_version(), InputVersion(3));
+    assert_eq!(store.input_version().unwrap(), InputVersion(3));
     assert!(store.bundle(bundle_uuid).unwrap().is_none());
     assert!(store.entry(asset_uuid).unwrap().is_none());
 }
@@ -450,14 +450,14 @@ fn a_coordinated_publication_is_invisible_until_it_commits_whole() {
             // The namespace is written, but not yet as a version anyone else
             // can read: it commits with the served rows.
             let outside = StoreReader::open(StoreConfig::new(state.clone())).unwrap();
-            assert_eq!(outside.input_version(), InputVersion(1));
+            assert_eq!(outside.input_version().unwrap(), InputVersion(1));
             assert!(outside.entry(asset_uuid).unwrap().is_some());
             Ok(commit)
         })
         .unwrap();
     assert_eq!(stamp.version, InputVersion(2));
     let outside = StoreReader::open(StoreConfig::new(state)).unwrap();
-    assert_eq!(outside.input_version(), InputVersion(2));
+    assert_eq!(outside.input_version().unwrap(), InputVersion(2));
     assert!(outside.entry(asset_uuid).unwrap().is_none());
     assert!(outside.bundle(bundle_uuid).unwrap().is_none());
 }
@@ -694,7 +694,7 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
         .iter()
         .all(|(_, path, _)| !path.starts_with("daemon-state-alias")));
     drop(store);
-    let version = coordinator.server().current_stamp().version;
+    let version = coordinator.server().current_stamp().unwrap().version;
 
     std::fs::remove_file(&alias).unwrap();
     coordinator
@@ -704,7 +704,7 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
         })
         .unwrap();
     assert!(coordinator.scan_diagnostics(&mut writer).unwrap().is_empty());
-    assert_eq!(coordinator.server().current_stamp().version, version);
+    assert_eq!(coordinator.server().current_stamp().unwrap().version, version);
     symlink(temp.path().join(".distill"), &alias).unwrap();
     coordinator
         .reconcile_incremental(&mut writer, &WatcherBatch {
@@ -713,9 +713,9 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
         })
         .unwrap();
     assert_eq!(coordinator.scan_diagnostics(&mut writer).unwrap().len(), 1);
-    assert_eq!(coordinator.server().current_stamp().version, version);
+    assert_eq!(coordinator.server().current_stamp().unwrap().version, version);
 
-    let base = coordinator.server().current_stamp().version;
+    let base = coordinator.server().current_stamp().unwrap().version;
     let hub = match coordinator
         .server()
         .root()
@@ -737,7 +737,7 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
         cancelled.next().unwrap().state,
         AuthoringProgressState::Cancelled
     );
-    assert_eq!(coordinator.server().current_stamp().version, base);
+    assert_eq!(coordinator.server().current_stamp().unwrap().version, base);
 
     let events = hub
         .operation(base, LongRunningOp::Doctor(DoctorRequest::Verify.encode()))
@@ -1003,7 +1003,7 @@ fn a_pending_scan_rejection_survives_an_authoring_write_and_a_restart() {
             },
         });
         let backend = Arc::clone(coordinator.authoring_service());
-        let base = coordinator.server().current_stamp().version;
+        let base = coordinator.server().current_stamp().unwrap().version;
         let stamp = coordinator
             .coordinated_commit(&mut writer, base, |store| {
                 backend
@@ -1075,7 +1075,7 @@ fn single_edit_pages(filler: usize) -> u64 {
     bundle.assets.get_mut("entry").unwrap().data = AuthoredValue::UInt(9);
     std::fs::write(&edited, distill_bundle::write_bundle(&bundle).unwrap()).unwrap();
     let before = writer.pages_fetched().unwrap();
-    let base = writer.input_version();
+    let base = writer.input_version().unwrap();
     let published = coordinator
         .reconcile_incremental(&mut writer, &WatcherBatch {
             paths: vec![edited],
@@ -1116,7 +1116,7 @@ fn configuration_error_pages(filler: usize) -> u64 {
     let ready = writer.configuration_state().unwrap();
 
     let before = writer.pages_fetched().unwrap();
-    let base = writer.input_version();
+    let base = writer.input_version().unwrap();
     let rejected = coordinator
         .publish_configuration_rejection(
             &mut writer,

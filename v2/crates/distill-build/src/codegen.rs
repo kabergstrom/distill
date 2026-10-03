@@ -48,7 +48,8 @@ impl<B> CodegenAttempt<B> {
 
 /// Read-only view used for the last-moment basis/trace check.
 pub trait CodegenSnapshot<B> {
-    fn current_basis(&self) -> B;
+    /// The current basis; `None` when it cannot be read, which requeues.
+    fn current_basis(&self) -> Option<B>;
     fn observe(&self, op: &TraceOp) -> bool;
 }
 
@@ -112,7 +113,7 @@ impl CodegenCoordinator {
         B: PartialEq,
         W: CodegenSnapshot<B> + CodegenPublisher<B>,
     {
-        if world.current_basis() != attempt.basis
+        if world.current_basis().as_ref() != Some(&attempt.basis)
             || !attempt.trace.iter().all(|op| world.observe(op))
         {
             return CodegenPublication::Requeued;

@@ -478,7 +478,7 @@ fn production_bootstrap_starts_at_the_durable_store_version() {
     )
     .unwrap();
 
-    assert_eq!(server.current_stamp().version, InputVersion(41));
+    assert_eq!(server.current_stamp().unwrap().version, InputVersion(41));
     assert_eq!(
         snapshot(&connect(&server, &[(1, false)])).stamp().version,
         InputVersion(41)
@@ -620,7 +620,7 @@ fn durable_write_backend_owns_the_committed_projection() {
         RpcResult::Success(InputVersion(9))
     );
     assert_eq!(*backend.bases.lock().unwrap(), [InputVersion(8)]);
-    assert_eq!(server.current_stamp().version, InputVersion(9));
+    assert_eq!(server.current_stamp().unwrap().version, InputVersion(9));
 }
 
 #[test]
@@ -667,7 +667,7 @@ fn coordinator_can_project_daemon_controls_but_hub_cannot_write_them_directly() 
         hub.write(InputVersion(1), vec![AuthoringOp::Set(control)], false),
         RpcResult::Failure(RpcFailure::InvalidAuthoringRequest { .. })
     ));
-    assert_eq!(server.current_stamp().version, InputVersion(1));
+    assert_eq!(server.current_stamp().unwrap().version, InputVersion(1));
 }
 
 fn connect(server: &Server, policies: &[(u8, bool)]) -> Hub {
@@ -1724,7 +1724,7 @@ fn published_runtime_failure_fences_shared_epoch_without_minting_a_version() {
         .unwrap();
 
     assert!(persisted);
-    assert_eq!(server.current_stamp(), stamp);
+    assert_eq!(server.current_stamp().unwrap(), stamp);
     let reason = ReconnectReason::PipelineEpochChanged;
     assert_reconnect(pinned.version(), reason);
     assert_reconnect(
@@ -1768,7 +1768,7 @@ fn published_runtime_failure_fences_shared_epoch_without_minting_a_version() {
 #[test]
 fn commit_rejects_unauthenticated_dscp_and_noncanonical_typed_pipeline_diagnostics() {
     let server = server_with(&[(1, false)]);
-    let before = server.current_stamp();
+    let before = server.current_stamp().unwrap();
     let mut error = ConfigurationError::from_reason(
         &DscpV1::MalformedConfiguration { file_hash: [1; 32] },
         "bad configuration",
@@ -1791,7 +1791,7 @@ fn commit_rejects_unauthenticated_dscp_and_noncanonical_typed_pipeline_diagnosti
         }),
         Err(AdminError::InvalidPipelineDiagnostic { .. })
     ));
-    assert_eq!(server.current_stamp(), before);
+    assert_eq!(server.current_stamp().unwrap(), before);
 }
 
 #[test]
@@ -2074,7 +2074,7 @@ fn restart_required_names_sorted_unique_keys_without_advancing_version() {
         .success()
         .unwrap();
     install.deltas.next().unwrap();
-    let before = server.current_stamp();
+    let before = server.current_stamp().unwrap();
     let after = server.restart_required(vec![
         "daemon.state_path".to_owned(),
         "daemon.address".to_owned(),
@@ -2316,7 +2316,7 @@ fn hub_authoring_and_wire_tree_surface_is_versioned_typed_and_generation_first()
     assert_eq!(events[1].state, AuthoringProgressState::Running);
     assert_eq!(&*events[1].payload, b"verify-cas");
     assert_eq!(events[2].state, AuthoringProgressState::Completed);
-    assert_eq!(server.current_stamp().version, InputVersion(4));
+    assert_eq!(server.current_stamp().unwrap().version, InputVersion(4));
     let cancelled_operation = LongRunningOp::Doctor(Arc::from(&b"cancel-me"[..]));
     let mut cancellable = hub
         .operation(InputVersion(4), cancelled_operation.clone())
@@ -2332,7 +2332,7 @@ fn hub_authoring_and_wire_tree_surface_is_versioned_typed_and_generation_first()
         AuthoringProgressState::Cancelled
     );
     assert!(!cancellable.cancel());
-    assert_eq!(server.current_stamp().version, InputVersion(4));
+    assert_eq!(server.current_stamp().unwrap().version, InputVersion(4));
     assert_eq!(*backend.imports.lock().unwrap(), vec![import_request]);
     assert_eq!(
         *backend.reimports.lock().unwrap(),
@@ -2442,7 +2442,7 @@ fn missing_authoring_backend_is_typed_and_never_advances_the_input_version() {
             operation: "import".to_owned(),
         })
     );
-    assert_eq!(server.current_stamp().version, InputVersion(0));
+    assert_eq!(server.current_stamp().unwrap().version, InputVersion(0));
 }
 
 #[test]
@@ -2497,7 +2497,7 @@ fn expired_and_foreign_snapshots_fail_without_serving_data() {
 #[test]
 fn commit_validation_is_atomic_for_duplicate_names_and_invalid_paths() {
     let server = server_with(&[(1, false)]);
-    let before = server.current_stamp();
+    let before = server.current_stamp().unwrap();
     assert!(matches!(
         server.commit(Commit {
             assets: vec![
@@ -2555,13 +2555,13 @@ fn commit_validation_is_atomic_for_duplicate_names_and_invalid_paths() {
             path: "empty.asset".to_owned()
         })
     );
-    assert_eq!(server.current_stamp(), before);
+    assert_eq!(server.current_stamp().unwrap(), before);
 }
 
 #[test]
 fn authoring_identity_validation_rejects_reserved_local_ids_and_noncanonical_tags_atomically() {
     let server = server_with(&[(1, false)]);
-    let before = server.current_stamp();
+    let before = server.current_stamp().unwrap();
     let mut reserved = authoring_entry(1, AuthoringEntryRole::Runtime);
     reserved.local_id = "$generated".to_owned();
     assert!(matches!(
@@ -2580,7 +2580,7 @@ fn authoring_identity_validation_rejects_reserved_local_ids_and_noncanonical_tag
         }),
         Err(AdminError::InvalidAuthoringIdentity { .. })
     ));
-    assert_eq!(server.current_stamp(), before);
+    assert_eq!(server.current_stamp().unwrap(), before);
 }
 
 #[test]

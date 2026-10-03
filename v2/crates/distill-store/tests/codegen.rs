@@ -20,18 +20,18 @@ fn codegen_output_preimages_are_memo_side_and_compare_and_set() {
     assert_eq!(store.codegen_outputs().unwrap(), empty);
     store.commit_codegen_outputs(&empty, &first).unwrap();
     assert_eq!(store.codegen_outputs().unwrap(), first);
-    assert_eq!(store.input_version().0, 0);
-    assert_eq!(store.memo_seq().0, 1);
+    assert_eq!(store.input_version().unwrap().0, 0);
+    assert_eq!(store.memo_seq().unwrap().0, 1);
 
     assert!(matches!(
         store.commit_codegen_outputs(&empty, &second),
         Err(StoreError::CodegenStateDrift)
     ));
     assert_eq!(store.codegen_outputs().unwrap(), first);
-    assert_eq!(store.memo_seq().0, 1);
+    assert_eq!(store.memo_seq().unwrap().0, 1);
 
     store.commit_codegen_outputs(&first, &second).unwrap();
     assert_eq!(store.codegen_outputs().unwrap(), second);
-    assert_eq!(store.input_version().0, 0);
-    assert_eq!(store.memo_seq().0, 2);
+    assert_eq!(store.input_version().unwrap().0, 0);
+    assert_eq!(store.memo_seq().unwrap().0, 2);
 }

@@ -169,7 +169,7 @@ fn a_failed_configuration_commit_changes_no_compiled_state() {
     let mut fixture = Fixture::new();
     let coordinator = Arc::clone(&fixture.coordinator);
     let reader = coordinator.open_reader().unwrap();
-    let version = reader.input_version();
+    let version = reader.input_version().unwrap();
     let snapshot = coordinator.open_reader().unwrap().begin_snapshot().unwrap();
     let before = coordinator.compiled_at(&reader).unwrap();
     assert_eq!(before.key(), Some(version));
@@ -199,7 +199,7 @@ fn a_failed_configuration_commit_changes_no_compiled_state() {
     // Nothing changed: the version, every reader's compiled state, the
     // registry's latest entry and the watcher's roots.
     let reader = coordinator.open_reader().unwrap();
-    assert_eq!(reader.input_version(), version);
+    assert_eq!(reader.input_version().unwrap(), version);
     assert!(Arc::ptr_eq(&coordinator.compiled_at(&reader).unwrap(), &before));
     assert!(Arc::ptr_eq(&coordinator.compiled_at(&snapshot).unwrap(), &before));
     assert!(Arc::ptr_eq(&coordinator.compiled.latest().unwrap(), &before));
@@ -559,7 +559,7 @@ fn publish_completely(
     let authority = &*configuration.authority;
     let candidate = ScanCandidate::build(scanner.scan().unwrap(), Some(authority)).unwrap();
     let claims = bundle_claims(candidate.scan.bundle_rows(), &configuration.projection, Some(authority)).unwrap();
-    let base = store.input_version();
+    let base = store.input_version().unwrap();
     publish_scan(
         store,
         base,

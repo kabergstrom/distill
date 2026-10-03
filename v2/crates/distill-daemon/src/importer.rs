@@ -606,11 +606,11 @@ impl AuthoringService {
             store
                 .record_watched_import_failure(&WatchedImportFailure {
                     bundle,
-                    attempted_input_version: store.input_version(),
+                    attempted_input_version: store.input_version().map_err(crate::authoring::invalid)?,
                     basis,
                     terminal: WatchedImportTerminal::DirectoryOrphan,
                     message,
-                    memo_seq: store.memo_seq(),
+                    memo_seq: store.memo_seq().map_err(crate::authoring::invalid)?,
                 })
                 .map_err(invalid)?;
         }
@@ -625,7 +625,7 @@ impl AuthoringService {
         store: &mut Store,
         import: &PassImport,
     ) -> Result<Option<PlannedImport>, RpcFailure> {
-        let base = store.input_version();
+        let base = store.input_version().map_err(crate::authoring::invalid)?;
         let planned = match import {
             PassImport::Directory(task) => {
                 let invocation = self
@@ -675,7 +675,7 @@ impl AuthoringService {
         store: &mut Store,
         run: ImportRun,
     ) -> Result<PassPublication, RpcFailure> {
-        let base = store.input_version();
+        let base = store.input_version().map_err(crate::authoring::invalid)?;
         match self.publish_import(store, base, run, ImportExecutionMode::Publish) {
             Ok(prepared) => Ok(PassPublication::Published(prepared)),
             Err(error) if error.memoized => Ok(PassPublication::Memoized),
@@ -1575,7 +1575,7 @@ impl AuthoringService {
         // The memo records the attempt whatever version it ran at; the
         // revalidation above only decides whether it is still wanted.
         store.write_transaction_with(invalid, |store| {
-            let memo_seq = store.memo_seq();
+            let memo_seq = store.memo_seq().map_err(crate::authoring::invalid)?;
             store
                 .record_watched_import_failure(&WatchedImportFailure {
                     bundle: destination.bundle,

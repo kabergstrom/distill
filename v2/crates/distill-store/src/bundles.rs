@@ -507,12 +507,12 @@ impl Store {
         updates: &[TagIndexUpdate],
     ) -> Result<(), StoreError> {
         self.write_txn(|store| {
-            if store.input_version() != expected {
+            if store.input_version()? != expected {
                 return Err(StoreError::InvalidConfiguration {
                     error: format!(
                         "tag-index refinement basis {:?}, current {:?}",
                         expected,
-                        store.input_version()
+                        store.input_version()?
                     ),
                 });
             }

@@ -116,15 +116,15 @@ fn malformed_wire_tree_bodies_are_rejected_before_append() {
 fn a_successful_commit_publishes_outputs_and_advances_only_the_memo_seq() {
     let (_d, mut store) = store();
     declare_child(&mut store, PARENT, "normals");
-    let input_version_before = store.input_version();
+    let input_version_before = store.input_version().unwrap();
 
     let receipt = store
         .commit_build(success_commit([1u8; 32], b"trace"))
         .unwrap();
     assert_eq!(receipt.memo_seq.0, 1);
-    assert_eq!(store.memo_seq().0, 1);
+    assert_eq!(store.memo_seq().unwrap().0, 1);
     assert_eq!(
-        store.input_version(),
+        store.input_version().unwrap(),
         input_version_before,
         "build results attach to an input basis without advancing any input version (§13)"
     );
@@ -669,5 +669,5 @@ fn commits_survive_reopen() {
         .lookup_candidates(KeyKind::Processor, &[1u8; 32])
         .unwrap();
     assert_eq!(candidates.len(), 1);
-    assert_eq!(store.memo_seq().0, 1, "memo counter persisted");
+    assert_eq!(store.memo_seq().unwrap().0, 1, "memo counter persisted");
 }

@@ -1040,7 +1040,7 @@ impl<'s> BuildContext<'s> {
                 BuildStores::Worker { view, .. } => StoreRead::Reader(view),
                 BuildStores::Inline(store) => StoreRead::Borrowed(store.borrow()),
             };
-            let version = read.input_version();
+            let version = read.input_version().map_err(BuildError::infrastructure)?;
             (version, read.state_path().join(runs))
         };
         Ok(Self {
@@ -1686,7 +1686,7 @@ fn poison_tag_index(
         })
         .collect::<Vec<_>>();
     store
-        .refine_unpublished_tag_index(store.input_version(), &updates)
+        .refine_unpublished_tag_index(store.input_version().map_err(|error| error.to_string())?, &updates)
         .map_err(|error| format!("poison the tag index: {error}"))?;
     Ok(PublishedTagIndex::conservatively_poisoned(assets))
 }
@@ -1775,7 +1775,7 @@ fn try_refine_tag_index(
     if tests::FAIL_TAG_REFINEMENT.with(|fail| fail.replace(false)) {
         return Err("injected tag-index refinement failure".to_owned());
     }
-    let basis = store.input_version();
+    let basis = store.input_version().map_err(|error| error.to_string())?;
     // A bundle's assets one after another, so each bundle is parsed once.
     let mut order = assets
         .iter()
@@ -5434,7 +5434,7 @@ mod tests {
                 .runtime_type_policy(
                     &coordinator.opener().open_reader().unwrap(),
                     &RuntimeTypePolicyRequest {
-                        basis: coordinator.server().current_stamp(),
+                        basis: coordinator.server().current_stamp().unwrap(),
                         target: request.target.clone(),
                         target_definition: request.target_definition,
                         type_uuid: TYPE,
@@ -5478,7 +5478,7 @@ mod tests {
                 wire_tree.bytes.to_vec(),
             );
         }
-        let first_memo = coordinator.open_reader().unwrap().memo_seq();
+        let first_memo = coordinator.open_reader().unwrap().memo_seq().unwrap();
         let import_key = build_import_digest(&BuildImportInputs {
             asset: ASSET,
             bundle: BUNDLE,
@@ -5558,7 +5558,7 @@ mod tests {
 
         let hydrated = build(&coordinator, &request).unwrap();
         assert_eq!(hydrated, first);
-        assert_eq!(coordinator.open_reader().unwrap().memo_seq(), first_memo);
+        assert_eq!(coordinator.open_reader().unwrap().memo_seq().unwrap(), first_memo);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(validator_calls.load(Ordering::SeqCst), 2);
 

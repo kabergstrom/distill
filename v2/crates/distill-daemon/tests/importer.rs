@@ -120,7 +120,7 @@ fn publish_schema_registry(coordinator: &DaemonCoordinator, schema_hash: Logical
         registrations: Vec::new(),
     })
     .unwrap();
-    let base = coordinator.server().current_stamp().version;
+    let base = coordinator.server().current_stamp().unwrap().version;
     coordinator
         .coordinated_commit(&mut writer, base, |store| {
             store
@@ -310,7 +310,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     assert_eq!(second.assets["asset"].data, AuthoredValue::UInt(8));
     assert_eq!(second.assets["$settings"].data, AuthoredValue::UInt(3));
     assert_eq!(
-        coordinator.open_reader().unwrap().input_version(),
+        coordinator.open_reader().unwrap().input_version().unwrap(),
         InputVersion(5)
     );
 
@@ -333,7 +333,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
         distill_store::imports::WatchedImportTerminal::Importer { code: 3 }
     );
     assert_eq!(
-        coordinator.open_reader().unwrap().input_version(),
+        coordinator.open_reader().unwrap().input_version().unwrap(),
         InputVersion(6),
         "memoizing a failure is not an input event"
     );
@@ -347,7 +347,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
         .is_empty());
     assert!(coordinator.reconcile_watched_imports(&mut writer).unwrap().is_empty());
     assert_eq!(
-        coordinator.open_reader().unwrap().memo_seq(),
+        coordinator.open_reader().unwrap().memo_seq().unwrap(),
         failed_memo,
         "an unchanged failure must not spin"
     );
@@ -373,7 +373,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     assert_eq!(healed.assets["asset"].data, AuthoredValue::UInt(9));
     assert!(import_failures(&coordinator).is_empty());
     assert_eq!(
-        coordinator.open_reader().unwrap().input_version(),
+        coordinator.open_reader().unwrap().input_version().unwrap(),
         InputVersion(8)
     );
 
@@ -412,7 +412,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     let healed = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(healed.assets["asset"].data, AuthoredValue::UInt(10));
     assert_eq!(
-        coordinator.open_reader().unwrap().input_version(),
+        coordinator.open_reader().unwrap().input_version().unwrap(),
         InputVersion(11)
     );
 }
@@ -492,7 +492,7 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
         .unwrap()
         .is_empty());
     assert_eq!(
-        coordinator.open_reader().unwrap().memo_seq(),
+        coordinator.open_reader().unwrap().memo_seq().unwrap(),
         orphan_memo,
         "an unchanged orphan must not spin memo state"
     );
@@ -576,7 +576,7 @@ fn watched_imports_defer_while_their_importer_is_unregistered() {
             }))
             .unwrap();
         let backend = Arc::clone(coordinator.authoring_service());
-        let base = coordinator.server().current_stamp().version;
+        let base = coordinator.server().current_stamp().unwrap().version;
         let imported = Arc::new(std::sync::Mutex::new(None));
         let captured = Arc::clone(&imported);
         coordinator
@@ -669,7 +669,7 @@ fn reverting_a_failed_watched_import_clears_its_failure_incrementally() {
         .register_importer(Arc::new(ByteImporter { schema }))
         .unwrap();
     let backend = Arc::clone(coordinator.authoring_service());
-    let base = coordinator.server().current_stamp().version;
+    let base = coordinator.server().current_stamp().unwrap().version;
     coordinator
         .coordinated_commit(&mut writer, base, |store| {
             let prepared = backend
@@ -921,7 +921,7 @@ fn a_burst_across_bundles_publishes_one_version() {
     let (_temp, assets, coordinator) =
         imported_sources(&[("a", "1"), ("b", "2"), ("c", "3")], PacedImporter::new);
     let mut writer = coordinator.open_writer().unwrap();
-    let base = writer.input_version();
+    let base = writer.input_version().unwrap();
 
     std::fs::write(assets.join("a.src"), b"9").unwrap();
     std::fs::write(assets.join("b.src"), b"5").unwrap();
@@ -933,7 +933,7 @@ fn a_burst_across_bundles_publishes_one_version() {
             loop {
                 let finished = done.load(std::sync::atomic::Ordering::Acquire);
                 let snapshot = coordinator.open_reader().unwrap().begin_snapshot().unwrap();
-                seen.push((snapshot.input_version(), generated_values(&snapshot, &stems)));
+                seen.push((snapshot.input_version().unwrap(), generated_values(&snapshot, &stems)));
                 if finished {
                     return seen;
                 }
@@ -991,7 +991,7 @@ fn an_rpc_write_during_a_pass_makes_it_stale_and_its_retry_applies_everything_on
         });
     let (entered, release) = GATE.with(|gate| gate.borrow_mut().take()).unwrap();
     let mut writer = coordinator.open_writer().unwrap();
-    let base = writer.input_version();
+    let base = writer.input_version().unwrap();
 
     std::fs::write(assets.join("a.src"), b"4").unwrap();
     std::fs::write(assets.join("b.src"), b"5").unwrap();
@@ -1040,7 +1040,7 @@ fn an_rpc_write_during_a_pass_makes_it_stale_and_its_retry_applies_everything_on
         "{stale:?}"
     );
     let reader = coordinator.open_reader().unwrap();
-    assert_eq!(reader.input_version(), InputVersion(base.0 + 1));
+    assert_eq!(reader.input_version().unwrap(), InputVersion(base.0 + 1));
     assert_eq!(
         generated_values(&reader, &["a", "b", "c"]),
         [Some(1), Some(2), Some(3)],
@@ -1079,7 +1079,7 @@ fn an_import_failure_in_a_pass_keeps_its_last_good_bundle_while_the_rest_publish
     let (_temp, assets, coordinator) =
         imported_sources(&[("a", "1"), ("b", "2"), ("c", "3")], PacedImporter::new);
     let mut writer = coordinator.open_writer().unwrap();
-    let base = writer.input_version();
+    let base = writer.input_version().unwrap();
 
     std::fs::write(assets.join("a.src"), b"4").unwrap();
     std::fs::write(assets.join("b.src"), b"broken").unwrap();
@@ -1179,7 +1179,7 @@ impl AuthoringImporter for ChainImporter {
 /// RPC publication, and pass over the watcher work it leaves.
 fn chain_import(coordinator: &DaemonCoordinator, assets: &std::path::Path, dest: &str, sources: &[&str]) {
     let mut writer = coordinator.open_writer().unwrap();
-    let base = writer.input_version();
+    let base = writer.input_version().unwrap();
     let backend = Arc::clone(coordinator.authoring_service());
     coordinator
         .coordinated_commit(&mut writer, base, |store| {
@@ -1249,7 +1249,7 @@ fn assert_chain_publishes_in_one_version(stems: &[&str]) {
         "each level is one more than the level it reads"
     );
     let mut writer = coordinator.open_writer().unwrap();
-    let base = writer.input_version();
+    let base = writer.input_version().unwrap();
 
     std::fs::write(assets.join("a.src"), b"5").unwrap();
     let outcome = coordinator
@@ -1262,7 +1262,7 @@ fn assert_chain_publishes_in_one_version(stems: &[&str]) {
     assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
     assert!(!outcome.more_work);
     let reader = coordinator.open_reader().unwrap();
-    assert_eq!(reader.input_version(), version);
+    assert_eq!(reader.input_version().unwrap(), version);
     assert_eq!(
         generated_values(&reader, &all),
         (5..5 + all.len() as u128).map(Some).collect::<Vec<_>>(),
@@ -1304,7 +1304,7 @@ fn a_chain_deeper_than_the_bound_continues_in_the_next_pass() {
     let mut all = vec!["a"];
     all.extend_from_slice(&stems);
     let mut writer = coordinator.open_writer().unwrap();
-    let base = writer.input_version();
+    let base = writer.input_version().unwrap();
 
     std::fs::write(assets.join("a.src"), b"20").unwrap();
     let first = coordinator
@@ -1353,7 +1353,7 @@ fn an_import_cycle_is_cut_and_reported() {
         .unwrap();
     let reader = coordinator.open_reader().unwrap();
     let before = generated_values(&reader, &["a", "x", "y"]);
-    let base = writer.input_version();
+    let base = writer.input_version().unwrap();
 
     std::fs::write(assets.join("a.src"), b"50").unwrap();
     let outcome = coordinator

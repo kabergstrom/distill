@@ -1081,7 +1081,7 @@ fn stale_tag_rows_are_index_searches() {
             }
         })
         .collect::<Vec<_>>();
-    let version = store.input_version();
+    let version = store.input_version().unwrap();
     store.refine_unpublished_tag_index(version, &updates).unwrap();
     let stale = |module| {
         store
@@ -1155,7 +1155,7 @@ fn a_changed_tag_epoch_marks_only_its_types_rows() {
     let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, mut store) = store_with(200);
     let refined = |store: &mut Store| {
-        let version = store.input_version();
+        let version = store.input_version().unwrap();
         let updates = [asset_uuid(3, 1), asset_uuid(3, 2), asset_uuid(4, 1)]
             .into_iter()
             .map(|asset| TagIndexUpdate {
