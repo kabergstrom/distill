@@ -3,7 +3,6 @@
 
 // The system allocator is installed by distill-pipeline-api.
 
-pub mod atomic;
 pub mod authoring;
 pub mod bootstrap;
 mod build;

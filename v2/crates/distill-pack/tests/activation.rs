@@ -34,7 +34,7 @@ fn activation_atomically_replaces_pointer_and_leaves_no_temp() {
     assert_eq!(read_current(&dir).unwrap(), [1; 32]);
     activate(&dir, [2; 32]).unwrap();
     assert_eq!(read_current(&dir).unwrap(), [2; 32]);
-    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+    assert_eq!(published_names(&dir), ["pack.current"]);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -68,7 +68,7 @@ fn archive_names_are_hash_addressed_and_publication_is_no_replace() {
     assert_eq!(expected.len(), "archive-".len() + 64 + ".dpk".len());
     assert_eq!(fs::read(dir.join(&expected)).unwrap(), archive.bytes);
     publish_archive(&dir, &archive.bytes).unwrap();
-    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+    assert_eq!(published_names(&dir), [expected.clone()]);
 
     fs::remove_file(dir.join(&expected)).unwrap();
     fs::write(dir.join(&expected), b"different immutable bytes").unwrap();
@@ -77,4 +77,24 @@ fn archive_names_are_hash_addressed_and_publication_is_no_replace() {
         Err(PointerError::ImmutableConflict(_))
     ));
     fs::remove_dir_all(dir).unwrap();
+}
+
+/// The directory's entries other than its staging directory, which must be
+/// empty: publication leaves no temp behind.
+fn published_names(dir: &std::path::Path) -> Vec<String> {
+    let staging = distill_store::atomic_file::staging_dir(dir);
+    if staging.exists() {
+        assert_eq!(
+            fs::read_dir(&staging).unwrap().count(),
+            0,
+            "a temp was left behind"
+        );
+    }
+    let mut names = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name != distill_store::atomic_file::STAGING_DIR)
+        .collect::<Vec<_>>();
+    names.sort();
+    names
 }

@@ -22,7 +22,7 @@ use distill_store::{Store, StoreReader};
 
 use crate::authoring::{invalid, require_base, AuthoringService};
 use crate::coordinator::publish_incremental_paths;
-use crate::atomic::{atomic_write_expecting, remove_expecting, AtomicWriteError};
+use distill_store::atomic_file::{self, AtomicWriteError};
 use crate::compiled::CompiledRegistry;
 use crate::scanner::RootedScanner;
 
@@ -249,12 +249,19 @@ impl OperationRuntime {
             );
         }
         require_base(store, base).map_err(|error| format!("{error:?}"))?;
+        let compiled = self.compiled.at(store).map_err(|error| error.to_string())?;
         let mut failures = initial_failures.to_vec();
         for file in files {
             let expected = file.preimage.into();
             let changed = match file.proposed.as_deref() {
-                Some(bytes) => atomic_write_expecting(&file.target, bytes, expected),
-                None => remove_expecting(&file.target, expected),
+                Some(bytes) => {
+                    let root = compiled
+                        .scanner()
+                        .root_containing(&file.target)
+                        .map_err(|error| error.to_string())?;
+                    atomic_file::write(&root, &file.target, bytes, expected)
+                }
+                None => atomic_file::remove(&file.target, expected),
             };
             match changed {
                 Ok(()) => {}
@@ -268,7 +275,6 @@ impl OperationRuntime {
             .iter()
             .map(|file| file.target.clone())
             .collect::<Vec<_>>();
-        let compiled = self.compiled.at(store).map_err(|error| error.to_string())?;
         let commit = publish_incremental_paths(
             &changed_paths,
             store,

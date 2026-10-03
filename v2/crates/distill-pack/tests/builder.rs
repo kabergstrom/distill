@@ -420,7 +420,13 @@ fn build_publish_and_activate_pack_commits_the_complete_pack() {
         fs::read(directory.join(archive_filename(output.archive_file_hash))).unwrap(),
         output.archive_bytes
     );
-    assert_eq!(fs::read_dir(directory).unwrap().count(), 3);
+    let staging = distill_store::atomic_file::staging_dir(directory);
+    assert_eq!(fs::read_dir(&staging).unwrap().count(), 0, "no temp is left behind");
+    assert_eq!(
+        fs::read_dir(directory).unwrap().count(),
+        4,
+        "three files and the staging directory"
+    );
 
     PackfileIO::mount_current(
         directory,

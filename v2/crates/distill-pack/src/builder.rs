@@ -584,6 +584,7 @@ pub async fn build_publish_and_activate_pack(
     hub: &RemoteHub,
 ) -> Result<PackBuildOutput, PackBuildError> {
     let output = build_pack(definition, target, encoder_identity, snapshot, hub).await?;
+    crate::activation::open_pack_directory(directory)?;
     let archive_hash = publish_archive(directory, &output.archive_bytes)?;
     debug_assert_eq!(archive_hash, output.archive_file_hash);
     let manifest_hash = publish_manifest(directory, &output.manifest_bytes)?;

@@ -33,14 +33,15 @@ fn instance_id_persists_across_reopen() {
 }
 
 #[test]
-fn reopen_removes_orphaned_tool_stage_files() {
+fn reopen_empties_the_tool_object_staging_directory() {
     let dir = tempfile::tempdir().unwrap();
     let config = cfg(&dir);
     drop(Store::open(config.clone()).unwrap());
 
     let objects = config.state_path.join("tools/objects");
-    std::fs::create_dir_all(&objects).unwrap();
-    let orphan = objects.join(".stage-abandoned");
+    let staging = distill_store::atomic_file::staging_dir(&objects);
+    std::fs::create_dir_all(&staging).unwrap();
+    let orphan = staging.join("1-1-abandoned");
     let immutable = objects.join("tool-object");
     std::fs::write(&orphan, b"partial").unwrap();
     std::fs::write(&immutable, b"complete").unwrap();

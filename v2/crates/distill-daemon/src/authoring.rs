@@ -23,7 +23,7 @@ use distill_rpc::{
 };
 use distill_store::{Current, Store, StoreOpener, StoreReader};
 
-use crate::atomic::{atomic_write_expecting, remove_expecting};
+use distill_store::atomic_file;
 use crate::compiled::{Compiled, CompiledRegistry};
 use crate::coordinator::publish_incremental_paths;
 use crate::importer::{RegisteredImporter, RegisteredImporters};
@@ -167,13 +167,16 @@ impl AuthoringService {
         proposed: Option<Vec<u8>>,
     ) -> Result<Commit, RpcFailure> {
         require_base(store, base)?;
+        let compiled = self.compiled(store)?;
         match proposed.as_deref() {
-            Some(bytes) => atomic_write_expecting(&target, bytes, preimage.into()),
-            None => remove_expecting(&target, preimage.into()),
+            Some(bytes) => {
+                let root = compiled.scanner().root_containing(&target).map_err(invalid)?;
+                atomic_file::write(&root, &target, bytes, preimage.into())
+            }
+            None => atomic_file::remove(&target, preimage.into()),
         }
         .map_err(invalid)?;
 
-        let compiled = self.compiled(store)?;
         publish_incremental_paths(
             std::slice::from_ref(&target),
             store,
