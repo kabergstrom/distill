@@ -1144,3 +1144,74 @@ fn a_configuration_error_reads_independent_of_namespace_size() {
     println!("configuration error and heal: {small} pages beside 100 files, {large} beside 6000");
     assert!(large <= small + 16, "{small} pages beside 100 files, {large} beside 6000");
 }
+
+static EDIT_STATEMENTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn record_edit_statement(sql: &str) {
+    EDIT_STATEMENTS.lock().unwrap().push(sql.to_owned());
+}
+
+/// One bundle edited beside `n` others, reconciled by a watcher pass: the
+/// statements it ran and the pages it fetched.
+fn edit_cost(n: u32) -> (Vec<String>, u64) {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    let bundle = |index: u32, value: u64| {
+        let mut bytes = [0u8; 16];
+        bytes[..4].copy_from_slice(&index.to_le_bytes());
+        let (data, ..) = ordinary_bundle_with(0, 0, value);
+        // Distinct bundle and asset ids per index.
+        let mut parsed = distill_bundle::parse_bundle(&data).unwrap();
+        parsed.uuid = BundleUuid({
+            let mut uuid = bytes;
+            uuid[15] = 0xB0;
+            uuid
+        });
+        for entry in parsed.assets.values_mut() {
+            entry.uuid = AssetUuid({
+                let mut uuid = bytes;
+                uuid[15] = 0xA0;
+                uuid
+            });
+        }
+        distill_bundle::write_bundle(&parsed).unwrap()
+    };
+    for index in 0..n {
+        let dir = assets.join(format!("d{}", index % 20));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("b{index}.bundle")), bundle(index, 1)).unwrap();
+    }
+    let coordinator = coordinator(&temp);
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator
+        .reconcile_rescan(&mut writer, &mut distill_daemon::watcher::WatcherQueue::new())
+        .unwrap();
+    let edited = assets.join("d7/b7.bundle");
+    let batch = WatcherBatch {
+        paths: vec![edited.clone()],
+        renames: Vec::new(),
+    };
+    // The first edit warms the connection's statement cache.
+    std::fs::write(&edited, bundle(7, 2)).unwrap();
+    coordinator.reconcile_batch(&mut writer, &batch, false).unwrap();
+    std::fs::write(&edited, bundle(7, 3)).unwrap();
+    let pages = writer.pages_fetched().unwrap();
+    EDIT_STATEMENTS.lock().unwrap().clear();
+    writer.trace_statements(Some(record_edit_statement));
+    coordinator.reconcile_batch(&mut writer, &batch, false).unwrap();
+    writer.trace_statements(None);
+    let pages = writer.pages_fetched().unwrap() - pages;
+    (std::mem::take(&mut *EDIT_STATEMENTS.lock().unwrap()), pages)
+}
+
+/// An edit's pass costs what the edit does, not what the namespace holds:
+/// the same statements beside 40 bundles as beside 1200, and pages that
+/// grow only with the B-trees' depth (237 and 332 when written).
+#[test]
+fn an_edit_pass_runs_the_same_statements_at_any_namespace_size() {
+    let (small, small_pages) = edit_cost(40);
+    let (large, large_pages) = edit_cost(1200);
+    println!("statements {} / {}, pages {small_pages} / {large_pages}", small.len(), large.len());
+    assert_eq!(small.len(), large.len(), "{small:#?}\n{large:#?}");
+    assert!(2 * large_pages <= 3 * small_pages, "{small_pages} -> {large_pages} pages");
+}

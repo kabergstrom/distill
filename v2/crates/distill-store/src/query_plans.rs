@@ -1240,8 +1240,7 @@ fn reconfigured_sources_are_index_searches() {
             vec![
                 "COMPOUND QUERY",
                 "LEFT-MOST SUBQUERY",
-                // The malformed sources: either `(kind, ...)` index's range.
-                "SEARCH t USING INDEX source_claims_by_claimant (kind=?)",
+                "SEARCH t USING INDEX source_claims_by_subject (kind=?)",
                 "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)",
                 "UNION USING TEMP B-TREE",
                 // The collisions: the defects, never the namespace's claims.
@@ -1363,7 +1362,14 @@ fn pass_bookkeeping_statements_search_their_indexes() {
     let authored = |path: &str| crate::claims::SourceClaims {
         root_name: "main".to_owned(),
         path: path.to_owned(),
-        claims: vec![crate::claims::SourceClaim::Authored {
+        claims: vec![crate::claims::SourceClaim::Bundle {
+            bundle: bundle_uuid(42),
+            source: ReadableBundleSource {
+                root_name: "main".to_owned(),
+                normalized_path: path.to_owned(),
+                file_hash: BundleFileHash([1; 32]),
+            },
+        }, crate::claims::SourceClaim::Authored {
             asset: asset_uuid(42, 1),
             claimant: AssetClaimant::Authored {
                 source: ReadableBundleSource {
@@ -1384,6 +1390,8 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         })
         .unwrap();
     let plans = configuration_plans(&mut store, |store| {
+        store.bundle_claim_sources(bundle_uuid(42)).unwrap();
+        store.path_claims(&bundle_path(4)).unwrap();
         let work = store.pending_file_work().unwrap();
         store.acknowledge_file_work(&work).unwrap();
         store.replace_import_index(&sources[..1], &rows[..1]).unwrap();
@@ -1409,7 +1417,21 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         found
     };
     let by_root = "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)";
-    let cases: [(&str, &[&str]); 14] = [
+    let by_subject = ["SEARCH source_claims USING INDEX source_claims_by_subject (kind=? AND subject=?)"];
+    let counted = [
+        "USE TEMP B-TREE FOR count(DISTINCT)",
+        "SEARCH source_claims USING INDEX source_claims_by_subject (kind=? AND subject=?)",
+    ];
+    let distinct = [
+        "SEARCH source_claims USING INDEX source_claims_by_subject (kind=? AND subject=?)",
+        "USE TEMP B-TREE FOR DISTINCT",
+    ];
+    let cases: [(&str, &[&str]); 18] = [
+        ("SELECT DISTINCT claimant FROM source_claims WHERE kind = 3", &distinct),
+        // A subject's claimants, whatever index orders claimants.
+        ("SELECT COUNT(DISTINCT claimant) FROM source_claims WHERE kind IN (0)", &counted),
+        ("SELECT COUNT(DISTINCT claimant) FROM source_claims WHERE kind IN (1, 2)", &counted),
+        ("SELECT DISTINCT claimant FROM source_claims WHERE kind = 0", &distinct),
         // The pending work: a pass's whole queue.
         ("SELECT d.seq", &["SCAN d", by_root]),
         ("SELECT e.seq", &["SCAN e", by_root]),
@@ -1456,13 +1478,10 @@ fn pass_bookkeeping_statements_search_their_indexes() {
                 "SEARCH r USING INDEX sqlite_autoindex_pipeline_schema_registry_1 (type_uuid=?)",
             ],
         ),
-        (
-            "SELECT claimant FROM source_claims WHERE kind = 1",
-            &["SEARCH source_claims USING INDEX source_claims_by_subject (kind=? AND subject=?)"],
-        ),
+        ("SELECT claimant FROM source_claims WHERE kind = 1", &by_subject),
         (
             "INSERT OR IGNORE INTO claim_pending(kind, subject) SELECT kind, subject",
-            &["SEARCH source_claims USING INDEX source_claims_by_claimant (kind=? AND claimant=?)"],
+            &["SEARCH source_claims USING INDEX source_claims_by_claimant (claimant=? AND kind=?)"],
         ),
         (
             "SELECT identity, record FROM errors",

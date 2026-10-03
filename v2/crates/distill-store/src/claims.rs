@@ -159,8 +159,6 @@ fn mark_asset_dependents_pending(
     conn: &rusqlite::Connection,
     asset: &[u8],
 ) -> Result<(), StoreError> {
-    // Deduplicated here: a DISTINCT would steer the planner to an index
-    // that yields claimants in order instead of the one the key searches.
     let claimants = {
         let mut select = conn.prepare_cached(
             "SELECT claimant FROM source_claims WHERE kind = ?1 AND subject = ?2",
@@ -184,8 +182,7 @@ fn mark_asset_dependents_pending(
              SELECT 1 FROM source_claims WHERE kind = ?1 AND subject = ?2)",
         rusqlite::params![DERIVED, asset],
     )?;
-    // `OR IGNORE` drops the repeats; a DISTINCT would steer the planner
-    // away from `source_claims_by_claimant`.
+    // `OR IGNORE` drops the repeats.
     conn.execute(
         "INSERT OR IGNORE INTO claim_pending(kind, subject)
          SELECT kind, subject FROM source_claims WHERE kind = ?1 AND claimant = ?2",

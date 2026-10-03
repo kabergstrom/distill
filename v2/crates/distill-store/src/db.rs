@@ -103,8 +103,11 @@ CREATE TABLE source_claims (
 );
 CREATE INDEX source_claims_by_subject ON source_claims(kind, subject);
 -- Schema 39: the claims an asset makes (a primary path's claimant), for
--- the sources an asset change makes pending.
-CREATE INDEX source_claims_by_claimant ON source_claims(kind, claimant);
+-- the sources an asset change makes pending. Led by the claimant: led by
+-- `kind`, it would serve a `DISTINCT claimant` of one kind in order, and
+-- the planner would walk the kind's every claim instead of searching
+-- `source_claims_by_subject`.
+CREATE INDEX source_claims_by_claimant ON source_claims(claimant, kind);
 -- Per-entity errors (see `errors`): one row per current defect. `family`
 -- is the producer that owns the row (1 scan namespace, 2 the pending scan
 -- rejection's namespace errors, 3 its configuration error, 4 the
