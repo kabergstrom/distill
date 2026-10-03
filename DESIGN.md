@@ -4923,13 +4923,12 @@ All daemon state is disposable (§2) and lives under `.distill/` (gitignored).
 | `files` | **(root id, normalized root-relative path)** → mtime, size, kind, content hash — last-known tree state. Physical tracking is per root: multiple roots form one *logical* namespace (§18), and a single-path key could hold only one of two same-path observations, silently choosing a root. The logical path index derives as a multimap with three states — `Missing`, `Unique(root)`, `Ambiguous(roots)` — and ambiguity is representable, not pre-collapsed |
 | `dirty_files` | pending incremental work (root id, path, exists/deleted), enqueued atomically with the corresponding `files` mutation and later cleared atomically with the downstream work it triggers |
 | `rename_events` | ordered live-rename log from the watcher, consumed transactionally before the batch is acknowledged |
-| `import_records`, `import_reads`, `directory_rule_sources` | the import index: each watched import bundle's read set by path, listing and capability key, and each directory-import rules asset by its source (root id, path). Derived from the committed bundles and kept by source: every bundle publication queues its paths in `dirty_files`, and an import pass reindexes the dirty bundle sources, parsing each once, before it acknowledges that work, so the index is current but for pending work. It is never rebuilt whole; a store starts with no bundles and an empty index |
+| `import_records`, `import_reads`, `directory_rule_sources` | the import index: each watched import bundle's read set by path, listing and capability key, and each directory-import rules asset by its source (root id, path) and by the directory of its listing's literal prefix, so a changed path finds the rules that may list it by its ancestor directories. Derived from the committed bundles and kept by source: every bundle publication queues its paths in `dirty_files`, and an import pass reindexes the dirty bundle sources, parsing each once, before it acknowledges that work, so the index is current but for pending work. It is never rebuilt whole; a store starts with no bundles and an empty index |
 | `directories` | **(root id, path)** → the directory's canonical path, unique across roots (`directories_by_canonical`): two observed directories with one canonical path are an inconsistent table, not an alias to choose between |
 | `bundles` | bundle uuid → **(root id, normalized path)**, format version, content hash — the physical key, matching `files`: UUID-based access must reach the owning file without a logical-index round trip that could turn ambiguous under a same-path file in a second root; path-query ambiguity is derived separately. Directory-import ownership derives at scan from generated bundles' `DirectoryOrigin` records (§8), whose `rule` is the authored stable `ImportRuleId`, never a vector index; deleting that id re-derives the orphan state, never reassigns ownership |
 | `bundle_path_refs` | bundle uuid → each logical path its entries' asset/weak reference fields name, written with the bundle's rows at publication. Rename-with-fixups (§4) reads only the bundles that reference the moving path, plus the poisoned ones, whose references are unknown |
 | `assets` | asset uuid → bundle uuid, local_id, type_uuid, logical hash, search tags, terminal type. A pipeline-map change republishes the rows of every bundle holding an asset whose terminal type it changes, whether or not the bundle changed |
 | `path_index` | path/primary resolution index |
-| `deps` | recorded content / resolution / query dependencies + selector indexes |
 | `schemas` | logical hash → schema JSON (cache, rebuilt from bundle snapshots) |
 | `artifacts` | static-input-key digest → candidate bucket: (trace digest → trace + output table), revalidated most-recent-first on lookup (§9 — the build-cache lookup; the full input hash is never stored, and commits append candidates, never overwrite); derived-output: child uuid → (parent uuid, output key) — input-versioned, derived per published version from its assets × pinned pipeline map (§9), the only authority for child resolution, commit rows verified against it; ContentHash → segment, offset, len (the CAS extent index) |
 | `pipeline_state` | importer/processor registrations and versions; the pipeline dylib content hash; the exact canonical target rows; and the candidate `(TypeUuid, DSLH)` schema map. Publication compares the schema map with source-controlled active lineage and makes the whole PipelineEpoch an input-hash input wherever pipeline code or policy runs |
@@ -5646,10 +5645,10 @@ value, authored type, path or glob literal prefix, terminal type through
 the authored types that reach it, tag), each then checked against every
 selector as before. Every question costs `O(log n)` plus its answer's
 size, and a five-question trace is a dozen statements at any project
-size. Answers are kept for the rest of the build, whose snapshot does not
-move; a `Read` is answered from the contents of nodes built so far. The
-tool epoch a build runs under is read per tool id when first asked. A
-store failure while answering (a poisoned bundle, a chain error) fails
+size. Nothing is kept between questions: each is asked of SQLite again,
+the one copy of the snapshot. A `Read` is answered from the contents of
+nodes built so far. A tool question is one `ToolEpoch` row at the build's
+tool version. A store failure while answering (a poisoned bundle, a chain error) fails
 only the build that asked a question reaching it. Two shapes still read
 more than their answer: a query with no indexed selector (only a local
 id, only `authoring_only`, or a glob with no literal prefix) reads every

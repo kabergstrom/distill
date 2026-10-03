@@ -6,8 +6,16 @@ at f10f599, not from the older design documents.
 
 ## 1. Principles
 
-1. **Zero `Mutex` / `RwLock` / `Condvar`** in `distill-store`,
-   `distill-rpc`, and `distill-daemon`.
+1. **No `Mutex` / `RwLock` / `Condvar`** in `distill-store`,
+   `distill-rpc`, and `distill-daemon`, except three that guard in-memory
+   runtime state, never database content, and are held only for a swap or
+   a module-host call:
+   - `Current<T>` (`distill-store/src/current.rs`): the `Arc` of a
+     configuration value replaced whole;
+   - `PipelineState::runtime` (`distill-daemon/src/coordinator.rs`): the
+     module host, taken to prepare, install or fail an epoch;
+   - `CompiledRegistry::inner` (`distill-daemon/src/compiled.rs`): the
+     live compiled states by key.
    - Threads communicate by message passing (std/tokio channels).
    - Atomics are allowed only for process shutdown and for FFI panic
      latches.
@@ -191,8 +199,8 @@ a connection of its own, and SQLite's write lock orders the writers.
   scans and imports, and runs startup. Each pass (`coordinator/pass.rs`)
   publishes one input version: the scan, directory and watched imports,
   the dirty-queue acknowledgement and the runtime pipeline-failure sync.
-  Its scan state (the pending rejection and health) sits in a `Mutex`
-  other publications read.
+  Its scan state (the pending rejection and health) is the store's own
+  rows, which other publications read in their transactions.
 - **watcher** forwards `notify` events to the loop and holds no queue
   state. It stops on its command channel.
 - **Imports and authoring calls** run on the calling thread: the process
@@ -796,20 +804,14 @@ should reach zero by the end of phase 6.
     `next_id`, `TEMP_SEQUENCE` (atomic.rs), pack activation `TEMP_ID`,
     `NEXT_SHARED_ID`, and `NEXT_HANDLE_ID` plus the embedded state-dir
     `NEXT` in server.rs.
-  - **Mutexes added:**
-    - `SharedStore::idle`: the idle writer pool, shared by every thread;
-      held only to push or pop.
-    - `PipelineState::runtime`: the module host; taken to prepare,
-      install or fail an epoch, never while waiting on the write lock.
-    - `DaemonCoordinator::scan` (pending rejection and health) and
-      `configuration_error`: written by the loop, read by publications on
-      other threads.
-    - `Current<T>` (distill-store), a `Mutex<Arc<T>>` held only to clone
-      or swap the `Arc`, replaces `arc-swap` for configuration replaced
-      whole: the store config, scanner roots and daemon-owned
-      directories, authoring roots, importers and pipeline projection,
-      build targets and the published `PipelineSnapshot`. The schema
-      authority is a `Mutex<Option<Arc<_>>>`.
+  - **Mutexes added:** `SharedStore::idle` (the idle writer pool),
+    `PipelineState::runtime` (the module host), `DaemonCoordinator::scan`
+    and `configuration_error`, `Current<T>` (replacing `arc-swap` for
+    configuration replaced whole) and the schema authority's
+    `Mutex<Option<Arc<_>>>`. Since then the writer pool, the scan state
+    and configuration error (now store rows) and the schema authority's
+    mutex are gone; `Current<T>`, `PipelineState::runtime` and
+    `CompiledRegistry::inner` remain (§1, principle 1).
   - **Tests:** 1044 passed, 1 failed (the known
     `tool_output_is_drained_while_large_stdin_is_written`); newgameplus
     lib 61 passed.
@@ -819,8 +821,9 @@ should reach zero by the end of phase 6.
     `gbuffer_common.glsl`, tonemap.comp's unchanged.
   - **Deviations:**
     - Tag-index refinement, build commits and `DeferredOperation`
-      completion run inside the input transaction. The front end's
-      build-result cache stays.
+      completion run inside the input transaction. (The front end's
+      build-result cache, kept at the time, has since been removed:
+      results are read from the store.)
     - `distilld pack` is an RPC client of the running daemon (fixed
       `daemon.address`, as `import`); with no daemon it says to start
       one. It reads the PackDefinition on the metadata hub and builds on
@@ -1123,6 +1126,23 @@ should reach zero by the end of phase 6.
   (`import_watched_bundles`). It used to parse every bundle that has a
   `$record` row just to read the flag. Poisoned bundles are still read
   from disk, and `bundles_with_reserved_entry` is gone.
+- **An edit costs its change (schema 39).** A pass applies its scan step
+  once when no import is due (it used to apply, roll back and apply
+  again), and an incremental step's overlay holds only the rows that
+  differ. The import index refresh keys sources by the root name the
+  dirty rows carry. Directory rules are found by the directories a
+  dirty path is under: `directory_rule_sources.listing_dir` is the
+  directory of the listing's literal prefix
+  (`directory_rule_sources_by_listing`), and every rule is read only
+  when a changed source holds rules or the capabilities changed.
+  Namespace errors, source claims and the full rescan's scan structure
+  are written as differences. `source_claims_by_claimant` is led by
+  `claimant` (a `DISTINCT` drove the planner onto a `kind`-led index and
+  a scan that grew with the project), and `dirty_files_by_path` answers
+  an acknowledgement's `(root_id, path)` delete. The `deps` table,
+  `errors_by_scope` and `assets_unhashed` are gone: nothing read them.
+  `an_edit_pass_runs_the_same_statements_at_any_namespace_size` pins the
+  per-edit statement count and bounds its page reads.
 
 ## 7. Test baseline
 
