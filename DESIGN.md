@@ -5131,14 +5131,22 @@ them; reads mmap and slice. Write order:
 append, fsync the segment, then insert the index rows; segment creation and
 deletion also fsync the directory. **SQLite is the authority** on what
 committed and on which segments exist (`cas_segments`, each writer's
-segment found by its row). Recovery truncates each segment to its indexed
-length; a segment file shorter than its indexed length lost committed
-records (an external truncation, a lying fsync), and the results and
-installs whose bytes it held are evicted whole, leaving every other
-segment's rows as they are; files no row names are deleted. Compaction
-writes new segments durably before one SQLite transaction repoints the
-index, and old segments are deleted only after a grace period past the
-read bound. GC is Bitcask-style
+segment found by its row; one open regular segment per writer is a
+unique index, not a sweep). Recovery truncates each segment to its indexed
+length. A segment file shorter than its indexed length lost committed
+records to something outside the store (an external truncation, a lying
+fsync): recovery reports it and changes nothing, and reads of the lost
+records fail. Allocation's commit point is `next_segment_id`: a file at or
+past it belongs to an allocation that never committed, and the next
+allocation of its id truncates it, so nothing scans for unnamed files.
+Compaction is one SQLite write transaction: it allocates its destination
+segments sealed, writes and fsyncs them, repoints the index and marks the
+old segments dead; their files are deleted only after a grace period past
+the read bound. A release deletes the extents only it held in its own
+transaction (`cas_refs` has a foreign key to `cas_extents`), so there is
+nothing to prune. Live bytes, whole and per segment, are sums over
+covering `(segment, len)` indexes on `cas_extents` and
+`result_candidates`. GC is Bitcask-style
 compaction driven by the size cap (random eviction, each victim one
 sampled index probe; the pass runs only after the CAS index changed) — everything in the CAS
 is rebuildable, so eviction is always safe. But never observable: eviction

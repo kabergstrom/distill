@@ -1,8 +1,10 @@
 //! §13 crash safety: the transaction that indexes a record group is its
 //! commit. Recovery cuts bytes past the index (rolled back or interrupted:
-//! uncommitted), drops what a lost tail held, and removes stray and dead
-//! segments — each asserted through the typed `RecoveryReport` and
-//! post-recovery reads.
+//! uncommitted), reports a lost tail without changing anything, and
+//! deletes dead segments — each asserted through the typed
+//! `RecoveryReport` and post-recovery reads. A segment file no row names
+//! is past `next_segment_id`, uncommitted, and truncated by the next
+//! allocation of its id.
 
 use distill_core::id::AssetUuid;
 use distill_store::cas::record::{encode_record, KeyKind, Record, RecordKind};
@@ -127,11 +129,12 @@ fn bytes_past_the_index_are_cut_off_and_publish_nothing() {
 }
 
 #[test]
-fn a_lost_tail_drops_what_it_held_and_nothing_else() {
+fn a_lost_tail_is_reported_and_changes_nothing() {
     // A segment file shorter than its index (an external truncation, a
-    // lying fsync): the results and installs whose bytes it lost are
-    // evicted whole; an install in another segment keeps its bytes, its
-    // reference and its load edges.
+    // lying fsync) broke the filesystem's contract. Recovery reports it on
+    // every open and repairs nothing: the lost result's rows stay, a read
+    // of its bytes fails, and everything in other segments reads as
+    // before.
     use distill_core::id::{ContentHash, TypeUuid};
     let dir = tempfile::tempdir().unwrap();
     let mut config = cfg(&dir);
@@ -140,7 +143,7 @@ fn a_lost_tail_drops_what_it_held_and_nothing_else() {
     let edges = [(AssetUuid([9; 16]), TypeUuid([1; 16]))];
     let installed = store.put_artifact(PARENT, &[5u8; 150], &edges).unwrap();
     let first = commit(&mut store, 1, b"first artifact");
-    let second = commit(&mut store, 2, b"second artifact");
+    commit(&mut store, 2, b"second artifact");
     drop(store);
 
     let files = segment_files(&dir);
@@ -154,41 +157,45 @@ fn a_lost_tail_drops_what_it_held_and_nothing_else() {
         .set_len(full - 7)
         .unwrap();
 
-    let (store, recovery) = Store::open_with_recovery(config.clone()).unwrap();
-    assert_eq!(recovery.lost_tails.len(), 1, "{recovery:?}");
-    assert_eq!(recovery.lost_tails[0].1, full - 7);
-    assert_eq!(recovery.evicted, 1, "{recovery:?}");
-    assert!(store.cas_read(&second).is_err());
-    assert!(store.lookup_candidates(KeyKind::Processor, &[2u8; 32]).unwrap().is_empty());
-    assert_eq!(store.cas_read(&first).unwrap(), b"first artifact");
-    assert_eq!(store.lookup_candidates(KeyKind::Processor, &[1u8; 32]).unwrap().len(), 1);
-    assert_eq!(store.cas_read(&installed.0).unwrap(), [5u8; 150]);
-    assert_eq!(store.artifact_load_edges(ContentHash(installed.0)).unwrap(), edges);
-    drop(store);
-    assert_eq!(
-        Store::open_with_recovery(config).unwrap().1,
-        RecoveryReport::default()
-    );
+    for _ in 0..2 {
+        let (store, recovery) = Store::open_with_recovery(config.clone()).unwrap();
+        assert_eq!(recovery.lost_tails.len(), 1, "{recovery:?}");
+        assert_eq!(recovery.lost_tails[0].1, full - 7);
+        assert_eq!(recovery.truncated_tails, []);
+        assert_eq!(std::fs::metadata(last).unwrap().len(), full - 7, "nothing was cut or grown");
+        assert!(store.lookup_candidates(KeyKind::Processor, &[2u8; 32]).is_err(), "the lost result record reads as an error");
+        assert_eq!(store.cas_read(&first).unwrap(), b"first artifact");
+        assert_eq!(store.lookup_candidates(KeyKind::Processor, &[1u8; 32]).unwrap().len(), 1);
+        assert_eq!(store.cas_read(&installed.0).unwrap(), [5u8; 150]);
+        assert_eq!(store.artifact_load_edges(ContentHash(installed.0)).unwrap(), edges);
+    }
 }
 
 #[test]
-fn stray_segment_files_are_removed() {
+fn a_segment_file_no_row_names_is_left_for_the_allocation_of_its_id() {
+    // A rolled-back allocation's file: created, its row and
+    // `next_segment_id` never committed. Recovery does not look for it;
+    // the next allocation of its id truncates it.
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
     commit(&mut store, 1, b"artifact");
     drop(store);
 
-    // Drop a segment-shaped stray (a rolled-back allocation: file created,
-    // row never committed).
     let cas_dir = dir.path().join(".distill/cas");
-    std::fs::write(cas_dir.join("seg-00000000000000ff.dsr"), b"garbage").unwrap();
+    let next = segment_files(&dir).len();
+    let uncommitted = cas_dir.join(format!("seg-{next:016x}.dsr"));
+    std::fs::write(&uncommitted, b"garbage from an allocation that rolled back").unwrap();
 
-    let (_store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
-    assert_eq!(
-        recovery.removed_stray_segments,
-        vec!["seg-00000000000000ff.dsr".to_owned()]
-    );
-    assert!(!cas_dir.join("seg-00000000000000ff.dsr").exists());
+    let (mut store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
+    assert_eq!(recovery, RecoveryReport::default());
+    assert!(uncommitted.exists());
+    // Recovery sealed the earlier writer's segment: this writer allocates
+    // the next id.
+    commit(&mut store, 2, b"after");
+    assert_eq!(store.cas_read(blake3::hash(b"after").as_bytes()).unwrap(), b"after");
+    assert_eq!(store.cas_read(blake3::hash(b"artifact").as_bytes()).unwrap(), b"artifact");
+    let bytes = std::fs::read(&uncommitted).unwrap();
+    assert!(!bytes.starts_with(b"garbage"), "the allocation truncated the uncommitted file");
 }
 
 #[test]

@@ -360,7 +360,7 @@ fn cas_segments_are_typed_regular_or_oversize() {
     let conn = open_conn(&dir);
     assert_eq!(
         columns(&conn, "cas_segments"),
-        ["segment_id", "file_name", "segment_kind", "indexed_len", "state", "owner", "live_len"]
+        ["segment_id", "file_name", "segment_kind", "indexed_len", "state", "owner"]
     );
 }
 

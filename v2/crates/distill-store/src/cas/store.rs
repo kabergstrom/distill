@@ -159,16 +159,18 @@ pub struct Candidate {
 
 /// This writer's CAS append state. Every writer appends to a segment of
 /// its own, so no two writers share a file offset. Which segment that is
-/// lives in `cas_segments` alone: the newest open regular segment whose
-/// `owner` is this writer ([`ACTIVE_SEGMENT`]), read in the transaction
-/// that appends. A transaction or savepoint that rolls back takes its
+/// lives in `cas_segments` alone: the one open regular segment whose
+/// `owner` is this writer ([`ACTIVE_SEGMENT`]; the unique partial index
+/// `cas_segments_open` allows no second), read in the transaction that
+/// appends. A transaction or savepoint that rolls back takes its
 /// allocations with it, and the next append reads what survived.
 #[derive(Debug)]
 pub(crate) struct CasInner {
     pub(crate) dir: PathBuf,
     /// This writer's `cas_segments.owner`: unique among the process's
-    /// writers. Startup recovery seals every open segment, so no open
-    /// segment of an earlier process carries it either.
+    /// writers. Opening the store ends every earlier process's writers,
+    /// sealing their open segments, so no open segment of an earlier
+    /// process carries it either.
     pub(crate) owner: i64,
 }
 
@@ -182,12 +184,11 @@ impl CasInner {
     }
 }
 
-/// The segment writer `?1` appends to: its newest open regular segment.
-/// The state and kind are literals so the plan walks the open segments'
-/// partial index backwards.
+/// The segment writer `?1` appends to: its one open regular segment. The
+/// state and kind are literals so the plan searches the open segments'
+/// unique partial index.
 pub(crate) const ACTIVE_SEGMENT: &str = "SELECT segment_id FROM cas_segments
-     WHERE owner = ?1 AND state = 0 AND segment_kind = 0
-     ORDER BY segment_id DESC LIMIT 1";
+     WHERE owner = ?1 AND state = 0 AND segment_kind = 0";
 const _: () = assert!(SegmentKind::Regular as i64 == 0);
 
 /// Every segment, for doctor verification.
@@ -196,10 +197,13 @@ pub(crate) const VERIFY_SEGMENTS: &str = "SELECT segment_id, file_name FROM cas_
 pub(crate) const VERIFY_SEGMENT_EXTENTS: &str =
     "SELECT content_hash, offset, len FROM cas_extents WHERE segment = ?1";
 
-/// Seal the open segments writer `?1` allocated below id `?2`. The states
-/// are literals so the plan can walk the open segments' partial index.
-pub(crate) const SEAL_OWN_SEGMENTS: &str = "UPDATE cas_segments SET state = 1
-     WHERE owner = ?1 AND segment_id < ?2 AND state = 0";
+/// Seal writer `?1`'s open regular segment, when it closes: at most one
+/// row, by the unique partial index the literals select.
+pub(crate) const SEAL_ACTIVE_SEGMENT: &str = "UPDATE cas_segments SET state = 1
+     WHERE owner = ?1 AND state = 0 AND segment_kind = 0";
+/// Seal segment `?1`: the segment a writer rolls off, in the transaction
+/// that allocates its next one.
+pub(crate) const SEAL_SEGMENT: &str = "UPDATE cas_segments SET state = 1 WHERE segment_id = ?1";
 const _: () = assert!(SEGMENT_OPEN == 0 && SEGMENT_SEALED == 1);
 
 /// `cas_segments.state`: a writer may still append.
@@ -373,13 +377,21 @@ struct Appended {
 }
 
 impl Store {
-    /// Allocate a segment in the open write transaction: its row, then its
-    /// file, fsynced with the directory, before the row can commit. A
-    /// rolled-back allocation leaves a file no row names: the next
-    /// allocation of its id truncates it, and startup recovery deletes it.
-    /// No writer appends to it meanwhile, since writers find their segment
-    /// by its row ([`ACTIVE_SEGMENT`]).
-    pub(crate) fn create_segment(&mut self, kind: SegmentKind) -> Result<u64, StoreError> {
+    /// Allocate a segment in `state` in the open write transaction: its row
+    /// and `next_segment_id`, then its file, created empty (truncating any
+    /// file of that name) and fsynced with the directory, before the row
+    /// can commit.
+    ///
+    /// `next_segment_id` is the allocation's commit point. A file whose id
+    /// is at or past it was created by an allocation that rolled back (or
+    /// that a crash interrupted): it is uncommitted by definition, no row
+    /// names it, no reader reaches it, and the next allocation of its id
+    /// truncates it. Nothing scans for such files.
+    pub(crate) fn create_segment(
+        &mut self,
+        kind: SegmentKind,
+        state: i64,
+    ) -> Result<u64, StoreError> {
         debug_assert!(!self.conn.is_autocommit(), "segments are allocated in a write transaction");
         let id = meta_get_u64(&self.conn, "next_segment_id")?.unwrap_or(0);
         meta_set_u64(&self.conn, "next_segment_id", id + 1)?;
@@ -387,7 +399,7 @@ impl Store {
         self.conn.execute(
             "INSERT INTO cas_segments(segment_id, file_name, segment_kind, indexed_len, state, owner)
              VALUES (?1, ?2, ?3, 0, ?4, ?5)",
-            rusqlite::params![id as i64, name, kind as i64, SEGMENT_OPEN, self.cas.owner],
+            rusqlite::params![id as i64, name, kind as i64, state, self.cas.owner],
         )?;
         let path = self.cas.dir.join(&name);
         let f = std::fs::File::create(&path).map_err(io_err(&path))?;
@@ -396,14 +408,13 @@ impl Store {
         Ok(id)
     }
 
-    /// Seal this writer's open segments: it stops appending to them, for
-    /// good.
+    /// Seal this writer's open segment: it stops appending to it, for good.
     pub fn seal_active(&mut self) -> Result<(), StoreError> {
         self.write_txn(|store| {
             store
                 .conn
-                .prepare_cached(SEAL_OWN_SEGMENTS)?
-                .execute(rusqlite::params![store.cas.owner, i64::MAX])?;
+                .prepare_cached(SEAL_ACTIVE_SEGMENT)?
+                .execute([store.cas.owner])?;
             Ok(())
         })
     }
@@ -435,8 +446,8 @@ impl Store {
     /// group's index rows commit with that transaction, which is the
     /// group's commit: bytes past a segment's `indexed_len` belong to no
     /// committed group. A regular record goes to this writer's segment,
-    /// rolling at the size cap (§18's `cas.segment_size`); the new
-    /// segment's allocation seals every older one this writer has open. A
+    /// rolling at the size cap (§18's `cas.segment_size`): the segment it
+    /// rolls off is sealed in the transaction that allocates the next. A
     /// record larger than the cap gets an oversize segment of its own.
     fn append_records(&mut self, encoded: &[Vec<u8>]) -> Result<Appended, StoreError> {
         debug_assert!(!self.conn.is_autocommit(), "records are appended in a write transaction");
@@ -446,18 +457,20 @@ impl Store {
         for bytes in encoded {
             let len = bytes.len() as u64;
             let (segment, kind, offset) = if len > self.config.segment_size {
-                (self.create_segment(SegmentKind::Oversize)?, SegmentKind::Oversize, 0)
+                let id = self.create_segment(SegmentKind::Oversize, SEGMENT_OPEN)?;
+                (id, SegmentKind::Oversize, 0)
             } else {
                 let (id, offset) = match active {
                     Some((id, end)) if end == 0 || end + len <= self.config.segment_size => {
                         (id, end)
                     }
                     _ => {
-                        let id = self.create_segment(SegmentKind::Regular)?;
-                        self.conn
-                            .prepare_cached(SEAL_OWN_SEGMENTS)?
-                            .execute(rusqlite::params![self.cas.owner, id as i64])?;
-                        (id, 0)
+                        if let Some((full, _)) = active {
+                            self.conn
+                                .prepare_cached(SEAL_SEGMENT)?
+                                .execute([full as i64])?;
+                        }
+                        (self.create_segment(SegmentKind::Regular, SEGMENT_OPEN)?, 0)
                     }
                 };
                 active = Some((id, offset + len));

@@ -1538,30 +1538,51 @@ fn cas_statements_search_their_indexes() {
     use crate::cas::gc::{
         COMPACTION_CANDIDATES, EVICT_RESULT_ROW, LIVE_BYTES, SEGMENTS_IN_STATE,
     };
-    use crate::cas::recovery::{DROP_LOST_EXTENTS, LOST_EXTENT_HOLDERS, LOST_RESULTS};
-    use crate::cas::store::{ACTIVE_SEGMENT, SEAL_OWN_SEGMENTS};
+    use crate::cas::store::{ACTIVE_SEGMENT, SEAL_ACTIVE_SEGMENT, SEAL_SEGMENT};
     use crate::served::DELETE_LOAD_EDGES;
     let (_dir, store) = store_with(10);
     let cases: &[(&str, &[&str])] = &[
+        // One open regular segment per writer: `cas_segments_open` is
+        // unique on the owner.
         (
-            SEAL_OWN_SEGMENTS,
-            &["SEARCH cas_segments USING INDEX cas_segments_open (owner=? AND segment_id<?)"],
+            SEAL_ACTIVE_SEGMENT,
+            &["SEARCH cas_segments USING INDEX cas_segments_open (owner=?)"],
         ),
+        (SEAL_SEGMENT, &["SEARCH cas_segments USING INTEGER PRIMARY KEY (rowid=?)"]),
         (
             EVICT_RESULT_ROW,
             &["SEARCH result_candidates USING INDEX sqlite_autoindex_result_candidates_1 (key_kind=? AND static_key=? AND trace_digest=?)"],
         ),
-        // The CAS's live bytes: one row per segment, never per extent.
-        (LIVE_BYTES, &["SCAN cas_segments"]),
+        // The CAS's live bytes: a sum over two covering indexes, never a
+        // table page.
+        (
+            LIVE_BYTES,
+            &[
+                "SCAN CONSTANT ROW",
+                "SCALAR SUBQUERY 1",
+                "SCAN cas_extents USING COVERING INDEX cas_extents_by_segment",
+                "SCALAR SUBQUERY 2",
+                "SCAN result_candidates USING COVERING INDEX result_candidates_by_segment",
+            ],
+        ),
+        // Each sealed segment (and this writer's open one) with its live
+        // bytes: two covering-index range sums per segment.
         (
             COMPACTION_CANDIDATES,
             &[
                 "MERGE (UNION ALL)",
                 "LEFT",
-                "SEARCH cas_segments USING INDEX cas_segments_by_state (state=? AND <expr><?)",
-                "USE TEMP B-TREE FOR ORDER BY",
+                "SEARCH s USING INDEX cas_segments_by_state (state=?)",
+                "CORRELATED SCALAR SUBQUERY 1",
+                "SEARCH cas_extents USING COVERING INDEX cas_extents_by_segment (segment=?)",
+                "CORRELATED SCALAR SUBQUERY 2",
+                "SEARCH result_candidates USING COVERING INDEX result_candidates_by_segment (segment=?)",
                 "RIGHT",
-                "SEARCH cas_segments USING INDEX cas_segments_open (owner=?)",
+                "SEARCH s USING INDEX cas_segments_open (owner=?)",
+                "CORRELATED SCALAR SUBQUERY 4",
+                "SEARCH cas_extents USING COVERING INDEX cas_extents_by_segment (segment=?)",
+                "CORRELATED SCALAR SUBQUERY 5",
+                "SEARCH result_candidates USING COVERING INDEX result_candidates_by_segment (segment=?)",
             ],
         ),
         (
@@ -1570,34 +1591,11 @@ fn cas_statements_search_their_indexes() {
         ),
         (
             ACTIVE_SEGMENT,
-            &["SEARCH cas_segments USING INDEX cas_segments_open (owner=?)"],
-        ),
-        // Recovery's lost-tail statements: one segment's rows past a
-        // length, and what holds them.
-        (
-            LOST_EXTENT_HOLDERS,
-            &[
-                "SEARCH cas_extents USING INDEX cas_extents_by_segment (segment=?)",
-                "SEARCH cas_refs USING COVERING INDEX cas_refs_by_hash (content_hash=?)",
-                "USE TEMP B-TREE FOR DISTINCT",
-            ],
-        ),
-        (
-            LOST_RESULTS,
-            &["SEARCH result_candidates USING INDEX result_candidates_by_segment (segment=?)"],
+            &["SEARCH cas_segments USING COVERING INDEX cas_segments_open (owner=?)"],
         ),
         (
             DELETE_LOAD_EDGES,
             &["SEARCH artifact_load_edges USING COVERING INDEX sqlite_autoindex_artifact_load_edges_1 (content_hash=?)"],
-        ),
-        // The delete cascades to the load edges and checks the references.
-        (
-            DROP_LOST_EXTENTS,
-            &[
-                "SEARCH cas_extents USING INDEX cas_extents_by_segment (segment=?)",
-                "SEARCH artifact_load_edges USING COVERING INDEX sqlite_autoindex_artifact_load_edges_1 (content_hash=?)",
-                "SEARCH cas_refs USING COVERING INDEX cas_refs_by_hash (content_hash=?)",
-            ],
         ),
     ];
     for (sql, expected) in cases {
@@ -1968,10 +1966,6 @@ fn cas_and_served_point_statements_search_their_keys() {
             &["SEARCH result_candidates USING INDEX sqlite_autoindex_result_candidates_1 (key_kind=? AND static_key=? AND trace_digest=?)"],
         ),
         (
-            "INSERT INTO cas_extents(content_hash, segment, offset, len) VALUES (?, ?, ?, ?) ON CONFLICT(content_hash) DO UPDATE SET segment = excluded.segment, offset = excluded.offset, len = excluded.len",
-            &["SEARCH artifact_load_edges USING COVERING INDEX sqlite_autoindex_artifact_load_edges_1 (content_hash=?)", "SEARCH cas_refs USING COVERING INDEX cas_refs_by_hash (content_hash=?)"],
-        ),
-        (
             "SELECT ? FROM cas_extents WHERE content_hash = ?",
             &["SEARCH cas_extents USING COVERING INDEX sqlite_autoindex_cas_extents_1 (content_hash=?)"],
         ),
@@ -1980,8 +1974,8 @@ fn cas_and_served_point_statements_search_their_keys() {
             &["SEARCH change_log"],
         ),
         (
-            "SELECT COALESCE(SUM(live_len), ?) FROM cas_segments",
-            &["SCAN cas_segments"],
+            "SELECT (SELECT COALESCE(SUM(len), ?) FROM cas_extents) + (SELECT COALESCE(SUM(len), ?) FROM result_candidates)",
+            &["SCAN CONSTANT ROW", "SCALAR SUBQUERY 1", "SCAN cas_extents USING COVERING INDEX cas_extents_by_segment", "SCALAR SUBQUERY 2", "SCAN result_candidates USING COVERING INDEX result_candidates_by_segment"],
         ),
         (
             "SELECT EXISTS(SELECT ? FROM cas_extents WHERE content_hash = ?)",
@@ -2052,12 +2046,12 @@ fn cas_and_served_point_statements_search_their_keys() {
             &["SEARCH cas_extents USING INDEX sqlite_autoindex_cas_extents_1 (content_hash=?)"],
         ),
         (
-            "SELECT segment_id FROM cas_segments WHERE owner = ? AND state = ? AND segment_kind = ? ORDER BY segment_id DESC LIMIT ?",
-            &["SEARCH cas_segments USING INDEX cas_segments_open (owner=?)"],
+            "SELECT segment_id FROM cas_segments WHERE owner = ? AND state = ? AND segment_kind = ?",
+            &["SEARCH cas_segments USING COVERING INDEX cas_segments_open (owner=?)"],
         ),
         (
-            "SELECT segment_id, file_name, segment_kind, indexed_len, live_len FROM cas_segments WHERE state = ? AND live_len * ? - indexed_len <= ? UNION ALL SELECT segment_id, file_name, segment_kind, indexed_len, live_len FROM cas_segments INDEXED BY cas_segments_open WHERE owner = ? AND state = ? AND live_len * ? - indexed_len <= ? ORDER BY segment_id",
-            &["MERGE (UNION ALL)", "LEFT", "SEARCH cas_segments USING INDEX cas_segments_by_state (state=? AND <expr><?)", "USE TEMP B-TREE FOR ORDER BY", "RIGHT", "SEARCH cas_segments USING INDEX cas_segments_open (owner=?)"],
+            "SELECT segment_id, file_name, segment_kind, indexed_len, (SELECT COALESCE(SUM(len), ?) FROM cas_extents WHERE segment = s.segment_id) + (SELECT COALESCE(SUM(len), ?) FROM result_candidates WHERE segment = s.segment_id) FROM cas_segments s WHERE state = ? UNION ALL SELECT segment_id, file_name, segment_kind, indexed_len, (SELECT COALESCE(SUM(len), ?) FROM cas_extents WHERE segment = s.segment_id) + (SELECT COALESCE(SUM(len), ?) FROM result_candidates WHERE segment = s.segment_id) FROM cas_segments s WHERE owner = ? AND state = ? AND segment_kind = ? ORDER BY segment_id",
+            &["MERGE (UNION ALL)", "LEFT", "SEARCH s USING INDEX cas_segments_by_state (state=?)", "CORRELATED SCALAR SUBQUERY 1", "SEARCH cas_extents USING COVERING INDEX cas_extents_by_segment (segment=?)", "CORRELATED SCALAR SUBQUERY 2", "SEARCH result_candidates USING COVERING INDEX result_candidates_by_segment (segment=?)", "RIGHT", "SEARCH s USING INDEX cas_segments_open (owner=?)", "CORRELATED SCALAR SUBQUERY 4", "SEARCH cas_extents USING COVERING INDEX cas_extents_by_segment (segment=?)", "CORRELATED SCALAR SUBQUERY 5", "SEARCH result_candidates USING COVERING INDEX result_candidates_by_segment (segment=?)"],
         ),
         (
             "SELECT seq, version, kind, asset_uuid, state, subject, detail FROM change_log WHERE seq > ? ORDER BY seq",
@@ -2080,7 +2074,7 @@ fn cas_and_served_point_statements_search_their_keys() {
             &["SEARCH cas_extents USING INDEX sqlite_autoindex_cas_extents_1 (content_hash=?)"],
         ),
         (
-            "UPDATE cas_segments SET indexed_len = ?, state = ? WHERE segment_id = ?",
+            "UPDATE cas_segments SET indexed_len = ? WHERE segment_id = ?",
             &["SEARCH cas_segments USING INTEGER PRIMARY KEY (rowid=?)"],
         ),
         (
@@ -2088,12 +2082,8 @@ fn cas_and_served_point_statements_search_their_keys() {
             &["SEARCH cas_segments USING INTEGER PRIMARY KEY (rowid=?)"],
         ),
         (
-            "UPDATE cas_segments SET state = ? WHERE owner = ? AND segment_id < ? AND state = ?",
-            &["SEARCH cas_segments USING INDEX cas_segments_open (owner=? AND segment_id<?)"],
-        ),
-        (
-            "UPDATE cas_segments SET state = ? WHERE segment_id = ? AND NOT EXISTS (SELECT ? FROM cas_extents WHERE segment = ?) AND NOT EXISTS (SELECT ? FROM result_candidates WHERE segment = ?)",
-            &["SEARCH cas_segments USING INTEGER PRIMARY KEY (rowid=?)", "SCALAR SUBQUERY 1", "SEARCH cas_extents USING COVERING INDEX cas_extents_by_segment (segment=?)", "SCALAR SUBQUERY 2", "SEARCH result_candidates USING COVERING INDEX result_candidates_by_segment (segment=?)"],
+            "UPDATE cas_segments SET state = ? WHERE segment_id = ?",
+            &["SEARCH cas_segments USING INTEGER PRIMARY KEY (rowid=?)"],
         ),
     ];
     let expected = expected

@@ -1155,15 +1155,23 @@ should reach zero by the end of phase 6.
   refinement failure fails its input instead of poisoning.
 - **The CAS index is the CAS's truth (schema 39).** The write transaction
   that indexes a record group is its commit, so recovery reads no records:
-  it cuts bytes past `indexed_len` and drops what a lost tail held. A
+  it cuts bytes past `indexed_len`. A
   writer keeps no active-segment binding in memory: it finds its segment
-  by `cas_segments.owner` (`ACTIVE_SEGMENT`), and its next allocation seals
-  the open segments it owns. A rolled-back write savepoint therefore needs
+  by `cas_segments.owner` (`ACTIVE_SEGMENT`). A rolled-back write savepoint therefore needs
   no CAS fixup: the allocation's row, its `next_segment_id` and its seals
   roll back with it, the id's next allocation truncates the file it left,
   and bytes it appended to a surviving segment are dead space the next
-  record is written past. The CAS pass and open read per segment
-  (`live_len`), not per extent; `derived_assertions` is gone.
+  record is written past. `derived_assertions` is gone.
+- **The CAS repairs nothing (schema 40).** One open regular segment per
+  writer is a unique partial index (`cas_segments_open`), so no seal sweeps
+  for a writer's leftovers: rolling seals the one it leaves by id.
+  Compaction is one write transaction that allocates its destinations
+  sealed. Recovery no longer scans for files no row names
+  (`next_segment_id` is the allocation's commit point; the next allocation
+  of an id truncates its file), and a lost tail is reported, not evicted.
+  `live_len` and its six triggers are gone: the live bytes and each
+  compaction candidate's are sums over covering `(segment, len)` indexes
+  on `cas_extents` and `result_candidates`.
 
 ## 7. Test baseline
 

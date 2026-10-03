@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 39;
+pub const SCHEMA_VERSION: u32 = 40;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -315,18 +315,24 @@ CREATE TABLE derived_outputs (
     output_key  TEXT NOT NULL,
     terminal_type BLOB
 );
-CREATE INDEX result_candidates_by_segment ON result_candidates(segment);
+-- Schema 40: a segment's result records with their lengths, so the bytes
+-- a segment holds are a covering-index sum.
+CREATE INDEX result_candidates_by_segment ON result_candidates(segment, len);
 CREATE TABLE cas_extents (
     content_hash BLOB NOT NULL PRIMARY KEY,
     segment      INTEGER NOT NULL,
     offset       INTEGER NOT NULL,
     len          INTEGER NOT NULL
 );
-CREATE INDEX cas_extents_by_segment ON cas_extents(segment);
+-- Schema 40: a segment's extents with their lengths: the bytes a segment
+-- holds, and the CAS's live bytes, are covering-index sums.
+CREATE INDEX cas_extents_by_segment ON cas_extents(segment, len);
 -- What keeps an extent indexed. holder_kind 0: a result (holder = key_kind
 -- byte, static key, trace digest) names its outputs, aux payloads and
 -- output wire trees. holder_kind 1: an installed artifact or wire tree
--- (holder = its own hash). An extent no row names is pruned.
+-- (holder = its own hash). Releasing a holder deletes, in the same
+-- transaction, each extent it held that nothing else references; the
+-- foreign key refuses to drop an extent something still references.
 CREATE TABLE cas_refs (
     holder_kind  INTEGER NOT NULL CHECK (holder_kind IN (0, 1)),
     holder       BLOB NOT NULL,
@@ -343,41 +349,17 @@ CREATE TABLE cas_segments (
     indexed_len INTEGER NOT NULL,
     state       INTEGER NOT NULL CHECK (state IN (0, 1, 2)),
     -- Schema 39 (fix-cas): the writer that allocated the segment
-    -- (`CasInner::owner`), so a writer seals its own open segments.
-    owner       INTEGER,
-    -- Schema 39 (fix-cas): the bytes of the extents and result records the
-    -- index places in this segment, kept by the triggers below, so the
-    -- CAS's live bytes and its compactable segments are read per segment,
-    -- never per extent.
-    live_len    INTEGER NOT NULL DEFAULT 0
+    -- (`CasInner::owner`).
+    owner       INTEGER
 );
--- Schema 39 (fix-cas): each writer's open segments.
-CREATE INDEX cas_segments_open ON cas_segments(owner, segment_id) WHERE state = 0;
--- Schema 39 (fix-cas): segments by state, then by how far their live bytes
--- fall short of half their indexed bytes: the dead segments the sweeper
--- deletes, and the sealed ones compaction kills or copies (see
--- `cas::gc::COMPACTION_CANDIDATES`), are each one key range.
-CREATE INDEX cas_segments_by_state ON cas_segments(state, live_len * 2 - indexed_len);
-CREATE TRIGGER cas_extents_live_insert AFTER INSERT ON cas_extents BEGIN
-    UPDATE cas_segments SET live_len = live_len + NEW.len WHERE segment_id = NEW.segment;
-END;
-CREATE TRIGGER cas_extents_live_delete AFTER DELETE ON cas_extents BEGIN
-    UPDATE cas_segments SET live_len = live_len - OLD.len WHERE segment_id = OLD.segment;
-END;
-CREATE TRIGGER cas_extents_live_update AFTER UPDATE OF segment, len ON cas_extents BEGIN
-    UPDATE cas_segments SET live_len = live_len - OLD.len WHERE segment_id = OLD.segment;
-    UPDATE cas_segments SET live_len = live_len + NEW.len WHERE segment_id = NEW.segment;
-END;
-CREATE TRIGGER result_candidates_live_insert AFTER INSERT ON result_candidates BEGIN
-    UPDATE cas_segments SET live_len = live_len + NEW.len WHERE segment_id = NEW.segment;
-END;
-CREATE TRIGGER result_candidates_live_delete AFTER DELETE ON result_candidates BEGIN
-    UPDATE cas_segments SET live_len = live_len - OLD.len WHERE segment_id = OLD.segment;
-END;
-CREATE TRIGGER result_candidates_live_update AFTER UPDATE OF segment, len ON result_candidates BEGIN
-    UPDATE cas_segments SET live_len = live_len - OLD.len WHERE segment_id = OLD.segment;
-    UPDATE cas_segments SET live_len = live_len + NEW.len WHERE segment_id = NEW.segment;
-END;
+-- Schema 40: a writer's one open regular segment, the one it appends to.
+-- Unique: rolling to a new segment seals the old one in the same
+-- transaction, so a writer can never hold two.
+CREATE UNIQUE INDEX cas_segments_open ON cas_segments(owner)
+    WHERE state = 0 AND segment_kind = 0;
+-- Segments by state: the dead ones the sweeper deletes, and the sealed ones
+-- compaction considers.
+CREATE INDEX cas_segments_by_state ON cas_segments(state);
 CREATE TABLE pipeline_state (
     id                 INTEGER PRIMARY KEY CHECK (id = 0),
     dylib_hash         BLOB,
