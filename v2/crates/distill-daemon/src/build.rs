@@ -59,8 +59,7 @@ use distill_rpc::{
     decode_asset_reference_query, AssetReferenceQuery, AuthoringMutation, BuildAnswer,
     BuildBackend, BuildCompletion, BuildRequest, BuildStart, BuildTicket, BuildView,
     BuildWorkClass, Commit, DriftedInput, PipelineUnavailableDiagnostic, RpcFailure,
-    RuntimeTypePolicy, RuntimeTypePolicyRequest, ServedLoadEdge, TagPoisonMutation,
-    TagProjectionMutation,
+    RuntimeTypePolicy, RuntimeTypePolicyRequest, ServedLoadEdge,
 };
 use distill_schema::{ProjectSchemaAuthority, ProjectTypeAuthority};
 use distill_store::bundles::{EntryMeta, TagIndexUpdate};
@@ -92,67 +91,6 @@ use trace_source::{BuiltNodes, StoreTraceSource, TraceBasis, TraceQueries};
 pub(crate) use trace_source::runtime_asset_filter;
 
 const MIGRATION_PLANNER_VERSION: u32 = 1;
-
-pub(crate) struct PublishedTagIndex {
-    tags: BTreeMap<AssetUuid, BTreeMap<String, Option<String>>>,
-    poisons: BTreeMap<AssetUuid, BundleUuid>,
-    removed: BTreeSet<AssetUuid>,
-}
-
-impl PublishedTagIndex {
-    fn conservatively_poisoned(assets: &BTreeMap<AssetUuid, BundleUuid>) -> Self {
-        Self {
-            tags: assets
-                .keys()
-                .copied()
-                .map(|asset| (asset, BTreeMap::new()))
-                .collect(),
-            poisons: assets.clone(),
-            removed: BTreeSet::new(),
-        }
-    }
-
-    /// Carry the refined tags in `commit`: the tags of the entries it sets,
-    /// and a tag and tag-poison mutation for each asset refined or removed.
-    fn apply(self, commit: &mut Commit) {
-        for mutation in &mut commit.authoring {
-            if let AuthoringMutation::Set(entry) = mutation {
-                if let Some(tags) = self.tags.get(&entry.uuid) {
-                    entry.tags = tags.clone();
-                }
-            }
-        }
-        for (asset, tags) in self.tags {
-            commit
-                .tag_projection_mutations
-                .push(TagProjectionMutation::Set { asset, tags });
-        }
-        for asset in &self.removed {
-            commit
-                .tag_projection_mutations
-                .push(TagProjectionMutation::Remove { asset: *asset });
-        }
-        let affected = commit
-            .tag_projection_mutations
-            .iter()
-            .map(|mutation| match mutation {
-                TagProjectionMutation::Set { asset, .. }
-                | TagProjectionMutation::Remove { asset } => *asset,
-            })
-            .collect::<BTreeSet<_>>();
-        for asset in affected {
-            match self.poisons.get(&asset) {
-                Some(bundle) => commit.tag_poison_mutations.push(TagPoisonMutation::Set {
-                    asset,
-                    bundle: *bundle,
-                }),
-                None => commit
-                    .tag_poison_mutations
-                    .push(TagPoisonMutation::Remove { asset }),
-            }
-        }
-    }
-}
 
 /// The production lazy-build authority. A request resolves at the
 /// requester's snapshot: its DSNK node key is a digest of the node's static
@@ -1644,9 +1582,10 @@ pub(crate) fn type_tag_epochs(authority: &ProjectSchemaAuthority) -> BTreeMap<Ty
 /// pending or poisoned rows and the migrated rows of another pipeline module
 /// (see [`StoreReader::stale_tag_index_assets`]). Every other row already holds
 /// what refining it would write, so a publication costs the rows it changed.
-/// Assets `commit` removes become tag removals. If refining fails, every
-/// asset it set out to refine is poisoned, in the store and in `commit`
-/// alike; a failure to write that poison fails the publication. A transient
+/// The refined rows are the store's: the daemon's served projection reads
+/// them, so `commit` carries none. If refining fails, every asset it set
+/// out to refine is poisoned; a failure to write that poison fails the
+/// publication. A transient
 /// failure (the store's or the runtime's) poisons nothing: it fails the
 /// publication, whose input rolls back.
 #[allow(clippy::too_many_arguments)]
@@ -1657,21 +1596,15 @@ pub(crate) fn refine_tag_index(
     pipeline: PipelineSnapshot,
     targets: &BTreeMap<String, Target>,
     max_depth: usize,
-    commit: &mut Commit,
+    commit: &Commit,
     stale: bool,
 ) -> Result<(), String> {
     let store = input.0;
     let tag_epoch = authority.source_hash();
     let mut assets = BTreeMap::new();
-    let mut removed = BTreeSet::new();
     for mutation in &commit.authoring {
-        match mutation {
-            AuthoringMutation::Set(entry) => {
-                assets.insert(entry.uuid, entry.bundle);
-            }
-            AuthoringMutation::Remove { uuid } => {
-                removed.insert(*uuid);
-            }
+        if let AuthoringMutation::Set(entry) = mutation {
+            assets.insert(entry.uuid, entry.bundle);
         }
     }
     if stale {
@@ -1688,10 +1621,10 @@ pub(crate) fn refine_tag_index(
                 .map_err(|error| format!("find the stale tag-index rows: {error}"))?,
         );
     }
-    if assets.is_empty() && removed.is_empty() {
+    if assets.is_empty() {
         return Ok(());
     }
-    let mut indexed = match try_refine_tag_index(
+    match try_refine_tag_index(
         &mut *store,
         scanner,
         authority,
@@ -1700,27 +1633,22 @@ pub(crate) fn refine_tag_index(
         max_depth,
         &assets,
     ) {
-        Ok(indexed) => indexed,
-        Err(error) if error.is_transient() => {
-            return Err(format!("refine the tag index: {error:?}"))
-        }
-        Err(BuildError::Failed(error)) => poison_tag_index(store, &assets, tag_epoch, &error)?,
-        Err(error) => poison_tag_index(store, &assets, tag_epoch, &format!("{error:?}"))?,
-    };
-    indexed.removed = removed;
-    indexed.apply(commit);
-    Ok(())
+        Ok(()) => Ok(()),
+        Err(error) if error.is_transient() => Err(format!("refine the tag index: {error:?}")),
+        Err(BuildError::Failed(error)) => poison_tag_index(store, &assets, tag_epoch, &error),
+        Err(error) => poison_tag_index(store, &assets, tag_epoch, &format!("{error:?}")),
+    }
 }
 
-/// The conservative half of a failed refinement, in the store and in the
-/// served projection alike: every asset of `assets` loses its tags and
-/// carries the failure as its tag poison, under `tag_epoch`.
+/// The conservative half of a failed refinement: every asset of `assets`
+/// loses its tags and carries the failure as its tag poison, under
+/// `tag_epoch`.
 fn poison_tag_index(
     store: &mut Store,
     assets: &BTreeMap<AssetUuid, BundleUuid>,
     tag_epoch: [u8; 32],
     error: &str,
-) -> Result<PublishedTagIndex, String> {
+) -> Result<(), String> {
     let updates = assets
         .keys()
         .map(|asset| TagIndexUpdate {
@@ -1735,8 +1663,7 @@ fn poison_tag_index(
         .collect::<Vec<_>>();
     store
         .refine_unpublished_tag_index(&updates)
-        .map_err(|error| format!("poison the tag index: {error}"))?;
-    Ok(PublishedTagIndex::conservatively_poisoned(assets))
+        .map_err(|error| format!("poison the tag index: {error}"))
 }
 
 /// The bundle a refinement read last: its assets are refined together, so
@@ -1817,7 +1744,7 @@ fn try_refine_tag_index(
     targets: &BTreeMap<String, Target>,
     max_depth: usize,
     assets: &BTreeMap<AssetUuid, BundleUuid>,
-) -> Result<PublishedTagIndex, BuildError> {
+) -> Result<(), BuildError> {
     let tag_epoch = authority.source_hash();
     #[cfg(test)]
     if tests::FAIL_TAG_REFINEMENT.with(|fail| fail.replace(false)) {
@@ -1846,8 +1773,6 @@ fn try_refine_tag_index(
         _ => None,
     };
 
-    let mut tags = BTreeMap::new();
-    let mut poisons = BTreeMap::new();
     let mut updates = Vec::with_capacity(order.len());
     let mut loaded = TagBundle::default();
     if let Some(env) = env {
@@ -1864,14 +1789,10 @@ fn try_refine_tag_index(
             error if error.is_transient() => error,
             error => BuildError::Failed(format!("pin tag-index tools: {error:?}")),
         })?;
-        for (bundle, asset) in order {
+        for (_, asset) in order {
             match index_one_tag_entry(&mut context, &mut loaded, asset, tag_epoch)? {
-                Ok(update) => {
-                    tags.insert(asset, update.tags.clone());
-                    updates.push(update);
-                }
+                Ok(update) => updates.push(update),
                 Err((error, trace, migrated)) => {
-                    poisons.insert(asset, bundle);
                     updates.push(TagIndexUpdate {
                         asset,
                         tags: BTreeMap::new(),
@@ -1889,7 +1810,7 @@ fn try_refine_tag_index(
             || "no build target is published".to_owned(),
             |error| error.to_string(),
         );
-        for (bundle, asset) in order {
+        for (_, asset) in order {
             let loaded = match loaded.load(store, &scanner, asset) {
                 Err(error) if error.is_transient() => return Err(error),
                 loaded => loaded,
@@ -1914,7 +1835,6 @@ fn try_refine_tag_index(
                         .into_iter()
                         .map(|(name, value)| (name, Some(value)))
                         .collect::<BTreeMap<_, _>>();
-                    tags.insert(asset, extracted.clone());
                     updates.push(TagIndexUpdate {
                         asset,
                         tags: extracted,
@@ -1926,7 +1846,6 @@ fn try_refine_tag_index(
                     });
                 }
                 Err((error, migrated)) => {
-                    poisons.insert(asset, bundle);
                     updates.push(TagIndexUpdate {
                         asset,
                         tags: BTreeMap::new(),
@@ -1942,12 +1861,7 @@ fn try_refine_tag_index(
     }
     store
         .refine_unpublished_tag_index(&updates)
-        .map_err(|error| BuildError::Infrastructure(format!("publish tag index: {error}")))?;
-    Ok(PublishedTagIndex {
-        tags,
-        poisons,
-        removed: BTreeSet::new(),
-    })
+        .map_err(|error| BuildError::Infrastructure(format!("publish tag index: {error}")))
 }
 
 fn index_one_tag_entry(
@@ -4393,22 +4307,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn conservative_tag_index_preserves_exact_bundle_identity() {
-        let other_asset = AssetUuid([80; 16]);
-        let other_bundle = BundleUuid([81; 16]);
-        let assets = BTreeMap::from([(ASSET, BUNDLE), (other_asset, other_bundle)]);
-
-        let index = PublishedTagIndex::conservatively_poisoned(&assets);
-
-        assert_eq!(index.poisons, assets);
-        assert_eq!(
-            index.tags.keys().copied().collect::<Vec<_>>(),
-            vec![ASSET, other_asset]
-        );
-        assert!(index.tags.values().all(BTreeMap::is_empty));
-    }
-
     fn path(krate: &str, name: &str) -> TypePath {
         TypePath {
             name: Some(name.to_owned()),
@@ -5196,7 +5094,7 @@ mod tests {
 
     /// A complete refinement redoes only the stale rows: none, once every
     /// row is refined. One that fails poisons the rows it set out to
-    /// refine, in the store as in its commit, each with its bundle.
+    /// refine.
     #[test]
     fn a_failed_complete_tag_refinement_poisons_every_asset_of_its_input() {
         let temp = tempfile::tempdir().unwrap();
@@ -5206,7 +5104,8 @@ mod tests {
             .unwrap();
         let mut writer = coordinator.open_writer().unwrap();
         let refine = |writer: &mut distill_store::StoreWriter| {
-            let mut commit = Commit::default();
+            let commit = Commit::default();
+            let loads = TAG_BUNDLE_LOADS.with(std::cell::Cell::get);
             writer.open_input().unwrap();
             refine_tag_index(
                 OpenInput::new(writer).unwrap(),
@@ -5215,19 +5114,19 @@ mod tests {
                 compiled.pipeline_snapshot(),
                 compiled.build_targets(),
                 64,
-                &mut commit,
+                &commit,
                 true,
             )
             .unwrap();
             let state = writer.tag_index_state(ASSET).unwrap().unwrap();
             writer.finish_input(true).unwrap();
-            (commit, state)
+            (TAG_BUNDLE_LOADS.with(std::cell::Cell::get) - loads, state)
         };
-        let (commit, before) = refine(&mut writer);
+        let (loads, before) = refine(&mut writer);
         assert_eq!(before.poison, None, "{before:?}");
-        assert_eq!(commit.tag_projection_mutations.len(), 1);
-        let (commit, _) = refine(&mut writer);
-        assert!(commit.tag_projection_mutations.is_empty(), "nothing was stale");
+        assert_eq!(loads, 1);
+        let (loads, _) = refine(&mut writer);
+        assert_eq!(loads, 0, "nothing was stale");
 
         // A publication marks the row pending; its refinement fails.
         let epoch = compiled.schema_authority().unwrap().source_hash();
@@ -5235,26 +5134,11 @@ mod tests {
             .input_transaction(|txn| txn.set_tag_index_pending(ASSET, epoch))
             .unwrap();
         FAIL_TAG_REFINEMENT.with(|fail| fail.set(true));
-        let (commit, after) = refine(&mut writer);
-        // The store says what the served projection says: no reader trusts
-        // the row the failed refinement left.
+        let (_, after) = refine(&mut writer);
+        // No reader trusts the row the failed refinement left.
         assert!(
             after.poison.as_deref().is_some_and(|poison| poison.starts_with("tag indexing failed")),
             "{after:?}"
-        );
-        assert_eq!(
-            commit.tag_poison_mutations,
-            [TagPoisonMutation::Set {
-                asset: ASSET,
-                bundle: BUNDLE
-            }]
-        );
-        assert_eq!(
-            commit.tag_projection_mutations,
-            [TagProjectionMutation::Set {
-                asset: ASSET,
-                tags: BTreeMap::new()
-            }]
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 

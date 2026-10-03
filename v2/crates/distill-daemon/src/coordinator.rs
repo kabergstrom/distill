@@ -2417,7 +2417,6 @@ fn publish_scan(
         &newly_failed,
         store,
         projection,
-        derived_outputs.clone(),
         &rpc_publishable_bundles,
     )?;
     let mut next_pipeline = pipeline_diagnostic(store.pipeline_failure()?);
@@ -2975,17 +2974,11 @@ fn prepare_incremental_publication(
         let assets = store.asset_ids_in_bundle(*bundle)?;
         durable_bundles.insert(*bundle, DurableBundleBasis { summary, assets });
     }
-    let old_derived = plan
-        .derived_outputs
-        .keys()
-        .map(|child| Ok((*child, store.derived_output_row(*child)?)))
-        .collect::<Result<BTreeMap<_, _>, StoreError>>()?;
     let mut commit = Commit {
         // Selected from the store's errors in the publishing input.
         configuration: None,
         pipeline: Some(pipeline_diagnostic(store.pipeline_failure()?)),
         namespace_errors: Some(plan.namespace_errors.clone()),
-        tag_poisons: Some(BTreeMap::new()),
         ..Commit::default()
     };
     let path_projections = &plan.paths;
@@ -3044,11 +3037,6 @@ fn prepare_incremental_publication(
                     },
                     delta: AssetDeltaState::Changed,
                 });
-                commit
-                    .tag_poisons
-                    .as_mut()
-                    .expect("incremental scan initializes tag poisons")
-                    .insert(entry.asset, poison.bundle);
                 if old.assets.contains(&entry.asset) {
                     commit
                         .authoring
@@ -3090,30 +3078,6 @@ fn prepare_incremental_publication(
         }
     }
     append_path_mutations(&mut commit, path_projections, &old_paths);
-    for (child, current) in &plan.derived_outputs {
-        let old = old_derived[child].as_ref();
-        let unchanged = match (old, current) {
-            (None, None) => true,
-            (Some((parent, key)), Some(entry)) => {
-                parent == &entry.parent && key == &entry.output_key
-            }
-            _ => false,
-        };
-        if unchanged {
-            continue;
-        }
-        match current {
-            Some(entry) => commit
-                .derived_output_mutations
-                .push(DerivedOutputMutation::Set {
-                    child: *child,
-                    entry: entry.clone(),
-                }),
-            None => commit
-                .derived_output_mutations
-                .push(DerivedOutputMutation::Remove { child: *child }),
-        }
-    }
     for (asset, error) in plan.withheld.newly_failed(store)? {
         commit.assets.push(AssetMutation::Set {
             uuid: asset,
@@ -3295,7 +3259,6 @@ fn rpc_commit(
     newly_failed: &BTreeMap<AssetUuid, String>,
     old: &StoreReader,
     projection: &PipelineProjection,
-    derived_outputs: BTreeMap<AssetUuid, DerivedOutputEntry>,
     changed_bundles: &BTreeSet<BundleUuid>,
 ) -> Result<Commit, StoreError> {
     let mut commit = Commit {
@@ -3303,8 +3266,6 @@ fn rpc_commit(
         configuration: None,
         pipeline: Some(PipelineDiagnostic::Ready),
         namespace_errors: Some(candidate.namespace_errors.clone()),
-        derived_outputs: Some(derived_outputs),
-        tag_poisons: Some(BTreeMap::new()),
         ..Commit::default()
     };
 
@@ -3352,11 +3313,6 @@ fn rpc_commit(
                 entry,
                 projection.interface(entry.type_uuid).terminal,
             )?));
-            commit
-                .tag_poisons
-                .as_mut()
-                .expect("scan commit initializes tag poisons")
-                .insert(entry.uuid, bundle.uuid);
         }
         if let Some(primary) = &bundle.primary {
             paths
@@ -3378,11 +3334,6 @@ fn rpc_commit(
                 },
                 delta: AssetDeltaState::Changed,
             });
-            commit
-                .tag_poisons
-                .as_mut()
-                .expect("scan commit initializes tag poisons")
-                .insert(entry.asset, poison.bundle);
             if old.asset_exists(entry.asset)? {
                 commit
                     .authoring
