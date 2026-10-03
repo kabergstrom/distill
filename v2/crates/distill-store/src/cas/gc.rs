@@ -4,7 +4,7 @@
 //! Eviction is always *safe*: everything in the CAS is rebuildable. It
 //! deletes index rows only; a reader that loses the race sees a cache
 //! miss. `cas_refs` says what keeps each extent indexed, with a foreign
-//! key to `cas_extents`, so pruning is one statement inside the write
+//! key to `cas_extents`, so pruning is one statement insrusqlite::params![SEGMENT_SEALED, self.cas.er]e the write
 //! transaction and can never leave a reference dangling.
 //!
 //! Compaction copies the live records of a mostly-dead sealed segment into
@@ -46,10 +46,6 @@ pub struct CompactionReport {
     pub dead_segments: Vec<u64>,
 }
 
-/// Delete the extents of segment `?1` that no `cas_refs` row names.
-pub(crate) const PRUNE_SEGMENT: &str = "DELETE FROM cas_extents WHERE segment = ?1 AND NOT EXISTS
-       (SELECT 1 FROM cas_refs WHERE cas_refs.content_hash = cas_extents.content_hash)";
-
 /// Drop one holder's references and the extents only it held; the extent
 /// bytes that freed.
 fn release_holder(
@@ -88,7 +84,7 @@ pub(crate) const EVICT_RESULT_ROW: &str = "DELETE FROM result_candidates
 
 /// Evict one result row and everything only it held; `None` when there is
 /// no such row, else the bytes that freed (its record and extents).
-fn evict_result_rows(
+pub(crate) fn evict_result_rows(
     txn: &rusqlite::Connection,
     key_kind: i64,
     static_key: &[u8],
@@ -111,6 +107,25 @@ fn evict_result_rows(
     Ok(Some(record as u64 + release_holder(txn, HOLDER_RESULT, &holder)?))
 }
 
+/// Evict one holder: a result (its candidate row too) or an install, and
+/// what only it held; the bytes that freed. A result holder whose row is
+/// gone still has its references released.
+pub(crate) fn evict_holder(
+    txn: &rusqlite::Connection,
+    holder_kind: i64,
+    holder: &[u8],
+) -> Result<u64, StoreError> {
+    let row = if holder_kind == HOLDER_RESULT && holder.len() == 65 {
+        evict_result_rows(txn, i64::from(holder[0]), &holder[1..33], &holder[33..65])?
+    } else {
+        None
+    };
+    match row {
+        Some(freed) => Ok(freed),
+        None => release_holder(txn, holder_kind, holder),
+    }
+}
+
 /// One eviction victim, sampled: the holder of the first reference at or
 /// after a random content hash (`cas_refs_by_hash`), so a holder is drawn
 /// about in proportion to the extents it holds.
@@ -124,15 +139,17 @@ pub(crate) const FIRST_HOLDER: &str =
 pub(crate) const LIVE_BYTES: &str = "SELECT COALESCE(SUM(live_len), 0) FROM cas_segments";
 /// The segments compaction kills (nothing live) or copies (at most half
 /// live): the sealed ones (state `?1`), one key range of
-/// `cas_segments_by_state`, and the compacting writer's own open segment
-/// `?2` (state `?3`).
+/// `cas_segments_by_state`, and the open segments of the compacting
+/// writer `?2`, on the open segments' partial index (state literal).
 pub(crate) const COMPACTION_CANDIDATES: &str =
     "SELECT segment_id, file_name, segment_kind, indexed_len, live_len FROM cas_segments
      WHERE state = ?1 AND live_len * 2 - indexed_len <= 0
      UNION ALL
-     SELECT segment_id, file_name, segment_kind, indexed_len, live_len FROM cas_segments
-     WHERE segment_id = ?2 AND state = ?3 AND live_len * 2 - indexed_len <= 0
+     SELECT segment_id, file_name, segment_kind, indexed_len, live_len
+     FROM cas_segments INDEXED BY cas_segments_open
+     WHERE owner = ?2 AND state = 0 AND live_len * 2 - indexed_len <= 0
      ORDER BY segment_id";
+const _: () = assert!(SEGMENT_OPEN == 0);
 /// The segments in state `?1`.
 pub(crate) const SEGMENTS_IN_STATE: &str =
     "SELECT segment_id, file_name FROM cas_segments WHERE state = ?1";
@@ -148,22 +165,6 @@ enum Moved {
 }
 
 impl Store {
-    /// Remove the extents of `segments` that nothing references. Every
-    /// write transaction indexes an extent with what references it, and an
-    /// eviction drops an extent with its last reference, so only recovery
-    /// leaves extents unreferenced: payloads of a group whose result it did
-    /// not adopt, in the segments it scanned. It prunes those.
-    pub(crate) fn prune_unreferenced_extents(&mut self, segments: &[u64]) -> Result<usize, StoreError> {
-        self.write_txn(|store| {
-            let mut statement = store.conn.prepare_cached(PRUNE_SEGMENT)?;
-            let mut pruned = 0;
-            for segment in segments {
-                pruned += statement.execute([*segment as i64])?;
-            }
-            Ok(pruned)
-        })
-    }
-
     /// Evict one committed result as a whole unit. `Ok(false)` when the
     /// candidate does not exist. Shared extents survive while anything
     /// else still references them.
@@ -222,17 +223,7 @@ impl Store {
                 let Some((holder_kind, holder)) = victim else {
                     break;
                 };
-                // A result holder whose row is gone still has its
-                // references released, so no sample draws it again.
-                let row = if holder_kind == HOLDER_RESULT && holder.len() == 65 {
-                    evict_result_rows(txn, i64::from(holder[0]), &holder[1..33], &holder[33..65])?
-                } else {
-                    None
-                };
-                let freed = match row {
-                    Some(freed) => freed,
-                    None => release_holder(txn, holder_kind, &holder)?,
-                };
+                let freed = evict_holder(txn, holder_kind, &holder)?;
                 evicted += 1;
                 live_bytes = live_bytes.saturating_sub(freed);
             }
@@ -243,7 +234,7 @@ impl Store {
         })
     }
 
-    /// Compact the CAS. A sealed segment (or this writer's own active one)
+    /// Compact the CAS. A sealed segment (or an open one of this writer)
     /// that nothing references any more dies; one whose live records fill
     /// less than half of it has them copied into new segments, the index
     /// repointed in one write transaction, and then dies. Dead segments are
@@ -256,11 +247,10 @@ impl Store {
             indexed_len: u64,
             live: u64,
         }
-        let own = self.cas.active_id();
         let candidates: Vec<Candidate> = {
             let mut statement = self.conn.prepare_cached(COMPACTION_CANDIDATES)?;
             let rows = statement.query_map(
-                rusqlite::params![SEGMENT_SEALED, own.map_or(-1, |id| id as i64), SEGMENT_OPEN],
+                rusqlite::params![SEGMENT_SEALED, self.cas.owner],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
@@ -360,12 +350,7 @@ impl Store {
                 dead_segments: Vec::new(),
             });
         }
-        if own.is_some_and(|own| victims.contains(&own)) {
-            self.cas.forget_active();
-        }
-
-        // Write the copies into new segments, rolling at the cap. Payloads
-        // precede every result, so the new segments alone rebuild.
+        // Write the copies into new segments, rolling at the cap.
         let segment_size = self.config.segment_size;
         let mut written: Vec<(u64, Vec<u8>)> = Vec::new();
         let mut moves = Vec::new();
@@ -377,14 +362,9 @@ impl Store {
                 }
             };
             if roll {
-                let id = self.write_txn(|store| {
-                    let id = store.create_segment(SegmentKind::Regular)?;
-                    store.conn.execute(
-                        "UPDATE cas_segments SET state = ?2 WHERE segment_id = ?1 AND state = ?3",
-                        rusqlite::params![id as i64, SEGMENT_SEALED, SEGMENT_OPEN],
-                    )?;
-                    Ok(id)
-                })?;
+                // Open, as this writer's, until the repoint indexes and
+                // seals it: no other writer's compaction takes it for empty.
+                let id = self.write_txn(|store| store.create_segment(SegmentKind::Regular))?;
                 written.push((id, Vec::new()));
             }
             let (id, segment) = written.last_mut().expect("a destination segment");
@@ -444,8 +424,8 @@ impl Store {
             }
             for (id, bytes) in &written {
                 txn.execute(
-                    "UPDATE cas_segments SET indexed_len = ?2 WHERE segment_id = ?1",
-                    rusqlite::params![*id as i64, bytes.len() as i64],
+                    "UPDATE cas_segments SET indexed_len = ?2, state = ?3 WHERE segment_id = ?1",
+                    rusqlite::params![*id as i64, bytes.len() as i64, SEGMENT_SEALED],
                 )?;
             }
             let mut dead = Vec::new();
@@ -661,13 +641,13 @@ mod tests {
         let pass = store.pages_fetched().unwrap() - before;
         drop(store);
         let (store, recovery) = Store::open_with_recovery(config).unwrap();
-        assert_eq!(recovery.orphaned_payloads, 0);
+        assert_eq!(recovery, crate::cas::RecoveryReport::default());
         (pass, store.pages_fetched().unwrap())
     }
 
-    /// The live bytes and the compactable segments are read per segment and
-    /// the startup prune reads only the segments recovery scanned: none of
-    /// it grows with the extents the CAS holds.
+    /// The live bytes and the compactable segments are read per segment, and
+    /// recovery reads segment rows only: none of it grows with the extents
+    /// the CAS holds.
     #[test]
     fn the_cas_pass_and_open_read_segments_not_extents() {
         let small = pass_and_open_pages(20);
@@ -736,11 +716,11 @@ mod tests {
     }
 
     #[test]
-    fn a_prune_racing_a_commit_never_leaves_a_dangling_reference() {
-        // Writer `a` finds the wire tree installed and does not append it;
-        // before its index transaction, writer `b` evicts the install, which
-        // prunes the extent. `a`'s transaction checks again, appends the tree
-        // after all, and commits a result whose every reference resolves.
+    fn a_commit_never_leaves_a_dangling_reference() {
+        // A commit checks which bytes the index holds in its own write
+        // transaction, so no eviction lands between the check and the index
+        // rows: a tree evicted before the commit is appended again, and the
+        // result's every reference resolves.
         let dir = tempfile::tempdir().unwrap();
         let mut a = Store::open(StoreConfig::new(dir.path().join("state"))).unwrap();
         let node = WireNode::Unit { offset: 0 };
@@ -763,13 +743,8 @@ mod tests {
         )
         .unwrap();
 
-        let mut b = Some(a.open_writer().unwrap());
-        a.before_commit = Some(Box::new(move || {
-            if let Some(mut b) = b.take() {
-                b.evict_installed(&layout.0).unwrap();
-                assert!(matches!(b.wire_tree_read(layout), Err(StoreError::NotFound { .. })));
-            }
-        }));
+        a.open_writer().unwrap().evict_installed(&layout.0).unwrap();
+        assert!(matches!(a.wire_tree_read(layout), Err(StoreError::NotFound { .. })));
         let receipt = a
             .commit_build(BuildCommit {
                 wire_trees: vec![wire_bytes.clone()],
@@ -789,7 +764,6 @@ mod tests {
                 },
             })
             .unwrap();
-        a.before_commit = None;
         assert_eq!(a.wire_tree_read(layout).unwrap(), wire_bytes);
 
         let dangling: i64 = a
@@ -814,5 +788,105 @@ mod tests {
             .evict_result(KeyKind::Processor, &[1; 32], &receipt.trace_digest)
             .unwrap());
         assert!(matches!(a.wire_tree_read(layout), Err(StoreError::NotFound { .. })));
+    }
+
+    fn open_segments(store: &Store) -> i64 {
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM cas_segments WHERE state = 0", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn compaction_never_kills_a_segment_a_group_is_being_written_to() {
+        // Writer `b` commits a group that rolls its segment mid-group: the
+        // output lands in S0, the result record in S1. Before `b`'s index
+        // rows commit, writer `a` runs the CAS pass. S0 must not look like a
+        // sealed segment nothing references.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StoreConfig::new(dir.path().join("state"));
+        config.segment_size = 400;
+        let mut b = Store::open(config).unwrap();
+        let mut a = Some(b.open_writer().unwrap());
+        let dead = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen = std::sync::Arc::clone(&dead);
+        b.before_commit = Some(Box::new(move || {
+            if let Some(mut a) = a.take() {
+                let compaction = a.compact().unwrap();
+                crate::cas::SegmentSweeper::new(std::time::Duration::ZERO)
+                    .sweep(&mut a)
+                    .unwrap();
+                *seen.lock().unwrap() = Some(compaction.dead_segments);
+            }
+        }));
+        let output = vec![9u8; 300];
+        let hash = *blake3::hash(&output).as_bytes();
+        b.commit_build(BuildCommit {
+            wire_trees: Vec::new(),
+            key_kind: KeyKind::Processor,
+            static_input_key: [1; 32],
+            asset_uuid: AssetUuid([7; 16]),
+            static_inputs_canonical: vec![],
+            trace: vec![1],
+            outcome: CommitOutcome::Success {
+                payload_kind: PayloadKind::ProcessorOutput,
+                outputs: vec![OutputSpec {
+                    output_key: String::new(),
+                    type_uuids: vec![],
+                    bytes: output.clone(),
+                }],
+                aux: vec![],
+            },
+        })
+        .unwrap();
+        b.before_commit = None;
+        let read = b.cas_read(&hash);
+        assert!(
+            read.as_deref().ok() == Some(output.as_slice()),
+            "a committed output is unreadable: {:?}; segments compaction killed mid-commit: {:?}",
+            read.map(|bytes| bytes.len()),
+            dead.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_rolled_back_savepoint_takes_its_segment_allocation_with_it() {
+        // A savepoint that allocated this writer's segment rolls back; the
+        // enclosing transaction commits. The row and its id are gone, so a
+        // later allocation reuses the id. Nothing may still append there.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(StoreConfig::new(dir.path().join("state"))).unwrap();
+        store
+            .write_txn(|store| {
+                store.conn.execute_batch("SAVEPOINT inner")?;
+                store.put_artifact(AssetUuid([1; 16]), b"rolled back", &[])?;
+                store.conn.execute_batch("ROLLBACK TO inner; RELEASE inner")?;
+                Ok(())
+            })
+            .unwrap();
+        store.put_artifact(AssetUuid([2; 16]), b"kept", &[]).unwrap();
+        let mut other = store.open_writer().unwrap();
+        other.put_artifact(AssetUuid([3; 16]), b"another writer's", &[]).unwrap();
+        let kept = *blake3::hash(b"kept").as_bytes();
+        let read = store.cas_read(&kept);
+        assert!(
+            read.as_deref().ok() == Some(b"kept".as_slice()),
+            "an artifact committed after the rolled-back savepoint: {read:?}, extent {:?}",
+            store.extent_of(&kept)
+        );
+        assert_eq!(other.cas_read(blake3::hash(b"another writer's").as_bytes()).unwrap(), b"another writer's");
+    }
+
+    #[test]
+    fn a_writer_closed_mid_transaction_seals_its_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreConfig::new(dir.path().join("state"))).unwrap();
+        let (opener, first) = crate::opener::StoreOpener::new(store);
+        let mut writer = opener.open_writer().unwrap();
+        writer.put_artifact(AssetUuid([1; 16]), b"committed", &[]).unwrap();
+        assert_eq!(open_segments(&*first), 1);
+        writer.open_input().unwrap();
+        drop(writer);
+        assert_eq!(open_segments(&*first), 0, "a closed writer's segment stays open");
     }
 }

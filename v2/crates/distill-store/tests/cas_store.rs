@@ -609,15 +609,11 @@ fn a_record_larger_than_the_cap_gets_one_typed_dedicated_oversize_segment() {
         "compaction leaves a live oversize segment alone"
     );
 
-    // Force startup's full segment-scan path, including the oversize
-    // payload followed by its result record in another segment.
+    // A reopen keeps the oversize payload and its result record in
+    // another segment.
     drop(store);
-    let conn = rusqlite::Connection::open(config.state_path.join("meta.sqlite")).unwrap();
-    conn.execute("UPDATE cas_segments SET indexed_len = indexed_len + 1000000", [])
-        .unwrap();
-    drop(conn);
     let (reopened, recovery) = Store::open_with_recovery(config).unwrap();
-    assert!(recovery.rebuilt_index);
+    assert_eq!(recovery, distill_store::cas::RecoveryReport::default());
     assert_eq!(
         reopened
             .lookup_candidates(KeyKind::Processor, &[0x33; 32])

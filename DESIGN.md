@@ -5100,43 +5100,40 @@ segment-scan rules: deterministic build failures memoize at their basis
 (§15's quiescence — an unchanged basis answers from the record instead
 of rebuilding once per client), while transient infrastructure errors
 (I/O outside the tree, a module crash) are typed apart and never
-memoized. **The result record is the commit marker**: recovery ignores
-payload records not covered by a committed result record — a crash after
-output 2 of 3 publishes nothing — and the indexes rebuild by role:
+memoized. **The write transaction that indexes a record group is its
+commit**: payloads first, the result record last, one fsync per touched
+segment, then the group's index rows, all in one SQLite write transaction
+(the caller's, when a node publishes its result with its artifact
+installs and their load edges). A group whose transaction rolls back, or
+that a crash interrupts before COMMIT, publishes nothing — a crash after
+output 2 of 3 publishes nothing — and its bytes past the segment's
+indexed length are dead. The index maps by role:
 `static-input key → candidate bucket` (every committed result record for
-the key, keyed secondarily by trace digest — rebuild recovers the whole
-bucket, not a last-winner, §9) from processor result records,
-`DSBI digest → candidate bucket` from build-import result records,
-`ContentHash → location`
-from payload records. The derived-output *namespace* is deliberately not
-among them: historical result tables are memos, and child resolution
-consults only the current version's derived index (§9) — a retired
-child UUID is never resurrected by an old record. Together
-**every** artifact index rebuilds from a segment scan. Segments
+the key, keyed secondarily by trace digest, §9) from processor result
+records, `DSBI digest → candidate bucket` from build-import result
+records, `ContentHash → location` from payload records. The
+derived-output *namespace* is deliberately not among them: historical
+result tables are memos, and child resolution consults only the current
+version's derived index (§9) — a retired child UUID is never resurrected
+by an old record. Segments
 roll at a size cap; a record whose framed size exceeds the cap is
 written instead as a dedicated **oversize segment** — one record per
-file, the same record grammar, named and typed as oversize in the
-generation manifest, indexed, scanned, compacted, and evicted exactly
+file, the same record grammar, named and typed as oversize in
+`cas_segments`, indexed, compacted, and evicted exactly
 like any segment — so an oversized artifact (blobs are unbounded, §4,
 §16) is representable, never rejected or truncated. SQLite indexes
 them; reads mmap and slice. Write order:
 append, fsync the segment, then insert the index rows; segment creation and
-deletion also fsync the directory. Recovery scans forward from the last
-indexed offset, verifies each payload against its stored blake3 (not just
-CRC), and adopts committed groups or truncates the tail; duplicate content hashes
-are byte-identical
-by definition — recovery keeps the last and marks the rest garbage. The
-active segment set is named by a generation manifest (a `CURRENT` file,
-atomically replaced), and **`CURRENT` is the single authority**: SQLite
-records the generation it indexed, and a mismatch at startup discards the
-SQLite artifact index and rebuilds it from the `CURRENT` generation's
-segments before any read — the two stores are never trusted to agree on
-their own. An interrupted compaction therefore leaves one generation or
-the other intact, never a mix. Compaction writes new segments durably
-before one SQLite transaction flips the index, and old segments are deleted
-only when no live snapshot or mmap reader pins their generation.
-**Segments are the durable record within daemon state; the index is
-rebuildable by a segment scan.** GC is Bitcask-style
+deletion also fsync the directory. **SQLite is the authority** on what
+committed and on which segments exist (`cas_segments`, each writer's
+segment found by its row). Recovery truncates each segment to its indexed
+length; a segment file shorter than its indexed length lost committed
+records (an external truncation, a lying fsync), and the results and
+installs whose bytes it held are evicted whole, leaving every other
+segment's rows as they are; files no row names are deleted. Compaction
+writes new segments durably before one SQLite transaction repoints the
+index, and old segments are deleted only after a grace period past the
+read bound. GC is Bitcask-style
 compaction driven by the size cap (random eviction, each victim one
 sampled index probe; the pass runs only after the CAS index changed) — everything in the CAS
 is rebuildable, so eviction is always safe. But never observable: eviction
@@ -8020,9 +8017,9 @@ put production image codecs, mesh optimization, or shader compilers in core.
   include text. Listing loss orphans a generated bundle (doctor-listed,
   user-deleted), never auto-deletes; output paths are deterministic and
   collisions are errors.
-- **CAS authority** (§13): `CURRENT` is the single generation authority;
-  a SQLite mismatch rebuilds the index from segments; the record grammar is
-  pinned, with asset UUID and output key in every record.
+- **CAS authority** (§13): SQLite is the authority on what committed and
+  which segments exist; recovery holds each segment to its index; the
+  record grammar is pinned, with asset UUID and output key in every record.
 - **Search tags** (§4, §10): `#[asset(tag)]` authored fields; bundle-level
   re-indexing on dirt.
 - **Blob runtime type** (§4, §12): `Blob`, an `Arc`-backed byte range; pack

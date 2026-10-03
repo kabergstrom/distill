@@ -819,7 +819,6 @@ impl Store {
             self.joined_input_transaction(f, false)
         }));
         let _ = self.read.conn.execute_batch("ROLLBACK");
-        self.cas.forget_active();
         match out {
             Ok(out) => out.map(|(out, _)| out),
             Err(panic) => std::panic::resume_unwind(panic),
@@ -920,13 +919,11 @@ impl Store {
                 Ok(()) => return Ok(self.input_version()),
                 Err(error) => {
                     let _ = self.read.conn.execute_batch("ROLLBACK");
-                    self.cas.forget_active();
                     return Err(error.into());
                 }
             }
         }
         self.read.conn.execute_batch("ROLLBACK")?;
-        self.cas.forget_active();
         Ok(base)
     }
 
@@ -934,18 +931,13 @@ impl Store {
     /// open, so the transaction holds SQLite's write lock from its first
     /// read and never upgrades a read snapshot; inside an open one `f` joins
     /// it. On failure everything `f` wrote rolls back with the enclosing
-    /// transaction, and this writer forgets its active segment, whose row
-    /// may have been part of it.
+    /// transaction.
     pub(crate) fn write_txn<T>(
         &mut self,
         f: impl FnOnce(&mut Store) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         if !self.read.conn.is_autocommit() {
-            let out = f(self);
-            if out.is_err() {
-                self.cas.forget_active();
-            }
-            return out;
+            return f(self);
         }
         self.refresh_config();
         self.read.conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -958,12 +950,10 @@ impl Store {
             Ok(Err(error)) => Err(error),
             Err(panic) => {
                 let _ = self.read.conn.execute_batch("ROLLBACK");
-                self.cas.forget_active();
                 std::panic::resume_unwind(panic)
             }
         };
         let _ = self.read.conn.execute_batch("ROLLBACK");
-        self.cas.forget_active();
         out
     }
 

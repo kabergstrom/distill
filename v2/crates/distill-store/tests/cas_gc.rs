@@ -306,10 +306,10 @@ fn compaction_repoints_live_records_and_the_sweeper_deletes_the_dead_segment() {
         .unwrap()
         .is_empty());
 
-    // The index flip was transactional: a reopen does not rebuild.
+    // The index flip was transactional: a reopen recovers nothing.
     drop(store);
     let (store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
-    assert!(!recovery.rebuilt_index);
+    assert_eq!(recovery, distill_store::cas::RecoveryReport::default());
     assert_eq!(store.cas_read(&survivor).unwrap(), b"surviving artifact");
 }
 
@@ -343,7 +343,7 @@ fn a_snapshot_reads_its_blobs_until_the_dead_segment_is_swept() {
 }
 
 #[test]
-fn compacted_duplicate_payload_precedes_every_surviving_result() {
+fn compaction_keeps_a_shared_payload_for_its_surviving_result() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
     let (hash, _, first_digest) =
@@ -359,15 +359,8 @@ fn compacted_duplicate_payload_precedes_every_surviving_result() {
     SegmentSweeper::new(Duration::ZERO).sweep(&mut store).unwrap();
     drop(store);
 
-    // Force the rebuild path, which must reconstruct the complete index
-    // from only the compacted log.
-    let conn = rusqlite::Connection::open(dir.path().join(".distill/meta.sqlite")).unwrap();
-    conn.execute("UPDATE cas_segments SET indexed_len = indexed_len + 1000000", [])
-        .unwrap();
-    drop(conn);
-
     let (store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
-    assert!(recovery.rebuilt_index);
+    assert_eq!(recovery, distill_store::cas::RecoveryReport::default());
     assert_eq!(store.cas_read(&hash).unwrap(), b"shared artifact");
     let candidates = store
         .lookup_candidates(KeyKind::Processor, &[1; 32])

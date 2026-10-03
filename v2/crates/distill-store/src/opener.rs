@@ -123,11 +123,10 @@ impl std::ops::DerefMut for StoreWriter {
 
 impl Drop for StoreWriter {
     fn drop(&mut self) {
-        // A writer dropped mid-transaction (its owner panicked) rolls back
-        // as its connection closes; its segment row stays open, and
-        // recovery treats it like a crashed writer's.
-        if self.0.in_transaction() {
-            return;
+        // A writer dropped mid-transaction (its owner panicked) rolls it
+        // back first.
+        if !self.0.read.conn.is_autocommit() {
+            let _ = self.0.read.conn.execute_batch("ROLLBACK");
         }
         if let Err(error) = self.0.seal_active() {
             tracing::warn!(%error, "sealing a closing writer's segment failed");

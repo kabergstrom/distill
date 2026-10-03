@@ -1332,9 +1332,10 @@ fn candidate_rows_search_their_bucket() {
 #[test]
 fn cas_statements_search_their_indexes() {
     use crate::cas::gc::{
-        COMPACTION_CANDIDATES, EVICT_RESULT_ROW, LIVE_BYTES, PRUNE_SEGMENT, SEGMENTS_IN_STATE,
+        COMPACTION_CANDIDATES, EVICT_RESULT_ROW, LIVE_BYTES, SEGMENTS_IN_STATE,
     };
-    use crate::cas::store::SEAL_OWN_SEGMENTS;
+    use crate::cas::recovery::{DROP_LOST_EXTENTS, LOST_EXTENT_HOLDERS, LOST_RESULTS};
+    use crate::cas::store::{ACTIVE_SEGMENT, SEAL_OWN_SEGMENTS};
     let (_dir, store) = store_with(10);
     let cases: &[(&str, &[&str])] = &[
         (
@@ -1355,7 +1356,7 @@ fn cas_statements_search_their_indexes() {
                 "SEARCH cas_segments USING INDEX cas_segments_by_state (state=? AND <expr><?)",
                 "USE TEMP B-TREE FOR ORDER BY",
                 "RIGHT",
-                "SEARCH cas_segments USING INTEGER PRIMARY KEY (rowid=?)",
+                "SEARCH cas_segments USING INDEX cas_segments_open (owner=?)",
             ],
         ),
         (
@@ -1363,11 +1364,28 @@ fn cas_statements_search_their_indexes() {
             &["SEARCH cas_segments USING INDEX cas_segments_by_state (state=?)"],
         ),
         (
-            PRUNE_SEGMENT,
+            ACTIVE_SEGMENT,
+            &["SEARCH cas_segments USING INDEX cas_segments_open (owner=?)"],
+        ),
+        // Recovery's lost-tail statements: one segment's rows past a
+        // length, and what holds them.
+        (
+            LOST_EXTENT_HOLDERS,
             &[
                 "SEARCH cas_extents USING INDEX cas_extents_by_segment (segment=?)",
-                "CORRELATED SCALAR SUBQUERY 1",
                 "SEARCH cas_refs USING COVERING INDEX cas_refs_by_hash (content_hash=?)",
+                "USE TEMP B-TREE FOR DISTINCT",
+            ],
+        ),
+        (
+            LOST_RESULTS,
+            &["SEARCH result_candidates USING INDEX result_candidates_by_segment (segment=?)"],
+        ),
+        // The delete checks the references.
+        (
+            DROP_LOST_EXTENTS,
+            &[
+                "SEARCH cas_extents USING INDEX cas_extents_by_segment (segment=?)",
                 "SEARCH cas_refs USING COVERING INDEX cas_refs_by_hash (content_hash=?)",
             ],
         ),
