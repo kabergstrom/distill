@@ -547,18 +547,29 @@ impl DaemonCoordinator {
         store: &mut Store,
         changes: &[RestartOnlyChange],
     ) -> Result<PendingRestart, CoordinatorError> {
-        let pending = store
-            .stage_pending_restart(changes)
-            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        self.server.restart_required(store, pending.keys.clone());
-        Ok(pending)
+        let mut pending = None;
+        self.server
+            .restart_required(store, |store| {
+                let staged = store
+                    .stage_pending_restart(changes)
+                    .map_err(|error| error.to_string())?;
+                let keys = staged.keys.clone();
+                pending = Some(staged);
+                Ok(keys)
+            })
+            .map_err(CoordinatorError::InvalidManifest)?;
+        Ok(pending.expect("a staged restart has keys"))
     }
 
     pub fn clear_restart_configuration(&self, store: &mut Store) -> Result<(), CoordinatorError> {
-        store
-            .clear_pending_restart()
-            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        self.server.restart_required(store, Vec::new());
+        self.server
+            .restart_required(store, |store| {
+                store
+                    .clear_pending_restart()
+                    .map_err(|error| error.to_string())?;
+                Ok(Vec::new())
+            })
+            .map_err(CoordinatorError::InvalidManifest)?;
         Ok(())
     }
 

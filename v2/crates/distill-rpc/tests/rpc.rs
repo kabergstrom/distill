@@ -2925,3 +2925,16 @@ fn a_runtime_pipeline_failure_persists_with_its_fence_or_not_at_all() {
         assert!(store.scan_diagnostics().unwrap().is_empty(), "the persisted half committed");
     });
 }
+
+/// Publishing a protocol epoch or target definition that is already in
+/// effect changes nothing, so it publishes no version.
+#[test]
+fn an_unchanged_protocol_epoch_or_target_publishes_no_version() {
+    let server = server_with(&[(1, false)]);
+    let before = server.current_stamp().unwrap();
+    assert_eq!(server.replace_protocol_epoch(PROTOCOL_VERSION), before);
+    assert_eq!(server.replace_target(target_with(7, &[(1, false)])).unwrap(), before);
+    assert_eq!(server.current_stamp().unwrap(), before);
+    let changed = server.replace_protocol_epoch(PROTOCOL_VERSION + 1);
+    assert_eq!(changed.version.0, before.version.0 + 1);
+}

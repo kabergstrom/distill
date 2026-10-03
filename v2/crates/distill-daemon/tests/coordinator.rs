@@ -1215,3 +1215,24 @@ fn an_edit_pass_runs_the_same_statements_at_any_namespace_size() {
     assert_eq!(small.len(), large.len(), "{small:#?}\n{large:#?}");
     assert!(2 * large_pages <= 3 * small_pages, "{small_pages} -> {large_pages} pages");
 }
+
+/// A staged restart and its served RestartRequired keys are one
+/// transaction: when the served write fails, nothing is staged.
+#[test]
+fn a_staged_restart_commits_with_its_served_keys_or_not_at_all() {
+    let temp = tempfile::tempdir().unwrap();
+    let coordinator = coordinator(&temp);
+    let mut writer = coordinator.open_writer().unwrap();
+    rusqlite::Connection::open(temp.path().join(".distill/meta.sqlite"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_restart_keys BEFORE INSERT ON store_meta
+             WHEN NEW.key = 'served_restart_keys'
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .unwrap();
+    let staged =
+        coordinator.stage_restart_configuration(&mut writer, &[RestartOnlyChange::AutoCodegen(true)]);
+    assert!(staged.is_err());
+    assert!(writer.pending_restart().unwrap().is_none(), "the staging committed alone");
+}
