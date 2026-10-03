@@ -2006,7 +2006,7 @@ fn old_history_returns_resync_marker_and_future_cursor_is_typed_failure() {
             AssetDeltaState::Restored,
         ),
     );
-    server.discard_history_before(InputVersion(1));
+    server.discard_history_before(InputVersion(1)).unwrap();
 
     let install = hub
         .subscribe(InputVersion(0), vec![asset_id(1)], vec![])
@@ -2079,7 +2079,7 @@ fn restart_required_names_sorted_unique_keys_without_advancing_version() {
         "daemon.state_path".to_owned(),
         "daemon.address".to_owned(),
         "daemon.address".to_owned(),
-    ]);
+    ]).unwrap();
     assert_eq!(before, after);
     match install.deltas.next().unwrap() {
         StreamEvent::Asset { basis, event } => {
@@ -2099,7 +2099,7 @@ fn restart_required_names_sorted_unique_keys_without_advancing_version() {
 fn pending_restart_state_is_queued_after_the_cursor_bound_first_message() {
     let server = server_with(&[(1, false)]);
     let hub = connect(&server, &[(1, false)]);
-    server.restart_required(vec!["daemon.address".to_owned()]);
+    server.restart_required(vec!["daemon.address".to_owned()]).unwrap();
     let install = hub
         .subscribe(InputVersion(0), vec![], vec![])
         .success()
@@ -2121,8 +2121,8 @@ fn pending_restart_state_is_queued_after_the_cursor_bound_first_message() {
 fn restart_required_replaces_the_prior_pending_key_set() {
     let server = server_with(&[(1, false)]);
     let hub = connect(&server, &[(1, false)]);
-    server.restart_required(vec!["daemon.address".to_owned()]);
-    server.restart_required(vec!["codegen.auto_codegen".to_owned()]);
+    server.restart_required(vec!["daemon.address".to_owned()]).unwrap();
+    server.restart_required(vec!["codegen.auto_codegen".to_owned()]).unwrap();
     let install = hub
         .subscribe(InputVersion(0), vec![], vec![])
         .success()
@@ -2888,6 +2888,42 @@ fn a_failed_backend_step_commits_nothing_it_wrote() {
     unchanged("partial-operation");
 }
 
+/// A served admin write the store fails returns the store's error, and
+/// publishes nothing; the server keeps serving.
+#[test]
+fn a_failed_served_write_returns_the_store_error() {
+    let server = server_with(&[(1, false)]);
+    let before = server.current_stamp().unwrap();
+    let db = server.with_writer(|store| store.state_path().join("meta.sqlite"));
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_epoch BEFORE INSERT ON store_meta
+             WHEN NEW.key = 'rpc_protocol_epoch'
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;
+             CREATE TRIGGER fail_target BEFORE UPDATE ON rpc_targets
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;
+             CREATE TRIGGER fail_discard BEFORE DELETE ON change_log
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .unwrap();
+    assert!(server.replace_protocol_epoch(PROTOCOL_VERSION + 1).is_err());
+    assert!(matches!(
+        server.replace_target(target_with(8, &[(1, false)])),
+        Err(distill_rpc::AdminWriteError::Store(_))
+    ));
+    assert!(matches!(
+        server.replace_target(TargetDefinition::new("absent", TargetDefinitionHash([1; 32]))),
+        Err(distill_rpc::AdminWriteError::Invalid(AdminError::UnknownTarget { .. }))
+    ));
+    commit_one(
+        &server,
+        set_asset(asset_id(1), StoredResolve::Deleted, AssetDeltaState::Restored),
+    );
+    assert!(server.discard_history_before(InputVersion(2)).is_err());
+    assert_eq!(server.current_stamp().unwrap().version.0, before.version.0 + 1);
+}
+
 /// The durable runtime failure and the served fence are one transaction:
 /// when the served write fails, the persisted failure rolls back with it.
 #[test]
@@ -2936,9 +2972,9 @@ fn a_runtime_pipeline_failure_persists_with_its_fence_or_not_at_all() {
 fn an_unchanged_protocol_epoch_or_target_publishes_no_version() {
     let server = server_with(&[(1, false)]);
     let before = server.current_stamp().unwrap();
-    assert_eq!(server.replace_protocol_epoch(PROTOCOL_VERSION), before);
+    assert_eq!(server.replace_protocol_epoch(PROTOCOL_VERSION).unwrap(), before);
     assert_eq!(server.replace_target(target_with(7, &[(1, false)])).unwrap(), before);
     assert_eq!(server.current_stamp().unwrap(), before);
-    let changed = server.replace_protocol_epoch(PROTOCOL_VERSION + 1);
+    let changed = server.replace_protocol_epoch(PROTOCOL_VERSION + 1).unwrap();
     assert_eq!(changed.version.0, before.version.0 + 1);
 }

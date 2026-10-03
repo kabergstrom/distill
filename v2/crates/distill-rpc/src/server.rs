@@ -166,6 +166,19 @@ enum PublishError {
     Store(StoreError),
 }
 
+/// An admin write that failed: refused as invalid, or the store failed it.
+#[derive(Debug)]
+pub enum AdminWriteError {
+    Invalid(AdminError),
+    Store(StoreError),
+}
+
+impl From<StoreError> for AdminWriteError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
 /// The shared identity of one served store. Every connection opens a front
 /// end of its own on it ([`Root::connect`]); writes go through a writer the
 /// caller owns and passes in.
@@ -428,7 +441,7 @@ impl ServerHandle {
         store: &mut Store,
         new_version: bool,
         job: impl FnOnce(&mut dyn ServedWriteObj) -> Result<bool, StoreError>,
-    ) -> bool {
+    ) -> Result<bool, StoreError> {
         let mut unchanged = false;
         let result = if new_version {
             store
@@ -448,13 +461,13 @@ impl ServerHandle {
         let changed = match result {
             Ok(changed) => changed,
             Err(_) if unchanged => false,
-            Err(error) => panic!("RPC store write failed: {error}"),
+            Err(error) => return Err(error),
         };
         // Inside an open input, readers are told once it commits.
         if changed && !store.input_open() {
             self.notify_published();
         }
-        changed
+        Ok(changed)
     }
 }
 
@@ -820,16 +833,13 @@ impl ServerHandle {
     }
 
     /// Advance the protocol epoch and fence every existing connection.
-    pub fn replace_protocol_epoch(&self, store: &mut Store, protocol_epoch: u32) -> SnapshotStamp {
-        self.write_served(store, true, move |txn| txn.protocol_epoch(protocol_epoch));
-        self.written_stamp(store)
-    }
-
-    /// The version `store` is at after [`Self::write_served`], under its
-    /// policy: a store that fails the write's own read is a failed write.
-    fn written_stamp(&self, store: &StoreReader) -> SnapshotStamp {
+    pub fn replace_protocol_epoch(
+        &self,
+        store: &mut Store,
+        protocol_epoch: u32,
+    ) -> Result<SnapshotStamp, StoreError> {
+        self.write_served(store, true, move |txn| txn.protocol_epoch(protocol_epoch))?;
         self.stamp_of(store)
-            .unwrap_or_else(|error| panic!("RPC store read failed: {error}"))
     }
 
     /// Validate and publish one artifact with its typed direct load edges.
@@ -1116,8 +1126,13 @@ impl ServerHandle {
     }
 
     /// Discard cursor history strictly before `oldest_available`.
-    pub fn discard_history_before(&self, store: &mut Store, oldest_available: InputVersion) {
-        self.write_served(store, false, move |txn| txn.discard_before(oldest_available));
+    pub fn discard_history_before(
+        &self,
+        store: &mut Store,
+        oldest_available: InputVersion,
+    ) -> Result<(), StoreError> {
+        self.write_served(store, false, move |txn| txn.discard_before(oldest_available))
+            .map(|_| ())
     }
 
     /// Replace a staged target definition and fence every bound Hub.
@@ -1125,19 +1140,16 @@ impl ServerHandle {
         &self,
         store: &mut Store,
         replacement: TargetDefinition,
-    ) -> Result<SnapshotStamp, AdminError> {
+    ) -> Result<SnapshotStamp, AdminWriteError> {
         let name = replacement.name().to_owned();
         let hash = replacement.definition_hash();
-        let known = store.rpc_target(&name).map_err(|_| AdminError::UnknownTarget {
-            target: name.clone(),
-        })?;
-        if known.is_none() {
-            return Err(AdminError::UnknownTarget { target: name });
+        if store.rpc_target(&name)?.is_none() {
+            return Err(AdminWriteError::Invalid(AdminError::UnknownTarget { target: name }));
         }
         // Rechecked inside the transaction: an unchanged definition
         // publishes no version.
-        self.write_served(store, true, move |txn| txn.target(&name, hash));
-        Ok(self.written_stamp(store))
+        self.write_served(store, true, move |txn| txn.target(&name, hash))?;
+        Ok(self.stamp_of(store)?)
     }
 
     /// Stage a restart-only edit (`stage` returns its keys) and serve its
@@ -1184,7 +1196,7 @@ impl Server {
         })
     }
 
-    pub fn replace_protocol_epoch(&self, protocol_epoch: u32) -> SnapshotStamp {
+    pub fn replace_protocol_epoch(&self, protocol_epoch: u32) -> Result<SnapshotStamp, StoreError> {
         self.with_writer(|store| self.inner.handle.replace_protocol_epoch(store, protocol_epoch))
     }
 
@@ -1249,20 +1261,19 @@ impl Server {
         })
     }
 
-    pub fn discard_history_before(&self, oldest_available: InputVersion) {
+    pub fn discard_history_before(&self, oldest_available: InputVersion) -> Result<(), StoreError> {
         self.with_writer(|store| self.inner.handle.discard_history_before(store, oldest_available))
     }
 
     pub fn replace_target(
         &self,
         replacement: TargetDefinition,
-    ) -> Result<SnapshotStamp, AdminError> {
+    ) -> Result<SnapshotStamp, AdminWriteError> {
         self.with_writer(|store| self.inner.handle.replace_target(store, replacement))
     }
 
-    pub fn restart_required(&self, keys: Vec<String>) -> SnapshotStamp {
+    pub fn restart_required(&self, keys: Vec<String>) -> Result<SnapshotStamp, String> {
         self.with_writer(|store| self.inner.handle.restart_required(store, |_| Ok(keys)))
-            .unwrap_or_else(|error| panic!("RPC store write failed: {error}"))
     }
 }
 
