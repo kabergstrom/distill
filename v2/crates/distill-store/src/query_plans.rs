@@ -1629,3 +1629,272 @@ fn an_entry_and_its_bundle_are_one_statement() {
         ]
     );
 }
+
+/// A traced statement with its literals replaced by `?`: statements that
+/// differ only in their parameters have one shape.
+fn statement_shape(sql: &str) -> String {
+    let mut shape = String::new();
+    let mut chars = sql.chars().peekable();
+    let mut previous = ' ';
+    while let Some(c) = chars.next() {
+        let blob = (c == 'X' || c == 'x') && chars.peek() == Some(&'\'');
+        let word = previous.is_alphanumeric() || previous == '_';
+        if c == '\'' || (blob && !word) {
+            if blob {
+                chars.next();
+            }
+            for c in chars.by_ref() {
+                if c == '\'' {
+                    break;
+                }
+            }
+            shape.push('?');
+        } else if c.is_ascii_digit() && !word {
+            while chars.peek().is_some_and(char::is_ascii_digit) {
+                chars.next();
+            }
+            shape.push('?');
+        } else {
+            shape.push(c);
+        }
+        previous = c;
+    }
+    shape.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The point statements the CAS (an install, a build commit, its
+/// lookup, reads, evictions, a compaction that copies live records) and
+/// the served reads issue, each with its exact plan: every one searches the
+/// key it is given, except the whole-table reads named here.
+#[test]
+fn cas_and_served_point_statements_search_their_keys() {
+    use crate::cas::{BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
+    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = crate::StoreConfig::new(dir.path().join(".distill"));
+    config.segment_size = 4096;
+    let mut store = Store::open(config).unwrap();
+    populate(&mut store, 50);
+    let asset = asset_uuid(42, 1);
+    let edges = [(asset_uuid(43, 1), RUNTIME_TYPE)];
+    store.read.conn.trace(Some(trace));
+    let installed = (0..12u8)
+        .map(|index| store.put_artifact(asset, &[index; 1000], &edges).unwrap())
+        .collect::<Vec<_>>();
+    store.put_artifact(asset, &[0; 1000], &edges).unwrap();
+    let key = [3; 32];
+    store
+        .commit_build(BuildCommit {
+            wire_trees: Vec::new(),
+            key_kind: crate::cas::record::KeyKind::Processor,
+            static_input_key: key,
+            asset_uuid: asset,
+            static_inputs_canonical: vec![],
+            trace: vec![1],
+            outcome: CommitOutcome::Success {
+                payload_kind: PayloadKind::ProcessorOutput,
+                outputs: vec![OutputSpec {
+                    output_key: String::new(),
+                    type_uuids: vec![],
+                    bytes: b"output".to_vec(),
+                }],
+                aux: vec![],
+            },
+        })
+        .unwrap();
+    let candidates = store.lookup_candidates(crate::cas::record::KeyKind::Processor, &key).unwrap();
+    let hash = installed[11];
+    store.cas_read(&hash.0).unwrap();
+    store.cas_contains(&hash.0).unwrap();
+    store.artifact_load_edges(hash).unwrap();
+    store.served_entry(asset).unwrap();
+    store.asset_resolution(asset).unwrap();
+    store.served_derived_output(asset).unwrap();
+    store.served_path_candidates(&bundle_path(42)).unwrap();
+    store.served_named_candidates(&bundle_path(42), "main").unwrap();
+    store.served_paths_of(asset).unwrap();
+    store.rpc_target("pc").unwrap();
+    store.rpc_targets().unwrap();
+    store.change_log_head().unwrap();
+    store.change_log_after(0).unwrap();
+    store.resolve_child(asset).unwrap();
+    store
+        .evict_result(
+            crate::cas::record::KeyKind::Processor,
+            &key,
+            &candidates[0].trace_digest,
+        )
+        .unwrap();
+    for hash in installed.iter().step_by(2) {
+        store.evict_installed(&hash.0).unwrap();
+    }
+    let compaction = store.compact().unwrap();
+    store.enforce_cache_limit().unwrap();
+    store.read.conn.trace(None);
+    assert!(compaction.records_copied > 0, "{compaction:?}");
+    let statements = std::mem::take(&mut *TRACED.lock().unwrap());
+    let mut plans = BTreeMap::new();
+    for sql in statements {
+        // Trigger bodies are traced as comments.
+        if sql.starts_with("--") {
+            continue;
+        }
+        let plan = explain(&store.read.conn, &sql);
+        if !plan.is_empty() {
+            plans.entry(statement_shape(&sql)).or_insert(plan);
+        }
+    }
+    // The whole-table reads: the live-bytes sum and the compaction
+    // candidates are one row per segment; the RPC target set is a handful.
+    let expected: &[(&str, &[&str])] = &[
+        (
+            "DELETE FROM artifact_load_edges WHERE content_hash = ?",
+            &["SEARCH artifact_load_edges USING COVERING INDEX sqlite_autoindex_artifact_load_edges_1 (content_hash=?)"],
+        ),
+        (
+            "DELETE FROM cas_extents WHERE content_hash = ? AND NOT EXISTS (SELECT ? FROM cas_refs WHERE content_hash = ?) RETURNING len",
+            &["SEARCH cas_extents USING INDEX sqlite_autoindex_cas_extents_1 (content_hash=?)", "SCALAR SUBQUERY 1", "SEARCH cas_refs USING COVERING INDEX cas_refs_by_hash (content_hash=?)", "SEARCH artifact_load_edges USING COVERING INDEX sqlite_autoindex_artifact_load_edges_1 (content_hash=?)", "SEARCH cas_refs USING COVERING INDEX cas_refs_by_hash (content_hash=?)"],
+        ),
+        (
+            "DELETE FROM cas_refs WHERE holder_kind = ? AND holder = ?",
+            &["SEARCH cas_refs USING PRIMARY KEY (holder_kind=? AND holder=?)"],
+        ),
+        (
+            "DELETE FROM result_candidates WHERE key_kind = ? AND static_key = ? AND trace_digest = ? RETURNING len",
+            &["SEARCH result_candidates USING INDEX sqlite_autoindex_result_candidates_1 (key_kind=? AND static_key=? AND trace_digest=?)"],
+        ),
+        (
+            "INSERT INTO cas_extents(content_hash, segment, offset, len) VALUES (?, ?, ?, ?) ON CONFLICT(content_hash) DO UPDATE SET segment = excluded.segment, offset = excluded.offset, len = excluded.len",
+            &["SEARCH artifact_load_edges USING COVERING INDEX sqlite_autoindex_artifact_load_edges_1 (content_hash=?)", "SEARCH cas_refs USING COVERING INDEX cas_refs_by_hash (content_hash=?)"],
+        ),
+        (
+            "SELECT ? FROM cas_extents WHERE content_hash = ?",
+            &["SEARCH cas_extents USING COVERING INDEX sqlite_autoindex_cas_extents_1 (content_hash=?)"],
+        ),
+        (
+            "SELECT COALESCE(MAX(seq), ?) FROM change_log",
+            &["SEARCH change_log"],
+        ),
+        (
+            "SELECT COALESCE(SUM(live_len), ?) FROM cas_segments",
+            &["SCAN cas_segments"],
+        ),
+        (
+            "SELECT EXISTS(SELECT ? FROM cas_extents WHERE content_hash = ?)",
+            &["SCAN CONSTANT ROW", "SCALAR SUBQUERY 1", "SEARCH cas_extents USING COVERING INDEX sqlite_autoindex_cas_extents_1 (content_hash=?)"],
+        ),
+        (
+            "SELECT a.asset_uuid FROM assets a JOIN bundles b ON b.bundle_uuid = a.bundle_uuid WHERE a.authored_value IS NOT NULL AND a.terminal_type IS NOT NULL AND a.logical_hash IS NOT NULL AND b.poison IS NULL AND b.path = ? AND a.local_id = ? AND a.authoring_only = ?",
+            &["SEARCH a USING INDEX assets_by_local_id (local_id=?)", "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)"],
+        ),
+        (
+            "SELECT a.asset_uuid, a.bundle_uuid, a.local_id, b.path, a.type_uuid, a.terminal_type, a.logical_hash, a.authoring_only FROM assets a JOIN bundles b ON b.bundle_uuid = a.bundle_uuid WHERE a.authored_value IS NOT NULL AND a.terminal_type IS NOT NULL AND a.logical_hash IS NOT NULL AND b.poison IS NULL AND a.asset_uuid = ?",
+            &["SEARCH a USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)", "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)"],
+        ),
+        (
+            "SELECT asset_uuid FROM path_index WHERE path = ?",
+            &["SEARCH path_index USING INDEX sqlite_autoindex_path_index_1 (path=?)"],
+        ),
+        (
+            "SELECT asset_uuid, expected_terminal FROM artifact_load_edges WHERE content_hash = ? ORDER BY asset_uuid",
+            &["SEARCH artifact_load_edges USING INDEX sqlite_autoindex_artifact_load_edges_1 (content_hash=?)"],
+        ),
+        (
+            "SELECT content_hash FROM cas_refs WHERE holder_kind = ? AND holder = ?",
+            &["SEARCH cas_refs USING PRIMARY KEY (holder_kind=? AND holder=?)"],
+        ),
+        (
+            "SELECT content_hash, offset FROM cas_extents WHERE segment = ?",
+            &["SEARCH cas_extents USING INDEX cas_extents_by_segment (segment=?)"],
+        ),
+        (
+            "SELECT file_name FROM cas_segments WHERE segment_id = ?",
+            &["SEARCH cas_segments USING INTEGER PRIMARY KEY (rowid=?)"],
+        ),
+        (
+            "SELECT kind, content_hash, detail, deleted_version FROM asset_resolutions WHERE asset_uuid = ?",
+            &["SEARCH asset_resolutions USING INDEX sqlite_autoindex_asset_resolutions_1 (asset_uuid=?)"],
+        ),
+        (
+            "SELECT name, definition_hash, generation FROM rpc_targets ORDER BY name",
+            &["SCAN rpc_targets USING INDEX sqlite_autoindex_rpc_targets_1"],
+        ),
+        (
+            "SELECT name, definition_hash, generation FROM rpc_targets WHERE name = ?",
+            &["SEARCH rpc_targets USING INDEX sqlite_autoindex_rpc_targets_1 (name=?)"],
+        ),
+        (
+            "SELECT offset, key_kind, static_key, trace_digest FROM result_candidates WHERE segment = ?",
+            &["SEARCH result_candidates USING INDEX result_candidates_by_segment (segment=?)"],
+        ),
+        (
+            "SELECT parent_uuid, output_key FROM derived_outputs WHERE child_uuid = ?",
+            &["SEARCH derived_outputs USING INDEX sqlite_autoindex_derived_outputs_1 (child_uuid=?)"],
+        ),
+        (
+            "SELECT parent_uuid, output_key, terminal_type FROM derived_outputs WHERE child_uuid = ? AND terminal_type IS NOT NULL",
+            &["SEARCH derived_outputs USING INDEX sqlite_autoindex_derived_outputs_1 (child_uuid=?)"],
+        ),
+        (
+            "SELECT path FROM path_index WHERE asset_uuid = ?",
+            &["SEARCH path_index USING INDEX path_index_by_asset (asset_uuid=?)"],
+        ),
+        (
+            "SELECT s.schema_json, a.authored_value FROM assets a JOIN schemas s ON s.logical_hash = a.logical_hash WHERE a.asset_uuid = ?",
+            &["SEARCH a USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)", "SEARCH s USING INDEX sqlite_autoindex_schemas_1 (logical_hash=?)"],
+        ),
+        (
+            "SELECT segment, offset, len FROM cas_extents WHERE content_hash = ?",
+            &["SEARCH cas_extents USING INDEX sqlite_autoindex_cas_extents_1 (content_hash=?)"],
+        ),
+        (
+            "SELECT segment_id FROM cas_segments WHERE owner = ? AND state = ? AND segment_kind = ? ORDER BY segment_id DESC LIMIT ?",
+            &["SEARCH cas_segments USING INDEX cas_segments_open (owner=?)"],
+        ),
+        (
+            "SELECT segment_id, file_name, segment_kind, indexed_len, live_len FROM cas_segments WHERE state = ? AND live_len * ? - indexed_len <= ? UNION ALL SELECT segment_id, file_name, segment_kind, indexed_len, live_len FROM cas_segments INDEXED BY cas_segments_open WHERE owner = ? AND state = ? AND live_len * ? - indexed_len <= ? ORDER BY segment_id",
+            &["MERGE (UNION ALL)", "LEFT", "SEARCH cas_segments USING INDEX cas_segments_by_state (state=? AND <expr><?)", "USE TEMP B-TREE FOR ORDER BY", "RIGHT", "SEARCH cas_segments USING INDEX cas_segments_open (owner=?)"],
+        ),
+        (
+            "SELECT seq, version, kind, asset_uuid, state, subject, detail FROM change_log WHERE seq > ? ORDER BY seq",
+            &["SEARCH change_log USING INTEGER PRIMARY KEY (rowid>?)"],
+        ),
+        (
+            "SELECT tag, value FROM asset_tags WHERE asset_uuid = ? ORDER BY tag",
+            &["SEARCH asset_tags USING INDEX sqlite_autoindex_asset_tags_1 (asset_uuid=?)"],
+        ),
+        (
+            "SELECT trace_digest, memo_seq, segment, offset, len FROM result_candidates WHERE key_kind = ? AND static_key = ? ORDER BY memo_seq DESC",
+            &["SEARCH result_candidates USING INDEX sqlite_autoindex_result_candidates_1 (key_kind=? AND static_key=?)", "USE TEMP B-TREE FOR ORDER BY"],
+        ),
+        (
+            "SELECT value FROM store_meta WHERE key = ?",
+            &["SEARCH store_meta USING INDEX sqlite_autoindex_store_meta_1 (key=?)"],
+        ),
+        (
+            "UPDATE cas_extents SET segment = ?, offset = ? WHERE content_hash = ? AND segment = ? AND offset = ?",
+            &["SEARCH cas_extents USING INDEX sqlite_autoindex_cas_extents_1 (content_hash=?)"],
+        ),
+        (
+            "UPDATE cas_segments SET indexed_len = ?, state = ? WHERE segment_id = ?",
+            &["SEARCH cas_segments USING INTEGER PRIMARY KEY (rowid=?)"],
+        ),
+        (
+            "UPDATE cas_segments SET indexed_len = ?, state = CASE WHEN segment_kind = ? THEN ? ELSE state END WHERE segment_id = ?",
+            &["SEARCH cas_segments USING INTEGER PRIMARY KEY (rowid=?)"],
+        ),
+        (
+            "UPDATE cas_segments SET state = ? WHERE owner = ? AND segment_id < ? AND state = ?",
+            &["SEARCH cas_segments USING INDEX cas_segments_open (owner=? AND segment_id<?)"],
+        ),
+        (
+            "UPDATE cas_segments SET state = ? WHERE segment_id = ? AND NOT EXISTS (SELECT ? FROM cas_extents WHERE segment = ?) AND NOT EXISTS (SELECT ? FROM result_candidates WHERE segment = ?)",
+            &["SEARCH cas_segments USING INTEGER PRIMARY KEY (rowid=?)", "SCALAR SUBQUERY 1", "SEARCH cas_extents USING COVERING INDEX cas_extents_by_segment (segment=?)", "SCALAR SUBQUERY 2", "SEARCH result_candidates USING COVERING INDEX result_candidates_by_segment (segment=?)"],
+        ),
+    ];
+    let expected = expected
+        .iter()
+        .map(|(sql, plan)| (sql.to_string(), plan.iter().map(|step| step.to_string()).collect::<Vec<_>>()))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(plans, expected);
+}
