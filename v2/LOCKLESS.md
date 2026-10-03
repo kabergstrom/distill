@@ -1153,6 +1153,17 @@ should reach zero by the end of phase 6.
   A configuration candidate reads its base before it scans. An unchanged
   protocol epoch or target publishes no version, and a transient tag
   refinement failure fails its input instead of poisoning.
+- **The CAS index is the CAS's truth (schema 39).** The write transaction
+  that indexes a record group is its commit, so recovery reads no records:
+  it cuts bytes past `indexed_len` and drops what a lost tail held. A
+  writer keeps no active-segment binding in memory: it finds its segment
+  by `cas_segments.owner` (`ACTIVE_SEGMENT`), and its next allocation seals
+  the open segments it owns. A rolled-back write savepoint therefore needs
+  no CAS fixup: the allocation's row, its `next_segment_id` and its seals
+  roll back with it, the id's next allocation truncates the file it left,
+  and bytes it appended to a surviving segment are dead space the next
+  record is written past. The CAS pass and open read per segment
+  (`live_len`), not per extent; `derived_assertions` is gone.
 
 ## 7. Test baseline
 
@@ -1195,3 +1206,8 @@ passed, no failures (12 from reads-scan, 8 from reads-query, 1 new: the
 complete publication's re-validated poisoned skeleton).
 Schema 39 (an edit costs its change, a failed step commits nothing):
 1227 passed, no failures.
+Merge of fix-pass and fix-cas (one schema 39), with a nested write
+savepoint that needs no CAS fixup: 1243 passed, no failures (10 from
+fix-pass, 14 from fix-cas, 2 new: a failed write savepoint leaks no open
+segment and truncates nothing, for a segment allocated before it and one
+allocated inside it).
