@@ -1434,3 +1434,77 @@ fn an_indexed_namespace_is_not_reindexed() {
     println!("watched-import check: {small} pages beside 20 bundles, {large} beside 2000");
     assert!(large <= small + 16, "{small} pages beside 20 bundles, {large} beside 2000");
 }
+
+/// An RPC reimport whose importer fails memoizes the failure: the memo
+/// commits, with no new version, and the client gets the failure.
+#[test]
+fn a_failed_rpc_reimport_commits_only_its_memo() {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    let (ordinary, schema, schema_hash) = ordinary_bundle();
+    std::fs::write(assets.join("ordinary.bundle"), ordinary).unwrap();
+    std::fs::write(assets.join("source.txt"), b"7").unwrap();
+    let coordinator = DaemonCoordinator::open(
+        StoreConfig::new(temp.path().join(".distill")),
+        vec![AssetRoot::new("main", &assets)],
+        vec![target()],
+        64,
+    )
+    .unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    publish_schema_registry(&coordinator, schema_hash);
+    coordinator
+        .authoring_service()
+        .register_importer(Arc::new(ByteImporter { schema }))
+        .unwrap();
+    let backend = Arc::clone(coordinator.authoring_service());
+    let base = coordinator.server().current_stamp().unwrap().version;
+    let mut bundle = None;
+    coordinator
+        .coordinated_commit(&mut writer, base, |store| {
+            let prepared = backend
+                .prepare_import(
+                    store,
+                    base,
+                    &ImportRequest {
+                        importer: "byte-importer".into(),
+                        sources: vec!["source.txt".into()],
+                        dest: "imported.bundle".into(),
+                        settings: AuthoringValue {
+                            canonical_value: Arc::from(&b"3"[..]),
+                            blobs: Vec::new(),
+                        },
+                        watch: true,
+                        root: "main".into(),
+                    },
+                )
+                .map_err(|error| format!("{error:?}"))?;
+            bundle = Some(prepared.bundle);
+            Ok(prepared.commit)
+        })
+        .unwrap();
+    std::fs::write(assets.join("source.txt"), b"broken").unwrap();
+    coordinator
+        .reconcile_incremental(&mut writer, &WatcherBatch {
+            paths: vec![assets.join("source.txt")],
+            renames: Vec::new(),
+        })
+        .unwrap();
+    assert!(import_failures(&coordinator).is_empty());
+
+    let base = coordinator.server().current_stamp().unwrap().version;
+    let hub = match coordinator
+        .server()
+        .root()
+        .connect(distill_rpc::ConnectRequest::new("dev", TargetDefinitionHash([4; 32])))
+    {
+        distill_rpc::ConnectOutcome::Connected(connected) => connected.hub,
+        other => panic!("expected connection, got {other:?}"),
+    };
+    let reimport = hub.reimport(base, bundle.unwrap());
+    assert!(matches!(reimport, distill_rpc::RpcResult::Failure(_)), "{reimport:?}");
+    assert_eq!(coordinator.server().current_stamp().unwrap().version, base);
+    assert_eq!(import_failures(&coordinator).len(), 1, "the failure memo committed");
+}

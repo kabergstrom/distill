@@ -952,7 +952,7 @@ impl AuthoringService {
         let run = self
             .run_import(base, importer, invocation, None)
             .map_err(ImportExecutionError::into_rpc)?;
-        self.publish_import_run(store, base, run)
+        self.publish_import_run(store, base, run)?
     }
 
     /// Run an explicit import at `base` without publishing it. The run
@@ -985,14 +985,19 @@ impl AuthoringService {
     }
 
     /// Publish a run made at `base`, in an input opened at `base`.
+    /// `Ok(Err(failure))` when the run failed and its failure is memoized:
+    /// the memo commits. On `Err` nothing commits.
     pub(crate) fn publish_import_run(
         &self,
         store: &mut Store,
         base: InputVersion,
         run: ImportRun,
-    ) -> Result<PreparedImportCommit, RpcFailure> {
-        self.publish_import(store, base, run, ImportExecutionMode::Publish)
-            .map_err(ImportExecutionError::into_rpc)
+    ) -> Result<Result<PreparedImportCommit, RpcFailure>, RpcFailure> {
+        match self.publish_import(store, base, run, ImportExecutionMode::Publish) {
+            Ok(prepared) => Ok(Ok(prepared)),
+            Err(error) if error.memoized => Ok(Err(error.rpc)),
+            Err(error) => Err(error.into_rpc()),
+        }
     }
 
     fn import_invocation(

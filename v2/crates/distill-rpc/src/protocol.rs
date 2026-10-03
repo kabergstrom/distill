@@ -712,9 +712,15 @@ impl PreparedOperationCommit {
 
 /// The publishing step of an import run: publish what ran on a worker, or
 /// fail. It runs inside the input open on the writer it is given, which
-/// then publishes it.
-pub type ImportJob =
-    Box<dyn FnOnce(&mut distill_store::Store) -> Result<PreparedImportCommit, RpcFailure> + Send>;
+/// then publishes it. `Ok(Err(failure))` is a failure the step memoized:
+/// its writes commit, with no new version. On `Err` nothing it wrote
+/// commits.
+pub type ImportJob = Box<
+    dyn FnOnce(
+            &mut distill_store::Store,
+        ) -> Result<Result<PreparedImportCommit, RpcFailure>, RpcFailure>
+        + Send,
+>;
 
 /// Daemon integration seam for workflows that require importer, filesystem,
 /// migration, or doctor services. Implementations prepare a side-effect-free
@@ -762,7 +768,7 @@ pub trait AuthoringBackend: Send + Sync + 'static {
         base: InputVersion,
         request: ImportRequest,
     ) -> Result<ImportJob, RpcFailure> {
-        Ok(Box::new(move |store| self.prepare_import(store, base, &request)))
+        Ok(Box::new(move |store| self.prepare_import(store, base, &request).map(Ok)))
     }
 
     /// [`AuthoringBackend::run_import`] for a reimport.
@@ -771,7 +777,7 @@ pub trait AuthoringBackend: Send + Sync + 'static {
         base: InputVersion,
         bundle: BundleUuid,
     ) -> Result<ImportJob, RpcFailure> {
-        Ok(Box::new(move |store| self.prepare_reimport(store, base, bundle)))
+        Ok(Box::new(move |store| self.prepare_reimport(store, base, bundle).map(Ok)))
     }
 
     /// Check an operation against `store` and describe its progress; a

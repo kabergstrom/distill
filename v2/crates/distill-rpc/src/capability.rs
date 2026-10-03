@@ -668,9 +668,10 @@ fn complete_publication(
                 PreparedOperationPublication::Deferred(operation) => {
                     match operation.complete(store, base) {
                         Ok(completed) => (completed.commit, completed.terminal_error),
+                        // Nothing a failed operation wrote commits.
                         Err(error) => {
-                            failed = Some(error);
-                            return Ok(None);
+                            failed = Some(error.clone());
+                            return Err(error);
                         }
                     }
                 }
@@ -678,8 +679,10 @@ fn complete_publication(
             terminal = terminal_error;
             Ok(Some(commit))
         });
+        if let Some(error) = failed {
+            return Err(error);
+        }
         match published {
-            Ok(_) if failed.is_some() => Err(failed.expect("checked")),
             Ok(_) => terminal.map_or(Ok(()), Err),
             Err(CoordinatedCommitError::Stale { expected, observed }) => Err(format!(
                 "{what} lost its input basis: expected {expected:?}, observed {observed:?}"
@@ -1092,7 +1095,8 @@ impl Hub {
 
     /// Run the backend's `prepare` on this connection's writer and publish
     /// its commit as one input, still at `base`. `None` when the backend
-    /// declined.
+    /// declined: what it wrote then commits as durable state with no new
+    /// version. When it fails, nothing it wrote commits.
     fn prepared<T>(
         &self,
         base: InputVersion,
@@ -1110,15 +1114,16 @@ impl Hub {
                         Ok(Some(commit))
                     }
                     Ok(None) => Ok(None),
-                    // What the backend made durable before it failed (a
-                    // memoized failure) still commits; nothing is published.
                     Err(error) => {
+                        let detail = format!("{error:?}");
                         failed = Some(error);
-                        Ok(None)
+                        Err(detail)
                     }
                 });
+            if let Some(error) = failed {
+                return Some(RpcResult::Failure(error));
+            }
             match published {
-                Ok(_) if failed.is_some() => Some(RpcResult::Failure(failed.expect("checked"))),
                 Ok(Some(_)) => Some(RpcResult::Success(value.expect("a publication has a value"))),
                 Ok(None) => None,
                 Err(error) => Some(RpcResult::Failure(coordinated_failure(error))),
@@ -1328,8 +1333,17 @@ impl Hub {
             Ok(job) => job,
             Err(error) => return RpcResult::Failure(error),
         };
-        let published = self.prepared(base, move |_, store| {
-            let prepared = job(store)?;
+        // A failure the job memoized commits that memo and publishes
+        // nothing.
+        let mut memoized = None;
+        let published = self.prepared(base, |_, store| {
+            let prepared = match job(store)? {
+                Ok(prepared) => prepared,
+                Err(failure) => {
+                    memoized = Some(failure);
+                    return Ok(None);
+                }
+            };
             if reimport.is_some_and(|bundle| bundle != prepared.bundle) {
                 return Err(RpcFailure::InvalidAuthoringRequest {
                     detail: "reimport backend changed the bundle identity".to_owned(),
@@ -1337,7 +1351,11 @@ impl Hub {
             }
             Ok(Some((prepared.commit, prepared.bundle)))
         });
-        published.expect("an import always publishes")
+        match (published, memoized) {
+            (Some(result), _) => result,
+            (None, Some(failure)) => RpcResult::Failure(failure),
+            (None, None) => unreachable!("an import publishes or fails"),
+        }
     }
 
     pub fn operation(

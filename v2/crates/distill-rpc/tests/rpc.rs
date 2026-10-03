@@ -2751,3 +2751,135 @@ fn coordinated_target_set_replacement_advances_once_and_fences_changed_or_remove
         ReconnectReason::TargetDefinitionChanged,
     );
 }
+
+/// A backend that writes, then fails: a write, an import whose bundle
+/// identity changed, and a deferred operation.
+struct PartialFailBackend;
+
+fn write_then_fail(store: &mut distill_store::Store, root: &str) {
+    store
+        .input_transaction(|txn| txn.intern_root(root).map(drop))
+        .unwrap();
+}
+
+struct PartialFailOperation;
+
+impl DeferredOperation for PartialFailOperation {
+    fn complete(
+        &self,
+        store: &mut distill_store::Store,
+        _base: InputVersion,
+    ) -> Result<DeferredOperationResult, String> {
+        write_then_fail(store, "partial-operation");
+        Err("a later file failed".to_owned())
+    }
+}
+
+impl AuthoringBackend for PartialFailBackend {
+    fn prepare_write(
+        &self,
+        store: &mut distill_store::Store,
+        _base: InputVersion,
+        _operations: &[AuthoringOp],
+        _force_lossy: bool,
+    ) -> Result<Option<Commit>, RpcFailure> {
+        write_then_fail(store, "partial-write");
+        Err(RpcFailure::InvalidAuthoringRequest {
+            detail: "refinement failed".to_owned(),
+        })
+    }
+
+    fn prepare_import(
+        &self,
+        _: &mut distill_store::Store,
+        _: InputVersion,
+        _: &ImportRequest,
+    ) -> Result<PreparedImportCommit, RpcFailure> {
+        unreachable!("only reimports")
+    }
+
+    fn prepare_reimport(
+        &self,
+        store: &mut distill_store::Store,
+        _: InputVersion,
+        _: BundleUuid,
+    ) -> Result<PreparedImportCommit, RpcFailure> {
+        write_then_fail(store, "partial-reimport");
+        Ok(PreparedImportCommit {
+            bundle: BundleUuid([0xEE; 16]),
+            commit: Commit::default(),
+        })
+    }
+
+    fn prepare_operation(
+        &self,
+        _: &mut distill_store::Store,
+        _: InputVersion,
+        _: &LongRunningOp,
+    ) -> Result<PreparedOperationCommit, RpcFailure> {
+        Ok(PreparedOperationCommit::deferred(
+            Arc::new(PartialFailOperation),
+            vec![
+                AuthoringProgressEvent {
+                    sequence: 0,
+                    state: AuthoringProgressState::Started,
+                    payload: Arc::from([]),
+                },
+                AuthoringProgressEvent {
+                    sequence: 1,
+                    state: AuthoringProgressState::Completed,
+                    payload: Arc::from([]),
+                },
+            ],
+        ))
+    }
+}
+
+/// A backend step that fails after writing commits none of it: the
+/// version does not move and no row of the failed step is visible (a
+/// failed input would otherwise commit as a version with no change log).
+#[test]
+fn a_failed_backend_step_commits_nothing_it_wrote() {
+    let server = Server::new_at_version_with_authoring_backend(
+        StoreInstanceId([9; 16]),
+        InputVersion(8),
+        vec![target_with(7, &[(1, false)])],
+        Arc::new(PartialFailBackend),
+    )
+    .unwrap();
+    let hub = connect(&server, &[(1, false)]);
+    let unchanged = |root: &str| {
+        assert_eq!(server.current_stamp().unwrap().version, InputVersion(8), "{root}");
+        server.with_writer(|store| {
+            assert_eq!(store.root_id(root).unwrap(), None, "{root} committed");
+            assert_eq!(store.input_version().unwrap(), InputVersion(8), "{root}");
+        });
+    };
+
+    let write = hub.write(
+        InputVersion(8),
+        vec![AuthoringOp::Remove { uuid: asset_id(7) }],
+        false,
+    );
+    assert!(matches!(write, RpcResult::Failure(_)), "{write:?}");
+    unchanged("partial-write");
+
+    let reimport = hub.reimport(InputVersion(8), BundleUuid([0xAA; 16]));
+    assert!(matches!(reimport, RpcResult::Failure(_)), "{reimport:?}");
+    unchanged("partial-reimport");
+
+    let progress = hub
+        .operation(
+            InputVersion(8),
+            LongRunningOp::RenameWithFixups(Arc::from(&b"rename"[..])),
+        )
+        .success()
+        .unwrap();
+    let events = progress.collect::<Vec<_>>();
+    assert_eq!(
+        events.last().unwrap().state,
+        AuthoringProgressState::Failed,
+        "{events:?}"
+    );
+    unchanged("partial-operation");
+}
