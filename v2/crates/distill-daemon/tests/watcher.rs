@@ -264,3 +264,48 @@ fn native_watcher_maps_parent_introduction_to_missing_control_without_a_scan() {
     assert_eq!(batch.paths, [control]);
     assert!(batch.renames.is_empty());
 }
+
+/// A write staged in `.distill-staging` and renamed onto its target is a
+/// change to the target alone: the temp is never queued, and its rename is
+/// not a lost rename source.
+#[test]
+fn a_rename_out_of_the_staging_directory_is_a_change_to_its_target() {
+    let mut queue = WatcherQueue::new();
+    let temp = PathBuf::from("/assets/.distill-staging/7-1-b.txt");
+    let target = PathBuf::from("/assets/b.txt");
+    queue.push_native(create(&temp));
+    assert_eq!(queue.take_live_action(), WatcherAction::None);
+    queue.push_native(
+        Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(temp.clone())
+            .add_path(target.clone()),
+    );
+    assert_eq!(
+        queue.take_live_action(),
+        WatcherAction::Batch(distill_daemon::watcher::WatcherBatch {
+            paths: vec![target.clone()],
+            renames: Vec::new(),
+        })
+    );
+
+    // Split rename events: the staged source half is dropped, and the
+    // target half arrives as a plain change rather than an unmatched
+    // destination that would force a rescan.
+    queue.push_native(
+        Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::From)))
+            .add_path(temp)
+            .set_tracker(9),
+    );
+    queue.push_native(
+        Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To)))
+            .add_path(target.clone())
+            .set_tracker(9),
+    );
+    assert_eq!(
+        queue.take_live_action(),
+        WatcherAction::Batch(distill_daemon::watcher::WatcherBatch {
+            paths: vec![target],
+            renames: Vec::new(),
+        })
+    );
+}

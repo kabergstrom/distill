@@ -509,3 +509,34 @@ fn ancestor_symlink_cycle_is_excluded_with_a_diagnostic() {
         } if normalized_path == "nested/back-to-root" && path_chain.len() >= 3
     )));
 }
+
+/// Staged temps are uncommitted: neither a full scan nor an event naming
+/// one observes them.
+#[test]
+fn the_staging_directory_is_never_scanned() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("assets");
+    let staging = distill_store::atomic_file::staging_dir(&root);
+    std::fs::create_dir_all(&staging).unwrap();
+    let staged = staging.join("1-1-good.bundle");
+    std::fs::write(&staged, ordinary_bundle()).unwrap();
+    std::fs::write(root.join("source.png"), b"raw source").unwrap();
+    let scanner = scanner(&temp);
+
+    let scan = scanner.scan().unwrap();
+    assert_eq!(
+        scan.file_rows()
+            .map(|file| file.normalized_path.as_str())
+            .collect::<Vec<_>>(),
+        ["source.png"]
+    );
+    assert!(scan.bundles.is_empty());
+
+    assert!(
+        scanner
+            .scan_incremental(&scan, &[staged, staging])
+            .unwrap()
+            .is_none(),
+        "staged paths affect nothing"
+    );
+}
