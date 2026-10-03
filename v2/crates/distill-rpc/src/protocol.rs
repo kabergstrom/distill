@@ -670,10 +670,20 @@ pub struct DeferredOperationResult {
     pub terminal_error: Option<String>,
 }
 
+/// A read-only operation: a report on one read snapshot. It holds no write
+/// lock, writes nothing and publishes no version.
+pub trait ReportOperation: Send + Sync {
+    /// Report on `snapshot`, a read snapshot of the operation's base.
+    /// `Ok(None)` completes the operation; `Ok(Some(findings))` fails it
+    /// with them.
+    fn report(&self, snapshot: &crate::server::ReportSnapshot<'_>) -> Result<Option<String>, String>;
+}
+
 #[derive(Clone)]
 pub enum PreparedOperationPublication {
     Immediate(Box<Commit>),
     Deferred(Arc<dyn DeferredOperation>),
+    Report(Arc<dyn ReportOperation>),
 }
 
 impl std::fmt::Debug for PreparedOperationPublication {
@@ -681,6 +691,7 @@ impl std::fmt::Debug for PreparedOperationPublication {
         match self {
             Self::Immediate(commit) => formatter.debug_tuple("Immediate").field(commit).finish(),
             Self::Deferred(_) => formatter.write_str("Deferred(..)"),
+            Self::Report(_) => formatter.write_str("Report(..)"),
         }
     }
 }
@@ -705,6 +716,13 @@ impl PreparedOperationCommit {
     ) -> Self {
         Self {
             publication: PreparedOperationPublication::Deferred(operation),
+            progress,
+        }
+    }
+
+    pub fn report(operation: Arc<dyn ReportOperation>, progress: Vec<AuthoringProgressEvent>) -> Self {
+        Self {
+            publication: PreparedOperationPublication::Report(operation),
             progress,
         }
     }

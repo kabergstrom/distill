@@ -31,7 +31,7 @@ pub use capability::{
     MetadataSnapshot, PendingBuild, ResolveStep, Snapshot,
 };
 pub use server::{
-    target_map, AdminWriteError, CoordinatedCommitError, Root, Server, ServerHandle, SnapshotPolicy,
+    target_map, AdminWriteError, CoordinatedCommitError, ReportSnapshot, Root, Server, ServerHandle, SnapshotPolicy,
     DEFAULT_SNAPSHOT_TTL, MAX_SUBSCRIBED_ASSETS, MAX_SUBSCRIBED_PATHS,
 };
 pub use validate::{decode_asset_reference_query, decode_authoring_payload};

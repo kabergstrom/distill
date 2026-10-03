@@ -53,7 +53,9 @@ fn complete(
 ) -> DeferredOperationResult {
     match publication {
         PreparedOperationPublication::Deferred(operation) => operation.complete(store, base).unwrap(),
-        PreparedOperationPublication::Immediate(_) => panic!("production operations are deferred"),
+        PreparedOperationPublication::Immediate(_) | PreparedOperationPublication::Report(_) => {
+            panic!("rename operations are deferred")
+        }
     }
 }
 

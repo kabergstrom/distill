@@ -728,18 +728,44 @@ impl Server {
         self.inner.current_stamp()
     }
 
-    /// Batch requests for every runtime entry of the current snapshot, used
-    /// by `doctor verify`. This bypasses transport capabilities but not
-    /// configuration or pipeline errors; the daemon rebuilds each request
-    /// inline, inside the input the verification runs in.
+    /// A read snapshot of the current version, for a report.
+    pub fn report_snapshot(&self) -> Result<ReportSnapshot<'_>, StoreError> {
+        Ok(ReportSnapshot {
+            server: self,
+            txn: self.inner.current_snapshot()?,
+        })
+    }
+
+}
+
+/// One read snapshot a report runs on (see
+/// [`crate::ReportOperation`]): the store at one version, and what the
+/// server serves there.
+pub struct ReportSnapshot<'a> {
+    server: &'a Server,
+    txn: Rc<SnapshotTxn>,
+}
+
+impl ReportSnapshot<'_> {
+    pub fn stamp(&self) -> SnapshotStamp {
+        self.txn.stamp
+    }
+
+    pub fn reader(&self) -> &StoreReader {
+        self.txn.snapshot()
+    }
+
+    /// Batch requests for every runtime entry at this snapshot, for each
+    /// target: what `doctor verify` rebuilds. This bypasses transport
+    /// capabilities but not configuration or pipeline errors.
     pub fn verification_build_requests(&self) -> Result<Vec<BuildRequest>, RpcFailure> {
-        let txn = self.inner.current_snapshot().map_err(store_failure)?;
+        let txn = &self.txn;
         if let ConfigurationStatus::Failed(error) = txn.configuration().map_err(store_failure)? {
             return Err(RpcFailure::InvalidQuery {
                 detail: format!("cannot verify failed configuration: {error:?}"),
             });
         }
-        if let Some(error) = pipeline_failure(self.inner.effective_pipeline(&txn)) {
+        if let Some(error) = pipeline_failure(self.server.inner.effective_pipeline(txn)) {
             return Err(error);
         }
         let snapshot = txn.snapshot();
@@ -771,7 +797,6 @@ impl Server {
         }
         Ok(requests)
     }
-
 }
 
 impl ServerHandle {

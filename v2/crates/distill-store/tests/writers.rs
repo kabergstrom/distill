@@ -160,7 +160,7 @@ fn a_failed_nested_write_rolls_back_only_its_own_writes() {
     assert_eq!(paths, ["kept"]);
 }
 
-/// An inline (doctor) build's flush nested in an open input: when it fails
+/// An inline (tag-refinement) build's flush nested in an open input: when it fails
 /// after its node row, the input that commits keeps none of the node, and
 /// its rolled-back segment row is no OPEN segment left behind.
 #[test]

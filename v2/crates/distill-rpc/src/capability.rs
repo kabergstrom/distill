@@ -659,12 +659,29 @@ fn complete_publication(
     publication: PreparedOperationPublication,
     what: &'static str,
 ) -> Result<(), String> {
+    let publication = match publication {
+        // A report reads one snapshot of its base and writes nothing.
+        PreparedOperationPublication::Report(operation) => {
+            let snapshot = server
+                .report_snapshot()
+                .map_err(|error| format!("{what} cannot read the store: {error}"))?;
+            if snapshot.stamp().version != base {
+                return Err(format!(
+                    "{what} lost its input basis: expected {base:?}, observed {:?}",
+                    snapshot.stamp().version
+                ));
+            }
+            return operation.report(&snapshot)?.map_or(Ok(()), Err);
+        }
+        publication => publication,
+    };
     {
         let mut failed = None;
         let mut terminal = None;
         let published = server.coordinated_maybe_commit(base, |store| {
             let (commit, terminal_error) = match publication {
                 PreparedOperationPublication::Immediate(commit) => (*commit, None),
+                PreparedOperationPublication::Report(_) => unreachable!("a report publishes nothing"),
                 PreparedOperationPublication::Deferred(operation) => {
                     match operation.complete(store, base) {
                         Ok(completed) => (completed.commit, completed.terminal_error),

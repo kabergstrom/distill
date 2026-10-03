@@ -2096,9 +2096,11 @@ affects only newly adopted assets, never silently reinterpreting old ones.
   claiming one bundle UUID, or two entries anywhere in the tree claiming
   one asset UUID (file copies either way), are integrity errors surfaced
   with every authored claimant; derived collisions additionally name each
-  `(parent, output_key)` claimant. `doctor` re-mints identity only in an
-  authored copy the user designates — never silently resolves a derived
-  claimant. Two registered types claiming one
+  `(parent, output_key)` claimant. Nothing resolves a collision for the
+  user: `doctor` reports it, and re-minting identity in an authored copy
+  is an ordinary authoring write (`Hub.write`) to the copy the user
+  designates — never a silent resolution of a derived claimant. Two
+  registered types claiming one
   type UUID is a schema-load error. Derived identities are validated at
   **publication**, not first use: every input-version publication checks
   the union of authored UUIDs and the version's precomputed derived UUIDs
@@ -3588,7 +3590,13 @@ claim in this document ("content hashes are determined by snapshot inputs",
 "checkout + rebuild is byte-identical") holds under this contract, not
 unconditionally. Mitigations, not enforcement: the optional double-run
 determinism check, `doctor verify` (rebuild-and-compare), and process
-isolation remaining available as future hardening (§22).
+isolation remaining available as future hardening (§22). `doctor verify`
+is a read-only report on one read snapshot: it holds no write lock,
+publishes no version and repairs nothing. It rescans every root against
+the published input, reruns every watched import against its bundle,
+rebuilds every runtime entry twice without a cache and compares both with
+each other and with the cached result, and checks every CAS extent's bytes
+against its hash; each difference is a finding.
 
 ## 10. Dependency & Invalidation Model
 
@@ -4297,9 +4305,11 @@ declares — there is no inference fallback. Consequences:
   (§6): an integrity error, the same class as malformed JSON. The file stays
   intact and uninterpreted; nothing is ever lossily re-read.
 - Because the hash pins the schema's content, a missing snapshot is
-  repairable from **any** holder of the same hash — another bundle, a
+  restorable from **any** holder of the same hash — another bundle, a
   migration bundle's endpoints, the archive cache, git history — and the
-  repair provably cannot guess wrong. `doctor` does this automatically.
+  restoration provably cannot guess wrong. It is an ordinary authoring
+  write of the snapshot into the bundle, made when the user asks;
+  `doctor` only reports the missing snapshot.
 - Hand-authored files without machine fields are not an integrity failure:
   the author is by definition writing against the current schema, so
   adoption (§6) **validates** against it and stamps hash + snapshot.
@@ -5670,9 +5680,10 @@ write transaction while a processor runs.
 **The RPC side.** A connection thread only reads: it looks the node up and
 submits or joins a cell, then awaits the ticket on its `LocalSet`; the
 build runs on the build workers, never on a connection thread. Inline
-builds (`doctor verify`, tag-index refinement) run on a writer inside an
-open input and are reachable only through an `OpenInput` proof; nothing
-that answers a resolve holds one. A reconciliation pass refines the tag
+builds (tag-index refinement) run on a writer inside an open input and
+are reachable only through an `OpenInput` proof; nothing that answers a
+resolve holds one. `doctor verify` builds at one read snapshot, without
+any cache, and writes nothing. A reconciliation pass refines the tag
 index in its one apply input (§14, one pass, one input version), never in
 its rolled-back plan. A complete refinement (a full rescan or a configuration
 publication) that fails poisons every asset's tags, reading the

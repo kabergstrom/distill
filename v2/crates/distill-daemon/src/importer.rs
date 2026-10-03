@@ -676,7 +676,7 @@ impl AuthoringService {
         run: ImportRun,
     ) -> Result<PassPublication, RpcFailure> {
         let base = store.input_version().map_err(crate::authoring::invalid)?;
-        match self.publish_import(store, base, run, ImportExecutionMode::Publish) {
+        match self.publish_import(store, base, run) {
             Ok(prepared) => Ok(PassPublication::Published(prepared)),
             Err(error) if error.memoized => Ok(PassPublication::Memoized),
             Err(error) if error.drifted => Ok(PassPublication::Drifted),
@@ -993,7 +993,7 @@ impl AuthoringService {
         base: InputVersion,
         run: ImportRun,
     ) -> Result<Result<PreparedImportCommit, RpcFailure>, RpcFailure> {
-        match self.publish_import(store, base, run, ImportExecutionMode::Publish) {
+        match self.publish_import(store, base, run) {
             Ok(prepared) => Ok(Ok(prepared)),
             Err(error) if error.memoized => Ok(Err(error.rpc)),
             Err(error) => Err(error.into_rpc()),
@@ -1051,12 +1051,23 @@ impl AuthoringService {
         base: InputVersion,
         bundle: BundleUuid,
     ) -> Result<PreparedImportCommit, RpcFailure> {
-        self.prepare_reimport_bundle_mode(store, base, bundle, ImportExecutionMode::Publish)
+        let (importer, invocation) = self.reimport_invocation(store, base, bundle)?;
+        let run = self
+            .run_import(base, importer, invocation, None)
+            .map_err(ImportExecutionError::into_rpc)?;
+        let prepared = self
+            .publish_import(store, base, run)
+            .map_err(ImportExecutionError::into_rpc)?;
+        debug_assert_eq!(prepared.bundle, bundle);
+        Ok(prepared)
     }
 
+    /// The watched import bundles at `store` (a read snapshot at `base`)
+    /// that are not byte-identical fixpoints of their importer. Writes
+    /// nothing.
     pub(crate) fn verify_watched_import_fixpoints(
         &self,
-        store: &mut Store,
+        store: &StoreReader,
         base: InputVersion,
     ) -> Result<Vec<BundleUuid>, RpcFailure> {
         let watched = {
@@ -1080,29 +1091,69 @@ impl AuthoringService {
         };
         let mut failed = Vec::new();
         for bundle in watched {
-            if self
-                .prepare_reimport_bundle_mode(store, base, bundle, ImportExecutionMode::Verify)
-                .is_err()
-            {
+            if self.verify_reimport(store, base, bundle).is_err() {
                 failed.push(bundle);
             }
         }
         Ok(failed)
     }
 
-    fn prepare_reimport_bundle_mode(
+    /// Rerun `bundle`'s import at `base` and check its bytes are the ones
+    /// on disk.
+    fn verify_reimport(
         &self,
-        store: &mut Store,
+        store: &StoreReader,
         base: InputVersion,
         bundle: BundleUuid,
-        mode: ImportExecutionMode,
-    ) -> Result<PreparedImportCommit, RpcFailure> {
+    ) -> Result<(), RpcFailure> {
         let (importer, invocation) = self.reimport_invocation(store, base, bundle)?;
-        let prepared = self
-            .execute_import(store, base, importer, invocation, mode)
+        let run = self
+            .run_import(base, importer, invocation, None)
             .map_err(ImportExecutionError::into_rpc)?;
-        debug_assert_eq!(prepared.bundle, bundle);
-        Ok(prepared)
+        let ImportRun {
+            base: run_base,
+            importer,
+            destination,
+            prior,
+            sources,
+            explicit_settings,
+            watch,
+            origin,
+            read_set,
+            outcome,
+        } = run;
+        let output = outcome.map_err(|failure| failure.rpc)?;
+        let (compiled, folded, bytes) = self
+            .checked_fold(
+                store,
+                base,
+                run_base,
+                &importer,
+                &destination,
+                prior.as_ref(),
+                FoldRequest {
+                    output,
+                    explicit_settings,
+                    default_settings: importer.default_settings.clone(),
+                    importer: importer.id.clone(),
+                    sources,
+                    watch,
+                    read_set,
+                    origin,
+                },
+            )
+            .map_err(ImportExecutionError::into_rpc)?;
+        debug_assert_eq!(folded, bundle);
+        let observed = compiled
+            .scanner()
+            .read_identity_checked(&destination.target)
+            .map_err(invalid)?;
+        if observed != bytes {
+            return Err(invalid(format!(
+                "watched import bundle {bundle} is not a byte-identical importer fixpoint"
+            )));
+        }
+        Ok(())
     }
 
     fn reimport_invocation(
@@ -1153,18 +1204,6 @@ impl AuthoringService {
                 basis_deps: Vec::new(),
             },
         ))
-    }
-
-    fn execute_import(
-        &self,
-        store: &mut Store,
-        base: InputVersion,
-        importer: RegisteredImporter,
-        invocation: ImportInvocation,
-        mode: ImportExecutionMode,
-    ) -> Result<PreparedImportCommit, ImportExecutionError> {
-        let run = self.run_import(base, importer, invocation, None)?;
-        self.publish_import(store, base, run, mode)
     }
 
     /// Run the importer at `base`. This writes nothing, so it runs outside any
@@ -1294,7 +1333,6 @@ impl AuthoringService {
         store: &mut Store,
         base: InputVersion,
         run: ImportRun,
-        mode: ImportExecutionMode,
     ) -> Result<PreparedImportCommit, ImportExecutionError> {
         let ImportRun {
             base: run_base,
@@ -1320,8 +1358,8 @@ impl AuthoringService {
         let output = match outcome {
             Ok(output) => output,
             Err(failure) => {
-                let memo = if mode == ImportExecutionMode::Publish {
-                    self.record_failed_attempt(
+                let memo = self
+                    .record_failed_attempt(
                         store,
                         run_base,
                         destination.meta.as_ref(),
@@ -1330,10 +1368,7 @@ impl AuthoringService {
                         failure.terminal,
                         &failure.message,
                     )
-                    .map_err(ImportExecutionError::unmemoized)?
-                } else {
-                    None
-                };
+                    .map_err(ImportExecutionError::unmemoized)?;
                 let memoized = memo == Some(true);
                 if memoized {
                     // Handled (memoized) failures never reach the loop's
@@ -1359,6 +1394,62 @@ impl AuthoringService {
             }
         };
 
+        let (_, bundle, bytes) = self.checked_fold(
+            store,
+            base,
+            run_base,
+            &importer,
+            &destination,
+            prior.as_ref(),
+            FoldRequest {
+                output,
+                explicit_settings,
+                default_settings: importer.default_settings.clone(),
+                importer: importer.id.clone(),
+                sources,
+                watch,
+                read_set,
+                origin,
+            },
+        )?;
+        let preimage = destination.meta.as_ref().map(|meta| meta.content_hash);
+        if let Some(meta) = &destination.meta {
+            if store
+                .clear_watched_import_failure(bundle)
+                .map_err(invalid)
+                .map_err(ImportExecutionError::unmemoized)?
+            {
+                self.reindex_watched_bundle(store, meta)
+                    .map_err(ImportExecutionError::unmemoized)?;
+            }
+        }
+        let commit = self
+            .publish_file(
+                store,
+                base,
+                destination.target,
+                preimage,
+                Some(bytes),
+            )
+            .map_err(ImportExecutionError::unmemoized)?;
+        Ok(PreparedImportCommit { bundle, commit })
+    }
+
+    /// Fold a successful run at `store`, the version `base`, and check it
+    /// still applies there: its read set is unchanged, and its identities
+    /// collide with no other bundle. The publishing version's compiled
+    /// state, the bundle's identity and its bytes.
+    #[allow(clippy::too_many_arguments)]
+    fn checked_fold(
+        &self,
+        store: &StoreReader,
+        base: InputVersion,
+        run_base: InputVersion,
+        importer: &RegisteredImporter,
+        destination: &ImportDestination,
+        prior: Option<&PriorImport>,
+        request: FoldRequest,
+    ) -> Result<(Arc<Compiled>, BundleUuid, Vec<u8>), ImportExecutionError> {
         require_base(store, base).map_err(ImportExecutionError::unmemoized)?;
         // The publishing version's compiled state: a run from an earlier
         // base whose capabilities moved fails its revalidation.
@@ -1369,30 +1460,13 @@ impl AuthoringService {
             .importer_capabilities(&compiled)
             .map_err(ImportExecutionError::unmemoized)?;
         let mut recheck = RootedImportBackend::new(compiled.scanner(), store, &capabilities);
-        if !revalidate_read_set(&read_set, &mut recheck) {
+        if !revalidate_read_set(&request.read_set, &mut recheck) {
             return Err(ImportExecutionError::drifted(invalid(
                 "import read-set changed before publication; the result was discarded",
             )));
         }
         let (bundle, bytes) = self
-            .folded_bundle(
-                store,
-                &compiled,
-                run_base,
-                &importer,
-                &destination,
-                prior.as_ref(),
-                FoldRequest {
-                    output,
-                    explicit_settings,
-                    default_settings: importer.default_settings.clone(),
-                    importer: importer.id.clone(),
-                    sources,
-                    watch,
-                    read_set,
-                    origin,
-                },
-            )
+            .folded_bundle(store, &compiled, run_base, importer, destination, prior, request)
             .map_err(ImportExecutionError::unmemoized)?;
         if store
             .bundle(bundle)
@@ -1422,43 +1496,7 @@ impl AuthoringService {
                 ))));
             }
         }
-        let preimage = destination.meta.as_ref().map(|meta| meta.content_hash);
-        if mode == ImportExecutionMode::Verify {
-            let observed = compiled
-                .scanner()
-                .read_identity_checked(&destination.target)
-                .map_err(invalid)
-                .map_err(ImportExecutionError::unmemoized)?;
-            if observed != bytes {
-                return Err(ImportExecutionError::unmemoized(invalid(format!(
-                    "watched import bundle {bundle} is not a byte-identical importer fixpoint"
-                ))));
-            }
-            return Ok(PreparedImportCommit {
-                bundle,
-                commit: distill_rpc::Commit::default(),
-            });
-        }
-        if let Some(meta) = &destination.meta {
-            if store
-                .clear_watched_import_failure(bundle)
-                .map_err(invalid)
-                .map_err(ImportExecutionError::unmemoized)?
-            {
-                self.reindex_watched_bundle(store, meta)
-                    .map_err(ImportExecutionError::unmemoized)?;
-            }
-        }
-        let commit = self
-            .publish_file(
-                store,
-                base,
-                destination.target,
-                preimage,
-                Some(bytes),
-            )
-            .map_err(ImportExecutionError::unmemoized)?;
-        Ok(PreparedImportCommit { bundle, commit })
+        Ok((compiled, bundle, bytes))
     }
 
     /// The bundle a successful run folds to at `store`: its identity and
@@ -3725,12 +3763,6 @@ struct ImportInvocation {
     watch: bool,
     origin: Option<DirectoryOrigin>,
     basis_deps: Vec<FileDep>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ImportExecutionMode {
-    Publish,
-    Verify,
 }
 
 struct ImportExecutionError {

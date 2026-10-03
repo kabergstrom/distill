@@ -807,11 +807,16 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
     );
     assert_eq!(coordinator.server().current_stamp().unwrap().version, base);
 
+    // Doctor verify is a report on a read snapshot: it completes while
+    // another writer holds an open input (the write lock), and publishes no
+    // version.
+    writer.open_input().unwrap();
     let events = hub
         .operation(base, LongRunningOp::Doctor(DoctorRequest::Verify.encode()))
         .success()
         .unwrap()
         .collect::<Vec<_>>();
+    writer.finish_input(false).unwrap();
     assert_eq!(events.len(), 3);
     assert_eq!(events[0].state, AuthoringProgressState::Started);
     assert_eq!(events[1].state, AuthoringProgressState::Running);
@@ -819,6 +824,7 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
     assert!(std::str::from_utf8(&events[2].payload)
         .unwrap()
         .contains("daemon-owned-directory-alias"));
+    assert_eq!(coordinator.server().current_stamp().unwrap().version, base);
 }
 
 fn u8_struct(fields: &[&str]) -> LogicalSchema {

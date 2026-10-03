@@ -946,6 +946,7 @@ impl ToolEpochSnapshot for BuildContext<'_> {
         match &self.stores {
             BuildStores::Worker { view, .. } => view.tool_at(id, self.tool_version),
             BuildStores::Inline(store) => store.borrow().tool_at(id, self.tool_version),
+            BuildStores::Snapshot(snapshot) => snapshot.tool_at(id, self.tool_version),
         }
     }
 }
@@ -975,6 +976,9 @@ enum BuildStores<'s> {
     },
     /// Inline in an open input: reads and writes see its uncommitted rows.
     Inline(RefCell<&'s mut Store>),
+    /// A report's: every read at one read snapshot, and nothing written (it
+    /// verifies fresh).
+    Snapshot(&'s StoreReader),
 }
 
 /// A read of a build's store; no write is made while one is held.
@@ -1046,6 +1050,7 @@ impl<'s> BuildContext<'s> {
             let read = match &stores {
                 BuildStores::Worker { view, .. } => StoreRead::Reader(view),
                 BuildStores::Inline(store) => StoreRead::Borrowed(store.borrow()),
+                BuildStores::Snapshot(snapshot) => StoreRead::Reader(snapshot),
             };
             let version = read.input_version().map_err(BuildError::infrastructure)?;
             (version, read.state_path().join(runs))
@@ -1072,6 +1077,7 @@ fn lock_build_store<'c>(context: &'c BuildContext<'_>) -> Result<StoreRead<'c>, 
     Ok(match &context.stores {
         BuildStores::Worker { view, .. } => StoreRead::Reader(view),
         BuildStores::Inline(store) => StoreRead::Borrowed(store.borrow()),
+        BuildStores::Snapshot(snapshot) => StoreRead::Reader(snapshot),
     })
 }
 
@@ -1080,6 +1086,7 @@ fn latest_store<'c>(context: &'c BuildContext<'_>) -> StoreRead<'c> {
     match &context.stores {
         BuildStores::Worker { latest, .. } => StoreRead::Reader(latest),
         BuildStores::Inline(store) => StoreRead::Borrowed(store.borrow()),
+        BuildStores::Snapshot(snapshot) => StoreRead::Reader(snapshot),
     }
 }
 
@@ -1117,6 +1124,9 @@ fn flush_writes(context: &BuildContext) -> Result<(), BuildError> {
     match &context.stores {
         BuildStores::Worker { writer, .. } => writer.borrow_mut().write_transaction(publish),
         BuildStores::Inline(store) => store.borrow_mut().write_transaction(publish),
+        BuildStores::Snapshot(_) => {
+            return Err(BuildError::Failed("a build at a read snapshot publishes nothing".to_owned()))
+        }
     }
     .map_err(BuildError::infrastructure)
 }
@@ -1453,25 +1463,45 @@ fn split_artifact(
     Ok((view, Arc::from(bytes[..structural_len].to_vec()), blobs))
 }
 
-/// Build `request`'s node inline in an open input, at the input's own
-/// rows: a doctor's verification. `verify_fresh` builds without any cache
-/// and publishes nothing.
-fn build_inline(
+/// What `doctor verify` knows of `request`'s node at `snapshot`: its
+/// cached result there, if any, and two fresh builds of it that use no
+/// cache. Nothing is written.
+fn verify_at_snapshot(
     coordinator: &DaemonCoordinator,
-    input: &mut OpenInput<'_>,
+    snapshot: &StoreReader,
     request: &BuildRequest,
-    verify_fresh: bool,
+) -> Result<(Option<NodeResult>, [Result<NodeResult, BuildError>; 2]), BuildError> {
+    // The compiled state of the snapshot's own rows.
+    let compiled = compiled_for_build(coordinator, snapshot)?;
+    let env = NodeEnv::capture(coordinator, &compiled, &request.target)?;
+    check_request(&env, request)?;
+    let tool_version = snapshot.input_version().map_err(BuildError::infrastructure)?;
+    let cached = NodeLookup::new(&env, snapshot, snapshot, tool_version).node(request.entry.uuid, 0)?;
+    Ok((
+        cached,
+        [
+            build_fresh_at(coordinator, snapshot, request),
+            build_fresh_at(coordinator, snapshot, request),
+        ],
+    ))
+}
+
+/// Build `request`'s node at `snapshot` without any cache, writing
+/// nothing.
+fn build_fresh_at(
+    coordinator: &DaemonCoordinator,
+    snapshot: &StoreReader,
+    request: &BuildRequest,
 ) -> Result<NodeResult, BuildError> {
-    // The compiled state of the input's own rows.
-    let compiled = compiled_for_build(coordinator, &input.0)?;
+    let compiled = compiled_for_build(coordinator, snapshot)?;
     let env = NodeEnv::capture(coordinator, &compiled, &request.target)?;
     check_request(&env, request)?;
     let mut context = BuildContext::new(
         env,
-        BuildStores::Inline(RefCell::new(&mut *input.0)),
+        BuildStores::Snapshot(snapshot),
         compiled.scanner().clone(),
         None,
-        verify_fresh,
+        true,
         "tool-runs",
     )?;
     let node = build_asset(&mut context, request.entry.uuid)?;
@@ -1483,41 +1513,47 @@ fn build_inline(
     Ok(node)
 }
 
-/// Rebuild each request three times inside `input`: doctor verification
-/// runs inside the input it completes in, so its builds see that input's
-/// rows, run inline on its writer, and never wait on a build cell.
+/// Rebuild each request twice without a cache at `snapshot`, a read
+/// snapshot, and compare the builds with each other and with the cached
+/// result there: a report. It holds no write lock and writes nothing; an
+/// asset nothing has built yet is compared only with itself.
 pub(crate) fn doctor_verify_builds(
     coordinator: &Arc<DaemonCoordinator>,
-    mut input: OpenInput<'_>,
+    snapshot: &StoreReader,
     requests: &[BuildRequest],
-) -> Result<Vec<String>, String> {
+) -> Vec<String> {
     let mut defects = Vec::new();
     for request in requests {
-        let mut run =
-            |verify_fresh| build_inline(coordinator, &mut input, request, verify_fresh);
-        let published = run(false);
-        let first = run(true);
-        let second = run(true);
+        let (cached, [first, second]) = match verify_at_snapshot(coordinator, snapshot, request) {
+            Ok(verified) => verified,
+            Err(error) => {
+                defects.push(format!(
+                    "asset {} target {:?} cannot be verified: {error:?}",
+                    request.requested_asset, request.target
+                ));
+                continue;
+            }
+        };
         let root = |node: &NodeResult| node.outputs.get(&request.output_key).copied();
-        match (published, first, second) {
-            (Ok(published), Ok(first), Ok(second))
-                if published.outputs == first.outputs && first.outputs == second.outputs => {}
-            (Ok(published), Ok(first), Ok(second)) if first.outputs == second.outputs => defects.push(format!(
-                "asset {} target {:?} fresh rebuild differs from the published artifact set: published root {:?}, rebuilt root {:?}",
-                request.requested_asset,
-                request.target,
-                root(&published),
-                root(&first)
-            )),
-            (Ok(_), Ok(_), Ok(_)) => defects.push(format!(
+        match (first, second) {
+            (Ok(first), Ok(second)) if first.outputs == second.outputs => match cached {
+                Some(cached) if cached.outputs != first.outputs => defects.push(format!(
+                    "asset {} target {:?} fresh rebuild differs from the published artifact set: published root {:?}, rebuilt root {:?}",
+                    request.requested_asset,
+                    request.target,
+                    root(&cached),
+                    root(&first)
+                )),
+                _ => {}
+            },
+            (Ok(_), Ok(_)) => defects.push(format!(
                 "asset {} target {:?} produced different fresh rebuild publications",
                 request.requested_asset, request.target
             )),
-            (Err(published), Err(first), Err(second)) => {
-                let published = format!("{published:?}");
+            (Err(first), Err(second)) => {
                 let first = format!("{first:?}");
                 let second = format!("{second:?}");
-                if published == first && first == second {
+                if first == second {
                     defects.push(format!(
                         "asset {} target {:?} failed reproducibly: {first}",
                         request.requested_asset, request.target
@@ -1529,17 +1565,16 @@ pub(crate) fn doctor_verify_builds(
                     ));
                 }
             }
-            (published, first, second) => defects.push(format!(
-                "asset {} target {:?} changed published/fresh rebuild outcome: {:?}; {:?}; {:?}",
+            (first, second) => defects.push(format!(
+                "asset {} target {:?} changed fresh rebuild outcome: {:?}; {:?}",
                 request.requested_asset,
                 request.target,
-                published.map(|node| node.outputs),
                 first.map(|node| node.outputs),
                 second.map(|node| node.outputs),
             )),
         }
     }
-    Ok(defects)
+    defects
 }
 
 /// Each authored type's tag epoch under `authority`: a digest of the
@@ -4713,25 +4748,14 @@ mod tests {
         }
     }
 
-    /// Build `request` inline without any cache, as a doctor's verification
-    /// does, and read the outputs it would publish (identical content is
-    /// already in the CAS).
-    fn build_fresh(
-        coordinator: &Arc<DaemonCoordinator>,
-        writer: &mut Store,
-        request: &BuildRequest,
-    ) -> BuildPublication {
-        writer.open_input().unwrap();
-        let node = build_inline(
-            coordinator,
-            &mut OpenInput::new(writer).unwrap(),
-            request,
-            true,
-        )
-        .unwrap();
-        writer.finish_input(false).unwrap();
+    /// Build `request` at a read snapshot without any cache, as a doctor's
+    /// verification does, and read the outputs it would publish (identical
+    /// content is already in the CAS).
+    fn build_fresh(coordinator: &Arc<DaemonCoordinator>, request: &BuildRequest) -> BuildPublication {
+        let snapshot = coordinator.open_reader().unwrap().begin_snapshot().unwrap();
+        let node = build_fresh_at(coordinator, &snapshot, request).unwrap();
         let root = node.outputs[&request.output_key];
-        published(&coordinator.open_reader().unwrap(), root, &node)
+        published(&snapshot, root, &node)
     }
 
     fn rpc_target(hash: TargetDefinitionHash) -> TargetDefinition {
@@ -5628,7 +5652,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(validator_calls.load(Ordering::SeqCst), 2);
 
-        assert_eq!(build_fresh(&coordinator, &mut writer, &request), first);
+        assert_eq!(build_fresh(&coordinator, &request), first);
         assert_eq!(calls.load(Ordering::SeqCst), 4);
         assert_eq!(validator_calls.load(Ordering::SeqCst), 4);
     }

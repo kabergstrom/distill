@@ -1177,6 +1177,13 @@ should reach zero by the end of phase 6.
   restart's full publication diffs against it and writes only what
   changed (about 90k claim INSERTs fewer at 20k bundles), and a rejected
   first scan reports the stored collisions instead of none.
+- **Doctor reports.** `doctor verify` is a `ReportOperation` run on one
+  read snapshot of its base (`ReportSnapshot`): no write lock, no input,
+  no empty version. Its builds run in `BuildStores::Snapshot`, verifying
+  fresh; the "published" result is a `NodeLookup` at the snapshot, and the
+  build requests are computed at that snapshot. Watched-import fixpoints
+  are checked on a reader (`verify_reimport`, sharing `checked_fold` with
+  publication).
 
 ## 7. Test baseline
 

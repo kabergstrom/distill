@@ -13,9 +13,9 @@ use distill_bundle::Bundle;
 use distill_core::id::ContentHash;
 use distill_json::AuthoredValue;
 use distill_rpc::{
-    AuthoringProgressEvent, AuthoringProgressState, BuildRequest, Commit, DeferredOperation,
+    AuthoringProgressEvent, AuthoringProgressState, Commit, DeferredOperation,
     DeferredOperationResult, DoctorRequest, InputVersion, LongRunningOp, PreparedOperationCommit,
-    RenameWithFixupsRequest, RpcFailure,
+    RenameWithFixupsRequest, ReportOperation, ReportSnapshot, RpcFailure,
 };
 use distill_schema::ngp_schema::SchemaNode;
 use distill_store::{Store, StoreReader};
@@ -57,49 +57,19 @@ impl AuthoringService {
             LongRunningOp::Doctor(payload) => {
                 let request =
                     DoctorRequest::decode(payload).map_err(|error| invalid(error.to_string()))?;
-                // Snapshot the served request set now, on the RPC thread; the
-                // deferred completion runs later, in its own input.
-                let build_requests = if request == DoctorRequest::Verify {
-                    match runtime.tag_index_coordinator.upgrade() {
-                        Some(coordinator) => coordinator
-                            .server()
-                            .verification_build_requests()
-                            .map_err(|error| {
-                                format!(
-                                    "build verification is unavailable for the current store state: {error:?}"
-                                )
-                            }),
-                        None => Err("build coordinator stopped during doctor verify".to_owned()),
-                    }
-                } else {
-                    Ok(Vec::new())
-                };
-                PlannedOperation::Doctor {
-                    request,
-                    build_requests,
-                }
+                // The report runs when the client consumes Completed, on a
+                // read snapshot of `base`; until then the progress stream
+                // can be cancelled without starting any of its work.
+                return Ok(PreparedOperationCommit::report(
+                    Arc::new(DoctorReport { runtime, request }),
+                    progress_events(&format!("doctor {request:?}")),
+                ));
             }
         };
         let running_payload = operation_summary(&planned);
         Ok(PreparedOperationCommit::deferred(
             Arc::new(DeferredAuthoringOperation { runtime, planned }),
-            vec![
-                AuthoringProgressEvent {
-                    sequence: 0,
-                    state: AuthoringProgressState::Started,
-                    payload: Arc::from([]),
-                },
-                AuthoringProgressEvent {
-                    sequence: 1,
-                    state: AuthoringProgressState::Running,
-                    payload: Arc::from(running_payload.into_bytes()),
-                },
-                AuthoringProgressEvent {
-                    sequence: 2,
-                    state: AuthoringProgressState::Completed,
-                    payload: Arc::from([]),
-                },
-            ],
+            progress_events(&running_payload),
         ))
     }
 
@@ -204,10 +174,6 @@ enum PlannedOperation {
         files: Vec<OperationFile>,
         failures: Vec<String>,
     },
-    Doctor {
-        request: DoctorRequest,
-        build_requests: Result<Vec<BuildRequest>, String>,
-    },
 }
 
 struct DeferredAuthoringOperation {
@@ -225,12 +191,46 @@ impl DeferredOperation for DeferredAuthoringOperation {
             PlannedOperation::Files { files, failures } => {
                 self.runtime.publish_files(store, base, files, failures)
             }
-            PlannedOperation::Doctor {
-                request,
-                build_requests,
-            } => self.runtime.run_doctor(store, base, *request, build_requests),
         }
     }
+}
+
+/// `doctor verify`: a read-only report on one read snapshot. It holds no
+/// write lock, writes nothing, publishes no version and repairs nothing;
+/// every finding fails the operation with its description.
+struct DoctorReport {
+    runtime: OperationRuntime,
+    request: DoctorRequest,
+}
+
+impl ReportOperation for DoctorReport {
+    fn report(&self, snapshot: &ReportSnapshot<'_>) -> Result<Option<String>, String> {
+        match self.request {
+            DoctorRequest::Verify => self.runtime.verify(snapshot),
+        }
+    }
+}
+
+/// The progress of an operation that completes when the client consumes
+/// Completed.
+fn progress_events(running: &str) -> Vec<AuthoringProgressEvent> {
+    vec![
+        AuthoringProgressEvent {
+            sequence: 0,
+            state: AuthoringProgressState::Started,
+            payload: Arc::from([]),
+        },
+        AuthoringProgressEvent {
+            sequence: 1,
+            state: AuthoringProgressState::Running,
+            payload: Arc::from(running.as_bytes()),
+        },
+        AuthoringProgressEvent {
+            sequence: 2,
+            state: AuthoringProgressState::Completed,
+            payload: Arc::from([]),
+        },
+    ]
 }
 
 impl OperationRuntime {
@@ -282,95 +282,53 @@ impl OperationRuntime {
         })
     }
 
-    fn run_doctor(
-        &self,
-        store: &mut Store,
-        base: InputVersion,
-        request: DoctorRequest,
-        build_requests: &Result<Vec<BuildRequest>, String>,
-    ) -> Result<DeferredOperationResult, String> {
-        // Keep the repository-wide reimport and schema walks deferred until
-        // the client consumes Completed. Until then the progress stream can
-        // be cancelled without starting either workload.
-        let coordinator = if request == DoctorRequest::Verify {
-            Some(
-                self.tag_index_coordinator
-                    .upgrade()
-                    .ok_or_else(|| "build coordinator stopped during doctor verify".to_owned())?,
-            )
-        } else {
-            None
+    /// Everything `doctor verify` checks, at `snapshot`: the scan of every
+    /// root against the published input, each watched import's fixpoint,
+    /// fresh rebuilds of every runtime entry against each other and the
+    /// cached result, and every CAS extent's bytes against its hash.
+    fn verify(&self, snapshot: &ReportSnapshot<'_>) -> Result<Option<String>, String> {
+        let coordinator = self
+            .tag_index_coordinator
+            .upgrade()
+            .ok_or_else(|| "build coordinator stopped during doctor verify".to_owned())?;
+        let reader = snapshot.reader();
+        let base = snapshot.stamp().version;
+        let import_failures = coordinator
+            .authoring_service()
+            .verify_watched_import_fixpoints(reader, base)
+            .map_err(|error| format!("{error:?}"))?;
+        let compiled = self.compiled.at(reader).map_err(|error| error.to_string())?;
+        let observed = compiled.scanner().scan().map_err(|error| error.to_string())?;
+        let filesystem_mismatch = !observed
+            .matches_published(reader, true)
+            .map_err(|error| error.to_string())?;
+        let build_defects = match snapshot.verification_build_requests() {
+            Ok(requests) => crate::build::doctor_verify_builds(&coordinator, reader, &requests),
+            Err(error) => vec![format!(
+                "build verification is unavailable for the current store state: {error:?}"
+            )],
         };
-        let import_failures = if request == DoctorRequest::Verify {
-            coordinator
-                .as_ref()
-                .expect("verify coordinator was required")
-                .authoring_service()
-                .verify_watched_import_fixpoints(store, base)
-                .map_err(|error| format!("{error:?}"))?
-        } else {
-            Vec::new()
-        };
-        let (filesystem_mismatch, scan_diagnostics) = if request == DoctorRequest::Verify {
-            let compiled = self.compiled.at(store).map_err(|error| error.to_string())?;
-            let observed = compiled.scanner().scan().map_err(|error| error.to_string())?;
-            let mismatch = !observed
-                .matches_published(store, true)
-                .map_err(|error| error.to_string())?;
-            let diagnostics = observed
-                .diagnostic_rows()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>();
-            (mismatch, diagnostics)
-        } else {
-            (false, Vec::new())
-        };
-        let build_defects = if request == DoctorRequest::Verify {
-            match build_requests {
-                Ok(requests) => crate::build::doctor_verify_builds(
-                    coordinator
-                        .as_ref()
-                        .expect("verify coordinator was required"),
-                    crate::build::OpenInput::new(store).ok_or_else(|| {
-                        "doctor build verification runs outside its input".to_owned()
-                    })?,
-                    requests,
-                )?,
-                Err(defect) => vec![defect.clone()],
-            }
-        } else {
-            Vec::new()
-        };
-        require_base(store, base).map_err(|error| format!("{error:?}"))?;
-        let terminal_error = match request {
-            DoctorRequest::Verify => {
-                store
-                    .verify_all_cas_extents()
-                    .map_err(|error| error.to_string())?;
-                let mut defects = Vec::new();
-                if filesystem_mismatch {
-                    defects.push(
-                        "full filesystem rehash differs from the published input snapshot"
-                            .to_owned(),
-                    );
-                }
-                defects.extend(scan_diagnostics);
-                if !import_failures.is_empty() {
-                    defects.push(format!(
-                        "{} watched import bundle(s) are not byte-identical fixpoints: {}",
-                        import_failures.len(),
-                        import_failures
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
-                }
-                defects.extend(build_defects);
-                (!defects.is_empty()).then(|| defects.join("; "))
-            }
-        };
-        self.advance_empty(store, base, terminal_error)
+        reader
+            .verify_all_cas_extents()
+            .map_err(|error| error.to_string())?;
+        let mut defects = Vec::new();
+        if filesystem_mismatch {
+            defects.push("full filesystem rehash differs from the published input snapshot".to_owned());
+        }
+        defects.extend(observed.diagnostic_rows().map(|row| row.to_string()));
+        if !import_failures.is_empty() {
+            defects.push(format!(
+                "{} watched import bundle(s) are not byte-identical fixpoints: {}",
+                import_failures.len(),
+                import_failures
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        defects.extend(build_defects);
+        Ok((!defects.is_empty()).then(|| defects.join("; ")))
     }
 
     fn advance_empty(
@@ -624,7 +582,6 @@ fn operation_summary(operation: &PlannedOperation) -> String {
             files.len(),
             failures.len()
         ),
-        PlannedOperation::Doctor { request, .. } => format!("doctor {request:?}"),
     }
 }
 
