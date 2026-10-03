@@ -265,12 +265,13 @@ const NAMESPACE_TABLES: [&str; 8] = [
 ];
 
 /// Partial indexes: walking one visits only the rows it was declared for.
-const PARTIAL_INDEXES: [&str; 6] = [
+const PARTIAL_INDEXES: [&str; 7] = [
     "bundles_poisoned",
     "bundles_import_watched",
     "assets_authoring",
     "files_by_ext",
     "asset_tag_index_poisoned",
+    "asset_tag_index_poisoned_by_type",
     "assets_by_terminal_type",
 ];
 
@@ -415,7 +416,7 @@ fn filter_shapes() -> Vec<(AssetFilter, &'static [&'static str], &'static [&'sta
             &[
                 "SEARCH a USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)",
                 "LIST SUBQUERY 1",
-                "SCAN i USING INDEX asset_tag_index_poisoned",
+                "SEARCH i USING INDEX asset_tag_index_poisoned_by_type (type_uuid=?)",
                 "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)",
             ],
         ),
@@ -437,7 +438,7 @@ fn filter_shapes() -> Vec<(AssetFilter, &'static [&'static str], &'static [&'sta
             &[
                 "SEARCH a USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)",
                 "LIST SUBQUERY 1",
-                "SCAN i USING INDEX asset_tag_index_poisoned",
+                "SEARCH i USING INDEX asset_tag_index_poisoned_by_type (type_uuid=?)",
                 "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)",
             ],
         ),
@@ -481,7 +482,7 @@ fn filter_shapes() -> Vec<(AssetFilter, &'static [&'static str], &'static [&'sta
             &[
                 "SEARCH a USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)",
                 "LIST SUBQUERY 1",
-                "SCAN i USING INDEX asset_tag_index_poisoned",
+                "SEARCH i USING INDEX asset_tag_index_poisoned_by_type (type_uuid=?)",
                 "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)",
             ],
         ),
@@ -594,6 +595,45 @@ fn pages(reader: &StoreReader, read: impl FnOnce()) -> u64 {
     let before = reader.pages_fetched().unwrap();
     read();
     reader.pages_fetched().unwrap() - before
+}
+
+/// Pages a typed tag query of the records fetches over `count` bundles,
+/// with every runtime asset's tag index `pending` or not.
+fn typed_tag_query_pages(count: u32, pending: bool) -> u64 {
+    let (_dir, mut store) = store_with(count);
+    if pending {
+        store
+            .input_transaction(|txn| {
+                for index in (0..count).filter(|index| index % 500 != 199) {
+                    txn.set_tag_index_pending(asset_uuid(index, 1), [1; 32])?;
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+    let reader = store.reader().unwrap();
+    let poisoned = reader.tag_poisoned_assets().unwrap().len() as u32;
+    assert_eq!(poisoned, if pending { count - count / 500 } else { 0 });
+    let records = AssetFilter {
+        authored_type: Some(RECORD_TYPE),
+        tag: Some(("kind".into(), None)),
+        ..AssetFilter::default()
+    };
+    pages(&reader, || {
+        reader.namespace_assets_matching(&records, |_| true).unwrap().unwrap();
+    })
+}
+
+/// A typed query's tag-poison check walks the poisoned rows of its own
+/// types (`asset_tag_index_poisoned_by_type`): thousands of pending rows of
+/// another type cost it nothing.
+#[test]
+fn a_typed_tag_query_checks_only_its_types_poisons() {
+    let clean = typed_tag_query_pages(8_000, false);
+    let pending = typed_tag_query_pages(8_000, true);
+    // The one page is the partial index's root, empty when nothing is
+    // pending.
+    assert!(pending <= clean + 1, "{clean} {pending}");
 }
 
 #[test]

@@ -331,9 +331,13 @@ impl InputTxn<'_> {
     ) -> Result<(), StoreError> {
         self.txn.execute(
             "INSERT INTO asset_tag_index(
-                asset_uuid, tag_epoch, planner_version, dylib_hash, trace, poison
-             ) VALUES (?1, ?2, NULL, NULL, X'', 'tag indexing pending')
+                asset_uuid, type_uuid, tag_epoch, planner_version, dylib_hash, trace, poison
+             ) VALUES (
+                ?1, (SELECT type_uuid FROM assets WHERE asset_uuid = ?1), ?2, NULL, NULL, X'',
+                'tag indexing pending'
+             )
              ON CONFLICT(asset_uuid) DO UPDATE SET
+                type_uuid = excluded.type_uuid,
                 tag_epoch = excluded.tag_epoch,
                 planner_version = NULL,
                 dylib_hash = NULL,
@@ -494,9 +498,14 @@ impl Store {
                 }
                 txn.execute(
                     "INSERT INTO asset_tag_index(
-                        asset_uuid, tag_epoch, planner_version, dylib_hash, trace, poison
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                        asset_uuid, type_uuid, tag_epoch, planner_version, dylib_hash, trace,
+                        poison
+                     ) VALUES (
+                        ?1, (SELECT type_uuid FROM assets WHERE asset_uuid = ?1), ?2, ?3, ?4, ?5,
+                        ?6
+                     )
                      ON CONFLICT(asset_uuid) DO UPDATE SET
+                        type_uuid = excluded.type_uuid,
                         tag_epoch = excluded.tag_epoch,
                         planner_version = excluded.planner_version,
                         dylib_hash = excluded.dylib_hash,
@@ -793,7 +802,7 @@ impl StoreReader {
         let module = dylib_hash.map_or_else(Vec::new, |hash| hash.to_vec());
         let mut statement = self.conn.prepare_cached(
             "SELECT i.asset_uuid, a.bundle_uuid
-             FROM asset_tag_index i JOIN assets a USING (asset_uuid)
+             FROM asset_tag_index i INDEXED BY asset_tag_index_poisoned JOIN assets a USING (asset_uuid)
              WHERE i.poison IS NOT NULL
              UNION SELECT i.asset_uuid, a.bundle_uuid
              FROM asset_tag_index i JOIN assets a USING (asset_uuid)
@@ -1284,9 +1293,12 @@ impl AssetFilter {
             let n = bind(params, Value::Text(local_id.clone()));
             conditions.push(format!("a.local_id = ?{n}"));
         }
+        // The authored types the rows must have, as a condition on a
+        // `type_uuid` column.
+        let mut types_condition = Vec::new();
         if let Some(type_uuid) = self.authored_type {
             let n = bind(params, Value::Blob(type_uuid.0.to_vec()));
-            conditions.push(format!("a.type_uuid = ?{n}"));
+            types_condition.push(format!("= ?{n}"));
         }
         if let Some(types) = &self.authored_type_in {
             let list = types
@@ -1294,7 +1306,10 @@ impl AssetFilter {
                 .map(|type_uuid| format!("?{}", bind(params, Value::Blob(type_uuid.0.to_vec()))))
                 .collect::<Vec<_>>()
                 .join(", ");
-            conditions.push(format!("a.type_uuid IN ({list})"));
+            types_condition.push(format!("IN ({list})"));
+        }
+        for condition in &types_condition {
+            conditions.push(format!("a.type_uuid {condition}"));
         }
         if let Some(type_uuid) = self.terminal_type {
             let n = bind(params, Value::Blob(type_uuid.0.to_vec()));
@@ -1331,9 +1346,18 @@ impl AssetFilter {
         }
         if tag_poisoned {
             conditions.push(if driver == Driver::TagPoisoned {
-                "a.asset_uuid IN (SELECT i.asset_uuid FROM asset_tag_index i
-                                  WHERE i.poison IS NOT NULL)"
-                    .to_owned()
+                // A typed query walks the poisoned rows of its types only.
+                match types_condition.first() {
+                    Some(types) => format!(
+                        "a.asset_uuid IN (SELECT i.asset_uuid
+                                          FROM asset_tag_index i INDEXED BY asset_tag_index_poisoned_by_type
+                                          WHERE i.poison IS NOT NULL AND i.type_uuid {types})"
+                    ),
+                    None => "a.asset_uuid IN (SELECT i.asset_uuid
+                                              FROM asset_tag_index i INDEXED BY asset_tag_index_poisoned
+                                              WHERE i.poison IS NOT NULL)"
+                        .to_owned(),
+                }
             } else {
                 "EXISTS (SELECT 1 FROM asset_tag_index i
                          WHERE i.asset_uuid = a.asset_uuid AND i.poison IS NOT NULL)"

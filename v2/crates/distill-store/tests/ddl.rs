@@ -218,6 +218,7 @@ fn assets_row_shape() {
         columns(&conn, "asset_tag_index"),
         [
             "asset_uuid",
+            "type_uuid",
             "tag_epoch",
             "planner_version",
             "dylib_hash",

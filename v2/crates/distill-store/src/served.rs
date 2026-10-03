@@ -497,7 +497,8 @@ impl StoreReader {
     pub fn tag_poisoned_assets(&self) -> Result<Vec<(AssetUuid, BundleUuid)>, StoreError> {
         let mut statement = self.conn.prepare_cached(
             "SELECT i.asset_uuid, a.bundle_uuid
-             FROM asset_tag_index i JOIN assets a ON a.asset_uuid = i.asset_uuid
+             FROM asset_tag_index i INDEXED BY asset_tag_index_poisoned
+             JOIN assets a ON a.asset_uuid = i.asset_uuid
              WHERE i.poison IS NOT NULL ORDER BY i.asset_uuid",
         )?;
         let rows = statement.query_map([], |row| {
@@ -1064,9 +1065,11 @@ pub trait ServedWrite {
         let conn = self.served_conn();
         match poison {
             Some(poison) => conn.execute(
-                "INSERT INTO asset_tag_index(asset_uuid, tag_epoch, trace, poison)
-                 VALUES (?1, zeroblob(32), X'', ?2)
-                 ON CONFLICT(asset_uuid) DO UPDATE SET poison = excluded.poison",
+                "INSERT INTO asset_tag_index(asset_uuid, type_uuid, tag_epoch, trace, poison)
+                 VALUES (?1, (SELECT type_uuid FROM assets WHERE asset_uuid = ?1), zeroblob(32),
+                         X'', ?2)
+                 ON CONFLICT(asset_uuid) DO UPDATE SET
+                   type_uuid = excluded.type_uuid, poison = excluded.poison",
                 rusqlite::params![asset.0.as_slice(), poison],
             )?,
             None => conn.execute(

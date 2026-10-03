@@ -1184,6 +1184,12 @@ should reach zero by the end of phase 6.
   build requests are computed at that snapshot. Watched-import fixpoints
   are checked on a reader (`verify_reimport`, sharing `checked_fold` with
   publication).
+- **A typed tag query checks its own types' poisons (schema 40).**
+  `asset_tag_index.type_uuid` is copied from the asset row whenever the
+  tag row is written (every asset-row write deletes it), and the partial
+  index `asset_tag_index_poisoned_by_type` lets a typed query's poison
+  check walk only its types' poisoned rows: 31 pages instead of 8,164 with
+  8,000 pending rows of another type.
 
 ## 7. Test baseline
 

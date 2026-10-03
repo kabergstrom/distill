@@ -266,6 +266,11 @@ CREATE TABLE asset_tags (
 CREATE INDEX asset_tags_by_tag ON asset_tags(tag, value);
 CREATE TABLE asset_tag_index (
     asset_uuid       BLOB NOT NULL PRIMARY KEY,
+    -- The asset's authored type, copied from its row when this one is
+    -- written. Every write of the asset row deletes this one in the same
+    -- transaction (`upsert_asset`, `remove_owned_asset_rows`), so the copy
+    -- cannot outlive the type it copied.
+    type_uuid        BLOB,
     tag_epoch        BLOB NOT NULL,
     planner_version  INTEGER,
     dylib_hash       BLOB,
@@ -275,6 +280,9 @@ CREATE TABLE asset_tag_index (
 -- A tag query fails naming the least poisoned bundle among its
 -- candidates; this lists exactly the poisoned rows.
 CREATE INDEX asset_tag_index_poisoned ON asset_tag_index(asset_uuid)
+    WHERE poison IS NOT NULL;
+-- A typed query's poison check walks the poisoned rows of its types only.
+CREATE INDEX asset_tag_index_poisoned_by_type ON asset_tag_index(type_uuid)
     WHERE poison IS NOT NULL;
 -- A refinement redoes the migrated rows (those a pipeline module's
 -- migration produced) of another module.
