@@ -140,3 +140,51 @@ fn an_artifacts_load_edges_are_its_latest_installs_and_go_with_it() {
         "load edges outlived their artifact"
     );
 }
+
+/// The writer the fence test publishes through from inside the reader's
+/// statement trace.
+static FENCE_WRITER: std::sync::Mutex<Option<Store>> = std::sync::Mutex::new(None);
+
+/// Publish a new protocol epoch and pipeline generation together, once,
+/// just before the reader's first statement that reads the pipeline
+/// generation runs.
+fn publish_before_the_generation_read(sql: &str) {
+    if !sql.contains("rpc_pipeline_generation") {
+        return;
+    }
+    if let Some(mut writer) = FENCE_WRITER.lock().unwrap().take() {
+        writer
+            .served_transaction(|txn| {
+                txn.set_rpc_protocol_epoch(99)?;
+                txn.bump_rpc_pipeline_generation().map(drop)
+            })
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_connections_fences_are_read_at_one_instant() {
+    // A publication that changes the protocol epoch and the pipeline
+    // generation together lands while a front end reads the fences. It
+    // must see both or neither: seeing the new generation with the old
+    // epoch tells the client PipelineEpochChanged where the protocol
+    // changed.
+    let (_dir, mut store) = store();
+    store
+        .served_transaction(|txn| {
+            txn.set_rpc_protocol_epoch(7)?;
+            txn.set_rpc_target("pc", [1; 32]).map(drop)
+        })
+        .unwrap();
+    let mut reader = store.reader().unwrap();
+    *FENCE_WRITER.lock().unwrap() = Some(store);
+    reader.trace_statements(Some(publish_before_the_generation_read));
+    let (fences, target_generation) = reader.rpc_fence("pc").unwrap();
+    reader.trace_statements(None);
+    assert!(FENCE_WRITER.lock().unwrap().is_none(), "the publication landed mid-read");
+    assert_eq!(
+        (fences.protocol_epoch, fences.pipeline_generation, target_generation),
+        (Some(99), 1, Some(0)),
+        "the fences mix two versions"
+    );
+}

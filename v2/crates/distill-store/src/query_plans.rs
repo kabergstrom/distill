@@ -1466,3 +1466,22 @@ fn cas_verification_reads_per_segment() {
         ["SEARCH cas_extents USING INDEX cas_extents_by_segment (segment=?)"]
     );
 }
+
+/// A connection's fence check is one statement of three primary-key
+/// searches.
+#[test]
+fn the_rpc_fence_is_three_key_searches() {
+    let (_dir, store) = store_with(1);
+    assert_eq!(
+        store.query_plan_details(crate::served::RPC_FENCE).unwrap(),
+        [
+            "SCAN CONSTANT ROW",
+            "SCALAR SUBQUERY 1",
+            "SEARCH store_meta USING INDEX sqlite_autoindex_store_meta_1 (key=?)",
+            "SCALAR SUBQUERY 2",
+            "SEARCH store_meta USING INDEX sqlite_autoindex_store_meta_1 (key=?)",
+            "SCALAR SUBQUERY 3",
+            "SEARCH rpc_targets USING INDEX sqlite_autoindex_rpc_targets_1 (name=?)",
+        ]
+    );
+}

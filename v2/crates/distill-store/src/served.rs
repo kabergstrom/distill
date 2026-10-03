@@ -29,6 +29,13 @@ pub const SERVED_RESTART_KEYS: &str = "served_restart_keys";
 const RPC_PROTOCOL_EPOCH: &str = "rpc_protocol_epoch";
 const RPC_PIPELINE_GENERATION: &str = "rpc_pipeline_generation";
 const CHANGE_LOG_OLDEST: &str = "change_log_oldest";
+/// The protocol epoch, the pipeline generation and target `?1`'s generation
+/// in one statement, so they are read at one instant. The keys are
+/// [`RPC_PROTOCOL_EPOCH`] and [`RPC_PIPELINE_GENERATION`].
+pub(crate) const RPC_FENCE: &str = "SELECT
+       (SELECT value FROM store_meta WHERE key = 'rpc_protocol_epoch'),
+       (SELECT value FROM store_meta WHERE key = 'rpc_pipeline_generation'),
+       (SELECT generation FROM rpc_targets WHERE name = ?1)";
 /// Drop an artifact's load edges ahead of recording its latest install's.
 pub(crate) const DELETE_LOAD_EDGES: &str = "DELETE FROM artifact_load_edges WHERE content_hash = ?1";
 
@@ -503,6 +510,20 @@ impl StoreReader {
             protocol_epoch: meta_get_u64(&self.conn, RPC_PROTOCOL_EPOCH)?.map(|epoch| epoch as u32),
             pipeline_generation: meta_get_u64(&self.conn, RPC_PIPELINE_GENERATION)?.unwrap_or(0),
         })
+    }
+
+    /// A connection's reconnect fences and its target's generation, read
+    /// by one statement: one instant ([`RPC_FENCE`]).
+    pub fn rpc_fence(&self, target: &str) -> Result<(RpcFences, Option<u64>), StoreError> {
+        Ok(self.conn.prepare_cached(RPC_FENCE)?.query_row([target], |row| {
+            Ok((
+                RpcFences {
+                    protocol_epoch: row.get::<_, Option<i64>>(0)?.map(|epoch| epoch as u32),
+                    pipeline_generation: row.get::<_, Option<i64>>(1)?.unwrap_or(0) as u64,
+                },
+                row.get::<_, Option<i64>>(2)?.map(|generation| generation as u64),
+            ))
+        })?)
     }
 
     pub fn rpc_targets(&self) -> Result<Vec<RpcTargetRow>, StoreError> {

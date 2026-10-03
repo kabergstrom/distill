@@ -1669,8 +1669,9 @@ impl Inner {
 
     /// Why `connection` must reconnect, if it must.
     pub(crate) fn generation_fence(&self, connection: &ConnectionState) -> Option<ReconnectReason> {
-        let fences = match self.reader.rpc_fences() {
-            Ok(fences) => fences,
+        // One statement: the fences and the target generation of one instant.
+        let (fences, target_generation) = match self.reader.rpc_fence(&connection.target) {
+            Ok(fence) => fence,
             Err(error) => {
                 tracing::error!(%error, "cannot read RPC fences");
                 return Some(ReconnectReason::StoreInstanceChanged);
@@ -1682,14 +1683,8 @@ impl Inner {
         if fences.pipeline_generation != connection.pipeline_generation {
             return Some(ReconnectReason::PipelineEpochChanged);
         }
-        match self.reader.rpc_target(&connection.target) {
-            Ok(Some(row)) if row.generation == connection.target_generation => None,
-            Ok(_) => Some(ReconnectReason::TargetDefinitionChanged),
-            Err(error) => {
-                tracing::error!(%error, "cannot read the RPC target");
-                Some(ReconnectReason::StoreInstanceChanged)
-            }
-        }
+        (target_generation != Some(connection.target_generation))
+            .then_some(ReconnectReason::TargetDefinitionChanged)
     }
 
     /// Deliver to `connection` every change-log row published since its
