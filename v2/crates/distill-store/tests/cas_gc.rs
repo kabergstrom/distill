@@ -423,3 +423,45 @@ fn segment_bytes(dir: &tempfile::TempDir) -> u64 {
         })
         .sum()
 }
+
+fn segment_files(dir: &tempfile::TempDir) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir.path().join(".distill/cas"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".dsr"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// A rolled-back input makes the writer drop its segment binding (the
+/// rollback may have taken the segment's row with it). A segment whose row
+/// had committed before is still reclaimed: once nothing in it is live,
+/// compaction kills it and the sweeper deletes its file, without a restart.
+#[test]
+fn a_segment_a_rolled_back_input_left_behind_is_reclaimed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(cfg(&dir)).unwrap();
+    let (_, _, first) = commit_with_aux(&mut store, 1, &[1u8; 4096], b"dbg-1");
+    let left_behind = segment_files(&dir);
+    assert_eq!(left_behind.len(), 1, "{left_behind:?}");
+
+    // A build committed inside an input that rolls back (a plan input).
+    store.open_input().unwrap();
+    commit_with_aux(&mut store, 2, &[2u8; 4096], b"dbg-2");
+    store.finish_input(false).unwrap();
+
+    let (kept, _, _) = commit_with_aux(&mut store, 3, b"kept artifact", b"dbg-3");
+    assert!(store
+        .evict_result(KeyKind::Processor, &[1u8; 32], &first)
+        .unwrap());
+    let report = store.compact().unwrap();
+    SegmentSweeper::new(Duration::ZERO).sweep(&mut store).unwrap();
+    let remaining = segment_files(&dir);
+    assert!(
+        !remaining.contains(&left_behind[0]),
+        "{} leaked: {report:?}, {remaining:?}",
+        left_behind[0]
+    );
+    assert_eq!(store.cas_read(&kept).unwrap(), b"kept artifact");
+}

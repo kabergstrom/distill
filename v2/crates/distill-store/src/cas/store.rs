@@ -164,21 +164,35 @@ pub struct Candidate {
 
 /// This writer's CAS append state. Every writer appends to a segment of
 /// its own, so no two writers share a file offset; everything else about
-/// the segments lives in `cas_segments`.
+/// the segments lives in `cas_segments`, whose `owner` column names the
+/// writer that allocated each one.
 #[derive(Debug)]
 pub(crate) struct CasInner {
     pub(crate) dir: PathBuf,
+    /// This writer's `cas_segments.owner`: unique among the process's
+    /// writers. Startup recovery seals every open segment, so no open
+    /// segment of an earlier process carries it either.
+    owner: i64,
     /// The regular segment this writer appends to, and its length.
     active: Option<(u64, u64)>,
 }
 
 impl CasInner {
     pub(crate) fn new(dir: PathBuf) -> Self {
-        Self { dir, active: None }
+        static NEXT_OWNER: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+        Self {
+            dir,
+            owner: NEXT_OWNER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            active: None,
+        }
     }
 
     /// Stop appending to the active segment: a rolled-back transaction may
-    /// have taken its row with it. Its unindexed bytes are dead space.
+    /// have taken its row with it (and a later allocation its id). Its
+    /// unindexed bytes are dead space. A row that had committed stays open
+    /// under this writer's owner until the writer's next segment
+    /// allocation seals it ([`SEAL_OWN_SEGMENTS`]); compaction then
+    /// reclaims it like any sealed segment.
     pub(crate) fn forget_active(&mut self) {
         self.active = None;
     }
@@ -191,6 +205,12 @@ impl CasInner {
         self.active.map(|(id, _)| id)
     }
 }
+
+/// Seal the open segments writer `?1` allocated below id `?2`. The states
+/// are literals so the plan can walk the open segments' partial index.
+pub(crate) const SEAL_OWN_SEGMENTS: &str = "UPDATE cas_segments SET state = 1
+     WHERE owner = ?1 AND segment_id < ?2 AND state = 0";
+const _: () = assert!(SEGMENT_OPEN == 0 && SEGMENT_SEALED == 1);
 
 /// `cas_segments.state`: a writer may still append.
 pub(crate) const SEGMENT_OPEN: i64 = 0;
@@ -373,9 +393,9 @@ impl Store {
         meta_set_u64(&self.conn, "next_segment_id", id + 1)?;
         let name = segment_file_name(id, kind);
         self.conn.execute(
-            "INSERT INTO cas_segments(segment_id, file_name, segment_kind, indexed_len, state)
-             VALUES (?1, ?2, ?3, 0, ?4)",
-            rusqlite::params![id as i64, name, kind as i64, SEGMENT_OPEN],
+            "INSERT INTO cas_segments(segment_id, file_name, segment_kind, indexed_len, state, owner)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+            rusqlite::params![id as i64, name, kind as i64, SEGMENT_OPEN, self.cas.owner],
         )?;
         let path = self.cas.dir.join(&name);
         let f = std::fs::File::create(&path).map_err(io_err(&path))?;
@@ -398,24 +418,30 @@ impl Store {
         })
     }
 
-    /// The active segment with room for `incoming` bytes, rolling (and
-    /// sealing the previous one) at the size cap (§18's
-    /// `cas.segment_size`).
-    fn active_segment(&mut self, incoming: u64) -> Result<(u64, u64), StoreError> {
+    /// The active segment with room for `incoming` bytes, rolling at the
+    /// size cap (§18's `cas.segment_size`). A new segment's transaction
+    /// seals every open segment this writer allocated before the group in
+    /// flight did (`group_start`: the group's first allocation, if any):
+    /// the previous active one, and any that a failed transaction left
+    /// open after the writer dropped its binding.
+    fn active_segment(
+        &mut self,
+        incoming: u64,
+        group_start: Option<u64>,
+    ) -> Result<(u64, u64), StoreError> {
         if let Some((id, len)) = self.cas.active {
             if len == 0 || len + incoming <= self.config.segment_size {
                 return Ok((id, len));
             }
         }
-        let previous = self.cas.take_active();
+        self.cas.take_active();
         let id = self.write_txn(|store| {
-            if let Some(previous) = previous {
-                store.conn.execute(
-                    "UPDATE cas_segments SET state = ?2 WHERE segment_id = ?1 AND state = ?3",
-                    rusqlite::params![previous as i64, SEGMENT_SEALED, SEGMENT_OPEN],
-                )?;
-            }
-            store.create_segment(SegmentKind::Regular)
+            let id = store.create_segment(SegmentKind::Regular)?;
+            store
+                .conn
+                .prepare_cached(SEAL_OWN_SEGMENTS)?
+                .execute(rusqlite::params![store.cas.owner, group_start.unwrap_or(id) as i64])?;
+            Ok(id)
         })?;
         self.cas.active = Some((id, 0));
         Ok((id, 0))
@@ -437,13 +463,21 @@ impl Store {
     fn append_records_inner(&mut self, encoded: &[Vec<u8>]) -> Result<Appended, StoreError> {
         let mut locations = Vec::with_capacity(encoded.len());
         let mut touched: Vec<(u64, SegmentKind, u64)> = Vec::new();
+        // The group's first allocation: it and every later one hold the
+        // group's records, so no seal reaches them.
+        let mut group_start = None;
         for bytes in encoded {
             let len = bytes.len() as u64;
             let (segment, kind, offset) = if len > self.config.segment_size {
                 let id = self.write_txn(|store| store.create_segment(SegmentKind::Oversize))?;
+                group_start = group_start.or(Some(id));
                 (id, SegmentKind::Oversize, 0)
             } else {
-                let (id, offset) = self.active_segment(len)?;
+                let previous = self.cas.active_id();
+                let (id, offset) = self.active_segment(len, group_start)?;
+                if previous != Some(id) {
+                    group_start = group_start.or(Some(id));
+                }
                 (id, SegmentKind::Regular, offset)
             };
             let path = self.cas.dir.join(segment_file_name(segment, kind));

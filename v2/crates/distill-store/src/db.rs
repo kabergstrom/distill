@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 38;
+pub const SCHEMA_VERSION: u32 = 39;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -346,8 +346,13 @@ CREATE TABLE cas_segments (
     file_name   TEXT NOT NULL,
     segment_kind INTEGER NOT NULL,
     indexed_len INTEGER NOT NULL,
-    state       INTEGER NOT NULL CHECK (state IN (0, 1, 2))
+    state       INTEGER NOT NULL CHECK (state IN (0, 1, 2)),
+    -- Schema 39 (fix-cas): the writer that allocated the segment
+    -- (`CasInner::owner`), so a writer seals its own open segments.
+    owner       INTEGER
 );
+-- Schema 39 (fix-cas): each writer's open segments.
+CREATE INDEX cas_segments_open ON cas_segments(owner, segment_id) WHERE state = 0;
 CREATE TABLE pipeline_state (
     id                 INTEGER PRIMARY KEY CHECK (id = 0),
     dylib_hash         BLOB,
@@ -791,6 +796,7 @@ impl Store {
             self.joined_input_transaction(f, false)
         }));
         let _ = self.read.conn.execute_batch("ROLLBACK");
+        self.cas.forget_active();
         match out {
             Ok(out) => out.map(|(out, _)| out),
             Err(panic) => std::panic::resume_unwind(panic),

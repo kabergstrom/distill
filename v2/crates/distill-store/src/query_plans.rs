@@ -1326,3 +1326,18 @@ fn candidate_rows_search_their_bucket() {
         ]
     );
 }
+
+/// The CAS's statements, each with its exact plan: every one searches an
+/// index for the rows it answers, except the whole-index reads named here.
+#[test]
+fn cas_statements_search_their_indexes() {
+    use crate::cas::store::SEAL_OWN_SEGMENTS;
+    let (_dir, store) = store_with(10);
+    let cases: &[(&str, &[&str])] = &[(
+        SEAL_OWN_SEGMENTS,
+        &["SEARCH cas_segments USING INDEX cas_segments_open (owner=? AND segment_id<?)"],
+    )];
+    for (sql, expected) in cases {
+        assert_eq!(&store.query_plan_details(sql).unwrap(), expected, "{sql}");
+    }
+}
