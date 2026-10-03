@@ -4999,7 +4999,13 @@ keys (literal prefix and literal final segment, one shared cutter,
 `files::GlobKeys`) and is matched on the streamed rows. The filter is driven
 by its most selective indexed selector and runs as at most two statements
 whatever the namespace size — a filter with no indexed selector is one
-streamed statement over every row, never a read per row.
+streamed statement over every row, never a read per row. Those filters ask
+for the whole namespace by nature: a bare `**`, a glob with neither a
+literal prefix nor a literal final segment (bundle paths share their
+extension, so it keys nothing), and the runtime role alone (most rows are
+runtime rows; the authoring role has its partial index). A tag query is
+driven by `asset_tags`, and its poison check by the poisoned rows' partial
+index, which holds no rows while no refinement is pending or failed.
 
 One poison semantics holds for every caller. A query answers the
 non-poisoned rows of its role that match every selector, glob included. It
