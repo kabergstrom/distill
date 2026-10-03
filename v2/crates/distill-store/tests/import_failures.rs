@@ -7,8 +7,8 @@ fn watched_import_failure_is_memo_state_and_roundtrips_exact_basis() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(StoreConfig::new(dir.path().join(".distill"))).unwrap();
     let bundle = BundleUuid([7; 16]);
-    let input = store.input_version();
-    let before_memo = store.memo_seq();
+    let input = store.input_version().unwrap();
+    let before_memo = store.memo_seq().unwrap();
     let record = WatchedImportFailure {
         bundle,
         attempted_input_version: input,
@@ -19,7 +19,7 @@ fn watched_import_failure_is_memo_state_and_roundtrips_exact_basis() {
     };
 
     let seq = store.record_watched_import_failure(&record).unwrap();
-    assert_eq!(store.input_version(), input);
+    assert_eq!(store.input_version().unwrap(), input);
     assert!(seq.0 > before_memo.0);
     let loaded = store.watched_import_failure(bundle).unwrap().unwrap();
     assert_eq!(loaded.bundle, bundle);
@@ -30,7 +30,7 @@ fn watched_import_failure_is_memo_state_and_roundtrips_exact_basis() {
     assert_eq!(loaded.memo_seq, seq);
 
     assert!(store.clear_watched_import_failure(bundle).unwrap());
-    assert_eq!(store.input_version(), input);
+    assert_eq!(store.input_version().unwrap(), input);
     assert!(store.watched_import_failure(bundle).unwrap().is_none());
 }
 
@@ -41,11 +41,11 @@ fn dependency_terminal_forbids_an_importer_code_and_upsert_replaces_atomically()
     let bundle = BundleUuid([8; 16]);
     let mut record = WatchedImportFailure {
         bundle,
-        attempted_input_version: store.input_version(),
+        attempted_input_version: store.input_version().unwrap(),
         basis: vec![1],
         terminal: WatchedImportTerminal::Dependency,
         message: "missing".into(),
-        memo_seq: store.memo_seq(),
+        memo_seq: store.memo_seq().unwrap(),
     };
     let first = store.record_watched_import_failure(&record).unwrap();
     record.basis = vec![2];
@@ -65,11 +65,11 @@ fn directory_orphan_terminal_roundtrips_without_an_importer_code() {
     store
         .record_watched_import_failure(&WatchedImportFailure {
             bundle,
-            attempted_input_version: store.input_version(),
+            attempted_input_version: store.input_version().unwrap(),
             basis: vec![3],
             terminal: WatchedImportTerminal::DirectoryOrphan,
             message: "orphaned".into(),
-            memo_seq: store.memo_seq(),
+            memo_seq: store.memo_seq().unwrap(),
         })
         .unwrap();
 

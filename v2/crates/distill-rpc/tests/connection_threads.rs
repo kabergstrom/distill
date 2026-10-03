@@ -529,7 +529,7 @@ fn deltas_and_fences_reach_every_connection() {
         let Fixture { server, .. } = fixture();
         let daemon = Daemon::start(server.root());
         let address = daemon.address;
-        let since = server.current_stamp().version;
+        let since = server.current_stamp().unwrap().version;
 
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
         let (event_tx, event_rx) = mpsc::channel::<(usize, StreamEvent)>();
@@ -889,7 +889,7 @@ fn concurrent_snapshots_resolves_fetches_and_commits_stay_consistent() {
         let Fixture { server, hash, .. } = fixture();
         let daemon = Daemon::start(server.root());
         let address = daemon.address;
-        let base = server.current_stamp().version;
+        let base = server.current_stamp().unwrap().version;
         const CLIENTS: usize = 6;
         const COMMITS: u64 = 120;
 
@@ -1166,7 +1166,7 @@ fn two_connections_writing_concurrently_both_commit_in_order() {
         let server = ledger_server(Arc::clone(&backend));
         let daemon = Daemon::start(server.root());
         let address = daemon.address;
-        let start = server.current_stamp().version;
+        let start = server.current_stamp().unwrap().version;
         const WRITES: u64 = 15;
 
         let barrier = Arc::new(std::sync::Barrier::new(2));
@@ -1208,7 +1208,7 @@ fn two_connections_writing_concurrently_both_commit_in_order() {
         );
         let reader = server.handle().opener().open_reader().unwrap();
         let last = InputVersion(start.0 + 2 * WRITES);
-        assert_eq!(reader.input_version(), last);
+        assert_eq!(reader.input_version().unwrap(), last);
         assert_eq!(reader.clean_watermark().unwrap(), Some(last.0 as i64));
     });
 }
@@ -1221,7 +1221,7 @@ fn a_coordinated_commits_backend_row_and_served_projection_land_together() {
     watchdog(Duration::from_secs(60), || {
         let server = ledger_server(Arc::new(LedgerBackend::default()));
         let handle = server.handle();
-        let start = server.current_stamp().version;
+        let start = server.current_stamp().unwrap().version;
         const COMMITS: u64 = 150;
 
         let committer = {
@@ -1230,7 +1230,7 @@ fn a_coordinated_commits_backend_row_and_served_projection_land_together() {
                 // An owner of its own: this thread's writer.
                 let admin = Server::open(&handle);
                 for _ in 0..COMMITS {
-                    let base = admin.current_stamp().version;
+                    let base = admin.current_stamp().unwrap().version;
                     let next = InputVersion(base.0 + 1);
                     admin
                         .coordinated_commit(base, |store| {
@@ -1250,7 +1250,7 @@ fn a_coordinated_commits_backend_row_and_served_projection_land_together() {
                 .unwrap()
                 .begin_snapshot()
                 .unwrap();
-            let version = snapshot.input_version();
+            let version = snapshot.input_version().unwrap();
             let watermark = snapshot.clean_watermark().unwrap();
             let served = snapshot.asset_resolution(ASSET).unwrap();
             if version == start {

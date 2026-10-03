@@ -724,6 +724,50 @@ fn replace_schema_registry(
     Ok(())
 }
 
+/// The pipeline failure the `pipeline_state` failure columns hold.
+fn decode_failure(
+    failure_code: Option<i64>,
+    failure_origin: Option<i64>,
+    failure_cleanup: Option<i64>,
+    failure_identity: Option<Vec<u8>>,
+    failure_message: Option<String>,
+) -> Result<Option<PipelineFailure>, StoreError> {
+    Ok(match (
+        failure_code,
+        failure_origin,
+        failure_cleanup,
+        failure_identity,
+        failure_message,
+    ) {
+        (None, None, None, None, None) => None,
+        (Some(code), Some(origin), Some(cleanup), Some(identity), Some(message)) => Some(
+            PipelineFailure::from_wire(
+                u16::try_from(code).map_err(|_| {
+                    StoreError::InvalidPipelineFailure(
+                        crate::state::PipelineFailureDecodeError::UnknownCode(code as u16),
+                    )
+                })?,
+                u16::try_from(origin).map_err(|_| {
+                    StoreError::InvalidPipelineFailure(
+                        crate::state::PipelineFailureDecodeError::UnknownOrigin(origin as u16),
+                    )
+                })?,
+                u16::try_from(cleanup).map_err(|_| {
+                    StoreError::InvalidPipelineFailure(
+                        crate::state::PipelineFailureDecodeError::UnknownCleanup(cleanup as u16),
+                    )
+                })?,
+                exact_blob32(identity, "pipeline-failure identity")?,
+                message,
+            )
+            .map_err(StoreError::InvalidPipelineFailure)?,
+        ),
+        _ => {
+            return Err(invalid_state("pipeline failure columns are incomplete"));
+        }
+    })
+}
+
 fn load_schema_registry(
     conn: &rusqlite::Connection,
 ) -> Result<BTreeMap<TypeUuid, LogicalHash>, StoreError> {
@@ -933,42 +977,13 @@ impl StoreReader {
             None => None,
         };
 
-        let failure = match (
+        let failure = decode_failure(
             failure_code,
             failure_origin,
             failure_cleanup,
             failure_identity,
             failure_message,
-        ) {
-            (None, None, None, None, None) => None,
-            (Some(code), Some(origin), Some(cleanup), Some(identity), Some(message)) => Some(
-                PipelineFailure::from_wire(
-                    u16::try_from(code).map_err(|_| {
-                        StoreError::InvalidPipelineFailure(
-                            crate::state::PipelineFailureDecodeError::UnknownCode(code as u16),
-                        )
-                    })?,
-                    u16::try_from(origin).map_err(|_| {
-                        StoreError::InvalidPipelineFailure(
-                            crate::state::PipelineFailureDecodeError::UnknownOrigin(origin as u16),
-                        )
-                    })?,
-                    u16::try_from(cleanup).map_err(|_| {
-                        StoreError::InvalidPipelineFailure(
-                            crate::state::PipelineFailureDecodeError::UnknownCleanup(
-                                cleanup as u16,
-                            ),
-                        )
-                    })?,
-                    exact_blob32(identity, "pipeline-failure identity")?,
-                    message,
-                )
-                .map_err(StoreError::InvalidPipelineFailure)?,
-            ),
-            _ => {
-                return Err(invalid_state("pipeline failure columns are incomplete"));
-            }
-        };
+        )?;
 
         Ok(Some(match failure {
             None => match epoch {
@@ -984,6 +999,48 @@ impl StoreReader {
         }))
     }
 
+    /// The published pipeline's failure, if it has one: the failure
+    /// columns of the one `pipeline_state` row, without its epoch.
+    pub fn pipeline_failure(&self) -> Result<Option<PipelineFailure>, StoreError> {
+        let row = self
+            .conn
+            .prepare_cached(
+                "SELECT poison_code, poison_origin, poison_cleanup, poison_identity, poison_message
+                 FROM pipeline_state WHERE id = 0",
+            )?
+            .query_row([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .optional()?;
+        match row {
+            Some((code, origin, cleanup, identity, message)) => {
+                decode_failure(code, origin, cleanup, identity, message)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// The schema a ready pipeline registers for `type_uuid`: `None` when the
+    /// pipeline is not ready or registers none. One row of each table.
+    pub fn ready_schema_hash(&self, type_uuid: TypeUuid) -> Result<Option<LogicalHash>, StoreError> {
+        let hash: Option<Vec<u8>> = self
+            .conn
+            .prepare_cached(
+                "SELECT r.logical_hash FROM pipeline_state p, pipeline_schema_registry r
+                 WHERE p.id = 0 AND p.dylib_hash IS NOT NULL AND p.poison_code IS NULL
+                   AND r.type_uuid = ?1",
+            )?
+            .query_row([type_uuid.0.as_slice()], |r| r.get(0))
+            .optional()?;
+        hash.map(|hash| {
+            hash.try_into().map(LogicalHash).map_err(|_| {
+                invalid_state("a pipeline registry logical hash is not exactly 32 bytes")
+            })
+        })
+        .transpose()
+    }
+
+    /// Test hook: every tool's hash at `basis`, for a reference trace
+    /// index that checks the builds' own reads.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn tool_hashes_at(
         &self,
         basis: InputVersion,
@@ -1014,7 +1071,7 @@ impl StoreReader {
 
     /// Resolve a tool key through the ToolEpoch table (§13).
     pub fn tool(&self, key: &str) -> Result<Option<RegisteredTool>, StoreError> {
-        self.tool_at(key, self.input_version())
+        self.tool_at(key, self.input_version()?)
     }
 
     /// Resolve the last ToolEpoch mapping visible at an exact pinned input

@@ -1,16 +1,15 @@
 //! §13 asset-namespace tables: bundles (physical key + poison rows),
-//! assets + search tags, the path/primary resolution index, dependency
-//! records with selector indexes, the schema cache — and the two error
-//! shapes: bundle-scoped poison rows and namespace errors.
+//! assets + search tags, the path/primary resolution index, the schema
+//! cache — and the two error shapes: bundle-scoped poison rows and namespace errors.
 
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_store::bundles::{
-    AssetFilter,     AssetRecord, BundleMeta, DepKind, DirectoryOrigin, DirectoryRuleId, NamespaceSkeleton,
+    AssetFilter,     AssetRecord, BundleMeta, DirectoryOrigin, DirectoryRuleId, NamespaceSkeleton,
     SkeletonEntry, TagIndexUpdate,
 };
 use distill_store::files::RootId;
 use distill_store::state::{
-    ErrorScope, ReadableBundleSource, SkeletonFailureCode, NamespaceError, NamespaceErrorV1,
+    ReadableBundleSource, SkeletonFailureCode, NamespaceError, NamespaceErrorV1,
 };
 use distill_store::{Store, StoreConfig, StoreError};
 use std::collections::{BTreeMap, BTreeSet};
@@ -117,10 +116,6 @@ fn bundle_and_asset_rows_roundtrip() {
     assert!(store.entry(AssetUuid([99u8; 16])).unwrap().is_none());
     assert!(store.bundle(BundleUuid([99u8; 16])).unwrap().is_none());
     assert_eq!(store.all_bundles().unwrap(), [bundle]);
-    assert_eq!(
-        store.entries_in_bundle(BundleUuid([1; 16])).unwrap(),
-        [entry]
-    );
     assert_eq!(
         store.all_asset_bundles().unwrap(),
         BTreeMap::from([(AssetUuid([10; 16]), BundleUuid([1; 16]))])
@@ -262,7 +257,7 @@ fn upsert_asset_replaces_tags_wholesale() {
 fn tag_index_refinement_is_value_aware_and_pending_state_never_underapproximates() {
     let (_d, mut store) = store();
     seed(&mut store);
-    let (_, version) = store
+    store
         .input_transaction(|txn| txn.set_tag_index_pending(AssetUuid([10; 16]), [7; 32]))
         .unwrap();
     assert!(matches!(
@@ -272,7 +267,6 @@ fn tag_index_refinement_is_value_aware_and_pending_state_never_underapproximates
 
     store
         .refine_unpublished_tag_index(
-            version,
             &[TagIndexUpdate {
                 asset: AssetUuid([10; 16]),
                 tags: BTreeMap::from([("category".to_owned(), Some("enemy".to_owned()))]),
@@ -312,10 +306,6 @@ fn authoring_only_entries_are_visible_to_tooling_but_ineligible_at_runtime() {
 
     let metadata = store.entry(control.asset).unwrap().unwrap();
     assert!(metadata.authoring_only);
-    assert!(matches!(
-        store.runtime_entry(control.asset).unwrap_err(),
-        StoreError::RoleIneligible { asset } if asset == control.asset
-    ));
     assert!(tagged(&store, "control", None, false).unwrap().is_empty());
     assert_eq!(
         tagged(&store, "control", None, true).unwrap(),
@@ -329,10 +319,7 @@ fn authoring_only_entries_are_visible_to_tooling_but_ineligible_at_runtime() {
         err,
         StoreError::RoleIneligible { asset } if asset == control.asset
     ));
-    assert_eq!(store.resolve_path("tex/control.bundle").unwrap(), None);
-
-    let runtime = store.runtime_entry(AssetUuid([10u8; 16])).unwrap().unwrap();
-    assert!(!runtime.authoring_only);
+    assert!(store.path_assets("tex/control.bundle").unwrap().is_empty());
 }
 
 #[test]
@@ -348,90 +335,6 @@ fn remove_bundle_cascades_to_assets_and_tags() {
     assert!(store.bundle(BundleUuid([1u8; 16])).unwrap().is_none());
     assert!(store.entry(AssetUuid([10u8; 16])).unwrap().is_none());
     assert!(tagged(&store, "hero", None, false).unwrap().is_empty());
-}
-
-// ---- path resolution (§13 MetadataSnapshot::resolve_path semantics) ----
-
-#[test]
-fn resolve_path_misses_are_first_class() {
-    let (_d, mut store) = store();
-    seed(&mut store);
-    assert_eq!(store.resolve_path("absent/path.bundle").unwrap(), None);
-    assert_eq!(
-        store.resolve_path("tex/1.bundle").unwrap(),
-        Some(AssetUuid([10u8; 16]))
-    );
-}
-
-#[test]
-fn resolve_path_ambiguity_is_an_error_never_a_tiebreak() {
-    // §13: "a path resolvable in more than one asset root is Err (§18),
-    // never a tiebreak".
-    let (_d, mut store) = store();
-    seed(&mut store);
-    store
-        .input_transaction(|txn| {
-            let engine = txn.intern_root("engine")?;
-            txn.set_path_entry("tex/1.bundle", engine, AssetUuid([20u8; 16]))?;
-            Ok(())
-        })
-        .unwrap();
-    let err = store.resolve_path("tex/1.bundle").unwrap_err();
-    match err {
-        StoreError::AmbiguousPath { path, roots } => {
-            assert_eq!(path, "tex/1.bundle");
-            let mut roots = roots;
-            roots.sort();
-            assert_eq!(roots, ["engine", "main"]);
-        }
-        other => panic!("expected AmbiguousPath, got {other:?}"),
-    }
-}
-
-// ---- deps + selector indexes ----
-
-#[test]
-fn dep_records_roundtrip_by_selector() {
-    let (_d, mut store) = store();
-    seed(&mut store);
-    store
-        .input_transaction(|txn| {
-            txn.record_dep(
-                AssetUuid([10u8; 16]),
-                DepKind::Resolution,
-                "path:tex/2.bundle",
-            )?;
-            txn.record_dep(AssetUuid([10u8; 16]), DepKind::Query, "tag:hero")?;
-            txn.record_dep(AssetUuid([11u8; 16]), DepKind::Query, "tag:hero")?;
-            Ok(())
-        })
-        .unwrap();
-
-    let mut dependents = store.deps_on(DepKind::Query, "tag:hero").unwrap();
-    dependents.sort();
-    assert_eq!(dependents, [AssetUuid([10u8; 16]), AssetUuid([11u8; 16])]);
-    assert_eq!(
-        store
-            .deps_on(DepKind::Resolution, "path:tex/2.bundle")
-            .unwrap(),
-        [AssetUuid([10u8; 16])]
-    );
-    assert!(store
-        .deps_on(DepKind::Content, "path:tex/2.bundle")
-        .unwrap()
-        .is_empty());
-
-    // Re-recording clears wholesale per source.
-    store
-        .input_transaction(|txn| {
-            txn.clear_deps(AssetUuid([10u8; 16]))?;
-            Ok(())
-        })
-        .unwrap();
-    assert_eq!(
-        store.deps_on(DepKind::Query, "tag:hero").unwrap(),
-        [AssetUuid([11u8; 16])]
-    );
 }
 
 // ---- schema cache ----
@@ -451,13 +354,6 @@ fn schema_cache_roundtrips() {
         Some("{\"kind\":\"struct\"}")
     );
     assert!(store.schema(LogicalHash([6u8; 32])).unwrap().is_none());
-    assert_eq!(
-        store.all_schemas().unwrap(),
-        vec![
-            (LogicalHash([4u8; 32]), "\"unit\"".to_owned()),
-            (hash, "{\"kind\":\"struct\"}".to_owned()),
-        ]
-    );
 }
 
 // ---- bundle-scoped poison rows (§7, §13) ----
@@ -511,12 +407,6 @@ fn poisoning_a_bundle_fails_resolves_against_its_uuids() {
         store.asset_ids_in_bundle(BundleUuid([1u8; 16])).unwrap(),
         BTreeSet::from([AssetUuid([10u8; 16])])
     );
-
-    // Path resolution reaching into the poisoned bundle fails the same way.
-    assert!(matches!(
-        store.resolve_path("tex/1.bundle").unwrap_err(),
-        StoreError::BundlePoisoned { .. }
-    ));
 
     // Queries whose selectors could match the file's entries fail naming
     // the poisoned bundle — the same shape as §10's tag poisoning.
@@ -674,17 +564,8 @@ fn a_namespace_error_leaves_the_rest_of_the_namespace_readable() {
         .unwrap();
 
     assert_eq!(store.namespace_errors().unwrap(), vec![error.clone()]);
-    assert_eq!(
-        store
-            .namespace_errors_about(&ErrorScope::File {
-                root_name: "main".into(),
-                path: "broken.bundle".into(),
-            })
-            .unwrap(),
-        vec![error]
-    );
     assert!(store.entry(AssetUuid([10u8; 16])).unwrap().is_some());
-    assert!(store.resolve_path("tex/1.bundle").unwrap().is_some());
+    assert!(!store.path_assets("tex/1.bundle").unwrap().is_empty());
 
     // The next version heals.
     store

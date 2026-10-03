@@ -135,25 +135,40 @@ impl InputTxn<'_> {
     ) -> Result<Vec<NamespaceError>, StoreError> {
         let errors =
             NamespaceError::canonical_set(errors).map_err(StoreError::InvalidNamespaceError)?;
-        self.txn
-            .execute("DELETE FROM errors WHERE family = ?1", [family])?;
+        // Only the rows that change are written: a family holds the
+        // namespace's defects, and most publications change none.
+        let mut held = self
+            .txn
+            .prepare_cached("SELECT identity, record FROM errors WHERE family = ?1")?
+            .query_map([family], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)))?
+            .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
         for error in &errors {
+            let record = error
+                .persisted_bytes()
+                .map_err(StoreError::InvalidNamespaceError)?;
+            if held.remove(error.identity.as_slice()).as_ref() == Some(&record) {
+                continue;
+            }
             let scope = error.scope();
-            self.txn.execute(
-                "INSERT INTO errors(family, scope_kind, scope_id, identity, code, record, message)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![
+            self.txn
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO errors(family, scope_kind, scope_id, identity, code, record, message)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )?
+                .execute(rusqlite::params![
                     family,
                     scope.kind(),
                     scope.id(),
                     error.identity.as_slice(),
                     error.code as u16,
-                    error
-                        .persisted_bytes()
-                        .map_err(StoreError::InvalidNamespaceError)?,
+                    record,
                     error.message,
-                ],
-            )?;
+                ])?;
+        }
+        for identity in held.keys() {
+            self.txn
+                .prepare_cached("DELETE FROM errors WHERE family = ?1 AND identity = ?2")?
+                .execute(rusqlite::params![family, identity])?;
         }
         Ok(errors)
     }
@@ -166,18 +181,6 @@ impl StoreReader {
         self.decode_errors(
             "SELECT record FROM errors WHERE family IN (?1, ?2)",
             rusqlite::params![NAMESPACE, SCAN_REJECTION],
-        )
-    }
-
-    /// The namespace errors about `scope`.
-    pub fn namespace_errors_about(
-        &self,
-        scope: &ErrorScope,
-    ) -> Result<Vec<NamespaceError>, StoreError> {
-        self.decode_errors(
-            "SELECT record FROM errors
-             WHERE family IN (?1, ?2) AND scope_kind = ?3 AND scope_id = ?4",
-            rusqlite::params![NAMESPACE, SCAN_REJECTION, scope.kind(), scope.id()],
         )
     }
 

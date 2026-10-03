@@ -42,7 +42,7 @@ use distill_store::served::{encode_authored_value, ResolutionRow};
 use distill_store::state::{
     AssetClaimant, CleanupDisposition, ConfigurationState, DirectoryAliasSide, DscpV1,
     InputVersion, PipelineFailure, PipelineFailureCode, PipelineFailureOrigin,
-    PipelineState as StoredPipelineState, ReadableBundleSource, ScanFailureCode, ScanSubject,
+    ReadableBundleSource, ScanFailureCode, ScanSubject,
     SkeletonFailureCode,
 };
 use distill_store::{Store, StoreConfig, StoreError, StoreOpener, StoreReader, StoreWriter};
@@ -182,7 +182,7 @@ impl DaemonCoordinator {
                 transaction.adopt_pending_restart().map(|_| ())
             })?;
         }
-        let version = opened_store.input_version();
+        let version = opened_store.input_version()?;
         opened_store.served_transaction(|transaction| {
             use distill_store::served::ServedWrite;
             transaction.init_change_log_oldest(version)?;
@@ -547,18 +547,29 @@ impl DaemonCoordinator {
         store: &mut Store,
         changes: &[RestartOnlyChange],
     ) -> Result<PendingRestart, CoordinatorError> {
-        let pending = store
-            .stage_pending_restart(changes)
-            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        self.server.restart_required(store, pending.keys.clone());
-        Ok(pending)
+        let mut pending = None;
+        self.server
+            .restart_required(store, |store| {
+                let staged = store
+                    .stage_pending_restart(changes)
+                    .map_err(|error| error.to_string())?;
+                let keys = staged.keys.clone();
+                pending = Some(staged);
+                Ok(keys)
+            })
+            .map_err(CoordinatorError::InvalidManifest)?;
+        Ok(pending.expect("a staged restart has keys"))
     }
 
     pub fn clear_restart_configuration(&self, store: &mut Store) -> Result<(), CoordinatorError> {
-        store
-            .clear_pending_restart()
-            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        self.server.restart_required(store, Vec::new());
+        self.server
+            .restart_required(store, |store| {
+                store
+                    .clear_pending_restart()
+                    .map_err(|error| error.to_string())?;
+                Ok(Vec::new())
+            })
+            .map_err(CoordinatorError::InvalidManifest)?;
         Ok(())
     }
 
@@ -589,7 +600,7 @@ impl DaemonCoordinator {
         error: Option<ConfigurationError>,
     ) -> Result<SnapshotStamp, CoordinatorError> {
         self.loop_compiled(store)?;
-        let base = self.server.stamp_of(store).version;
+        let base = self.server.stamp_of(store)?.version;
         self.server
             .coordinated_commit(store, base, |store| {
                 let generation = configuration_generation(store).map_err(|error| error.to_string())?;
@@ -627,6 +638,10 @@ impl DaemonCoordinator {
             mut requirements,
             schema_authority,
         } = candidate;
+        // The version the candidate is derived from, read before its scan:
+        // a publication that commits while it scans makes it stale, so it
+        // never republishes rows its scan read before that write.
+        let base = self.server.stamp_of(store)?.version;
         // The candidate's own scanner: its roots never change, and it becomes
         // the candidate's compiled state.
         let scanner = self
@@ -650,6 +665,8 @@ impl DaemonCoordinator {
         } else {
             None
         };
+        #[cfg(test)]
+        compiled_tests::candidate_scanned().map_err(CoordinatorError::InvalidManifest)?;
         let mut runtime = lock_pipeline(&self.pipeline);
         let prepared_epoch = {
             let CoordinatedPipelineRuntime { host, loader, .. } = &mut *runtime;
@@ -750,7 +767,6 @@ impl DaemonCoordinator {
         };
         let tag_epoch = schema_authority.source_hash();
         let max_dependency_depth = self.operational_configuration().max_dependency_depth;
-        let base = self.server.stamp_of(store).version;
         let mut staged: Option<StagedCompiled<'_>> = None;
         let mut published_pipeline = None;
         let result = self
@@ -779,7 +795,7 @@ impl DaemonCoordinator {
                 let mut commit = match (candidate, &installed_claims) {
                     (Some(candidate), Some(claims)) => publish_scan(
                         store,
-                        store.input_version(),
+                        store.input_version().map_err(|error| error.to_string())?,
                         candidate,
                         true,
                         Some(&pipeline),
@@ -931,14 +947,14 @@ impl DaemonCoordinator {
             &failure,
             "pipeline candidate rejected; importers from it are unavailable",
         );
-        let base = self.server.stamp_of(store).version;
+        let base = self.server.stamp_of(store)?.version;
         let diagnostic = failure.clone();
         let mut staged: Option<StagedCompiled<'_>> = None;
         let result = self.server.coordinated_commit(store, base, |store| {
-            if store.input_version() != base {
+            if store.input_version().map_err(|error| error.to_string())? != base {
                 return Err(format!(
                     "durable pipeline-failure basis is {:?}, expected {base:?}",
-                    store.input_version()
+                    store.input_version().map_err(|error| error.to_string())?
                 ));
             }
             // The compiled state this version keeps but for its pipeline: the
@@ -991,7 +1007,7 @@ impl DaemonCoordinator {
     /// with no imports.
     pub fn reconcile_full_scan(&self, store: &mut Store) -> Result<SnapshotStamp, CoordinatorError> {
         let compiled = self.loop_compiled(store)?;
-        let base = self.server.stamp_of(store).version;
+        let base = self.server.stamp_of(store)?.version;
         let step = self.full_step(&compiled, store)?;
         self.pass(store, base, step, ImportScope::NONE)
             .map(|outcome| outcome.stamp)
@@ -1006,7 +1022,7 @@ impl DaemonCoordinator {
         batch: &WatcherBatch,
     ) -> Result<SnapshotStamp, CoordinatorError> {
         let compiled = self.loop_compiled(store)?;
-        let base = self.server.stamp_of(store).version;
+        let base = self.server.stamp_of(store)?.version;
         let step = self.incremental_step(&compiled, store, batch)?;
         self.pass(store, base, step, ImportScope::NONE)
             .map(|outcome| outcome.stamp)
@@ -1053,7 +1069,7 @@ impl DaemonCoordinator {
         scope: ImportScope<'_>,
     ) -> Result<Vec<BundleUuid>, CoordinatorError> {
         self.loop_compiled(store)?;
-        let base = self.server.stamp_of(store).version;
+        let base = self.server.stamp_of(store)?.version;
         let outcome = self.pass(store, base, pass::ScanStep::Unchanged, scope)?;
         if !outcome.failures.is_empty() {
             return Err(CoordinatorError::InvalidManifest(outcome.failures.join("; ")));
@@ -2259,11 +2275,11 @@ fn publish_scan(
                 .map(|poison| (bundle, poison))
         })
         .collect();
-    if store.input_version() != base {
+    if store.input_version()? != base {
         return Err(StoreError::InvalidConfiguration {
             error: format!(
                 "durable scan basis is {:?}, expected {base:?}",
-                store.input_version()
+                store.input_version()?
             ),
         });
     }
@@ -2355,7 +2371,7 @@ fn publish_scan(
         derived_outputs.clone(),
         &rpc_publishable_bundles,
     )?;
-    let mut next_pipeline = pipeline_diagnostic(store.pipeline_state()?);
+    let mut next_pipeline = pipeline_diagnostic(store.pipeline_failure()?);
     let mut configuration = None;
     store.input_transaction(|transaction| {
         // Rows are labelled with the version the input publishes, which a
@@ -2675,11 +2691,11 @@ fn publish_incremental_scan(
     projection: &PipelineProjection,
     tag_epoch: [u8; 32],
 ) -> Result<Commit, StoreError> {
-    if store.input_version() != base {
+    if store.input_version()? != base {
         return Err(StoreError::InvalidConfiguration {
             error: format!(
                 "durable incremental-scan basis is {:?}, expected {base:?}",
-                store.input_version()
+                store.input_version()?
             ),
         });
     }
@@ -2915,11 +2931,10 @@ fn prepare_incremental_publication(
         .keys()
         .map(|child| Ok((*child, store.derived_output_row(*child)?)))
         .collect::<Result<BTreeMap<_, _>, StoreError>>()?;
-    let stored_pipeline = store.pipeline_state()?;
     let mut commit = Commit {
         // Selected from the store's errors in the publishing input.
         configuration: None,
-        pipeline: Some(pipeline_diagnostic(stored_pipeline)),
+        pipeline: Some(pipeline_diagnostic(store.pipeline_failure()?)),
         namespace_errors: Some(plan.namespace_errors.clone()),
         tag_poisons: Some(BTreeMap::new()),
         ..Commit::default()
@@ -3072,6 +3087,26 @@ fn prepare_incremental_publication(
 
 /// The `files` rows `delta` writes or removes: its observation against the
 /// published rows under its affected prefixes, read from `published`.
+/// What `delta` changes against `published`, as an import overlay: only
+/// the rows that differ.
+pub(crate) fn incremental_overlay(
+    published: &StoreReader,
+    delta: &ScanDelta,
+) -> Result<crate::importer::FileOverlay, StoreError> {
+    Ok(crate::importer::FileOverlay::of_changes(
+        incremental_file_mutations(published, delta)?
+            .into_iter()
+            .map(|mutation| {
+                let row = mutation.file.map(|file| distill_store::files::ObservedFile {
+                    root_name: mutation.root_name.clone(),
+                    path: mutation.path.clone(),
+                    file,
+                });
+                ((mutation.root_name, mutation.path), row)
+            }),
+    ))
+}
+
 fn incremental_file_mutations(
     published: &StoreReader,
     delta: &ScanDelta,
@@ -3130,10 +3165,10 @@ fn bundle_summary(source: &ScannedBundle) -> Result<BundleSummary, StoreError> {
     })
 }
 
-fn pipeline_diagnostic(state: Option<StoredPipelineState>) -> PipelineDiagnostic {
-    match state {
-        Some(StoredPipelineState::Ready(_)) | None => PipelineDiagnostic::Ready,
-        Some(StoredPipelineState::Failed { error, .. }) => PipelineDiagnostic::Failed(error),
+fn pipeline_diagnostic(failure: Option<PipelineFailure>) -> PipelineDiagnostic {
+    match failure {
+        None => PipelineDiagnostic::Ready,
+        Some(error) => PipelineDiagnostic::Failed(error),
     }
 }
 
@@ -3989,7 +4024,7 @@ mod projection_tests {
     ) {
         let candidate = ScanCandidate::build(scanner.scan().unwrap(), None).unwrap();
         let claims = bundle_claims(candidate.scan.bundle_rows(), projection, None).unwrap();
-        let base = store.input_version();
+        let base = store.input_version().unwrap();
         publish_scan(store, base, candidate, false, None, projection, retyped, None, [0; 32], &claims).unwrap();
     }
 

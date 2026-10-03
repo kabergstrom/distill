@@ -18,6 +18,16 @@ type Hook = Box<dyn FnMut() -> Result<(), String>>;
 
 thread_local! {
     static CANDIDATE_STAGED: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    static CANDIDATE_SCANNED: RefCell<Option<Hook>> = const { RefCell::new(None) };
+}
+
+/// Called on the publishing thread once a configuration candidate has
+/// scanned its roots, before it takes the write lock.
+pub(super) fn candidate_scanned() -> Result<(), String> {
+    match CANDIDATE_SCANNED.with(|hook| hook.borrow_mut().take()) {
+        Some(mut hook) => hook(),
+        None => Ok(()),
+    }
 }
 
 /// Called on the publishing thread once a configuration candidate staged
@@ -169,7 +179,7 @@ fn a_failed_configuration_commit_changes_no_compiled_state() {
     let mut fixture = Fixture::new();
     let coordinator = Arc::clone(&fixture.coordinator);
     let reader = coordinator.open_reader().unwrap();
-    let version = reader.input_version();
+    let version = reader.input_version().unwrap();
     let snapshot = coordinator.open_reader().unwrap().begin_snapshot().unwrap();
     let before = coordinator.compiled_at(&reader).unwrap();
     assert_eq!(before.key(), Some(version));
@@ -199,7 +209,7 @@ fn a_failed_configuration_commit_changes_no_compiled_state() {
     // Nothing changed: the version, every reader's compiled state, the
     // registry's latest entry and the watcher's roots.
     let reader = coordinator.open_reader().unwrap();
-    assert_eq!(reader.input_version(), version);
+    assert_eq!(reader.input_version().unwrap(), version);
     assert!(Arc::ptr_eq(&coordinator.compiled_at(&reader).unwrap(), &before));
     assert!(Arc::ptr_eq(&coordinator.compiled_at(&snapshot).unwrap(), &before));
     assert!(Arc::ptr_eq(&coordinator.compiled.latest().unwrap(), &before));
@@ -226,6 +236,44 @@ fn a_failed_configuration_commit_changes_no_compiled_state() {
     assert!(optimized(&after));
     assert_eq!(root_names(&after), ["main", "extra"]);
     assert!(coordinator.scanner().has_same_roots(after.scanner()));
+}
+
+/// A publication that commits while a configuration candidate scans makes
+/// the candidate stale: it publishes nothing over that write (its scan may
+/// predate it), and the loop retries it.
+#[test]
+fn a_write_during_a_configuration_scan_makes_the_candidate_stale() {
+    let mut fixture = Fixture::new();
+    let coordinator = Arc::clone(&fixture.coordinator);
+    let assets = fixture.temp.path().join("assets");
+    {
+        let coordinator = Arc::clone(&coordinator);
+        CANDIDATE_SCANNED.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(assets.join("written.txt"), b"x").unwrap();
+                let mut other = coordinator.open_writer().unwrap();
+                coordinator.reconcile_full_scan(&mut other).unwrap();
+                Ok(())
+            }))
+        });
+    }
+    let written = coordinator.open_reader().unwrap().input_version().unwrap();
+    let candidate = fixture.candidate(true, true);
+    let published = coordinator.publish_configuration_candidate(&mut fixture.writer, candidate);
+    assert!(
+        matches!(
+            published,
+            Err(CoordinatorError::Coordinated(
+                distill_rpc::CoordinatedCommitError::Stale { .. }
+            ))
+        ),
+        "{published:?}"
+    );
+    assert_eq!(
+        coordinator.open_reader().unwrap().input_version().unwrap(),
+        InputVersion(written.0 + 1),
+        "only the write published"
+    );
 }
 
 #[test]
@@ -559,7 +607,7 @@ fn publish_completely(
     let authority = &*configuration.authority;
     let candidate = ScanCandidate::build(scanner.scan().unwrap(), Some(authority)).unwrap();
     let claims = bundle_claims(candidate.scan.bundle_rows(), &configuration.projection, Some(authority)).unwrap();
-    let base = store.input_version();
+    let base = store.input_version().unwrap();
     publish_scan(
         store,
         base,

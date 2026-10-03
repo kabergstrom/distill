@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 38;
+pub const SCHEMA_VERSION: u32 = 39;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -102,6 +102,12 @@ CREATE TABLE source_claims (
     PRIMARY KEY (root_id, path, kind, subject, claimant)
 );
 CREATE INDEX source_claims_by_subject ON source_claims(kind, subject);
+-- Schema 39: the claims an asset makes (a primary path's claimant), for
+-- the sources an asset change makes pending. Led by the claimant: led by
+-- `kind`, it would serve a `DISTINCT claimant` of one kind in order, and
+-- the planner would walk the kind's every claim instead of searching
+-- `source_claims_by_subject`.
+CREATE INDEX source_claims_by_claimant ON source_claims(claimant, kind);
 -- Per-entity errors (see `errors`): one row per current defect. `family`
 -- is the producer that owns the row (1 scan namespace, 2 the pending scan
 -- rejection's namespace errors, 3 its configuration error, 4 the
@@ -117,7 +123,6 @@ CREATE TABLE errors (
     message    TEXT NOT NULL,
     PRIMARY KEY (family, identity)
 );
-CREATE INDEX errors_by_scope ON errors(scope_kind, scope_id);
 -- The physical subjects (platform path encoding) whose revalidation heals
 -- the pending scan rejection.
 CREATE TABLE scan_rejection_subjects (
@@ -158,9 +163,13 @@ CREATE TABLE directory_rule_sources (
     rules_asset  BLOB NOT NULL,
     root_id      INTEGER NOT NULL,
     path         TEXT NOT NULL,
+    -- The directory, ending in `/` (`''` for the whole root), that every
+    -- path the rules' listing matches is under.
+    listing_dir  TEXT NOT NULL,
     PRIMARY KEY (rules_bundle, rules_asset)
 );
 CREATE INDEX directory_rule_sources_by_source ON directory_rule_sources(root_id, path);
+CREATE INDEX directory_rule_sources_by_listing ON directory_rule_sources(listing_dir);
 CREATE TABLE dirty_files (
     seq         INTEGER PRIMARY KEY AUTOINCREMENT,
     root_id     INTEGER NOT NULL,
@@ -168,6 +177,8 @@ CREATE TABLE dirty_files (
     exists_flag INTEGER NOT NULL,
     observation INTEGER NOT NULL
 );
+-- Schema 39: acknowledging a pass's work deletes by path.
+CREATE INDEX dirty_files_by_path ON dirty_files(root_id, path);
 CREATE TABLE rename_events (
     seq       INTEGER PRIMARY KEY AUTOINCREMENT,
     root_id   INTEGER NOT NULL,
@@ -241,8 +252,6 @@ CREATE INDEX assets_by_bundle ON assets(bundle_uuid, local_id, asset_uuid);
 -- Build traces query assets by authored and terminal type (§9).
 CREATE INDEX assets_by_type ON assets(type_uuid);
 CREATE INDEX assets_by_terminal_type ON assets(terminal_type) WHERE terminal_type IS NOT NULL;
--- Skeleton rows (and only they) lack a logical hash.
-CREATE INDEX assets_unhashed ON assets(asset_uuid) WHERE logical_hash IS NULL;
 -- Assets by local id alone: a reserved entry (`$record`, `$settings`)
 -- across bundles, or a query naming only a local id.
 CREATE INDEX assets_by_local_id ON assets(local_id);
@@ -286,13 +295,6 @@ CREATE TABLE path_index (
     PRIMARY KEY (path, root_id)
 );
 CREATE INDEX path_index_by_asset ON path_index(asset_uuid);
-CREATE TABLE deps (
-    src_uuid BLOB NOT NULL,
-    kind     INTEGER NOT NULL,
-    target   TEXT NOT NULL,
-    PRIMARY KEY (src_uuid, kind, target)
-);
-CREATE INDEX deps_by_target ON deps(kind, target);
 CREATE TABLE schemas (
     logical_hash BLOB NOT NULL PRIMARY KEY,
     schema_json  TEXT NOT NULL
@@ -604,32 +606,20 @@ impl Store {
         let db_path = state_path.join("meta.sqlite");
         let conn = open_writer_connection(&db_path)?;
 
-        let found: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if found == 0 {
-            conn.execute_batch(DDL)?;
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        } else if found != SCHEMA_VERSION {
-            return Err(StoreError::SchemaVersionMismatch {
-                found,
-                supported: SCHEMA_VERSION,
-            });
-        }
-
-        // Bootstrap identity + counters.
-        let instance_id = match meta_get_blob(&conn, "instance_id")? {
-            Some(bytes) if bytes.len() == 16 => {
-                let mut id = [0u8; 16];
-                id.copy_from_slice(&bytes);
-                StoreInstanceId(id)
+        // The schema and the store's identity are created in one
+        // transaction (SQLite DDL is transactional): a first open that
+        // fails part-way leaves no partial schema behind.
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let instance_id = match create_schema(&conn) {
+            Ok(instance_id) => {
+                conn.execute_batch("COMMIT")?;
+                instance_id
             }
-            _ => {
-                let id = StoreInstanceId::mint();
-                meta_set_blob(&conn, "instance_id", &id.0)?;
-                id
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(error);
             }
         };
-        meta_get_u64_or_init(&conn, "input_version")?;
-        meta_get_u64_or_init(&conn, "memo_seq")?;
 
         let mut store = Store {
             read: StoreReader {
@@ -647,8 +637,8 @@ impl Store {
         let recovery = store.recover_cas()?;
         tracing::info!(
             path = %store.config.state_path.display(),
-            input_version = store.input_version().0,
-            memo_seq = store.memo_seq().0,
+            input_version = store.input_version()?.0,
+            memo_seq = store.memo_seq()?.0,
             recovery = ?recovery,
             "store opened"
         );
@@ -774,29 +764,6 @@ impl Store {
         }
     }
 
-    /// Run the same exact-basis validation surface as an input transaction,
-    /// then roll every database mutation back. Coordinators use this before a
-    /// journaled filesystem swap when the authoritative store transition is
-    /// intentionally checked a second time in the publishing transaction.
-    pub fn preview_input_transaction<T, F>(&mut self, f: F) -> Result<T, StoreError>
-    where
-        F: FnOnce(&mut InputTxn<'_>) -> Result<T, StoreError>,
-    {
-        if !self.read.conn.is_autocommit() {
-            return self.joined_input_transaction(f, false).map(|(out, _)| out);
-        }
-        self.refresh_config();
-        self.read.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.joined_input_transaction(f, false)
-        }));
-        let _ = self.read.conn.execute_batch("ROLLBACK");
-        match out {
-            Ok(out) => out.map(|(out, _)| out),
-            Err(panic) => std::panic::resume_unwind(panic),
-        }
-    }
-
     /// `f` as a savepoint in the open input (or, with none open, in a
     /// transaction of its own), kept only when `keep`.
     fn joined_input_transaction<T, F>(
@@ -826,6 +793,7 @@ impl Store {
             version,
             state_path,
             config,
+            roots: std::collections::BTreeMap::new(),
         };
         let out = f(&mut input_txn)?;
         if keep {
@@ -884,11 +852,11 @@ impl Store {
         let state = std::mem::replace(&mut self.input, InputState::Closed);
         let InputState::Begun { base } = state else {
             assert_eq!(state, InputState::Armed, "an input is armed");
-            return Ok(self.input_version());
+            return Ok(self.input_version()?);
         };
         if keep {
             match self.read.conn.execute_batch("COMMIT") {
-                Ok(()) => return Ok(self.input_version()),
+                Ok(()) => return Ok(self.input_version()?),
                 Err(error) => {
                     let _ = self.read.conn.execute_batch("ROLLBACK");
                     self.cas.forget_active();
@@ -903,19 +871,38 @@ impl Store {
 
     /// Run `f` as one write transaction: `BEGIN IMMEDIATE` when none is
     /// open, so the transaction holds SQLite's write lock from its first
-    /// read and never upgrades a read snapshot; inside an open one `f` joins
-    /// it. On failure everything `f` wrote rolls back with the enclosing
-    /// transaction, and this writer forgets its active segment, whose row
+    /// read and never upgrades a read snapshot; inside an open one, a
+    /// savepoint in it. On failure everything `f` wrote rolls back (a nested
+    /// one only its own writes, so a caller that handles the error commits
+    /// none of them), and this writer forgets its active segment, whose row
     /// may have been part of it.
     pub(crate) fn write_txn<T>(
         &mut self,
         f: impl FnOnce(&mut Store) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         if !self.read.conn.is_autocommit() {
-            let out = f(self);
-            if out.is_err() {
-                self.cas.forget_active();
-            }
+            self.read.conn.execute_batch("SAVEPOINT write_txn")?;
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+            let out = match out {
+                Ok(Ok(value)) => match self.read.conn.execute_batch("RELEASE write_txn") {
+                    Ok(()) => return Ok(value),
+                    Err(error) => Err(error.into()),
+                },
+                Ok(Err(error)) => Err(error),
+                Err(panic) => {
+                    let _ = self
+                        .read
+                        .conn
+                        .execute_batch("ROLLBACK TO write_txn; RELEASE write_txn");
+                    self.cas.forget_active();
+                    std::panic::resume_unwind(panic)
+                }
+            };
+            let _ = self
+                .read
+                .conn
+                .execute_batch("ROLLBACK TO write_txn; RELEASE write_txn");
+            self.cas.forget_active();
             return out;
         }
         self.refresh_config();
@@ -998,6 +985,36 @@ impl Store {
             Ok((out, seq))
         })
     }
+}
+
+/// Create the schema on a fresh database (or check its version), and the
+/// store's identity and counters, inside the caller's transaction.
+fn create_schema(conn: &Connection) -> Result<StoreInstanceId, StoreError> {
+    let found: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if found == 0 {
+        conn.execute_batch(DDL)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    } else if found != SCHEMA_VERSION {
+        return Err(StoreError::SchemaVersionMismatch {
+            found,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    let instance_id = match meta_get_blob(conn, "instance_id")? {
+        Some(bytes) if bytes.len() == 16 => {
+            let mut id = [0u8; 16];
+            id.copy_from_slice(&bytes);
+            StoreInstanceId(id)
+        }
+        _ => {
+            let id = StoreInstanceId::mint();
+            meta_set_blob(conn, "instance_id", &id.0)?;
+            id
+        }
+    };
+    meta_get_u64_or_init(conn, "input_version")?;
+    meta_get_u64_or_init(conn, "memo_seq")?;
+    Ok(instance_id)
 }
 
 impl StoreReader {
@@ -1127,35 +1144,22 @@ impl StoreReader {
     }
 
     /// The committed input version visible to this connection.
-    ///
-    /// Infallible for now: the phase-3+ rewrites of its callers make it
-    /// return `Result`. A failing single-row read of `store_meta` on an
-    /// open connection means the database is gone or corrupt.
-    pub fn input_version(&self) -> InputVersion {
-        InputVersion(
-            meta_get_u64(&self.conn, "input_version")
-                .expect("store_meta.input_version is readable")
-                .unwrap_or(0),
-        )
+    pub fn input_version(&self) -> Result<InputVersion, StoreError> {
+        Ok(InputVersion(meta_get_u64(&self.conn, "input_version")?.unwrap_or(0)))
     }
 
-    /// The committed memo sequence visible to this connection. See
-    /// [`StoreReader::input_version`] on infallibility.
-    pub fn memo_seq(&self) -> MemoSeq {
-        MemoSeq(
-            meta_get_u64(&self.conn, "memo_seq")
-                .expect("store_meta.memo_seq is readable")
-                .unwrap_or(0),
-        )
+    /// The committed memo sequence visible to this connection.
+    pub fn memo_seq(&self) -> Result<MemoSeq, StoreError> {
+        Ok(MemoSeq(meta_get_u64(&self.conn, "memo_seq")?.unwrap_or(0)))
     }
 
     /// The instance-qualified current version (§13): what crosses the
     /// RPC boundary.
-    pub fn stamp(&self) -> SnapshotStamp {
-        SnapshotStamp {
+    pub fn stamp(&self) -> Result<SnapshotStamp, StoreError> {
+        Ok(SnapshotStamp {
             instance: self.instance_id,
-            version: self.input_version(),
-        }
+            version: self.input_version()?,
+        })
     }
 
     /// §14's clean watermark: the newest mtime observed under active
@@ -1185,6 +1189,10 @@ pub struct InputTxn<'a> {
     version: InputVersion,
     pub(crate) state_path: PathBuf,
     config: Arc<StoreConfig>,
+    /// The root ids this transaction interned or looked up, by name: a
+    /// memo of this transaction only (it rolls back with it), so a
+    /// publication's rows name their root without a lookup each.
+    pub(crate) roots: std::collections::BTreeMap<String, crate::files::RootId>,
 }
 
 impl InputTxn<'_> {
@@ -1272,35 +1280,33 @@ fn create_dir(path: &Path) -> Result<(), StoreError> {
 
 pub(crate) fn meta_get_blob(conn: &Connection, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
     Ok(conn
-        .query_row("SELECT value FROM store_meta WHERE key = ?1", [key], |r| {
-            r.get(0)
-        })
+        .prepare_cached("SELECT value FROM store_meta WHERE key = ?1")?
+        .query_row([key], |r| r.get(0))
         .optional()?)
 }
 
 pub(crate) fn meta_set_blob(conn: &Connection, key: &str, value: &[u8]) -> Result<(), StoreError> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO store_meta(key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        rusqlite::params![key, value],
-    )?;
+    )?
+    .execute(rusqlite::params![key, value])?;
     Ok(())
 }
 
 pub(crate) fn meta_get_i64(conn: &Connection, key: &str) -> Result<Option<i64>, StoreError> {
     Ok(conn
-        .query_row("SELECT value FROM store_meta WHERE key = ?1", [key], |r| {
-            r.get(0)
-        })
+        .prepare_cached("SELECT value FROM store_meta WHERE key = ?1")?
+        .query_row([key], |r| r.get(0))
         .optional()?)
 }
 
 pub(crate) fn meta_set_i64(conn: &Connection, key: &str, value: i64) -> Result<(), StoreError> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO store_meta(key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        rusqlite::params![key, value],
-    )?;
+    )?
+    .execute(rusqlite::params![key, value])?;
     Ok(())
 }
 

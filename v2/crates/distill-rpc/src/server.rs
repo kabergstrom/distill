@@ -364,7 +364,7 @@ impl ServerHandle {
                 }
                 ApplyError::Store(error) => error,
             };
-            let observed = store.input_version();
+            let observed = store.input_version().map_err(PublishError::Store)?;
             let base = base.unwrap_or(observed);
             let result = if full || observed == base {
                 let mode = if full { ApplyMode::Full } else { ApplyMode::Delta };
@@ -421,66 +421,64 @@ impl ServerHandle {
     }
 
     /// Change served state in one transaction, optionally as a new (empty)
-    /// input version.
-    fn write_served<T>(
+    /// input version. `job` says whether it changed anything: a version
+    /// that would change nothing rolls back and is not published.
+    fn write_served(
         &self,
         store: &mut Store,
         new_version: bool,
-        job: impl FnOnce(&mut dyn ServedWriteObj) -> Result<T, StoreError>,
-    ) -> T {
+        job: impl FnOnce(&mut dyn ServedWriteObj) -> Result<bool, StoreError>,
+    ) -> bool {
+        let mut unchanged = false;
         let result = if new_version {
             store
-                .input_transaction(|txn| job(txn))
-                .map(|(value, _)| value)
+                .input_transaction(|txn| {
+                    if job(txn)? {
+                        return Ok(true);
+                    }
+                    unchanged = true;
+                    Err(StoreError::Rejected {
+                        detail: "the served state is unchanged".to_owned(),
+                    })
+                })
+                .map(|(changed, _)| changed)
         } else {
             store.served_transaction(|txn| job(txn))
         };
-        let value = result.unwrap_or_else(|error| panic!("RPC store write failed: {error}"));
+        let changed = match result {
+            Ok(changed) => changed,
+            Err(_) if unchanged => false,
+            Err(error) => panic!("RPC store write failed: {error}"),
+        };
         // Inside an open input, readers are told once it commits.
-        if !store.input_open() {
+        if changed && !store.input_open() {
             self.notify_published();
         }
-        value
+        changed
     }
 }
 
 /// [`ServedWrite`] made object safe by delegation.
 trait ServedWriteObj {
-    fn runtime_failure(&mut self, failure: PipelineFailure) -> Result<bool, StoreError>;
-    fn restart(&mut self, keys: &[String]) -> Result<bool, StoreError>;
-    fn target(
-        &mut self,
-        name: &str,
-        hash: TargetDefinitionHash,
-    ) -> Result<Option<bool>, StoreError>;
+    fn target(&mut self, name: &str, hash: TargetDefinitionHash) -> Result<bool, StoreError>;
     fn protocol_epoch(&mut self, epoch: u32) -> Result<bool, StoreError>;
-    fn discard_before(&mut self, oldest: InputVersion) -> Result<(), StoreError>;
+    fn discard_before(&mut self, oldest: InputVersion) -> Result<bool, StoreError>;
 }
 
 impl<W: ServedWrite> ServedWriteObj for W {
-    fn runtime_failure(&mut self, failure: PipelineFailure) -> Result<bool, StoreError> {
-        publish_runtime_pipeline_failure(self, failure)
-    }
-
-    fn restart(&mut self, keys: &[String]) -> Result<bool, StoreError> {
-        publish_restart_required(self, keys)
-    }
-
-    fn target(
-        &mut self,
-        name: &str,
-        hash: TargetDefinitionHash,
-    ) -> Result<Option<bool>, StoreError> {
-        publish_target(self, name, hash)
+    /// Whether the known target `name` now has `hash`.
+    fn target(&mut self, name: &str, hash: TargetDefinitionHash) -> Result<bool, StoreError> {
+        Ok(publish_target(self, name, hash)? == Some(true))
     }
 
     fn protocol_epoch(&mut self, epoch: u32) -> Result<bool, StoreError> {
         publish_protocol_epoch(self, epoch)
     }
 
-    fn discard_before(&mut self, oldest: InputVersion) -> Result<(), StoreError> {
+    fn discard_before(&mut self, oldest: InputVersion) -> Result<bool, StoreError> {
         let current = self.change_version();
-        self.discard_change_log_before(InputVersion(oldest.0.min(current.0)))
+        self.discard_change_log_before(InputVersion(oldest.0.min(current.0)))?;
+        Ok(true)
     }
 }
 
@@ -711,7 +709,7 @@ impl Server {
         self.inner.handle.instance
     }
 
-    pub fn current_stamp(&self) -> SnapshotStamp {
+    pub fn current_stamp(&self) -> Result<SnapshotStamp, StoreError> {
         self.inner.current_stamp()
     }
 
@@ -779,36 +777,57 @@ impl ServerHandle {
         if failure.origin != PipelineFailureOrigin::PublishedRuntime {
             return Err("runtime failure publication requires PublishedRuntime origin".to_owned());
         }
-        let (_, current) = store
-            .served_blob(SERVED_PIPELINE)
-            .and_then(read_served_pipeline)
-            .map_err(|error| error.to_string())?;
-        match &current {
-            PipelineDiagnostic::Ready => {}
-            PipelineDiagnostic::Failed(existing) if existing == &failure => return Ok(()),
-            other => {
-                return Err(format!(
-                    "current RPC pipeline is not the observed ready epoch: {other:?}"
-                ))
-            }
+        // The durable failure and the served fence commit together.
+        let changed = store.write_transaction_with(
+            |error| error.to_string(),
+            |store| {
+                let (_, current) = store
+                    .served_blob(SERVED_PIPELINE)
+                    .and_then(read_served_pipeline)
+                    .map_err(|error| error.to_string())?;
+                match &current {
+                    PipelineDiagnostic::Ready => {}
+                    PipelineDiagnostic::Failed(existing) if existing == &failure => {
+                        return Ok(false)
+                    }
+                    other => {
+                        return Err(format!(
+                            "current RPC pipeline is not the observed ready epoch: {other:?}"
+                        ))
+                    }
+                }
+                persist(store)?;
+                store
+                    .served_transaction(|txn| publish_runtime_pipeline_failure(txn, failure))
+                    .map_err(|error| error.to_string())
+            },
+        )?;
+        // Inside an open input, readers are told once it commits.
+        if changed && !store.input_open() {
+            self.notify_published();
         }
-        persist(store)?;
-        self.write_served(store, false, move |txn| txn.runtime_failure(failure));
         Ok(())
     }
 
     /// The version `store` is at, as this server stamps it.
-    pub fn stamp_of(&self, store: &StoreReader) -> SnapshotStamp {
-        SnapshotStamp {
+    pub fn stamp_of(&self, store: &StoreReader) -> Result<SnapshotStamp, StoreError> {
+        Ok(SnapshotStamp {
             instance: self.instance,
-            version: store.input_version(),
-        }
+            version: store.input_version()?,
+        })
     }
 
     /// Advance the protocol epoch and fence every existing connection.
     pub fn replace_protocol_epoch(&self, store: &mut Store, protocol_epoch: u32) -> SnapshotStamp {
         self.write_served(store, true, move |txn| txn.protocol_epoch(protocol_epoch));
+        self.written_stamp(store)
+    }
+
+    /// The version `store` is at after [`Self::write_served`], under its
+    /// policy: a store that fails the write's own read is a failed write.
+    fn written_stamp(&self, store: &StoreReader) -> SnapshotStamp {
         self.stamp_of(store)
+            .unwrap_or_else(|error| panic!("RPC store read failed: {error}"))
     }
 
     /// Validate and publish one artifact with its typed direct load edges.
@@ -1110,21 +1129,37 @@ impl ServerHandle {
         let known = store.rpc_target(&name).map_err(|_| AdminError::UnknownTarget {
             target: name.clone(),
         })?;
-        match known {
-            None => return Err(AdminError::UnknownTarget { target: name }),
-            Some(row) if row.definition_hash == hash.0 => return Ok(self.stamp_of(store)),
-            Some(_) => {}
+        if known.is_none() {
+            return Err(AdminError::UnknownTarget { target: name });
         }
-        let changed = self.write_served(store, true, move |txn| txn.target(&name, hash));
-        debug_assert_eq!(changed, Some(true));
-        Ok(self.stamp_of(store))
+        // Rechecked inside the transaction: an unchanged definition
+        // publishes no version.
+        self.write_served(store, true, move |txn| txn.target(&name, hash));
+        Ok(self.written_stamp(store))
     }
 
-    /// Stage a valid restart-only edit. This does not advance the input
-    /// version or mutate active configuration values.
-    pub fn restart_required(&self, store: &mut Store, keys: Vec<String>) -> SnapshotStamp {
-        self.write_served(store, false, move |txn| txn.restart(&keys));
-        self.stamp_of(store)
+    /// Stage a restart-only edit (`stage` returns its keys) and serve its
+    /// RestartRequired keys, in one transaction. This does not advance the
+    /// input version or mutate active configuration values.
+    pub fn restart_required(
+        &self,
+        store: &mut Store,
+        stage: impl FnOnce(&mut Store) -> Result<Vec<String>, String>,
+    ) -> Result<SnapshotStamp, String> {
+        let changed = store.write_transaction_with(
+            |error| error.to_string(),
+            |store| {
+                let keys = stage(store)?;
+                store
+                    .served_transaction(|txn| publish_restart_required(txn, &keys))
+                    .map_err(|error| error.to_string())
+            },
+        )?;
+        // Inside an open input, readers are told once it commits.
+        if changed && !store.input_open() {
+            self.notify_published();
+        }
+        self.stamp_of(store).map_err(|error| error.to_string())
     }
 }
 
@@ -1224,7 +1259,8 @@ impl Server {
     }
 
     pub fn restart_required(&self, keys: Vec<String>) -> SnapshotStamp {
-        self.with_writer(|store| self.inner.handle.restart_required(store, keys))
+        self.with_writer(|store| self.inner.handle.restart_required(store, |_| Ok(keys)))
+            .unwrap_or_else(|error| panic!("RPC store write failed: {error}"))
     }
 }
 
@@ -1525,11 +1561,11 @@ impl Inner {
         job(writer)
     }
 
-    pub(crate) fn current_stamp(&self) -> SnapshotStamp {
-        SnapshotStamp {
+    pub(crate) fn current_stamp(&self) -> Result<SnapshotStamp, StoreError> {
+        Ok(SnapshotStamp {
             instance: self.handle.instance,
-            version: self.reader.input_version(),
-        }
+            version: self.reader.input_version()?,
+        })
     }
 
     /// Read several facts from one committed version.
@@ -1544,7 +1580,7 @@ impl Inner {
     /// version on this front end share it; each new version opens a read
     /// transaction on a connection of its own.
     pub(crate) fn current_snapshot(&self) -> Result<Rc<SnapshotTxn>, StoreError> {
-        let current = self.reader.input_version();
+        let current = self.reader.input_version()?;
         if let Some(txn) = self.current_txn.borrow().upgrade() {
             if txn.stamp.version == current {
                 return Ok(txn);

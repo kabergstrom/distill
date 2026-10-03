@@ -73,16 +73,17 @@ fn file_rows_roundtrip_and_are_keyed_per_root() {
     assert_eq!(a.kind, FileKind::File);
     assert_eq!(a.content_hash, Some(ContentHash([3u8; 32])));
     assert!(store.file(main, "absent").unwrap().is_none());
+    let _ = (main, engine);
     assert_eq!(
         store
-            .all_files()
+            .observed_files()
             .unwrap()
             .into_iter()
-            .map(|(root, path, state)| (root, path, state.mtime))
+            .map(|row| (row.root_name, row.path, row.file.state.mtime))
             .collect::<Vec<_>>(),
         [
-            (main, "tex/rock.bundle".to_owned(), 100),
-            (engine, "tex/rock.bundle".to_owned(), 200),
+            ("engine".to_owned(), "tex/rock.bundle".to_owned(), 200),
+            ("main".to_owned(), "tex/rock.bundle".to_owned(), 100),
         ]
     );
 }
@@ -190,11 +191,11 @@ fn pending_file_work_acknowledges_only_the_observed_sequence_prefix() {
             transaction.push_rename(root, "later.bundle", "last.bundle")
         })
         .unwrap();
-    let version = store.input_version();
+    let version = store.input_version().unwrap();
     let acknowledged = store.acknowledge_file_work(&observed).unwrap();
     assert!(acknowledged);
     assert_eq!(
-        store.input_version(),
+        store.input_version().unwrap(),
         version,
         "internal queue acknowledgement is unversioned"
     );

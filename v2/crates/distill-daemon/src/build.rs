@@ -876,6 +876,12 @@ impl BuildError {
         Self::Infrastructure(format!("{error:?}"))
     }
 
+    /// A failure of the store or the runtime rather than of the inputs:
+    /// the same work may succeed when retried, so it records no outcome.
+    fn is_transient(&self) -> bool {
+        matches!(self, Self::Infrastructure(_) | Self::Unavailable(_))
+    }
+
     fn deterministic(message: impl Into<String>, facts: DslfV1) -> Self {
         Self::Deterministic {
             message: message.into(),
@@ -1040,7 +1046,7 @@ impl<'s> BuildContext<'s> {
                 BuildStores::Worker { view, .. } => StoreRead::Reader(view),
                 BuildStores::Inline(store) => StoreRead::Borrowed(store.borrow()),
             };
-            let version = read.input_version();
+            let version = read.input_version().map_err(BuildError::infrastructure)?;
             (version, read.state_path().join(runs))
         };
         Ok(Self {
@@ -1604,7 +1610,9 @@ pub(crate) fn type_tag_epochs(authority: &ProjectSchemaAuthority) -> BTreeMap<Ty
 /// what refining it would write, so a publication costs the rows it changed.
 /// Assets `commit` removes become tag removals. If refining fails, every
 /// asset it set out to refine is poisoned, in the store and in `commit`
-/// alike; a failure to write that poison fails the publication.
+/// alike; a failure to write that poison fails the publication. A transient
+/// failure (the store's or the runtime's) poisons nothing: it fails the
+/// publication, whose input rolls back.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn refine_tag_index(
     input: OpenInput<'_>,
@@ -1657,7 +1665,11 @@ pub(crate) fn refine_tag_index(
         &assets,
     ) {
         Ok(indexed) => indexed,
-        Err(error) => poison_tag_index(store, &assets, tag_epoch, &error)?,
+        Err(error) if error.is_transient() => {
+            return Err(format!("refine the tag index: {error:?}"))
+        }
+        Err(BuildError::Failed(error)) => poison_tag_index(store, &assets, tag_epoch, &error)?,
+        Err(error) => poison_tag_index(store, &assets, tag_epoch, &format!("{error:?}"))?,
     };
     indexed.removed = removed;
     indexed.apply(commit);
@@ -1686,7 +1698,7 @@ fn poison_tag_index(
         })
         .collect::<Vec<_>>();
     store
-        .refine_unpublished_tag_index(store.input_version(), &updates)
+        .refine_unpublished_tag_index(&updates)
         .map_err(|error| format!("poison the tag index: {error}"))?;
     Ok(PublishedTagIndex::conservatively_poisoned(assets))
 }
@@ -1707,7 +1719,7 @@ impl TagBundle {
     ) -> Result<(EntryMeta, Arc<Bundle>, AssetEntry), BuildError> {
         let meta = store
             .entry(asset)
-            .map_err(BuildError::failed)?
+            .map_err(BuildError::infrastructure)?
             .ok_or_else(|| BuildError::Failed(format!("asset {asset} is missing")))?;
         if self.0.as_ref().is_none_or(|(bundle, _)| *bundle != meta.bundle) {
             #[cfg(test)]
@@ -1769,13 +1781,16 @@ fn try_refine_tag_index(
     targets: &BTreeMap<String, Target>,
     max_depth: usize,
     assets: &BTreeMap<AssetUuid, BundleUuid>,
-) -> Result<PublishedTagIndex, String> {
+) -> Result<PublishedTagIndex, BuildError> {
     let tag_epoch = authority.source_hash();
     #[cfg(test)]
     if tests::FAIL_TAG_REFINEMENT.with(|fail| fail.replace(false)) {
-        return Err("injected tag-index refinement failure".to_owned());
+        return Err(BuildError::Failed("injected tag-index refinement failure".to_owned()));
     }
-    let basis = store.input_version();
+    #[cfg(test)]
+    if tests::FAIL_TAG_REFINEMENT_TRANSIENT.with(|fail| fail.replace(false)) {
+        return Err(BuildError::Infrastructure("injected store failure".to_owned()));
+    }
     // A bundle's assets one after another, so each bundle is parsed once.
     let mut order = assets
         .iter()
@@ -1790,7 +1805,7 @@ fn try_refine_tag_index(
                 target.clone(),
                 max_depth,
             )
-            .map_err(|error| format!("tag-index pipeline map: {error:?}"))?,
+            .map_err(|error| BuildError::Failed(format!("tag-index pipeline map: {error:?}")))?,
         ),
         _ => None,
     };
@@ -1809,9 +1824,12 @@ fn try_refine_tag_index(
             false,
             "tag-index-runs",
         )
-        .map_err(|error| format!("pin tag-index tools: {error:?}"))?;
+        .map_err(|error| match error {
+            error if error.is_transient() => error,
+            error => BuildError::Failed(format!("pin tag-index tools: {error:?}")),
+        })?;
         for (bundle, asset) in order {
-            match index_one_tag_entry(&mut context, &mut loaded, asset, tag_epoch) {
+            match index_one_tag_entry(&mut context, &mut loaded, asset, tag_epoch)? {
                 Ok(update) => {
                     tags.insert(asset, update.tags.clone());
                     updates.push(update);
@@ -1836,10 +1854,12 @@ fn try_refine_tag_index(
             |error| error.to_string(),
         );
         for (bundle, asset) in order {
+            let loaded = match loaded.load(store, &scanner, asset) {
+                Err(error) if error.is_transient() => return Err(error),
+                loaded => loaded,
+            };
             let direct = (|| {
-                let (_, _, entry) = loaded
-                    .load(store, &scanner, asset)
-                    .map_err(|error| (format!("{error:?}"), false))?;
+                let (_, _, entry) = loaded.map_err(|error| (format!("{error:?}"), false))?;
                 let project = authority.project_type(entry.type_uuid).ok_or_else(|| {
                     (
                         format!("type {} has no project schema authority", entry.type_uuid),
@@ -1885,8 +1905,8 @@ fn try_refine_tag_index(
         }
     }
     store
-        .refine_unpublished_tag_index(basis, &updates)
-        .map_err(|error| format!("publish tag index: {error}"))?;
+        .refine_unpublished_tag_index(&updates)
+        .map_err(|error| BuildError::Infrastructure(format!("publish tag index: {error}")))?;
     Ok(PublishedTagIndex {
         tags,
         poisons,
@@ -1899,13 +1919,26 @@ fn index_one_tag_entry(
     loaded: &mut TagBundle,
     asset: AssetUuid,
     tag_epoch: [u8; 32],
-) -> Result<TagIndexUpdate, (String, Vec<u8>, bool)> {
-    let (_, bundle, entry) = {
-        let store = lock_build_store(context).map_err(|error| (format!("{error:?}"), Vec::new(), false))?;
-        loaded
-            .load(&store, &context.scanner, asset)
-            .map_err(|error| (format!("{error:?}"), Vec::new(), false))?
+) -> Result<Result<TagIndexUpdate, (String, Vec<u8>, bool)>, BuildError> {
+    let store = lock_build_store(context)?;
+    let (_, bundle, entry) = match loaded.load(&store, &context.scanner, asset) {
+        Ok(loaded) => loaded,
+        Err(error) if error.is_transient() => return Err(error),
+        Err(error) => return Ok(Err((format!("{error:?}"), Vec::new(), false))),
     };
+    drop(store);
+    Ok(index_loaded_tag_entry(context, asset, tag_epoch, bundle, entry))
+}
+
+/// [`index_one_tag_entry`] past its load: every failure here is the
+/// asset's own.
+fn index_loaded_tag_entry(
+    context: &mut BuildContext,
+    asset: AssetUuid,
+    tag_epoch: [u8; 32],
+    bundle: Arc<Bundle>,
+    entry: AssetEntry,
+) -> Result<TagIndexUpdate, (String, Vec<u8>, bool)> {
     let Some(project) = context.env.authority.project_type(entry.type_uuid).cloned() else {
         return Err((
             format!("type {} has no project schema authority", entry.type_uuid),
@@ -4228,6 +4261,10 @@ mod tests {
         /// Fail the next tag-index refinement on this thread.
         pub(super) static FAIL_TAG_REFINEMENT: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
+        /// Fail the next tag-index refinement on this thread as a store
+        /// failure would (transient).
+        pub(super) static FAIL_TAG_REFINEMENT_TRANSIENT: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
         /// Bundles tag-index refinements on this thread read and parsed.
         pub(super) static TAG_BUNDLE_LOADS: std::cell::Cell<usize> =
             const { std::cell::Cell::new(0) };
@@ -5197,6 +5234,29 @@ mod tests {
             }]
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // A transient failure (the store's, not the asset's) poisons
+        // nothing: the refinement fails and its input rolls back, leaving
+        // the row pending for the next one.
+        writer
+            .input_transaction(|txn| txn.set_tag_index_pending(ASSET, epoch))
+            .unwrap();
+        FAIL_TAG_REFINEMENT_TRANSIENT.with(|fail| fail.set(true));
+        writer.open_input().unwrap();
+        let refined = refine_tag_index(
+            OpenInput::new(&mut writer).unwrap(),
+            compiled.scanner().clone(),
+            compiled.schema_authority().unwrap(),
+            compiled.pipeline_snapshot(),
+            compiled.build_targets(),
+            64,
+            &mut Commit::default(),
+            true,
+        );
+        assert!(refined.is_err());
+        writer.finish_input(false).unwrap();
+        let state = writer.tag_index_state(ASSET).unwrap().unwrap();
+        assert_eq!(state.poison.as_deref(), Some("tag indexing pending"), "{state:?}");
     }
 
     /// A full step refines only the rows its publication made pending, and
@@ -5434,7 +5494,7 @@ mod tests {
                 .runtime_type_policy(
                     &coordinator.opener().open_reader().unwrap(),
                     &RuntimeTypePolicyRequest {
-                        basis: coordinator.server().current_stamp(),
+                        basis: coordinator.server().current_stamp().unwrap(),
                         target: request.target.clone(),
                         target_definition: request.target_definition,
                         type_uuid: TYPE,
@@ -5478,7 +5538,7 @@ mod tests {
                 wire_tree.bytes.to_vec(),
             );
         }
-        let first_memo = coordinator.open_reader().unwrap().memo_seq();
+        let first_memo = coordinator.open_reader().unwrap().memo_seq().unwrap();
         let import_key = build_import_digest(&BuildImportInputs {
             asset: ASSET,
             bundle: BUNDLE,
@@ -5558,7 +5618,7 @@ mod tests {
 
         let hydrated = build(&coordinator, &request).unwrap();
         assert_eq!(hydrated, first);
-        assert_eq!(coordinator.open_reader().unwrap().memo_seq(), first_memo);
+        assert_eq!(coordinator.open_reader().unwrap().memo_seq().unwrap(), first_memo);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(validator_calls.load(Ordering::SeqCst), 2);
 

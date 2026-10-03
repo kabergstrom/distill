@@ -215,70 +215,100 @@ pub struct ImportIndexSource {
     pub root_name: String,
     pub path: String,
     pub watched: Option<WatchedImport>,
-    pub directory_rules: Vec<(BundleUuid, AssetUuid)>,
+    /// Each directory-import rules asset, with its listing directory: the
+    /// directory every path its listing matches is under (`""` for the
+    /// whole root), ending in `/`. See
+    /// [`StoreReader::directory_rule_sources_listing`].
+    pub directory_rules: Vec<(BundleUuid, AssetUuid, String)>,
 }
 
 impl Store {
     /// Replace the import index rows of the bundle sources at `sources` with
-    /// `rows`. The index is derived state, so this publishes no input
-    /// version. It is kept by source: every bundle publication queues its
-    /// paths as dirty work, and the import pass reindexes the dirty bundle
-    /// sources before it acknowledges that work.
+    /// `rows`, returning the directory rules those sources held before. The
+    /// index is derived state, so this publishes no input version. It is
+    /// kept by source: every bundle publication queues its paths as dirty
+    /// work, and the import pass reindexes the dirty bundle sources before
+    /// it acknowledges that work.
     pub fn replace_import_index(
         &mut self,
         sources: &[(String, String)],
         rows: &[ImportIndexSource],
-    ) -> Result<(), StoreError> {
+    ) -> Result<Vec<DirectoryRuleSource>, StoreError> {
         self.write_txn(|store| {
             let transaction = store.read.conn.savepoint()?;
-            for (root, path) in sources {
-                let params = rusqlite::params![root, path];
-                transaction.execute(
-                    "DELETE FROM import_reads WHERE bundle_uuid IN (
-                       SELECT t.bundle_uuid FROM import_records t JOIN roots r USING (root_id)
-                       WHERE r.name = ?1 AND t.path = ?2)",
-                    params,
+            // Root ids of this call, by name: `roots` is append-only.
+            let mut roots = std::collections::BTreeMap::new();
+            let mut previous = Vec::new();
+            for (root_name, path) in sources {
+                let root = crate::files::interned_root(&transaction, &mut roots, root_name)?;
+                let params = rusqlite::params![root.0, path];
+                transaction
+                    .prepare_cached(
+                        "DELETE FROM import_reads WHERE bundle_uuid IN (
+                           SELECT bundle_uuid FROM import_records WHERE root_id = ?1 AND path = ?2)",
+                    )?
+                    .execute(params)?;
+                transaction
+                    .prepare_cached("DELETE FROM import_records WHERE root_id = ?1 AND path = ?2")?
+                    .execute(params)?;
+                let mut statement = transaction.prepare_cached(
+                    "DELETE FROM directory_rule_sources WHERE root_id = ?1 AND path = ?2
+                     RETURNING rules_bundle, rules_asset",
                 )?;
-                for table in ["import_records", "directory_rule_sources"] {
-                    transaction.execute(
-                        &format!(
-                            "DELETE FROM {table} WHERE rowid IN (
-                               SELECT t.rowid FROM {table} t JOIN roots r USING (root_id)
-                               WHERE r.name = ?1 AND t.path = ?2)"
-                        ),
-                        params,
-                    )?;
-                }
+                let mut held = statement
+                    .query_map(params, |row| {
+                        Ok(DirectoryRuleSource {
+                            root_name: root_name.clone(),
+                            path: path.clone(),
+                            rules_bundle: BundleUuid(uuid16(row.get(0)?)?),
+                            rules_asset: AssetUuid(uuid16(row.get(1)?)?),
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                held.sort_by_key(|rule| (rule.rules_bundle, rule.rules_asset));
+                previous.extend(held);
             }
             for row in rows {
-                let root = crate::files::intern_root(&transaction, &row.root_name)?;
+                let root = crate::files::interned_root(&transaction, &mut roots, &row.root_name)?;
                 if let Some(watched) = &row.watched {
                     let bundle = watched.bundle.0.as_slice();
-                    transaction.execute("DELETE FROM import_reads WHERE bundle_uuid = ?1", [bundle])?;
-                    transaction.execute(
-                        "INSERT OR REPLACE INTO import_records(bundle_uuid, root_id, path, basis)
-                         VALUES (?1, ?2, ?3, ?4)",
-                        rusqlite::params![bundle, root.0, row.path, watched.basis],
-                    )?;
+                    transaction
+                        .prepare_cached("DELETE FROM import_reads WHERE bundle_uuid = ?1")?
+                        .execute([bundle])?;
+                    transaction
+                        .prepare_cached(
+                            "INSERT OR REPLACE INTO import_records(bundle_uuid, root_id, path, basis)
+                             VALUES (?1, ?2, ?3, ?4)",
+                        )?
+                        .execute(rusqlite::params![bundle, root.0, row.path, watched.basis])?;
                     for read in &watched.reads {
                         let (kind, key) = read.row();
-                        transaction.execute(
-                            "INSERT OR IGNORE INTO import_reads(bundle_uuid, kind, key)
-                             VALUES (?1, ?2, ?3)",
-                            rusqlite::params![bundle, kind, key],
-                        )?;
+                        transaction
+                            .prepare_cached(
+                                "INSERT OR IGNORE INTO import_reads(bundle_uuid, kind, key)
+                                 VALUES (?1, ?2, ?3)",
+                            )?
+                            .execute(rusqlite::params![bundle, kind, key])?;
                     }
                 }
-                for (bundle, asset) in &row.directory_rules {
-                    transaction.execute(
-                        "INSERT OR REPLACE INTO directory_rule_sources(rules_bundle, rules_asset, root_id, path)
-                         VALUES (?1, ?2, ?3, ?4)",
-                        rusqlite::params![bundle.0.as_slice(), asset.0.as_slice(), root.0, row.path],
-                    )?;
+                for (bundle, asset, listing_dir) in &row.directory_rules {
+                    transaction
+                        .prepare_cached(
+                            "INSERT OR REPLACE INTO directory_rule_sources
+                               (rules_bundle, rules_asset, root_id, path, listing_dir)
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                        )?
+                        .execute(rusqlite::params![
+                            bundle.0.as_slice(),
+                            asset.0.as_slice(),
+                            root.0,
+                            row.path,
+                            listing_dir
+                        ])?;
                 }
             }
             transaction.commit()?;
-            Ok(())
+            Ok(previous)
         })
     }
 }
@@ -376,6 +406,28 @@ impl StoreReader {
              WHERE r.name = ?1 AND t.path = ?2 ORDER BY t.rules_bundle, t.rules_asset",
             rusqlite::params![root_name, path],
         )
+    }
+
+    /// The directory-import rules assets whose listing directory is one of
+    /// `dirs`: given the ancestor directories of a path (`""`, `a/`,
+    /// `a/b/`, ...), every rule whose listing may match it. One indexed
+    /// lookup per directory.
+    pub fn directory_rule_sources_listing<'a>(
+        &self,
+        dirs: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Vec<DirectoryRuleSource>, StoreError> {
+        let mut found = Vec::new();
+        for dir in dirs {
+            found.extend(self.directory_rule_rows(
+                "SELECT r.name, t.path, t.rules_bundle, t.rules_asset
+                 FROM directory_rule_sources t JOIN roots r USING (root_id)
+                 WHERE t.listing_dir = ?1",
+                [dir],
+            )?);
+        }
+        found.sort_by_key(|rule| (rule.rules_bundle, rule.rules_asset));
+        found.dedup();
+        Ok(found)
     }
 
     fn directory_rule_rows<P: rusqlite::Params>(

@@ -96,7 +96,7 @@ impl CodegenService {
         let compiled = daemon.compiled_at(store).map_err(|error| error.to_string())?;
         let snapshot = compiled.pipeline_snapshot();
         let epoch = snapshot.epoch().map_err(|failure| failure.to_string())?;
-        let basis = store.input_version();
+        let basis = store.input_version().map_err(|error| error.to_string())?;
         if self.last_attempted == Some(basis) {
             return Ok(());
         }
@@ -201,7 +201,7 @@ impl<'s> AuthoredCodegenContext<'s> {
         if self.stopped {
             return Err(CodegenContextError::AttemptStopped);
         }
-        if store.input_version() != self.basis {
+        if store.input_version().map_err(|error| CodegenContextError::Failed(error.to_string()))? != self.basis {
             self.stopped = true;
             return Err(CodegenContextError::AttemptStopped);
         }
@@ -262,8 +262,8 @@ struct CodegenWorld<'a> {
 }
 
 impl CodegenSnapshot<InputVersion> for CodegenWorld<'_> {
-    fn current_basis(&self) -> InputVersion {
-        self.store.input_version()
+    fn current_basis(&self) -> Option<InputVersion> {
+        self.store.input_version().ok()
     }
 
     fn observe(&self, op: &TraceOp) -> bool {
@@ -308,7 +308,7 @@ impl CodegenWorld<'_> {
         // The basis check, the file writes and the rows share one write
         // transaction.
         self.store.write_transaction_with(|error| error.to_string(), |store| {
-            if store.input_version() != basis {
+            if store.input_version().map_err(|error| error.to_string())? != basis {
                 return Err("codegen input version changed before publication".into());
             }
             let previous = store.codegen_outputs().map_err(|error| error.to_string())?;
@@ -875,7 +875,7 @@ mod tests {
     fn complete_namespace_publishes_diffs_and_skips_unchanged_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let (mut store, scanner, output) = publication_world(&temp);
-        let basis = store.input_version();
+        let basis = store.input_version().unwrap();
         let first = generated(1, b"pub const VALUE: u8 = 1;\n");
         let second = generated(2, b"pub const VALUE: u8 = 2;\n");
         let first_path = output.path.join(first.relative_path());
@@ -889,7 +889,7 @@ mod tests {
         world
             .publish_files(basis, &[first.clone(), second.clone()])
             .unwrap();
-        let first_memo = world.store.memo_seq();
+        let first_memo = world.store.memo_seq().unwrap();
         assert_eq!(fs::read(&first_path).unwrap(), first.bytes());
         assert_eq!(fs::read(&second_path).unwrap(), second.bytes());
         assert_eq!(
@@ -904,7 +904,7 @@ mod tests {
         world
             .publish_files(basis, &[first.clone(), second])
             .unwrap();
-        assert_eq!(world.store.memo_seq(), first_memo);
+        assert_eq!(world.store.memo_seq().unwrap(), first_memo);
 
         world.publish_files(basis, &[first]).unwrap();
         assert!(first_path.exists());
@@ -916,7 +916,7 @@ mod tests {
     fn hand_edits_and_unknown_generated_names_are_never_overwritten() {
         let temp = tempfile::tempdir().unwrap();
         let (mut store, scanner, output) = publication_world(&temp);
-        let basis = store.input_version();
+        let basis = store.input_version().unwrap();
         let file = generated(3, b"original\n");
         let target = output.path.join(file.relative_path());
         let mut world = CodegenWorld {
@@ -1007,7 +1007,7 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(root.0, 1);
-            store.input_version()
+            store.input_version().unwrap()
         };
         let mut context = AuthoredCodegenContext::new(&store, scanner.clone(), basis);
         let results = context
@@ -1064,7 +1064,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let (mut store, scanner, output) = publication_world(&temp);
-        let basis = store.input_version();
+        let basis = store.input_version().unwrap();
         let initial = generated(4, b"initial\n");
         let replacement = generated(4, b"replacement\n");
         let relative = initial.relative_path().to_owned();
@@ -1093,7 +1093,7 @@ mod tests {
     fn files_written_before_a_crash_are_adopted_by_the_next_publication() {
         let temp = tempfile::tempdir().unwrap();
         let (mut store, scanner, output) = publication_world(&temp);
-        let basis = store.input_version();
+        let basis = store.input_version().unwrap();
         let first = generated(5, b"pub const VALUE: u8 = 5;\n");
         let files = [first.clone()];
         // The files reached the disk, the rows were never committed.

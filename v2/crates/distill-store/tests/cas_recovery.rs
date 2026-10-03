@@ -238,7 +238,7 @@ fn an_unindexed_committed_group_is_adopted_on_reopen() {
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].payload.trace, b"adopted trace");
     assert!(
-        store.memo_seq().0 >= 2,
+        store.memo_seq().unwrap().0 >= 2,
         "adoption advanced the memo sequence"
     );
 }

@@ -45,7 +45,7 @@ fn concurrent_writers_lose_no_update_and_log_in_commit_order() {
     }
 
     let total = (THREADS * EACH) as u64;
-    assert_eq!(store.input_version(), InputVersion(total));
+    assert_eq!(store.input_version().unwrap(), InputVersion(total));
     let log = store.change_log_after(0).unwrap();
     assert_eq!(log.len(), THREADS * EACH);
     // Sequence order is commit order: the n-th row belongs to version n.
@@ -69,25 +69,25 @@ fn an_open_input_is_seen_through_its_writer_and_by_no_other_connection() {
         .input_transaction(|txn| txn.set_clean_watermark(7))
         .unwrap();
     // The owner reads its open input through its writer.
-    assert_eq!(writer.input_version(), InputVersion(1));
+    assert_eq!(writer.input_version().unwrap(), InputVersion(1));
     assert_eq!(writer.clean_watermark().unwrap(), Some(7));
     // Another thread's reader, and another writer, see none of it.
     let other = {
         let opener = Arc::clone(&opener);
         std::thread::spawn(move || {
             let read = opener.open_reader().unwrap();
-            (read.input_version(), read.clean_watermark().unwrap())
+            (read.input_version().unwrap(), read.clean_watermark().unwrap())
         })
         .join()
         .unwrap()
     };
     assert_eq!(other, (InputVersion(0), None));
-    assert_eq!(store.input_version(), InputVersion(0));
+    assert_eq!(store.input_version().unwrap(), InputVersion(0));
 
     assert_eq!(writer.finish_input(true).unwrap(), InputVersion(1));
     let other = {
         let opener = Arc::clone(&opener);
-        std::thread::spawn(move || opener.open_reader().unwrap().input_version())
+        std::thread::spawn(move || opener.open_reader().unwrap().input_version().unwrap())
             .join()
             .unwrap()
     };
@@ -112,4 +112,121 @@ fn writers_follow_the_operational_configuration_from_their_next_transaction() {
     assert_eq!(store.config().segment_size, before * 2);
     // A writer opened afterwards starts from it.
     assert_eq!(opener.open_writer().unwrap().config().segment_size, before * 2);
+}
+
+/// A write transaction nested in an open input is a savepoint: when it
+/// fails, its own writes roll back and the input keeps the rest.
+#[test]
+fn a_failed_nested_write_rolls_back_only_its_own_writes() {
+    use distill_store::files::ObservedDiagnostic;
+    use distill_store::StoreError;
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(StoreConfig::new(dir.path().join("state"))).unwrap();
+    let diagnostic = |path: &str| ObservedDiagnostic {
+        root_name: "main".to_owned(),
+        path: path.to_owned(),
+        detail: b"unreadable".to_vec(),
+    };
+    store.open_input().unwrap();
+    store
+        .write_transaction(|store| {
+            store.replace_scan_diagnostics(Some(&[]), &[diagnostic("kept")])
+        })
+        .unwrap();
+    let failed = store.write_transaction(|store| {
+        store.replace_scan_diagnostics(Some(&[]), &[diagnostic("dropped")])?;
+        Err::<(), _>(StoreError::Rejected {
+            detail: "the step failed".to_owned(),
+        })
+    });
+    assert!(failed.is_err());
+    let failed_with = store.write_transaction_with(
+        |error| error.to_string(),
+        |store| {
+            store
+                .replace_scan_diagnostics(Some(&[]), &[diagnostic("dropped too")])
+                .map_err(|error| error.to_string())?;
+            Err::<(), _>("the step failed".to_owned())
+        },
+    );
+    assert!(failed_with.is_err());
+    store.finish_input(true).unwrap();
+    let paths = store
+        .scan_diagnostics()
+        .unwrap()
+        .into_iter()
+        .map(|row| row.path)
+        .collect::<Vec<_>>();
+    assert_eq!(paths, ["kept"]);
+}
+
+/// An inline (doctor) build's flush nested in an open input: when it fails
+/// after its node row, the input that commits keeps none of the node, and
+/// its rolled-back segment row is no OPEN segment left behind.
+#[test]
+fn a_failed_inline_build_flush_commits_no_partial_node() {
+    use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
+    use distill_store::cas::record::KeyKind;
+    use distill_store::cas::{BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
+    use distill_store::StoreError;
+    use distill_wire::artifact::{write_artifact, ArtifactHeader};
+    use distill_wire::dswl::{dswl_bytes, dswl_hash};
+    use distill_wire::wire::WireNode;
+
+    let node_commit = |key: u8| {
+        let node = WireNode::Unit { offset: 0 };
+        let artifact = write_artifact(
+            &ArtifactHeader {
+                asset_uuid: AssetUuid([key; 16]),
+                authored_type: TypeUuid([1; 16]),
+                terminal_type: TypeUuid([2; 16]),
+                encoded_type: TypeUuid([3; 16]),
+                logical_hash: LogicalHash([4; 32]),
+                layout_hash: dswl_hash(&node).unwrap(),
+            },
+            &[AssetUuid([9; 16])],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        BuildCommit {
+            wire_trees: vec![dswl_bytes(&node).unwrap()],
+            key_kind: KeyKind::Node,
+            static_input_key: [key; 32],
+            asset_uuid: AssetUuid([key; 16]),
+            static_inputs_canonical: vec![],
+            trace: vec![key],
+            outcome: CommitOutcome::Success {
+                payload_kind: PayloadKind::ProcessorOutput,
+                outputs: vec![OutputSpec {
+                    output_key: String::new(),
+                    type_uuids: vec![],
+                    bytes: artifact,
+                }],
+                aux: vec![],
+            },
+        }
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(StoreConfig::new(dir.path().join("state"))).unwrap();
+    store.open_input().unwrap();
+    let flush = store.write_transaction(|store| {
+        store.commit_build(node_commit(3))?;
+        Err::<(), _>(StoreError::Rejected {
+            detail: "a later write of the node failed".to_owned(),
+        })
+    });
+    assert!(flush.is_err());
+    store.finish_input(true).unwrap();
+    assert!(store.candidate_rows(KeyKind::Node, &[3; 32]).unwrap().is_empty());
+
+    store
+        .write_transaction(|store| store.commit_build(node_commit(4)).map(drop))
+        .unwrap();
+    let conn = rusqlite::Connection::open(dir.path().join("state/meta.sqlite")).unwrap();
+    let open: i64 = conn
+        .query_row("SELECT COUNT(*) FROM cas_segments WHERE state = 0", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(open, 1, "only the live writer's segment is OPEN");
 }

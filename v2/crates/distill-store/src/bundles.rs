@@ -1,5 +1,5 @@
 //! Asset-namespace metadata (§13): `bundles`, `assets` + search tags,
-//! `path_index`, `deps`, `schemas` — and bundle poison versus namespace errors.
+//! `path_index`, `schemas` — and bundle poison versus namespace errors.
 //!
 //! Bundle-scoped poison (§7, §13): a file that cannot be indexed
 //! publishes a poison row *only when the current malformed bytes
@@ -25,7 +25,6 @@ use rusqlite::OptionalExtension;
 use crate::db::{InputTxn, Store, StoreReader};
 use crate::error::StoreError;
 use crate::files::RootId;
-use crate::state::InputVersion;
 
 /// One `bundles` row (§13): the physical key, matching `files`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,24 +163,6 @@ pub struct TagIndexState {
     pub dylib_hash: Option<[u8; 32]>,
     pub trace: Vec<u8>,
     pub poison: Option<String>,
-}
-
-/// Recorded dependency kinds (§10, §13's `deps`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DepKind {
-    Content,
-    Resolution,
-    Query,
-}
-
-impl DepKind {
-    fn to_i64(self) -> i64 {
-        match self {
-            DepKind::Content => 0,
-            DepKind::Resolution => 1,
-            DepKind::Query => 2,
-        }
-    }
 }
 
 impl InputTxn<'_> {
@@ -389,37 +370,6 @@ impl InputTxn<'_> {
         Ok(())
     }
 
-    /// Remove a path/primary resolution entry.
-    pub fn remove_path_entry(&mut self, path: &str, root: RootId) -> Result<bool, StoreError> {
-        let n = self.txn.execute(
-            "DELETE FROM path_index WHERE path = ?1 AND root_id = ?2",
-            rusqlite::params![path, root.0],
-        )?;
-        Ok(n > 0)
-    }
-
-    /// Record one dependency edge (§13's `deps`).
-    pub fn record_dep(
-        &mut self,
-        src: AssetUuid,
-        kind: DepKind,
-        target: &str,
-    ) -> Result<(), StoreError> {
-        self.txn.execute(
-            "INSERT OR IGNORE INTO deps(src_uuid, kind, target) VALUES (?1, ?2, ?3)",
-            rusqlite::params![src.0.as_slice(), kind.to_i64(), target],
-        )?;
-        Ok(())
-    }
-
-    /// Drop every recorded dependency of `src` (re-recording is
-    /// wholesale).
-    pub fn clear_deps(&mut self, src: AssetUuid) -> Result<(), StoreError> {
-        self.txn
-            .execute("DELETE FROM deps WHERE src_uuid = ?1", [src.0.as_slice()])?;
-        Ok(())
-    }
-
     /// Cache a schema by logical hash (§13's `schemas` — rebuilt from
     /// bundle snapshots, never precious).
     pub fn put_schema(&mut self, hash: LogicalHash, json: &str) -> Result<(), StoreError> {
@@ -501,21 +451,14 @@ impl Store {
     /// the RPC publication step. This deliberately does not
     /// advance the input version: a crash between the namespace transaction
     /// and this refinement leaves the conservative pending poison intact.
+    /// The daemon runs it inside the input that publishes the namespace it
+    /// read (`refine_tag_index` takes that input's proof), so the rows it
+    /// writes are of the version they were read at.
     pub fn refine_unpublished_tag_index(
         &mut self,
-        expected: InputVersion,
         updates: &[TagIndexUpdate],
     ) -> Result<(), StoreError> {
         self.write_txn(|store| {
-            if store.input_version() != expected {
-                return Err(StoreError::InvalidConfiguration {
-                    error: format!(
-                        "tag-index refinement basis {:?}, current {:?}",
-                        expected,
-                        store.input_version()
-                    ),
-                });
-            }
             let mut assets = BTreeSet::new();
             let txn = store.read.conn.savepoint()?;
             for update in updates {
@@ -773,25 +716,6 @@ impl StoreReader {
             .conn
             .prepare_cached("SELECT EXISTS(SELECT 1 FROM assets WHERE asset_uuid = ?1)")?
             .query_row([asset.0.as_slice()], |row| row.get(0))?)
-    }
-
-    /// Complete deterministic entry projection for one bundle. Poisoned
-    /// skeleton rows intentionally fail through [`Store::entry`] rather than
-    /// being mistaken for ordinary authored metadata.
-    pub fn entries_in_bundle(&self, bundle: BundleUuid) -> Result<Vec<EntryMeta>, StoreError> {
-        let mut statement = self
-            .conn
-            .prepare("SELECT asset_uuid FROM assets WHERE bundle_uuid = ?1 ORDER BY asset_uuid")?;
-        let assets = statement
-            .query_map([bundle.0.as_slice()], |row| row.get::<_, Vec<u8>>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut entries = Vec::with_capacity(assets.len());
-        for asset in assets {
-            if let Some(entry) = self.entry(AssetUuid(blob16(asset)))? {
-                entries.push(entry);
-            }
-        }
-        Ok(entries)
     }
 
     /// Raw deterministic identity set for one bundle, including poisoned
@@ -1102,100 +1026,6 @@ impl StoreReader {
         }))
     }
 
-    /// Runtime direct-UUID lookup. Authoring/control rows remain visible to
-    /// `entry()` for tooling metadata, but can never enter a runtime closure.
-    pub fn runtime_entry(&self, asset: AssetUuid) -> Result<Option<EntryMeta>, StoreError> {
-        let entry = self.entry(asset)?;
-        if entry.as_ref().is_some_and(|entry| entry.authoring_only) {
-            return Err(StoreError::RoleIneligible { asset });
-        }
-        Ok(entry)
-    }
-
-    /// §13 `MetadataSnapshot::resolve_path` semantics: `Ok(None)` is a
-    /// recordable miss; a path resolvable in more than one asset root is
-    /// `Err` (§18), never a tiebreak; a namespace error is `Err`.
-    pub fn resolve_path(&self, path: &str) -> Result<Option<AssetUuid>, StoreError> {
-        // A poisoned bundle's own path fails naming it (§13): the poison
-        // row replaced the file's asset rows, and a Missing here would
-        // silently change query semantics.
-        let poisoned_at_path: Option<(Vec<u8>, String)> = self
-            .conn
-            .query_row(
-                "SELECT bundle_uuid, poison FROM bundles
-                 WHERE path = ?1 AND poison IS NOT NULL LIMIT 1",
-                [path],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        if let Some((bundle_bytes, error)) = poisoned_at_path {
-            return Err(StoreError::BundlePoisoned {
-                bundle: BundleUuid(blob16(bundle_bytes)),
-                error,
-            });
-        }
-        let mut stmt = self.conn.prepare(
-            "SELECT p.root_id, p.asset_uuid, r.name FROM path_index p
-             LEFT JOIN roots r ON r.root_id = p.root_id
-             WHERE p.path = ?1 ORDER BY p.root_id",
-        )?;
-        let rows: Vec<(i64, Vec<u8>, Option<String>)> = stmt
-            .query_map([path], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-            .collect::<Result<_, _>>()?;
-        match rows.len() {
-            0 => Ok(None),
-            1 => {
-                let asset = AssetUuid(blob16(rows.into_iter().next().unwrap().1));
-                // A resolution reaching a poisoned bundle is the stable
-                // Failed, not a silent success (§13).
-                let owner: Option<(Vec<u8>, Option<String>, bool)> = self
-                    .conn
-                    .query_row(
-                        "SELECT b.bundle_uuid, b.poison, a.authoring_only FROM assets a
-                         JOIN bundles b ON b.bundle_uuid = a.bundle_uuid
-                         WHERE a.asset_uuid = ?1",
-                        [asset.0.as_slice()],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
-                    )
-                    .optional()?;
-                if let Some((bundle_bytes, poison, authoring_only)) = owner {
-                    if let Some(error) = poison {
-                        return Err(StoreError::BundlePoisoned {
-                            bundle: BundleUuid(blob16(bundle_bytes)),
-                            error,
-                        });
-                    }
-                    if authoring_only {
-                        return Err(StoreError::RoleIneligible { asset });
-                    }
-                }
-                Ok(Some(asset))
-            }
-            _ => Err(StoreError::AmbiguousPath {
-                path: path.to_owned(),
-                roots: rows
-                    .into_iter()
-                    .map(|(id, _, name)| name.unwrap_or_else(|| format!("root#{id}")))
-                    .collect(),
-            }),
-        }
-    }
-
-    /// Reverse dependency lookup by selector (§13's `deps` indexes).
-    pub fn deps_on(&self, kind: DepKind, target: &str) -> Result<Vec<AssetUuid>, StoreError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT src_uuid FROM deps WHERE kind = ?1 AND target = ?2")?;
-        let rows = stmt.query_map(rusqlite::params![kind.to_i64(), target], |r| {
-            r.get::<_, Vec<u8>>(0)
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(AssetUuid(blob16(row?)));
-        }
-        Ok(out)
-    }
-
     /// Cached schema JSON by logical hash.
     pub fn schema(&self, hash: LogicalHash) -> Result<Option<String>, StoreError> {
         Ok(self
@@ -1206,30 +1036,6 @@ impl StoreReader {
                 |r| r.get(0),
             )
             .optional()?)
-    }
-
-    /// Every retained exact-hash schema snapshot, including snapshots no
-    /// longer referenced by the current bundle projection. Doctor uses this
-    /// disposable cache as one additional exact repair source.
-    pub fn all_schemas(&self) -> Result<Vec<(LogicalHash, String)>, StoreError> {
-        let mut statement = self
-            .conn
-            .prepare("SELECT logical_hash, schema_json FROM schemas ORDER BY logical_hash")?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        rows.into_iter()
-            .map(|(hash, json)| {
-                if hash.len() != 32 {
-                    return Err(StoreError::InvalidSchemaCache {
-                        detail: "schema cache contains a non-32-byte logical hash".to_owned(),
-                    });
-                }
-                Ok((LogicalHash(blob32(hash)), json))
-            })
-            .collect()
     }
 }
 

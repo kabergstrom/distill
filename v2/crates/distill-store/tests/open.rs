@@ -60,29 +60,29 @@ fn recreate_re_mints_the_instance_id_and_resets_versions() {
     let mut store = Store::open(cfg(&dir)).unwrap();
     store.input_transaction(|_txn| Ok(())).unwrap();
     let old_id = store.instance_id();
-    assert_eq!(store.input_version().0, 1);
+    assert_eq!(store.input_version().unwrap().0, 1);
     drop(store);
 
     let store = Store::recreate(cfg(&dir)).unwrap();
     assert_ne!(store.instance_id(), old_id);
-    assert_eq!(store.input_version().0, 0);
-    assert_eq!(store.memo_seq().0, 0);
+    assert_eq!(store.input_version().unwrap().0, 0);
+    assert_eq!(store.memo_seq().unwrap().0, 0);
 }
 
 #[test]
 fn input_transactions_advance_the_input_version_only() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
-    assert_eq!(store.input_version().0, 0);
-    assert_eq!(store.memo_seq().0, 0);
+    assert_eq!(store.input_version().unwrap().0, 0);
+    assert_eq!(store.memo_seq().unwrap().0, 0);
 
     let (_, v1) = store.input_transaction(|_txn| Ok(())).unwrap();
     assert_eq!(v1.0, 1);
     let (_, v2) = store.input_transaction(|_txn| Ok(())).unwrap();
     assert_eq!(v2.0, 2);
-    assert_eq!(store.input_version().0, 2);
+    assert_eq!(store.input_version().unwrap().0, 2);
     assert_eq!(
-        store.memo_seq().0,
+        store.memo_seq().unwrap().0,
         0,
         "input events never advance the memo sequence"
     );
@@ -103,7 +103,7 @@ fn a_failed_input_transaction_publishes_nothing() {
         })
         .unwrap_err();
     assert!(matches!(err, StoreError::InvalidConfiguration { .. }));
-    assert_eq!(store.input_version().0, 0, "the version was never advanced");
+    assert_eq!(store.input_version().unwrap().0, 0, "the version was never advanced");
     assert_eq!(
         store.clean_watermark().unwrap(),
         None,
@@ -120,7 +120,7 @@ fn versions_persist_across_reopen() {
     store.input_transaction(|_| Ok(())).unwrap();
     drop(store);
     let store = Store::open(cfg(&dir)).unwrap();
-    assert_eq!(store.input_version().0, 3);
+    assert_eq!(store.input_version().unwrap().0, 3);
 }
 
 #[test]
@@ -128,9 +128,9 @@ fn stamp_pairs_instance_and_version() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
     store.input_transaction(|_| Ok(())).unwrap();
-    let stamp = store.stamp();
+    let stamp = store.stamp().unwrap();
     assert_eq!(stamp.instance, store.instance_id());
-    assert_eq!(stamp.version, store.input_version());
+    assert_eq!(stamp.version, store.input_version().unwrap());
 }
 
 #[test]
@@ -198,11 +198,11 @@ fn a_reader_connection_observes_each_commit_and_cannot_write() {
     let mut store = Store::open(cfg(&dir)).unwrap();
     let reader = store.reader().unwrap();
     assert_eq!(reader.instance_id(), store.instance_id());
-    assert_eq!(reader.input_version(), store.input_version());
+    assert_eq!(reader.input_version().unwrap(), store.input_version().unwrap());
 
     let (_, version) = store.input_transaction(|_txn| Ok(())).unwrap();
-    assert_eq!(reader.input_version(), version, "no cached counter");
-    assert_eq!(reader.stamp(), store.stamp());
+    assert_eq!(reader.input_version().unwrap(), version, "no cached counter");
+    assert_eq!(reader.stamp().unwrap(), store.stamp().unwrap());
 
     // The reader is a read-only SQLite connection, not a second writer.
     assert!(reader.rebuild_indexes().is_err());
@@ -212,4 +212,41 @@ fn a_reader_connection_observes_each_commit_and_cannot_write() {
 fn a_reader_requires_an_existing_store() {
     let dir = tempfile::tempdir().unwrap();
     assert!(StoreReader::open(cfg(&dir)).is_err());
+}
+
+/// The schema is created in one transaction: an open that fails part-way
+/// leaves none of it, so the next open creates it whole.
+#[test]
+fn a_failed_schema_creation_leaves_no_partial_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = cfg(&dir);
+    std::fs::create_dir_all(&config.state_path).unwrap();
+    let db = config.state_path.join("meta.sqlite");
+    let tables = |db: &std::path::Path| -> Vec<String> {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        let mut statement = conn
+            .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
+            .unwrap();
+        let names = statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap();
+        names
+    };
+    // The schema's last table already exists: its CREATE fails.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("CREATE TABLE artifact_load_edges (x)")
+        .unwrap();
+    assert!(Store::open(config.clone()).is_err());
+    assert_eq!(tables(&db), ["artifact_load_edges"]);
+
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("DROP TABLE artifact_load_edges")
+        .unwrap();
+    let store = Store::open(config).unwrap();
+    assert!(tables(&db).contains(&"store_meta".to_owned()));
+    drop(store);
 }

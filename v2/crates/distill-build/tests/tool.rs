@@ -67,7 +67,7 @@ fn context<'a, S: ToolEpochSnapshot>(
 #[test]
 fn missing_tool_is_a_terminal_memoizable_capability_observation() {
     let (directory, store) = new_store();
-    let snapshot = StoreToolEpochSnapshot::new(&store, store.input_version());
+    let snapshot = StoreToolEpochSnapshot::new(&store, store.input_version().unwrap());
     let mut process = context(&snapshot, directory.path());
     let error = process.run_tool("missing", &[], b"").unwrap_err();
     let expected = StableFailureFingerprint::MissingCapability {
@@ -101,7 +101,7 @@ fn package_tool_uses_the_registered_tree_and_only_the_sealed_environment() {
             )
         })
         .unwrap();
-    let snapshot = StoreToolEpochSnapshot::new(&store, store.input_version());
+    let snapshot = StoreToolEpochSnapshot::new(&store, store.input_version().unwrap());
     let mut process = context(&snapshot, directory.path());
     let ToolOutput {
         status,
@@ -138,7 +138,7 @@ fn package_drift_discards_the_entire_attempt_trace() {
         })
         .unwrap();
     std::fs::remove_file(registered.root.as_ref().unwrap().join("work/resource")).unwrap();
-    let snapshot = StoreToolEpochSnapshot::new(&store, store.input_version());
+    let snapshot = StoreToolEpochSnapshot::new(&store, store.input_version().unwrap());
     let mut process = context(&snapshot, directory.path());
     let error = process.run_tool("compiler", &[], b"").unwrap_err();
     assert!(matches!(
@@ -163,7 +163,7 @@ fn package_subdirectory_is_the_process_cwd_inside_a_private_copy() {
             )
         })
         .unwrap();
-    let snapshot = StoreToolEpochSnapshot::new(&store, store.input_version());
+    let snapshot = StoreToolEpochSnapshot::new(&store, store.input_version().unwrap());
     let mut process = context(&snapshot, directory.path());
     let output = process.run_tool("compiler", &["ok"], b"\n").unwrap();
     assert_eq!(output.stdout, b"sealed|unset|ok|");
@@ -196,7 +196,7 @@ fn ambient_tool_runs_directly_and_trust_controls_memoization() {
         store
             .input_transaction(|txn| txn.register_tool("shell", ambient_registration(trusted)))
             .unwrap();
-        let snapshot = StoreToolEpochSnapshot::new(&store, store.input_version());
+        let snapshot = StoreToolEpochSnapshot::new(&store, store.input_version().unwrap());
         let mut process = context(&snapshot, directory.path());
         let output = process
             .run_tool("shell", &["-c", "printf '%s' \"$FOO\""], b"")
@@ -235,7 +235,7 @@ while IFS= read -r _; do :; done
             )
         })
         .unwrap();
-    let snapshot = StoreToolEpochSnapshot::new(&store, store.input_version());
+    let snapshot = StoreToolEpochSnapshot::new(&store, store.input_version().unwrap());
     let mut process = context(&snapshot, directory.path());
     let output = process.run_tool("duplex", &[], &vec![7; 262_144]).unwrap();
     assert_eq!(output.status, 0);

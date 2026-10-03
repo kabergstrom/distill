@@ -478,7 +478,7 @@ fn production_bootstrap_starts_at_the_durable_store_version() {
     )
     .unwrap();
 
-    assert_eq!(server.current_stamp().version, InputVersion(41));
+    assert_eq!(server.current_stamp().unwrap().version, InputVersion(41));
     assert_eq!(
         snapshot(&connect(&server, &[(1, false)])).stamp().version,
         InputVersion(41)
@@ -620,7 +620,7 @@ fn durable_write_backend_owns_the_committed_projection() {
         RpcResult::Success(InputVersion(9))
     );
     assert_eq!(*backend.bases.lock().unwrap(), [InputVersion(8)]);
-    assert_eq!(server.current_stamp().version, InputVersion(9));
+    assert_eq!(server.current_stamp().unwrap().version, InputVersion(9));
 }
 
 #[test]
@@ -667,7 +667,7 @@ fn coordinator_can_project_daemon_controls_but_hub_cannot_write_them_directly() 
         hub.write(InputVersion(1), vec![AuthoringOp::Set(control)], false),
         RpcResult::Failure(RpcFailure::InvalidAuthoringRequest { .. })
     ));
-    assert_eq!(server.current_stamp().version, InputVersion(1));
+    assert_eq!(server.current_stamp().unwrap().version, InputVersion(1));
 }
 
 fn connect(server: &Server, policies: &[(u8, bool)]) -> Hub {
@@ -1724,7 +1724,7 @@ fn published_runtime_failure_fences_shared_epoch_without_minting_a_version() {
         .unwrap();
 
     assert!(persisted);
-    assert_eq!(server.current_stamp(), stamp);
+    assert_eq!(server.current_stamp().unwrap(), stamp);
     let reason = ReconnectReason::PipelineEpochChanged;
     assert_reconnect(pinned.version(), reason);
     assert_reconnect(
@@ -1768,7 +1768,7 @@ fn published_runtime_failure_fences_shared_epoch_without_minting_a_version() {
 #[test]
 fn commit_rejects_unauthenticated_dscp_and_noncanonical_typed_pipeline_diagnostics() {
     let server = server_with(&[(1, false)]);
-    let before = server.current_stamp();
+    let before = server.current_stamp().unwrap();
     let mut error = ConfigurationError::from_reason(
         &DscpV1::MalformedConfiguration { file_hash: [1; 32] },
         "bad configuration",
@@ -1791,7 +1791,7 @@ fn commit_rejects_unauthenticated_dscp_and_noncanonical_typed_pipeline_diagnosti
         }),
         Err(AdminError::InvalidPipelineDiagnostic { .. })
     ));
-    assert_eq!(server.current_stamp(), before);
+    assert_eq!(server.current_stamp().unwrap(), before);
 }
 
 #[test]
@@ -2074,7 +2074,7 @@ fn restart_required_names_sorted_unique_keys_without_advancing_version() {
         .success()
         .unwrap();
     install.deltas.next().unwrap();
-    let before = server.current_stamp();
+    let before = server.current_stamp().unwrap();
     let after = server.restart_required(vec![
         "daemon.state_path".to_owned(),
         "daemon.address".to_owned(),
@@ -2316,7 +2316,7 @@ fn hub_authoring_and_wire_tree_surface_is_versioned_typed_and_generation_first()
     assert_eq!(events[1].state, AuthoringProgressState::Running);
     assert_eq!(&*events[1].payload, b"verify-cas");
     assert_eq!(events[2].state, AuthoringProgressState::Completed);
-    assert_eq!(server.current_stamp().version, InputVersion(4));
+    assert_eq!(server.current_stamp().unwrap().version, InputVersion(4));
     let cancelled_operation = LongRunningOp::Doctor(Arc::from(&b"cancel-me"[..]));
     let mut cancellable = hub
         .operation(InputVersion(4), cancelled_operation.clone())
@@ -2332,7 +2332,7 @@ fn hub_authoring_and_wire_tree_surface_is_versioned_typed_and_generation_first()
         AuthoringProgressState::Cancelled
     );
     assert!(!cancellable.cancel());
-    assert_eq!(server.current_stamp().version, InputVersion(4));
+    assert_eq!(server.current_stamp().unwrap().version, InputVersion(4));
     assert_eq!(*backend.imports.lock().unwrap(), vec![import_request]);
     assert_eq!(
         *backend.reimports.lock().unwrap(),
@@ -2442,7 +2442,7 @@ fn missing_authoring_backend_is_typed_and_never_advances_the_input_version() {
             operation: "import".to_owned(),
         })
     );
-    assert_eq!(server.current_stamp().version, InputVersion(0));
+    assert_eq!(server.current_stamp().unwrap().version, InputVersion(0));
 }
 
 #[test]
@@ -2497,7 +2497,7 @@ fn expired_and_foreign_snapshots_fail_without_serving_data() {
 #[test]
 fn commit_validation_is_atomic_for_duplicate_names_and_invalid_paths() {
     let server = server_with(&[(1, false)]);
-    let before = server.current_stamp();
+    let before = server.current_stamp().unwrap();
     assert!(matches!(
         server.commit(Commit {
             assets: vec![
@@ -2555,13 +2555,13 @@ fn commit_validation_is_atomic_for_duplicate_names_and_invalid_paths() {
             path: "empty.asset".to_owned()
         })
     );
-    assert_eq!(server.current_stamp(), before);
+    assert_eq!(server.current_stamp().unwrap(), before);
 }
 
 #[test]
 fn authoring_identity_validation_rejects_reserved_local_ids_and_noncanonical_tags_atomically() {
     let server = server_with(&[(1, false)]);
-    let before = server.current_stamp();
+    let before = server.current_stamp().unwrap();
     let mut reserved = authoring_entry(1, AuthoringEntryRole::Runtime);
     reserved.local_id = "$generated".to_owned();
     assert!(matches!(
@@ -2580,7 +2580,7 @@ fn authoring_identity_validation_rejects_reserved_local_ids_and_noncanonical_tag
         }),
         Err(AdminError::InvalidAuthoringIdentity { .. })
     ));
-    assert_eq!(server.current_stamp(), before);
+    assert_eq!(server.current_stamp().unwrap(), before);
 }
 
 #[test]
@@ -2750,4 +2750,191 @@ fn coordinated_target_set_replacement_advances_once_and_fences_changed_or_remove
         replacement.snapshot(),
         ReconnectReason::TargetDefinitionChanged,
     );
+}
+
+/// A backend that writes, then fails: a write, an import whose bundle
+/// identity changed, and a deferred operation.
+struct PartialFailBackend;
+
+fn write_then_fail(store: &mut distill_store::Store, root: &str) {
+    store
+        .input_transaction(|txn| txn.intern_root(root).map(drop))
+        .unwrap();
+}
+
+struct PartialFailOperation;
+
+impl DeferredOperation for PartialFailOperation {
+    fn complete(
+        &self,
+        store: &mut distill_store::Store,
+        _base: InputVersion,
+    ) -> Result<DeferredOperationResult, String> {
+        write_then_fail(store, "partial-operation");
+        Err("a later file failed".to_owned())
+    }
+}
+
+impl AuthoringBackend for PartialFailBackend {
+    fn prepare_write(
+        &self,
+        store: &mut distill_store::Store,
+        _base: InputVersion,
+        _operations: &[AuthoringOp],
+        _force_lossy: bool,
+    ) -> Result<Option<Commit>, RpcFailure> {
+        write_then_fail(store, "partial-write");
+        Err(RpcFailure::InvalidAuthoringRequest {
+            detail: "refinement failed".to_owned(),
+        })
+    }
+
+    fn prepare_import(
+        &self,
+        _: &mut distill_store::Store,
+        _: InputVersion,
+        _: &ImportRequest,
+    ) -> Result<PreparedImportCommit, RpcFailure> {
+        unreachable!("only reimports")
+    }
+
+    fn prepare_reimport(
+        &self,
+        store: &mut distill_store::Store,
+        _: InputVersion,
+        _: BundleUuid,
+    ) -> Result<PreparedImportCommit, RpcFailure> {
+        write_then_fail(store, "partial-reimport");
+        Ok(PreparedImportCommit {
+            bundle: BundleUuid([0xEE; 16]),
+            commit: Commit::default(),
+        })
+    }
+
+    fn prepare_operation(
+        &self,
+        _: &mut distill_store::Store,
+        _: InputVersion,
+        _: &LongRunningOp,
+    ) -> Result<PreparedOperationCommit, RpcFailure> {
+        Ok(PreparedOperationCommit::deferred(
+            Arc::new(PartialFailOperation),
+            vec![
+                AuthoringProgressEvent {
+                    sequence: 0,
+                    state: AuthoringProgressState::Started,
+                    payload: Arc::from([]),
+                },
+                AuthoringProgressEvent {
+                    sequence: 1,
+                    state: AuthoringProgressState::Completed,
+                    payload: Arc::from([]),
+                },
+            ],
+        ))
+    }
+}
+
+/// A backend step that fails after writing commits none of it: the
+/// version does not move and no row of the failed step is visible (a
+/// failed input would otherwise commit as a version with no change log).
+#[test]
+fn a_failed_backend_step_commits_nothing_it_wrote() {
+    let server = Server::new_at_version_with_authoring_backend(
+        StoreInstanceId([9; 16]),
+        InputVersion(8),
+        vec![target_with(7, &[(1, false)])],
+        Arc::new(PartialFailBackend),
+    )
+    .unwrap();
+    let hub = connect(&server, &[(1, false)]);
+    let unchanged = |root: &str| {
+        assert_eq!(server.current_stamp().unwrap().version, InputVersion(8), "{root}");
+        server.with_writer(|store| {
+            assert_eq!(store.root_id(root).unwrap(), None, "{root} committed");
+            assert_eq!(store.input_version().unwrap(), InputVersion(8), "{root}");
+        });
+    };
+
+    let write = hub.write(
+        InputVersion(8),
+        vec![AuthoringOp::Remove { uuid: asset_id(7) }],
+        false,
+    );
+    assert!(matches!(write, RpcResult::Failure(_)), "{write:?}");
+    unchanged("partial-write");
+
+    let reimport = hub.reimport(InputVersion(8), BundleUuid([0xAA; 16]));
+    assert!(matches!(reimport, RpcResult::Failure(_)), "{reimport:?}");
+    unchanged("partial-reimport");
+
+    let progress = hub
+        .operation(
+            InputVersion(8),
+            LongRunningOp::RenameWithFixups(Arc::from(&b"rename"[..])),
+        )
+        .success()
+        .unwrap();
+    let events = progress.collect::<Vec<_>>();
+    assert_eq!(
+        events.last().unwrap().state,
+        AuthoringProgressState::Failed,
+        "{events:?}"
+    );
+    unchanged("partial-operation");
+}
+
+/// The durable runtime failure and the served fence are one transaction:
+/// when the served write fails, the persisted failure rolls back with it.
+#[test]
+fn a_runtime_pipeline_failure_persists_with_its_fence_or_not_at_all() {
+    let server = server_with(&[(1, false)]);
+    let failure = PipelineFailure::new(
+        PipelineFailureCode::PublishedCallbackPanic,
+        PipelineFailureOrigin::PublishedRuntime,
+        CleanupDisposition::PublishedEpochLeaked,
+        "processor callback panicked",
+    )
+    .unwrap();
+    // The served pipeline write fails.
+    let db = server.with_writer(|store| store.state_path().join("meta.sqlite"));
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_served_pipeline BEFORE INSERT ON store_meta
+             WHEN NEW.key = 'served_pipeline'
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .unwrap();
+    let published = server.coordinated_runtime_pipeline_failure(failure, |store| {
+        store
+            .write_transaction(|store| {
+                store.replace_scan_diagnostics(
+                    Some(&[]),
+                    &[distill_store::files::ObservedDiagnostic {
+                        root_name: "main".to_owned(),
+                        path: "persisted".to_owned(),
+                        detail: Vec::new(),
+                    }],
+                )
+            })
+            .map_err(|error| error.to_string())
+    });
+    assert!(published.is_err());
+    server.with_writer(|store| {
+        assert!(store.scan_diagnostics().unwrap().is_empty(), "the persisted half committed");
+    });
+}
+
+/// Publishing a protocol epoch or target definition that is already in
+/// effect changes nothing, so it publishes no version.
+#[test]
+fn an_unchanged_protocol_epoch_or_target_publishes_no_version() {
+    let server = server_with(&[(1, false)]);
+    let before = server.current_stamp().unwrap();
+    assert_eq!(server.replace_protocol_epoch(PROTOCOL_VERSION), before);
+    assert_eq!(server.replace_target(target_with(7, &[(1, false)])).unwrap(), before);
+    assert_eq!(server.current_stamp().unwrap(), before);
+    let changed = server.replace_protocol_epoch(PROTOCOL_VERSION + 1);
+    assert_eq!(changed.version.0, before.version.0 + 1);
 }

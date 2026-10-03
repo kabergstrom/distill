@@ -298,14 +298,14 @@ fn startup_adopts_the_pending_restart_generation_before_rpc_construction() {
 
     let coordinator = coordinator(&temp);
     let store = coordinator.open_reader().unwrap();
-    assert_eq!(store.input_version(), InputVersion(1));
+    assert_eq!(store.input_version().unwrap(), InputVersion(1));
     assert!(store.pending_restart().unwrap().is_none());
     assert!(matches!(
         store.configuration_state().unwrap(),
         ConfigurationState::Ready(epoch) if epoch.generation == pending_generation
     ));
     assert_eq!(
-        coordinator.server().current_stamp().version,
+        coordinator.server().current_stamp().unwrap().version,
         InputVersion(1)
     );
 }
@@ -320,9 +320,9 @@ fn full_scan_publishes_one_store_and_rpc_version() {
 
     let stamp = coordinator.reconcile_full_scan(&mut writer).unwrap();
     assert_eq!(stamp.version, InputVersion(1));
-    assert_eq!(coordinator.server().current_stamp(), stamp);
+    assert_eq!(coordinator.server().current_stamp().unwrap(), stamp);
     let store = coordinator.open_reader().unwrap();
-    assert_eq!(store.input_version(), InputVersion(1));
+    assert_eq!(store.input_version().unwrap(), InputVersion(1));
     assert!(store.bundle(bundle).unwrap().is_some());
     assert_eq!(store.entry(asset).unwrap().unwrap().local_id, "entry");
     assert!(matches!(
@@ -363,7 +363,7 @@ fn watcher_trigger_reconciles_an_offline_delete_in_exactly_one_version() {
     let store = coordinator.open_reader().unwrap();
     assert!(store.bundle(bundle).unwrap().is_none());
     assert!(store.entry(asset).unwrap().is_none());
-    assert_eq!(store.input_version(), InputVersion(2));
+    assert_eq!(store.input_version().unwrap(), InputVersion(2));
 }
 
 #[test]
@@ -408,7 +408,7 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
     let rewritten = distill_bundle::parse_bundle(&std::fs::read(&bundle_path).unwrap()).unwrap();
     assert_eq!(rewritten.assets["entry"].data, AuthoredValue::UInt(9));
     assert_eq!(
-        coordinator.open_reader().unwrap().input_version(),
+        coordinator.open_reader().unwrap().input_version().unwrap(),
         InputVersion(2)
     );
 
@@ -424,7 +424,7 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
     assert_eq!(stamp.version, InputVersion(3));
     assert!(!bundle_path.exists());
     let store = coordinator.open_reader().unwrap();
-    assert_eq!(store.input_version(), InputVersion(3));
+    assert_eq!(store.input_version().unwrap(), InputVersion(3));
     assert!(store.bundle(bundle_uuid).unwrap().is_none());
     assert!(store.entry(asset_uuid).unwrap().is_none());
 }
@@ -450,14 +450,14 @@ fn a_coordinated_publication_is_invisible_until_it_commits_whole() {
             // The namespace is written, but not yet as a version anyone else
             // can read: it commits with the served rows.
             let outside = StoreReader::open(StoreConfig::new(state.clone())).unwrap();
-            assert_eq!(outside.input_version(), InputVersion(1));
+            assert_eq!(outside.input_version().unwrap(), InputVersion(1));
             assert!(outside.entry(asset_uuid).unwrap().is_some());
             Ok(commit)
         })
         .unwrap();
     assert_eq!(stamp.version, InputVersion(2));
     let outside = StoreReader::open(StoreConfig::new(state)).unwrap();
-    assert_eq!(outside.input_version(), InputVersion(2));
+    assert_eq!(outside.input_version().unwrap(), InputVersion(2));
     assert!(outside.entry(asset_uuid).unwrap().is_none());
     assert!(outside.bundle(bundle_uuid).unwrap().is_none());
 }
@@ -689,12 +689,12 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
     ));
     assert!(store.entry(ordinary_asset).unwrap().is_some());
     assert!(store
-        .all_files()
+        .observed_files()
         .unwrap()
         .iter()
-        .all(|(_, path, _)| !path.starts_with("daemon-state-alias")));
+        .all(|row| !row.path.starts_with("daemon-state-alias")));
     drop(store);
-    let version = coordinator.server().current_stamp().version;
+    let version = coordinator.server().current_stamp().unwrap().version;
 
     std::fs::remove_file(&alias).unwrap();
     coordinator
@@ -704,7 +704,7 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
         })
         .unwrap();
     assert!(coordinator.scan_diagnostics(&mut writer).unwrap().is_empty());
-    assert_eq!(coordinator.server().current_stamp().version, version);
+    assert_eq!(coordinator.server().current_stamp().unwrap().version, version);
     symlink(temp.path().join(".distill"), &alias).unwrap();
     coordinator
         .reconcile_incremental(&mut writer, &WatcherBatch {
@@ -713,9 +713,9 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
         })
         .unwrap();
     assert_eq!(coordinator.scan_diagnostics(&mut writer).unwrap().len(), 1);
-    assert_eq!(coordinator.server().current_stamp().version, version);
+    assert_eq!(coordinator.server().current_stamp().unwrap().version, version);
 
-    let base = coordinator.server().current_stamp().version;
+    let base = coordinator.server().current_stamp().unwrap().version;
     let hub = match coordinator
         .server()
         .root()
@@ -737,7 +737,7 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
         cancelled.next().unwrap().state,
         AuthoringProgressState::Cancelled
     );
-    assert_eq!(coordinator.server().current_stamp().version, base);
+    assert_eq!(coordinator.server().current_stamp().unwrap().version, base);
 
     let events = hub
         .operation(base, LongRunningOp::Doctor(DoctorRequest::Verify.encode()))
@@ -1003,7 +1003,7 @@ fn a_pending_scan_rejection_survives_an_authoring_write_and_a_restart() {
             },
         });
         let backend = Arc::clone(coordinator.authoring_service());
-        let base = coordinator.server().current_stamp().version;
+        let base = coordinator.server().current_stamp().unwrap().version;
         let stamp = coordinator
             .coordinated_commit(&mut writer, base, |store| {
                 backend
@@ -1075,7 +1075,7 @@ fn single_edit_pages(filler: usize) -> u64 {
     bundle.assets.get_mut("entry").unwrap().data = AuthoredValue::UInt(9);
     std::fs::write(&edited, distill_bundle::write_bundle(&bundle).unwrap()).unwrap();
     let before = writer.pages_fetched().unwrap();
-    let base = writer.input_version();
+    let base = writer.input_version().unwrap();
     let published = coordinator
         .reconcile_incremental(&mut writer, &WatcherBatch {
             paths: vec![edited],
@@ -1116,7 +1116,7 @@ fn configuration_error_pages(filler: usize) -> u64 {
     let ready = writer.configuration_state().unwrap();
 
     let before = writer.pages_fetched().unwrap();
-    let base = writer.input_version();
+    let base = writer.input_version().unwrap();
     let rejected = coordinator
         .publish_configuration_rejection(
             &mut writer,
@@ -1143,4 +1143,96 @@ fn a_configuration_error_reads_independent_of_namespace_size() {
     let large = configuration_error_pages(6000);
     println!("configuration error and heal: {small} pages beside 100 files, {large} beside 6000");
     assert!(large <= small + 16, "{small} pages beside 100 files, {large} beside 6000");
+}
+
+static EDIT_STATEMENTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn record_edit_statement(sql: &str) {
+    EDIT_STATEMENTS.lock().unwrap().push(sql.to_owned());
+}
+
+/// One bundle edited beside `n` others, reconciled by a watcher pass: the
+/// statements it ran and the pages it fetched.
+fn edit_cost(n: u32) -> (Vec<String>, u64) {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    let bundle = |index: u32, value: u64| {
+        let mut bytes = [0u8; 16];
+        bytes[..4].copy_from_slice(&index.to_le_bytes());
+        let (data, ..) = ordinary_bundle_with(0, 0, value);
+        // Distinct bundle and asset ids per index.
+        let mut parsed = distill_bundle::parse_bundle(&data).unwrap();
+        parsed.uuid = BundleUuid({
+            let mut uuid = bytes;
+            uuid[15] = 0xB0;
+            uuid
+        });
+        for entry in parsed.assets.values_mut() {
+            entry.uuid = AssetUuid({
+                let mut uuid = bytes;
+                uuid[15] = 0xA0;
+                uuid
+            });
+        }
+        distill_bundle::write_bundle(&parsed).unwrap()
+    };
+    for index in 0..n {
+        let dir = assets.join(format!("d{}", index % 20));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("b{index}.bundle")), bundle(index, 1)).unwrap();
+    }
+    let coordinator = coordinator(&temp);
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator
+        .reconcile_rescan(&mut writer, &mut distill_daemon::watcher::WatcherQueue::new())
+        .unwrap();
+    let edited = assets.join("d7/b7.bundle");
+    let batch = WatcherBatch {
+        paths: vec![edited.clone()],
+        renames: Vec::new(),
+    };
+    // The first edit warms the connection's statement cache.
+    std::fs::write(&edited, bundle(7, 2)).unwrap();
+    coordinator.reconcile_batch(&mut writer, &batch, false).unwrap();
+    std::fs::write(&edited, bundle(7, 3)).unwrap();
+    let pages = writer.pages_fetched().unwrap();
+    EDIT_STATEMENTS.lock().unwrap().clear();
+    writer.trace_statements(Some(record_edit_statement));
+    coordinator.reconcile_batch(&mut writer, &batch, false).unwrap();
+    writer.trace_statements(None);
+    let pages = writer.pages_fetched().unwrap() - pages;
+    (std::mem::take(&mut *EDIT_STATEMENTS.lock().unwrap()), pages)
+}
+
+/// An edit's pass costs what the edit does, not what the namespace holds:
+/// the same statements beside 40 bundles as beside 1200, and pages that
+/// grow only with the B-trees' depth (237 and 332 when written).
+#[test]
+fn an_edit_pass_runs_the_same_statements_at_any_namespace_size() {
+    let (small, small_pages) = edit_cost(40);
+    let (large, large_pages) = edit_cost(1200);
+    println!("statements {} / {}, pages {small_pages} / {large_pages}", small.len(), large.len());
+    assert_eq!(small.len(), large.len(), "{small:#?}\n{large:#?}");
+    assert!(2 * large_pages <= 3 * small_pages, "{small_pages} -> {large_pages} pages");
+}
+
+/// A staged restart and its served RestartRequired keys are one
+/// transaction: when the served write fails, nothing is staged.
+#[test]
+fn a_staged_restart_commits_with_its_served_keys_or_not_at_all() {
+    let temp = tempfile::tempdir().unwrap();
+    let coordinator = coordinator(&temp);
+    let mut writer = coordinator.open_writer().unwrap();
+    rusqlite::Connection::open(temp.path().join(".distill/meta.sqlite"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_restart_keys BEFORE INSERT ON store_meta
+             WHEN NEW.key = 'served_restart_keys'
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .unwrap();
+    let staged =
+        coordinator.stage_restart_configuration(&mut writer, &[RestartOnlyChange::AutoCodegen(true)]);
+    assert!(staged.is_err());
+    assert!(writer.pending_restart().unwrap().is_none(), "the staging committed alone");
 }

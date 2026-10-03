@@ -240,7 +240,7 @@ impl AuthoringService {
                 return Err(invalid(format!(
                     "bundle {} changed since durable version {}",
                     meta.path,
-                    store.input_version().0
+                    store.input_version().map_err(crate::authoring::invalid)?.0
                 )));
             }
             let bundle = distill_bundle::parse_bundle(&bytes).map_err(invalid)?;
@@ -540,7 +540,7 @@ struct PlannedBundleMutation {
 }
 
 pub(crate) fn require_base(store: &StoreReader, base: InputVersion) -> Result<(), RpcFailure> {
-    let expected = store.input_version();
+    let expected = store.input_version().map_err(crate::authoring::invalid)?;
     if expected != base {
         return Err(RpcFailure::StaleInputVersion {
             expected,

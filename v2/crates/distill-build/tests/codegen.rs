@@ -16,8 +16,8 @@ struct World {
 }
 
 impl CodegenSnapshot<u64> for World {
-    fn current_basis(&self) -> u64 {
-        self.basis
+    fn current_basis(&self) -> Option<u64> {
+        Some(self.basis)
     }
 
     fn observe(&self, op: &TraceOp) -> bool {
@@ -156,8 +156,8 @@ fn typed_generation_failure_is_published_only_if_its_basis_stays_current() {
 fn publication_error_does_not_install_trace_or_partial_state() {
     struct Failing(World);
     impl CodegenSnapshot<u64> for Failing {
-        fn current_basis(&self) -> u64 {
-            self.0.basis
+        fn current_basis(&self) -> Option<u64> {
+            Some(self.0.basis)
         }
         fn observe(&self, op: &TraceOp) -> bool {
             self.0.observe(op)

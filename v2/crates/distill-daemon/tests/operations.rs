@@ -149,11 +149,11 @@ fn rename_with_fixups_is_deferred_and_rescanned_as_one_version() {
         AuthoredValue::Str("renamed.bundle".into())
     );
     assert_eq!(
-        coordinator.open_reader().unwrap().input_version(),
+        coordinator.open_reader().unwrap().input_version().unwrap(),
         InputVersion(2)
     );
     assert_eq!(
-        coordinator.server().current_stamp().version,
+        coordinator.server().current_stamp().unwrap().version,
         InputVersion(2)
     );
 }

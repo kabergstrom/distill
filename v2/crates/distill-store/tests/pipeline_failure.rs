@@ -187,7 +187,7 @@ fn typed_pipeline_failure_roundtrips_through_store_and_invalid_identity_rolls_ba
 
     let mut invalid = failure;
     invalid.identity[0] ^= 1;
-    let before = store.input_version();
+    let before = store.input_version().unwrap();
     let error = store
         .input_transaction(|txn| txn.publish_pipeline_failure(&invalid))
         .unwrap_err();
@@ -195,5 +195,5 @@ fn typed_pipeline_failure_roundtrips_through_store_and_invalid_identity_rolls_ba
         error,
         StoreError::InvalidPipelineFailure(PipelineFailureDecodeError::IdentityMismatch)
     ));
-    assert_eq!(store.input_version(), before);
+    assert_eq!(store.input_version().unwrap(), before);
 }

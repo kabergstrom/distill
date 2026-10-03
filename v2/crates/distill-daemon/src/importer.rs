@@ -96,6 +96,19 @@ struct DirectoryRuleEntry {
     rules: DecodedDirectoryRules,
 }
 
+/// The pending file work a pass reconciles: its dirty entries and renames.
+pub(crate) type PassWork<'a> = (
+    &'a [distill_store::files::DirtyEntry],
+    &'a [distill_store::files::RenameEvent],
+);
+
+/// What refreshing the import index found: the bundle sources it reindexed,
+/// by (root, path), and the directory rules they held before.
+pub(crate) struct IndexRefresh {
+    changed: BTreeSet<(String, String)>,
+    previous: Vec<DirectoryRuleSource>,
+}
+
 /// A rules listing's sources by (rule index, group).
 type DirectoryGroups = BTreeMap<(usize, RootedPath), BTreeSet<RootedPath>>;
 
@@ -137,25 +150,18 @@ impl RegisteredImporter {
 }
 
 impl AuthoringService {
-    /// Bring the import index up to date. It is current but for the bundle
-    /// sources pending file work names: every bundle publication queues its
-    /// paths, and work is acknowledged only after a pass reindexed it. A
-    /// pass with no `work` of its own reindexes the store's pending work.
-    fn refresh_import_index(
+    /// Bring the import index up to date for `dirty`, the pending file work
+    /// a pass consumes: it is current but for the bundle sources pending
+    /// work names (every bundle publication queues its paths, and work is
+    /// acknowledged only after a pass reindexed it). Each source is parsed
+    /// once.
+    pub(crate) fn refresh_import_index(
         &self,
         store: &mut Store,
-        work: Option<(
-            &[distill_store::files::DirtyEntry],
-            &[distill_store::files::RenameEvent],
-        )>,
-    ) -> Result<(BTreeSet<(String, String)>, Vec<DirectoryRuleSource>), RpcFailure> {
-        match work {
-            Some((dirty, _)) => self.refresh_dirty_import_index(store, dirty),
-            None => {
-                let pending = store.pending_file_work().map_err(invalid)?;
-                self.refresh_dirty_import_index(store, &pending.dirty)
-            }
-        }
+        dirty: &[distill_store::files::DirtyEntry],
+    ) -> Result<IndexRefresh, RpcFailure> {
+        let (changed, previous) = self.refresh_dirty_import_index(store, dirty)?;
+        Ok(IndexRefresh { changed, previous })
     }
 
     /// Reindex the bundle sources `dirty` names, parsing each once. Returns
@@ -166,11 +172,13 @@ impl AuthoringService {
         dirty: &[distill_store::files::DirtyEntry],
     ) -> Result<(BTreeSet<(String, String)>, Vec<DirectoryRuleSource>), RpcFailure> {
         store.write_transaction_with(invalid, |store| {
-            let keys = dirty_bundle_keys(store, dirty)?;
-            let mut previous = Vec::new();
+            let keys = dirty
+                .iter()
+                .filter(|entry| entry.path.ends_with(".bundle"))
+                .map(|entry| ((entry.root_name.clone(), entry.path.clone()), entry.root))
+                .collect::<BTreeMap<_, _>>();
             let mut rows = Vec::new();
-            for (root, path) in &keys {
-                previous.extend(store.directory_rule_sources_at(root, path).map_err(invalid)?);
+            for ((root, path), root_id) in &keys {
                 let Some(bytes) = store.bundle_file(root, path).map_err(invalid)? else {
                     continue;
                 };
@@ -182,45 +190,43 @@ impl AuthoringService {
                     continue;
                 };
                 // The published bundle of this UUID may be another source's.
-                let bundle = if meta.path == *path
-                    && store.root_name(meta.root).map_err(invalid)?.as_deref() == Some(root.as_str())
-                {
-                    bundle
+                let (root_name, bundle) = if meta.path == *path && meta.root == *root_id {
+                    (root.clone(), bundle)
                 } else {
-                    self.cached_bundle(store, &meta)?
+                    self.published_bundle(store, &meta)?
                 };
-                rows.push(self.index_import_bundle(store, &meta, bundle)?);
+                rows.push(self.index_import_bundle(store, &meta, root_name, bundle)?);
             }
-            if !keys.is_empty() {
+            let keys = keys.into_keys().collect::<BTreeSet<_>>();
+            let previous = if keys.is_empty() {
+                Vec::new()
+            } else {
                 let sources = keys.iter().cloned().collect::<Vec<_>>();
                 store
                     .replace_import_index(&sources, &rows)
-                    .map_err(invalid)?;
-            }
+                    .map_err(invalid)?
+            };
             Ok((keys, previous))
         })
     }
 
-    /// The import index rows of the published bundle `meta`, parsed as
-    /// `bundle`.
+    /// The import index rows of the published bundle `meta` in the root
+    /// `root_name`, parsed as `bundle`.
     fn index_import_bundle(
         &self,
         store: &StoreReader,
         meta: &BundleMeta,
+        root_name: String,
         bundle: Bundle,
     ) -> Result<ImportIndexSource, RpcFailure> {
-        let root_name = store
-            .root_name(meta.root)
-            .map_err(invalid)?
-            .ok_or_else(|| invalid("bundle root is not interned"))?;
         let mut directory_rules = Vec::new();
         for entry in bundle
             .assets
             .values()
             .filter(|entry| entry.type_uuid == DIRECTORY_IMPORT_RULES_TYPE_UUID)
         {
-            decode_directory_rules(&entry.data)?;
-            directory_rules.push((bundle.uuid, entry.uuid));
+            let rules = decode_directory_rules(&entry.data)?;
+            directory_rules.push((bundle.uuid, entry.uuid, listing_dir(&rules.listing)));
         }
         let mut watched = None;
         if let Ok(prior) = decode_prior_import(bundle) {
@@ -249,20 +255,32 @@ impl AuthoringService {
         })
     }
 
-    /// Every indexed directory-import rules asset, decoded, in (bundle,
-    /// asset) order.
-    fn directory_rule_entries(&self, store: &StoreReader) -> Result<Vec<DirectoryRuleEntry>, RpcFailure> {
+    /// The indexed directory-import rules assets `sources` names, decoded,
+    /// in (bundle, asset) order. Each rules bundle is parsed once per call.
+    fn directory_rule_entries(
+        &self,
+        store: &StoreReader,
+        sources: Vec<DirectoryRuleSource>,
+    ) -> Result<Vec<DirectoryRuleEntry>, RpcFailure> {
+        let mut parsed = BTreeMap::<BundleUuid, Option<Bundle>>::new();
         let mut entries = Vec::new();
-        for source in store.directory_rule_sources().map_err(invalid)? {
-            let Some(meta) = store.bundle(source.rules_bundle).map_err(invalid)? else {
-                continue;
+        for source in sources {
+            let bundle = match parsed.entry(source.rules_bundle) {
+                std::collections::btree_map::Entry::Occupied(slot) => slot.into_mut(),
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    let bundle = match store.bundle(source.rules_bundle).map_err(invalid)? {
+                        Some(meta) => Some(self.published_bundle(store, &meta)?.1),
+                        None => None,
+                    };
+                    slot.insert(bundle)
+                }
             };
-            let bundle = self.cached_bundle(store, &meta)?;
-            let Some(entry) = bundle
-                .assets
-                .values()
-                .find(|entry| entry.uuid == source.rules_asset)
-            else {
+            let Some(entry) = bundle.as_ref().and_then(|bundle| {
+                bundle
+                    .assets
+                    .values()
+                    .find(|entry| entry.uuid == source.rules_asset)
+            }) else {
                 continue;
             };
             entries.push(DirectoryRuleEntry {
@@ -278,51 +296,51 @@ impl AuthoringService {
         Ok(entries)
     }
 
+    /// The directory rules whose listing may match one of `paths`, found by
+    /// their listing directories.
+    fn directory_rules_listing<'a>(
+        &self,
+        store: &StoreReader,
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Vec<DirectoryRuleEntry>, RpcFailure> {
+        let dirs = paths
+            .into_iter()
+            .flat_map(ancestor_dirs)
+            .collect::<BTreeSet<_>>();
+        let sources = store
+            .directory_rule_sources_listing(dirs)
+            .map_err(invalid)?;
+        self.directory_rule_entries(store, sources)
+    }
+
     /// Return every watched bundle whose complete committed read-set no longer
     /// reproduces under the current rooted filesystem and importer-capability
-    /// projection. The caller reruns these under the single-writer RPC CAS.
+    /// projection, with the index refreshed for the pending work. The caller
+    /// reruns these under the single-writer RPC CAS.
     pub fn watched_imports_needing_reimport(
         &self,
         store: &mut Store,
     ) -> Result<Vec<BundleUuid>, RpcFailure> {
-        self.watched_imports_needing_reimport_inner(store, None, false, None)
+        let pending = store.pending_file_work().map_err(invalid)?;
+        self.refresh_import_index(store, &pending.dirty)?;
+        self.watched_imports_due(store, None, None)
     }
 
-    /// Incremental watcher variant: read sets that cannot observe any dirty
-    /// logical path are left untouched, so an unrelated event never reopens or
-    /// rehashes their source files.
-    pub(crate) fn watched_imports_affected_by(
+    /// The watched bundles whose read sets no longer reproduce, over the
+    /// refreshed index. With `affected` (the work and whether importer
+    /// capabilities changed), read sets that cannot observe any dirty
+    /// logical path are left untouched, so an unrelated event never reopens
+    /// or rehashes their source files; `None` revalidates every one.
+    pub(crate) fn watched_imports_due(
         &self,
         store: &mut Store,
-        dirty: &[distill_store::files::DirtyEntry],
-        renames: &[distill_store::files::RenameEvent],
+        affected: Option<(PassWork<'_>, bool)>,
         overlay: Option<&FileOverlay>,
     ) -> Result<Vec<BundleUuid>, RpcFailure> {
-        self.watched_imports_needing_reimport_inner(store, Some((dirty, renames)), false, overlay)
-    }
-
-    pub(crate) fn watched_imports_affected_by_capabilities(
-        &self,
-        store: &mut Store,
-        dirty: &[distill_store::files::DirtyEntry],
-        renames: &[distill_store::files::RenameEvent],
-    ) -> Result<Vec<BundleUuid>, RpcFailure> {
-        self.watched_imports_needing_reimport_inner(store, Some((dirty, renames)), true, None)
-    }
-
-    fn watched_imports_needing_reimport_inner(
-        &self,
-        store: &mut Store,
-        work: Option<(
-            &[distill_store::files::DirtyEntry],
-            &[distill_store::files::RenameEvent],
-        )>,
-        capabilities_changed: bool,
-        overlay: Option<&FileOverlay>,
-    ) -> Result<Vec<BundleUuid>, RpcFailure> {
+        let work = affected.map(|(work, _)| work);
+        let capabilities_changed = affected.is_some_and(|(_, changed)| changed);
         let compiled = self.compiled(store)?;
         let capabilities = self.importer_capabilities(&compiled)?;
-        self.refresh_import_index(store, work)?;
         let watched = match work {
             Some((dirty, renames)) => {
                 let paths = dirty.iter().map(|entry| entry.path.as_str()).chain(
@@ -357,54 +375,58 @@ impl AuthoringService {
         Ok(pending)
     }
 
+    /// The directory-import tasks due over the refreshed index: with
+    /// `affected` (the work and whether importer capabilities changed),
+    /// those of the rules a changed rules source holds or whose listing a
+    /// dirty path is in; `None` revalidates every rule. Records the outputs
+    /// their rules no longer produce as orphaned.
     pub(crate) fn directory_import_tasks(
         &self,
         store: &mut Store,
-    ) -> Result<Vec<DirectoryImportTask>, RpcFailure> {
-        self.directory_import_tasks_inner(store, None, false, None)
-    }
-
-    pub(crate) fn directory_import_tasks_affected_by(
-        &self,
-        store: &mut Store,
-        dirty: &[distill_store::files::DirtyEntry],
-        renames: &[distill_store::files::RenameEvent],
+        refreshed: &IndexRefresh,
+        affected: Option<(PassWork<'_>, bool)>,
         overlay: Option<&FileOverlay>,
     ) -> Result<Vec<DirectoryImportTask>, RpcFailure> {
-        self.directory_import_tasks_inner(store, Some((dirty, renames)), false, overlay)
-    }
-
-    pub(crate) fn directory_import_tasks_affected_by_capabilities(
-        &self,
-        store: &mut Store,
-        dirty: &[distill_store::files::DirtyEntry],
-        renames: &[distill_store::files::RenameEvent],
-    ) -> Result<Vec<DirectoryImportTask>, RpcFailure> {
-        self.directory_import_tasks_inner(store, Some((dirty, renames)), true, None)
-    }
-
-    fn directory_import_tasks_inner(
-        &self,
-        store: &mut Store,
-        work: Option<(
-            &[distill_store::files::DirtyEntry],
-            &[distill_store::files::RenameEvent],
-        )>,
-        capabilities_changed: bool,
-        overlay: Option<&FileOverlay>,
-    ) -> Result<Vec<DirectoryImportTask>, RpcFailure> {
+        let work = affected.map(|(work, _)| work);
+        let capabilities_changed = affected.is_some_and(|(_, changed)| changed);
         let compiled = self.compiled(store)?;
         let capabilities = self.importer_capabilities(&compiled)?;
-        let (changed, previous) = self.refresh_import_index(store, work)?;
-        let entries = self.directory_rule_entries(&store)?;
+        let (changed, previous) = (&refreshed.changed, &refreshed.previous);
+        let mut paths = Vec::new();
+        if let Some((dirty, renames)) = work {
+            for entry in dirty {
+                paths.push((entry.root_name.clone(), entry.path.clone()));
+            }
+            for rename in renames {
+                paths.push((rename.root_name.clone(), rename.from_path.clone()));
+                paths.push((rename.root_name.clone(), rename.to_path.clone()));
+            }
+        }
+        // Every rule is revalidated with no work or changed capabilities, and
+        // read when a changed source holds rules, so a rule id it duplicates
+        // is found; otherwise only the rules whose listing a dirty path may
+        // be in are read.
+        let mut changed_rules = false;
+        for (root, path) in changed {
+            changed_rules |= !store
+                .directory_rule_sources_at(root, path)
+                .map_err(invalid)?
+                .is_empty();
+        }
+        let entries = if work.is_none() || capabilities_changed || changed_rules {
+            let sources = store.directory_rule_sources().map_err(invalid)?;
+            self.directory_rule_entries(&store, sources)?
+        } else {
+            self.directory_rules_listing(&store, paths.iter().map(|(_, path)| path.as_str()))?
+        };
         let mut backend = RootedImportBackend::over(compiled.scanner(), &store, &capabilities, overlay);
         let mut groups = BTreeMap::new();
         let mut touched = BTreeSet::<(BundleUuid, AssetUuid, usize, RootedPath)>::new();
         let mut touched_origins = BTreeSet::<StoredDirectoryOrigin>::new();
-        if let Some((dirty, renames)) = work {
+        if work.is_some() {
             // A changed rules source may have dropped rules: every bundle its
             // previous rules generated is rechecked for orphaning.
-            for rules in &previous {
+            for rules in previous {
                 for bundle in store
                     .bundles_owned_by(rules.rules_bundle)
                     .map_err(invalid)?
@@ -413,18 +435,6 @@ impl AuthoringService {
                     {
                         touched_origins.insert(origin);
                     }
-                }
-            }
-            let mut paths = Vec::new();
-            for entry in dirty {
-                if let Some(root) = store.root_name(entry.root).map_err(invalid)? {
-                    paths.push((root, entry.path.clone()));
-                }
-            }
-            for rename in renames {
-                if let Some(root) = store.root_name(rename.root).map_err(invalid)? {
-                    paths.push((root.clone(), rename.from_path.clone()));
-                    paths.push((root, rename.to_path.clone()));
                 }
             }
             for entry in &entries {
@@ -565,7 +575,7 @@ impl AuthoringService {
                 let Some(origin) = &meta.origin else {
                     continue;
                 };
-                let prior = self.read_prior_import_cached(store, meta)?;
+                let prior = self.read_prior_import_published(store, meta)?;
                 let current_basis = prior
                     .model
                     .record
@@ -596,11 +606,11 @@ impl AuthoringService {
             store
                 .record_watched_import_failure(&WatchedImportFailure {
                     bundle,
-                    attempted_input_version: store.input_version(),
+                    attempted_input_version: store.input_version().map_err(crate::authoring::invalid)?,
                     basis,
                     terminal: WatchedImportTerminal::DirectoryOrphan,
                     message,
-                    memo_seq: store.memo_seq(),
+                    memo_seq: store.memo_seq().map_err(crate::authoring::invalid)?,
                 })
                 .map_err(invalid)?;
         }
@@ -615,7 +625,7 @@ impl AuthoringService {
         store: &mut Store,
         import: &PassImport,
     ) -> Result<Option<PlannedImport>, RpcFailure> {
-        let base = store.input_version();
+        let base = store.input_version().map_err(crate::authoring::invalid)?;
         let planned = match import {
             PassImport::Directory(task) => {
                 let invocation = self
@@ -665,7 +675,7 @@ impl AuthoringService {
         store: &mut Store,
         run: ImportRun,
     ) -> Result<PassPublication, RpcFailure> {
-        let base = store.input_version();
+        let base = store.input_version().map_err(crate::authoring::invalid)?;
         match self.publish_import(store, base, run, ImportExecutionMode::Publish) {
             Ok(prepared) => Ok(PassPublication::Published(prepared)),
             Err(error) if error.memoized => Ok(PassPublication::Memoized),
@@ -709,7 +719,7 @@ impl AuthoringService {
             }
         }
         Ok(self
-            .directory_rule_entries(store)?
+            .directory_rules_listing(store, paths.iter().copied())?
             .iter()
             .any(|entry| paths.iter().any(|path| query_matches(&entry.rules.listing, path))))
     }
@@ -807,7 +817,7 @@ impl AuthoringService {
             .bundle(bundle)
             .map_err(invalid)?
             .ok_or_else(|| invalid(format!("cannot reimport unknown bundle {bundle}")))?;
-        let prior = self.read_prior_import_cached(store, &meta)?;
+        let prior = self.read_prior_import_published(store, &meta)?;
         Ok((prior.model.record.importer.clone(), meta.path.clone()))
     }
 
@@ -901,7 +911,7 @@ impl AuthoringService {
         let Some(meta) = destination.meta else {
             return Ok(true);
         };
-        let prior = self.read_prior_import_cached(store, &meta)?;
+        let prior = self.read_prior_import_published(store, &meta)?;
         let expected_origin = DirectoryOrigin {
             rules_bundle: task.rules_bundle,
             rule: task.rule.clone(),
@@ -942,7 +952,7 @@ impl AuthoringService {
         let run = self
             .run_import(base, importer, invocation, None)
             .map_err(ImportExecutionError::into_rpc)?;
-        self.publish_import_run(store, base, run)
+        self.publish_import_run(store, base, run)?
     }
 
     /// Run an explicit import at `base` without publishing it. The run
@@ -975,14 +985,19 @@ impl AuthoringService {
     }
 
     /// Publish a run made at `base`, in an input opened at `base`.
+    /// `Ok(Err(failure))` when the run failed and its failure is memoized:
+    /// the memo commits. On `Err` nothing commits.
     pub(crate) fn publish_import_run(
         &self,
         store: &mut Store,
         base: InputVersion,
         run: ImportRun,
-    ) -> Result<PreparedImportCommit, RpcFailure> {
-        self.publish_import(store, base, run, ImportExecutionMode::Publish)
-            .map_err(ImportExecutionError::into_rpc)
+    ) -> Result<Result<PreparedImportCommit, RpcFailure>, RpcFailure> {
+        match self.publish_import(store, base, run, ImportExecutionMode::Publish) {
+            Ok(prepared) => Ok(Ok(prepared)),
+            Err(error) if error.memoized => Ok(Err(error.rpc)),
+            Err(error) => Err(error.into_rpc()),
+        }
     }
 
     fn import_invocation(
@@ -1055,7 +1070,7 @@ impl AuthoringService {
                     .bundle(bundle)
                     .map_err(invalid)?
                     .ok_or_else(|| invalid(format!("poisoned bundle {bundle} has no row")))?;
-                let parsed = self.cached_bundle(store, &meta)?;
+                let (_, parsed) = self.published_bundle(store, &meta)?;
                 if decoded_import_record(&parsed)?.is_some_and(|record| record.watch) {
                     watched.push(meta.bundle);
                 }
@@ -1529,10 +1544,11 @@ impl AuthoringService {
     /// success's, a revert to that source revalidates and the failure never
     /// clears.
     fn reindex_watched_bundle(&self, store: &mut Store, meta: &BundleMeta) -> Result<(), RpcFailure> {
-        let bundle = self.cached_bundle(store, meta)?;
-        let row = self.index_import_bundle(store, meta, bundle)?;
+        let (root_name, bundle) = self.published_bundle(store, meta)?;
+        let row = self.index_import_bundle(store, meta, root_name, bundle)?;
         let source = [(row.root_name.clone(), row.path.clone())];
-        store.replace_import_index(&source, &[row]).map_err(invalid)
+        store.replace_import_index(&source, &[row]).map_err(invalid)?;
+        Ok(())
     }
 
     /// Memoize a watched run's failure. `Some(true)` once memoized;
@@ -1564,7 +1580,7 @@ impl AuthoringService {
         // The memo records the attempt whatever version it ran at; the
         // revalidation above only decides whether it is still wanted.
         store.write_transaction_with(invalid, |store| {
-            let memo_seq = store.memo_seq();
+            let memo_seq = store.memo_seq().map_err(crate::authoring::invalid)?;
             store
                 .record_watched_import_failure(&WatchedImportFailure {
                     bundle: destination.bundle,
@@ -1700,7 +1716,13 @@ impl AuthoringService {
         })
     }
 
-    fn cached_bundle(&self, store: &StoreReader, meta: &BundleMeta) -> Result<Bundle, RpcFailure> {
+    /// The published bundle `meta`, read from the scan and parsed, with its
+    /// root's name. Every call reads and parses it.
+    fn published_bundle(
+        &self,
+        store: &StoreReader,
+        meta: &BundleMeta,
+    ) -> Result<(String, Bundle), RpcFailure> {
         let root = store
             .root_name(meta.root)
             .map_err(invalid)?
@@ -1714,16 +1736,17 @@ impl AuthoringService {
                 "published scan does not match durable bundle metadata",
             ));
         }
-        distill_bundle::parse_bundle(&bytes).map_err(invalid)
+        let bundle = distill_bundle::parse_bundle(&bytes).map_err(invalid)?;
+        Ok((root, bundle))
     }
 
-    fn read_prior_import_cached(
+    /// `meta`'s import record, from the published scan.
+    fn read_prior_import_published(
         &self,
         store: &StoreReader,
         meta: &BundleMeta,
     ) -> Result<PriorImport, RpcFailure> {
-        let bundle = self.cached_bundle(store, meta)?;
-        decode_prior_import(bundle)
+        decode_prior_import(self.published_bundle(store, meta)?.1)
     }
 
     fn read_prior_import(
@@ -1841,20 +1864,6 @@ fn directory_groups(
     Ok(groups)
 }
 
-fn dirty_bundle_keys(
-    store: &StoreReader,
-    dirty: &[distill_store::files::DirtyEntry],
-) -> Result<BTreeSet<(String, String)>, RpcFailure> {
-    dirty
-        .iter()
-        .filter(|entry| entry.path.ends_with(".bundle"))
-        .filter_map(|entry| match store.root_name(entry.root) {
-            Ok(Some(root)) => Some(Ok((root, entry.path.clone()))),
-            Ok(None) => None,
-            Err(error) => Some(Err(invalid(error))),
-        })
-        .collect()
-}
 
 
 fn directory_assignment(
@@ -2005,6 +2014,26 @@ fn directory_task_origin(task: &DirectoryImportTask) -> StoredDirectoryOrigin {
     }
 }
 
+/// The directory, ending in `/` (`""` for the whole root), that every path
+/// `listing` matches is under: the parent of the longest literal text all
+/// its matches start with.
+fn listing_dir(listing: &FileQuery) -> String {
+    let glob = listing
+        .path_glob
+        .as_deref()
+        .map_or("", |pattern| GlobKeys::of(pattern, GLOBSET_META).prefix);
+    let prefix = listing.path_prefix.as_deref().unwrap_or("");
+    let literal = if glob.len() > prefix.len() { glob } else { prefix };
+    literal
+        .rfind('/')
+        .map_or_else(String::new, |slash| literal[..=slash].to_owned())
+}
+
+/// `""` and each directory `path` is under, ending in `/`.
+fn ancestor_dirs(path: &str) -> impl Iterator<Item = &str> {
+    std::iter::once("").chain(path.match_indices('/').map(|(slash, _)| &path[..=slash]))
+}
+
 fn validate_directory_rule_ids(entries: &[DirectoryRuleEntry]) -> Result<(), RpcFailure> {
     let mut owners = BTreeMap::<[u8; 16], BundleUuid>::new();
     for entry in entries {
@@ -2106,17 +2135,12 @@ pub(crate) struct PassOutput {
 /// and the outputs of the imports it runs before others that read them. A
 /// pass runs its imports outside any write against the committed rows with
 /// these over them, which is what its input will hold when it publishes
-/// them.
-///
-/// An incremental pass's overlay holds every row under its scanned prefixes
-/// (`under`); a complete pass's holds only the rows that differ from the
-/// committed ones (`paths`), each new row or removal by (root, path).
+/// them. It holds only the rows that differ from the committed ones, each
+/// new row or removal by (root, path): its size is the change's, not the
+/// namespace's.
 #[derive(Clone)]
 pub(crate) struct FileOverlay {
-    under: Vec<(String, String)>,
-    /// The rows under `under`.
-    rows: Vec<ObservedFile>,
-    /// Single rows replaced (`Some`) or removed (`None`) by (root, path).
+    /// Rows replaced (`Some`) or removed (`None`) by (root, path).
     paths: BTreeMap<(String, String), Option<ObservedFile>>,
     /// Earlier imports' outputs by (root, path): each replaces any other
     /// row at its path, and reads of it see these bytes.
@@ -2124,23 +2148,15 @@ pub(crate) struct FileOverlay {
 }
 
 impl FileOverlay {
-    /// Capture the rows under `under` as `store`'s open input holds them.
-    pub(crate) fn capture(
-        store: &StoreReader,
-        under: &[(String, String)],
-    ) -> Result<Self, StoreError> {
-        let mut rows = BTreeMap::new();
-        for (root, prefix) in under {
-            for row in store.observed_files_under(root, prefix)? {
-                rows.insert((row.root_name.clone(), row.path.clone()), row);
-            }
-        }
-        Ok(Self {
-            under: under.to_vec(),
-            rows: rows.into_values().collect(),
-            paths: BTreeMap::new(),
+    /// An overlay of `changes`: rows replaced (`Some`) or removed (`None`)
+    /// by (root, path), each differing from the committed row.
+    pub(crate) fn of_changes(
+        changes: impl IntoIterator<Item = ((String, String), Option<ObservedFile>)>,
+    ) -> Self {
+        Self {
+            paths: changes.into_iter().collect(),
             outputs: BTreeMap::new(),
-        })
+        }
     }
 
     /// The rows of `observed`, a complete observation in (root name, path)
@@ -2170,22 +2186,18 @@ impl FileOverlay {
         for added in observed {
             paths.insert((added.root_name.clone(), added.path.clone()), Some(added));
         }
-        Ok(Self {
-            under: Vec::new(),
-            rows: Vec::new(),
-            paths,
-            outputs: BTreeMap::new(),
-        })
+        Ok(Self::of_changes(paths))
     }
 
     /// An overlay of nothing: every committed row reads through.
     pub(crate) fn empty() -> Self {
-        Self {
-            under: Vec::new(),
-            rows: Vec::new(),
-            paths: BTreeMap::new(),
-            outputs: BTreeMap::new(),
-        }
+        Self::of_changes([])
+    }
+
+    /// How many rows the overlay replaces or removes.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.paths.len()
     }
 
     /// This overlay with `outputs` over it, each replacing the row at its
@@ -2194,9 +2206,6 @@ impl FileOverlay {
         let mut overlay = self.clone();
         for output in outputs {
             let key = (output.root.clone(), output.path.clone());
-            overlay
-                .rows
-                .retain(|row| (&row.root_name, &row.path) != (&key.0, &key.1));
             overlay.paths.insert(
                 key.clone(),
                 Some(ObservedFile {
@@ -2224,20 +2233,11 @@ impl FileOverlay {
 
     fn covers(&self, root: &str, path: &str) -> bool {
         self.paths.contains_key(&(root.to_owned(), path.to_owned()))
-            || self.under.iter().any(|(prefix_root, prefix)| {
-                prefix_root == root
-                    && (prefix.is_empty()
-                        || path == prefix
-                        || path
-                            .strip_prefix(prefix.as_str())
-                            .is_some_and(|suffix| suffix.starts_with('/')))
-            })
     }
 
-    /// The overlay's own rows: those under its prefixes and those it
-    /// replaces one path at a time.
+    /// The overlay's own rows: those it replaces.
     fn own_rows(&self) -> impl Iterator<Item = &ObservedFile> {
-        self.rows.iter().chain(self.paths.values().flatten())
+        self.paths.values().flatten()
     }
 
     fn files_at(&self, reader: &StoreReader, path: &str) -> Result<Vec<ObservedFile>, StoreError> {
@@ -2669,13 +2669,10 @@ fn current_type_schema(
     if let Some(project) = authority.and_then(|authority| authority.project_type(type_uuid)) {
         return Ok((project.logical_hash, project.logical_schema.clone()));
     }
-    let hash = match store.pipeline_state().map_err(invalid)? {
-        Some(distill_store::state::PipelineState::Ready(epoch)) => {
-            epoch.schema_registry.get(&type_uuid).copied()
-        }
-        _ => None,
-    }
-    .ok_or_else(|| invalid(format!("output type {type_uuid} has no current schema")))?;
+    let hash = store
+        .ready_schema_hash(type_uuid)
+        .map_err(invalid)?
+        .ok_or_else(|| invalid(format!("output type {type_uuid} has no current schema")))?;
     let snapshot = store
         .schema(hash)
         .map_err(invalid)?
@@ -4080,10 +4077,33 @@ mod enumerate_tests {
             .filter(|key| before.get(*key) != after.get(*key))
             .collect::<BTreeSet<_>>();
         assert_eq!(differences.paths.keys().collect::<BTreeSet<_>>(), changed);
+        // An incremental pass's holds what changed under its prefixes.
+        let changes_under = |under: &[(String, String)]| {
+            FileOverlay::of_changes(
+                changed
+                    .iter()
+                    .filter(|(root, path)| {
+                        under.iter().any(|(prefix_root, prefix)| {
+                            prefix_root == root
+                                && (prefix.is_empty()
+                                    || path == prefix
+                                    || path.starts_with(&format!("{prefix}/")))
+                        })
+                    })
+                    .map(|key| {
+                        let row = after.get(*key).map(|file| ObservedFile {
+                            root_name: key.0.clone(),
+                            path: key.1.clone(),
+                            file: file.clone(),
+                        });
+                        ((*key).clone(), row)
+                    }),
+            )
+        };
         let overlays = [
             (None, differences),
-            (Some(&under[..2]), FileOverlay::capture(&observed.reader().unwrap(), &under[..2]).unwrap()),
-            (Some(&under[2..]), FileOverlay::capture(&observed.reader().unwrap(), &under[2..]).unwrap()),
+            (Some(&under[..2]), changes_under(&under[..2])),
+            (Some(&under[2..]), changes_under(&under[2..])),
         ];
         for (under, overlay) in overlays {
             let reader = committed.reader().unwrap();
