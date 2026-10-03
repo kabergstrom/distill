@@ -116,14 +116,6 @@ pub enum StoreError {
         offset: u64,
         payload_len: u64,
     },
-    /// A commit's derived-output assertion did not verify against the
-    /// input-versioned namespace index (§9, §13) — reported, never
-    /// silently recorded.
-    DerivedOutputUnverified {
-        child: distill_core::id::AssetUuid,
-        parent: distill_core::id::AssetUuid,
-        output_key: String,
-    },
     /// A build-import result must carry exactly one output row (§13).
     BuildImportOutputArity { got: usize },
     /// A build commit names a wire tree the CAS does not hold.
@@ -242,11 +234,6 @@ impl fmt::Display for StoreError {
                 f,
                 "CAS record in segment {segment} at offset {offset} declares payload_len {payload_len} \
                  beyond the segment bounds"
-            ),
-            StoreError::DerivedOutputUnverified { child, parent, output_key } => write!(
-                f,
-                "derived-output assertion {child} → ({parent}, `{output_key}`) does not verify \
-                 against the namespace index"
             ),
             StoreError::BuildImportOutputArity { got } => {
                 write!(f, "a build-import result carries exactly one output row, got {got}")

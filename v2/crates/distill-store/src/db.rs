@@ -315,13 +315,6 @@ CREATE TABLE derived_outputs (
     output_key  TEXT NOT NULL,
     terminal_type BLOB
 );
-CREATE TABLE derived_assertions (
-    child_uuid  BLOB NOT NULL,
-    parent_uuid BLOB NOT NULL,
-    output_key  TEXT NOT NULL,
-    memo_seq    INTEGER NOT NULL,
-    PRIMARY KEY (child_uuid, memo_seq)
-);
 CREATE INDEX result_candidates_by_segment ON result_candidates(segment);
 CREATE TABLE cas_extents (
     content_hash BLOB NOT NULL PRIMARY KEY,
@@ -348,8 +341,43 @@ CREATE TABLE cas_segments (
     file_name   TEXT NOT NULL,
     segment_kind INTEGER NOT NULL,
     indexed_len INTEGER NOT NULL,
-    state       INTEGER NOT NULL CHECK (state IN (0, 1, 2))
+    state       INTEGER NOT NULL CHECK (state IN (0, 1, 2)),
+    -- Schema 39 (fix-cas): the writer that allocated the segment
+    -- (`CasInner::owner`), so a writer seals its own open segments.
+    owner       INTEGER,
+    -- Schema 39 (fix-cas): the bytes of the extents and result records the
+    -- index places in this segment, kept by the triggers below, so the
+    -- CAS's live bytes and its compactable segments are read per segment,
+    -- never per extent.
+    live_len    INTEGER NOT NULL DEFAULT 0
 );
+-- Schema 39 (fix-cas): each writer's open segments.
+CREATE INDEX cas_segments_open ON cas_segments(owner, segment_id) WHERE state = 0;
+-- Schema 39 (fix-cas): segments by state, then by how far their live bytes
+-- fall short of half their indexed bytes: the dead segments the sweeper
+-- deletes, and the sealed ones compaction kills or copies (see
+-- `cas::gc::COMPACTION_CANDIDATES`), are each one key range.
+CREATE INDEX cas_segments_by_state ON cas_segments(state, live_len * 2 - indexed_len);
+CREATE TRIGGER cas_extents_live_insert AFTER INSERT ON cas_extents BEGIN
+    UPDATE cas_segments SET live_len = live_len + NEW.len WHERE segment_id = NEW.segment;
+END;
+CREATE TRIGGER cas_extents_live_delete AFTER DELETE ON cas_extents BEGIN
+    UPDATE cas_segments SET live_len = live_len - OLD.len WHERE segment_id = OLD.segment;
+END;
+CREATE TRIGGER cas_extents_live_update AFTER UPDATE OF segment, len ON cas_extents BEGIN
+    UPDATE cas_segments SET live_len = live_len - OLD.len WHERE segment_id = OLD.segment;
+    UPDATE cas_segments SET live_len = live_len + NEW.len WHERE segment_id = NEW.segment;
+END;
+CREATE TRIGGER result_candidates_live_insert AFTER INSERT ON result_candidates BEGIN
+    UPDATE cas_segments SET live_len = live_len + NEW.len WHERE segment_id = NEW.segment;
+END;
+CREATE TRIGGER result_candidates_live_delete AFTER DELETE ON result_candidates BEGIN
+    UPDATE cas_segments SET live_len = live_len - OLD.len WHERE segment_id = OLD.segment;
+END;
+CREATE TRIGGER result_candidates_live_update AFTER UPDATE OF segment, len ON result_candidates BEGIN
+    UPDATE cas_segments SET live_len = live_len - OLD.len WHERE segment_id = OLD.segment;
+    UPDATE cas_segments SET live_len = live_len + NEW.len WHERE segment_id = NEW.segment;
+END;
 CREATE TABLE pipeline_state (
     id                 INTEGER PRIMARY KEY CHECK (id = 0),
     dylib_hash         BLOB,
@@ -448,6 +476,9 @@ CREATE TABLE change_log (
     detail     BLOB
 );
 CREATE INDEX change_log_by_version ON change_log(version);
+-- Schema 39 (fix-cas): a subscriber's history, one subject at a time.
+CREATE INDEX change_log_assets ON change_log(asset_uuid, version) WHERE kind = 1;
+CREATE INDEX change_log_paths ON change_log(subject, version) WHERE kind = 2;
 -- The RPC target set and each target's reconnect generation.
 CREATE TABLE rpc_targets (
     name            TEXT NOT NULL PRIMARY KEY,
@@ -455,9 +486,11 @@ CREATE TABLE rpc_targets (
     generation      INTEGER NOT NULL
 );
 -- The one piece of artifact metadata the DSTL bytes do not carry: each
--- direct load edge's expected terminal type. Written with the CAS index.
+-- direct load edge's expected terminal type. Written with the CAS index,
+-- by the artifact's latest install; deleted with its extent.
 CREATE TABLE artifact_load_edges (
-    content_hash      BLOB NOT NULL,
+    content_hash      BLOB NOT NULL
+                      REFERENCES cas_extents(content_hash) ON DELETE CASCADE,
     asset_uuid        BLOB NOT NULL,
     expected_terminal BLOB NOT NULL,
     PRIMARY KEY (content_hash, asset_uuid)
@@ -600,9 +633,9 @@ impl Store {
         create_dir(state_path)?;
         create_dir(&state_path.join("cas"))?;
         create_dir(&state_path.join("tools"))?;
+        let state_lock = lock_state_dir(state_path)?;
         crate::pipeline::cleanup_staged_tool_temps(state_path)?;
 
-        let state_lock = lock_state_dir(state_path)?;
         let db_path = state_path.join("meta.sqlite");
         let conn = open_writer_connection(&db_path)?;
 
@@ -635,6 +668,7 @@ impl Store {
             before_commit: None,
         };
         let recovery = store.recover_cas()?;
+        crate::pipeline::collect_unregistered_tool_files(&store.conn, &store.config.state_path)?;
         tracing::info!(
             path = %store.config.state_path.display(),
             input_version = store.input_version()?.0,
@@ -859,13 +893,11 @@ impl Store {
                 Ok(()) => return Ok(self.input_version()?),
                 Err(error) => {
                     let _ = self.read.conn.execute_batch("ROLLBACK");
-                    self.cas.forget_active();
                     return Err(error.into());
                 }
             }
         }
         self.read.conn.execute_batch("ROLLBACK")?;
-        self.cas.forget_active();
         Ok(base)
     }
 
@@ -874,8 +906,10 @@ impl Store {
     /// read and never upgrades a read snapshot; inside an open one, a
     /// savepoint in it. On failure everything `f` wrote rolls back (a nested
     /// one only its own writes, so a caller that handles the error commits
-    /// none of them), and this writer forgets its active segment, whose row
-    /// may have been part of it.
+    /// none of them). The CAS needs no fixup: a writer finds its segment by
+    /// its `cas_segments` row, so a rolled-back allocation goes with its row
+    /// (and its id with `next_segment_id`), and bytes a rolled-back append
+    /// left in a surviving segment are dead space past its `indexed_len`.
     pub(crate) fn write_txn<T>(
         &mut self,
         f: impl FnOnce(&mut Store) -> Result<T, StoreError>,
@@ -894,7 +928,6 @@ impl Store {
                         .read
                         .conn
                         .execute_batch("ROLLBACK TO write_txn; RELEASE write_txn");
-                    self.cas.forget_active();
                     std::panic::resume_unwind(panic)
                 }
             };
@@ -902,7 +935,6 @@ impl Store {
                 .read
                 .conn
                 .execute_batch("ROLLBACK TO write_txn; RELEASE write_txn");
-            self.cas.forget_active();
             return out;
         }
         self.refresh_config();
@@ -916,12 +948,10 @@ impl Store {
             Ok(Err(error)) => Err(error),
             Err(panic) => {
                 let _ = self.read.conn.execute_batch("ROLLBACK");
-                self.cas.forget_active();
                 std::panic::resume_unwind(panic)
             }
         };
         let _ = self.read.conn.execute_batch("ROLLBACK");
-        self.cas.forget_active();
         out
     }
 

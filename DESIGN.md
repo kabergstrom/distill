@@ -3475,12 +3475,11 @@ the cache stores is not one ContentHash but the whole result: `output_key →
 (type uuids, ContentHash)` — the primary output under a reserved key plus every
 extra output — together with the discovered trace. Each output is its own
 DSTL artifact with its own ContentHash and load-dep list. One coordinator
-transaction commits the CAS index rows for every output, the
-static-input-key → (trace, result) row, and one **derived-output assertion**
-row per
-extra output — `child uuid → (parent uuid, output_key)`, memo data
-verified against the input-versioned namespace index (below), never a
-namespace claim of its own. UUIDv5 is one-way,
+transaction commits the CAS index rows for every output and the
+static-input-key → (trace, result) row. It writes no child row: an extra
+output's `child uuid → (parent uuid, output_key)` lives only in the
+input-versioned namespace index (below), never as a claim of the
+commit's own. UUIDv5 is one-way,
 so that index is how `resolve(child, at)` finds the parent — and it cannot
 miss: a client can only name a child it read out of a fetched parent
 artifact, and that artifact's commit wrote the index row first. Child
@@ -3507,16 +3506,14 @@ updates it for unchanged assets — and a client holding a child UUID
 across eviction, daemon restart, or `.distill` loss can always resolve
 it (UUIDv5 is one-way; without this, a remembered child would be
 permanently orphaned). This snapshot-scoped index is the **only
-authority** for child resolution: commit-time rows and anything
-recovered from historical CAS result records are memo consistency data,
-never namespace claims — a child UUID resolves at a snapshot iff that
+authority** for child resolution: anything recovered from historical
+CAS result records is memo data, never a namespace claim — a child UUID resolves at a snapshot iff that
 snapshot derives it, so a retired output key's UUID can later be minted
 for authored data without a stale result record resurrecting the old
 claim. The index is validated against authored UUIDs at
 publication (§7) — collisions surface before the version is queryable,
-never as ordering-dependent resolution. Commit-time rows are
-consistency-checked against
-the derived index, and no artifact is created — laziness intact. Anything that pins a
+never as ordering-dependent resolution. No artifact is created —
+laziness intact. Anything that pins a
 parent's terminal artifact pins the whole chain
 result, earlier-stage extras included, so a child UUID read out of any
 held artifact is always resolvable for as long as that artifact is held.
@@ -5001,7 +4998,13 @@ keys (literal prefix and literal final segment, one shared cutter,
 `files::GlobKeys`) and is matched on the streamed rows. The filter is driven
 by its most selective indexed selector and runs as at most two statements
 whatever the namespace size — a filter with no indexed selector is one
-streamed statement over every row, never a read per row.
+streamed statement over every row, never a read per row. Those filters ask
+for the whole namespace by nature: a bare `**`, a glob with neither a
+literal prefix nor a literal final segment (bundle paths share their
+extension, so it keys nothing), and the runtime role alone (most rows are
+runtime rows; the authoring role has its partial index). A tag query is
+driven by `asset_tags`, and its poison check by the poisoned rows' partial
+index, which holds no rows while no refinement is pending or failed.
 
 One poison semantics holds for every caller. A query answers the
 non-poisoned rows of its role that match every selector, glob included. It
@@ -5102,43 +5105,40 @@ segment-scan rules: deterministic build failures memoize at their basis
 (§15's quiescence — an unchanged basis answers from the record instead
 of rebuilding once per client), while transient infrastructure errors
 (I/O outside the tree, a module crash) are typed apart and never
-memoized. **The result record is the commit marker**: recovery ignores
-payload records not covered by a committed result record — a crash after
-output 2 of 3 publishes nothing — and the indexes rebuild by role:
+memoized. **The write transaction that indexes a record group is its
+commit**: payloads first, the result record last, one fsync per touched
+segment, then the group's index rows, all in one SQLite write transaction
+(the caller's, when a node publishes its result with its artifact
+installs and their load edges). A group whose transaction rolls back, or
+that a crash interrupts before COMMIT, publishes nothing — a crash after
+output 2 of 3 publishes nothing — and its bytes past the segment's
+indexed length are dead. The index maps by role:
 `static-input key → candidate bucket` (every committed result record for
-the key, keyed secondarily by trace digest — rebuild recovers the whole
-bucket, not a last-winner, §9) from processor result records,
-`DSBI digest → candidate bucket` from build-import result records,
-`ContentHash → location`
-from payload records. The derived-output *namespace* is deliberately not
-among them: historical result tables are memos, and child resolution
-consults only the current version's derived index (§9) — a retired
-child UUID is never resurrected by an old record. Together
-**every** artifact index rebuilds from a segment scan. Segments
+the key, keyed secondarily by trace digest, §9) from processor result
+records, `DSBI digest → candidate bucket` from build-import result
+records, `ContentHash → location` from payload records. The
+derived-output *namespace* is deliberately not among them: historical
+result tables are memos, and child resolution consults only the current
+version's derived index (§9) — a retired child UUID is never resurrected
+by an old record. Segments
 roll at a size cap; a record whose framed size exceeds the cap is
 written instead as a dedicated **oversize segment** — one record per
-file, the same record grammar, named and typed as oversize in the
-generation manifest, indexed, scanned, compacted, and evicted exactly
+file, the same record grammar, named and typed as oversize in
+`cas_segments`, indexed, compacted, and evicted exactly
 like any segment — so an oversized artifact (blobs are unbounded, §4,
 §16) is representable, never rejected or truncated. SQLite indexes
 them; reads mmap and slice. Write order:
 append, fsync the segment, then insert the index rows; segment creation and
-deletion also fsync the directory. Recovery scans forward from the last
-indexed offset, verifies each payload against its stored blake3 (not just
-CRC), and adopts committed groups or truncates the tail; duplicate content hashes
-are byte-identical
-by definition — recovery keeps the last and marks the rest garbage. The
-active segment set is named by a generation manifest (a `CURRENT` file,
-atomically replaced), and **`CURRENT` is the single authority**: SQLite
-records the generation it indexed, and a mismatch at startup discards the
-SQLite artifact index and rebuilds it from the `CURRENT` generation's
-segments before any read — the two stores are never trusted to agree on
-their own. An interrupted compaction therefore leaves one generation or
-the other intact, never a mix. Compaction writes new segments durably
-before one SQLite transaction flips the index, and old segments are deleted
-only when no live snapshot or mmap reader pins their generation.
-**Segments are the durable record within daemon state; the index is
-rebuildable by a segment scan.** GC is Bitcask-style
+deletion also fsync the directory. **SQLite is the authority** on what
+committed and on which segments exist (`cas_segments`, each writer's
+segment found by its row). Recovery truncates each segment to its indexed
+length; a segment file shorter than its indexed length lost committed
+records (an external truncation, a lying fsync), and the results and
+installs whose bytes it held are evicted whole, leaving every other
+segment's rows as they are; files no row names are deleted. Compaction
+writes new segments durably before one SQLite transaction repoints the
+index, and old segments are deleted only after a grace period past the
+read bound. GC is Bitcask-style
 compaction driven by the size cap (random eviction, each victim one
 sampled index probe; the pass runs only after the CAS index changed) — everything in the CAS
 is rebuildable, so eviction is always safe. But never observable: eviction
@@ -5173,8 +5173,7 @@ none of it. The store partitions by authority: **input-versioned** state
 (bundle metadata, search tags, authored dependency records, and the
 derived-output **namespace index**, §9) moves only
 with input versions; **memo** state (build results, dependency traces,
-and the per-result derived-output *assertions* — which only ever verify
-against the namespace index, never define names) is monotone and keyed
+which never define names) is monotone and keyed
 by input basis, never
 versioned — an old snapshot reading a newer memo is the memoization
 semantic below, not a leak; **ephemeral** state (watch cursors, lease
@@ -8023,9 +8022,9 @@ put production image codecs, mesh optimization, or shader compilers in core.
   include text. Listing loss orphans a generated bundle (doctor-listed,
   user-deleted), never auto-deletes; output paths are deterministic and
   collisions are errors.
-- **CAS authority** (§13): `CURRENT` is the single generation authority;
-  a SQLite mismatch rebuilds the index from segments; the record grammar is
-  pinned, with asset UUID and output key in every record.
+- **CAS authority** (§13): SQLite is the authority on what committed and
+  which segments exist; recovery holds each segment to its index; the
+  record grammar is pinned, with asset UUID and output key in every record.
 - **Search tags** (§4, §10): `#[asset(tag)]` authored fields; bundle-level
   re-indexing on dirt.
 - **Blob runtime type** (§4, §12): `Blob`, an `Arc`-backed byte range; pack

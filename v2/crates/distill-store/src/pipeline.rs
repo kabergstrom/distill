@@ -190,6 +190,77 @@ pub(crate) fn cleanup_staged_tool_temps(state_path: &std::path::Path) -> Result<
     Ok(())
 }
 
+/// Every registered tool: its hash and identity, one row per
+/// registration (the `tools` namespace, read whole by the collector).
+pub(crate) const REGISTERED_TOOLS: &str =
+    "SELECT tool_hash, identity_object FROM tools WHERE present = 1";
+
+/// The object file a package member is hard-linked from.
+fn tool_object_name(metadata: &ToolPackageFile) -> String {
+    let mode = if metadata.executable { "x" } else { "n" };
+    format!("{}-{mode}", hex_hash(&metadata.bytes_hash))
+}
+
+/// Delete the tool packages and objects no `tools` row names: what a
+/// registration staged in an input that rolled back. Runs at open with
+/// the state lock held, so no registration is in flight; it streams the
+/// registered tools once, which is the namespace it collects.
+pub(crate) fn collect_unregistered_tool_files(
+    conn: &rusqlite::Connection,
+    state_path: &std::path::Path,
+) -> Result<(), StoreError> {
+    let tools = state_path.join("tools");
+    let mut packages = std::collections::HashSet::new();
+    let mut objects = std::collections::HashSet::new();
+    let mut statement = conn.prepare(REGISTERED_TOOLS)?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let hash: Vec<u8> = row.get(0)?;
+        if !packages.insert(hex_hash(&exact_blob32(hash, "tool_hash")?)) {
+            continue;
+        }
+        let identity = ToolExecutionIdentityV2::decode_record(&row.get::<_, Vec<u8>>(1)?)
+            .map_err(StoreError::InvalidToolIdentity)?;
+        if let ToolSourceIdentityV2::Package { files, .. } = &identity.source {
+            objects.extend(files.iter().map(tool_object_name));
+        }
+    }
+    let io = |path: &std::path::Path| {
+        let path = path.to_path_buf();
+        move |source| StoreError::Io { path, source }
+    };
+    for (dir, keep, is_package) in [
+        (tools.join("packages"), &packages, true),
+        (tools.join("objects"), &objects, false),
+    ] {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io(&dir)(error)),
+        };
+        let mut removed = false;
+        for entry in entries {
+            let entry = entry.map_err(io(&dir))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if keep.contains(&name) || name.starts_with(".stage-") {
+                continue;
+            }
+            let path = entry.path();
+            if is_package {
+                std::fs::remove_dir_all(&path).map_err(io(&path))?;
+            } else {
+                std::fs::remove_file(&path).map_err(io(&path))?;
+            }
+            removed = true;
+        }
+        if removed {
+            crate::cas::store::fsync_dir(&dir)?;
+        }
+    }
+    Ok(())
+}
+
+
 fn stage_immutable_file(
     key: &str,
     path: &std::path::Path,
@@ -584,9 +655,7 @@ impl InputTxn<'_> {
                 create_dir_all(&objects_dir)?;
                 create_dir_all(&root)?;
                 for (metadata, source) in files.iter().zip(&sources) {
-                    let mode = if metadata.executable { "x" } else { "n" };
-                    let object =
-                        objects_dir.join(format!("{}-{mode}", hex_hash(&metadata.bytes_hash)));
+                    let object = objects_dir.join(tool_object_name(metadata));
                     stage_immutable_file(key, &object, &source.bytes, metadata)?;
                     let member = root.join(&metadata.path);
                     if let Some(parent) = member.parent() {

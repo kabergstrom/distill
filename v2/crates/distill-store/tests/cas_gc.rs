@@ -306,10 +306,10 @@ fn compaction_repoints_live_records_and_the_sweeper_deletes_the_dead_segment() {
         .unwrap()
         .is_empty());
 
-    // The index flip was transactional: a reopen does not rebuild.
+    // The index flip was transactional: a reopen recovers nothing.
     drop(store);
     let (store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
-    assert!(!recovery.rebuilt_index);
+    assert_eq!(recovery, distill_store::cas::RecoveryReport::default());
     assert_eq!(store.cas_read(&survivor).unwrap(), b"surviving artifact");
 }
 
@@ -343,7 +343,7 @@ fn a_snapshot_reads_its_blobs_until_the_dead_segment_is_swept() {
 }
 
 #[test]
-fn compacted_duplicate_payload_precedes_every_surviving_result() {
+fn compaction_keeps_a_shared_payload_for_its_surviving_result() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
     let (hash, _, first_digest) =
@@ -359,15 +359,8 @@ fn compacted_duplicate_payload_precedes_every_surviving_result() {
     SegmentSweeper::new(Duration::ZERO).sweep(&mut store).unwrap();
     drop(store);
 
-    // Force the rebuild path, which must reconstruct the complete index
-    // from only the compacted log.
-    let conn = rusqlite::Connection::open(dir.path().join(".distill/meta.sqlite")).unwrap();
-    conn.execute("UPDATE cas_segments SET indexed_len = indexed_len + 1000000", [])
-        .unwrap();
-    drop(conn);
-
     let (store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
-    assert!(recovery.rebuilt_index);
+    assert_eq!(recovery, distill_store::cas::RecoveryReport::default());
     assert_eq!(store.cas_read(&hash).unwrap(), b"shared artifact");
     let candidates = store
         .lookup_candidates(KeyKind::Processor, &[1; 32])
@@ -422,4 +415,46 @@ fn segment_bytes(dir: &tempfile::TempDir) -> u64 {
                 .then(|| e.metadata().unwrap().len())
         })
         .sum()
+}
+
+fn segment_files(dir: &tempfile::TempDir) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir.path().join(".distill/cas"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".dsr"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// A rolled-back input makes the writer drop its segment binding (the
+/// rollback may have taken the segment's row with it). A segment whose row
+/// had committed before is still reclaimed: once nothing in it is live,
+/// compaction kills it and the sweeper deletes its file, without a restart.
+#[test]
+fn a_segment_a_rolled_back_input_left_behind_is_reclaimed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(cfg(&dir)).unwrap();
+    let (_, _, first) = commit_with_aux(&mut store, 1, &[1u8; 4096], b"dbg-1");
+    let left_behind = segment_files(&dir);
+    assert_eq!(left_behind.len(), 1, "{left_behind:?}");
+
+    // A build committed inside an input that rolls back (a plan input).
+    store.open_input().unwrap();
+    commit_with_aux(&mut store, 2, &[2u8; 4096], b"dbg-2");
+    store.finish_input(false).unwrap();
+
+    let (kept, _, _) = commit_with_aux(&mut store, 3, b"kept artifact", b"dbg-3");
+    assert!(store
+        .evict_result(KeyKind::Processor, &[1u8; 32], &first)
+        .unwrap());
+    let report = store.compact().unwrap();
+    SegmentSweeper::new(Duration::ZERO).sweep(&mut store).unwrap();
+    let remaining = segment_files(&dir);
+    assert!(
+        !remaining.contains(&left_behind[0]),
+        "{} leaked: {report:?}, {remaining:?}",
+        left_behind[0]
+    );
+    assert_eq!(store.cas_read(&kept).unwrap(), b"kept artifact");
 }

@@ -54,7 +54,7 @@ fn every_section_13_table_exists() {
     // The §13 table inventory, plus the store-internal tables §13/§14
     // require: store_meta (instance id, counters, watermark, poisons,
     // CAS segment ids), asset_tags (the `assets` search tags),
-    // result_candidates / derived_outputs / derived_assertions /
+    // result_candidates / derived_outputs /
     // cas_extents / cas_segments (the three roles of §13's `artifacts`
     // row), cas_refs (what keeps each extent indexed), bundle_path_refs
     // (the reference fields a rename rewrites), registrations (the
@@ -83,7 +83,6 @@ fn every_section_13_table_exists() {
         "schemas",
         "result_candidates",
         "derived_outputs",
-        "derived_assertions",
         "cas_extents",
         "cas_segments",
         "cas_refs",
@@ -346,7 +345,7 @@ fn extent_index_holds_the_only_physical_location() {
     );
     assert_eq!(pk_columns(&conn, "cas_extents"), ["content_hash"]);
     // And no other artifact table sneaks a physical location in.
-    for table in ["derived_outputs", "derived_assertions", "assets", "bundles"] {
+    for table in ["derived_outputs", "assets", "bundles"] {
         let cols = columns(&conn, table);
         assert!(
             !cols.iter().any(|c| c == "offset" || c == "segment"),
@@ -361,14 +360,14 @@ fn cas_segments_are_typed_regular_or_oversize() {
     let conn = open_conn(&dir);
     assert_eq!(
         columns(&conn, "cas_segments"),
-        ["segment_id", "file_name", "segment_kind", "indexed_len", "state"]
+        ["segment_id", "file_name", "segment_kind", "indexed_len", "state", "owner", "live_len"]
     );
 }
 
 #[test]
-fn derived_output_namespace_and_assertions_are_separate_tables() {
+fn derived_output_namespace_is_keyed_by_child() {
     // §9/§13: the input-versioned namespace index is the only authority
-    // for child resolution; per-result assertion rows are memo data.
+    // for child resolution.
     let dir = tempfile::tempdir().unwrap();
     let conn = open_conn(&dir);
     assert_eq!(
@@ -376,10 +375,6 @@ fn derived_output_namespace_and_assertions_are_separate_tables() {
         ["child_uuid", "parent_uuid", "output_key", "terminal_type"]
     );
     assert_eq!(pk_columns(&conn, "derived_outputs"), ["child_uuid"]);
-    assert_eq!(
-        columns(&conn, "derived_assertions"),
-        ["child_uuid", "parent_uuid", "output_key", "memo_seq"]
-    );
 }
 
 #[test]

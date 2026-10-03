@@ -29,6 +29,15 @@ pub const SERVED_RESTART_KEYS: &str = "served_restart_keys";
 const RPC_PROTOCOL_EPOCH: &str = "rpc_protocol_epoch";
 const RPC_PIPELINE_GENERATION: &str = "rpc_pipeline_generation";
 const CHANGE_LOG_OLDEST: &str = "change_log_oldest";
+/// The protocol epoch, the pipeline generation and target `?1`'s generation
+/// in one statement, so they are read at one instant. The keys are
+/// [`RPC_PROTOCOL_EPOCH`] and [`RPC_PIPELINE_GENERATION`].
+pub(crate) const RPC_FENCE: &str = "SELECT
+       (SELECT value FROM store_meta WHERE key = 'rpc_protocol_epoch'),
+       (SELECT value FROM store_meta WHERE key = 'rpc_pipeline_generation'),
+       (SELECT generation FROM rpc_targets WHERE name = ?1)";
+/// Drop an artifact's load edges ahead of recording its latest install's.
+pub(crate) const DELETE_LOAD_EDGES: &str = "DELETE FROM artifact_load_edges WHERE content_hash = ?1";
 
 /// Encode an RPC authored value (canonical JSON plus its blob table) for
 /// `assets.authored_value`.
@@ -144,6 +153,16 @@ const CHANGE_PATH: i64 = 2;
 const CHANGE_RECONNECT_ALL: i64 = 3;
 const CHANGE_RECONNECT_TARGET: i64 = 4;
 const CHANGE_RESTART: i64 = 5;
+
+/// Asset `?1`'s published deltas with `?2 < version <= ?3`, on the asset
+/// deltas' partial index (kind literal: [`CHANGE_ASSET`]).
+pub(crate) const ASSET_HISTORY: &str = "SELECT seq, version, kind, asset_uuid, state, subject, detail
+     FROM change_log WHERE kind = 1 AND asset_uuid = ?1 AND version > ?2 AND version <= ?3";
+/// Path `?1`'s published deltas with `?2 < version <= ?3`, on the path
+/// deltas' partial index (kind literal: [`CHANGE_PATH`]).
+pub(crate) const PATH_HISTORY: &str = "SELECT seq, version, kind, asset_uuid, state, subject, detail
+     FROM change_log WHERE kind = 2 AND subject = ?1 AND version > ?2 AND version <= ?3";
+const _: () = assert!(CHANGE_ASSET == 1 && CHANGE_PATH == 2);
 
 /// One `change_log` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -503,6 +522,20 @@ impl StoreReader {
         })
     }
 
+    /// A connection's reconnect fences and its target's generation, read
+    /// by one statement: one instant ([`RPC_FENCE`]).
+    pub fn rpc_fence(&self, target: &str) -> Result<(RpcFences, Option<u64>), StoreError> {
+        Ok(self.conn.prepare_cached(RPC_FENCE)?.query_row([target], |row| {
+            Ok((
+                RpcFences {
+                    protocol_epoch: row.get::<_, Option<i64>>(0)?.map(|epoch| epoch as u32),
+                    pipeline_generation: row.get::<_, Option<i64>>(1)?.unwrap_or(0) as u64,
+                },
+                row.get::<_, Option<i64>>(2)?.map(|generation| generation as u64),
+            ))
+        })?)
+    }
+
     pub fn rpc_targets(&self) -> Result<Vec<RpcTargetRow>, StoreError> {
         let mut statement = self.conn.prepare_cached(
             "SELECT name, definition_hash, generation FROM rpc_targets ORDER BY name",
@@ -539,22 +572,40 @@ impl StoreReader {
             .collect::<Result<Vec<_>, _>>()
     }
 
-    /// Published asset and path deltas with `since < version <= upto`,
-    /// ordered by version then sequence.
+    /// The published deltas of `assets` and `paths` with
+    /// `since < version <= upto`, ordered by version then sequence: one
+    /// search per subject ([`ASSET_HISTORY`], [`PATH_HISTORY`]), never the
+    /// whole window.
     pub fn change_log_history(
         &self,
         since: InputVersion,
         upto: InputVersion,
+        assets: &BTreeSet<AssetUuid>,
+        paths: &BTreeSet<String>,
     ) -> Result<Vec<ChangeEntry>, StoreError> {
-        let mut statement = self.conn.prepare_cached(
-            "SELECT seq, version, kind, asset_uuid, state, subject, detail
-             FROM change_log WHERE version > ?1 AND version <= ?2 AND kind IN (1, 2)
-             ORDER BY version, seq",
-        )?;
-        let rows = statement.query_map([since.0 as i64, upto.0 as i64], change_entry_row)?;
-        rows.collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
+        let window = [since.0 as i64, upto.0 as i64];
+        let mut entries = Vec::new();
+        let mut by_asset = self.conn.prepare_cached(ASSET_HISTORY)?;
+        for asset in assets {
+            let rows = by_asset.query_map(
+                rusqlite::params![asset.0.as_slice(), window[0], window[1]],
+                change_entry_row,
+            )?;
+            for row in rows {
+                entries.push(row??);
+            }
+        }
+        let mut by_path = self.conn.prepare_cached(PATH_HISTORY)?;
+        for path in paths {
+            let rows =
+                by_path.query_map(rusqlite::params![path, window[0], window[1]], change_entry_row)?;
+            for row in rows {
+                entries.push(row??);
+            }
+        }
+        // Sequence order is version order: versions commit in sequence.
+        entries.sort_by_key(|entry| entry.seq);
+        Ok(entries)
     }
 
     /// The oldest version a subscription cursor may resume from.
@@ -895,42 +946,30 @@ pub trait ServedWrite {
             > 0)
     }
 
-    /// Record an artifact's typed direct load edges. Idempotent; a
-    /// different edge set for the same artifact is an error.
+    /// Record an artifact's typed direct load edges, replacing any an
+    /// earlier install recorded. The DSTL bytes carry the edges' assets but
+    /// not their expected terminals, so the same bytes rebuilt after a
+    /// dependency's terminal type changed carry other edges: the latest
+    /// install's are the artifact's. The rows go with the artifact's
+    /// extent (`ON DELETE CASCADE`).
     fn record_artifact_load_edges(
         &mut self,
         hash: ContentHash,
         edges: &[(AssetUuid, TypeUuid)],
     ) -> Result<(), StoreError> {
         let conn = self.served_conn();
-        let mut statement = conn.prepare_cached(
-            "SELECT asset_uuid, expected_terminal FROM artifact_load_edges
-             WHERE content_hash = ?1 ORDER BY asset_uuid",
+        conn.prepare_cached(DELETE_LOAD_EDGES)?
+            .execute([hash.0.as_slice()])?;
+        let mut insert = conn.prepare_cached(
+            "INSERT INTO artifact_load_edges(content_hash, asset_uuid, expected_terminal)
+             VALUES (?1, ?2, ?3)",
         )?;
-        let existing = statement
-            .query_map([hash.0.as_slice()], |row| {
-                Ok((
-                    AssetUuid(blob16(row.get(0)?)),
-                    TypeUuid(blob16(row.get(1)?)),
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        if !existing.is_empty() {
-            let mut sorted = edges.to_vec();
-            sorted.sort();
-            if existing != sorted {
-                return Err(StoreError::InvalidConfiguration {
-                    error: format!("artifact {hash:?} already has different load edges"),
-                });
-            }
-            return Ok(());
-        }
         for (asset, terminal) in edges {
-            conn.execute(
-                "INSERT INTO artifact_load_edges(content_hash, asset_uuid, expected_terminal)
-                 VALUES (?1, ?2, ?3)",
-                rusqlite::params![hash.0.as_slice(), asset.0.as_slice(), terminal.0.as_slice()],
-            )?;
+            insert.execute(rusqlite::params![
+                hash.0.as_slice(),
+                asset.0.as_slice(),
+                terminal.0.as_slice()
+            ])?;
         }
         Ok(())
     }

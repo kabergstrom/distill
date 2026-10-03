@@ -563,6 +563,8 @@ pub(crate) struct Inner {
     current_txn: RefCell<Weak<SnapshotTxn>>,
     /// This front end's open snapshots, oldest first.
     snapshots: RefCell<VecDeque<Weak<SnapshotHold>>>,
+    /// The connection its next read transaction begins on.
+    spare: Spare,
     pub(crate) handle: Arc<ServerHandle>,
     /// A connection's place under `max_connections`; none for an admin
     /// front end.
@@ -1335,25 +1337,56 @@ pub(crate) fn pipeline_failure(
 
 /// One read transaction pinning one input version, on a connection of its
 /// own, shared by every snapshot of that version on one front end. What it
-/// pins is read through it when asked, each a primary-key read.
+/// pins is read through it when asked, each a primary-key read. Its
+/// connection becomes its front end's spare when it ends.
 pub(crate) struct SnapshotTxn {
-    snapshot: distill_store::served::StoreSnapshot,
+    snapshot: Option<distill_store::served::StoreSnapshot>,
+    spare: Spare,
     pub(crate) stamp: SnapshotStamp,
+}
+
+impl Drop for SnapshotTxn {
+    fn drop(&mut self) {
+        if let Some(snapshot) = self.snapshot.take() {
+            keep_spare(&self.spare, snapshot);
+        }
+    }
 }
 
 impl SnapshotTxn {
     pub(crate) fn snapshot(&self) -> &StoreReader {
-        &self.snapshot
+        self.snapshot
+            .as_deref()
+            .expect("a live snapshot transaction owns its snapshot")
     }
 
     /// The configuration status this snapshot pins.
     pub(crate) fn configuration(&self) -> Result<ConfigurationStatus, StoreError> {
-        Ok(configuration_status(&self.snapshot.configuration_state()?))
+        Ok(configuration_status(&self.snapshot().configuration_state()?))
     }
 
     /// The served pipeline this snapshot pins, and its installing version.
     pub(crate) fn pipeline(&self) -> Result<(InputVersion, PipelineDiagnostic), StoreError> {
-        read_served_pipeline(self.snapshot.served_blob(SERVED_PIPELINE)?)
+        read_served_pipeline(self.snapshot().served_blob(SERVED_PIPELINE)?)
+    }
+}
+
+/// A front end's connection with no read transaction open, kept for its
+/// next read transaction so that a new version does not open a connection.
+/// It holds no state of the store's: a transaction on it reads the version
+/// current when it begins. One is enough: a front end's transactions of
+/// different versions overlap only while a client still holds an old
+/// snapshot.
+type Spare = Rc<RefCell<Option<StoreReader>>>;
+
+/// End `snapshot`'s transaction and keep its connection as the spare, if
+/// there is none.
+fn keep_spare(spare: &RefCell<Option<StoreReader>>, snapshot: distill_store::served::StoreSnapshot) {
+    match snapshot.into_reader() {
+        Ok(reader) => {
+            spare.borrow_mut().get_or_insert(reader);
+        }
+        Err(error) => tracing::error!(%error, "cannot end a read transaction"),
     }
 }
 
@@ -1543,6 +1576,7 @@ impl Inner {
             writer: RefCell::new(None),
             current_txn: RefCell::new(Weak::new()),
             snapshots: RefCell::new(VecDeque::new()),
+            spare: Rc::new(RefCell::new(None)),
             handle: Arc::clone(handle),
             _admission: admission,
         }
@@ -1568,17 +1602,35 @@ impl Inner {
         })
     }
 
+    /// Begin a read transaction on the spare connection, or on a new one
+    /// while the spare is in use.
+    fn begin_snapshot(&self) -> Result<distill_store::served::StoreSnapshot, StoreError> {
+        let spare = self.spare.borrow_mut().take();
+        let reader = match spare {
+            Some(reader) => reader,
+            None => {
+                #[cfg(test)]
+                bound_tests::READER_OPENS.with(|opens| opens.set(opens.get() + 1));
+                StoreReader::open(self.handle.config.clone())?
+            }
+        };
+        reader.begin_snapshot()
+    }
+
     /// Read several facts from one committed version.
     pub(crate) fn read_consistent<T>(
         &self,
         read: impl FnOnce(&StoreReader) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        read_consistent(&self.handle.config, read)
+        let snapshot = self.begin_snapshot()?;
+        let result = read(&snapshot);
+        keep_spare(&self.spare, snapshot);
+        result
     }
 
     /// The read transaction pinning the current version. Snapshots of one
-    /// version on this front end share it; each new version opens a read
-    /// transaction on a connection of its own.
+    /// version on this front end share it; each new version begins a read
+    /// transaction on the spare connection.
     pub(crate) fn current_snapshot(&self) -> Result<Rc<SnapshotTxn>, StoreError> {
         let current = self.reader.input_version()?;
         if let Some(txn) = self.current_txn.borrow().upgrade() {
@@ -1586,10 +1638,11 @@ impl Inner {
                 return Ok(txn);
             }
         }
-        let snapshot = StoreReader::open(self.handle.config.clone())?.begin_snapshot()?;
+        let snapshot = self.begin_snapshot()?;
         let txn = Rc::new(SnapshotTxn {
             stamp: snapshot.stamp(),
-            snapshot,
+            snapshot: Some(snapshot),
+            spare: Rc::clone(&self.spare),
         });
         *self.current_txn.borrow_mut() = Rc::downgrade(&txn);
         Ok(txn)
@@ -1705,8 +1758,9 @@ impl Inner {
 
     /// Why `connection` must reconnect, if it must.
     pub(crate) fn generation_fence(&self, connection: &ConnectionState) -> Option<ReconnectReason> {
-        let fences = match self.reader.rpc_fences() {
-            Ok(fences) => fences,
+        // One statement: the fences and the target generation of one instant.
+        let (fences, target_generation) = match self.reader.rpc_fence(&connection.target) {
+            Ok(fence) => fence,
             Err(error) => {
                 tracing::error!(%error, "cannot read RPC fences");
                 return Some(ReconnectReason::StoreInstanceChanged);
@@ -1718,14 +1772,8 @@ impl Inner {
         if fences.pipeline_generation != connection.pipeline_generation {
             return Some(ReconnectReason::PipelineEpochChanged);
         }
-        match self.reader.rpc_target(&connection.target) {
-            Ok(Some(row)) if row.generation == connection.target_generation => None,
-            Ok(_) => Some(ReconnectReason::TargetDefinitionChanged),
-            Err(error) => {
-                tracing::error!(%error, "cannot read the RPC target");
-                Some(ReconnectReason::StoreInstanceChanged)
-            }
-        }
+        (target_generation != Some(connection.target_generation))
+            .then_some(ReconnectReason::TargetDefinitionChanged)
     }
 
     /// Deliver to `connection` every change-log row published since its
@@ -1972,6 +2020,47 @@ pub(crate) fn is_embedded(server: &Server) -> bool {
 #[cfg(test)]
 mod bound_tests {
     use super::*;
+
+    thread_local! {
+        /// Connections this thread's front ends opened for read
+        /// transactions.
+        pub(super) static READER_OPENS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn a_front_end_reads_each_version_on_the_connection_it_has() {
+        let server = Server::new(
+            StoreInstanceId([9; 16]),
+            vec![TargetDefinition::new("dev", TargetDefinitionHash([7; 32]))],
+        )
+        .unwrap();
+        let ConnectOutcome::Connected(connected) = connect(&server) else {
+            panic!("the connection is admitted");
+        };
+        let hub = connected.hub;
+        let snapshot = |hub: &Hub| match hub.snapshot() {
+            RpcResult::Success(snapshot) => snapshot,
+            other => panic!("expected snapshot, got {other:?}"),
+        };
+        let publish = || {
+            server.with_writer(|store| store.input_transaction(|_| Ok(())).unwrap());
+        };
+        READER_OPENS.with(|opens| opens.set(0));
+        for _ in 0..50 {
+            drop(snapshot(&hub));
+            publish();
+        }
+        assert_eq!(READER_OPENS.with(|opens| opens.get()), 1, "a connection per version");
+        // A client holding an old version's snapshot while it takes the
+        // new one needs a second connection, and only one.
+        let mut held = snapshot(&hub);
+        for _ in 0..50 {
+            publish();
+            held = snapshot(&hub);
+        }
+        drop(held);
+        assert_eq!(READER_OPENS.with(|opens| opens.get()), 2);
+    }
 
     fn connect(server: &Server) -> ConnectOutcome {
         let request = ConnectRequest::new("dev", TargetDefinitionHash([7; 32]));

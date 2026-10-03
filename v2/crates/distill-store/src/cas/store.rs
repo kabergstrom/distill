@@ -2,17 +2,16 @@
 //!
 //! Write order (pinned): append the build's payload records first and
 //! one result record last, fsync each touched segment in that order,
-//! then insert the index rows in one memo transaction. **The result
-//! record is the commit marker** — a crash after output 2 of 3 publishes
-//! nothing. Segment creation and deletion also fsync the directory.
+//! then insert the index rows, all in one write transaction. **That
+//! transaction is the group's commit** — a rollback or a crash before
+//! COMMIT publishes nothing, and recovery cuts the bytes it appended.
+//! Segment creation and deletion also fsync the directory.
 //!
 //! Each writer appends to a segment of its own; ordinary commit groups
 //! roll as a unit. A record larger than the regular segment cap is
-//! instead written alone in a typed oversize segment; recovery resolves
-//! coverage across all segments, so a group may cross segment boundaries
-//! without weakening the result marker rule. Writers never coordinate
-//! beyond SQLite: a transaction that rolls back leaves its appended bytes
-//! as dead space.
+//! instead written alone in a typed oversize segment, so a group may
+//! cross segment boundaries. Writers never coordinate beyond SQLite: a
+//! transaction that rolls back leaves its appended bytes as dead space.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -129,10 +128,6 @@ pub struct CommitReceipt {
     pub outputs: Vec<(String, ContentHash)>,
     /// `debug_key → ContentHash` for every committed aux payload.
     pub aux: Vec<(String, ContentHash)>,
-    /// Derived-output assertions that did not verify against the
-    /// input-versioned namespace index (§9) — reported, never silently
-    /// recorded.
-    pub unverified_assertions: Vec<(AssetUuid, String)>,
 }
 
 /// Where one bucket candidate's record lies (§13), by its row in
@@ -163,34 +158,49 @@ pub struct Candidate {
 }
 
 /// This writer's CAS append state. Every writer appends to a segment of
-/// its own, so no two writers share a file offset; everything else about
-/// the segments lives in `cas_segments`.
+/// its own, so no two writers share a file offset. Which segment that is
+/// lives in `cas_segments` alone: the newest open regular segment whose
+/// `owner` is this writer ([`ACTIVE_SEGMENT`]), read in the transaction
+/// that appends. A transaction or savepoint that rolls back takes its
+/// allocations with it, and the next append reads what survived.
 #[derive(Debug)]
 pub(crate) struct CasInner {
     pub(crate) dir: PathBuf,
-    /// The regular segment this writer appends to, and its length.
-    active: Option<(u64, u64)>,
+    /// This writer's `cas_segments.owner`: unique among the process's
+    /// writers. Startup recovery seals every open segment, so no open
+    /// segment of an earlier process carries it either.
+    pub(crate) owner: i64,
 }
 
 impl CasInner {
     pub(crate) fn new(dir: PathBuf) -> Self {
-        Self { dir, active: None }
-    }
-
-    /// Stop appending to the active segment: a rolled-back transaction may
-    /// have taken its row with it. Its unindexed bytes are dead space.
-    pub(crate) fn forget_active(&mut self) {
-        self.active = None;
-    }
-
-    pub(crate) fn take_active(&mut self) -> Option<u64> {
-        self.active.take().map(|(id, _)| id)
-    }
-
-    pub(crate) fn active_id(&self) -> Option<u64> {
-        self.active.map(|(id, _)| id)
+        static NEXT_OWNER: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+        Self {
+            dir,
+            owner: NEXT_OWNER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
     }
 }
+
+/// The segment writer `?1` appends to: its newest open regular segment.
+/// The state and kind are literals so the plan walks the open segments'
+/// partial index backwards.
+pub(crate) const ACTIVE_SEGMENT: &str = "SELECT segment_id FROM cas_segments
+     WHERE owner = ?1 AND state = 0 AND segment_kind = 0
+     ORDER BY segment_id DESC LIMIT 1";
+const _: () = assert!(SegmentKind::Regular as i64 == 0);
+
+/// Every segment, for doctor verification.
+pub(crate) const VERIFY_SEGMENTS: &str = "SELECT segment_id, file_name FROM cas_segments";
+/// The extents segment `?1` holds.
+pub(crate) const VERIFY_SEGMENT_EXTENTS: &str =
+    "SELECT content_hash, offset, len FROM cas_extents WHERE segment = ?1";
+
+/// Seal the open segments writer `?1` allocated below id `?2`. The states
+/// are literals so the plan can walk the open segments' partial index.
+pub(crate) const SEAL_OWN_SEGMENTS: &str = "UPDATE cas_segments SET state = 1
+     WHERE owner = ?1 AND segment_id < ?2 AND state = 0";
+const _: () = assert!(SEGMENT_OPEN == 0 && SEGMENT_SEALED == 1);
 
 /// `cas_segments.state`: a writer may still append.
 pub(crate) const SEGMENT_OPEN: i64 = 0;
@@ -365,17 +375,19 @@ struct Appended {
 impl Store {
     /// Allocate a segment in the open write transaction: its row, then its
     /// file, fsynced with the directory, before the row can commit. A
-    /// rolled-back allocation leaves a file no row names; startup recovery
-    /// deletes it.
+    /// rolled-back allocation leaves a file no row names: the next
+    /// allocation of its id truncates it, and startup recovery deletes it.
+    /// No writer appends to it meanwhile, since writers find their segment
+    /// by its row ([`ACTIVE_SEGMENT`]).
     pub(crate) fn create_segment(&mut self, kind: SegmentKind) -> Result<u64, StoreError> {
         debug_assert!(!self.conn.is_autocommit(), "segments are allocated in a write transaction");
         let id = meta_get_u64(&self.conn, "next_segment_id")?.unwrap_or(0);
         meta_set_u64(&self.conn, "next_segment_id", id + 1)?;
         let name = segment_file_name(id, kind);
         self.conn.execute(
-            "INSERT INTO cas_segments(segment_id, file_name, segment_kind, indexed_len, state)
-             VALUES (?1, ?2, ?3, 0, ?4)",
-            rusqlite::params![id as i64, name, kind as i64, SEGMENT_OPEN],
+            "INSERT INTO cas_segments(segment_id, file_name, segment_kind, indexed_len, state, owner)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+            rusqlite::params![id as i64, name, kind as i64, SEGMENT_OPEN, self.cas.owner],
         )?;
         let path = self.cas.dir.join(&name);
         let f = std::fs::File::create(&path).map_err(io_err(&path))?;
@@ -384,66 +396,71 @@ impl Store {
         Ok(id)
     }
 
-    /// Seal this writer's active segment: it stops appending, for good.
+    /// Seal this writer's open segments: it stops appending to them, for
+    /// good.
     pub fn seal_active(&mut self) -> Result<(), StoreError> {
-        let Some(previous) = self.cas.take_active() else {
-            return Ok(());
-        };
         self.write_txn(|store| {
-            store.conn.execute(
-                "UPDATE cas_segments SET state = ?2 WHERE segment_id = ?1 AND state = ?3",
-                rusqlite::params![previous as i64, SEGMENT_SEALED, SEGMENT_OPEN],
-            )?;
+            store
+                .conn
+                .prepare_cached(SEAL_OWN_SEGMENTS)?
+                .execute(rusqlite::params![store.cas.owner, i64::MAX])?;
             Ok(())
         })
     }
 
-    /// The active segment with room for `incoming` bytes, rolling (and
-    /// sealing the previous one) at the size cap (§18's
-    /// `cas.segment_size`).
-    fn active_segment(&mut self, incoming: u64) -> Result<(u64, u64), StoreError> {
-        if let Some((id, len)) = self.cas.active {
-            if len == 0 || len + incoming <= self.config.segment_size {
-                return Ok((id, len));
-            }
-        }
-        let previous = self.cas.take_active();
-        let id = self.write_txn(|store| {
-            if let Some(previous) = previous {
-                store.conn.execute(
-                    "UPDATE cas_segments SET state = ?2 WHERE segment_id = ?1 AND state = ?3",
-                    rusqlite::params![previous as i64, SEGMENT_SEALED, SEGMENT_OPEN],
-                )?;
-            }
-            store.create_segment(SegmentKind::Regular)
-        })?;
-        self.cas.active = Some((id, 0));
-        Ok((id, 0))
+    /// The segment this writer appends to and its length, if it has one
+    /// open ([`ACTIVE_SEGMENT`]). The length is the file's: bytes a
+    /// rolled-back transaction appended are dead space before the next
+    /// record.
+    fn active_segment(&self) -> Result<Option<(u64, u64)>, StoreError> {
+        use rusqlite::OptionalExtension;
+        let Some(id) = self
+            .conn
+            .prepare_cached(ACTIVE_SEGMENT)?
+            .query_row([self.cas.owner], |row| row.get::<_, i64>(0))
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let path = self
+            .cas
+            .dir
+            .join(segment_file_name(id as u64, SegmentKind::Regular));
+        let len = std::fs::metadata(&path).map_err(io_err(&path))?.len();
+        Ok(Some((id as u64, len)))
     }
 
-    /// Append a group of encoded records and fsync each touched segment
-    /// once, in first-write order. The group's last record is its commit
-    /// marker, so the segment holding it is synced only after every earlier
-    /// payload segment is durable (§13). A record larger than the regular
-    /// cap gets an oversize segment of its own.
+    /// Append a group of encoded records in the open write transaction,
+    /// and fsync each touched segment once, in first-write order. The
+    /// group's index rows commit with that transaction, which is the
+    /// group's commit: bytes past a segment's `indexed_len` belong to no
+    /// committed group. A regular record goes to this writer's segment,
+    /// rolling at the size cap (§18's `cas.segment_size`); the new
+    /// segment's allocation seals every older one this writer has open. A
+    /// record larger than the cap gets an oversize segment of its own.
     fn append_records(&mut self, encoded: &[Vec<u8>]) -> Result<Appended, StoreError> {
-        let appended = self.append_records_inner(encoded);
-        if appended.is_err() {
-            self.cas.forget_active();
-        }
-        appended
-    }
-
-    fn append_records_inner(&mut self, encoded: &[Vec<u8>]) -> Result<Appended, StoreError> {
+        debug_assert!(!self.conn.is_autocommit(), "records are appended in a write transaction");
         let mut locations = Vec::with_capacity(encoded.len());
         let mut touched: Vec<(u64, SegmentKind, u64)> = Vec::new();
+        let mut active = self.active_segment()?;
         for bytes in encoded {
             let len = bytes.len() as u64;
             let (segment, kind, offset) = if len > self.config.segment_size {
-                let id = self.write_txn(|store| store.create_segment(SegmentKind::Oversize))?;
-                (id, SegmentKind::Oversize, 0)
+                (self.create_segment(SegmentKind::Oversize)?, SegmentKind::Oversize, 0)
             } else {
-                let (id, offset) = self.active_segment(len)?;
+                let (id, offset) = match active {
+                    Some((id, end)) if end == 0 || end + len <= self.config.segment_size => {
+                        (id, end)
+                    }
+                    _ => {
+                        let id = self.create_segment(SegmentKind::Regular)?;
+                        self.conn
+                            .prepare_cached(SEAL_OWN_SEGMENTS)?
+                            .execute(rusqlite::params![self.cas.owner, id as i64])?;
+                        (id, 0)
+                    }
+                };
+                active = Some((id, offset + len));
                 (id, SegmentKind::Regular, offset)
             };
             let path = self.cas.dir.join(segment_file_name(segment, kind));
@@ -452,9 +469,6 @@ impl Store {
                 .open(&path)
                 .map_err(io_err(&path))?;
             f.write_all(bytes).map_err(io_err(&path))?;
-            if kind == SegmentKind::Regular {
-                self.cas.active = Some((segment, offset + len));
-            }
             match touched.iter_mut().find(|(id, _, _)| *id == segment) {
                 Some(entry) => entry.2 = offset + len,
                 None => touched.push((segment, kind, offset + len)),
@@ -479,45 +493,33 @@ impl Store {
     }
 
     /// Store `payload` as the extent `hash`, held by the installed holder
-    /// `hash`, and run `also` in the same write transaction. The check that
-    /// skips the append is only a hint: the transaction checks again and,
-    /// if the extent was pruned in between, appends after all.
+    /// `hash`, and run `also`, in one write transaction: the extent is
+    /// appended only when the index does not hold it.
     fn put_installed(
         &mut self,
         hash: [u8; 32],
         record: Record,
-        mut also: impl FnMut(&mut Store) -> Result<(), StoreError>,
+        also: impl FnOnce(&mut Store) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
-        let payload_len = record.payload.len() as u64;
         let payload_offset = RECORD_HEADER_LEN as u64
             + record.static_input_key.len() as u64
             + record.output_key.len() as u64;
-        let mut append = !extent_exists(&self.conn, &hash)?;
-        loop {
-            let appended = if append {
-                Some(self.append_records(std::slice::from_ref(&encode_record(&record)))?)
-            } else {
-                None
-            };
-            let stored = self.write_txn(|store| {
-                match &appended {
-                    Some(appended) => {
-                        let (segment, offset) = appended.locations[0];
-                        upsert_extent(&store.conn, &hash, segment, offset + payload_offset, payload_len)?;
-                        index_segments(&store.conn, &appended.touched)?;
-                    }
-                    None if !extent_exists(&store.conn, &hash)? => return Ok(false),
-                    None => {}
-                }
-                insert_ref(&store.conn, HOLDER_INSTALLED, &hash, &hash)?;
-                also(store)?;
-                Ok(true)
-            })?;
-            if stored {
-                return Ok(());
+        self.write_txn(|store| {
+            if !extent_exists(&store.conn, &hash)? {
+                let appended = store.append_records(std::slice::from_ref(&encode_record(&record)))?;
+                let (segment, offset) = appended.locations[0];
+                upsert_extent(
+                    &store.conn,
+                    &hash,
+                    segment,
+                    offset + payload_offset,
+                    record.payload.len() as u64,
+                )?;
+                index_segments(&store.conn, &appended.touched)?;
             }
-            append = true;
-        }
+            insert_ref(&store.conn, HOLDER_INSTALLED, &hash, &hash)?;
+            also(store)
+        })
     }
 
     /// Install a wire tree (§13: a first-class CAS record). Idempotent:
@@ -567,15 +569,15 @@ impl Store {
         Ok(hash)
     }
 
-    /// Commit one build result (§13): payloads first, the result record last,
-    /// one fsync per touched segment in record order, then one memo transaction
-    /// inserting the extent rows, the result's references, the candidate-bucket
-    /// row, and the verified derived-output assertions. Advances only the memo
-    /// sequence.
+    /// Commit one build result (§13), in one write transaction (the
+    /// caller's, when one is open): payloads first, the result record
+    /// last, one fsync per touched segment in record order, then the
+    /// extent rows, the result's references and the candidate-bucket row.
+    /// Advances only the memo sequence. The group is committed exactly when
+    /// that transaction is.
     ///
     /// Every wire tree an output artifact names must be in
-    /// `commit.wire_trees` or already in the CAS. A tree the commit expected
-    /// to find but that was pruned meanwhile is appended after all.
+    /// `commit.wire_trees` or already in the CAS.
     pub fn commit_build(&mut self, commit: BuildCommit) -> Result<CommitReceipt, StoreError> {
         // Shape checks before any byte lands.
         if let CommitOutcome::Success { outputs, .. } = &commit.outcome {
@@ -652,60 +654,53 @@ impl Store {
         };
         let key_kind = commit.key_kind;
         let static_key = commit.static_input_key;
-        let asset_uuid = commit.asset_uuid;
         let holder = result_holder(key_kind, &static_key, &trace_digest);
         let mut unit: Vec<[u8; 32]> = output_rows.iter().map(|row| row.content_hash.0).collect();
         unit.extend(aux_rows.iter().map(|row| row.content_hash.0));
         unit.extend(layouts.iter().copied());
 
-        // Wire trees and payloads already in the CAS are not appended again
-        // (a hint the transaction checks): a node result names the bytes its
-        // last stage already committed.
-        let mut skip_trees = Vec::with_capacity(trees.len());
-        for (hash, _) in &trees {
-            skip_trees.push(extent_exists(&self.conn, &hash.0)?);
-        }
-        let record_hashes: Vec<[u8; 32]> = records
-            .iter()
-            .map(|record| *blake3::hash(&record.payload).as_bytes())
-            .collect();
-        let mut skip_records = Vec::with_capacity(records.len());
-        for hash in &record_hashes {
-            skip_records.push(extent_exists(&self.conn, hash)?);
-        }
-        loop {
-            let mut group: Vec<Record> = trees
-                .iter()
-                .zip(&skip_trees)
-                .filter(|(_, skip)| !**skip)
-                .map(|((_, preimage), _)| Record {
-                    kind: RecordKind::WireTree,
-                    asset_uuid: AssetUuid([0u8; 16]),
-                    static_input_key: Vec::new(),
-                    output_key: String::new(),
-                    payload: preimage.clone(),
-                })
-                .collect();
-            group.extend(
-                records
-                    .iter()
-                    .zip(&skip_records)
-                    .filter(|(_, skip)| !**skip)
-                    .map(|(record, _)| record.clone()),
-            );
+        // A wire tree no output names would be indexed with nothing
+        // referencing it: it is not committed.
+        trees.retain(|(hash, _)| layouts.contains(&hash.0));
+        self.write_txn(|store| {
+            // Wire trees and payloads the index holds are not appended
+            // again: a node result names the bytes its last stage committed.
+            let mut group: Vec<Record> = Vec::new();
+            for (hash, preimage) in &trees {
+                if !extent_exists(&store.conn, &hash.0)? {
+                    group.push(Record {
+                        kind: RecordKind::WireTree,
+                        asset_uuid: AssetUuid([0u8; 16]),
+                        static_input_key: Vec::new(),
+                        output_key: String::new(),
+                        payload: preimage.clone(),
+                    });
+                }
+            }
+            for record in &records {
+                if !extent_exists(&store.conn, blake3::hash(&record.payload).as_bytes())? {
+                    group.push(record.clone());
+                }
+            }
+            for hash in &layouts {
+                if !extent_exists(&store.conn, hash)?
+                    && !trees.iter().any(|(tree, _)| tree.0 == *hash)
+                {
+                    return Err(StoreError::MissingWireTree { hash: *hash });
+                }
+            }
             group.push(result_record.clone());
             let encoded: Vec<Vec<u8>> = group.iter().map(encode_record).collect();
-            let appended = self.append_records(&encoded)?;
+            let appended = store.append_records(&encoded)?;
             let result_index = group.len() - 1;
             let (result_segment, result_offset) = appended.locations[result_index];
             let result_len = encoded[result_index].len() as u64;
 
             #[cfg(test)]
-            if let Some(hook) = self.before_commit.as_mut() {
+            if let Some(hook) = store.before_commit.as_mut() {
                 hook();
             }
-            let mut unverified = Vec::new();
-            let committed = self.memo_transaction(|txn, memo_seq| {
+            let ((), memo_seq) = store.memo_transaction(|txn, memo_seq| {
                 for (i, rec) in group.iter().enumerate().take(result_index) {
                     let (segment, offset) = appended.locations[i];
                     let payload_offset = offset
@@ -714,22 +709,6 @@ impl Store {
                         + rec.output_key.len() as u64;
                     let hash = *blake3::hash(&rec.payload).as_bytes();
                     upsert_extent(txn, &hash, segment, payload_offset, rec.payload.len() as u64)?;
-                }
-                for ((hash, _), skipped) in trees.iter().zip(&skip_trees) {
-                    if *skipped && !extent_exists(txn, &hash.0)? {
-                        // Pruned since the hint: append it after all.
-                        return Err(StoreError::NotFound { hash: hash.0 });
-                    }
-                }
-                for (hash, skipped) in record_hashes.iter().zip(&skip_records) {
-                    if *skipped && !extent_exists(txn, hash)? {
-                        return Err(StoreError::NotFound { hash: *hash });
-                    }
-                }
-                for hash in &layouts {
-                    if !extent_exists(txn, hash)? {
-                        return Err(StoreError::MissingWireTree { hash: *hash });
-                    }
                 }
                 upsert_candidate(
                     txn,
@@ -744,46 +723,10 @@ impl Store {
                 for hash in &unit {
                     insert_ref(txn, HOLDER_RESULT, &holder, hash)?;
                 }
-                // Derived-output assertions: memo data verified against the
-                // input-versioned namespace index, never a namespace claim
-                // of its own (§9).
-                for row in &output_rows {
-                    if row.output_key.is_empty() {
-                        continue;
-                    }
-                    let child = AssetUuid::v5(asset_uuid, &row.output_key);
-                    if derived_row_matches(txn, child, asset_uuid, &row.output_key)? {
-                        txn.execute(
-                            "INSERT INTO derived_assertions(child_uuid, parent_uuid, output_key, memo_seq)
-                             VALUES (?1, ?2, ?3, ?4)
-                             ON CONFLICT(child_uuid, memo_seq) DO NOTHING",
-                            rusqlite::params![
-                                child.0.as_slice(),
-                                asset_uuid.0.as_slice(),
-                                row.output_key,
-                                memo_seq.0 as i64,
-                            ],
-                        )?;
-                    } else {
-                        unverified.push((child, row.output_key.clone()));
-                    }
-                }
                 index_segments(txn, &appended.touched)?;
                 Ok(())
-            });
-            let memo_seq = match committed {
-                Ok(((), memo_seq)) => memo_seq,
-                Err(StoreError::NotFound { hash })
-                    if trees.iter().any(|(tree, _)| tree.0 == hash)
-                        || record_hashes.contains(&hash) =>
-                {
-                    skip_trees.iter_mut().for_each(|skip| *skip = false);
-                    skip_records.iter_mut().for_each(|skip| *skip = false);
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            return Ok(CommitReceipt {
+            })?;
+            Ok(CommitReceipt {
                 memo_seq,
                 trace_digest,
                 outputs: output_rows
@@ -794,9 +737,8 @@ impl Store {
                     .iter()
                     .map(|row| (row.debug_key.clone(), row.content_hash))
                     .collect(),
-                unverified_assertions: unverified,
-            });
-        }
+            })
+        })
     }
 }
 
@@ -995,27 +937,52 @@ impl StoreReader {
         Ok(body.to_vec())
     }
 
-    /// Full doctor verification of every indexed CAS extent. Each record is
-    /// read through the ordinary hash-checking path, so an index/segment drift
-    /// cannot be reported healthy merely because its framing still decodes.
+    /// Full doctor verification of every indexed CAS extent: each one's
+    /// bytes are read and checked against its hash, so an index/segment
+    /// drift cannot be reported healthy merely because its framing still
+    /// decodes. Segment by segment: one statement and one file open each
+    /// ([`VERIFY_SEGMENTS`], [`VERIFY_SEGMENT_EXTENTS`]).
     pub fn verify_all_cas_extents(&self) -> Result<usize, StoreError> {
-        let hashes = {
-            let mut statement = self
-                .conn
-                .prepare("SELECT content_hash FROM cas_extents ORDER BY content_hash")?;
-            let hashes = statement
-                .query_map([], |row| row.get::<_, Vec<u8>>(0))?
-                .map(|row| {
-                    let bytes = row?;
-                    bytes.try_into().map_err(|_| rusqlite::Error::InvalidQuery)
-                })
-                .collect::<Result<Vec<[u8; 32]>, _>>()?;
-            hashes
+        use std::io::{Read, Seek, SeekFrom};
+        let segments: Vec<(i64, String)> = {
+            let mut statement = self.conn.prepare(VERIFY_SEGMENTS)?;
+            let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<Result<_, _>>()?
         };
-        for hash in &hashes {
-            self.cas_read(hash)?;
+        let mut extents = self.conn.prepare(VERIFY_SEGMENT_EXTENTS)?;
+        let mut verified = 0;
+        for (segment, name) in segments {
+            let mut rows = extents.query([segment])?;
+            let Some(mut row) = rows.next()? else {
+                continue;
+            };
+            let path = self.config.state_path.join("cas").join(name);
+            let mut file = segment_open_options()
+                .read(true)
+                .open(&path)
+                .map_err(io_err(&path))?;
+            let mut bytes = Vec::new();
+            loop {
+                let hash: Vec<u8> = row.get(0)?;
+                let offset = row.get::<_, i64>(1)? as u64;
+                let len = row.get::<_, i64>(2)? as usize;
+                bytes.resize(len, 0);
+                file.seek(SeekFrom::Start(offset)).map_err(io_err(&path))?;
+                file.read_exact(&mut bytes).map_err(io_err(&path))?;
+                if blake3::hash(&bytes).as_bytes().as_slice() != hash.as_slice() {
+                    return Err(StoreError::CorruptExtent {
+                        segment: segment as u64,
+                        offset,
+                    });
+                }
+                verified += 1;
+                match rows.next()? {
+                    Some(next) => row = next,
+                    None => break,
+                }
+            }
         }
-        Ok(hashes.len())
+        Ok(verified)
     }
 
     pub(crate) fn read_extent(
@@ -1083,23 +1050,6 @@ pub(crate) fn upsert_candidate(
         ],
     )?;
     Ok(())
-}
-
-pub(crate) fn derived_row_matches(
-    txn: &rusqlite::Connection,
-    child: AssetUuid,
-    parent: AssetUuid,
-    output_key: &str,
-) -> Result<bool, StoreError> {
-    use rusqlite::OptionalExtension;
-    let row: Option<(Vec<u8>, String)> = txn
-        .query_row(
-            "SELECT parent_uuid, output_key FROM derived_outputs WHERE child_uuid = ?1",
-            [child.0.as_slice()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    Ok(matches!(row, Some((p, k)) if p == parent.0.as_slice() && k == output_key))
 }
 
 // ---- derived-output namespace (input-versioned, §9/§13) ----

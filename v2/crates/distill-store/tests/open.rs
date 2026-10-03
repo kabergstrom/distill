@@ -25,6 +25,25 @@ fn open_creates_the_state_layout() {
 }
 
 #[test]
+fn a_refused_open_leaves_the_live_stores_tool_stage_files() {
+    // A second open of a state directory another store holds is refused
+    // before it touches anything: the holder's in-flight tool stage files
+    // stay.
+    let dir = tempfile::tempdir().unwrap();
+    let config = cfg(&dir);
+    let _live = Store::open(config.clone()).unwrap();
+    let objects = config.state_path.join("tools/objects");
+    std::fs::create_dir_all(&objects).unwrap();
+    let staged = objects.join(".stage-in-flight");
+    std::fs::write(&staged, b"tool bytes").unwrap();
+    assert!(matches!(
+        Store::open(config.clone()),
+        Err(StoreError::StateLocked { .. })
+    ));
+    assert!(staged.exists(), "a refused open deleted the live store's stage file");
+}
+
+#[test]
 fn instance_id_persists_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let first = Store::open(cfg(&dir)).unwrap().instance_id();
@@ -47,8 +66,9 @@ fn reopen_removes_orphaned_tool_stage_files() {
 
     drop(Store::open(config).unwrap());
 
+    // Neither is a registered package's: the stage file and the object go.
     assert!(!orphan.exists());
-    assert_eq!(std::fs::read(immutable).unwrap(), b"complete");
+    assert!(!immutable.exists());
 }
 
 #[test]
