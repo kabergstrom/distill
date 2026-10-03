@@ -257,7 +257,7 @@ fn upsert_asset_replaces_tags_wholesale() {
 fn tag_index_refinement_is_value_aware_and_pending_state_never_underapproximates() {
     let (_d, mut store) = store();
     seed(&mut store);
-    let (_, version) = store
+    store
         .input_transaction(|txn| txn.set_tag_index_pending(AssetUuid([10; 16]), [7; 32]))
         .unwrap();
     assert!(matches!(
@@ -267,7 +267,6 @@ fn tag_index_refinement_is_value_aware_and_pending_state_never_underapproximates
 
     store
         .refine_unpublished_tag_index(
-            version,
             &[TagIndexUpdate {
                 asset: AssetUuid([10; 16]),
                 tags: BTreeMap::from([("category".to_owned(), Some("enemy".to_owned()))]),

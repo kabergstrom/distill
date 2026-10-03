@@ -25,7 +25,6 @@ use rusqlite::OptionalExtension;
 use crate::db::{InputTxn, Store, StoreReader};
 use crate::error::StoreError;
 use crate::files::RootId;
-use crate::state::InputVersion;
 
 /// One `bundles` row (§13): the physical key, matching `files`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -452,21 +451,14 @@ impl Store {
     /// the RPC publication step. This deliberately does not
     /// advance the input version: a crash between the namespace transaction
     /// and this refinement leaves the conservative pending poison intact.
+    /// The daemon runs it inside the input that publishes the namespace it
+    /// read (`refine_tag_index` takes that input's proof), so the rows it
+    /// writes are of the version they were read at.
     pub fn refine_unpublished_tag_index(
         &mut self,
-        expected: InputVersion,
         updates: &[TagIndexUpdate],
     ) -> Result<(), StoreError> {
         self.write_txn(|store| {
-            if store.input_version()? != expected {
-                return Err(StoreError::InvalidConfiguration {
-                    error: format!(
-                        "tag-index refinement basis {:?}, current {:?}",
-                        expected,
-                        store.input_version()?
-                    ),
-                });
-            }
             let mut assets = BTreeSet::new();
             let txn = store.read.conn.savepoint()?;
             for update in updates {

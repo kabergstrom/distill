@@ -1698,7 +1698,7 @@ fn poison_tag_index(
         })
         .collect::<Vec<_>>();
     store
-        .refine_unpublished_tag_index(store.input_version().map_err(|error| error.to_string())?, &updates)
+        .refine_unpublished_tag_index(&updates)
         .map_err(|error| format!("poison the tag index: {error}"))?;
     Ok(PublishedTagIndex::conservatively_poisoned(assets))
 }
@@ -1791,7 +1791,6 @@ fn try_refine_tag_index(
     if tests::FAIL_TAG_REFINEMENT_TRANSIENT.with(|fail| fail.replace(false)) {
         return Err(BuildError::Infrastructure("injected store failure".to_owned()));
     }
-    let basis = store.input_version().map_err(BuildError::infrastructure)?;
     // A bundle's assets one after another, so each bundle is parsed once.
     let mut order = assets
         .iter()
@@ -1906,7 +1905,7 @@ fn try_refine_tag_index(
         }
     }
     store
-        .refine_unpublished_tag_index(basis, &updates)
+        .refine_unpublished_tag_index(&updates)
         .map_err(|error| BuildError::Infrastructure(format!("publish tag index: {error}")))?;
     Ok(PublishedTagIndex {
         tags,
