@@ -29,6 +29,8 @@ pub const SERVED_RESTART_KEYS: &str = "served_restart_keys";
 const RPC_PROTOCOL_EPOCH: &str = "rpc_protocol_epoch";
 const RPC_PIPELINE_GENERATION: &str = "rpc_pipeline_generation";
 const CHANGE_LOG_OLDEST: &str = "change_log_oldest";
+/// Drop an artifact's load edges ahead of recording its latest install's.
+pub(crate) const DELETE_LOAD_EDGES: &str = "DELETE FROM artifact_load_edges WHERE content_hash = ?1";
 
 /// Encode an RPC authored value (canonical JSON plus its blob table) for
 /// `assets.authored_value`.
@@ -906,42 +908,30 @@ pub trait ServedWrite {
             > 0)
     }
 
-    /// Record an artifact's typed direct load edges. Idempotent; a
-    /// different edge set for the same artifact is an error.
+    /// Record an artifact's typed direct load edges, replacing any an
+    /// earlier install recorded. The DSTL bytes carry the edges' assets but
+    /// not their expected terminals, so the same bytes rebuilt after a
+    /// dependency's terminal type changed carry other edges: the latest
+    /// install's are the artifact's. The rows go with the artifact's
+    /// extent (`ON DELETE CASCADE`).
     fn record_artifact_load_edges(
         &mut self,
         hash: ContentHash,
         edges: &[(AssetUuid, TypeUuid)],
     ) -> Result<(), StoreError> {
         let conn = self.served_conn();
-        let mut statement = conn.prepare_cached(
-            "SELECT asset_uuid, expected_terminal FROM artifact_load_edges
-             WHERE content_hash = ?1 ORDER BY asset_uuid",
+        conn.prepare_cached(DELETE_LOAD_EDGES)?
+            .execute([hash.0.as_slice()])?;
+        let mut insert = conn.prepare_cached(
+            "INSERT INTO artifact_load_edges(content_hash, asset_uuid, expected_terminal)
+             VALUES (?1, ?2, ?3)",
         )?;
-        let existing = statement
-            .query_map([hash.0.as_slice()], |row| {
-                Ok((
-                    AssetUuid(blob16(row.get(0)?)),
-                    TypeUuid(blob16(row.get(1)?)),
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        if !existing.is_empty() {
-            let mut sorted = edges.to_vec();
-            sorted.sort();
-            if existing != sorted {
-                return Err(StoreError::InvalidConfiguration {
-                    error: format!("artifact {hash:?} already has different load edges"),
-                });
-            }
-            return Ok(());
-        }
         for (asset, terminal) in edges {
-            conn.execute(
-                "INSERT INTO artifact_load_edges(content_hash, asset_uuid, expected_terminal)
-                 VALUES (?1, ?2, ?3)",
-                rusqlite::params![hash.0.as_slice(), asset.0.as_slice(), terminal.0.as_slice()],
-            )?;
+            insert.execute(rusqlite::params![
+                hash.0.as_slice(),
+                asset.0.as_slice(),
+                terminal.0.as_slice()
+            ])?;
         }
         Ok(())
     }

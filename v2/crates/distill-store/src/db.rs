@@ -481,9 +481,11 @@ CREATE TABLE rpc_targets (
     generation      INTEGER NOT NULL
 );
 -- The one piece of artifact metadata the DSTL bytes do not carry: each
--- direct load edge's expected terminal type. Written with the CAS index.
+-- direct load edge's expected terminal type. Written with the CAS index,
+-- by the artifact's latest install; deleted with its extent.
 CREATE TABLE artifact_load_edges (
-    content_hash      BLOB NOT NULL,
+    content_hash      BLOB NOT NULL
+                      REFERENCES cas_extents(content_hash) ON DELETE CASCADE,
     asset_uuid        BLOB NOT NULL,
     expected_terminal BLOB NOT NULL,
     PRIMARY KEY (content_hash, asset_uuid)

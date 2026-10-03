@@ -1,5 +1,5 @@
 //! Served RPC state: snapshots are read transactions, the change log trims
-//! and advances its oldest cursor, artifact load edges are write-once, and
+//! and advances its oldest cursor, artifact load edges follow their artifact, and
 //! the authored-value codec roundtrips.
 
 use distill_core::id::{AssetUuid, ContentHash, TypeUuid};
@@ -76,20 +76,6 @@ fn change_log_trim_advances_the_oldest_cursor() {
 }
 
 #[test]
-fn artifact_load_edges_are_write_once() {
-    let (_dir, mut store) = store();
-    let edges = [(AssetUuid([9; 16]), TypeUuid([1; 16]))];
-    let hash = store.put_artifact(ASSET, b"artifact bytes", &edges).unwrap();
-    assert_eq!(hash, ContentHash(*blake3::hash(b"artifact bytes").as_bytes()));
-    assert_eq!(store.cas_read(&hash.0).unwrap(), b"artifact bytes");
-    assert_eq!(store.artifact_load_edges(hash).unwrap(), edges);
-    assert_eq!(store.put_artifact(ASSET, b"artifact bytes", &edges).unwrap(), hash);
-    assert!(store
-        .put_artifact(ASSET, b"artifact bytes", &[(AssetUuid([9; 16]), TypeUuid([2; 16]))])
-        .is_err());
-}
-
-#[test]
 fn rpc_targets_advance_generation_only_on_change() {
     let (_dir, mut store) = store();
     let changed = store
@@ -131,4 +117,26 @@ fn authored_value_codec_roundtrips() {
     assert_eq!(json, br#"{"a":1}"#);
     assert_eq!(blobs, [b"one".to_vec(), Vec::new()]);
     assert!(decode_authored_value(&encoded[..encoded.len() - 1]).is_err());
+}
+
+#[test]
+fn an_artifacts_load_edges_are_its_latest_installs_and_go_with_it() {
+    // The DSTL bytes do not carry the edges' expected terminals, so a
+    // dependency whose terminal type changed rebuilds the same bytes with
+    // other edges. That publication succeeds and its edges are served; the
+    // edges live exactly as long as the artifact's extent.
+    let (_dir, mut store) = store();
+    let old = [(AssetUuid([9; 16]), TypeUuid([1; 16]))];
+    let new = [(AssetUuid([9; 16]), TypeUuid([2; 16]))];
+    let hash = store.put_artifact(ASSET, b"artifact bytes", &old).unwrap();
+    store
+        .put_artifact(ASSET, b"artifact bytes", &new)
+        .expect("a rebuild with changed load edges publishes");
+    assert_eq!(store.artifact_load_edges(hash).unwrap(), new);
+    store.evict_installed(&hash.0).unwrap();
+    assert!(store.cas_read(&hash.0).is_err());
+    assert!(
+        store.artifact_load_edges(hash).unwrap().is_empty(),
+        "load edges outlived their artifact"
+    );
 }

@@ -1336,6 +1336,7 @@ fn cas_statements_search_their_indexes() {
     };
     use crate::cas::recovery::{DROP_LOST_EXTENTS, LOST_EXTENT_HOLDERS, LOST_RESULTS};
     use crate::cas::store::{ACTIVE_SEGMENT, SEAL_OWN_SEGMENTS};
+    use crate::served::DELETE_LOAD_EDGES;
     let (_dir, store) = store_with(10);
     let cases: &[(&str, &[&str])] = &[
         (
@@ -1381,11 +1382,16 @@ fn cas_statements_search_their_indexes() {
             LOST_RESULTS,
             &["SEARCH result_candidates USING INDEX result_candidates_by_segment (segment=?)"],
         ),
-        // The delete checks the references.
+        (
+            DELETE_LOAD_EDGES,
+            &["SEARCH artifact_load_edges USING COVERING INDEX sqlite_autoindex_artifact_load_edges_1 (content_hash=?)"],
+        ),
+        // The delete cascades to the load edges and checks the references.
         (
             DROP_LOST_EXTENTS,
             &[
                 "SEARCH cas_extents USING INDEX cas_extents_by_segment (segment=?)",
+                "SEARCH artifact_load_edges USING COVERING INDEX sqlite_autoindex_artifact_load_edges_1 (content_hash=?)",
                 "SEARCH cas_refs USING COVERING INDEX cas_refs_by_hash (content_hash=?)",
             ],
         ),
