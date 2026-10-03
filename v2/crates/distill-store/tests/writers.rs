@@ -113,3 +113,49 @@ fn writers_follow_the_operational_configuration_from_their_next_transaction() {
     // A writer opened afterwards starts from it.
     assert_eq!(opener.open_writer().unwrap().config().segment_size, before * 2);
 }
+
+/// A write transaction nested in an open input is a savepoint: when it
+/// fails, its own writes roll back and the input keeps the rest.
+#[test]
+fn a_failed_nested_write_rolls_back_only_its_own_writes() {
+    use distill_store::files::ObservedDiagnostic;
+    use distill_store::StoreError;
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(StoreConfig::new(dir.path().join("state"))).unwrap();
+    let diagnostic = |path: &str| ObservedDiagnostic {
+        root_name: "main".to_owned(),
+        path: path.to_owned(),
+        detail: b"unreadable".to_vec(),
+    };
+    store.open_input().unwrap();
+    store
+        .write_transaction(|store| {
+            store.replace_scan_diagnostics(Some(&[]), &[diagnostic("kept")])
+        })
+        .unwrap();
+    let failed = store.write_transaction(|store| {
+        store.replace_scan_diagnostics(Some(&[]), &[diagnostic("dropped")])?;
+        Err::<(), _>(StoreError::Rejected {
+            detail: "the step failed".to_owned(),
+        })
+    });
+    assert!(failed.is_err());
+    let failed_with = store.write_transaction_with(
+        |error| error.to_string(),
+        |store| {
+            store
+                .replace_scan_diagnostics(Some(&[]), &[diagnostic("dropped too")])
+                .map_err(|error| error.to_string())?;
+            Err::<(), _>("the step failed".to_owned())
+        },
+    );
+    assert!(failed_with.is_err());
+    store.finish_input(true).unwrap();
+    let paths = store
+        .scan_diagnostics()
+        .unwrap()
+        .into_iter()
+        .map(|row| row.path)
+        .collect::<Vec<_>>();
+    assert_eq!(paths, ["kept"]);
+}

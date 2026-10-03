@@ -776,29 +776,6 @@ impl Store {
         }
     }
 
-    /// Run the same exact-basis validation surface as an input transaction,
-    /// then roll every database mutation back. Coordinators use this before a
-    /// journaled filesystem swap when the authoritative store transition is
-    /// intentionally checked a second time in the publishing transaction.
-    pub fn preview_input_transaction<T, F>(&mut self, f: F) -> Result<T, StoreError>
-    where
-        F: FnOnce(&mut InputTxn<'_>) -> Result<T, StoreError>,
-    {
-        if !self.read.conn.is_autocommit() {
-            return self.joined_input_transaction(f, false).map(|(out, _)| out);
-        }
-        self.refresh_config();
-        self.read.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.joined_input_transaction(f, false)
-        }));
-        let _ = self.read.conn.execute_batch("ROLLBACK");
-        match out {
-            Ok(out) => out.map(|(out, _)| out),
-            Err(panic) => std::panic::resume_unwind(panic),
-        }
-    }
-
     /// `f` as a savepoint in the open input (or, with none open, in a
     /// transaction of its own), kept only when `keep`.
     fn joined_input_transaction<T, F>(
@@ -906,19 +883,38 @@ impl Store {
 
     /// Run `f` as one write transaction: `BEGIN IMMEDIATE` when none is
     /// open, so the transaction holds SQLite's write lock from its first
-    /// read and never upgrades a read snapshot; inside an open one `f` joins
-    /// it. On failure everything `f` wrote rolls back with the enclosing
-    /// transaction, and this writer forgets its active segment, whose row
+    /// read and never upgrades a read snapshot; inside an open one, a
+    /// savepoint in it. On failure everything `f` wrote rolls back (a nested
+    /// one only its own writes, so a caller that handles the error commits
+    /// none of them), and this writer forgets its active segment, whose row
     /// may have been part of it.
     pub(crate) fn write_txn<T>(
         &mut self,
         f: impl FnOnce(&mut Store) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         if !self.read.conn.is_autocommit() {
-            let out = f(self);
-            if out.is_err() {
-                self.cas.forget_active();
-            }
+            self.read.conn.execute_batch("SAVEPOINT write_txn")?;
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+            let out = match out {
+                Ok(Ok(value)) => match self.read.conn.execute_batch("RELEASE write_txn") {
+                    Ok(()) => return Ok(value),
+                    Err(error) => Err(error.into()),
+                },
+                Ok(Err(error)) => Err(error),
+                Err(panic) => {
+                    let _ = self
+                        .read
+                        .conn
+                        .execute_batch("ROLLBACK TO write_txn; RELEASE write_txn");
+                    self.cas.forget_active();
+                    std::panic::resume_unwind(panic)
+                }
+            };
+            let _ = self
+                .read
+                .conn
+                .execute_batch("ROLLBACK TO write_txn; RELEASE write_txn");
+            self.cas.forget_active();
             return out;
         }
         self.refresh_config();
