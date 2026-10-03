@@ -238,6 +238,9 @@ impl InputTxn<'_> {
         directories: &[ObservedDirectory],
         diagnostics: &[ObservedDiagnostic],
     ) -> Result<(), StoreError> {
+        if under.is_none() {
+            return self.replace_all_scan_structure(directories, diagnostics);
+        }
         clear_structure(&self.txn, under, true)?;
         for directory in directories {
             let root = interned_root(&self.txn, &mut self.roots, &directory.root_name)?;
@@ -252,6 +255,60 @@ impl InputTxn<'_> {
                 ],
             )?;
         }
+        insert_diagnostics(&self.txn, &mut self.roots, diagnostics)
+    }
+
+    /// [`InputTxn::replace_scan_structure`] of every root, writing only the
+    /// directory rows that change: a full rescan observes every directory,
+    /// and most are as they were. The diagnostics (defects) are replaced.
+    fn replace_all_scan_structure(
+        &mut self,
+        directories: &[ObservedDirectory],
+        diagnostics: &[ObservedDiagnostic],
+    ) -> Result<(), StoreError> {
+        let mut wanted = std::collections::BTreeMap::new();
+        for directory in directories {
+            let root = interned_root(&self.txn, &mut self.roots, &directory.root_name)?;
+            wanted.insert(
+                (root.0, directory.path.clone()),
+                (directory.canonical_path.clone(), directory.physical_path.clone()),
+            );
+        }
+        let mut stale = Vec::new();
+        {
+            let mut select = self.txn.prepare_cached(
+                "SELECT root_id, path, canonical_path, physical_path FROM directories",
+            )?;
+            let mut rows = select.query([])?;
+            while let Some(row) = rows.next()? {
+                let key: (i64, String) = (row.get(0)?, row.get(1)?);
+                let held: (Vec<u8>, Vec<u8>) = (row.get(2)?, row.get(3)?);
+                match wanted.remove(&key) {
+                    Some(same) if same == held => {}
+                    Some(changed) => {
+                        stale.push(key.clone());
+                        wanted.insert(key, changed);
+                    }
+                    None => stale.push(key),
+                }
+            }
+        }
+        // Deleted first: a moved directory keeps its canonical path, which
+        // is unique.
+        for (root, path) in &stale {
+            self.txn
+                .prepare_cached("DELETE FROM directories WHERE root_id = ?1 AND path = ?2")?
+                .execute(rusqlite::params![root, path])?;
+        }
+        for ((root, path), (canonical, physical)) in &wanted {
+            self.txn
+                .prepare_cached(
+                    "INSERT INTO directories(root_id, path, canonical_path, physical_path)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )?
+                .execute(rusqlite::params![root, path, canonical, physical])?;
+        }
+        clear_structure(&self.txn, None, false)?;
         insert_diagnostics(&self.txn, &mut self.roots, diagnostics)
     }
 

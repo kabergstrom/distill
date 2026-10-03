@@ -201,58 +201,47 @@ impl InputTxn<'_> {
         under: Option<&[(String, String)]>,
         sources: &[SourceClaims],
     ) -> Result<(), StoreError> {
+        let Some(prefixes) = under else {
+            return self.replace_all_source_claims(sources);
+        };
         let conn = &*self.txn;
         let mut touched = BTreeSet::<(i64, Vec<u8>)>::new();
-        match under {
-            None => clear_claims(conn)?,
-            Some(prefixes) => {
-                for (root, prefix) in prefixes {
-                    let mut select = conn.prepare_cached(&format!(
-                        "SELECT t.kind, t.subject FROM source_claims t JOIN roots r USING (root_id)
-                         WHERE {}",
-                        crate::files::under_sql(prefix)
-                    ))?;
-                    let rows = select.query_map(rusqlite::params![root, prefix], |row| {
-                        Ok((row.get(0)?, row.get(1)?))
-                    })?;
-                    for row in rows {
-                        touched.insert(row?);
-                    }
-                    conn.execute(
-                        &format!(
-                            "DELETE FROM source_claims WHERE rowid IN (
-                               SELECT t.rowid FROM source_claims t JOIN roots r USING (root_id)
-                               WHERE {})",
-                            crate::files::under_sql(prefix)
-                        ),
-                        rusqlite::params![root, prefix],
-                    )?;
-                }
+        for (root, prefix) in prefixes {
+            let mut select = conn.prepare_cached(&format!(
+                "SELECT t.kind, t.subject FROM source_claims t JOIN roots r USING (root_id)
+                 WHERE {}",
+                crate::files::under_sql(prefix)
+            ))?;
+            let rows = select.query_map(rusqlite::params![root, prefix], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+            for row in rows {
+                touched.insert(row?);
             }
+            conn.execute(
+                &format!(
+                    "DELETE FROM source_claims WHERE rowid IN (
+                       SELECT t.rowid FROM source_claims t JOIN roots r USING (root_id)
+                       WHERE {})",
+                    crate::files::under_sql(prefix)
+                ),
+                rusqlite::params![root, prefix],
+            )?;
         }
         for source in sources {
             let root = self.intern_root(&source.root_name)?;
             for claim in &source.claims {
                 let (kind, subject, claimant, detail) = claim_row(claim)?;
-                self.txn.execute(
-                    "INSERT OR REPLACE INTO source_claims(root_id, path, kind, subject, claimant, detail)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![root.0, source.path, kind, subject, claimant, detail],
-                )?;
+                self.txn
+                    .prepare_cached(
+                        "INSERT OR REPLACE INTO source_claims(root_id, path, kind, subject, claimant, detail)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    )?
+                    .execute(rusqlite::params![root.0, source.path, kind, subject, claimant, detail])?;
                 touched.insert((kind, subject));
             }
         }
         let conn = &*self.txn;
-        if under.is_none() {
-            conn.execute(
-                "INSERT INTO claim_collisions(grp, subject)
-                 SELECT CASE kind WHEN 0 THEN 0 ELSE 1 END AS g, subject FROM source_claims
-                 WHERE kind IN (0, 1, 2)
-                 GROUP BY g, subject HAVING COUNT(DISTINCT claimant) > 1",
-                [],
-            )?;
-            return Ok(());
-        }
         let mut refreshed = BTreeSet::new();
         for (kind, subject) in &touched {
             if let Some(group) = collision_group(*kind) {
@@ -292,6 +281,66 @@ impl InputTxn<'_> {
     }
 
     /// The pending subjects were published.
+    /// Replace every source's claims with `sources`, writing only the rows
+    /// that change: a full rescan republishes every source, and most keep
+    /// their claims. When any changed, every collision is recomputed.
+    /// Nothing is left pending.
+    fn replace_all_source_claims(&mut self, sources: &[SourceClaims]) -> Result<(), StoreError> {
+        type Key = (i64, String, i64, Vec<u8>, Vec<u8>);
+        let mut wanted = std::collections::BTreeMap::<Key, Vec<u8>>::new();
+        for source in sources {
+            let root = self.intern_root(&source.root_name)?;
+            for claim in &source.claims {
+                let (kind, subject, claimant, detail) = claim_row(claim)?;
+                wanted.insert((root.0, source.path.clone(), kind, subject, claimant), detail);
+            }
+        }
+        let conn = &*self.txn;
+        let mut stale = Vec::new();
+        {
+            let mut select = conn.prepare_cached(
+                "SELECT root_id, path, kind, subject, claimant, detail FROM source_claims",
+            )?;
+            let mut rows = select.query([])?;
+            while let Some(row) = rows.next()? {
+                let key: Key = (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?);
+                let detail: Vec<u8> = row.get(5)?;
+                match wanted.remove(&key) {
+                    Some(same) if same == detail => {}
+                    Some(changed) => {
+                        wanted.insert(key, changed);
+                    }
+                    None => stale.push(key),
+                }
+            }
+        }
+        for (root, path, kind, subject, claimant) in &stale {
+            conn.prepare_cached(
+                "DELETE FROM source_claims
+                 WHERE root_id = ?1 AND path = ?2 AND kind = ?3 AND subject = ?4 AND claimant = ?5",
+            )?
+            .execute(rusqlite::params![root, path, kind, subject, claimant])?;
+        }
+        for ((root, path, kind, subject, claimant), detail) in &wanted {
+            conn.prepare_cached(
+                "INSERT OR REPLACE INTO source_claims(root_id, path, kind, subject, claimant, detail)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?
+            .execute(rusqlite::params![root, path, kind, subject, claimant, detail])?;
+        }
+        if !stale.is_empty() || !wanted.is_empty() {
+            conn.execute_batch(
+                "DELETE FROM claim_collisions;
+                 INSERT INTO claim_collisions(grp, subject)
+                 SELECT CASE kind WHEN 0 THEN 0 ELSE 1 END AS g, subject FROM source_claims
+                 WHERE kind IN (0, 1, 2)
+                 GROUP BY g, subject HAVING COUNT(DISTINCT claimant) > 1;",
+            )?;
+        }
+        conn.execute("DELETE FROM claim_pending", [])?;
+        Ok(())
+    }
+
     pub fn clear_pending_claims(&mut self) -> Result<(), StoreError> {
         self.txn.execute("DELETE FROM claim_pending", [])?;
         Ok(())

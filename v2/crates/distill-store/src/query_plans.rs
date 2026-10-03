@@ -812,7 +812,6 @@ fn reading_bundle_file_hashes_skips_their_bytes() {
 fn populate_scan_structure(store: &mut Store, count: u32) {
     let mut directories = Vec::new();
     let mut diagnostics = Vec::new();
-    let mut claims = Vec::new();
     for index in 0..count {
         let root = ["main", "alt"][(index % 2) as usize].to_owned();
         let path = bundle_path(index);
@@ -827,15 +826,8 @@ fn populate_scan_structure(store: &mut Store, count: u32) {
             path: format!("{path}.x"),
             detail: Vec::new(),
         });
-        claims.push(crate::claims::SourceClaims {
-            root_name: root,
-            path: path.clone(),
-            claims: vec![crate::claims::SourceClaim::PrimaryPath {
-                path,
-                asset: asset_uuid(index, 1),
-            }],
-        });
     }
+    let claims = populate_scan_structure_claims(count);
     store
         .input_transaction(|txn| {
             let version = txn.version();
@@ -862,6 +854,23 @@ fn populate_scan_structure(store: &mut Store, count: u32) {
             Ok(())
         })
         .unwrap();
+}
+
+/// The claims [`populate_scan_structure`] writes: each bundle's primary path.
+fn populate_scan_structure_claims(count: u32) -> Vec<crate::claims::SourceClaims> {
+    (0..count)
+        .map(|index| {
+            let path = bundle_path(index);
+            crate::claims::SourceClaims {
+                root_name: ["main", "alt"][(index % 2) as usize].to_owned(),
+                path: path.clone(),
+                claims: vec![crate::claims::SourceClaim::PrimaryPath {
+                    path,
+                    asset: asset_uuid(index, 1),
+                }],
+            }
+        })
+        .collect()
 }
 
 /// The statements `run` issues that read a subtree of one root (they join
@@ -1406,6 +1415,17 @@ fn pass_bookkeeping_statements_search_their_indexes() {
                 txn.set_namespace_errors(Vec::new()).map(drop)
             })
             .unwrap();
+        // A full replacement that drops one source's claims.
+        let mut kept = populate_scan_structure_claims(200);
+        kept.pop();
+        store
+            .input_transaction(|txn| {
+                txn.replace_source_claims(None, &kept)?;
+                // And of the directories, dropping one.
+                let held = txn.reader().observed_directories_under("main", "")?;
+                txn.replace_scan_structure(None, &held[1..], &[])
+            })
+            .unwrap();
     });
     let plan = |prefix: &str| {
         let found = plans
@@ -1426,7 +1446,22 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         "SEARCH source_claims USING INDEX source_claims_by_subject (kind=? AND subject=?)",
         "USE TEMP B-TREE FOR DISTINCT",
     ];
-    let cases: [(&str, &[&str]); 18] = [
+    let cases: [(&str, &[&str]); 22] = [
+        (
+            "SELECT root_id, path, canonical_path, physical_path FROM directories",
+            &["SCAN directories"],
+        ),
+        (
+            "DELETE FROM directories WHERE root_id",
+            &["SEARCH directories USING INDEX sqlite_autoindex_directories_1 (root_id=? AND path=?)"],
+        ),
+        // A full replacement streams the claims (a whole-namespace pass)
+        // and deletes the stale ones by key.
+        ("SELECT root_id, path, kind, subject, claimant, detail FROM source_claims", &["SCAN source_claims"]),
+        (
+            "DELETE FROM source_claims WHERE root_id",
+            &["SEARCH source_claims USING INDEX sqlite_autoindex_source_claims_1 (root_id=? AND path=? AND kind=? AND subject=? AND claimant=?)"],
+        ),
         ("SELECT DISTINCT claimant FROM source_claims WHERE kind = 3", &distinct),
         // A subject's claimants, whatever index orders claimants.
         ("SELECT COUNT(DISTINCT claimant) FROM source_claims WHERE kind IN (0)", &counted),
