@@ -1458,9 +1458,6 @@ pub enum AdminError {
     EmptyPathCandidates {
         path: String,
     },
-    ArtifactAlreadyExistsWithDifferentPayload {
-        hash: ContentHash,
-    },
     WireTreeHashMismatch {
         expected: LayoutHash,
         observed: LayoutHash,

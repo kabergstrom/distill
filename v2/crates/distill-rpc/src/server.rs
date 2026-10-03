@@ -916,6 +916,9 @@ impl ServerHandle {
             .iter()
             .map(|edge| (edge.asset, edge.expected_terminal))
             .collect::<Vec<_>>();
+        // An artifact's load edges are its latest install's: a repeated
+        // install with the same edges changes nothing, a different one
+        // replaces them in the install's transaction.
         if store.cas_contains(&hash.0).unwrap_or(false) {
             let existing =
                 store
@@ -923,11 +926,8 @@ impl ServerHandle {
                     .map_err(|error| AdminError::InvalidArtifact {
                         detail: format!("cannot read recorded load edges: {error}"),
                     })?;
-            if existing == edges && (!edges.is_empty() || !existing.is_empty()) {
+            if existing == edges && !edges.is_empty() {
                 return Ok(());
-            }
-            if !existing.is_empty() {
-                return Err(AdminError::ArtifactAlreadyExistsWithDifferentPayload { hash });
             }
         }
         let bytes = distill_wire::artifact::assemble_artifact(&payload.structural, &blob_parts);
@@ -936,9 +936,6 @@ impl ServerHandle {
             Ok(stored) => Err(AdminError::InvalidArtifact {
                 detail: format!("stored artifact hash {stored:?} differs from {hash:?}"),
             }),
-            Err(StoreError::InvalidConfiguration { .. }) => {
-                Err(AdminError::ArtifactAlreadyExistsWithDifferentPayload { hash })
-            }
             Err(error) => Err(AdminError::InvalidArtifact {
                 detail: format!("the store rejected the artifact: {error}"),
             }),

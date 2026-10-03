@@ -2703,7 +2703,7 @@ fn artifact_install_authenticates_header_hash_and_direct_typed_load_edges() {
 }
 
 #[test]
-fn content_hash_records_are_immutable() {
+fn an_artifact_s_load_edges_are_its_latest_install_s() {
     let server = server_with(&[(1, false)]);
     let (hash, first) = canonical_artifact(
         asset_id(1),
@@ -2720,11 +2720,27 @@ fn content_hash_records_are_immutable() {
     );
     assert_eq!(server.install_artifact(hash, first.clone()), Ok(()));
     assert_eq!(server.install_artifact(hash, first.clone()), Ok(()));
-    let mut different_edges = first;
+    let mut different_edges = first.clone();
     different_edges.load_edges[0].expected_terminal = type_id(3);
+    assert_eq!(server.install_artifact(hash, different_edges), Ok(()));
+    commit_one(
+        &server,
+        set_asset(
+            asset_id(1),
+            StoredResolve::Built { content_hash: hash },
+            AssetDeltaState::Changed,
+        ),
+    );
+    let hub = connect(&server, &[(1, false), (2, false)]);
+    let RpcResult::Success(fetched) = snapshot(&hub).fetch(hash) else {
+        panic!("an installed artifact must be fetchable");
+    };
     assert_eq!(
-        server.install_artifact(hash, different_edges),
-        Err(AdminError::ArtifactAlreadyExistsWithDifferentPayload { hash })
+        fetched.value.load_edges(),
+        &[ServedLoadEdge {
+            asset: asset_id(2),
+            expected_terminal: type_id(3),
+        }]
     );
 }
 
