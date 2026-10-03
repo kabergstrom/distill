@@ -606,32 +606,20 @@ impl Store {
         let db_path = state_path.join("meta.sqlite");
         let conn = open_writer_connection(&db_path)?;
 
-        let found: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if found == 0 {
-            conn.execute_batch(DDL)?;
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        } else if found != SCHEMA_VERSION {
-            return Err(StoreError::SchemaVersionMismatch {
-                found,
-                supported: SCHEMA_VERSION,
-            });
-        }
-
-        // Bootstrap identity + counters.
-        let instance_id = match meta_get_blob(&conn, "instance_id")? {
-            Some(bytes) if bytes.len() == 16 => {
-                let mut id = [0u8; 16];
-                id.copy_from_slice(&bytes);
-                StoreInstanceId(id)
+        // The schema and the store's identity are created in one
+        // transaction (SQLite DDL is transactional): a first open that
+        // fails part-way leaves no partial schema behind.
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let instance_id = match create_schema(&conn) {
+            Ok(instance_id) => {
+                conn.execute_batch("COMMIT")?;
+                instance_id
             }
-            _ => {
-                let id = StoreInstanceId::mint();
-                meta_set_blob(&conn, "instance_id", &id.0)?;
-                id
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(error);
             }
         };
-        meta_get_u64_or_init(&conn, "input_version")?;
-        meta_get_u64_or_init(&conn, "memo_seq")?;
 
         let mut store = Store {
             read: StoreReader {
@@ -997,6 +985,36 @@ impl Store {
             Ok((out, seq))
         })
     }
+}
+
+/// Create the schema on a fresh database (or check its version), and the
+/// store's identity and counters, inside the caller's transaction.
+fn create_schema(conn: &Connection) -> Result<StoreInstanceId, StoreError> {
+    let found: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if found == 0 {
+        conn.execute_batch(DDL)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    } else if found != SCHEMA_VERSION {
+        return Err(StoreError::SchemaVersionMismatch {
+            found,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    let instance_id = match meta_get_blob(conn, "instance_id")? {
+        Some(bytes) if bytes.len() == 16 => {
+            let mut id = [0u8; 16];
+            id.copy_from_slice(&bytes);
+            StoreInstanceId(id)
+        }
+        _ => {
+            let id = StoreInstanceId::mint();
+            meta_set_blob(conn, "instance_id", &id.0)?;
+            id
+        }
+    };
+    meta_get_u64_or_init(conn, "input_version")?;
+    meta_get_u64_or_init(conn, "memo_seq")?;
+    Ok(instance_id)
 }
 
 impl StoreReader {

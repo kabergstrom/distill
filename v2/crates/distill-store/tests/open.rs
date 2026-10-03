@@ -213,3 +213,40 @@ fn a_reader_requires_an_existing_store() {
     let dir = tempfile::tempdir().unwrap();
     assert!(StoreReader::open(cfg(&dir)).is_err());
 }
+
+/// The schema is created in one transaction: an open that fails part-way
+/// leaves none of it, so the next open creates it whole.
+#[test]
+fn a_failed_schema_creation_leaves_no_partial_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = cfg(&dir);
+    std::fs::create_dir_all(&config.state_path).unwrap();
+    let db = config.state_path.join("meta.sqlite");
+    let tables = |db: &std::path::Path| -> Vec<String> {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        let mut statement = conn
+            .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
+            .unwrap();
+        let names = statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap();
+        names
+    };
+    // The schema's last table already exists: its CREATE fails.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("CREATE TABLE artifact_load_edges (x)")
+        .unwrap();
+    assert!(Store::open(config.clone()).is_err());
+    assert_eq!(tables(&db), ["artifact_load_edges"]);
+
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("DROP TABLE artifact_load_edges")
+        .unwrap();
+    let store = Store::open(config).unwrap();
+    assert!(tables(&db).contains(&"store_meta".to_owned()));
+    drop(store);
+}
