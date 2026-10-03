@@ -102,6 +102,9 @@ CREATE TABLE source_claims (
     PRIMARY KEY (root_id, path, kind, subject, claimant)
 );
 CREATE INDEX source_claims_by_subject ON source_claims(kind, subject);
+-- Schema 39: the claims an asset makes (a primary path's claimant), for
+-- the sources an asset change makes pending.
+CREATE INDEX source_claims_by_claimant ON source_claims(kind, claimant);
 -- Per-entity errors (see `errors`): one row per current defect. `family`
 -- is the producer that owns the row (1 scan namespace, 2 the pending scan
 -- rejection's namespace errors, 3 its configuration error, 4 the
@@ -172,6 +175,8 @@ CREATE TABLE dirty_files (
     exists_flag INTEGER NOT NULL,
     observation INTEGER NOT NULL
 );
+-- Schema 39: acknowledging a pass's work deletes by path.
+CREATE INDEX dirty_files_by_path ON dirty_files(root_id, path);
 CREATE TABLE rename_events (
     seq       INTEGER PRIMARY KEY AUTOINCREMENT,
     root_id   INTEGER NOT NULL,

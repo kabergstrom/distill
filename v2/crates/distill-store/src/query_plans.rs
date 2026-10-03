@@ -1240,7 +1240,8 @@ fn reconfigured_sources_are_index_searches() {
             vec![
                 "COMPOUND QUERY",
                 "LEFT-MOST SUBQUERY",
-                "SEARCH t USING INDEX source_claims_by_subject (kind=?)",
+                // The malformed sources: either `(kind, ...)` index's range.
+                "SEARCH t USING INDEX source_claims_by_claimant (kind=?)",
                 "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)",
                 "UNION USING TEMP B-TREE",
                 // The collisions: the defects, never the namespace's claims.
@@ -1324,5 +1325,157 @@ fn candidate_rows_search_their_bucket() {
             "SEARCH result_candidates USING INDEX sqlite_autoindex_result_candidates_1 (key_kind=? AND static_key=?)",
             "USE TEMP B-TREE FOR ORDER BY",
         ]
+    );
+}
+
+/// The statements a pass's bookkeeping issues per edit, each with its exact
+/// plan: the import index refresh (by source, its dropped rules returned by
+/// the delete), the directory rules a dirty path's directories select, the
+/// pending work and its acknowledgement by path, the sources an asset's
+/// collision change makes pending (by claimant), the namespace error
+/// family's diff, the pipeline failure and one registered schema, and a
+/// root id.
+#[test]
+fn pass_bookkeeping_statements_search_their_indexes() {
+    use crate::imports::ImportIndexSource;
+    use crate::state::{AssetClaimant, ReadableBundleSource};
+    use distill_core::id::BundleFileHash;
+    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, mut store) = store_with(200);
+    populate_scan_structure(&mut store, 200);
+    let rules = |index: u32| ImportIndexSource {
+        root_name: "main".to_owned(),
+        path: bundle_path(index),
+        watched: None,
+        directory_rules: vec![(bundle_uuid(index), asset_uuid(index, 3), format!("d{:02}/", index % 50))],
+    };
+    let sources = (0..200).step_by(2).map(|index| ("main".to_owned(), bundle_path(index))).collect::<Vec<_>>();
+    let rows = (0..200).step_by(2).map(rules).collect::<Vec<_>>();
+    store.replace_import_index(&sources, &rows).unwrap();
+    store
+        .input_transaction(|txn| {
+            let root = txn.intern_root("main")?;
+            let version = txn.version();
+            txn.push_dirty(root, "gone.png", false, version)
+        })
+        .unwrap();
+    // Two sources claim one asset: a collision the edit below resolves.
+    let authored = |path: &str| crate::claims::SourceClaims {
+        root_name: "main".to_owned(),
+        path: path.to_owned(),
+        claims: vec![crate::claims::SourceClaim::Authored {
+            asset: asset_uuid(42, 1),
+            claimant: AssetClaimant::Authored {
+                source: ReadableBundleSource {
+                    root_name: "main".to_owned(),
+                    normalized_path: path.to_owned(),
+                    file_hash: BundleFileHash([1; 32]),
+                },
+                bundle: bundle_uuid(42),
+                local_id: "main".to_owned(),
+            },
+        }],
+    };
+    let under = [("main".to_owned(), "x/b.bundle".to_owned())];
+    store
+        .input_transaction(|txn| {
+            txn.replace_source_claims(Some(&[("main".to_owned(), "x/a.bundle".to_owned())]), &[authored("x/a.bundle")])?;
+            txn.replace_source_claims(Some(&under), &[authored("x/b.bundle")])
+        })
+        .unwrap();
+    let plans = configuration_plans(&mut store, |store| {
+        let work = store.pending_file_work().unwrap();
+        store.acknowledge_file_work(&work).unwrap();
+        store.replace_import_index(&sources[..1], &rows[..1]).unwrap();
+        store.directory_rule_sources_listing(["", "d04/"]).unwrap();
+        store.directory_rule_sources_at("main", &bundle_path(4)).unwrap();
+        store.pipeline_failure().unwrap();
+        store.ready_schema_hash(RUNTIME_TYPE).unwrap();
+        store
+            .input_transaction(|txn| {
+                txn.intern_root("main")?;
+                txn.replace_source_claims(Some(&under), &[])?;
+                txn.set_namespace_errors(Vec::new()).map(drop)
+            })
+            .unwrap();
+    });
+    let plan = |prefix: &str| {
+        let found = plans
+            .iter()
+            .filter(|(sql, _)| sql.split_whitespace().collect::<Vec<_>>().join(" ").starts_with(prefix))
+            .map(|(_, plan)| plan.clone())
+            .collect::<Vec<_>>();
+        assert!(!found.is_empty(), "no statement starts with {prefix:?}: {plans:#?}");
+        found
+    };
+    let by_root = "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)";
+    let cases: [(&str, &[&str]); 14] = [
+        // The pending work: a pass's whole queue.
+        ("SELECT d.seq", &["SCAN d", by_root]),
+        ("SELECT e.seq", &["SCAN e", by_root]),
+        (
+            "SELECT observation FROM files",
+            &["SEARCH files USING INDEX sqlite_autoindex_files_1 (root_id=? AND path=?)"],
+        ),
+        (
+            "DELETE FROM dirty_files",
+            &["SEARCH dirty_files USING INDEX dirty_files_by_path (root_id=? AND path=? AND rowid<?)"],
+        ),
+        (
+            "SELECT root_id FROM roots",
+            &["SEARCH roots USING COVERING INDEX sqlite_autoindex_roots_1 (name=?)"],
+        ),
+        (
+            "DELETE FROM import_reads WHERE bundle_uuid IN",
+            &[
+                "SEARCH import_reads USING COVERING INDEX sqlite_autoindex_import_reads_1 (bundle_uuid=?)",
+                "LIST SUBQUERY 1",
+                "SEARCH import_records USING INDEX import_records_by_source (root_id=? AND path=?)",
+            ],
+        ),
+        (
+            "DELETE FROM import_records",
+            &["SEARCH import_records USING INDEX import_records_by_source (root_id=? AND path=?)"],
+        ),
+        (
+            "DELETE FROM directory_rule_sources",
+            &["SEARCH directory_rule_sources USING COVERING INDEX directory_rule_sources_by_source (root_id=? AND path=?)"],
+        ),
+        (
+            "SELECT r.name, t.path, t.rules_bundle, t.rules_asset FROM directory_rule_sources t JOIN roots r USING (root_id) WHERE t.listing_dir",
+            &["SEARCH t USING INDEX directory_rule_sources_by_listing (listing_dir=?)", by_root],
+        ),
+        (
+            "SELECT poison_code",
+            &["SEARCH pipeline_state USING INTEGER PRIMARY KEY (rowid=?)"],
+        ),
+        (
+            "SELECT r.logical_hash",
+            &[
+                "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)",
+                "SEARCH r USING INDEX sqlite_autoindex_pipeline_schema_registry_1 (type_uuid=?)",
+            ],
+        ),
+        (
+            "SELECT claimant FROM source_claims WHERE kind = 1",
+            &["SEARCH source_claims USING INDEX source_claims_by_subject (kind=? AND subject=?)"],
+        ),
+        (
+            "INSERT OR IGNORE INTO claim_pending(kind, subject) SELECT kind, subject",
+            &["SEARCH source_claims USING INDEX source_claims_by_claimant (kind=? AND claimant=?)"],
+        ),
+        (
+            "SELECT identity, record FROM errors",
+            &["SEARCH errors USING INDEX sqlite_autoindex_errors_1 (family=?)"],
+        ),
+    ];
+    for (prefix, expected) in cases {
+        for found in plan(prefix) {
+            assert_eq!(found, expected, "{prefix}");
+        }
+    }
+    assert_eq!(
+        plan("SELECT value FROM store_meta")[0],
+        ["SEARCH store_meta USING INDEX sqlite_autoindex_store_meta_1 (key=?)"]
     );
 }

@@ -410,11 +410,8 @@ impl Store {
             let mut complete = true;
             for ((root, path), entry) in latest {
                 let current = transaction
-                    .query_row(
-                        "SELECT observation FROM files WHERE root_id = ?1 AND path = ?2",
-                        rusqlite::params![root.0, path],
-                        |row| row.get::<_, i64>(0),
-                    )
+                    .prepare_cached("SELECT observation FROM files WHERE root_id = ?1 AND path = ?2")?
+                    .query_row(rusqlite::params![root.0, path], |row| row.get::<_, i64>(0))
                     .optional()?;
                 let matches = match (entry.exists, current) {
                     (true, Some(observation)) => observation as u64 == entry.observation.0,
@@ -422,10 +419,11 @@ impl Store {
                     _ => false,
                 };
                 if matches {
-                    transaction.execute(
-                        "DELETE FROM dirty_files WHERE root_id = ?1 AND path = ?2 AND seq <= ?3",
-                        rusqlite::params![root.0, path, entry.seq],
-                    )?;
+                    transaction
+                        .prepare_cached(
+                            "DELETE FROM dirty_files WHERE root_id = ?1 AND path = ?2 AND seq <= ?3",
+                        )?
+                        .execute(rusqlite::params![root.0, path, entry.seq])?;
                 } else {
                     complete = false;
                 }

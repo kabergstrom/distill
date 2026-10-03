@@ -159,14 +159,16 @@ fn mark_asset_dependents_pending(
     conn: &rusqlite::Connection,
     asset: &[u8],
 ) -> Result<(), StoreError> {
+    // Deduplicated here: a DISTINCT would steer the planner to an index
+    // that yields claimants in order instead of the one the key searches.
     let claimants = {
         let mut select = conn.prepare_cached(
-            "SELECT DISTINCT claimant FROM source_claims WHERE kind = ?1 AND subject = ?2",
+            "SELECT claimant FROM source_claims WHERE kind = ?1 AND subject = ?2",
         )?;
         let rows = select.query_map(rusqlite::params![AUTHORED, asset], |row| {
             row.get::<_, Vec<u8>>(0)
         })?;
-        rows.collect::<Result<Vec<_>, _>>()?
+        rows.collect::<Result<BTreeSet<_>, _>>()?
     };
     for claimant in claimants {
         if let AssetClaimant::Authored { bundle, .. } = decode_asset_claimant(&claimant)? {
@@ -182,9 +184,11 @@ fn mark_asset_dependents_pending(
              SELECT 1 FROM source_claims WHERE kind = ?1 AND subject = ?2)",
         rusqlite::params![DERIVED, asset],
     )?;
+    // `OR IGNORE` drops the repeats; a DISTINCT would steer the planner
+    // away from `source_claims_by_claimant`.
     conn.execute(
         "INSERT OR IGNORE INTO claim_pending(kind, subject)
-         SELECT DISTINCT kind, subject FROM source_claims WHERE kind = ?1 AND claimant = ?2",
+         SELECT kind, subject FROM source_claims WHERE kind = ?1 AND claimant = ?2",
         rusqlite::params![PRIMARY_PATH, asset],
     )?;
     Ok(())
