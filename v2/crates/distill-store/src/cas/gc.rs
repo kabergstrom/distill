@@ -30,7 +30,7 @@ use crate::error::StoreError;
 pub struct EvictionSweep {
     /// Units evicted (whole results or installs).
     pub evicted: usize,
-    /// Extent bytes still indexed after the sweep.
+    /// Bytes still indexed after the sweep: extents and result records.
     pub live_bytes: u64,
 }
 
@@ -46,15 +46,9 @@ pub struct CompactionReport {
     pub dead_segments: Vec<u64>,
 }
 
-/// Delete every extent no `cas_refs` row names. One statement, run in the
-/// caller's write transaction.
-fn prune(txn: &rusqlite::Connection) -> Result<usize, StoreError> {
-    Ok(txn.execute(
-        "DELETE FROM cas_extents WHERE NOT EXISTS
-           (SELECT 1 FROM cas_refs WHERE cas_refs.content_hash = cas_extents.content_hash)",
-        [],
-    )?)
-}
+/// Delete the extents of segment `?1` that no `cas_refs` row names.
+pub(crate) const PRUNE_SEGMENT: &str = "DELETE FROM cas_extents WHERE segment = ?1 AND NOT EXISTS
+       (SELECT 1 FROM cas_refs WHERE cas_refs.content_hash = cas_extents.content_hash)";
 
 /// Drop one holder's references and the extents only it held; the extent
 /// bytes that freed.
@@ -88,29 +82,33 @@ fn release_holder(
     Ok(freed)
 }
 
-/// Delete one result's candidate row.
+/// Delete one result's candidate row, returning its record's length.
 pub(crate) const EVICT_RESULT_ROW: &str = "DELETE FROM result_candidates
-     WHERE key_kind = ?1 AND static_key = ?2 AND trace_digest = ?3";
+     WHERE key_kind = ?1 AND static_key = ?2 AND trace_digest = ?3 RETURNING len";
 
 /// Evict one result row and everything only it held; `None` when there is
-/// no such row, else the extent bytes that freed.
+/// no such row, else the bytes that freed (its record and extents).
 fn evict_result_rows(
     txn: &rusqlite::Connection,
     key_kind: i64,
     static_key: &[u8],
     trace_digest: &[u8],
 ) -> Result<Option<u64>, StoreError> {
-    let deleted = txn
+    use rusqlite::OptionalExtension;
+    let Some(record) = txn
         .prepare_cached(EVICT_RESULT_ROW)?
-        .execute(rusqlite::params![key_kind, static_key, trace_digest])?;
-    if deleted == 0 {
+        .query_row(rusqlite::params![key_kind, static_key, trace_digest], |row| {
+            row.get::<_, i64>(0)
+        })
+        .optional()?
+    else {
         return Ok(None);
-    }
+    };
     let mut holder = Vec::with_capacity(65);
     holder.push(key_kind as u8);
     holder.extend_from_slice(static_key);
     holder.extend_from_slice(trace_digest);
-    release_holder(txn, HOLDER_RESULT, &holder).map(Some)
+    Ok(Some(record as u64 + release_holder(txn, HOLDER_RESULT, &holder)?))
 }
 
 /// One eviction victim, sampled: the holder of the first reference at or
@@ -121,8 +119,23 @@ pub(crate) const SAMPLE_HOLDER: &str = "SELECT holder_kind, holder FROM cas_refs
 /// The holder of the least reference, when the random hash lay past them.
 pub(crate) const FIRST_HOLDER: &str =
     "SELECT holder_kind, holder FROM cas_refs ORDER BY content_hash LIMIT 1";
-/// The extent bytes the index holds.
-pub(crate) const LIVE_BYTES: &str = "SELECT COALESCE(SUM(len), 0) FROM cas_extents";
+/// The bytes the index holds: its extents and result records, summed per
+/// segment.
+pub(crate) const LIVE_BYTES: &str = "SELECT COALESCE(SUM(live_len), 0) FROM cas_segments";
+/// The segments compaction kills (nothing live) or copies (at most half
+/// live): the sealed ones (state `?1`), one key range of
+/// `cas_segments_by_state`, and the compacting writer's own open segment
+/// `?2` (state `?3`).
+pub(crate) const COMPACTION_CANDIDATES: &str =
+    "SELECT segment_id, file_name, segment_kind, indexed_len, live_len FROM cas_segments
+     WHERE state = ?1 AND live_len * 2 - indexed_len <= 0
+     UNION ALL
+     SELECT segment_id, file_name, segment_kind, indexed_len, live_len FROM cas_segments
+     WHERE segment_id = ?2 AND state = ?3 AND live_len * 2 - indexed_len <= 0
+     ORDER BY segment_id";
+/// The segments in state `?1`.
+pub(crate) const SEGMENTS_IN_STATE: &str =
+    "SELECT segment_id, file_name FROM cas_segments WHERE state = ?1";
 /// Most victims one sweep samples; a sweep that stops short leaves the rest
 /// to the next pass.
 const MAX_VICTIMS: usize = 4096;
@@ -135,10 +148,20 @@ enum Moved {
 }
 
 impl Store {
-    /// Remove payload extents nothing references: bytes appended by a
-    /// transaction that rolled back, or left by an eviction.
-    pub(crate) fn prune_unreferenced_extents(&mut self) -> Result<usize, StoreError> {
-        self.write_txn(|store| prune(&store.conn))
+    /// Remove the extents of `segments` that nothing references. Every
+    /// write transaction indexes an extent with what references it, and an
+    /// eviction drops an extent with its last reference, so only recovery
+    /// leaves extents unreferenced: payloads of a group whose result it did
+    /// not adopt, in the segments it scanned. It prunes those.
+    pub(crate) fn prune_unreferenced_extents(&mut self, segments: &[u64]) -> Result<usize, StoreError> {
+        self.write_txn(|store| {
+            let mut statement = store.conn.prepare_cached(PRUNE_SEGMENT)?;
+            let mut pruned = 0;
+            for segment in segments {
+                pruned += statement.execute([*segment as i64])?;
+            }
+            Ok(pruned)
+        })
     }
 
     /// Evict one committed result as a whole unit. `Ok(false)` when the
@@ -235,18 +258,9 @@ impl Store {
         }
         let own = self.cas.active_id();
         let candidates: Vec<Candidate> = {
-            let mut statement = self.conn.prepare(
-                "SELECT s.segment_id, s.file_name, s.segment_kind, s.indexed_len,
-                   (SELECT COALESCE(SUM(len), 0) FROM cas_extents e
-                      WHERE e.segment = s.segment_id)
-                 + (SELECT COALESCE(SUM(len), 0) FROM result_candidates r
-                      WHERE r.segment = s.segment_id)
-                 FROM cas_segments s
-                 WHERE s.state = ?1 OR s.segment_id = ?2
-                 ORDER BY s.segment_id",
-            )?;
+            let mut statement = self.conn.prepare_cached(COMPACTION_CANDIDATES)?;
             let rows = statement.query_map(
-                rusqlite::params![SEGMENT_SEALED, own.map_or(-1, |id| id as i64)],
+                rusqlite::params![SEGMENT_SEALED, own.map_or(-1, |id| id as i64), SEGMENT_OPEN],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
@@ -280,7 +294,7 @@ impl Store {
                 victims.push(candidate.id);
                 continue;
             }
-            if candidate.kind != SegmentKind::Regular || candidate.live * 2 >= candidate.indexed_len
+            if candidate.kind != SegmentKind::Regular || candidate.live * 2 > candidate.indexed_len
             {
                 continue;
             }
@@ -487,7 +501,7 @@ impl SegmentSweeper {
         let dead: Vec<(u64, String)> = {
             let mut statement = store
                 .conn
-                .prepare("SELECT segment_id, file_name FROM cas_segments WHERE state = ?1")?;
+                .prepare_cached(SEGMENTS_IN_STATE)?;
             let rows = statement.query_map([SEGMENT_DEAD], |row| {
                 Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
             })?;
@@ -553,8 +567,8 @@ mod tests {
                 &["SEARCH cas_refs USING COVERING INDEX cas_refs_by_hash (content_hash>?)"],
             ),
             (FIRST_HOLDER, &["SCAN cas_refs USING COVERING INDEX cas_refs_by_hash"]),
-            // The pass's one whole read.
-            (LIVE_BYTES, &["SCAN cas_extents"]),
+            // The pass's one whole read: one row per segment.
+            (LIVE_BYTES, &["SCAN cas_segments"]),
         ];
         for (sql, expected) in cases {
             assert_eq!(&store.query_plan_details(sql).unwrap(), expected, "{sql}");
@@ -630,6 +644,81 @@ mod tests {
         assert_eq!(one[0], one[1], "{one:?}");
         assert_eq!(one[0].0, 1);
         assert_eq!(one[0].2, 1);
+    }
+
+    /// Pages a CAS pass within the cap (sweep and compaction), and a reopen
+    /// with nothing to recover, fetch over `results` committed results.
+    fn pass_and_open_pages(results: u32) -> (u64, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StoreConfig::new(dir.path().join("state"));
+        let mut store = Store::open(config.clone()).unwrap();
+        for index in 0..results {
+            commit_result(&mut store, index);
+        }
+        let before = store.pages_fetched().unwrap();
+        assert_eq!(store.enforce_cache_limit().unwrap().evicted, 0);
+        assert!(store.compact().unwrap().dead_segments.is_empty());
+        let pass = store.pages_fetched().unwrap() - before;
+        drop(store);
+        let (store, recovery) = Store::open_with_recovery(config).unwrap();
+        assert_eq!(recovery.orphaned_payloads, 0);
+        (pass, store.pages_fetched().unwrap())
+    }
+
+    /// The live bytes and the compactable segments are read per segment and
+    /// the startup prune reads only the segments recovery scanned: none of
+    /// it grows with the extents the CAS holds.
+    #[test]
+    fn the_cas_pass_and_open_read_segments_not_extents() {
+        let small = pass_and_open_pages(20);
+        let large = pass_and_open_pages(2000);
+        assert_eq!(small, large);
+    }
+
+    /// `live_len` is the extents and result records each segment holds,
+    /// whatever wrote, moved or deleted them.
+    #[test]
+    fn segment_live_bytes_follow_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StoreConfig::new(dir.path().join("state"));
+        config.segment_size = 4096;
+        let mut store = Store::open(config).unwrap();
+        let mut digests = Vec::new();
+        for index in 0..200u32 {
+            let mut key = [0u8; 32];
+            key[..4].copy_from_slice(&index.to_le_bytes());
+            digests.push(key);
+            commit_result(&mut store, index);
+        }
+        let check = |store: &Store| {
+            let mismatched: i64 = store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM cas_segments s WHERE live_len !=
+                       (SELECT COALESCE(SUM(len), 0) FROM cas_extents WHERE segment = s.segment_id)
+                     + (SELECT COALESCE(SUM(len), 0) FROM result_candidates WHERE segment = s.segment_id)",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(mismatched, 0);
+        };
+        check(&store);
+        for key in digests.iter().step_by(3) {
+            let digest = store.lookup_candidates(KeyKind::Processor, key).unwrap()[0].trace_digest;
+            assert!(store.evict_result(KeyKind::Processor, key, &digest).unwrap());
+        }
+        check(&store);
+        assert!(store.compact().unwrap().records_copied > 0);
+        check(&store);
+        let mut capped = store.config().clone();
+        capped.cache_limit = 0;
+        drop(store);
+        let mut store = Store::open(capped).unwrap();
+        store.enforce_cache_limit().unwrap();
+        check(&store);
+        let live: i64 = store.conn.query_row(LIVE_BYTES, [], |row| row.get(0)).unwrap();
+        assert_eq!(live, 0);
     }
 
     #[test]

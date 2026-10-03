@@ -342,10 +342,40 @@ CREATE TABLE cas_segments (
     state       INTEGER NOT NULL CHECK (state IN (0, 1, 2)),
     -- Schema 39 (fix-cas): the writer that allocated the segment
     -- (`CasInner::owner`), so a writer seals its own open segments.
-    owner       INTEGER
+    owner       INTEGER,
+    -- Schema 39 (fix-cas): the bytes of the extents and result records the
+    -- index places in this segment, kept by the triggers below, so the
+    -- CAS's live bytes and its compactable segments are read per segment,
+    -- never per extent.
+    live_len    INTEGER NOT NULL DEFAULT 0
 );
 -- Schema 39 (fix-cas): each writer's open segments.
 CREATE INDEX cas_segments_open ON cas_segments(owner, segment_id) WHERE state = 0;
+-- Schema 39 (fix-cas): segments by state, then by how far their live bytes
+-- fall short of half their indexed bytes: the dead segments the sweeper
+-- deletes, and the sealed ones compaction kills or copies (see
+-- `cas::gc::COMPACTION_CANDIDATES`), are each one key range.
+CREATE INDEX cas_segments_by_state ON cas_segments(state, live_len * 2 - indexed_len);
+CREATE TRIGGER cas_extents_live_insert AFTER INSERT ON cas_extents BEGIN
+    UPDATE cas_segments SET live_len = live_len + NEW.len WHERE segment_id = NEW.segment;
+END;
+CREATE TRIGGER cas_extents_live_delete AFTER DELETE ON cas_extents BEGIN
+    UPDATE cas_segments SET live_len = live_len - OLD.len WHERE segment_id = OLD.segment;
+END;
+CREATE TRIGGER cas_extents_live_update AFTER UPDATE OF segment, len ON cas_extents BEGIN
+    UPDATE cas_segments SET live_len = live_len - OLD.len WHERE segment_id = OLD.segment;
+    UPDATE cas_segments SET live_len = live_len + NEW.len WHERE segment_id = NEW.segment;
+END;
+CREATE TRIGGER result_candidates_live_insert AFTER INSERT ON result_candidates BEGIN
+    UPDATE cas_segments SET live_len = live_len + NEW.len WHERE segment_id = NEW.segment;
+END;
+CREATE TRIGGER result_candidates_live_delete AFTER DELETE ON result_candidates BEGIN
+    UPDATE cas_segments SET live_len = live_len - OLD.len WHERE segment_id = OLD.segment;
+END;
+CREATE TRIGGER result_candidates_live_update AFTER UPDATE OF segment, len ON result_candidates BEGIN
+    UPDATE cas_segments SET live_len = live_len - OLD.len WHERE segment_id = OLD.segment;
+    UPDATE cas_segments SET live_len = live_len + NEW.len WHERE segment_id = NEW.segment;
+END;
 CREATE TABLE pipeline_state (
     id                 INTEGER PRIMARY KEY CHECK (id = 0),
     dylib_hash         BLOB,

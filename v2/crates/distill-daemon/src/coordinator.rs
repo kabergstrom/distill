@@ -1165,15 +1165,15 @@ mod cas_pass_tests {
                 commit(&mut store, key.wrapping_add(idle.len() as u8 * 100));
             }
             let first = pass(&mut store, &mut swept);
-            assert!(first.iter().any(|sql| sql.contains("SUM(len)")), "{first:?}");
+            assert!(first.iter().any(|sql| sql.contains("SUM(")), "{first:?}");
             let again = pass(&mut store, &mut swept);
-            assert!(!again.iter().any(|sql| sql.contains("SUM(len)")), "{again:?}");
+            assert!(!again.iter().any(|sql| sql.contains("SUM(")), "{again:?}");
             idle.push(again.len());
         }
         assert_eq!(idle[0], idle[1], "{idle:?}");
         commit(&mut store, 250);
         let after_write = pass(&mut store, &mut swept);
-        assert!(after_write.iter().any(|sql| sql.contains("SUM(len)")), "{after_write:?}");
+        assert!(after_write.iter().any(|sql| sql.contains("SUM(")), "{after_write:?}");
     }
 
     /// The writer that commits while the pass compacts.

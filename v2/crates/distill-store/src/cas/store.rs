@@ -688,7 +688,9 @@ impl Store {
 
         // Wire trees and payloads already in the CAS are not appended again
         // (a hint the transaction checks): a node result names the bytes its
-        // last stage already committed.
+        // last stage already committed. A tree no output names would be
+        // indexed with nothing referencing it: it is not committed.
+        trees.retain(|(hash, _)| layouts.contains(&hash.0));
         let mut skip_trees = Vec::with_capacity(trees.len());
         for (hash, _) in &trees {
             skip_trees.push(extent_exists(&self.conn, &hash.0)?);

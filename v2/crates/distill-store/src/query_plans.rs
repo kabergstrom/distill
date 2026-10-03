@@ -1331,7 +1331,9 @@ fn candidate_rows_search_their_bucket() {
 /// index for the rows it answers, except the whole-index reads named here.
 #[test]
 fn cas_statements_search_their_indexes() {
-    use crate::cas::gc::EVICT_RESULT_ROW;
+    use crate::cas::gc::{
+        COMPACTION_CANDIDATES, EVICT_RESULT_ROW, LIVE_BYTES, PRUNE_SEGMENT, SEGMENTS_IN_STATE,
+    };
     use crate::cas::store::SEAL_OWN_SEGMENTS;
     let (_dir, store) = store_with(10);
     let cases: &[(&str, &[&str])] = &[
@@ -1342,6 +1344,32 @@ fn cas_statements_search_their_indexes() {
         (
             EVICT_RESULT_ROW,
             &["SEARCH result_candidates USING INDEX sqlite_autoindex_result_candidates_1 (key_kind=? AND static_key=? AND trace_digest=?)"],
+        ),
+        // The CAS's live bytes: one row per segment, never per extent.
+        (LIVE_BYTES, &["SCAN cas_segments"]),
+        (
+            COMPACTION_CANDIDATES,
+            &[
+                "MERGE (UNION ALL)",
+                "LEFT",
+                "SEARCH cas_segments USING INDEX cas_segments_by_state (state=? AND <expr><?)",
+                "USE TEMP B-TREE FOR ORDER BY",
+                "RIGHT",
+                "SEARCH cas_segments USING INTEGER PRIMARY KEY (rowid=?)",
+            ],
+        ),
+        (
+            SEGMENTS_IN_STATE,
+            &["SEARCH cas_segments USING INDEX cas_segments_by_state (state=?)"],
+        ),
+        (
+            PRUNE_SEGMENT,
+            &[
+                "SEARCH cas_extents USING INDEX cas_extents_by_segment (segment=?)",
+                "CORRELATED SCALAR SUBQUERY 1",
+                "SEARCH cas_refs USING COVERING INDEX cas_refs_by_hash (content_hash=?)",
+                "SEARCH cas_refs USING COVERING INDEX cas_refs_by_hash (content_hash=?)",
+            ],
         ),
     ];
     for (sql, expected) in cases {

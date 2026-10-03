@@ -373,7 +373,12 @@ impl Store {
             file.set_len(range.valid_end).map_err(io(&range.path))?;
             file.sync_all().map_err(io(&range.path))?;
         }
-        report.orphaned_payloads += self.prune_unreferenced_extents()?;
+        let scanned: Vec<u64> = ranges
+            .iter()
+            .filter(|range| range.start != range.file_len)
+            .map(|range| range.id)
+            .collect();
+        report.orphaned_payloads += self.prune_unreferenced_extents(&scanned)?;
 
         Ok(report)
     }
