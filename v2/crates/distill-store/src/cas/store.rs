@@ -2,17 +2,16 @@
 //!
 //! Write order (pinned): append the build's payload records first and
 //! one result record last, fsync each touched segment in that order,
-//! then insert the index rows in one memo transaction. **The result
-//! record is the commit marker** — a crash after output 2 of 3 publishes
-//! nothing. Segment creation and deletion also fsync the directory.
+//! then insert the index rows, all in one write transaction. **That
+//! transaction is the group's commit** — a rollback or a crash before
+//! COMMIT publishes nothing, and recovery cuts the bytes it appended.
+//! Segment creation and deletion also fsync the directory.
 //!
 //! Each writer appends to a segment of its own; ordinary commit groups
 //! roll as a unit. A record larger than the regular segment cap is
-//! instead written alone in a typed oversize segment; recovery resolves
-//! coverage across all segments, so a group may cross segment boundaries
-//! without weakening the result marker rule. Writers never coordinate
-//! beyond SQLite: a transaction that rolls back leaves its appended bytes
-//! as dead space.
+//! instead written alone in a typed oversize segment, so a group may
+//! cross segment boundaries. Writers never coordinate beyond SQLite: a
+//! transaction that rolls back leaves its appended bytes as dead space.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -190,6 +189,12 @@ pub(crate) const ACTIVE_SEGMENT: &str = "SELECT segment_id FROM cas_segments
      WHERE owner = ?1 AND state = 0 AND segment_kind = 0
      ORDER BY segment_id DESC LIMIT 1";
 const _: () = assert!(SegmentKind::Regular as i64 == 0);
+
+/// Every segment, for doctor verification.
+pub(crate) const VERIFY_SEGMENTS: &str = "SELECT segment_id, file_name FROM cas_segments";
+/// The extents segment `?1` holds.
+pub(crate) const VERIFY_SEGMENT_EXTENTS: &str =
+    "SELECT content_hash, offset, len FROM cas_extents WHERE segment = ?1";
 
 /// Seal the open segments writer `?1` allocated below id `?2`. The states
 /// are literals so the plan can walk the open segments' partial index.
@@ -932,27 +937,52 @@ impl StoreReader {
         Ok(body.to_vec())
     }
 
-    /// Full doctor verification of every indexed CAS extent. Each record is
-    /// read through the ordinary hash-checking path, so an index/segment drift
-    /// cannot be reported healthy merely because its framing still decodes.
+    /// Full doctor verification of every indexed CAS extent: each one's
+    /// bytes are read and checked against its hash, so an index/segment
+    /// drift cannot be reported healthy merely because its framing still
+    /// decodes. Segment by segment: one statement and one file open each
+    /// ([`VERIFY_SEGMENTS`], [`VERIFY_SEGMENT_EXTENTS`]).
     pub fn verify_all_cas_extents(&self) -> Result<usize, StoreError> {
-        let hashes = {
-            let mut statement = self
-                .conn
-                .prepare("SELECT content_hash FROM cas_extents ORDER BY content_hash")?;
-            let hashes = statement
-                .query_map([], |row| row.get::<_, Vec<u8>>(0))?
-                .map(|row| {
-                    let bytes = row?;
-                    bytes.try_into().map_err(|_| rusqlite::Error::InvalidQuery)
-                })
-                .collect::<Result<Vec<[u8; 32]>, _>>()?;
-            hashes
+        use std::io::{Read, Seek, SeekFrom};
+        let segments: Vec<(i64, String)> = {
+            let mut statement = self.conn.prepare(VERIFY_SEGMENTS)?;
+            let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<Result<_, _>>()?
         };
-        for hash in &hashes {
-            self.cas_read(hash)?;
+        let mut extents = self.conn.prepare(VERIFY_SEGMENT_EXTENTS)?;
+        let mut verified = 0;
+        for (segment, name) in segments {
+            let mut rows = extents.query([segment])?;
+            let Some(mut row) = rows.next()? else {
+                continue;
+            };
+            let path = self.config.state_path.join("cas").join(name);
+            let mut file = segment_open_options()
+                .read(true)
+                .open(&path)
+                .map_err(io_err(&path))?;
+            let mut bytes = Vec::new();
+            loop {
+                let hash: Vec<u8> = row.get(0)?;
+                let offset = row.get::<_, i64>(1)? as u64;
+                let len = row.get::<_, i64>(2)? as usize;
+                bytes.resize(len, 0);
+                file.seek(SeekFrom::Start(offset)).map_err(io_err(&path))?;
+                file.read_exact(&mut bytes).map_err(io_err(&path))?;
+                if blake3::hash(&bytes).as_bytes().as_slice() != hash.as_slice() {
+                    return Err(StoreError::CorruptExtent {
+                        segment: segment as u64,
+                        offset,
+                    });
+                }
+                verified += 1;
+                match rows.next()? {
+                    Some(next) => row = next,
+                    None => break,
+                }
+            }
         }
-        Ok(hashes.len())
+        Ok(verified)
     }
 
     pub(crate) fn read_extent(

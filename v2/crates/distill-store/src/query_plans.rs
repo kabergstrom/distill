@@ -1411,3 +1411,58 @@ fn the_tool_collector_streams_the_registered_tools() {
         ["SCAN tools"]
     );
 }
+
+/// Doctor's CAS verification runs one statement per segment, never one
+/// per extent, each a search of the segment's extents.
+#[test]
+fn cas_verification_reads_per_segment() {
+    use crate::cas::store::{VERIFY_SEGMENTS, VERIFY_SEGMENT_EXTENTS};
+    use crate::cas::{BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
+    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = crate::StoreConfig::new(dir.path().join("state"));
+    config.segment_size = 4096;
+    let mut store = Store::open(config).unwrap();
+    for index in 0..300u32 {
+        let mut key = [0u8; 32];
+        key[..4].copy_from_slice(&index.to_le_bytes());
+        store
+            .commit_build(BuildCommit {
+                wire_trees: Vec::new(),
+                key_kind: crate::cas::record::KeyKind::Processor,
+                static_input_key: key,
+                asset_uuid: distill_core::id::AssetUuid([7; 16]),
+                static_inputs_canonical: vec![],
+                trace: vec![1],
+                outcome: CommitOutcome::Success {
+                    payload_kind: PayloadKind::ProcessorOutput,
+                    outputs: vec![OutputSpec {
+                        output_key: String::new(),
+                        type_uuids: vec![],
+                        bytes: format!("output {index}").into_bytes(),
+                    }],
+                    aux: vec![],
+                },
+            })
+            .unwrap();
+    }
+    let segments: usize = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM cas_segments", [], |row| row.get::<_, i64>(0))
+        .unwrap() as usize;
+    assert!(segments > 1 && segments < 100, "{segments}");
+    let mut reader = store.reader().unwrap();
+    connection(&mut reader).trace(Some(trace));
+    assert_eq!(reader.verify_all_cas_extents().unwrap(), 300);
+    connection(&mut reader).trace(None);
+    let statements = std::mem::take(&mut *TRACED.lock().unwrap());
+    assert_eq!(statements.len(), 1 + segments, "{statements:?}");
+    assert_eq!(
+        store.query_plan_details(VERIFY_SEGMENTS).unwrap(),
+        ["SCAN cas_segments"]
+    );
+    assert_eq!(
+        store.query_plan_details(VERIFY_SEGMENT_EXTENTS).unwrap(),
+        ["SEARCH cas_extents USING INDEX cas_extents_by_segment (segment=?)"]
+    );
+}
