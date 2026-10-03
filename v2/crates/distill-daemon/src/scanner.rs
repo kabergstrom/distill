@@ -1122,6 +1122,27 @@ impl RootedScanner {
         Ok(physical)
     }
 
+    /// The configured directory of the root `path` (a [`Self::physical_path`])
+    /// lies in: the tree whose staging directory a write to `path` stages in
+    /// (`distill_store::atomic_file`).
+    pub fn root_containing(&self, path: &Path) -> Result<PathBuf, ScanError> {
+        self.root_snapshot()
+            .values()
+            .map(|root| &root.configured.path)
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.components().count())
+            .cloned()
+            .ok_or_else(|| ScanError::UnknownRoot(path.display().to_string()))
+    }
+
+    /// Every configured root directory.
+    pub fn root_paths(&self) -> Vec<PathBuf> {
+        self.root_snapshot()
+            .values()
+            .map(|root| root.configured.path.clone())
+            .collect()
+    }
+
     fn root_snapshot(&self) -> Arc<BTreeMap<String, CanonicalRoot>> {
         self.roots.load()
     }
@@ -1563,6 +1584,11 @@ fn scan_pending(
         }
 
         for entry in entries.into_iter().rev() {
+            // A staging directory holds uncommitted writes: nothing in it is
+            // input.
+            if distill_store::atomic_file::is_staging_name(&entry) {
+                continue;
+            }
             let physical = pending.physical_path.join(&entry);
             let component =
                 match normalize_scanned_component(roots, &pending.root_name, &physical, &entry) {
@@ -1985,6 +2011,10 @@ fn event_key(
     else {
         return Ok(None);
     };
+    // A staging directory holds uncommitted writes: nothing in it is input.
+    if distill_store::atomic_file::in_staging(relative) {
+        return Ok(None);
+    }
     let components = relative
         .components()
         .map(|component| {

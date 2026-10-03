@@ -1,11 +1,10 @@
 //! Durable `pack.current` activation (§16).
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
-static TEMP_ID: AtomicU64 = AtomicU64::new(1);
+use distill_store::atomic_file::{self, AtomicWriteError, Expected};
 
 #[derive(Debug)]
 pub enum PointerError {
@@ -18,6 +17,15 @@ pub enum PointerError {
 impl From<io::Error> for PointerError {
     fn from(value: io::Error) -> Self {
         Self::Io(value)
+    }
+}
+
+impl From<AtomicWriteError> for PointerError {
+    fn from(value: AtomicWriteError) -> Self {
+        match value {
+            AtomicWriteError::Io { source, .. } => Self::Io(source),
+            AtomicWriteError::Conflict { path } => Self::ImmutableConflict(path),
+        }
     }
 }
 
@@ -74,8 +82,8 @@ pub fn archive_filename(file_hash: [u8; 32]) -> String {
 }
 
 /// Publish an authenticated archive under its immutable content-addressed
-/// physical name. A temporary file is fsynced, then hard-linked into place:
-/// link creation is atomic and no-replace on the same filesystem. An existing
+/// physical name: an fsynced temp in the directory's staging directory is
+/// hard-linked into place, which is atomic and no-replace. An existing
 /// equal file is idempotent; different bytes under the same name are fatal.
 pub fn publish_archive(directory: &Path, bytes: &[u8]) -> Result<[u8; 32], PointerError> {
     crate::archive::validate_archive(bytes).map_err(|_| PointerError::InvalidPack)?;
@@ -96,40 +104,10 @@ fn publish_immutable(directory: &Path, name: &str, bytes: &[u8]) -> Result<(), P
     if destination.exists() {
         return verify_existing(&destination, bytes);
     }
-    let temp = unique_named_temp(directory, name);
-    let result = (|| -> Result<(), PointerError> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        match fs::hard_link(&temp, &destination) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                verify_existing(&destination, bytes)?;
-            }
-            Err(error) => return Err(PointerError::Io(error)),
-        }
-        sync_directory(directory)?;
-        fs::remove_file(&temp)?;
-        sync_directory(directory)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
+    if !atomic_file::stage(directory, &destination, bytes)?.commit_new()? {
+        verify_existing(&destination, bytes)?;
     }
-    result
-}
-
-/// fsync a directory; a no-op on Windows, which has no directory fsync
-/// (NTFS journals directory entries).
-fn sync_directory(directory: &Path) -> io::Result<()> {
-    if cfg!(windows) {
-        return Ok(());
-    }
-    File::open(directory)?.sync_all()
+    Ok(())
 }
 
 fn verify_existing(path: &Path, bytes: &[u8]) -> Result<(), PointerError> {
@@ -140,34 +118,21 @@ fn verify_existing(path: &Path, bytes: &[u8]) -> Result<(), PointerError> {
     }
 }
 
-/// The manifest/archives must already have been fsynced. This performs the
-/// final no-replace-temp → file-fsync → rename → directory-fsync sequence.
+/// Empty `directory`'s staging directory: the temps an earlier pack command
+/// left there never committed. Call it before publishing into `directory`.
+pub fn open_pack_directory(directory: &Path) -> Result<(), PointerError> {
+    atomic_file::open_staging(directory)?;
+    Ok(())
+}
+
+/// The manifest/archives must already have been published. This atomically
+/// replaces `pack.current` (fsynced temp, rename, directory fsync).
 pub fn activate(directory: &Path, hash: [u8; 32]) -> Result<(), PointerError> {
-    let temp = unique_temp(directory);
-    let result = (|| -> Result<(), PointerError> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
-        file.write_all(&pointer_bytes(hash))?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temp, directory.join("pack.current"))?;
-        sync_directory(directory)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
-}
-
-fn unique_temp(directory: &Path) -> PathBuf {
-    let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
-    directory.join(format!(".pack.current.{}.{}.tmp", std::process::id(), id))
-}
-
-fn unique_named_temp(directory: &Path, name: &str) -> PathBuf {
-    let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
-    directory.join(format!(".{name}.{}.{}.tmp", std::process::id(), id))
+    atomic_file::write(
+        directory,
+        &directory.join("pack.current"),
+        &pointer_bytes(hash),
+        Expected::Any,
+    )?;
+    Ok(())
 }

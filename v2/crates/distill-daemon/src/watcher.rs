@@ -14,6 +14,8 @@ use std::thread::{self, JoinHandle};
 use notify::event::{ModifyKind, RenameMode};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
+use distill_store::atomic_file::in_staging;
+
 use crate::scanner::RootedScanner;
 
 const DEFAULT_CAPACITY: usize = 65_536;
@@ -223,8 +225,12 @@ impl WatcherQueue {
             }
             _ => {}
         }
+        // A staging directory holds uncommitted writes (`atomic_file`): its
+        // events are not input.
         for path in event.paths {
-            self.paths.insert(path);
+            if !in_staging(&path) {
+                self.paths.insert(path);
+            }
         }
         self.check_capacity();
     }
@@ -234,10 +240,23 @@ impl WatcherQueue {
         self.check_capacity();
     }
 
+    /// A rename out of a staging directory is a write of `to`: a temp
+    /// carries no identity.
     fn push_rename(&mut self, from: PathBuf, to: PathBuf) {
-        self.paths.insert(from.clone());
-        self.paths.insert(to.clone());
-        self.renames.push(WatcherRename { from, to });
+        match (in_staging(&from), in_staging(&to)) {
+            (false, false) => {
+                self.paths.insert(from.clone());
+                self.paths.insert(to.clone());
+                self.renames.push(WatcherRename { from, to });
+            }
+            (true, false) => {
+                self.paths.insert(to);
+            }
+            (false, true) => {
+                self.paths.insert(from);
+            }
+            (true, true) => {}
+        }
     }
 
     fn check_capacity(&mut self) {

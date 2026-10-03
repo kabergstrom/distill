@@ -7112,7 +7112,8 @@ interface Hub {
   snapshot @0 () -> (result :SnapshotCall);
   subscribe @1 (since :UInt64, assets :List(Data), paths :List(Text))
             -> (result :SubscribeCall);
-  write @2 (base :UInt64, ops :List(AuthoringOp)) -> (result :UInt64Call);
+  write @2 (base :UInt64, ops :List(AuthoringOp), forceLossy :Bool)
+         -> (result :DataCall);   # an encoded WriteReceipt
   import @3 (base :UInt64, request :ImportRequest) -> (result :UuidCall);
   reimport @4 (base :UInt64, bundle :Uuid) -> (result :UuidCall);
   operation @5 (base :UInt64, operation :LongRunningOp)
@@ -7141,6 +7142,7 @@ interface AuthoringSnapshot {
   query @1 (query :AssetQuery) -> (result :UuidListCall);
   inspect @2 (uuid :Data) -> (result :AuthoringInspectCall);
   refresh @3 () -> (result :AuthoringSnapshotCall);
+  file @4 (root :Text, path :Text) -> (result :DataCall);
 }
 ```
 
@@ -7176,10 +7178,36 @@ notification is the authority for a fence—the server checks the fence on every
 call.
 
 Authoring methods carry an InputVersion base precondition. A stale base returns
-a typed conflict without mutation. Long-running operations expose ordered,
-cancellable progress and still commit through §14's journaled
-swap-verify-or-restore protocol. Subscription, snapshot, and authoring
-capabilities are bounded and leased so abandoned clients cannot retain
+a typed conflict without mutation.
+
+**Authoring writes are file writes.** `write` plans its batch against the
+base, inside an input on the connection's writer that is then rolled back
+(it holds the write lock while the plan is checked and the file written,
+and commits nothing), and answers once the bundle file is atomically on
+disk: a temp in the root's staging directory, fsynced, checked against the
+pre-image the plan read, renamed over the target, the directory fsynced.
+The store follows through the watcher and the next pass, like any other
+edit. The reply is a `WriteReceipt`: each changed file as (root, path,
+content hash, or none when removed). A client that needs the result waits
+for the first version whose `AuthoringSnapshot.file(root, path)` answers
+every receipt entry; a failure means no file changed. A second write
+planned against the same base before the store has caught up finds the
+file changed under it and fails without writing.
+
+Long-running operations expose ordered, cancellable progress. A
+rename-with-fixups (`operation`) is planned when it is asked for and
+applied when the client consumes its Completed event, whose payload is the
+receipt. Every temp is staged and every pre-image and the destination are
+checked before the first rename; then each referencing bundle is rewritten
+to the destination path, the moving bundle's own references are rewritten
+in place, and the bundle moves by one rename. Every intermediate state is
+ordinary authored input: a rewritten referencer's reference does not
+resolve until the move (a build reports it), and the bundle is never at
+both paths. A crash or I/O failure part-way leaves a prefix of the steps,
+reported as Failed with what was applied; the same request, retried, plans
+exactly what remains.
+
+Subscription, snapshot, and authoring capabilities are bounded and leased so abandoned clients cannot retain
 unbounded daemon state.
 
 ### Server threading

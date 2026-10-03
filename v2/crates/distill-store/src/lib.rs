@@ -7,6 +7,7 @@
 //! state; every index is rebuildable by a segment scan. Version control
 //! remains the durable archive.
 
+pub mod atomic_file;
 pub mod bundles;
 pub mod cas;
 pub mod claims;

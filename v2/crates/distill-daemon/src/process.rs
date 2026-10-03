@@ -189,6 +189,16 @@ impl DaemonProcess {
             targets,
             config.pipeline.max_dependency_depth,
         )?);
+        // Under the store lock, before anything writes into a root: what an
+        // earlier process staged and never renamed is uncommitted.
+        for root in config.asset_roots() {
+            distill_store::atomic_file::open_staging(&root.path).map_err(|source| {
+                DaemonProcessError::Staging {
+                    path: root.path.clone(),
+                    source,
+                }
+            })?;
+        }
         coordinator.attach_build_backend();
         let mut config_watch = ConfigWatch::new(config.clone());
         config_watch.rebuilder = Some(crate::rebuild::Rebuilder::start(
@@ -358,6 +368,11 @@ pub enum DaemonProcessError {
         source: std::io::Error,
     },
     Schema(SchemaAuthorityError),
+    /// An asset root's staging directory could not be emptied.
+    Staging {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     Codegen(String),
     Rpc(String),
 }

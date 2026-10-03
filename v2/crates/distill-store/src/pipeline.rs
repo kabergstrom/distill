@@ -3,7 +3,7 @@
 //! ToolEpoch table.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
+use crate::atomic_file;
 use std::path::PathBuf;
 
 use distill_core::bootstrap::bootstrap_control_logical_registry_v1;
@@ -144,50 +144,14 @@ fn hex_hash(hash: &[u8; 32]) -> String {
     hash.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-pub(crate) fn cleanup_staged_tool_temps(state_path: &std::path::Path) -> Result<(), StoreError> {
+/// Empty the tool object store's staging directory: the temps an earlier
+/// process left there never committed. Called under the state lock.
+pub(crate) fn open_tool_staging(state_path: &std::path::Path) -> Result<(), StoreError> {
     let objects = state_path.join("tools/objects");
-    let entries = match std::fs::read_dir(&objects) {
-        Ok(entries) => entries,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(source) => {
-            return Err(StoreError::Io {
-                path: objects,
-                source,
-            })
-        }
-    };
-    let mut removed = false;
-    for entry in entries {
-        let entry = entry.map_err(|source| StoreError::Io {
-            path: objects.clone(),
-            source,
-        })?;
-        if !entry
-            .file_type()
-            .map_err(|source| StoreError::Io {
-                path: entry.path(),
-                source,
-            })?
-            .is_file()
-            || !entry.file_name().to_string_lossy().starts_with(".stage-")
-        {
-            continue;
-        }
-        match std::fs::remove_file(entry.path()) {
-            Ok(()) => removed = true,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(StoreError::Io {
-                    path: entry.path(),
-                    source,
-                })
-            }
-        }
-    }
-    if removed {
-        crate::cas::store::fsync_dir(&objects)?;
-    }
-    Ok(())
+    atomic_file::open_staging(&objects).map_err(|source| StoreError::Io {
+        path: objects,
+        source,
+    })
 }
 
 /// Every registered tool: its hash and identity, one row per
@@ -242,7 +206,7 @@ pub(crate) fn collect_unregistered_tool_files(
         for entry in entries {
             let entry = entry.map_err(io(&dir))?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            if keep.contains(&name) || name.starts_with(".stage-") {
+            if keep.contains(&name) || name == atomic_file::STAGING_DIR {
                 continue;
             }
             let path = entry.path();
@@ -263,90 +227,39 @@ pub(crate) fn collect_unregistered_tool_files(
 
 fn stage_immutable_file(
     key: &str,
+    objects: &std::path::Path,
     path: &std::path::Path,
     bytes: &[u8],
     metadata: &ToolPackageFile,
 ) -> Result<(), StoreError> {
     if !path.exists() {
-        let parent = path.parent().ok_or_else(|| StoreError::ToolUnavailable {
-            key: key.to_owned(),
-            path: path.to_path_buf(),
-            detail: "staged object has no parent directory",
+        atomic_file::stage_with(objects, path, bytes, |file| {
+            set_staged_permissions(file, metadata.executable)
+        })
+        .and_then(atomic_file::Staged::commit_new)
+        .map_err(|error| match error {
+            atomic_file::AtomicWriteError::Io { path, source } => StoreError::Io { path, source },
+            conflict => StoreError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::other(conflict.to_string()),
+            },
         })?;
-        let mut nonce = [0u8; 8];
-        getrandom::getrandom(&mut nonce).map_err(|source| StoreError::Io {
-            path: path.to_path_buf(),
-            source: std::io::Error::other(source.to_string()),
-        })?;
-        let tmp = parent.join(format!(".stage-{}", u64::from_le_bytes(nonce)));
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .map_err(|source| StoreError::Io {
-                path: tmp.clone(),
-                source,
-            })?;
-        file.write_all(bytes).map_err(|source| StoreError::Io {
-            path: tmp.clone(),
-            source,
-        })?;
-        set_staged_permissions(&file, metadata.executable, &tmp)?;
-        file.sync_all().map_err(|source| StoreError::Io {
-            path: tmp.clone(),
-            source,
-        })?;
-        match std::fs::hard_link(&tmp, path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(source) => {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(StoreError::Io {
-                    path: path.to_path_buf(),
-                    source,
-                });
-            }
-        }
-        std::fs::remove_file(&tmp).map_err(|source| StoreError::Io { path: tmp, source })?;
-        crate::cas::store::fsync_dir(parent)?;
     }
     verify_package_file(key, path, metadata)
 }
 
 #[cfg(unix)]
-fn set_staged_permissions(
-    file: &std::fs::File,
-    executable: bool,
-    path: &std::path::Path,
-) -> Result<(), StoreError> {
+fn set_staged_permissions(file: &std::fs::File, executable: bool) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mode = if executable { 0o555 } else { 0o444 };
     file.set_permissions(std::fs::Permissions::from_mode(mode))
-        .map_err(|source| StoreError::Io {
-            path: path.to_path_buf(),
-            source,
-        })
 }
 
 #[cfg(not(unix))]
-fn set_staged_permissions(
-    file: &std::fs::File,
-    _executable: bool,
-    path: &std::path::Path,
-) -> Result<(), StoreError> {
-    let mut permissions = file
-        .metadata()
-        .map_err(|source| StoreError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?
-        .permissions();
+fn set_staged_permissions(file: &std::fs::File, _executable: bool) -> std::io::Result<()> {
+    let mut permissions = file.metadata()?.permissions();
     permissions.set_readonly(true);
     file.set_permissions(permissions)
-        .map_err(|source| StoreError::Io {
-            path: path.to_path_buf(),
-            source,
-        })
 }
 
 fn verify_package_root(
@@ -663,7 +576,7 @@ impl InputTxn<'_> {
                 create_dir_all(&root)?;
                 for (metadata, source) in files.iter().zip(&sources) {
                     let object = objects_dir.join(tool_object_name(metadata));
-                    stage_immutable_file(key, &object, &source.bytes, metadata)?;
+                    stage_immutable_file(key, &objects_dir, &object, &source.bytes, metadata)?;
                     let member = root.join(&metadata.path);
                     if let Some(parent) = member.parent() {
                         create_dir_all(parent)?;

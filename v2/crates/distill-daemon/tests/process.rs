@@ -216,14 +216,31 @@ fn a_write_whose_rows_were_never_committed_is_adopted_on_restart() {
     drop(process);
 
     // A publication wrote the file and stopped before its store commit.
-    distill_daemon::atomic::atomic_write(&target, b"new").unwrap();
+    distill_store::atomic_file::write(
+        &assets,
+        &target,
+        b"new",
+        distill_store::atomic_file::Expected::Any,
+    )
+    .unwrap();
 
     let process = DaemonProcess::start(config).unwrap();
     assert!(indexed(&process, new_hash));
+    let names = std::fs::read_dir(&assets)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
     assert_eq!(
-        std::fs::read_dir(&assets).unwrap().count(),
-        1,
-        "no temp file is left next to the target"
+        names.len(),
+        2,
+        "only the target and the staging directory: {names:?}"
+    );
+    assert_eq!(
+        std::fs::read_dir(distill_store::atomic_file::staging_dir(&assets))
+            .unwrap()
+            .count(),
+        0,
+        "no temp file is left behind"
     );
 }
 

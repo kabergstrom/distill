@@ -16,9 +16,9 @@ distill-loader = { path = "../distill-loader" }
 distill-json = { path = "../distill-json" }
 distill-rpc = { path = "../distill-rpc" }
 distill-schema = { path = "../distill-schema" }
+distill-store = { path = "../distill-store" }
 distill-wire = { path = "../distill-wire" }
 
 [dev-dependencies]
-distill-store = { path = "../distill-store" }
 tempfile = "3"
 tokio = { version = "1", features = ["net", "rt", "time"] }

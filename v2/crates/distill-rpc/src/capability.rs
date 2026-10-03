@@ -643,14 +643,6 @@ fn validate_progress(events: &[AuthoringProgressEvent]) -> Result<(), String> {
 }
 
 /// What a write answered: `None` when the backend declined.
-fn write_outcome(outcome: Option<RpcResult<InputVersion>>) -> RpcResult<InputVersion> {
-    outcome.unwrap_or_else(|| {
-        RpcResult::Failure(RpcFailure::AuthoringBackendUnavailable {
-            operation: "write".to_owned(),
-        })
-    })
-}
-
 /// Complete a prepared operation as one input on `server`'s writer, still
 /// at `base`.
 fn complete_publication(
@@ -680,7 +672,7 @@ fn complete_publication(
         let mut terminal = None;
         let published = server.coordinated_maybe_commit(base, |store| {
             let (commit, terminal_error) = match publication {
-                PreparedOperationPublication::Immediate(commit) => (*commit, None),
+                PreparedOperationPublication::Immediate(commit) => (Some(*commit), None),
                 PreparedOperationPublication::Report(_) => unreachable!("a report publishes nothing"),
                 PreparedOperationPublication::Deferred(operation) => {
                     match operation.complete(store, base) {
@@ -694,7 +686,7 @@ fn complete_publication(
                 }
             };
             terminal = terminal_error;
-            Ok(Some(commit))
+            Ok(commit)
         });
         if let Some(error) = failed {
             return Err(error);
@@ -1149,15 +1141,16 @@ impl Hub {
     }
 
     /// `force_lossy` writes even when data held under the on-disk schema
-    /// would be dropped (see [`RpcFailure::LossyWrite`]). The write
-    /// publishes on this connection's own writer: waiting on SQLite's write
-    /// lock holds up only this connection.
+    /// would be dropped (see [`RpcFailure::LossyWrite`]). The reply comes
+    /// once the changed files are atomically on disk; the store publishes
+    /// them through the watcher (see [`WriteReceipt`]). A failure means no
+    /// file changed.
     pub fn write(
         &self,
         base: InputVersion,
         ops: Vec<AuthoringOp>,
         force_lossy: bool,
-    ) -> RpcResult<InputVersion> {
+    ) -> RpcResult<WriteReceipt> {
         if let Some(result) = self.authoring_gate(base) {
             return result;
         }
@@ -1174,34 +1167,51 @@ impl Hub {
                     .to_owned(),
             });
         }
-        let next = InputVersion(base.0 + 1);
-        if is_embedded(&self.server) {
-            return self.embedded_write(base, ops, force_lossy, next);
-        }
-        write_outcome(self.prepared(base, move |backend, store| {
-            Ok(backend
-                .prepare_write(store, base, &ops, force_lossy)?
-                .map(|commit| (commit, next)))
-        }))
-    }
-
-    fn embedded_write(
-        &self,
-        base: InputVersion,
-        ops: Vec<AuthoringOp>,
-        force_lossy: bool,
-        next: InputVersion,
-    ) -> RpcResult<InputVersion> {
-        let backend_ops = ops.clone();
-        if let Some(result) = self.prepared(base, move |backend, store| {
-            Ok(backend
-                .prepare_write(store, base, &backend_ops, force_lossy)?
-                .map(|commit| (commit, next)))
-        }) {
+        if let Some(result) = self.write_files(base, &ops, force_lossy) {
             return result;
         }
+        if !is_embedded(&self.server) {
+            return RpcResult::Failure(RpcFailure::AuthoringBackendUnavailable {
+                operation: "write".to_owned(),
+            });
+        }
         let commit = rpc_try!(self.embedded_write_commit(ops));
-        self.publish(base, commit, next)
+        self.publish(base, commit, WriteReceipt::default())
+    }
+
+    /// Run the backend's file write on this connection's writer, inside an
+    /// input at `base` that is rolled back: it holds the write lock while
+    /// the backend plans and writes, and commits nothing. `None` when the
+    /// backend has no filesystem authority.
+    fn write_files(
+        &self,
+        base: InputVersion,
+        ops: &[AuthoringOp],
+        force_lossy: bool,
+    ) -> Option<RpcResult<WriteReceipt>> {
+        let backend = self.server.inner.handle.authoring_backend();
+        self.server.with_writer(|store| {
+            let observed = match store.open_input() {
+                Ok(observed) => observed,
+                Err(error) => return Some(RpcResult::Failure(store_failure(error))),
+            };
+            let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if observed != base {
+                    return Err(RpcFailure::StaleInputVersion {
+                        expected: observed,
+                        got: base,
+                    });
+                }
+                backend.write_files(store, base, ops, force_lossy)
+            }));
+            let _ = store.finish_input(false);
+            match written {
+                Ok(Ok(Some(receipt))) => Some(RpcResult::Success(receipt)),
+                Ok(Ok(None)) => None,
+                Ok(Err(error)) => Some(RpcResult::Failure(error)),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        })
     }
 
     /// The commit an embedded server publishes for a raw authoring batch.
@@ -2205,6 +2215,18 @@ impl AuthoringSnapshot {
             self.basis.snapshot,
             uuid
         )))
+    }
+
+    /// The content hash of the file this snapshot observed at `path` in
+    /// root `root`; `None` for no file there (absent, or a directory). A
+    /// [`WriteReceipt`] is reflected at the first version whose answers
+    /// match it.
+    pub fn file(&self, root: &str, path: &str) -> RpcResult<Option<ContentHash>> {
+        let txn = match self.preflight() {
+            Ok(txn) => txn,
+            Err(result) => return result,
+        };
+        RpcResult::Success(rpc_try!(txn.snapshot().file_content_hash(root, path)))
     }
 
     pub fn refresh(&self) -> RpcResult<AuthoringSnapshot> {

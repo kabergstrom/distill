@@ -509,6 +509,7 @@ fn a_rolled_back_registrations_package_is_collected_at_open() {
     let objects: Vec<String> = std::fs::read_dir(config.state_path.join("tools/objects"))
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name != distill_store::atomic_file::STAGING_DIR)
         .collect();
     assert_eq!(objects.len(), 2, "the kept package's two objects: {objects:?}");
     let root = kept.root.unwrap();

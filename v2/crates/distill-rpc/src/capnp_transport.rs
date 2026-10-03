@@ -768,16 +768,16 @@ impl schema::hub::Server for HubService {
                     return Ok(());
                 }
             };
-            // A publication waits on SQLite's write lock on this
+            // The write waits on SQLite's write lock on this
             // connection's own thread; no other connection waits with it.
             let result = self.hub.write(
                 InputVersion(params.get_base()),
                 ops,
                 params.get_force_lossy(),
             );
-            write_uint64_result(
+            write_data_result(
                 results.get().init_result(),
-                result.map_success(|version| version.0),
+                result.map_success(|receipt| receipt.encode()),
             );
             Ok(())
         }
@@ -1279,6 +1279,32 @@ struct AuthoringSnapshotService {
 
 #[allow(clippy::manual_async_fn)]
 impl schema::authoring_snapshot::Server for AuthoringSnapshotService {
+    fn file(
+        self: capnp::capability::Rc<Self>,
+        params: schema::authoring_snapshot::FileParams,
+        mut results: schema::authoring_snapshot::FileResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
+        async move {
+            if let Some(reason) = self.snapshot.generation_reconnect() {
+                write_reconnect(
+                    results.get().init_result().init_reconnect_required(),
+                    reason,
+                );
+                return Ok(());
+            }
+            let params = params.get()?;
+            let root = params.get_root()?.to_str()?;
+            let path = params.get_path()?.to_str()?;
+            write_data_result(
+                results.get().init_result(),
+                self.snapshot.file(root, path).map_success(|hash| {
+                    hash.map_or_else(|| Arc::from([]), |hash| Arc::from(hash.0))
+                }),
+            );
+            Ok(())
+        }
+    }
+
     fn version(
         self: capnp::capability::Rc<Self>,
         _params: schema::authoring_snapshot::VersionParams,

@@ -624,7 +624,7 @@ impl Store {
         create_dir(&state_path.join("cas"))?;
         create_dir(&state_path.join("tools"))?;
         let state_lock = lock_state_dir(state_path)?;
-        crate::pipeline::cleanup_staged_tool_temps(state_path)?;
+        crate::pipeline::open_tool_staging(state_path)?;
 
         let db_path = state_path.join("meta.sqlite");
         let conn = open_writer_connection(&db_path)?;
