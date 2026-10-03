@@ -260,7 +260,6 @@ fn recovery_checkpoints_cross_segment_groups_atomically() {
             "DELETE FROM cas_refs;
              DELETE FROM cas_extents;
              DELETE FROM result_candidates;
-             DELETE FROM derived_assertions;
              UPDATE cas_segments SET indexed_len = 0;",
         )
         .unwrap();

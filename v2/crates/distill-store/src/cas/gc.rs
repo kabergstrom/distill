@@ -88,6 +88,10 @@ fn release_holder(
     Ok(freed)
 }
 
+/// Delete one result's candidate row.
+pub(crate) const EVICT_RESULT_ROW: &str = "DELETE FROM result_candidates
+     WHERE key_kind = ?1 AND static_key = ?2 AND trace_digest = ?3";
+
 /// Evict one result row and everything only it held; `None` when there is
 /// no such row, else the extent bytes that freed.
 fn evict_result_rows(
@@ -96,24 +100,12 @@ fn evict_result_rows(
     static_key: &[u8],
     trace_digest: &[u8],
 ) -> Result<Option<u64>, StoreError> {
-    use rusqlite::OptionalExtension;
-    let memo_seq: Option<i64> = txn
-        .query_row(
-            "SELECT memo_seq FROM result_candidates
-             WHERE key_kind = ?1 AND static_key = ?2 AND trace_digest = ?3",
-            rusqlite::params![key_kind, static_key, trace_digest],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(memo_seq) = memo_seq else {
+    let deleted = txn
+        .prepare_cached(EVICT_RESULT_ROW)?
+        .execute(rusqlite::params![key_kind, static_key, trace_digest])?;
+    if deleted == 0 {
         return Ok(None);
-    };
-    txn.execute(
-        "DELETE FROM result_candidates
-         WHERE key_kind = ?1 AND static_key = ?2 AND trace_digest = ?3",
-        rusqlite::params![key_kind, static_key, trace_digest],
-    )?;
-    txn.execute("DELETE FROM derived_assertions WHERE memo_seq = ?1", [memo_seq])?;
+    }
     let mut holder = Vec::with_capacity(65);
     holder.push(key_kind as u8);
     holder.extend_from_slice(static_key);

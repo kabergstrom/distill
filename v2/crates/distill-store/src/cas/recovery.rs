@@ -15,11 +15,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use distill_core::id::AssetUuid;
-
 use crate::cas::record::{decode_record, Record, RecordKind, ResultOutcome, ResultPayload, RECORD_HEADER_LEN};
 use crate::cas::store::{
-    artifact_layout, derived_row_matches, extent_exists, fsync_dir, insert_ref, parse_segment_id,
+    artifact_layout, extent_exists, fsync_dir, insert_ref, parse_segment_id,
     read_segment, result_holder, upsert_candidate, upsert_extent, SegmentKind, HOLDER_RESULT,
     SEGMENT_DEAD, SEGMENT_OPEN, SEGMENT_SEALED,
 };
@@ -202,7 +200,6 @@ impl Store {
                 txn.execute("DELETE FROM cas_refs", [])?;
                 txn.execute("DELETE FROM cas_extents", [])?;
                 txn.execute("DELETE FROM result_candidates", [])?;
-                txn.execute("DELETE FROM derived_assertions", [])?;
                 txn.execute("UPDATE cas_segments SET indexed_len = 0", [])?;
                 Ok(())
             })?;
@@ -349,32 +346,6 @@ impl Store {
                 let holder = result_holder(payload.key_kind, &static_key, &trace_digest);
                 for hash in unit {
                     insert_ref(transaction, HOLDER_RESULT, &holder, hash)?;
-                }
-                if let ResultOutcome::Success { outputs, .. } = &payload.outcome {
-                    for output in outputs {
-                        if output.output_key.is_empty() {
-                            continue;
-                        }
-                        let child = AssetUuid::v5(row.record.asset_uuid, &output.output_key);
-                        if derived_row_matches(
-                            transaction,
-                            child,
-                            row.record.asset_uuid,
-                            &output.output_key,
-                        )? {
-                            transaction.execute(
-                                "INSERT INTO derived_assertions(child_uuid, parent_uuid, output_key, memo_seq)
-                                 VALUES (?1, ?2, ?3, ?4)
-                                 ON CONFLICT(child_uuid, memo_seq) DO NOTHING",
-                                rusqlite::params![
-                                    child.0.as_slice(),
-                                    row.record.asset_uuid.0.as_slice(),
-                                    output.output_key,
-                                    memo_counter as i64,
-                                ],
-                            )?;
-                        }
-                    }
                 }
             }
             for range in &ranges {

@@ -1,6 +1,6 @@
 //! §13 log-structured CAS behavior: append/commit/read roundtrips, the
 //! result record as commit marker, candidate buckets that append and
-//! never overwrite, derived-output assertion verification, wire trees as
+//! never overwrite, wire trees as
 //! first-class records, and segment rolling.
 
 use distill_core::id::{AssetUuid, BundleFileHash, ContentHash};
@@ -146,7 +146,6 @@ fn a_successful_commit_publishes_outputs_and_advances_only_the_memo_seq() {
         store.cas_read(&receipt.aux[0].1 .0).unwrap(),
         b"debug bytes"
     );
-    assert!(receipt.unverified_assertions.is_empty());
 }
 
 #[test]
@@ -442,7 +441,7 @@ fn a_deterministic_local_failure_memoizes_with_an_empty_trace() {
     assert!(candidates[0].payload.trace.is_empty());
 }
 
-// ---- derived-output namespace + assertions (§9, §13) ----
+// ---- derived-output namespace (§9, §13) ----
 
 #[test]
 fn derived_output_namespace_resolves_children() {
@@ -474,26 +473,6 @@ fn derived_output_namespace_replacement_is_atomic_and_complete() {
 }
 
 #[test]
-fn commit_assertions_verify_against_the_namespace() {
-    // §9: commit rows are memo data verified against the input-versioned
-    // namespace index, never a namespace claim of their own.
-    let (_d, mut store) = store();
-    // No namespace row for "normals": the assertion does not verify.
-    let receipt = store
-        .commit_build(success_commit([1u8; 32], b"trace"))
-        .unwrap();
-    assert_eq!(receipt.unverified_assertions.len(), 1);
-    assert_eq!(receipt.unverified_assertions[0].1, "normals");
-
-    // With the namespace row present, the assertion verifies.
-    declare_child(&mut store, PARENT, "normals");
-    let receipt = store
-        .commit_build(success_commit([1u8; 32], b"trace-2"))
-        .unwrap();
-    assert!(receipt.unverified_assertions.is_empty());
-}
-
-#[test]
 fn the_namespace_is_the_only_authority_for_child_resolution() {
     // §9/§13: a retired child UUID is never resurrected by an old record.
     let (_d, mut store) = store();
@@ -504,7 +483,7 @@ fn the_namespace_is_the_only_authority_for_child_resolution() {
     assert!(store.resolve_child(child).unwrap().is_some());
 
     // The namespace retires the key at a later input version; the memo
-    // rows (result record, assertion) still exist — resolution must miss.
+    // row (the result record) still exists — resolution must miss.
     store
         .input_transaction(|txn| txn.remove_derived_output(child))
         .unwrap();

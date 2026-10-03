@@ -129,10 +129,6 @@ pub struct CommitReceipt {
     pub outputs: Vec<(String, ContentHash)>,
     /// `debug_key → ContentHash` for every committed aux payload.
     pub aux: Vec<(String, ContentHash)>,
-    /// Derived-output assertions that did not verify against the
-    /// input-versioned namespace index (§9) — reported, never silently
-    /// recorded.
-    pub unverified_assertions: Vec<(AssetUuid, String)>,
 }
 
 /// Where one bucket candidate's record lies (§13), by its row in
@@ -604,8 +600,7 @@ impl Store {
     /// Commit one build result (§13): payloads first, the result record last,
     /// one fsync per touched segment in record order, then one memo transaction
     /// inserting the extent rows, the result's references, the candidate-bucket
-    /// row, and the verified derived-output assertions. Advances only the memo
-    /// sequence.
+    /// row. Advances only the memo sequence.
     ///
     /// Every wire tree an output artifact names must be in
     /// `commit.wire_trees` or already in the CAS. A tree the commit expected
@@ -686,7 +681,6 @@ impl Store {
         };
         let key_kind = commit.key_kind;
         let static_key = commit.static_input_key;
-        let asset_uuid = commit.asset_uuid;
         let holder = result_holder(key_kind, &static_key, &trace_digest);
         let mut unit: Vec<[u8; 32]> = output_rows.iter().map(|row| row.content_hash.0).collect();
         unit.extend(aux_rows.iter().map(|row| row.content_hash.0));
@@ -738,7 +732,6 @@ impl Store {
             if let Some(hook) = self.before_commit.as_mut() {
                 hook();
             }
-            let mut unverified = Vec::new();
             let committed = self.memo_transaction(|txn, memo_seq| {
                 for (i, rec) in group.iter().enumerate().take(result_index) {
                     let (segment, offset) = appended.locations[i];
@@ -778,30 +771,6 @@ impl Store {
                 for hash in &unit {
                     insert_ref(txn, HOLDER_RESULT, &holder, hash)?;
                 }
-                // Derived-output assertions: memo data verified against the
-                // input-versioned namespace index, never a namespace claim
-                // of its own (§9).
-                for row in &output_rows {
-                    if row.output_key.is_empty() {
-                        continue;
-                    }
-                    let child = AssetUuid::v5(asset_uuid, &row.output_key);
-                    if derived_row_matches(txn, child, asset_uuid, &row.output_key)? {
-                        txn.execute(
-                            "INSERT INTO derived_assertions(child_uuid, parent_uuid, output_key, memo_seq)
-                             VALUES (?1, ?2, ?3, ?4)
-                             ON CONFLICT(child_uuid, memo_seq) DO NOTHING",
-                            rusqlite::params![
-                                child.0.as_slice(),
-                                asset_uuid.0.as_slice(),
-                                row.output_key,
-                                memo_seq.0 as i64,
-                            ],
-                        )?;
-                    } else {
-                        unverified.push((child, row.output_key.clone()));
-                    }
-                }
                 index_segments(txn, &appended.touched)?;
                 Ok(())
             });
@@ -828,7 +797,6 @@ impl Store {
                     .iter()
                     .map(|row| (row.debug_key.clone(), row.content_hash))
                     .collect(),
-                unverified_assertions: unverified,
             });
         }
     }
@@ -1117,23 +1085,6 @@ pub(crate) fn upsert_candidate(
         ],
     )?;
     Ok(())
-}
-
-pub(crate) fn derived_row_matches(
-    txn: &rusqlite::Connection,
-    child: AssetUuid,
-    parent: AssetUuid,
-    output_key: &str,
-) -> Result<bool, StoreError> {
-    use rusqlite::OptionalExtension;
-    let row: Option<(Vec<u8>, String)> = txn
-        .query_row(
-            "SELECT parent_uuid, output_key FROM derived_outputs WHERE child_uuid = ?1",
-            [child.0.as_slice()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    Ok(matches!(row, Some((p, k)) if p == parent.0.as_slice() && k == output_key))
 }
 
 // ---- derived-output namespace (input-versioned, §9/§13) ----

@@ -313,13 +313,6 @@ CREATE TABLE derived_outputs (
     output_key  TEXT NOT NULL,
     terminal_type BLOB
 );
-CREATE TABLE derived_assertions (
-    child_uuid  BLOB NOT NULL,
-    parent_uuid BLOB NOT NULL,
-    output_key  TEXT NOT NULL,
-    memo_seq    INTEGER NOT NULL,
-    PRIMARY KEY (child_uuid, memo_seq)
-);
 CREATE INDEX result_candidates_by_segment ON result_candidates(segment);
 CREATE TABLE cas_extents (
     content_hash BLOB NOT NULL PRIMARY KEY,

@@ -1331,12 +1331,19 @@ fn candidate_rows_search_their_bucket() {
 /// index for the rows it answers, except the whole-index reads named here.
 #[test]
 fn cas_statements_search_their_indexes() {
+    use crate::cas::gc::EVICT_RESULT_ROW;
     use crate::cas::store::SEAL_OWN_SEGMENTS;
     let (_dir, store) = store_with(10);
-    let cases: &[(&str, &[&str])] = &[(
-        SEAL_OWN_SEGMENTS,
-        &["SEARCH cas_segments USING INDEX cas_segments_open (owner=? AND segment_id<?)"],
-    )];
+    let cases: &[(&str, &[&str])] = &[
+        (
+            SEAL_OWN_SEGMENTS,
+            &["SEARCH cas_segments USING INDEX cas_segments_open (owner=? AND segment_id<?)"],
+        ),
+        (
+            EVICT_RESULT_ROW,
+            &["SEARCH result_candidates USING INDEX sqlite_autoindex_result_candidates_1 (key_kind=? AND static_key=? AND trace_digest=?)"],
+        ),
+    ];
     for (sql, expected) in cases {
         assert_eq!(&store.query_plan_details(sql).unwrap(), expected, "{sql}");
     }

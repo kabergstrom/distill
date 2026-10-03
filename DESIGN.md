@@ -3475,12 +3475,11 @@ the cache stores is not one ContentHash but the whole result: `output_key →
 (type uuids, ContentHash)` — the primary output under a reserved key plus every
 extra output — together with the discovered trace. Each output is its own
 DSTL artifact with its own ContentHash and load-dep list. One coordinator
-transaction commits the CAS index rows for every output, the
-static-input-key → (trace, result) row, and one **derived-output assertion**
-row per
-extra output — `child uuid → (parent uuid, output_key)`, memo data
-verified against the input-versioned namespace index (below), never a
-namespace claim of its own. UUIDv5 is one-way,
+transaction commits the CAS index rows for every output and the
+static-input-key → (trace, result) row. It writes no child row: an extra
+output's `child uuid → (parent uuid, output_key)` lives only in the
+input-versioned namespace index (below), never as a claim of the
+commit's own. UUIDv5 is one-way,
 so that index is how `resolve(child, at)` finds the parent — and it cannot
 miss: a client can only name a child it read out of a fetched parent
 artifact, and that artifact's commit wrote the index row first. Child
@@ -3507,16 +3506,14 @@ updates it for unchanged assets — and a client holding a child UUID
 across eviction, daemon restart, or `.distill` loss can always resolve
 it (UUIDv5 is one-way; without this, a remembered child would be
 permanently orphaned). This snapshot-scoped index is the **only
-authority** for child resolution: commit-time rows and anything
-recovered from historical CAS result records are memo consistency data,
-never namespace claims — a child UUID resolves at a snapshot iff that
+authority** for child resolution: anything recovered from historical
+CAS result records is memo data, never a namespace claim — a child UUID resolves at a snapshot iff that
 snapshot derives it, so a retired output key's UUID can later be minted
 for authored data without a stale result record resurrecting the old
 claim. The index is validated against authored UUIDs at
 publication (§7) — collisions surface before the version is queryable,
-never as ordering-dependent resolution. Commit-time rows are
-consistency-checked against
-the derived index, and no artifact is created — laziness intact. Anything that pins a
+never as ordering-dependent resolution. No artifact is created —
+laziness intact. Anything that pins a
 parent's terminal artifact pins the whole chain
 result, earlier-stage extras included, so a child UUID read out of any
 held artifact is always resolvable for as long as that artifact is held.
@@ -5174,8 +5171,7 @@ none of it. The store partitions by authority: **input-versioned** state
 (bundle metadata, search tags, authored dependency records, and the
 derived-output **namespace index**, §9) moves only
 with input versions; **memo** state (build results, dependency traces,
-and the per-result derived-output *assertions* — which only ever verify
-against the namespace index, never define names) is monotone and keyed
+which never define names) is monotone and keyed
 by input basis, never
 versioned — an old snapshot reading a newer memo is the memoization
 semantic below, not a leak; **ephemeral** state (watch cursors, lease
