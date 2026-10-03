@@ -1485,3 +1485,112 @@ fn the_rpc_fence_is_three_key_searches() {
         ]
     );
 }
+
+/// The writer the fence test publishes through from inside the reader's
+/// statement trace.
+static FENCE_WRITER: std::sync::Mutex<Option<Store>> = std::sync::Mutex::new(None);
+
+/// Publish a new protocol epoch and pipeline generation together, once,
+/// just before the reader's first statement that reads the pipeline
+/// generation runs.
+fn publish_before_the_generation_read(sql: &str) {
+    if !sql.contains("rpc_pipeline_generation") {
+        return;
+    }
+    if let Some(mut writer) = FENCE_WRITER.lock().unwrap().take() {
+        writer
+            .served_transaction(|txn| {
+                use crate::served::ServedWrite;
+                txn.set_rpc_protocol_epoch(99)?;
+                txn.bump_rpc_pipeline_generation().map(drop)
+            })
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_connections_fences_are_read_at_one_instant() {
+    // A publication that changes the protocol epoch and the pipeline
+    // generation together lands while a front end reads the fences. It
+    // must see both or neither: seeing the new generation with the old
+    // epoch tells the client PipelineEpochChanged where the protocol
+    // changed.
+    use crate::served::ServedWrite;
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(crate::StoreConfig::new(dir.path().join("state"))).unwrap();
+    store
+        .served_transaction(|txn| {
+            txn.set_rpc_protocol_epoch(7)?;
+            txn.set_rpc_target("pc", [1; 32]).map(drop)
+        })
+        .unwrap();
+    let mut reader = store.reader().unwrap();
+    *FENCE_WRITER.lock().unwrap() = Some(store);
+    reader.trace_statements(Some(publish_before_the_generation_read));
+    let (fences, target_generation) = reader.rpc_fence("pc").unwrap();
+    reader.trace_statements(None);
+    assert!(FENCE_WRITER.lock().unwrap().is_none(), "the publication landed mid-read");
+    assert_eq!(
+        (fences.protocol_epoch, fences.pipeline_generation, target_generation),
+        (Some(99), 1, Some(0)),
+        "the fences mix two versions"
+    );
+}
+
+/// Pages a subscriber's history read fetches: one subscribed asset and
+/// one subscribed path among `unrelated` other changes in the window.
+fn history_pages(unrelated: u32) -> u64 {
+    use crate::state::InputVersion;
+    use crate::served::{Change, ServedWrite};
+    use distill_core::id::AssetUuid;
+    use std::collections::BTreeSet;
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(crate::StoreConfig::new(dir.path().join("state"))).unwrap();
+    store
+        .input_transaction(|txn| {
+            let version = txn.version();
+            for index in 0..unrelated {
+                let mut uuid = [0u8; 16];
+                uuid[..4].copy_from_slice(&index.to_le_bytes());
+                txn.append_change(version, &Change::Asset { asset: AssetUuid(uuid), state: 1 })?;
+                txn.append_change(version, &Change::Path { path: format!("other/{index}") })?;
+            }
+            txn.append_change(version, &Change::Asset { asset: AssetUuid([0xff; 16]), state: 1 })?;
+            txn.append_change(version, &Change::Path { path: "watched".into() })
+        })
+        .unwrap();
+    let reader = store.reader().unwrap();
+    let assets = BTreeSet::from([AssetUuid([0xff; 16])]);
+    let paths = BTreeSet::from(["watched".to_owned()]);
+    pages(&reader, || {
+        let history = reader
+            .change_log_history(InputVersion(0), InputVersion(1), &assets, &paths)
+            .unwrap();
+        assert_eq!(history.len(), 2, "{history:?}");
+    })
+}
+
+/// A subscriber's history costs its subscriptions, not the window: two
+/// subjects are two index descents and two row lookups, whose depth grows
+/// with the log of the table and nothing else. (The window read fetched
+/// 90 pages at 5000 unrelated changes.)
+#[test]
+fn subscription_history_reads_the_subscribed_subjects() {
+    let small = history_pages(10);
+    let large = history_pages(5000);
+    println!("history pages: {small} at 10 unrelated changes, {large} at 5000");
+    assert!(large <= 16, "history pages: {small} at 10 unrelated changes, {large} at 5000");
+}
+
+#[test]
+fn subscription_history_searches_one_subject() {
+    let (_dir, store) = store_with(1);
+    assert_eq!(
+        store.query_plan_details(crate::served::ASSET_HISTORY).unwrap(),
+        ["SEARCH change_log USING INDEX change_log_assets (asset_uuid=? AND version>? AND version<?)"]
+    );
+    assert_eq!(
+        store.query_plan_details(crate::served::PATH_HISTORY).unwrap(),
+        ["SEARCH change_log USING INDEX change_log_paths (subject=? AND version>? AND version<?)"]
+    );
+}

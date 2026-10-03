@@ -474,6 +474,9 @@ CREATE TABLE change_log (
     detail     BLOB
 );
 CREATE INDEX change_log_by_version ON change_log(version);
+-- Schema 39 (fix-cas): a subscriber's history, one subject at a time.
+CREATE INDEX change_log_assets ON change_log(asset_uuid, version) WHERE kind = 1;
+CREATE INDEX change_log_paths ON change_log(subject, version) WHERE kind = 2;
 -- The RPC target set and each target's reconnect generation.
 CREATE TABLE rpc_targets (
     name            TEXT NOT NULL PRIMARY KEY,

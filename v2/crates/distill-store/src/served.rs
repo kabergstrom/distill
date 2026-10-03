@@ -154,6 +154,16 @@ const CHANGE_RECONNECT_ALL: i64 = 3;
 const CHANGE_RECONNECT_TARGET: i64 = 4;
 const CHANGE_RESTART: i64 = 5;
 
+/// Asset `?1`'s published deltas with `?2 < version <= ?3`, on the asset
+/// deltas' partial index (kind literal: [`CHANGE_ASSET`]).
+pub(crate) const ASSET_HISTORY: &str = "SELECT seq, version, kind, asset_uuid, state, subject, detail
+     FROM change_log WHERE kind = 1 AND asset_uuid = ?1 AND version > ?2 AND version <= ?3";
+/// Path `?1`'s published deltas with `?2 < version <= ?3`, on the path
+/// deltas' partial index (kind literal: [`CHANGE_PATH`]).
+pub(crate) const PATH_HISTORY: &str = "SELECT seq, version, kind, asset_uuid, state, subject, detail
+     FROM change_log WHERE kind = 2 AND subject = ?1 AND version > ?2 AND version <= ?3";
+const _: () = assert!(CHANGE_ASSET == 1 && CHANGE_PATH == 2);
+
 /// One `change_log` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeEntry {
@@ -562,22 +572,40 @@ impl StoreReader {
             .collect::<Result<Vec<_>, _>>()
     }
 
-    /// Published asset and path deltas with `since < version <= upto`,
-    /// ordered by version then sequence.
+    /// The published deltas of `assets` and `paths` with
+    /// `since < version <= upto`, ordered by version then sequence: one
+    /// search per subject ([`ASSET_HISTORY`], [`PATH_HISTORY`]), never the
+    /// whole window.
     pub fn change_log_history(
         &self,
         since: InputVersion,
         upto: InputVersion,
+        assets: &BTreeSet<AssetUuid>,
+        paths: &BTreeSet<String>,
     ) -> Result<Vec<ChangeEntry>, StoreError> {
-        let mut statement = self.conn.prepare_cached(
-            "SELECT seq, version, kind, asset_uuid, state, subject, detail
-             FROM change_log WHERE version > ?1 AND version <= ?2 AND kind IN (1, 2)
-             ORDER BY version, seq",
-        )?;
-        let rows = statement.query_map([since.0 as i64, upto.0 as i64], change_entry_row)?;
-        rows.collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
+        let window = [since.0 as i64, upto.0 as i64];
+        let mut entries = Vec::new();
+        let mut by_asset = self.conn.prepare_cached(ASSET_HISTORY)?;
+        for asset in assets {
+            let rows = by_asset.query_map(
+                rusqlite::params![asset.0.as_slice(), window[0], window[1]],
+                change_entry_row,
+            )?;
+            for row in rows {
+                entries.push(row??);
+            }
+        }
+        let mut by_path = self.conn.prepare_cached(PATH_HISTORY)?;
+        for path in paths {
+            let rows =
+                by_path.query_map(rusqlite::params![path, window[0], window[1]], change_entry_row)?;
+            for row in rows {
+                entries.push(row??);
+            }
+        }
+        // Sequence order is version order: versions commit in sequence.
+        entries.sort_by_key(|entry| entry.seq);
+        Ok(entries)
     }
 
     /// The oldest version a subscription cursor may resume from.

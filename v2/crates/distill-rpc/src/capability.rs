@@ -1410,18 +1410,35 @@ impl Hub {
         if let Some(path) = paths.iter().find(|path| !valid_logical_path(path)) {
             return RpcResult::Failure(RpcFailure::InvalidPath { path: path.clone() });
         }
+        let requested_assets: BTreeSet<_> = assets.into_iter().collect();
+        let requested_paths: BTreeSet<_> = paths.into_iter().collect();
+        // Only `subscribe` grows a connection's subjects, so these are the
+        // ones the history below is for.
+        let (new_assets, new_paths) = {
+            let connection = self.connection.borrow();
+            let assets: BTreeSet<_> = requested_assets
+                .difference(&connection.subscribed_assets)
+                .copied()
+                .collect();
+            let paths: BTreeSet<_> = requested_paths
+                .difference(&connection.subscribed_paths)
+                .cloned()
+                .collect();
+            (assets, paths)
+        };
         let inner = &self.server.inner;
         let (stamp, head, oldest, history, restart) = rpc_try!(inner.read_consistent(|reader| {
             let stamp = reader.stamp();
-            let history = if since < stamp.version {
-                reader.change_log_history(since, stamp.version)?
+            let oldest = reader.change_log_oldest()?;
+            let history = if oldest <= since && since < stamp.version {
+                reader.change_log_history(since, stamp.version, &new_assets, &new_paths)?
             } else {
                 Vec::new()
             };
             Ok((
                 stamp,
                 reader.change_log_head()?,
-                reader.change_log_oldest()?,
+                oldest,
                 history,
                 reader.served_blob(SERVED_RESTART_KEYS)?,
             ))
@@ -1438,16 +1455,6 @@ impl Hub {
         inner.pump_until(&self.connection, Some(head));
 
         let mut connection = self.connection.borrow_mut();
-        let requested_assets: BTreeSet<_> = assets.into_iter().collect();
-        let requested_paths: BTreeSet<_> = paths.into_iter().collect();
-        let new_assets: BTreeSet<_> = requested_assets
-            .difference(&connection.subscribed_assets)
-            .copied()
-            .collect();
-        let new_paths: BTreeSet<_> = requested_paths
-            .difference(&connection.subscribed_paths)
-            .cloned()
-            .collect();
         if connection
             .subscribed_assets
             .len()
