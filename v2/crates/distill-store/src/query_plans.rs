@@ -1400,3 +1400,14 @@ fn cas_statements_search_their_indexes() {
         assert_eq!(&store.query_plan_details(sql).unwrap(), expected, "{sql}");
     }
 }
+
+/// The tool-package collector reads the `tools` namespace whole, once per
+/// open: it is collecting that namespace.
+#[test]
+fn the_tool_collector_streams_the_registered_tools() {
+    let (_dir, store) = store_with(1);
+    assert_eq!(
+        store.query_plan_details(crate::pipeline::REGISTERED_TOOLS).unwrap(),
+        ["SCAN tools"]
+    );
+}

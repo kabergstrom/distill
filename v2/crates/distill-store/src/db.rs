@@ -675,6 +675,7 @@ impl Store {
             before_commit: None,
         };
         let recovery = store.recover_cas()?;
+        crate::pipeline::collect_unregistered_tool_files(&store.conn, &store.config.state_path)?;
         tracing::info!(
             path = %store.config.state_path.display(),
             input_version = store.input_version().0,

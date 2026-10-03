@@ -66,8 +66,9 @@ fn reopen_removes_orphaned_tool_stage_files() {
 
     drop(Store::open(config).unwrap());
 
+    // Neither is a registered package's: the stage file and the object go.
     assert!(!orphan.exists());
-    assert_eq!(std::fs::read(immutable).unwrap(), b"complete");
+    assert!(!immutable.exists());
 }
 
 #[test]

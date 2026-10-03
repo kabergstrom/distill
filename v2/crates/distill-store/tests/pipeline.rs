@@ -482,3 +482,37 @@ fn ambient_registration_is_not_staged_and_trust_controls_cacheability() {
 }
 
 
+
+#[test]
+fn a_rolled_back_registrations_package_is_collected_at_open() {
+    // A package is staged on disk inside the publishing input; an input
+    // that rolls back leaves files no `tools` row names. The next open
+    // collects them and keeps every registered package.
+    let dir = tempfile::tempdir().unwrap();
+    let config = StoreConfig::new(dir.path().join(".distill"));
+    let mut store = Store::open(config.clone()).unwrap();
+    let (kept, _) = store
+        .input_transaction(|txn| txn.register_tool("kept", tool_package(b"kept tool", b"shared")))
+        .unwrap();
+    let mut rolled_back = None;
+    let out: Result<((), _), StoreError> = store.input_transaction(|txn| {
+        rolled_back = Some(txn.register_tool("dropped", tool_package(b"dropped tool", b"shared"))?);
+        Err(StoreError::Rejected { detail: "the publication failed".into() })
+    });
+    assert!(out.is_err());
+    let dropped_root = rolled_back.unwrap().root.unwrap();
+    assert!(dropped_root.join("bin/tool").is_file());
+    drop(store);
+
+    let store = Store::open(config.clone()).unwrap();
+    assert!(!dropped_root.exists(), "a rolled-back package outlived its registration");
+    let objects: Vec<String> = std::fs::read_dir(config.state_path.join("tools/objects"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(objects.len(), 2, "the kept package's two objects: {objects:?}");
+    let root = kept.root.unwrap();
+    assert_eq!(std::fs::read(root.join("bin/tool")).unwrap(), b"kept tool");
+    assert_eq!(std::fs::read(root.join("share/config")).unwrap(), b"shared");
+    assert!(store.tool("kept").unwrap().is_some());
+}
