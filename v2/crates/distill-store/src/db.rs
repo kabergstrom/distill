@@ -1245,6 +1245,9 @@ impl InputTxn<'_> {
     }
 }
 
+/// The writer's page cache: 64 MiB (a negative `cache_size` counts KiB).
+const WRITER_PAGE_CACHE_SIZE: i64 = -64 * 1024;
+
 /// Prepared statements a connection keeps. Every fixed statement the store
 /// runs is prepared once per connection and reused: a per-row write in a
 /// publication loop costs its execution, not a parse. Larger than the
@@ -1259,6 +1262,11 @@ fn open_writer_connection(db_path: &Path) -> Result<Connection, StoreError> {
     conn.pragma_update(None, "journal_mode", "wal")?;
     conn.busy_timeout(WRITER_BUSY_TIMEOUT)?;
     conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
+    // A publication writes in one transaction; past the default 2 MiB page
+    // cache SQLite spills dirty pages to the WAL mid-transaction (a cold
+    // 20k-bundle scan: 8.2 s with the default, 6.3-6.7 s with this). An
+    // upper bound, allocated as pages are used.
+    conn.pragma_update(None, "cache_size", WRITER_PAGE_CACHE_SIZE)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     // FULL: every committed transaction is durable; §13's index rows
     // must never lead the segment fsync they follow.
