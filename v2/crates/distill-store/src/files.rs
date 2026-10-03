@@ -21,6 +21,10 @@ use crate::db::{InputTxn, Store, StoreReader};
 use crate::error::StoreError;
 use crate::state::InputVersion;
 
+/// [`StoreReader::file_content_hash`]'s statement.
+pub(crate) const FILE_CONTENT_HASH: &str = "SELECT t.content_hash FROM files t JOIN roots r USING (root_id)
+     WHERE r.name = ?1 AND t.path = ?2";
+
 /// A process-local interned root id (§18) — never serialized beyond this
 /// store instance's disposable state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -796,6 +800,26 @@ impl StoreReader {
                  OR EXISTS(SELECT 1 FROM directories t JOIN roots r USING (root_id) WHERE {under})"
         ))?
         .query_row(rusqlite::params![root_name, prefix], |row| row.get(0))?)
+    }
+
+    /// The content hash of the file observed at (`root_name`, `path`):
+    /// `None` for no row, or a row with no content (a directory). One
+    /// search of each primary key.
+    pub fn file_content_hash(
+        &self,
+        root_name: &str,
+        path: &str,
+    ) -> Result<Option<ContentHash>, StoreError> {
+        let hash: Option<Option<Vec<u8>>> = self
+            .conn
+            .prepare_cached(FILE_CONTENT_HASH)?
+            .query_row(rusqlite::params![root_name, path], |row| row.get(0))
+            .optional()?;
+        Ok(hash.flatten().map(|bytes| {
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&bytes);
+            ContentHash(hash)
+        }))
     }
 
     /// One observed `.bundle` file's bytes.

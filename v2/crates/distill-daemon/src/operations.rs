@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
 use distill_bundle::Bundle;
@@ -15,14 +15,13 @@ use distill_json::AuthoredValue;
 use distill_rpc::{
     AuthoringProgressEvent, AuthoringProgressState, BuildRequest, Commit, DeferredOperation,
     DeferredOperationResult, DoctorRequest, InputVersion, LongRunningOp, PreparedOperationCommit,
-    RenameWithFixupsRequest, RpcFailure,
+    RenameWithFixupsRequest, RpcFailure, WriteReceipt, WrittenFile,
 };
 use distill_schema::ngp_schema::SchemaNode;
 use distill_store::{Store, StoreReader};
 
 use crate::authoring::{invalid, require_base, AuthoringService};
-use crate::coordinator::publish_incremental_paths;
-use distill_store::atomic_file::{self, AtomicWriteError};
+use distill_store::atomic_file::{self, Expected};
 use crate::compiled::CompiledRegistry;
 use crate::scanner::RootedScanner;
 
@@ -49,10 +48,7 @@ impl AuthoringService {
                     &request.destination_root,
                     &request.destination_path,
                 )?;
-                PlannedOperation::Files {
-                    files: self.plan_rename_with_fixups(store, base, &request)?,
-                    failures: Vec::new(),
-                }
+                PlannedOperation::Rename(self.plan_rename_with_fixups(store, base, &request)?)
             }
             LongRunningOp::Doctor(payload) => {
                 let request =
@@ -81,6 +77,12 @@ impl AuthoringService {
             }
         };
         let running_payload = operation_summary(&planned);
+        // A rename's Completed event carries its receipt: the files it will
+        // have changed when Completed is delivered.
+        let completed_payload = match &planned {
+            PlannedOperation::Rename(rename) => rename.receipt.encode(),
+            PlannedOperation::Doctor { .. } => Arc::from([]),
+        };
         Ok(PreparedOperationCommit::deferred(
             Arc::new(DeferredAuthoringOperation { runtime, planned }),
             vec![
@@ -97,7 +99,7 @@ impl AuthoringService {
                 AuthoringProgressEvent {
                     sequence: 2,
                     state: AuthoringProgressState::Completed,
-                    payload: Arc::from([]),
+                    payload: completed_payload,
                 },
             ],
         ))
@@ -108,7 +110,7 @@ impl AuthoringService {
         store: &StoreReader,
         base: InputVersion,
         request: &RenameWithFixupsRequest,
-    ) -> Result<Vec<OperationFile>, RpcFailure> {
+    ) -> Result<PlannedRename, RpcFailure> {
         require_base(store, base)?;
         let compiled = self.compiled(store)?;
         let scanner = compiled.scanner();
@@ -143,7 +145,11 @@ impl AuthoringService {
         candidates.push(moving.bundle);
         candidates.sort();
         candidates.dedup();
-        let mut files = Vec::new();
+        let mut referencers = Vec::new();
+        let mut moved = None;
+        // In the order the files change: referencers, then the move.
+        let mut receipt = Vec::new();
+        let mut moved_receipt = Vec::new();
         for bundle in candidates {
             let meta = store
                 .bundle(bundle)
@@ -171,22 +177,49 @@ impl AuthoringService {
                 &request.destination_path,
             )?;
             if meta.bundle == request.bundle {
-                let proposed = if changed {
-                    distill_bundle::write_bundle(&bundle).map_err(invalid)?
+                let rewritten = if changed {
+                    Some(distill_bundle::write_bundle(&bundle).map_err(invalid)?)
                 } else {
-                    bytes
+                    None
                 };
-                files.push(OperationFile::create(destination.clone(), proposed));
-                files.push(OperationFile::delete(path, observed));
+                moved_receipt.push(WrittenFile {
+                    root,
+                    path: meta.path,
+                    content_hash: None,
+                });
+                moved_receipt.push(WrittenFile {
+                    root: request.destination_root.clone(),
+                    path: request.destination_path.clone(),
+                    content_hash: Some(
+                        rewritten.as_deref().map_or(observed, atomic_file::content_hash),
+                    ),
+                });
+                moved = Some((path, observed, rewritten));
             } else if changed {
-                files.push(OperationFile::replace(
-                    path,
-                    observed,
-                    distill_bundle::write_bundle(&bundle).map_err(invalid)?,
-                ));
+                let proposed = distill_bundle::write_bundle(&bundle).map_err(invalid)?;
+                receipt.push(WrittenFile {
+                    root,
+                    path: meta.path,
+                    content_hash: Some(atomic_file::content_hash(&proposed)),
+                });
+                referencers.push(Rewrite {
+                    target: path,
+                    preimage: observed,
+                    proposed,
+                });
             }
         }
-        Ok(files)
+        let (source, source_preimage, source_rewritten) =
+            moved.expect("the moving bundle is a candidate");
+        receipt.extend(moved_receipt);
+        Ok(PlannedRename {
+            referencers,
+            source,
+            source_preimage,
+            source_rewritten,
+            destination,
+            receipt: WriteReceipt { files: receipt },
+        })
     }
 
 }
@@ -200,10 +233,7 @@ struct OperationRuntime {
 }
 
 enum PlannedOperation {
-    Files {
-        files: Vec<OperationFile>,
-        failures: Vec<String>,
-    },
+    Rename(PlannedRename),
     Doctor {
         request: DoctorRequest,
         build_requests: Result<Vec<BuildRequest>, String>,
@@ -222,9 +252,7 @@ impl DeferredOperation for DeferredAuthoringOperation {
         base: InputVersion,
     ) -> Result<DeferredOperationResult, String> {
         match &self.planned {
-            PlannedOperation::Files { files, failures } => {
-                self.runtime.publish_files(store, base, files, failures)
-            }
+            PlannedOperation::Rename(rename) => self.runtime.complete_rename(store, base, rename),
             PlannedOperation::Doctor {
                 request,
                 build_requests,
@@ -234,57 +262,75 @@ impl DeferredOperation for DeferredAuthoringOperation {
 }
 
 impl OperationRuntime {
-    fn publish_files(
+    /// Apply a planned rename as file writes, in the order that keeps every
+    /// intermediate state ordinary authored input:
+    ///
+    /// 1. each referencing bundle is rewritten to the destination path (its
+    ///    reference dangles until step 3, which a build reports as an
+    ///    unresolved reference);
+    /// 2. the moving bundle's own references are rewritten in place;
+    /// 3. the bundle moves, by one rename, so it is never at both paths.
+    ///
+    /// Every temp is staged and every pre-image and the destination checked
+    /// before the first rename, so a conflict found then changes nothing.
+    /// A failure or crash part-way leaves a prefix of the steps; the same
+    /// request, retried, plans exactly what remains (the published
+    /// references to the old path are the referencers not yet rewritten).
+    /// Nothing is published here: the watcher publishes the files.
+    fn complete_rename(
         &self,
-        store: &mut Store,
+        store: &Store,
         base: InputVersion,
-        files: &[OperationFile],
-        initial_failures: &[String],
+        rename: &PlannedRename,
     ) -> Result<DeferredOperationResult, String> {
-        if files.is_empty() {
-            return self.advance_empty(
-                store,
-                base,
-                (!initial_failures.is_empty()).then(|| initial_failures.join("; ")),
-            );
-        }
         require_base(store, base).map_err(|error| format!("{error:?}"))?;
         let compiled = self.compiled.at(store).map_err(|error| error.to_string())?;
-        let mut failures = initial_failures.to_vec();
-        for file in files {
-            let expected = file.preimage.into();
-            let changed = match file.proposed.as_deref() {
-                Some(bytes) => {
-                    let root = compiled
-                        .scanner()
-                        .root_containing(&file.target)
-                        .map_err(|error| error.to_string())?;
-                    atomic_file::write(&root, &file.target, bytes, expected)
-                }
-                None => atomic_file::remove(&file.target, expected),
-            };
-            match changed {
-                Ok(()) => {}
-                Err(conflict @ AtomicWriteError::Conflict { .. }) => {
-                    failures.push(conflict.to_string())
-                }
-                Err(error) => return Err(error.to_string()),
-            }
+        let scanner = compiled.scanner();
+        let stage = |target: &Path, bytes: &[u8]| {
+            let root = scanner
+                .root_containing(target)
+                .map_err(|error| error.to_string())?;
+            atomic_file::stage(&root, target, bytes).map_err(|error| error.to_string())
+        };
+        let mut steps = Vec::new();
+        for rewrite in &rename.referencers {
+            let staged = stage(&rewrite.target, &rewrite.proposed)?;
+            steps.push((&rewrite.target, rewrite.preimage, staged));
         }
-        let changed_paths = files
-            .iter()
-            .map(|file| file.target.clone())
-            .collect::<Vec<_>>();
-        let commit = publish_incremental_paths(
-            &changed_paths,
-            store,
-            base,
-            &compiled,
-            self.tag_index_coordinator.upgrade().as_deref(),
-        )?;
+        if let Some(bytes) = &rename.source_rewritten {
+            let staged = stage(&rename.source, bytes)?;
+            steps.push((&rename.source, rename.source_preimage, staged));
+        }
+        for (target, preimage, _) in &steps {
+            atomic_file::check(target, Expected::Hash(*preimage))
+                .map_err(|error| error.to_string())?;
+        }
+        atomic_file::check(&rename.source, Expected::Hash(rename.source_preimage))
+            .and_then(|()| atomic_file::check(&rename.destination, Expected::Absent))
+            .map_err(|error| error.to_string())?;
+
+        let moved = rename
+            .source_rewritten
+            .as_deref()
+            .map_or(rename.source_preimage, atomic_file::content_hash);
+        let total = steps.len() + 1;
+        let mut applied = 0;
+        let apply = || {
+            for (_, preimage, staged) in steps {
+                staged.commit(Expected::Hash(preimage))?;
+                applied += 1;
+            }
+            atomic_file::move_file(&rename.source, Expected::Hash(moved), &rename.destination)
+        };
+        let terminal_error = apply().err().map(|error| {
+            format!(
+                "rename applied {applied} of {total} file steps, then failed: {error}; \
+                 retry the same request to finish it"
+            )
+        });
         Ok(DeferredOperationResult {
-            commit,
-            terminal_error: (!failures.is_empty()).then(|| failures.join("; ")),
+            commit: None,
+            terminal_error,
         })
     }
 
@@ -394,43 +440,34 @@ impl OperationRuntime {
             .input_transaction(|_| Ok(()))
             .map_err(|error| error.to_string())?;
         Ok(DeferredOperationResult {
-            commit: Commit::default(),
+            commit: Some(Commit::default()),
             terminal_error,
         })
     }
 }
 
-struct OperationFile {
+/// One bundle file rewritten in place: it must hold `preimage` right before
+/// it is replaced.
+struct Rewrite {
     target: PathBuf,
-    preimage: Option<ContentHash>,
-    proposed: Option<Vec<u8>>,
+    preimage: ContentHash,
+    proposed: Vec<u8>,
 }
 
-impl OperationFile {
-    fn create(target: PathBuf, proposed: Vec<u8>) -> Self {
-        Self {
-            target,
-            preimage: None,
-            proposed: Some(proposed),
-        }
-    }
-
-    fn replace(target: PathBuf, preimage: ContentHash, proposed: Vec<u8>) -> Self {
-        Self {
-            target,
-            preimage: Some(preimage),
-            proposed: Some(proposed),
-        }
-    }
-
-    fn delete(target: PathBuf, preimage: ContentHash) -> Self {
-        Self {
-            target,
-            preimage: Some(preimage),
-            proposed: None,
-        }
-    }
-
+/// A rename-with-fixups, planned against one version
+/// ([`OperationRuntime::complete_rename`] applies it).
+struct PlannedRename {
+    /// The bundles that reference the moving one, rewritten to its
+    /// destination path.
+    referencers: Vec<Rewrite>,
+    /// The moving bundle, its bytes, and its bytes with its own references
+    /// rewritten when any changed.
+    source: PathBuf,
+    source_preimage: ContentHash,
+    source_rewritten: Option<Vec<u8>>,
+    destination: PathBuf,
+    /// The files the rename changes, for its Completed event.
+    receipt: WriteReceipt,
 }
 
 /// Every logical path `bundle`'s reference fields name: the strings
@@ -629,11 +666,9 @@ fn validate_rooted_destination(
 
 fn operation_summary(operation: &PlannedOperation) -> String {
     match operation {
-        PlannedOperation::Files { files, failures } => format!(
-            "rename: {} file(s), {} per-file failure(s)",
-            files.len(),
-            failures.len()
-        ),
+        PlannedOperation::Rename(rename) => {
+            format!("rename: {} file(s)", rename.receipt.files.len())
+        }
         PlannedOperation::Doctor { request, .. } => format!("doctor {request:?}"),
     }
 }

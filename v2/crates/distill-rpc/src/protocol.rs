@@ -14,8 +14,11 @@ pub use distill_store::state::{
 
 /// 10: `Hub.importFailures`. 11: snapshot `runtimeTypePolicy`, batch-class
 /// `resolve`, `ASSET_NOT_FOUND` (pack over RPC). 12: snapshot
-/// `resolveNamed` (an asset by path and local id).
-pub const PROTOCOL_VERSION: u32 = 12;
+/// `resolveNamed` (an asset by path and local id). 13: `Hub.write` and a
+/// rename's Completed event answer a [`WriteReceipt`] (the files changed on
+/// disk) instead of a version, and `AuthoringSnapshot.file` reads a file's
+/// published content hash.
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// A watched import whose latest attempt failed. The bundle keeps serving its
 /// last good contents; the failure clears when a later import succeeds.
@@ -509,6 +512,69 @@ impl std::fmt::Display for OperationPayloadError {
 
 impl std::error::Error for OperationPayloadError {}
 
+/// One file an authoring write changed on disk, by its new content hash
+/// (`None`: removed). The store reflects it at the first version whose
+/// `AuthoringSnapshot.file(root, path)` answers `content_hash`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrittenFile {
+    pub root: String,
+    pub path: String,
+    pub content_hash: Option<ContentHash>,
+}
+
+/// What an authoring write (`Hub.write`, or a rename's Completed event)
+/// did: the files it had atomically changed on disk when it answered. The
+/// store follows them through the daemon's watcher like any other edit;
+/// a client that needs the result waits for a version reflecting every
+/// file. Empty when the write needed no file (an embedded server publishes
+/// it in the call's own input).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WriteReceipt {
+    pub files: Vec<WrittenFile>,
+}
+
+impl WriteReceipt {
+    pub fn encode(&self) -> Arc<[u8]> {
+        let mut bytes = vec![1];
+        let count = u32::try_from(self.files.len()).expect("receipt exceeds the RPC message limit");
+        bytes.extend_from_slice(&count.to_le_bytes());
+        for file in &self.files {
+            encode_operation_text(&mut bytes, &file.root);
+            encode_operation_text(&mut bytes, &file.path);
+            match file.content_hash {
+                Some(hash) => {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&hash.0);
+                }
+                None => bytes.push(0),
+            }
+        }
+        Arc::from(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, OperationPayloadError> {
+        let mut reader = OperationPayloadReader::new(bytes)?;
+        let count = reader.u32()?;
+        let mut files = Vec::new();
+        for _ in 0..count {
+            let root = reader.text()?;
+            let path = reader.text()?;
+            let content_hash = match reader.u8()? {
+                0 => None,
+                1 => Some(ContentHash(reader.array()?)),
+                tag => return Err(OperationPayloadError::InvalidTag(tag)),
+            };
+            files.push(WrittenFile {
+                root,
+                path,
+                content_hash,
+            });
+        }
+        reader.finish()?;
+        Ok(Self { files })
+    }
+}
+
 impl RenameWithFixupsRequest {
     pub fn encode(&self) -> Arc<[u8]> {
         let mut bytes = vec![1];
@@ -663,10 +729,11 @@ pub trait DeferredOperation: Send + Sync {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeferredOperationResult {
-    pub commit: Commit,
-    /// A per-file operation may publish earlier successful files before a
-    /// later conflict. The version must still commit; this terminal diagnostic
-    /// changes Completed to Failed only after that commit is visible.
+    /// What the operation publishes in its own input; `None` for one whose
+    /// effect is files the watcher publishes (a rename).
+    pub commit: Option<Commit>,
+    /// A per-file operation may change earlier files before a later
+    /// conflict. This terminal diagnostic changes Completed to Failed.
     pub terminal_error: Option<String>,
 }
 
@@ -720,23 +787,24 @@ pub type ImportJob =
 /// migration, or doctor services. Implementations prepare a side-effect-free
 /// commit; publication remains an atomic RPC-server CAS step.
 pub trait AuthoringBackend: Send + Sync + 'static {
-    /// Execute an ordinary authoring batch against `base` and return the
-    /// rescan-proven in-memory projection when the backend owns durable
-    /// publication. `Ok(None)` retains the in-memory-only implementation used
-    /// by embedders and tests that have no filesystem authority.
+    /// Apply an ordinary authoring batch, planned against `base`, to the
+    /// files it changes, and return what it wrote. The write is complete
+    /// once the files are atomically on disk: the store follows through the
+    /// watcher, as for any other edit. An error means no file changed.
+    /// `Ok(None)`: the backend has no filesystem authority, and an embedded
+    /// server publishes the batch itself (embedders and tests).
     ///
-    /// The RPC server invokes this inside the input open on `store` that
-    /// publishes it; production implementations must compare that store's
-    /// version with `base`, publish, rescan, and advance it exactly once
-    /// before returning, all through `store`. They must not call back into
-    /// the [`crate::Server`].
-    fn prepare_write(
+    /// The RPC server invokes this inside an input open on `store` at
+    /// `base`, which it then rolls back: the input holds the write lock, so
+    /// no other writer publishes between the plan and the files. It must
+    /// not call back into the [`crate::Server`].
+    fn write_files(
         &self,
         _store: &mut distill_store::Store,
         _base: InputVersion,
         _operations: &[AuthoringOp],
         _force_lossy: bool,
-    ) -> Result<Option<Commit>, RpcFailure> {
+    ) -> Result<Option<WriteReceipt>, RpcFailure> {
         Ok(None)
     }
 

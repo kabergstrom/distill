@@ -310,13 +310,21 @@ pipeline, config, or daemon.
 6. **Logging.** `tracing` in daemon, rpc and store; `RUST_LOG` is honored by
    `distilld`. (Started in phase 0.)
 7. **Journal, quarantine, lineage: decided (phase 10).**
-   - The journal and quarantine are gone. Every write into an asset root
-     or codegen output is `atomic_write`: temp file in the target's
-     directory, fsync, rename over the target, fsync the directory. The
-     target is re-hashed right before the rename (conflict check). A
-     delete is a plain `remove_file`. The file is written first, the
-     store rows follow; a crash between the two is healed by the scanner,
-     which is disk truth.
+   - The journal and quarantine are gone. Every non-CAS file write goes
+     through `distill_store::atomic_file`: a temp in the owning tree's
+     `.distill-staging` directory (an asset root, the codegen output, the
+     tool object store, a pack directory), fsync, the target re-hashed
+     against its expected pre-image (conflict check), rename over the
+     target (Windows: `MoveFileExW` with REPLACE_EXISTING and
+     WRITE_THROUGH), fsync the directory. Content-addressed files publish
+     by no-replace hard link instead. A staging directory holds only
+     uncommitted temps, so its owner empties it when it opens the tree,
+     and the watcher and scanner never see it. A delete is a checked
+     `remove_file`. The file is written first, the store rows follow; a
+     crash between the two is healed by the scanner, which is disk truth.
+   - RPC authoring writes and rename-with-fixups are file writes only: the
+     reply is a `WriteReceipt` once the files are on disk, and the watcher
+     publishes them (DESIGN.md §17).
    - Migration happens on read only. A bundle write never drops data: the
      automatic plan from the stored entry's schema to the written one may
      drop only default-valued fields, and a refused plan needs a
@@ -1127,6 +1135,27 @@ should reach zero by the end of phase 6.
   (`import_watched_bundles`). It used to parse every bundle that has a
   `$record` row just to read the flag. Poisoned bundles are still read
   from disk, and `bundles_with_reserved_entry` is gone.
+- **Every file write is atomic; authoring writes are file writes.**
+  - One primitive, `distill_store::atomic_file`, writes every non-CAS
+    file (§5.7): asset roots (RPC writes, imports, renames), the codegen
+    output, pack archives, manifests and `pack.current`, and tool package
+    objects. The daemon's `atomic.rs` and the pack and tool-store temp
+    helpers are gone, and the tool-object temp sweep, which ran before the
+    state lock, became `open_staging` under it.
+  - `Hub.write` answers a `WriteReceipt` once the bundle file is on disk
+    and commits nothing (protocol 13); the watcher publishes the file.
+    `AuthoringBackend::prepare_write` became `write_files`, run inside an
+    input the server rolls back. `AuthoringSnapshot.file` answers a
+    file's published content hash (`FILE_CONTENT_HASH`, two key
+    searches). A rename's completion publishes nothing
+    (`DeferredOperationResult.commit` is optional) and its Completed
+    payload is the receipt.
+  - Since RPC writes no longer advance the input version, they no longer
+    make a running pass `Stale` (Txn livelock). A client writing faster
+    than `watch.quiet_ms` instead holds the quiet window open, which
+    defers the pass until it pauses and warns when held open too long.
+  - Txn M5: generated files carry a self-certifying mark, so a
+    publication cut short before its rows no longer wedges codegen.
 
 ## 7. Test baseline
 
@@ -1167,3 +1196,8 @@ Merge of reads-scan and reads-query (one schema 38), with a complete
 publication republishing the poisoned bundles of reschemaed types: 1217
 passed, no failures (12 from reads-scan, 8 from reads-query, 1 new: the
 complete publication's re-validated poisoned skeleton).
+Atomic file writes everywhere, authoring writes as file writes (protocol
+13), codegen marks: 1228 passed, no failures (net 11: the primitive's 6
+replacing atomic.rs's 1, staging ignored by scanner and watcher, codegen
+M5, the file-hash plan, and the rename's conflict and cut-short retry
+tests).

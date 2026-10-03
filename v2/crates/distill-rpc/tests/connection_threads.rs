@@ -1011,14 +1011,15 @@ fn concurrent_snapshots_resolves_fetches_and_commits_stay_consistent() {
 // ---------------------------------------------------------------------------
 // 9. Writers: every connection writes through a writer of its own
 
-/// Publishes every write, and writes a row of its own (the clean
-/// watermark: the version it publishes) through the writer it is given,
-/// inside the input. Records each base and the segment size its writer
-/// saw.
+/// Writes no file: answers a receipt, after writing a row of its own (the
+/// clean watermark) through the writer it is given, inside the input the
+/// server rolls back. Records each base, the segment size its writer saw,
+/// and the most writes it ever saw running at once.
 #[derive(Default)]
 struct LedgerBackend {
     bases: Mutex<Vec<InputVersion>>,
     segment_sizes: Mutex<Vec<u64>>,
+    running: Mutex<(usize, usize)>,
     /// Hold each write open this long, so writes on two connections
     /// overlap.
     hold: Duration,
@@ -1053,22 +1054,27 @@ fn ledger_row(store: &mut distill_store::Store, next: InputVersion) -> Result<()
 }
 
 impl AuthoringBackend for LedgerBackend {
-    fn prepare_write(
+    fn write_files(
         &self,
         store: &mut distill_store::Store,
         base: InputVersion,
         _operations: &[AuthoringOp],
         _force_lossy: bool,
-    ) -> Result<Option<Commit>, RpcFailure> {
-        let next = InputVersion(base.0 + 1);
-        ledger_row(store, next).map_err(store_failure)?;
+    ) -> Result<Option<WriteReceipt>, RpcFailure> {
+        {
+            let mut running = self.running.lock().unwrap();
+            running.0 += 1;
+            running.1 = running.1.max(running.0);
+        }
+        ledger_row(store, InputVersion(base.0 + 1)).map_err(store_failure)?;
         std::thread::sleep(self.hold);
         self.bases.lock().unwrap().push(base);
         self.segment_sizes
             .lock()
             .unwrap()
             .push(store.config().segment_size);
-        Ok(Some(ledger_commit(next)))
+        self.running.lock().unwrap().0 -= 1;
+        Ok(Some(WriteReceipt::default()))
     }
 
     fn prepare_import(
@@ -1124,8 +1130,8 @@ async fn connect_writer(address: SocketAddr) -> (CapnpClient, RemoteHub, schema:
     (client, hub, raw.0)
 }
 
-/// One write at `base`: the version it published, or the error code.
-async fn write_at(hub: &schema::hub::Client, base: InputVersion) -> Result<InputVersion, u16> {
+/// One write at `base`: its receipt, or the error code.
+async fn write_at(hub: &schema::hub::Client, base: InputVersion) -> Result<WriteReceipt, u16> {
     let mut call = hub.write_request();
     {
         let mut params = call.get();
@@ -1135,29 +1141,25 @@ async fn write_at(hub: &schema::hub::Client, base: InputVersion) -> Result<Input
     }
     let response = call.send().promise.await.unwrap();
     match response.get().unwrap().get_result().unwrap().which().unwrap() {
-        schema::u_int64_call::Which::Success(version) => Ok(InputVersion(version)),
-        schema::u_int64_call::Which::Error(error) => Err(error.unwrap().get_code()),
+        schema::data_call::Which::Success(bytes) => {
+            Ok(WriteReceipt::decode(bytes.unwrap()).unwrap())
+        }
+        schema::data_call::Which::Error(error) => Err(error.unwrap().get_code()),
         _ => panic!("unexpected write outcome"),
     }
 }
 
-/// Write at the current version until one write publishes.
-async fn write_once(hub: &RemoteHub, raw: &schema::hub::Client) -> InputVersion {
-    for _ in 0..1000 {
-        let base = snapshot(hub).await.basis().snapshot.version;
-        if let Ok(version) = write_at(raw, base).await {
-            return version;
-        }
-    }
-    panic!("no write published in 1000 attempts");
+/// One write at the current version, which succeeds.
+async fn write_once(hub: &RemoteHub, raw: &schema::hub::Client) -> WriteReceipt {
+    let base = snapshot(hub).await.basis().snapshot.version;
+    write_at(raw, base).await.unwrap()
 }
 
 /// Two connections write at once, each on its own writer. SQLite's write
-/// lock orders them: every write publishes exactly the version after its
-/// base, no version is lost or published twice, and each connection's
-/// versions rise.
+/// lock orders them: no two writes ever run at once, and none commits
+/// anything (the backend's row in each input is rolled back).
 #[test]
-fn two_connections_writing_concurrently_both_commit_in_order() {
+fn two_connections_writing_concurrently_are_serialized_and_commit_nothing() {
     watchdog(Duration::from_secs(60), || {
         let backend = Arc::new(LedgerBackend {
             hold: Duration::from_millis(2),
@@ -1176,40 +1178,27 @@ fn two_connections_writing_concurrently_both_commit_in_order() {
                 on_thread(move || async move {
                     let (_client, hub, raw) = connect_writer(address).await;
                     barrier.wait();
-                    let mut versions = Vec::new();
                     for _ in 0..WRITES {
-                        versions.push(write_once(&hub, &raw).await);
+                        assert_eq!(write_once(&hub, &raw).await, WriteReceipt::default());
                     }
-                    versions
                 })
             })
             .collect::<Vec<_>>();
-        let mut all = Vec::new();
         for writer in writers {
-            let versions = writer.join().unwrap();
-            assert!(
-                versions.windows(2).all(|pair| pair[0] < pair[1]),
-                "a connection's versions rise: {versions:?}"
-            );
-            all.extend(versions);
+            writer.join().unwrap();
         }
-        all.sort();
-        let expected = (1..=2 * WRITES)
-            .map(|offset| InputVersion(start.0 + offset))
-            .collect::<Vec<_>>();
-        assert_eq!(all, expected, "every write published one version");
-        // The backend ran inside each input in commit order: each base is
-        // the version before.
+        assert_eq!(
+            backend.running.lock().unwrap().1,
+            1,
+            "no two writes overlapped"
+        );
         assert_eq!(
             *backend.bases.lock().unwrap(),
-            (0..2 * WRITES)
-                .map(|offset| InputVersion(start.0 + offset))
-                .collect::<Vec<_>>(),
+            vec![start; 2 * WRITES as usize]
         );
         let reader = server.handle().opener().open_reader().unwrap();
-        let last = InputVersion(start.0 + 2 * WRITES);
-        assert_eq!(reader.input_version(), last);
-        assert_eq!(reader.clean_watermark().unwrap(), Some(last.0 as i64));
+        assert_eq!(reader.input_version(), start);
+        assert_eq!(reader.clean_watermark().unwrap(), None);
     });
 }
 
@@ -1278,7 +1267,7 @@ fn a_coordinated_commits_backend_row_and_served_projection_land_together() {
 
 /// A connection whose write waits on SQLite's write lock blocks only
 /// itself: another connection snapshots, resolves and subscribes
-/// meanwhile, and receives the delta once the write publishes.
+/// meanwhile, and the write answers once the lock is free.
 #[test]
 fn a_connection_blocked_on_the_write_lock_does_not_stall_another() {
     watchdog(Duration::from_secs(60), || {
@@ -1303,7 +1292,6 @@ fn a_connection_blocked_on_the_write_lock_does_not_stall_another() {
         assert!(written_rx.try_recv().is_err(), "the write waits on the lock");
 
         let (ready_tx, ready_rx) = mpsc::channel();
-        let (delta_tx, delta_rx) = mpsc::channel();
         let reader = on_thread(move || async move {
             let started = Instant::now();
             let (_client, hub) = connect(address).await;
@@ -1322,9 +1310,6 @@ fn a_connection_blocked_on_the_write_lock_does_not_stall_another() {
                 Some(StreamEvent::InitialDelta { .. })
             ));
             ready_tx.send(started.elapsed()).unwrap();
-            delta_tx
-                .send(subscription.next().await.unwrap().expect("the stream ended"))
-                .unwrap();
         });
         let elapsed = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(
@@ -1337,15 +1322,11 @@ fn a_connection_blocked_on_the_write_lock_does_not_stall_another() {
         );
 
         holder.finish_input(false).unwrap();
-        let next = InputVersion(start.0 + 1);
         assert_eq!(
             written_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
-            Ok(next)
+            Ok(WriteReceipt::default())
         );
-        assert!(matches!(
-            delta_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
-            StreamEvent::Delta(Delta { basis, .. }) if basis.snapshot.version == next
-        ));
+        assert_eq!(server.current_stamp().version, start);
         writer.join().unwrap();
         reader.join().unwrap();
     });

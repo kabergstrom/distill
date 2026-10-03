@@ -19,7 +19,7 @@ use distill_pipeline_api::callbacks::MigrationKey;
 use distill_rpc::{
     decode_authoring_payload, AuthoringBackend, AuthoringEntry, AuthoringEntryRole, AuthoringOp,
     Commit, ImportJob, ImportRequest, InputVersion, LongRunningOp, PreparedImportCommit,
-    PreparedOperationCommit, RpcFailure,
+    PreparedOperationCommit, RpcFailure, WriteReceipt, WrittenFile,
 };
 use distill_store::{Current, Store, StoreOpener, StoreReader};
 
@@ -137,22 +137,42 @@ impl AuthoringService {
         Ok(next)
     }
 
-    fn prepare_direct_write(
+    /// Write the one bundle file a direct authoring batch changes. The
+    /// write is complete once the file is atomically on disk: the watcher
+    /// publishes it like any other edit. An error means the file did not
+    /// change.
+    fn write_direct(
         &self,
-        store: &mut Store,
+        store: &StoreReader,
         base: InputVersion,
         operations: &[AuthoringOp],
         force_lossy: bool,
-    ) -> Result<Commit, RpcFailure> {
+    ) -> Result<WriteReceipt, RpcFailure> {
         require_base(store, base)?;
         let planned = self.plan_bundle_mutation(store, operations, force_lossy)?;
-        self.publish_file(
-            store,
-            base,
-            planned.target,
-            planned.preimage,
-            planned.proposed,
-        )
+        let compiled = self.compiled(store)?;
+        let content_hash = match planned.proposed.as_deref() {
+            Some(bytes) => {
+                let root = compiled
+                    .scanner()
+                    .root_containing(&planned.target)
+                    .map_err(invalid)?;
+                atomic_file::write(&root, &planned.target, bytes, planned.preimage.into())
+                    .map_err(invalid)?;
+                Some(atomic_file::content_hash(bytes))
+            }
+            None => {
+                atomic_file::remove(&planned.target, planned.preimage.into()).map_err(invalid)?;
+                None
+            }
+        };
+        Ok(WriteReceipt {
+            files: vec![WrittenFile {
+                root: planned.root,
+                path: planned.path,
+                content_hash,
+            }],
+        })
     }
 
     /// Write or delete one bundle file, then publish the store rows for
@@ -225,7 +245,7 @@ impl AuthoringService {
         let compiled = self.compiled(store)?;
         let scanner = compiled.scanner();
 
-        let (target, preimage, mut bundle) = if let Some(meta) =
+        let (root, path, target, preimage, mut bundle) = if let Some(meta) =
             store.bundle(bundle_id).map_err(invalid)?
         {
             let root = store
@@ -261,7 +281,7 @@ impl AuthoringService {
                     }
                 }
             }
-            (target, Some(observed), bundle)
+            (root, meta.path, target, Some(observed), bundle)
         } else {
             if operations
                 .iter()
@@ -292,6 +312,8 @@ impl AuthoringService {
                 return Err(invalid("new bundle destination already exists"));
             }
             (
+                root.name.clone(),
+                path.to_owned(),
                 target,
                 None,
                 Bundle {
@@ -332,6 +354,8 @@ impl AuthoringService {
             Some(distill_bundle::write_bundle(&bundle).map_err(invalid)?)
         };
         Ok(PlannedBundleMutation {
+            root,
+            path,
             target,
             preimage,
             proposed,
@@ -479,14 +503,14 @@ fn migration_function_registered(compiled: &Compiled, key: &MigrationKey) -> boo
 }
 
 impl AuthoringBackend for AuthoringService {
-    fn prepare_write(
+    fn write_files(
         &self,
         store: &mut Store,
         base: InputVersion,
         operations: &[AuthoringOp],
         force_lossy: bool,
-    ) -> Result<Option<Commit>, RpcFailure> {
-        self.prepare_direct_write(store, base, operations, force_lossy).map(Some)
+    ) -> Result<Option<WriteReceipt>, RpcFailure> {
+        self.write_direct(store, base, operations, force_lossy).map(Some)
     }
 
     fn prepare_import(
@@ -537,6 +561,9 @@ impl AuthoringBackend for AuthoringService {
 }
 
 struct PlannedBundleMutation {
+    /// The bundle's root name and normalized path, and its physical path.
+    root: String,
+    path: String,
     target: PathBuf,
     preimage: Option<ContentHash>,
     proposed: Option<Vec<u8>>,

@@ -10,8 +10,8 @@ use distill_json::AuthoredValue;
 use distill_rpc::{
     AuthoringBackend, AuthoringEntry, AuthoringEntryRole, AuthoringInspectResult, AuthoringOp,
     AuthoringProgressState, AuthoringValue as RpcAuthoringValue, ConnectOutcome, ConnectRequest,
-    Delta, DoctorRequest, LongRunningOp, MetadataCall, MetadataNamespaceCall, StreamEvent,
-    TargetDefinition, TargetDefinitionHash,
+    ContentHash, Delta, DoctorRequest, LongRunningOp, MetadataCall, MetadataNamespaceCall,
+    RpcFailure, StreamEvent, TargetDefinition, TargetDefinitionHash, WriteReceipt, WrittenFile,
 };
 use distill_schema::ngp_schema::{
     node_hash, snapshot_to_json, LogicalSchema, PrimitiveKind, SchemaNode,
@@ -284,6 +284,57 @@ fn coordinator(temp: &tempfile::TempDir) -> DaemonCoordinator {
     .unwrap()
 }
 
+/// An RPC authoring write as the server runs it: the backend writes the
+/// files inside an input at `base` that is then rolled back.
+fn write_files(
+    coordinator: &DaemonCoordinator,
+    writer: &mut Store,
+    base: InputVersion,
+    operations: &[AuthoringOp],
+    force_lossy: bool,
+) -> Result<WriteReceipt, RpcFailure> {
+    assert_eq!(writer.open_input().unwrap(), base);
+    let written = coordinator
+        .authoring_service()
+        .write_files(writer, base, operations, force_lossy);
+    writer.finish_input(false).unwrap();
+    written.map(|receipt| receipt.expect("production authoring writes files"))
+}
+
+/// [`write_files`], then the watcher's batch for the written files. The
+/// version it publishes reflects the receipt.
+fn write_and_publish(
+    coordinator: &DaemonCoordinator,
+    writer: &mut Store,
+    base: InputVersion,
+    operations: &[AuthoringOp],
+    force_lossy: bool,
+) -> Result<(WriteReceipt, InputVersion), RpcFailure> {
+    let receipt = write_files(coordinator, writer, base, operations, force_lossy)?;
+    let scanner = coordinator.scanner();
+    let paths = receipt
+        .files
+        .iter()
+        .map(|file| scanner.physical_path(&file.root, &file.path).unwrap())
+        .collect();
+    let version = coordinator
+        .reconcile_incremental(writer, &WatcherBatch {
+            paths,
+            renames: Vec::new(),
+        })
+        .unwrap()
+        .version;
+    let reader = coordinator.open_reader().unwrap();
+    for file in &receipt.files {
+        assert_eq!(
+            reader.file_content_hash(&file.root, &file.path).unwrap(),
+            file.content_hash,
+            "the published version reflects {file:?}"
+        );
+    }
+    Ok((receipt, version))
+}
+
 #[test]
 fn startup_adopts_the_pending_restart_generation_before_rpc_construction() {
     let temp = tempfile::tempdir().unwrap();
@@ -395,33 +446,32 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
             blobs: Vec::new(),
         },
     });
-    let backend = Arc::clone(coordinator.authoring_service());
-    let stamp = coordinator
-        .coordinated_commit(&mut writer, InputVersion(1), |store| {
-            backend
-                .prepare_write(store, InputVersion(1), &[operation], false)
-                .map_err(|error| format!("{error:?}"))?
-                .ok_or_else(|| "production authoring returned no commit".to_owned())
-        })
-        .unwrap();
-    assert_eq!(stamp.version, InputVersion(2));
-    let rewritten = distill_bundle::parse_bundle(&std::fs::read(&bundle_path).unwrap()).unwrap();
-    assert_eq!(rewritten.assets["entry"].data, AuthoredValue::UInt(9));
+    let (receipt, version) =
+        write_and_publish(&coordinator, &mut writer, InputVersion(1), &[operation], false)
+            .unwrap();
+    assert_eq!(version, InputVersion(2));
+    let bytes = std::fs::read(&bundle_path).unwrap();
     assert_eq!(
-        coordinator.open_reader().unwrap().input_version(),
-        InputVersion(2)
+        receipt.files,
+        [WrittenFile {
+            root: "main".into(),
+            path: "ordinary.bundle".into(),
+            content_hash: Some(ContentHash(*blake3::hash(&bytes).as_bytes())),
+        }]
     );
+    let rewritten = distill_bundle::parse_bundle(&bytes).unwrap();
+    assert_eq!(rewritten.assets["entry"].data, AuthoredValue::UInt(9));
 
-    let backend = Arc::clone(coordinator.authoring_service());
-    let stamp = coordinator
-        .coordinated_commit(&mut writer, InputVersion(2), |store| {
-            backend
-                .prepare_write(store, InputVersion(2), &[AuthoringOp::Remove { uuid: asset_uuid }], false)
-                .map_err(|error| format!("{error:?}"))?
-                .ok_or_else(|| "production authoring returned no commit".to_owned())
-        })
-        .unwrap();
-    assert_eq!(stamp.version, InputVersion(3));
+    let (receipt, version) = write_and_publish(
+        &coordinator,
+        &mut writer,
+        InputVersion(2),
+        &[AuthoringOp::Remove { uuid: asset_uuid }],
+        false,
+    )
+    .unwrap();
+    assert_eq!(version, InputVersion(3));
+    assert_eq!(receipt.files[0].content_hash, None);
     assert!(!bundle_path.exists());
     let store = coordinator.open_reader().unwrap();
     assert_eq!(store.input_version(), InputVersion(3));
@@ -429,37 +479,57 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
     assert!(store.entry(asset_uuid).unwrap().is_none());
 }
 
+/// A direct write changes the file and commits nothing: the store keeps
+/// the old version until the watcher publishes the file. A write that fails
+/// changes no file.
 #[test]
-fn a_coordinated_publication_is_invisible_until_it_commits_whole() {
+fn a_direct_write_changes_the_file_and_commits_nothing() {
     let temp = tempfile::tempdir().unwrap();
     let (bytes, bundle_uuid, asset_uuid) = ordinary_bundle();
     let coordinator = coordinator(&temp);
     let mut writer = coordinator.open_writer().unwrap();
     let bundle_path = temp.path().join("assets/ordinary.bundle");
-    std::fs::write(&bundle_path, bytes).unwrap();
+    std::fs::write(&bundle_path, &bytes).unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
 
-    let backend = Arc::clone(coordinator.authoring_service());
-    let state = temp.path().join(".distill");
-    let stamp = coordinator
-        .coordinated_commit(&mut writer, InputVersion(1), |store| {
-            let commit = backend
-                .prepare_write(store, InputVersion(1), &[AuthoringOp::Remove { uuid: asset_uuid }], false)
-                .map_err(|error| format!("{error:?}"))?
-                .ok_or_else(|| "production authoring returned no commit".to_owned())?;
-            // The namespace is written, but not yet as a version anyone else
-            // can read: it commits with the served rows.
-            let outside = StoreReader::open(StoreConfig::new(state.clone())).unwrap();
-            assert_eq!(outside.input_version(), InputVersion(1));
-            assert!(outside.entry(asset_uuid).unwrap().is_some());
-            Ok(commit)
-        })
-        .unwrap();
-    assert_eq!(stamp.version, InputVersion(2));
-    let outside = StoreReader::open(StoreConfig::new(state)).unwrap();
-    assert_eq!(outside.input_version(), InputVersion(2));
-    assert!(outside.entry(asset_uuid).unwrap().is_none());
-    assert!(outside.bundle(bundle_uuid).unwrap().is_none());
+    // A stale base fails before any file changes.
+    writer.open_input().unwrap();
+    let stale = coordinator.authoring_service().write_files(
+        &mut writer,
+        InputVersion(0),
+        &[AuthoringOp::Remove { uuid: asset_uuid }],
+        false,
+    );
+    writer.finish_input(false).unwrap();
+    assert!(matches!(stale, Err(RpcFailure::StaleInputVersion { .. })));
+    assert_eq!(std::fs::read(&bundle_path).unwrap(), bytes);
+
+    write_files(
+        &coordinator,
+        &mut writer,
+        InputVersion(1),
+        &[AuthoringOp::Remove { uuid: asset_uuid }],
+        false,
+    )
+    .unwrap();
+    assert!(!bundle_path.exists());
+    let outside = StoreReader::open(StoreConfig::new(temp.path().join(".distill"))).unwrap();
+    assert_eq!(outside.input_version(), InputVersion(1));
+    assert!(outside.entry(asset_uuid).unwrap().is_some());
+    assert!(outside.bundle(bundle_uuid).unwrap().is_some());
+
+    // A second write planned against the same version finds the file it
+    // read gone, and changes nothing.
+    std::fs::write(&bundle_path, b"not the published bytes").unwrap();
+    assert!(write_files(
+        &coordinator,
+        &mut writer,
+        InputVersion(1),
+        &[AuthoringOp::Remove { uuid: asset_uuid }],
+        false,
+    )
+    .is_err());
+    assert_eq!(std::fs::read(&bundle_path).unwrap(), b"not the published bytes");
 }
 
 #[cfg(unix)]
@@ -826,21 +896,9 @@ fn rewrite_under_a_new_schema(
             blobs: Vec::new(),
         },
     });
-    let backend = Arc::clone(coordinator.authoring_service());
-    let mut failure = None;
-    let committed = coordinator.coordinated_commit(&mut writer, InputVersion(1), |store| {
-        match backend.prepare_write(store, InputVersion(1), &[operation], force_lossy) {
-            Ok(commit) => commit.ok_or_else(|| "no commit".to_owned()),
-            Err(error) => {
-                failure = Some(error);
-                Err("refused".to_owned())
-            }
-        }
-    });
-    if let Some(failure) = failure {
-        return Err(failure);
-    }
-    assert_eq!(committed.unwrap().version, InputVersion(2));
+    let (_, version) =
+        write_and_publish(&coordinator, &mut writer, InputVersion(1), &[operation], force_lossy)?;
+    assert_eq!(version, InputVersion(2));
     let rewritten = distill_bundle::parse_bundle(&std::fs::read(&bundle_path).unwrap()).unwrap();
     Ok(rewritten.assets["entry"].data.clone())
 }
@@ -982,7 +1040,7 @@ fn a_pending_scan_rejection_survives_an_authoring_write_and_a_restart() {
         ));
         assert!(!pending.subjects.is_empty());
 
-        // An RPC authoring write publishes its own version beside it.
+        // An RPC authoring write, published by the watcher, keeps it.
         let parsed = distill_bundle::parse_bundle(&std::fs::read(&bundle_path).unwrap()).unwrap();
         let original = &parsed.assets["entry"];
         let logical_schema = snapshot_to_json(&parsed.schemas[&original.schema_hash]).unwrap();
@@ -1002,17 +1060,10 @@ fn a_pending_scan_rejection_survives_an_authoring_write_and_a_restart() {
                 blobs: Vec::new(),
             },
         });
-        let backend = Arc::clone(coordinator.authoring_service());
         let base = coordinator.server().current_stamp().version;
-        let stamp = coordinator
-            .coordinated_commit(&mut writer, base, |store| {
-                backend
-                    .prepare_write(store, base, &[operation], false)
-                    .map_err(|error| format!("{error:?}"))?
-                    .ok_or_else(|| "production authoring returned no commit".to_owned())
-            })
-            .unwrap();
-        assert_eq!(stamp.version, InputVersion(base.0 + 1));
+        let (_, version) =
+            write_and_publish(&coordinator, &mut writer, base, &[operation], false).unwrap();
+        assert_eq!(version, InputVersion(base.0 + 1));
         let store = coordinator.open_reader().unwrap();
         assert_eq!(store.scan_rejection().unwrap().as_ref(), Some(&pending));
         assert_eq!(store.namespace_errors().unwrap(), pending.errors);

@@ -1504,10 +1504,15 @@ async fn hub_authoring_operation_and_wire_tree_methods_are_live_and_generation_f
                 write_authoring_entry_value(ops.reborrow().get(0).init_set(), &entry);
             }
             let write = write.send().promise.await.unwrap();
-            assert!(matches!(
-                write.get().unwrap().get_result().unwrap().which().unwrap(),
-                schema::u_int64_call::Which::Success(1)
-            ));
+            // An embedded server publishes the write itself: no file, an
+            // empty receipt.
+            match write.get().unwrap().get_result().unwrap().which().unwrap() {
+                schema::data_call::Which::Success(receipt) => assert_eq!(
+                    WriteReceipt::decode(receipt.unwrap()).unwrap(),
+                    WriteReceipt::default()
+                ),
+                _ => panic!("expected a write receipt"),
+            }
 
             let mut import = hub.import_request();
             {

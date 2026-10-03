@@ -555,20 +555,20 @@ impl AuthoringBackend for RecordingAuthoringBackend {
 }
 
 #[derive(Default)]
-struct DurableWriteBackend {
+struct FileWriteBackend {
     bases: Mutex<Vec<InputVersion>>,
 }
 
-impl AuthoringBackend for DurableWriteBackend {
-    fn prepare_write(
+impl AuthoringBackend for FileWriteBackend {
+    fn write_files(
         &self,
         _store: &mut distill_store::Store,
         base: InputVersion,
         _operations: &[AuthoringOp],
         _force_lossy: bool,
-    ) -> Result<Option<Commit>, RpcFailure> {
+    ) -> Result<Option<WriteReceipt>, RpcFailure> {
         self.bases.lock().unwrap().push(base);
-        Ok(Some(Commit::default()))
+        Ok(Some(receipt()))
     }
 
     fn prepare_import(
@@ -599,9 +599,21 @@ impl AuthoringBackend for DurableWriteBackend {
     }
 }
 
+fn receipt() -> WriteReceipt {
+    WriteReceipt {
+        files: vec![WrittenFile {
+            root: "main".to_owned(),
+            path: "a.bundle".to_owned(),
+            content_hash: Some(ContentHash([3; 32])),
+        }],
+    }
+}
+
+/// A backend that writes files answers their receipt and publishes
+/// nothing: the store follows the files. A stale base reaches no backend.
 #[test]
-fn durable_write_backend_owns_the_committed_projection() {
-    let backend = Arc::new(DurableWriteBackend::default());
+fn a_file_write_answers_its_receipt_and_publishes_nothing() {
+    let backend = Arc::new(FileWriteBackend::default());
     let server = Server::new_at_version_with_authoring_backend(
         StoreInstanceId([9; 16]),
         InputVersion(8),
@@ -617,10 +629,24 @@ fn durable_write_backend_owns_the_committed_projection() {
             vec![AuthoringOp::Remove { uuid: asset_id(7) }],
             false
         ),
-        RpcResult::Success(InputVersion(9))
+        RpcResult::Success(receipt())
     );
     assert_eq!(*backend.bases.lock().unwrap(), [InputVersion(8)]);
-    assert_eq!(server.current_stamp().version, InputVersion(9));
+    assert_eq!(server.current_stamp().version, InputVersion(8));
+    assert_eq!(
+        hub.write(
+            InputVersion(7),
+            vec![AuthoringOp::Remove { uuid: asset_id(7) }],
+            false
+        ),
+        RpcResult::Failure(RpcFailure::StaleInputVersion {
+            expected: InputVersion(8),
+            got: InputVersion(7),
+        })
+    );
+    assert_eq!(*backend.bases.lock().unwrap(), [InputVersion(8)]);
+    assert_eq!(server.current_stamp().version, InputVersion(8));
+    assert_eq!(WriteReceipt::decode(&receipt().encode()), Ok(receipt()));
 }
 
 #[test]
@@ -2256,8 +2282,9 @@ fn hub_authoring_and_wire_tree_surface_is_versioned_typed_and_generation_first()
     entry.terminal_type = type_id(1);
     assert_eq!(
         hub.write(InputVersion(0), vec![AuthoringOp::Set(entry.clone())], false),
-        RpcResult::Success(InputVersion(1))
+        RpcResult::Success(WriteReceipt::default())
     );
+    assert_eq!(server.current_stamp().version, InputVersion(1));
     assert_eq!(
         snapshot(&hub)
             .entry(entry.uuid)

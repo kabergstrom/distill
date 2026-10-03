@@ -1326,3 +1326,25 @@ fn candidate_rows_search_their_bucket() {
         ]
     );
 }
+
+/// A file's content hash, what a write receipt is waited on by, is one
+/// search of the root name's index and one of the files primary key.
+#[test]
+fn a_file_content_hash_searches_two_keys() {
+    let (_dir, store) = store_with(10);
+    assert_eq!(
+        store.query_plan_details(crate::files::FILE_CONTENT_HASH).unwrap(),
+        [
+            "SEARCH r USING COVERING INDEX sqlite_autoindex_roots_1 (name=?)",
+            "SEARCH t USING INDEX sqlite_autoindex_files_1 (root_id=? AND path=?)",
+        ]
+    );
+    let reader = store.reader().unwrap();
+    let path = bundle_path(0);
+    assert_eq!(
+        reader.file_content_hash("main", &path).unwrap(),
+        Some(ContentHash(*blake3::hash(b"bundle 0").as_bytes()))
+    );
+    assert_eq!(reader.file_content_hash("alt", &path).unwrap(), None);
+    assert_eq!(reader.file_content_hash("main", "missing").unwrap(), None);
+}

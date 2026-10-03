@@ -786,8 +786,10 @@ interface Hub {
   subscribe @1 (since :UInt64, assets :List(Data), paths :List(Text))
             -> (result :SubscribeCall);
   # forceLossy writes even when data held under the on-disk schema would
-  # be dropped.
-  write @2 (base :UInt64, ops :List(AuthoringOp), forceLossy :Bool) -> (result :UInt64Call);
+  # be dropped. Success is an encoded WriteReceipt: the files the write
+  # changed on disk, which the store publishes through its watcher.
+  # Protocol 13 (a version before).
+  write @2 (base :UInt64, ops :List(AuthoringOp), forceLossy :Bool) -> (result :DataCall);
   import @3 (base :UInt64, request :ImportRequest) -> (result :UuidCall);
   reimport @4 (base :UInt64, bundle :Uuid) -> (result :UuidCall);
   operation @5 (base :UInt64, operation :LongRunningOp) -> (result :ProgressCall);
@@ -836,6 +838,10 @@ interface AuthoringSnapshot {
   query @1 (query :AssetQuery) -> (result :UuidListCall);
   inspect @2 (uuid :Data) -> (result :AuthoringInspectCall);
   refresh @3 () -> (result :AuthoringSnapshotCall);
+  # The content hash of the file observed at path in root: 32 bytes, or
+  # empty for no file there. A WriteReceipt is reflected at the first
+  # version whose answers match it. Protocol 13.
+  file @4 (root :Text, path :Text) -> (result :DataCall);
 }
 
 interface ChunkStream {
