@@ -678,15 +678,18 @@ impl Server {
     /// holds no connection state; every connection gets a front end of its
     /// own ([`Root::connect`]).
     pub fn open(handle: &Arc<ServerHandle>) -> Self {
+        let reader = StoreReader::open(handle.config.clone())
+            .unwrap_or_else(|error| panic!("cannot read the served store: {error}"));
         Self {
-            inner: Rc::new(Inner::open(handle, None)),
+            inner: Rc::new(Inner::new(handle, reader, None)),
         }
     }
 
-    /// A front end of its own for one admitted connection.
-    fn connection(handle: &Arc<ServerHandle>, admission: Admission) -> Self {
+    /// A front end of its own for one admitted connection, on the reader
+    /// its handshake read.
+    fn connection(handle: &Arc<ServerHandle>, reader: StoreReader, admission: Admission) -> Self {
         Self {
-            inner: Rc::new(Inner::open(handle, Some(admission))),
+            inner: Rc::new(Inner::new(handle, reader, Some(admission))),
         }
     }
 
@@ -1594,19 +1597,21 @@ pub(crate) fn history_deltas(instance: StoreInstanceId, rows: &[ChangeEntry]) ->
     deltas
 }
 
-/// Read several facts from one committed version, on a reader of its own.
-fn read_consistent<T>(
+/// A connection's handshake: several facts read from one committed
+/// version, on the reader the connection then keeps.
+fn handshake<T>(
     config: &StoreConfig,
     read: impl FnOnce(&StoreReader) -> Result<T, StoreError>,
-) -> Result<T, StoreError> {
+) -> Result<(StoreReader, T), StoreError> {
+    #[cfg(test)]
+    bound_tests::HANDSHAKE_READERS.with(|opens| opens.set(opens.get() + 1));
     let snapshot = StoreReader::open(config.clone())?.begin_snapshot()?;
-    read(&snapshot)
+    let read = read(&snapshot)?;
+    Ok((snapshot.into_reader()?, read))
 }
 
 impl Inner {
-    fn open(handle: &Arc<ServerHandle>, admission: Option<Admission>) -> Self {
-        let reader = StoreReader::open(handle.config.clone())
-            .unwrap_or_else(|error| panic!("cannot read the served store: {error}"));
+    fn new(handle: &Arc<ServerHandle>, reader: StoreReader, admission: Option<Admission>) -> Self {
         Self {
             reader,
             writer: RefCell::new(None),
@@ -1913,9 +1918,10 @@ impl Root {
     /// metadata hub is a connection of its own.
     pub fn metadata(&self, protocol: u32) -> MetadataConnectOutcome {
         let handle = &self.handle;
-        let expected = read_consistent(&handle.config, |reader| reader.rpc_fences())
-            .map(|fences| fences.protocol_epoch.unwrap_or(PROTOCOL_VERSION))
-            .unwrap_or_else(|error| panic!("cannot read the served store: {error}"));
+        let (reader, expected) = match handshake(&handle.config, |reader| reader.rpc_fences()) {
+            Ok((reader, fences)) => (reader, fences.protocol_epoch.unwrap_or(PROTOCOL_VERSION)),
+            Err(error) => return MetadataConnectOutcome::Refused(store_failure(error)),
+        };
         if protocol != expected {
             return MetadataConnectOutcome::ProtocolMismatch {
                 expected,
@@ -1931,7 +1937,7 @@ impl Root {
                     id: handle.connection_id(),
                     protocol_epoch: expected,
                 }),
-                server: Server::connection(handle, admission),
+                server: Server::connection(handle, reader, admission),
             },
             instance: handle.instance,
             protocol_epoch: expected,
@@ -1942,7 +1948,7 @@ impl Root {
     pub fn connect(&self, request: ConnectRequest) -> ConnectOutcome {
         let handle = &self.handle;
         let target_name = request.target.nfc().collect::<String>();
-        let read = read_consistent(&handle.config, |reader| {
+        let read = handshake(&handle.config, |reader| {
             Ok((
                 reader.rpc_fences()?,
                 reader.rpc_target(&target_name)?,
@@ -1951,9 +1957,9 @@ impl Root {
                 reader.change_log_head()?,
             ))
         });
-        let (fences, target, configuration, pipeline, head) = match read {
+        let (reader, (fences, target, configuration, pipeline, head)) = match read {
             Ok(read) => read,
-            Err(error) => panic!("cannot read the served store: {error}"),
+            Err(error) => return ConnectOutcome::Refused(store_failure(error)),
         };
         let protocol = fences.protocol_epoch.unwrap_or(PROTOCOL_VERSION);
         if request.protocol != protocol {
@@ -1983,12 +1989,12 @@ impl Root {
                     PipelineUnavailableDiagnostic::PipelineFailure(failure),
                 );
             }
-            Err(error) => panic!("cannot read the served pipeline: {error}"),
+            Err(error) => return ConnectOutcome::Refused(store_failure(error)),
         }
         let Some(admission) = handle.admit_connection() else {
             return ConnectOutcome::Refused(connection_limit(handle));
         };
-        let server = Server::connection(handle, admission);
+        let server = Server::connection(handle, reader, admission);
         let connection = server
             .inner
             .open_connection(target_name, target.generation, &fences, head);
@@ -2061,6 +2067,35 @@ mod bound_tests {
         /// Connections this thread's front ends opened for read
         /// transactions.
         pub(super) static READER_OPENS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        /// Connections handshakes opened.
+        pub(super) static HANDSHAKE_READERS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A handshake reads on one connection, which its front end then
+    /// keeps: a target or metadata connection opens one reader, and its
+    /// first snapshot opens none.
+    #[test]
+    fn a_connection_reads_its_handshake_on_the_reader_it_keeps() {
+        let server = Server::new(
+            StoreInstanceId([9; 16]),
+            vec![TargetDefinition::new("dev", TargetDefinitionHash([7; 32]))],
+        )
+        .unwrap();
+        HANDSHAKE_READERS.with(|opens| opens.set(0));
+        READER_OPENS.with(|opens| opens.set(0));
+        let ConnectOutcome::Connected(connected) = connect(&server) else {
+            panic!("the connection is admitted");
+        };
+        assert_eq!(HANDSHAKE_READERS.with(|opens| opens.get()), 1);
+        let MetadataConnectOutcome::Connected(metadata) = server.root().metadata(PROTOCOL_VERSION) else {
+            panic!("the metadata connection is admitted");
+        };
+        assert_eq!(HANDSHAKE_READERS.with(|opens| opens.get()), 2);
+        assert_eq!(
+            connected.hub.server.inner.reader.input_version().unwrap(),
+            metadata.hub.server.inner.reader.input_version().unwrap()
+        );
+        assert_eq!(READER_OPENS.with(|opens| opens.get()), 0);
     }
 
     #[test]
