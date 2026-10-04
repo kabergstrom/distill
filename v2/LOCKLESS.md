@@ -1298,9 +1298,9 @@ What went:
   is a missing one.
 - `derived_outputs`. A derived child is its one `source_claims` claim
   while neither it nor its parent is withheld.
-- `cas_segments.file_name` (schema 58), a formatting of the row's id and
+- `cas_segments.file_name` (schema 60), a formatting of the row's id and
   kind.
-- `codegen_outputs` (schema 59). A generated file's mark says whether it
+- `codegen_outputs` (schema 61). A generated file's mark says whether it
   is distill's unedited output, and the files codegen generates plus a
   listing of the output directory name every file a publication writes
   or removes.
