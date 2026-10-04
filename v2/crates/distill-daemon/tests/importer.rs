@@ -114,6 +114,7 @@ fn import_with(
         },
         watch: true,
         root: "main".into(),
+        if_changed: false,
     };
     match connect(coordinator).import(base, request) {
         distill_rpc::RpcResult::Success(bundle) => bundle,
@@ -1583,4 +1584,93 @@ fn a_failed_rpc_reimport_commits_only_its_memo() {
         1,
         "the failure memo committed"
     );
+}
+
+/// Import through the hub as [`import_with`] does, with `if_changed`.
+fn import_if_changed(
+    coordinator: &DaemonCoordinator,
+    sources: &[&str],
+    dest: &str,
+    settings: &AuthoredValue,
+) -> BundleUuid {
+    let base = coordinator.server().current_stamp().unwrap().version;
+    let request = ImportRequest {
+        importer: BYTE_IMPORTER.into(),
+        sources: sources.iter().map(|source| (*source).to_owned()).collect(),
+        dest: dest.into(),
+        settings: AuthoringValue {
+            canonical_value: Arc::from(distill_json::write(settings).unwrap().into_bytes()),
+            blobs: Vec::new(),
+        },
+        watch: true,
+        root: "main".into(),
+        if_changed: true,
+    };
+    match connect(coordinator).import(base, request) {
+        distill_rpc::RpcResult::Success(bundle) => bundle,
+        other => panic!("expected an import, got {other:?}"),
+    }
+}
+
+/// `if_changed` skips an explicit import whose importer, sources, watch
+/// flag and completed settings equal what the destination's `$settings`
+/// and `$record` hold, and reimports when the settings differ, including a
+/// field left out that now takes the importer's default.
+#[test]
+fn if_changed_imports_skip_unchanged_settings_and_rerun_edited_ones() {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("source.txt"), b"4").unwrap();
+    let coordinator = DaemonCoordinator::open(
+        StoreConfig::new(temp.path().join(".distill")),
+        vec![AssetRoot::new("main", &assets)],
+        vec![target()],
+        64,
+    )
+    .unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    configure(&coordinator, temp.path(), &assets);
+    let read = || {
+        distill_bundle::parse_bundle(&std::fs::read(assets.join("imported.bundle")).unwrap())
+            .unwrap()
+    };
+
+    // A missing destination imports.
+    let tripled = settings([0, 0], 3);
+    let bundle = import_if_changed(&coordinator, &["source.txt"], "imported.bundle", &tripled);
+    assert_eq!(read().assets["asset"].data, byte(4 * 3));
+    let bytes = std::fs::read(assets.join("imported.bundle")).unwrap();
+
+    // The same line again: skipped, so the importer never sees the source
+    // change the watcher has not published yet. A sparse spelling
+    // completing to the same value is the same line.
+    std::fs::write(assets.join("source.txt"), b"5").unwrap();
+    let sparse = object([("scale", object([("by", AuthoredValue::UInt(3))]))]);
+    for same in [&tripled, &sparse] {
+        assert_eq!(
+            import_if_changed(&coordinator, &["source.txt"], "imported.bundle", same),
+            bundle
+        );
+    }
+    assert_eq!(std::fs::read(assets.join("imported.bundle")).unwrap(), bytes);
+    assert_eq!(read().assets["asset"].data, byte(4 * 3));
+    let skipped_to = coordinator.server().current_stamp().unwrap().version;
+    assert!(changed_assets(&coordinator.open_reader().unwrap(), skipped_to).is_empty());
+    std::fs::write(assets.join("source.txt"), b"4").unwrap();
+
+    // Edited settings reimport, keeping the bundle identity.
+    let doubled = settings([1, 0], 2);
+    assert_eq!(
+        import_if_changed(&coordinator, &["source.txt"], "imported.bundle", &doubled),
+        bundle
+    );
+    assert_eq!(read().assets["$settings"].data, doubled);
+    assert_eq!(read().assets["asset"].data, byte((4 + 1) * 2));
+
+    // Settings left out take the defaults, which differ: reimport.
+    import_if_changed(&coordinator, &["source.txt"], "imported.bundle", &object([]));
+    assert_eq!(read().assets["$settings"].data, default_settings());
+    assert_eq!(read().assets["asset"].data, byte(4));
 }

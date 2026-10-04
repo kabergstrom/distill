@@ -18,7 +18,7 @@ static SYSTEM: std::alloc::System = std::alloc::System;
 const USAGE: &str = "usage:
   distilld [config-path]
   distilld import <config-path> <source> <dest-bundle> --importer <id> --settings <json>
-                  [--root <name>] [--target <name>] [--no-watch] [--if-missing] [--wait <seconds>]
+                  [--root <name>] [--target <name>] [--no-watch] [--if-missing | --if-changed] [--wait <seconds>]
   distilld engine-args <config-path> [target]
   distilld pack <config-path> <definition-uuid> <output-directory>";
 
@@ -77,6 +77,7 @@ fn import(args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
     let mut target = None;
     let mut watch = true;
     let mut if_missing = false;
+    let mut if_changed = false;
     let mut wait = DEFAULT_IMPORT_WAIT;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -91,6 +92,7 @@ fn import(args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
             Some("--wait") => wait = Duration::from_secs_f64(value()?.parse()?),
             Some("--no-watch") => watch = false,
             Some("--if-missing") => if_missing = true,
+            Some("--if-changed") => if_changed = true,
             _ => positional.push(arg),
         }
     }
@@ -125,6 +127,7 @@ fn import(args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
         },
         watch,
         root,
+        if_changed,
     };
     let address = config.daemon.address;
     if address.port() == 0 {

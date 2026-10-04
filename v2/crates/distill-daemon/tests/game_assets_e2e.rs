@@ -529,6 +529,7 @@ fn import_assets(process: &DaemonProcess, config: &DaemonConfig, assets: &Path) 
             },
             watch: true,
             root: "main".into(),
+            if_changed: false,
         },
         Duration::from_secs(30),
     )

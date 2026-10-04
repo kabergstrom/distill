@@ -687,9 +687,13 @@ should reach zero by the end of phase 6.
       fixed port).
   - **CLI:** `distilld init <config>`, `distilld import <config> <source>
     <dest> --importer <id> --settings <json> [--root] [--target]
-    [--no-watch] [--if-missing] [--wait]`, `distilld engine-args <config>
-    [target]`. `--settings` is required: the RPC import takes explicit
-    settings and has no "importer default" spelling.
+    [--no-watch] [--if-missing | --if-changed] [--wait]`, `distilld engine-args
+    <config> [target]`. `--settings` is required: the RPC import takes
+    explicit settings and has no "importer default" spelling.
+    `--if-changed` (`ImportRequest::if_changed`): the daemon skips the import
+    when the destination already holds an import by the same importer of
+    the same sources and watch flag whose `$settings` equal the request's
+    settings completed with the importer's defaults.
   - `game_assets_e2e` bootstraps through `init` (a rerun writes nothing)
     and imports through the RPC hub.
   - **source-walk `--pipeline-manifest <crate>`** walks the pipeline crate

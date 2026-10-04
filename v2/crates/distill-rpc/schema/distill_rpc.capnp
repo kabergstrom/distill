@@ -628,6 +628,7 @@ struct ImportRequest {
   settings @3 :AuthoringValue;
   watch @4 :Bool;
   root @5 :Text;
+  ifChanged @6 :Bool;
 }
 
 struct LongRunningOp {

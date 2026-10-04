@@ -1776,6 +1776,7 @@ fn decode_import_request(
         .map_err(|error| error.message)?,
         settings: decode_authoring_value(request.get_settings().map_err(authoring_decode_error)?)?,
         watch: request.get_watch(),
+        if_changed: request.get_if_changed(),
         root: decode_text(
             request.get_root().map_err(authoring_decode_error)?,
             "import.root",

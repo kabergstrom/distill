@@ -2634,6 +2634,7 @@ fn hub_authoring_and_wire_tree_surface_is_versioned_typed_and_generation_first()
         },
         watch: true,
         root: "assets".to_owned(),
+        if_changed: true,
     };
     assert_eq!(
         recording.import(InputVersion(1), import_request.clone()),
@@ -2773,6 +2774,7 @@ fn an_unregistered_importer_is_typed_and_never_advances_the_input_version() {
         },
         watch: false,
         root: String::new(),
+        if_changed: false,
     };
     assert_eq!(
         daemon.import(base.version, request),

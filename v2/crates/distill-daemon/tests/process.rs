@@ -1406,6 +1406,7 @@ fn start_gate_daemon(temp: &tempfile::TempDir, variant: &GateVariant) -> DaemonP
             },
             watch: true,
             root: "main".into(),
+            if_changed: false,
         },
         Duration::from_secs(30),
     )

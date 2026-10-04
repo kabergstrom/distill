@@ -212,6 +212,7 @@ impl RemoteHub {
             }
             wire.set_dest(request.dest.as_str());
             wire.set_watch(request.watch);
+            wire.set_if_changed(request.if_changed);
             wire.set_root(request.root.as_str());
             let mut settings = wire.init_settings();
             settings.set_canonical_value(&request.settings.canonical_value);

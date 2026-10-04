@@ -497,6 +497,12 @@ impl AuthoringBackend for AuthoringService {
         base: InputVersion,
         request: &ImportRequest,
     ) -> Result<PreparedImportCommit, RpcFailure> {
+        if let Some(bundle) = self.unchanged_import_request(store, base, request)? {
+            return Ok(PreparedImportCommit {
+                bundle,
+                commit: Commit::default(),
+            });
+        }
         self.prepare_import_request(store, base, request)
     }
 
@@ -514,6 +520,18 @@ impl AuthoringBackend for AuthoringService {
         base: InputVersion,
         request: ImportRequest,
     ) -> Result<ImportJob, RpcFailure> {
+        let unchanged = {
+            let snapshot = self.snapshot()?;
+            self.unchanged_import_request(&snapshot, base, &request)?
+        };
+        if let Some(bundle) = unchanged {
+            return Ok(Box::new(move |_| {
+                Ok(Ok(PreparedImportCommit {
+                    bundle,
+                    commit: Commit::default(),
+                }))
+            }));
+        }
         let run = self.run_import_request(base, &request)?;
         Ok(Box::new(move |store| {
             self.publish_import_run(store, base, run)

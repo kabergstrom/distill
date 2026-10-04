@@ -467,6 +467,11 @@ pub struct ImportRequest {
     pub settings: AuthoringValue,
     pub watch: bool,
     pub root: String,
+    /// Skip the import when the destination already holds an import by
+    /// `importer` of the same sources and watch flag whose `$settings` equal
+    /// these settings completed with the importer's defaults; the reply
+    /// names the existing bundle.
+    pub if_changed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

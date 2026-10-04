@@ -894,7 +894,7 @@ impl AuthoringService {
 
     /// A read snapshot of the store's committed state, for a run that
     /// executes outside any write.
-    fn snapshot(&self) -> Result<distill_store::served::StoreSnapshot, RpcFailure> {
+    pub(crate) fn snapshot(&self) -> Result<distill_store::served::StoreSnapshot, RpcFailure> {
         self.opener
             .open_reader()
             .and_then(StoreReader::begin_snapshot)
@@ -1035,6 +1035,40 @@ impl AuthoringService {
             None => prior.model.record.read_set.clone(),
         };
         Ok(!revalidate_read_set(&basis, &mut backend))
+    }
+
+    /// The bundle `request` would import again unchanged: with `if_changed`,
+    /// when its destination holds an explicit import by the same importer
+    /// of the same sources and watch flag whose `$settings` equal the
+    /// request's settings completed with the importer's defaults. `None`
+    /// means the request runs.
+    pub(crate) fn unchanged_import_request(
+        &self,
+        store: &StoreReader,
+        base: InputVersion,
+        request: &ImportRequest,
+    ) -> Result<Option<BundleUuid>, RpcFailure> {
+        if !request.if_changed {
+            return Ok(None);
+        }
+        let (importer, invocation) = self.import_invocation(store, base, request)?;
+        let Some(prior) = invocation.prior.as_ref() else {
+            return Ok(None);
+        };
+        let record = &prior.model.record;
+        let sorted = |sources: &[RootedPath]| {
+            let mut sources = sources.to_vec();
+            sources.sort_unstable();
+            sources.dedup();
+            sources
+        };
+        let unchanged = record.origin.is_none()
+            && record.importer == importer.id
+            && record.watch == invocation.watch
+            && sorted(&record.sources) == sorted(&invocation.sources)
+            && prior.settings_type_uuid == importer.settings_type_uuid
+            && invocation.explicit_settings.as_ref() == Some(&prior.model.settings);
+        Ok(unchanged.then_some(prior.model.bundle_uuid))
     }
 
     pub(crate) fn prepare_import_request(
