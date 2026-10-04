@@ -525,6 +525,19 @@ impl Store {
         Ok(hash)
     }
 
+    /// Record the typed direct load edges of `hash`, an extent a result
+    /// holds, replacing any earlier ones. The edges go with the extent.
+    pub fn record_load_edges(
+        &mut self,
+        hash: ContentHash,
+        load_edges: &[(AssetUuid, distill_core::id::TypeUuid)],
+    ) -> Result<(), StoreError> {
+        use crate::served::ServedWrite;
+        self.write_txn(|store| {
+            store.served_transaction(|txn| txn.record_artifact_load_edges(hash, load_edges))
+        })
+    }
+
     /// Commit one build result (§13), in one write transaction (the
     /// caller's, when one is open): the bytes not yet in the CAS first,
     /// one fsync per touched segment, then the extent rows, the `results`

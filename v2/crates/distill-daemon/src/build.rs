@@ -948,8 +948,15 @@ struct CellScope<'w> {
 enum BuildWrite {
     WireTree(Vec<u8>),
     Commit(BuildCommit),
+    /// An install: the artifact is its own holder (an output no result
+    /// holds).
     Artifact {
         bytes: Arc<[u8]>,
+        load_edges: Vec<(AssetUuid, TypeUuid)>,
+    },
+    /// The load edges of an output its result holds.
+    LoadEdges {
+        hash: ContentHash,
         load_edges: Vec<(AssetUuid, TypeUuid)>,
     },
 }
@@ -1050,6 +1057,9 @@ fn flush_writes(context: &BuildContext) -> Result<(), BuildError> {
                     load_edges,
                 } => {
                     store.put_artifact(&bytes, &load_edges)?;
+                }
+                BuildWrite::LoadEdges { hash, load_edges } => {
+                    store.record_load_edges(hash, &load_edges)?;
                 }
             }
         }
@@ -3122,8 +3132,12 @@ fn assemble_pending(
         .map(|(output_key, row)| (output_key.clone(), row.content_hash))
         .collect::<BTreeMap<_, _>>();
 
-    for tree in wire_trees.values() {
-        record_write(context, BuildWrite::WireTree(tree.clone()));
+    // A cacheable node's result holds its outputs and their wire trees;
+    // an uncacheable one's are installs.
+    if !cacheable {
+        for tree in wire_trees.values() {
+            record_write(context, BuildWrite::WireTree(tree.clone()));
+        }
     }
     if cacheable {
         let key = {
@@ -3159,15 +3173,23 @@ fn assemble_pending(
             .artifacts
             .borrow_mut()
             .insert(content_hash, Arc::clone(&artifact.bytes));
+        let load_edges = artifact
+            .load_edges
+            .iter()
+            .map(|edge| (edge.asset, edge.expected_terminal))
+            .collect();
         record_write(
             context,
-            BuildWrite::Artifact {
-                bytes: artifact.bytes,
-                load_edges: artifact
-                    .load_edges
-                    .iter()
-                    .map(|edge| (edge.asset, edge.expected_terminal))
-                    .collect(),
+            if cacheable {
+                BuildWrite::LoadEdges {
+                    hash: content_hash,
+                    load_edges,
+                }
+            } else {
+                BuildWrite::Artifact {
+                    bytes: artifact.bytes,
+                    load_edges,
+                }
             },
         );
     }
@@ -5394,6 +5416,13 @@ mod tests {
                 .unwrap(),
             RuntimeTypePolicy { build_only: false }
         );
+        // The cacheable chain's outputs and wire trees are held by its
+        // result alone: no install pins them.
+        let meta = rusqlite::Connection::open(temp.path().join("state/meta.sqlite")).unwrap();
+        let count = |sql: &str| meta.query_row(sql, [], |row| row.get::<_, i64>(0)).unwrap();
+        assert_eq!(count("SELECT COUNT(*) FROM cas_refs"), 0);
+        assert!(count("SELECT COUNT(*) FROM result_outputs WHERE role = 0") > 0);
+        drop(meta);
         for artifact in &first.artifacts {
             coordinator
                 .server()
