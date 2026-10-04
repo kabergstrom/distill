@@ -26,7 +26,7 @@ use crate::state::{
 };
 
 /// The scan's namespace errors.
-const NAMESPACE: i64 = 1;
+pub(crate) const NAMESPACE: i64 = 1;
 /// The namespace errors of the pending scan rejection.
 const SCAN_REJECTION: i64 = 2;
 /// The configuration error of the pending scan rejection (at most one row).
@@ -189,21 +189,7 @@ impl InputTxn<'_> {
             if held.remove(error.identity.as_slice()).as_ref() == Some(&record) {
                 continue;
             }
-            let scope = error.scope();
-            self.txn
-                .prepare_cached(
-                    "INSERT OR REPLACE INTO errors(family, scope_kind, scope_id, identity, code, record, message)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                )?
-                .execute(rusqlite::params![
-                    family,
-                    scope.kind(),
-                    scope.id(),
-                    error.identity.as_slice(),
-                    error.code as u16,
-                    record,
-                    error.message,
-                ])?;
+            write_namespace_error(&self.txn, family, error, &record)?;
         }
         for identity in held.keys() {
             self.txn
@@ -212,6 +198,30 @@ impl InputTxn<'_> {
         }
         Ok(errors)
     }
+}
+
+/// Write `error`, whose persisted bytes are `record`, as a row of `family`.
+pub(crate) fn write_namespace_error(
+    conn: &rusqlite::Connection,
+    family: i64,
+    error: &NamespaceError,
+    record: &[u8],
+) -> Result<(), StoreError> {
+    let scope = error.scope();
+    conn.prepare_cached(
+        "INSERT OR REPLACE INTO errors(family, scope_kind, scope_id, identity, code, record, message)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?
+    .execute(rusqlite::params![
+        family,
+        scope.kind(),
+        scope.id(),
+        error.identity.as_slice(),
+        error.code as u16,
+        record,
+        error.message,
+    ])?;
+    Ok(())
 }
 
 impl StoreReader {
@@ -341,7 +351,7 @@ impl StoreReader {
         Ok(Some(error))
     }
 
-    fn decode_errors(
+    pub(crate) fn decode_errors(
         &self,
         sql: &str,
         params: impl rusqlite::Params,

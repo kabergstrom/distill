@@ -505,8 +505,10 @@ should reach zero by the end of phase 6.
   - **Claims in tables** (`claims.rs`, schema 30).
     - `source_claims` holds one row per claim per source. Claim kinds are
       bundle, authored, derived, primary path, lineage and malformed.
-    - `claim_collisions` and `claim_pending` are kept by
-      `InputTxn::replace_source_claims`, for the touched subjects only.
+    - A collided subject is its namespace error row (`errors`, found by
+      `errors_by_scope`), written by `InputTxn::replace_source_claims`
+      for the touched subjects only. The subjects pending publication are
+      its return value, not a table.
     - An incremental scan writes its files, structure and claims, then
       plans against `transaction.reader()`, all in one input transaction.
     - `ScanProjectionIndex` and its checkpoint/restore logic are deleted.

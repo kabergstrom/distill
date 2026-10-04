@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 50;
+pub const SCHEMA_VERSION: u32 = 51;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -112,22 +112,13 @@ CREATE TABLE errors (
     message    TEXT NOT NULL,
     PRIMARY KEY (family, identity)
 );
+-- An entity's errors: a claim subject's collision row (scope 2 bundle,
+-- 3 asset) is found by its subject.
+CREATE INDEX errors_by_scope ON errors(scope_kind, scope_id);
 -- The physical subjects (platform path encoding) whose revalidation heals
 -- the pending scan rejection.
 CREATE TABLE scan_rejection_subjects (
     path BLOB NOT NULL PRIMARY KEY
-);
--- Subjects with more than one distinct claimant (group 0 bundles, 1 assets).
-CREATE TABLE claim_collisions (
-    grp     INTEGER NOT NULL,
-    subject BLOB NOT NULL,
-    PRIMARY KEY (grp, subject)
-);
--- Claim subjects changed since the last clean publication.
-CREATE TABLE claim_pending (
-    kind    INTEGER NOT NULL,
-    subject BLOB NOT NULL,
-    PRIMARY KEY (kind, subject)
 );
 -- The watcher work no pass has consumed yet, in order. kind 0: `path` was
 -- deleted, 1: `path` exists as observed at input version `observation`,

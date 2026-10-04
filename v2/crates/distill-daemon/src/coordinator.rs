@@ -32,7 +32,7 @@ use distill_store::bundles::{
     AssetRecord, BundleMeta, NamespaceSkeleton as StoreNamespaceSkeleton,
     SkeletonEntry,
 };
-use distill_store::claims::{DerivedOutputClaim, SourceClaim, SourceClaims};
+use distill_store::claims::{DerivedOutputClaim, PendingClaims, SourceClaim, SourceClaims};
 use distill_store::config::{PendingRestart, RestartOnlyChange};
 use distill_store::errors::ScanRejectionRecord;
 use distill_store::files::{FileObservation, PendingFileWork};
@@ -1812,10 +1812,10 @@ fn claimed_source(
 fn incremental_plan(
     reader: &StoreReader,
     inputs: &PlanInputs<'_>,
+    pending: PendingClaims,
 ) -> Result<IncrementalScanPlan, CoordinatorError> {
     let namespace_errors = NamespaceError::canonical_set(reader.claims_namespace_errors()?)
         .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-    let pending = reader.pending_claims()?;
     // Every source of each pending bundle: a colliding bundle withholds the
     // assets of all of them.
     let mut claimed = BTreeMap::new();
@@ -2628,9 +2628,10 @@ fn publish_reconfiguration(
                 transaction.publish_pipeline_failure(failure)?;
             }
         }
-        transaction.replace_source_claims(Some(&keys), &claims)?;
+        let pending = transaction.replace_source_claims(Some(&keys), &claims)?;
         publish_claimed(
             transaction,
+            pending,
             &PlanInputs {
                 authority: Some(authority),
                 fresh,
@@ -2733,9 +2734,10 @@ fn publish_incremental_scan(
             &delta.observed().directory_rows(),
             &delta.observed().encoded_diagnostic_rows(),
         )?;
-        transaction.replace_source_claims(Some(delta.affected_prefixes()), claims)?;
+        let pending = transaction.replace_source_claims(Some(delta.affected_prefixes()), claims)?;
         let commit = publish_claimed(
             transaction,
+            pending,
             inputs,
             projection,
             &BTreeSet::new(),
@@ -2757,11 +2759,12 @@ fn publish_incremental_scan(
 /// input: the namespace errors, the configuration status (its generation
 /// advanced when `advance_configuration`), the bundles whose rows change
 /// (and every bundle of `forced`, whose rows change without its summary or
-/// assets: a retype, a new skeleton), the derived outputs, and the pending
-/// claims cleared.
+/// assets: a retype, a new skeleton), and the derived outputs, of the
+/// subjects `pending` names.
 #[allow(clippy::too_many_arguments)] // Each input is independently pinned by the caller.
 fn publish_claimed(
     transaction: &mut distill_store::InputTxn<'_>,
+    pending: PendingClaims,
     inputs: &PlanInputs<'_>,
     projection: &PipelineProjection,
     forced: &BTreeSet<BundleUuid>,
@@ -2773,7 +2776,7 @@ fn publish_claimed(
         mut commit,
         changed_bundles,
         configuration_generation,
-    } = prepare_incremental_publication(&transaction.reader(), inputs, projection, forced)?;
+    } = prepare_incremental_publication(&transaction.reader(), inputs, pending, projection, forced)?;
     transaction.set_namespace_errors(plan.namespace_errors.iter().cloned())?;
     let generation = if advance_configuration {
         configuration_generation
@@ -2864,7 +2867,6 @@ fn publish_claimed(
             }
         }
     }
-    transaction.clear_pending_claims()?;
     Ok(commit)
 }
 
@@ -2880,10 +2882,11 @@ struct IncrementalPublication {
 fn prepare_incremental_publication(
     store: &StoreReader,
     inputs: &PlanInputs<'_>,
+    pending: PendingClaims,
     projection: &PipelineProjection,
     forced: &BTreeSet<BundleUuid>,
 ) -> Result<IncrementalPublication, StoreError> {
-    let plan = incremental_plan(store, inputs).map_err(|error| match error {
+    let plan = incremental_plan(store, inputs, pending).map_err(|error| match error {
         CoordinatorError::Drifted { root, path } => StoreError::Drifted { root, path },
         error => StoreError::InvalidConfiguration {
             error: error.to_string(),

@@ -64,8 +64,6 @@ fn every_section_13_table_exists() {
         "directories",
         "scan_diagnostics",
         "source_claims",
-        "claim_collisions",
-        "claim_pending",
         "import_keys",
         "file_work",
         "bundles",

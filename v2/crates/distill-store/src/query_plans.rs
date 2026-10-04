@@ -1486,7 +1486,7 @@ fn reconfigured_sources_are_index_searches() {
                 "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)",
                 "UNION USING TEMP B-TREE",
                 // The collisions: the defects, never the namespace's claims.
-                "SCAN c",
+                "SEARCH c USING INDEX sqlite_autoindex_errors_1 (family=?)",
                 "SEARCH t USING INDEX source_claims_by_subject (kind=? AND subject=?)",
                 "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)",
             ],
@@ -1648,6 +1648,7 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         store.replace_import_index(&sources[..1], &rows[..1]).unwrap();
         store.directory_rule_sources_listing(["", "d04/"]).unwrap();
         store.directory_rule_sources_at("main", &bundle_path(4)).unwrap();
+        store.claims_namespace_errors().unwrap();
         store.pipeline_failure().unwrap();
         store.pipeline_module_hash().unwrap();
         // A rejected pipeline candidate: no module, one failure row.
@@ -1692,15 +1693,11 @@ fn pass_bookkeeping_statements_search_their_indexes() {
     };
     let by_root = "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)";
     let by_subject = ["SEARCH source_claims USING INDEX source_claims_by_subject (kind=? AND subject=?)"];
-    let counted = [
-        "USE TEMP B-TREE FOR count(DISTINCT)",
-        "SEARCH source_claims USING INDEX source_claims_by_subject (kind=? AND subject=?)",
-    ];
     let distinct = [
         "SEARCH source_claims USING INDEX source_claims_by_subject (kind=? AND subject=?)",
         "USE TEMP B-TREE FOR DISTINCT",
     ];
-    let cases: [(&str, &[&str]); 18] = [
+    let cases: [(&str, &[&str]); 23] = [
         (
             "SELECT root_id, path, canonical_path, physical_path FROM directories",
             &["SCAN directories"],
@@ -1718,8 +1715,13 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         ),
         ("SELECT DISTINCT claimant FROM source_claims WHERE kind = 3", &distinct),
         // A subject's claimants, whatever index orders claimants.
-        ("SELECT COUNT(DISTINCT claimant) FROM source_claims WHERE kind IN (0)", &counted),
-        ("SELECT COUNT(DISTINCT claimant) FROM source_claims WHERE kind IN (1, 2)", &counted),
+        ("SELECT DISTINCT claimant FROM source_claims WHERE kind IN (0)", &distinct),
+        ("SELECT DISTINCT claimant FROM source_claims WHERE kind IN (1, 2)", &distinct),
+        // The row recording a subject's collision, and its replacement.
+        (
+            "SELECT identity FROM errors WHERE scope_kind",
+            &["SEARCH errors USING INDEX errors_by_scope (scope_kind=? AND scope_id=?)"],
+        ),
         ("SELECT DISTINCT claimant FROM source_claims WHERE kind = 0", &distinct),
         // The pending work: a pass's whole queue.
         ("SELECT w.seq", &["SCAN w", by_root]),
@@ -1755,8 +1757,25 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         ),
         ("SELECT claimant FROM source_claims WHERE kind = 1", &by_subject),
         (
-            "INSERT OR IGNORE INTO claim_pending(kind, subject) SELECT kind, subject",
+            "SELECT subject FROM source_claims WHERE kind",
             &["SEARCH source_claims USING INDEX source_claims_by_claimant (claimant=? AND kind=?)"],
+        ),
+        (
+            "SELECT 1 FROM source_claims WHERE kind",
+            &["SEARCH source_claims USING COVERING INDEX source_claims_by_subject (kind=? AND subject=?)"],
+        ),
+        // A full replacement's held collisions, and a resolved one's row.
+        (
+            "SELECT identity FROM errors WHERE family = 1 AND scope_kind IN (2, 3)",
+            &["SEARCH errors USING INDEX sqlite_autoindex_errors_1 (family=?)"],
+        ),
+        (
+            "DELETE FROM errors WHERE family = 1 AND identity",
+            &["SEARCH errors USING INDEX sqlite_autoindex_errors_1 (family=? AND identity=?)"],
+        ),
+        (
+            "SELECT record FROM errors WHERE family = 1 AND scope_kind IN (2, 3)",
+            &["SEARCH errors USING INDEX sqlite_autoindex_errors_1 (family=?)"],
         ),
         (
             "SELECT identity, record FROM errors",
