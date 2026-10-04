@@ -279,7 +279,10 @@ impl DaemonCoordinator {
         &self,
         reader: &StoreReader,
     ) -> Result<Option<PipelineFailure>, CoordinatorError> {
-        let compiled = self.compiled.at(reader).map_err(CoordinatorError::Compiled)?;
+        let compiled = self
+            .compiled
+            .at(reader)
+            .map_err(CoordinatorError::Compiled)?;
         Ok(compiled.pipeline_failure())
     }
 
@@ -543,7 +546,10 @@ impl DaemonCoordinator {
     /// The restart-only changes the configuration file asks for, against
     /// the values this process runs (none clears them): what every RPC
     /// stream is told requires a restart.
-    pub fn set_restart_required(&self, changes: &[RestartOnlyChange]) -> Result<(), CoordinatorError> {
+    pub fn set_restart_required(
+        &self,
+        changes: &[RestartOnlyChange],
+    ) -> Result<(), CoordinatorError> {
         self.server
             .set_restart_required(changes)
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
@@ -1894,12 +1900,7 @@ fn incremental_plan(
         .into_iter()
         .map(|path| Ok((path.clone(), reader.path_claims(&path)?)))
         .collect::<Result<BTreeMap<_, _>, StoreError>>()?;
-    let withheld = Withheld::claimed(
-        reader,
-        &pending.assets,
-        &claimed,
-        paths.values().flatten(),
-    )?;
+    let withheld = Withheld::claimed(reader, &pending.assets, &claimed, paths.values().flatten())?;
     let mut bundles = BTreeMap::new();
     let mut bundle_poisons = BTreeMap::new();
     for (bundle, sources) in claimed {
@@ -2933,15 +2934,12 @@ fn prepare_incremental_publication(
     projection: &PipelineProjection,
     forced: &BTreeSet<BundleUuid>,
 ) -> Result<IncrementalPublication, StoreError> {
-    let plan =
-        incremental_plan(store, inputs, pending).map_err(
-            |error| match error {
-                CoordinatorError::Drifted { root, path } => StoreError::Drifted { root, path },
-                error => StoreError::InvalidConfiguration {
-                    error: error.to_string(),
-                },
-            },
-        )?;
+    let plan = incremental_plan(store, inputs, pending).map_err(|error| match error {
+        CoordinatorError::Drifted { root, path } => StoreError::Drifted { root, path },
+        error => StoreError::InvalidConfiguration {
+            error: error.to_string(),
+        },
+    })?;
     let mut durable_bundles = BTreeMap::new();
     for bundle in plan.bundles.keys() {
         let meta = store.bundle(*bundle)?;

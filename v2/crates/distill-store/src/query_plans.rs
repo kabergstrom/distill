@@ -2016,9 +2016,12 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         found
     };
     let by_root = "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)";
-    let by_subject =
-        ["SEARCH source_claims USING COVERING INDEX source_claims_by_subject (kind=? AND subject=?)"];
-    let distinct = ["SEARCH source_claims USING COVERING INDEX source_claims_by_subject (kind=? AND subject=?)"];
+    let by_subject = [
+        "SEARCH source_claims USING COVERING INDEX source_claims_by_subject (kind=? AND subject=?)",
+    ];
+    let distinct = [
+        "SEARCH source_claims USING COVERING INDEX source_claims_by_subject (kind=? AND subject=?)",
+    ];
     let cases: [(&str, &[&str]); 16] = [
         // A full replacement streams the claims (a whole-namespace pass)
         // and deletes the stale ones by key.

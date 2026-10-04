@@ -98,13 +98,11 @@ const CHANGE_RECONNECT_ALL: i64 = 3;
 
 /// Asset `?1`'s published deltas with `?2 < version <= ?3`, on the asset
 /// deltas' partial index (kind literal: [`CHANGE_ASSET`]).
-pub(crate) const ASSET_HISTORY: &str =
-    "SELECT seq, version, kind, asset_uuid, state, subject
+pub(crate) const ASSET_HISTORY: &str = "SELECT seq, version, kind, asset_uuid, state, subject
      FROM change_log WHERE kind = 1 AND asset_uuid = ?1 AND version > ?2 AND version <= ?3";
 /// Path `?1`'s published deltas with `?2 < version <= ?3`, on the path
 /// deltas' partial index (kind literal: [`CHANGE_PATH`]).
-pub(crate) const PATH_HISTORY: &str =
-    "SELECT seq, version, kind, asset_uuid, state, subject
+pub(crate) const PATH_HISTORY: &str = "SELECT seq, version, kind, asset_uuid, state, subject
      FROM change_log WHERE kind = 2 AND subject = ?1 AND version > ?2 AND version <= ?3";
 const _: () = assert!(CHANGE_ASSET == 1 && CHANGE_PATH == 2);
 

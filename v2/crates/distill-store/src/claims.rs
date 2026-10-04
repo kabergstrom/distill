@@ -356,7 +356,12 @@ impl InputTxn<'_> {
                     if !pending.assets.contains_key(&asset) {
                         let collides = asset_collides(conn, subject)?;
                         if collides != collided[subject] {
-                            asset_dependents_pending(conn, subject, &mut bundles, &mut pending.paths)?;
+                            asset_dependents_pending(
+                                conn,
+                                subject,
+                                &mut bundles,
+                                &mut pending.paths,
+                            )?;
                         }
                         pending.assets.insert(asset, collides);
                     }

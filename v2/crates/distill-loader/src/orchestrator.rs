@@ -1380,7 +1380,8 @@ impl<I: LoaderIO> Loader<I> {
                 self.diagnostics.push(LoaderDiagnostic::Io(message));
             }
             IoEvent::RestartRequired { keys } => {
-                self.diagnostics.push(LoaderDiagnostic::RestartRequired(keys));
+                self.diagnostics
+                    .push(LoaderDiagnostic::RestartRequired(keys));
             }
         }
         Ok(())

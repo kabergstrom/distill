@@ -1036,11 +1036,7 @@ impl DaemonCoordinator {
         let scanner = compiled.scanner();
         let mut rejection = classify_scan_rejection(scanner, error)?;
         let mut subjects = scanner.rejection_subjects(error);
-        if let Some(previous) = self
-            .server
-            .scan_rejection()
-            .filter(|_| !replaces_pending)
-        {
+        if let Some(previous) = self.server.scan_rejection().filter(|_| !replaces_pending) {
             rejection = select_scan_rejection([
                 ScanRejection {
                     version: previous.errors,

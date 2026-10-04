@@ -45,7 +45,6 @@ impl StoreConfig {
     }
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigValidationError {
     ParallelismZero,

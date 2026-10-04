@@ -216,7 +216,10 @@ fn namespace_errors_and_withholding_are_read_from_the_claims() {
     assert_eq!(errors.len(), 2);
     assert!(errors.contains(&malformed));
     let bundle_message = bundle_collision_message(BundleUuid([1; 16]));
-    assert_eq!(store.withholding(AssetUuid([10; 16])).unwrap(), Some(bundle_message.clone()));
+    assert_eq!(
+        store.withholding(AssetUuid([10; 16])).unwrap(),
+        Some(bundle_message.clone())
+    );
     assert_eq!(
         store.withheld_assets().unwrap(),
         BTreeSet::from([AssetUuid([10; 16]), AssetUuid([20; 16])])

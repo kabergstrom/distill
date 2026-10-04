@@ -7,11 +7,11 @@ use distill_loader::{
     RuntimeTarget,
 };
 use distill_rpc::capnp_transport::StagedListener;
-use distill_store::config::RestartOnlyChange;
 use distill_rpc::{
     ArtifactPayload, BuildAnswer, ConnectRequest, Server, SnapshotPolicy, TargetDefinition,
     TargetDefinitionHash,
 };
+use distill_store::config::RestartOnlyChange;
 use distill_test_project::{Asset, TestBuilds, TestProject};
 use distill_wire::artifact::{content_hash, parse_artifact, write_artifact, ArtifactHeader};
 use distill_wire::dswl::{dswl_bytes, dswl_hash};

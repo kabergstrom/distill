@@ -9,9 +9,10 @@ use distill_daemon::watcher::WatcherBatch;
 use distill_json::AuthoredValue;
 use distill_rpc::{
     AuthoringBackend, AuthoringEntry, AuthoringEntryRole, AuthoringInspectResult, AuthoringOp,
-    AuthoringProgressState, AuthoringValue as RpcAuthoringValue, ConnectOutcome, ConnectRequest,
-    ContentHash, Delta, DoctorRequest, LongRunningOp, MetadataCall, MetadataNamespaceCall,
-    ConfigurationStatus, RpcFailure, StreamEvent, TargetDefinition, TargetDefinitionHash, WriteReceipt, WrittenFile,
+    AuthoringProgressState, AuthoringValue as RpcAuthoringValue, ConfigurationStatus,
+    ConnectOutcome, ConnectRequest, ContentHash, Delta, DoctorRequest, LongRunningOp, MetadataCall,
+    MetadataNamespaceCall, RpcFailure, StreamEvent, TargetDefinition, TargetDefinitionHash,
+    WriteReceipt, WrittenFile,
 };
 use distill_schema::ngp_schema::{
     node_hash, snapshot_to_json, LogicalSchema, PrimitiveKind, SchemaNode,
@@ -320,10 +321,7 @@ fn claims_survive_a_restart_whose_first_scan_is_rejected() {
     coordinator.reconcile_full_scan(&mut writer).unwrap();
     let reader = coordinator.open_reader().unwrap();
     let hub = coordinator.server_handle();
-    assert!(
-        hub.scan_rejection().is_some(),
-        "the first scan is rejected"
-    );
+    assert!(hub.scan_rejection().is_some(), "the first scan is rejected");
     let errors = hub.namespace_errors(&reader).unwrap();
     assert!(
         errors.iter().any(|error| matches!(
@@ -1473,7 +1471,10 @@ fn restart_required_is_told_as_it_changes_and_clears() {
     {
         let coordinator = coordinator(&temp);
         let mut writer = coordinator.open_writer().unwrap();
-        let version = coordinator.reconcile_full_scan(&mut writer).unwrap().version;
+        let version = coordinator
+            .reconcile_full_scan(&mut writer)
+            .unwrap()
+            .version;
         let installed = connect(&coordinator);
         assert_eq!(restart_events(&installed), Vec::<Vec<String>>::new());
         coordinator

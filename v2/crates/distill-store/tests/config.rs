@@ -81,7 +81,7 @@ fn restart_only_changes_name_their_keys_once_in_key_order() {
 #[test]
 fn invalid_restart_value_is_rejected() {
     let non_loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 9999);
-    let err = RestartOnlyChange::key_values(&[RestartOnlyChange::Address(non_loopback)])
-        .unwrap_err();
+    let err =
+        RestartOnlyChange::key_values(&[RestartOnlyChange::Address(non_loopback)]).unwrap_err();
     assert!(matches!(err, ConfigValidationError::NonLoopbackAddress(a) if a == non_loopback));
 }

@@ -890,7 +890,11 @@ impl ServerHandle {
 
     /// The pending scan rejection, if a scan left one.
     pub fn scan_rejection(&self) -> Option<PendingScanRejection> {
-        self.rejections.lock().expect("rejections lock").scan.clone()
+        self.rejections
+            .lock()
+            .expect("rejections lock")
+            .scan
+            .clone()
     }
 
     /// Replace the configuration source's error; `None` heals it.
@@ -934,7 +938,11 @@ impl ServerHandle {
         snapshot: &StoreReader,
     ) -> Result<Vec<NamespaceError>, StoreError> {
         let mut errors = snapshot.namespace_errors()?;
-        errors.extend(self.scan_rejection().into_iter().flat_map(|scan| scan.errors));
+        errors.extend(
+            self.scan_rejection()
+                .into_iter()
+                .flat_map(|scan| scan.errors),
+        );
         NamespaceError::canonical_set(errors).map_err(StoreError::InvalidNamespaceError)
     }
 }
@@ -1105,7 +1113,6 @@ impl SnapshotTxn {
             .as_deref()
             .expect("a live snapshot transaction owns its snapshot")
     }
-
 }
 
 /// A front end's connection with no read transaction open, kept for its

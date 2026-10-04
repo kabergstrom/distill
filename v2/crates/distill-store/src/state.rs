@@ -1766,4 +1766,3 @@ impl fmt::Display for NamespaceError {
 }
 
 impl std::error::Error for NamespaceError {}
-

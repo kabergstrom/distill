@@ -30,9 +30,9 @@ pub use capability::{
 };
 pub use protocol::*;
 pub use server::{
-    bundle_authoring_entry, target_map, CoordinatedCommitError, ReportSnapshot, Root, Server,
-    PendingScanRejection, ServerHandle, SnapshotPolicy, DEFAULT_SNAPSHOT_TTL, MAX_SUBSCRIBED_ASSETS,
-    MAX_SUBSCRIBED_PATHS,
+    bundle_authoring_entry, target_map, CoordinatedCommitError, PendingScanRejection,
+    ReportSnapshot, Root, Server, ServerHandle, SnapshotPolicy, DEFAULT_SNAPSHOT_TTL,
+    MAX_SUBSCRIBED_ASSETS, MAX_SUBSCRIBED_PATHS,
 };
 pub use target::{TargetDefinition, TargetSetError};
 pub use validate::{decode_asset_reference_query, decode_authoring_payload};

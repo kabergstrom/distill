@@ -8,8 +8,8 @@ use distill_daemon::compiled::Compiled;
 use distill_daemon::config::DaemonConfig;
 use distill_daemon::process::DaemonProcess;
 use distill_daemon::scanner::{DaemonOwnedDirectoryKind, ScanDiagnostic};
-use distill_schema::ngp_schema::{LayoutIdentity, Schema, SchemaLayouts};
 use distill_rpc::ConfigurationStatus;
+use distill_schema::ngp_schema::{LayoutIdentity, Schema, SchemaLayouts};
 use distill_store::state::DscpV1;
 
 fn test_layout_identity() -> LayoutIdentity {
@@ -463,10 +463,7 @@ fn malformed_configuration_publishes_once_and_a_valid_edit_heals_it() {
                 .current_stamp()
                 .unwrap()
                 .version;
-            let state = process
-                .coordinator()
-                .configuration_status()
-                .unwrap();
+            let state = process.coordinator().configuration_status().unwrap();
             version > failed && matches!(state, ConfigurationStatus::Ready)
         },
         "valid configuration did not clear its malformed-source error",
@@ -627,9 +624,7 @@ fn restart_only_configuration_is_announced_without_an_input_version() {
     std::fs::write(temp.path().join("distill.toml"), edited).unwrap();
 
     wait_until(
-        || {
-            process.coordinator().server_handle().restart_required().1 == ["codegen.auto_codegen"]
-        },
+        || process.coordinator().server_handle().restart_required().1 == ["codegen.auto_codegen"],
         "restart-only edit was not announced",
     );
     assert_eq!(

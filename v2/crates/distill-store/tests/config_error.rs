@@ -2,8 +2,8 @@
 
 use distill_store::state::{
     ConfigurationError, ConfigurationErrorCode, ConfigurationPathKey,
-    ConfigurationSourceFailureCode, ConfigurationSourcePath,
-    DirectoryAliasSide, DscpV1, OwnedPathKind, OwnedPathSide,
+    ConfigurationSourceFailureCode, ConfigurationSourcePath, DirectoryAliasSide, DscpV1,
+    OwnedPathKind, OwnedPathSide,
 };
 use ngp_schema::identity::LayoutIdentity;
 
@@ -334,4 +334,3 @@ fn typed_configuration_error_carries_its_reason_and_message_is_not_hashed() {
         "presentation prose never enters DSCP"
     );
 }
-

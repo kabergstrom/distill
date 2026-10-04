@@ -875,7 +875,11 @@ impl MetadataHub {
             stamp: txn.stamp,
             configuration: metadata_try!(self.server.inner.configuration()),
             pipeline: metadata_rpc_try!(self.server.inner.effective_pipeline(&txn)),
-            namespace_errors: metadata_try!(self.server.inner.handle.namespace_errors(txn.snapshot())),
+            namespace_errors: metadata_try!(self
+                .server
+                .inner
+                .handle
+                .namespace_errors(txn.snapshot())),
         })
     }
 
@@ -987,7 +991,11 @@ impl MetadataSnapshot {
             stamp: self.basis.snapshot,
             configuration: metadata_try!(self.server.inner.configuration()),
             pipeline: metadata_rpc_try!(self.server.inner.effective_pipeline(&txn)),
-            namespace_errors: metadata_try!(self.server.inner.handle.namespace_errors(txn.snapshot())),
+            namespace_errors: metadata_try!(self
+                .server
+                .inner
+                .handle
+                .namespace_errors(txn.snapshot())),
         })
     }
 

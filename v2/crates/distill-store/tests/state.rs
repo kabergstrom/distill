@@ -1,9 +1,7 @@
 //! §13 consistency-contract state machinery: version counters and the
 //! snapshot stamp (RPC-side realization of `IoBasis::Rpc`, §15).
 
-use distill_store::state::{
-    InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId,
-};
+use distill_store::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 
 // ---- version counters ----
 

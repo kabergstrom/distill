@@ -155,4 +155,3 @@ fn wire_decoder_rejects_unknown_tags_and_identity_mismatch() {
         PipelineFailureDecodeError::IdentityMismatch
     );
 }
-
