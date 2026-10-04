@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 
 use crate::cas::record::KeyKind;
 use crate::cas::store::{
-    count_cas_write, fsync_dir, segment_file_name, segment_open_options, SegmentKind, SEGMENT_DEAD,
-    SEGMENT_OPEN, SEGMENT_SEALED,
+    count_cas_write, fsync_dir, segment_file_name, segment_open_options, segment_row_file_name,
+    SegmentKind, SEGMENT_DEAD, SEGMENT_OPEN, SEGMENT_SEALED,
 };
 use crate::db::Store;
 use crate::error::StoreError;
@@ -144,18 +144,18 @@ pub(crate) const LIVE_BYTES: &str = "SELECT COALESCE(SUM(len), 0) FROM cas_exten
 /// range of `cas_segments_by_state`) and the compacting writer `?2`'s open
 /// segment (the unique partial index the literals select).
 pub(crate) const COMPACTION_CANDIDATES: &str =
-    "SELECT segment_id, file_name, segment_kind, indexed_len,
+    "SELECT segment_id, segment_kind, indexed_len,
        (SELECT COALESCE(SUM(len), 0) FROM cas_extents WHERE segment = s.segment_id)
      FROM cas_segments s WHERE state = ?1
      UNION ALL
-     SELECT segment_id, file_name, segment_kind, indexed_len,
+     SELECT segment_id, segment_kind, indexed_len,
        (SELECT COALESCE(SUM(len), 0) FROM cas_extents WHERE segment = s.segment_id)
      FROM cas_segments s WHERE owner = ?2 AND state = 0 AND segment_kind = 0
      ORDER BY segment_id";
 const _: () = assert!(SEGMENT_OPEN == 0);
 /// The segments in state `?1`.
 pub(crate) const SEGMENTS_IN_STATE: &str =
-    "SELECT segment_id, file_name FROM cas_segments WHERE state = ?1";
+    "SELECT segment_id, segment_kind FROM cas_segments WHERE state = ?1";
 /// The extents segment `?1` holds, where they lie.
 pub(crate) const SEGMENT_EXTENTS: &str =
     "SELECT content_hash, offset, len FROM cas_extents WHERE segment = ?1";
@@ -259,18 +259,17 @@ impl Store {
             statement.query_map(rusqlite::params![SEGMENT_SEALED, self.cas.owner], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
                 ))
             })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, name, kind, indexed_len, live) = row?;
+            let (id, kind, indexed_len, live) = row?;
             let candidate = CompactionCandidate {
                 id: id as u64,
-                name,
+                name: segment_row_file_name(id, kind)?,
                 kind: SegmentKind::from_i64(kind).unwrap_or(SegmentKind::Regular),
                 indexed_len: indexed_len as u64,
                 live: live as u64,
@@ -452,22 +451,22 @@ impl SegmentSweeper {
     /// Delete the dead segments whose grace has passed; returns how many.
     pub fn sweep(&mut self, store: &mut Store) -> Result<usize, StoreError> {
         let now = Instant::now();
-        let dead: Vec<(u64, String)> = {
+        let dead: Vec<(u64, i64)> = {
             let mut statement = store.conn.prepare_cached(SEGMENTS_IN_STATE)?;
             let rows = statement.query_map([SEGMENT_DEAD], |row| {
-                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
+                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)?))
             })?;
             rows.collect::<Result<_, _>>()?
         };
         self.dead_since
             .retain(|id, _| dead.iter().any(|(dead, _)| dead == id));
         let mut deleted = Vec::new();
-        for (id, name) in dead {
+        for (id, kind) in dead {
             let since = *self.dead_since.entry(id).or_insert(now);
             if now.duration_since(since) < self.grace {
                 continue;
             }
-            let path = store.cas.dir.join(&name);
+            let path = store.cas.dir.join(segment_row_file_name(id as i64, kind)?);
             match std::fs::remove_file(&path) {
                 Ok(()) => deleted.push(id),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => deleted.push(id),

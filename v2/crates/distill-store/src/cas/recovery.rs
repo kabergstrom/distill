@@ -21,7 +21,7 @@
 //! never committed, and the next allocation of its id truncates it.
 
 use crate::cas::store::{
-    fsync_dir, parse_segment_id, SegmentKind, SEGMENT_DEAD, SEGMENT_OPEN, SEGMENT_SEALED,
+    fsync_dir, segment_row_file_name, SEGMENT_DEAD, SEGMENT_OPEN, SEGMENT_SEALED,
 };
 use crate::db::Store;
 use crate::error::StoreError;
@@ -59,31 +59,23 @@ impl Store {
 
         let rows: Vec<SegmentRow> = {
             let mut statement = self.conn.prepare(
-                "SELECT segment_id, file_name, segment_kind, indexed_len, state
+                "SELECT segment_id, segment_kind, indexed_len, state
                  FROM cas_segments ORDER BY segment_id",
             )?;
             let rows = statement.query_map([], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
                 ))
             })?;
             let mut out = Vec::new();
             for row in rows {
-                let (id, name, kind, indexed_len, state) = row?;
-                SegmentKind::from_i64(kind)
-                    .filter(|kind| parse_segment_id(&name, *kind) == Some(id as u64))
-                    .ok_or_else(|| StoreError::BadRecord {
-                        segment: id as u64,
-                        offset: 0,
-                        detail: format!("segment row names an invalid file `{name}`"),
-                    })?;
+                let (id, kind, indexed_len, state) = row?;
                 out.push(SegmentRow {
                     id: id as u64,
-                    name,
+                    name: segment_row_file_name(id, kind)?,
                     indexed_len: indexed_len as u64,
                     state,
                 });

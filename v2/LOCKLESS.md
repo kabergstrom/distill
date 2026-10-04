@@ -139,7 +139,7 @@ tables, so the ~50 rpc test call sites keep working.
 | `configuration_poison`, `scan_rejection` | memory only (and `PendingScanRejection.subjects` is lost on restart) | process state on the RPC hub (§6.1; schema 59, was `errors` families 2–4 and `scan_rejection_subjects`): a restart recomputes it from the startup scan and configuration parse. |
 | `scan_initialized` / `scan_healthy` | atomics | authority-local. Done: `scan_initialized` is set only after a commit; healthy is "no pending rejection". |
 | `Store.input_version` / `memo_seq` | cached copies | read from `store_meta` in the transaction |
-| `Store.cas: CasInner` | memory | owned by the authority (the writer). Readers resolve segment names from `cas_segments`, not from `CasInner`. |
+| `Store.cas: CasInner` | memory | owned by the authority (the writer). Readers resolve a segment's file from its `cas_segments` row (id and kind), not from `CasInner`. |
 | `Store.last_recovery` | memory | returned from `open` and logged |
 | `last_background_error` | memory | memory: process state, as the configuration error is |
 
@@ -365,7 +365,7 @@ baseline failures) and the deferred-ngp hot-reload scenario still working
    - `Store` → `StoreWriter` (connection + `CasInner`) and `StoreReader`
      (a read-only connection with `&self` reads).
    - Drop the cached `input_version` / `memo_seq`.
-   - Readers use `cas_segments` for file names.
+   - Readers name segment files from `cas_segments` rows.
    - `lookup_candidates` becomes pure (done; eviction is random).
    - Merge `refine_unpublished_tag_index` and the other separate commits
      into their parent transactions.
@@ -1298,6 +1298,8 @@ What went:
   is a missing one.
 - `derived_outputs`. A derived child is its one `source_claims` claim
   while neither it nor its parent is withheld.
+- `cas_segments.file_name` (schema 58), a formatting of the row's id and
+  kind.
 
 Write paths:
 - A tool epoch writes only the rows it changes.

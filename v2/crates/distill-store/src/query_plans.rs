@@ -2559,7 +2559,7 @@ fn cas_and_served_point_statements_search_their_keys() {
             &["SEARCH artifact_load_edges USING INDEX sqlite_autoindex_artifact_load_edges_1 (content_hash=?)"],
         ),
         (
-            "SELECT file_name FROM cas_segments WHERE segment_id = ?",
+            "SELECT segment_kind FROM cas_segments WHERE segment_id = ?",
             &["SEARCH cas_segments USING INTEGER PRIMARY KEY (rowid=?)"],
         ),
         (
@@ -2686,7 +2686,7 @@ fn cas_and_served_point_statements_search_their_keys() {
             ],
         ),
         (
-            "SELECT segment_id, file_name, segment_kind, indexed_len, (SELECT COALESCE(SUM(len), ?) FROM cas_extents WHERE segment = s.segment_id) FROM cas_segments s WHERE state = ? UNION ALL SELECT segment_id, file_name, segment_kind, indexed_len, (SELECT COALESCE(SUM(len), ?) FROM cas_extents WHERE segment = s.segment_id) FROM cas_segments s WHERE owner = ? AND state = ? AND segment_kind = ? ORDER BY segment_id",
+            "SELECT segment_id, segment_kind, indexed_len, (SELECT COALESCE(SUM(len), ?) FROM cas_extents WHERE segment = s.segment_id) FROM cas_segments s WHERE state = ? UNION ALL SELECT segment_id, segment_kind, indexed_len, (SELECT COALESCE(SUM(len), ?) FROM cas_extents WHERE segment = s.segment_id) FROM cas_segments s WHERE owner = ? AND state = ? AND segment_kind = ? ORDER BY segment_id",
             &[
                 "MERGE (UNION ALL)",
                 "LEFT",

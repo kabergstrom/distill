@@ -290,7 +290,6 @@ fn cas_segments_are_typed_regular_or_oversize() {
         columns(&conn, "cas_segments"),
         [
             "segment_id",
-            "file_name",
             "segment_kind",
             "indexed_len",
             "state",

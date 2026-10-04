@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 59;
+pub const SCHEMA_VERSION: u32 = 60;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -284,7 +284,6 @@ CREATE INDEX cas_refs_by_hash ON cas_refs(content_hash);
 -- 2: dead, its file deleted once no read can still reach it (see `cas`).
 CREATE TABLE cas_segments (
     segment_id  INTEGER PRIMARY KEY,
-    file_name   TEXT NOT NULL,
     segment_kind INTEGER NOT NULL,
     indexed_len INTEGER NOT NULL,
     state       INTEGER NOT NULL CHECK (state IN (0, 1, 2)),

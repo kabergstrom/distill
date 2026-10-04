@@ -183,7 +183,7 @@ pub(crate) const ACTIVE_SEGMENT: &str = "SELECT segment_id FROM cas_segments
 const _: () = assert!(SegmentKind::Regular as i64 == 0);
 
 /// Every segment, for doctor verification.
-pub(crate) const VERIFY_SEGMENTS: &str = "SELECT segment_id, file_name FROM cas_segments";
+pub(crate) const VERIFY_SEGMENTS: &str = "SELECT segment_id, segment_kind FROM cas_segments";
 /// The extents segment `?1` holds.
 pub(crate) const VERIFY_SEGMENT_EXTENTS: &str =
     "SELECT content_hash, offset, len FROM cas_extents WHERE segment = ?1";
@@ -213,16 +213,15 @@ pub(crate) fn segment_file_name(id: u64, kind: SegmentKind) -> String {
     format!("{prefix}-{id:016x}.dsr")
 }
 
-pub(crate) fn parse_segment_id(name: &str, kind: SegmentKind) -> Option<u64> {
-    let prefix = match kind {
-        SegmentKind::Regular => "seg-",
-        SegmentKind::Oversize => "oversize-",
-    };
-    let hex = name.strip_prefix(prefix)?.strip_suffix(".dsr")?;
-    if hex.len() != 16 {
-        return None;
-    }
-    u64::from_str_radix(hex, 16).ok()
+/// The file name of a `cas_segments` row, from its `segment_id` and
+/// `segment_kind`.
+pub(crate) fn segment_row_file_name(id: i64, kind: i64) -> Result<String, StoreError> {
+    let kind = SegmentKind::from_i64(kind).ok_or_else(|| StoreError::BadRecord {
+        segment: id as u64,
+        offset: 0,
+        detail: format!("segment row has the unknown kind {kind}"),
+    })?;
+    Ok(segment_file_name(id as u64, kind))
 }
 
 /// Options for opening a segment file. On Windows a segment is opened with
@@ -359,14 +358,13 @@ impl Store {
         );
         let id = meta_get_u64(&self.conn, "next_segment_id")?.unwrap_or(0);
         meta_set_u64(&self.conn, "next_segment_id", id + 1)?;
-        let name = segment_file_name(id, kind);
         self.conn
             .prepare_cached(
-                "INSERT INTO cas_segments(segment_id, file_name, segment_kind, indexed_len, state, owner)
-             VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+                "INSERT INTO cas_segments(segment_id, segment_kind, indexed_len, state, owner)
+             VALUES (?1, ?2, 0, ?3, ?4)",
             )?
-            .execute(rusqlite::params![id as i64, name, kind as i64, state, self.cas.owner])?;
-        let path = self.cas.dir.join(&name);
+            .execute(rusqlite::params![id as i64, kind as i64, state, self.cas.owner])?;
+        let path = self.cas.dir.join(segment_file_name(id, kind));
         let f = std::fs::File::create(&path).map_err(io_err(&path))?;
         f.sync_all().map_err(io_err(&path))?;
         fsync_dir(&self.cas.dir)?;
@@ -868,20 +866,21 @@ impl StoreReader {
         // extent; a location whose row is gone names a deleted segment, and
         // its read fails as a cache miss.
         use rusqlite::OptionalExtension;
-        let name: Option<String> = self
+        let kind = self
             .conn
             .query_row(
-                "SELECT file_name FROM cas_segments WHERE segment_id = ?1",
+                "SELECT segment_kind FROM cas_segments WHERE segment_id = ?1",
                 [segment_id as i64],
                 |row| row.get(0),
             )
             .optional()
             .ok()
-            .flatten();
-        self.config
-            .state_path
-            .join("cas")
-            .join(name.unwrap_or_else(|| segment_file_name(segment_id, SegmentKind::Regular)))
+            .flatten()
+            .and_then(SegmentKind::from_i64);
+        self.config.state_path.join("cas").join(segment_file_name(
+            segment_id,
+            kind.unwrap_or(SegmentKind::Regular),
+        ))
     }
 
     pub(crate) fn extent_of(&self, hash: &[u8; 32]) -> Result<Option<(u64, u64, u64)>, StoreError> {
@@ -963,19 +962,23 @@ impl StoreReader {
     /// ([`VERIFY_SEGMENTS`], [`VERIFY_SEGMENT_EXTENTS`]).
     pub fn verify_all_cas_extents(&self) -> Result<usize, StoreError> {
         use std::io::{Read, Seek, SeekFrom};
-        let segments: Vec<(i64, String)> = {
+        let segments: Vec<(i64, i64)> = {
             let mut statement = self.conn.prepare(VERIFY_SEGMENTS)?;
             let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
             rows.collect::<Result<_, _>>()?
         };
         let mut extents = self.conn.prepare(VERIFY_SEGMENT_EXTENTS)?;
         let mut verified = 0;
-        for (segment, name) in segments {
+        for (segment, kind) in segments {
             let mut rows = extents.query([segment])?;
             let Some(mut row) = rows.next()? else {
                 continue;
             };
-            let path = self.config.state_path.join("cas").join(name);
+            let path = self
+                .config
+                .state_path
+                .join("cas")
+                .join(segment_row_file_name(segment, kind)?);
             let mut file = segment_open_options()
                 .read(true)
                 .open(&path)
