@@ -1100,11 +1100,16 @@ fn ledger_commit(next: InputVersion) -> Commit {
     }
 }
 
-/// The backend's row for the version `next`, written through `store`.
+/// The backend's row for the version `next` (a root named for it), written
+/// through `store`.
 fn ledger_row(store: &mut distill_store::Store, next: InputVersion) -> Result<(), distill_store::StoreError> {
     store
-        .input_transaction(|transaction| transaction.set_clean_watermark(next.0 as i64))
+        .input_transaction(|transaction| transaction.intern_root(&ledger_root(next)))
         .map(|_| ())
+}
+
+fn ledger_root(version: InputVersion) -> String {
+    format!("ledger-v{}", version.0)
 }
 
 impl AuthoringBackend for LedgerBackend {
@@ -1252,7 +1257,7 @@ fn two_connections_writing_concurrently_are_serialized_and_commit_nothing() {
         );
         let reader = server.handle().opener().open_reader().unwrap();
         assert_eq!(reader.input_version().unwrap(), start);
-        assert_eq!(reader.clean_watermark().unwrap(), None);
+        assert_eq!(reader.root_id(&ledger_root(InputVersion(start.0 + 1))).unwrap(), None);
     });
 }
 
@@ -1294,12 +1299,12 @@ fn a_coordinated_commits_backend_row_and_served_projection_land_together() {
                 .begin_snapshot()
                 .unwrap();
             let version = snapshot.input_version().unwrap();
-            let watermark = snapshot.clean_watermark().unwrap();
+            let ledger = snapshot.root_id(&ledger_root(version)).unwrap();
+            let next_ledger = snapshot.root_id(&ledger_root(InputVersion(version.0 + 1))).unwrap();
             let served = snapshot.asset_resolution(ASSET).unwrap();
-            if version == start {
-                assert_eq!(watermark, None);
-            } else {
-                assert_eq!(watermark, Some(version.0 as i64), "backend row at {version:?}");
+            assert_eq!(next_ledger, None, "no later backend row at {version:?}");
+            if version != start {
+                assert!(ledger.is_some(), "backend row at {version:?}");
                 assert_eq!(
                     served,
                     Some(distill_store::served::ResolutionRow::Failed(format!(

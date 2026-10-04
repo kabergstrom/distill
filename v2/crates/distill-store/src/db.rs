@@ -1168,13 +1168,6 @@ impl StoreReader {
         })
     }
 
-    /// §14's clean watermark: the newest mtime observed under active
-    /// watch, recorded durably per session; reconciliation content-hashes
-    /// anything not strictly older.
-    pub fn clean_watermark(&self) -> Result<Option<i64>, StoreError> {
-        meta_get_i64(&self.conn, "clean_watermark")
-    }
-
     /// The input version that last published the daemon's compiled
     /// configuration state (schema authority, targets, pipeline epoch,
     /// roots): what in-memory state derived from it is keyed by. `None`
@@ -1226,11 +1219,6 @@ impl InputTxn<'_> {
     /// The version this transaction will publish on commit.
     pub fn version(&self) -> InputVersion {
         self.version
-    }
-
-    /// Record §14's clean watermark.
-    pub fn set_clean_watermark(&mut self, mtime: i64) -> Result<(), StoreError> {
-        meta_set_i64(&self.txn, "clean_watermark", mtime)
     }
 
     /// Record that this input publishes the daemon's compiled configuration

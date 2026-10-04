@@ -66,17 +66,17 @@ fn an_open_input_is_seen_through_its_writer_and_by_no_other_connection() {
     let mut writer = opener.open_writer().unwrap();
     writer.arm_input();
     writer
-        .input_transaction(|txn| txn.set_clean_watermark(7))
+        .input_transaction(|txn| txn.intern_root("main"))
         .unwrap();
     // The owner reads its open input through its writer.
     assert_eq!(writer.input_version().unwrap(), InputVersion(1));
-    assert_eq!(writer.clean_watermark().unwrap(), Some(7));
+    assert!(writer.root_id("main").unwrap().is_some());
     // Another thread's reader, and another writer, see none of it.
     let other = {
         let opener = Arc::clone(&opener);
         std::thread::spawn(move || {
             let read = opener.open_reader().unwrap();
-            (read.input_version().unwrap(), read.clean_watermark().unwrap())
+            (read.input_version().unwrap(), read.root_id("main").unwrap())
         })
         .join()
         .unwrap()

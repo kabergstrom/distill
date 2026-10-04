@@ -18,7 +18,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use distill_store::bundles::{AssetAnswer, AssetFilter};
 use distill_store::files::GlobKeys;
-use distill_store::served::{ResolutionRow, ServedEntryMeta, SERVED_RESTART_KEYS};
+use distill_store::served::{ResolutionRow, ServedEntryMeta};
 use distill_store::{Store, StoreError, StoreReader};
 
 use crate::persist::decode_drifted_input;
@@ -1434,7 +1434,7 @@ impl Hub {
                 reader.change_log_head()?,
                 oldest,
                 history,
-                reader.served_blob(SERVED_RESTART_KEYS)?,
+                reader.pending_restart()?,
             ))
         }));
         let installed = stamp.version;
@@ -1500,9 +1500,7 @@ impl Hub {
             }
         }
         connection.stream_installed = true;
-        let restart = restart
-            .and_then(|bytes| distill_store::served::decode_keys(&bytes))
-            .unwrap_or_default();
+        let restart = restart.map(|pending| pending.keys).unwrap_or_default();
         if first_install && !restart.is_empty() {
             connection.enqueue(StreamEvent::Asset {
                 basis: RpcBasis { snapshot: stamp },

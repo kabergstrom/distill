@@ -115,7 +115,7 @@ fn a_failed_input_transaction_publishes_nothing() {
     let mut store = Store::open(cfg(&dir)).unwrap();
     let err = store
         .input_transaction::<(), _>(|txn| {
-            txn.set_clean_watermark(123)?;
+            txn.intern_root("main")?;
             Err(StoreError::InvalidConfiguration {
                 error: "boom".to_owned(),
             })
@@ -123,11 +123,7 @@ fn a_failed_input_transaction_publishes_nothing() {
         .unwrap_err();
     assert!(matches!(err, StoreError::InvalidConfiguration { .. }));
     assert_eq!(store.input_version().unwrap().0, 0, "the version was never advanced");
-    assert_eq!(
-        store.clean_watermark().unwrap(),
-        None,
-        "the write rolled back"
-    );
+    assert_eq!(store.root_id("main").unwrap(), None, "the write rolled back");
 }
 
 #[test]

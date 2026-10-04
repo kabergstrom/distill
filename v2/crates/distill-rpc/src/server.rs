@@ -1102,20 +1102,29 @@ impl ServerHandle {
         Ok(self.stamp_of(store)?)
     }
 
-    /// Stage a restart-only edit (`stage` returns its keys) and serve its
-    /// RestartRequired keys, in one transaction. This does not advance the
-    /// input version or mutate active configuration values.
+    /// Stage a restart-only edit (`stage` replaces the store's pending
+    /// restart) and announce its RestartRequired keys, in one transaction.
+    /// This does not advance the input version or mutate active
+    /// configuration values.
     pub fn restart_required(
         &self,
         store: &mut Store,
-        stage: impl FnOnce(&mut Store) -> Result<Vec<String>, String>,
+        stage: impl FnOnce(&mut Store) -> Result<(), String>,
     ) -> Result<SnapshotStamp, String> {
+        let pending_keys = |store: &Store| {
+            store
+                .pending_restart()
+                .map(|pending| pending.map(|pending| pending.keys).unwrap_or_default())
+                .map_err(|error| error.to_string())
+        };
         let changed = store.write_transaction_with(
             |error| error.to_string(),
             |store| {
-                let keys = stage(store)?;
+                let before = pending_keys(store)?;
+                stage(store)?;
+                let keys = pending_keys(store)?;
                 store
-                    .served_transaction(|txn| publish_restart_required(txn, &keys))
+                    .served_transaction(|txn| publish_restart_required(txn, &before, &keys))
                     .map_err(|error| error.to_string())
             },
         )?;
@@ -1206,8 +1215,18 @@ impl Server {
         self.with_writer(|store| self.inner.handle.replace_target(store, replacement))
     }
 
-    pub fn restart_required(&self, keys: Vec<String>) -> Result<SnapshotStamp, String> {
-        self.with_writer(|store| self.inner.handle.restart_required(store, |_| Ok(keys)))
+    pub fn restart_required(
+        &self,
+        changes: Vec<distill_store::config::RestartOnlyChange>,
+    ) -> Result<SnapshotStamp, String> {
+        self.with_writer(|store| {
+            self.inner.handle.restart_required(store, |store| {
+                store
+                    .stage_pending_restart(&changes)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })
+        })
     }
 }
 

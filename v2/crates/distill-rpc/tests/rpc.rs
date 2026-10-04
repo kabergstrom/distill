@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use distill_json::AuthoredValue;
 use distill_rpc::*;
+use distill_store::config::RestartOnlyChange;
 use distill_schema::ngp_schema::{
     node_hash, snapshot_to_json, LogicalSchema, PrimitiveKind, SchemaNode,
 };
@@ -1910,11 +1911,13 @@ fn restart_required_names_sorted_unique_keys_without_advancing_version() {
         .unwrap();
     install.deltas.next().unwrap();
     let before = server.current_stamp().unwrap();
-    let after = server.restart_required(vec![
-        "daemon.state_path".to_owned(),
-        "daemon.address".to_owned(),
-        "daemon.address".to_owned(),
-    ]).unwrap();
+    let after = server
+        .restart_required(vec![
+            RestartOnlyChange::StatePath("state".into()),
+            RestartOnlyChange::Address(([127, 0, 0, 1], 9000).into()),
+            RestartOnlyChange::Address(([127, 0, 0, 1], 9001).into()),
+        ])
+        .unwrap();
     assert_eq!(before, after);
     match install.deltas.next().unwrap() {
         StreamEvent::Asset { basis, event } => {
@@ -1935,7 +1938,9 @@ fn pending_restart_state_is_queued_after_the_cursor_bound_first_message() {
     let project = project();
     let server = project.server();
     let hub = connect(&server, &[(1, false)]);
-    server.restart_required(vec!["daemon.address".to_owned()]).unwrap();
+    server
+        .restart_required(vec![RestartOnlyChange::Address(([127, 0, 0, 1], 9000).into())])
+        .unwrap();
     let install = hub
         .subscribe(InputVersion(0), vec![], vec![])
         .success()
@@ -1958,8 +1963,12 @@ fn restart_required_replaces_the_prior_pending_key_set() {
     let project = project();
     let server = project.server();
     let hub = connect(&server, &[(1, false)]);
-    server.restart_required(vec!["daemon.address".to_owned()]).unwrap();
-    server.restart_required(vec!["codegen.auto_codegen".to_owned()]).unwrap();
+    server
+        .restart_required(vec![RestartOnlyChange::Address(([127, 0, 0, 1], 9000).into())])
+        .unwrap();
+    server
+        .restart_required(vec![RestartOnlyChange::AutoCodegen(true)])
+        .unwrap();
     let install = hub
         .subscribe(InputVersion(0), vec![], vec![])
         .success()

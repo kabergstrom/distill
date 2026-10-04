@@ -23,7 +23,7 @@ mod target;
 pub use bind::{validate_bind_address, BindStageError};
 pub use protocol::*;
 pub use apply::{
-    apply_commit, publish_protocol_epoch, publish_restart_required, publish_runtime_pipeline_failure,
+    apply_commit, publish_protocol_epoch, publish_runtime_pipeline_failure,
     publish_target, publish_target_set, ApplyError, RETAINED_HISTORY_VERSIONS,
 };
 pub use capability::{

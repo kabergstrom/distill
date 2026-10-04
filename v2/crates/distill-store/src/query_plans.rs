@@ -1855,6 +1855,9 @@ fn cas_and_served_point_statements_search_their_keys() {
     populate(&mut store, 50);
     let asset = asset_uuid(42, 1);
     let edges = [(asset_uuid(43, 1), RUNTIME_TYPE)];
+    store
+        .stage_pending_restart(&[crate::config::RestartOnlyChange::AutoCodegen(true)])
+        .unwrap();
     store.read.conn.trace(Some(trace));
     let installed = (0..12u8)
         .map(|index| store.put_artifact(asset, &[index; 1000], &edges).unwrap())
@@ -1897,6 +1900,8 @@ fn cas_and_served_point_statements_search_their_keys() {
     store.rpc_targets().unwrap();
     store.change_log_head().unwrap();
     store.change_log_after(0).unwrap();
+    // A subscription's RestartRequired keys: the pending restart.
+    store.pending_restart().unwrap();
     store.resolve_child(asset).unwrap();
     store
         .evict_result(
@@ -1962,6 +1967,14 @@ fn cas_and_served_point_statements_search_their_keys() {
         (
             "SELECT (SELECT COALESCE(SUM(len), ?) FROM cas_extents) + (SELECT COALESCE(SUM(len), ?) FROM result_candidates)",
             &["SCAN CONSTANT ROW", "SCALAR SUBQUERY 1", "SCAN cas_extents USING COVERING INDEX cas_extents_by_segment", "SCALAR SUBQUERY 2", "SCAN result_candidates USING COVERING INDEX result_candidates_by_segment"],
+        ),
+        (
+            "SELECT MAX(generation) FROM pending_restart",
+            &["SEARCH pending_restart USING COVERING INDEX sqlite_autoindex_pending_restart_1"],
+        ),
+        (
+            "SELECT config_key FROM pending_restart WHERE generation = ? ORDER BY config_key",
+            &["SEARCH pending_restart USING COVERING INDEX sqlite_autoindex_pending_restart_1 (generation=?)"],
         ),
         (
             "SELECT EXISTS(SELECT ? FROM cas_extents WHERE content_hash = ?)",

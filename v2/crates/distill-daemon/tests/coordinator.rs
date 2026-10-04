@@ -1341,18 +1341,17 @@ fn an_edit_pass_runs_the_same_statements_at_any_namespace_size() {
     assert!(2 * large_pages <= 3 * small_pages, "{small_pages} -> {large_pages} pages");
 }
 
-/// A staged restart and its served RestartRequired keys are one
-/// transaction: when the served write fails, nothing is staged.
+/// A staged restart and its RestartRequired announcement are one
+/// transaction: when the change-log write fails, nothing is staged.
 #[test]
-fn a_staged_restart_commits_with_its_served_keys_or_not_at_all() {
+fn a_staged_restart_commits_with_its_announcement_or_not_at_all() {
     let temp = tempfile::tempdir().unwrap();
     let coordinator = coordinator(&temp);
     let mut writer = coordinator.open_writer().unwrap();
     rusqlite::Connection::open(temp.path().join(".distill/meta.sqlite"))
         .unwrap()
         .execute_batch(
-            "CREATE TRIGGER fail_restart_keys BEFORE INSERT ON store_meta
-             WHEN NEW.key = 'served_restart_keys'
+            "CREATE TRIGGER fail_restart_announcement BEFORE INSERT ON change_log
              BEGIN SELECT RAISE(ABORT, 'injected'); END;",
         )
         .unwrap();
@@ -1360,4 +1359,51 @@ fn a_staged_restart_commits_with_its_served_keys_or_not_at_all() {
         coordinator.stage_restart_configuration(&mut writer, &[RestartOnlyChange::AutoCodegen(true)]);
     assert!(staged.is_err());
     assert!(writer.pending_restart().unwrap().is_none(), "the staging committed alone");
+}
+
+/// The RestartRequired keys a new subscription is told are the store's
+/// pending restart: staged, a subscriber hears them; once a restart adopts
+/// them, a subscriber hears none.
+#[test]
+fn restart_required_clears_once_a_restart_adopts_the_staged_values() {
+    let temp = tempfile::tempdir().unwrap();
+    let restart_events = |coordinator: &DaemonCoordinator| {
+        let hub = match coordinator
+            .server()
+            .root()
+            .connect(ConnectRequest::new("dev", TargetDefinitionHash([4; 32])))
+        {
+            ConnectOutcome::Connected(connected) => connected.hub,
+            outcome => panic!("target connection failed: {outcome:?}"),
+        };
+        let subscription = hub.subscribe(InputVersion(0), vec![], vec![]).success().unwrap();
+        let mut keys = Vec::new();
+        while let Some(event) = subscription.deltas.next() {
+            if let StreamEvent::Asset {
+                event: distill_rpc::AssetEvent::RestartRequired { keys: event },
+                ..
+            } = event
+            {
+                keys.push(event);
+            }
+        }
+        keys
+    };
+    {
+        let coordinator = coordinator(&temp);
+        let mut writer = coordinator.open_writer().unwrap();
+        coordinator.reconcile_full_scan(&mut writer).unwrap();
+        coordinator
+            .stage_restart_configuration(&mut writer, &[RestartOnlyChange::AutoCodegen(true)])
+            .unwrap();
+        assert_eq!(
+            restart_events(&coordinator),
+            vec![vec!["codegen.auto_codegen".to_owned()]]
+        );
+    }
+    let coordinator = coordinator(&temp);
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    assert!(writer.pending_restart().unwrap().is_none(), "the restart adopted the values");
+    assert_eq!(restart_events(&coordinator), Vec::<Vec<String>>::new());
 }

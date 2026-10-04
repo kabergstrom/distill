@@ -553,9 +553,8 @@ impl DaemonCoordinator {
                 let staged = store
                     .stage_pending_restart(changes)
                     .map_err(|error| error.to_string())?;
-                let keys = staged.keys.clone();
                 pending = Some(staged);
-                Ok(keys)
+                Ok(())
             })
             .map_err(CoordinatorError::InvalidManifest)?;
         Ok(pending.expect("a staged restart has keys"))
@@ -566,8 +565,7 @@ impl DaemonCoordinator {
             .restart_required(store, |store| {
                 store
                     .clear_pending_restart()
-                    .map_err(|error| error.to_string())?;
-                Ok(Vec::new())
+                    .map_err(|error| error.to_string())
             })
             .map_err(CoordinatorError::InvalidManifest)?;
         Ok(())
@@ -2431,12 +2429,10 @@ fn publish_scan(
         let observation = transaction.version();
         transaction.replace_source_claims(None, claims)?;
         let mut root_ids = BTreeMap::new();
-        let mut newest_mtime = 0;
         for (key, file) in candidate.scan.file_observations() {
             let root = *root_ids
                 .entry(key.0.clone())
                 .or_insert(transaction.intern_root(&key.0)?);
-            newest_mtime = newest_mtime.max(file.state.mtime);
             let Some(&dirty) = file_writes.get(key) else {
                 continue;
             };
@@ -2455,7 +2451,6 @@ fn publish_scan(
             &candidate.scan.directory_rows(),
             &candidate.scan.encoded_diagnostic_rows(),
         )?;
-        transaction.set_clean_watermark(newest_mtime)?;
         transaction.set_namespace_errors(candidate.namespace_errors.iter().cloned())?;
         transaction.clear_derived_outputs()?;
         for (child, output) in &derived_outputs {
@@ -2741,9 +2736,7 @@ fn publish_incremental_scan(
         // pass, an earlier step has already advanced it past `base`.
         let observation = transaction.version();
         let file_mutations = incremental_file_mutations(&transaction.reader(), delta)?;
-        let watermark = transaction.reader().clean_watermark()?.unwrap_or(0);
         let mut root_ids = BTreeMap::new();
-        let mut newest_mtime = watermark;
         for mutation in &file_mutations {
             let root = *root_ids
                 .entry(mutation.root_name.clone())
@@ -2754,7 +2747,6 @@ fn publish_incremental_scan(
                     if mutation.dirty {
                         transaction.push_dirty(root, &mutation.path, true, observation)?;
                     }
-                    newest_mtime = newest_mtime.max(file.state.mtime);
                 }
                 None => {
                     transaction.remove_file(root, &mutation.path)?;
@@ -2767,7 +2759,6 @@ fn publish_incremental_scan(
             &delta.observed().directory_rows(),
             &delta.observed().encoded_diagnostic_rows(),
         )?;
-        transaction.set_clean_watermark(newest_mtime)?;
         transaction.replace_source_claims(Some(delta.affected_prefixes()), claims)?;
         let commit = publish_claimed(
             transaction,

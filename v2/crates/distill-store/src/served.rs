@@ -23,8 +23,6 @@ use crate::state::{InputVersion, SnapshotStamp};
 
 /// `store_meta` key of the published pipeline diagnostic.
 pub const SERVED_PIPELINE: &str = "served_pipeline";
-/// `store_meta` key of the staged restart-required configuration keys.
-pub const SERVED_RESTART_KEYS: &str = "served_restart_keys";
 
 const RPC_PROTOCOL_EPOCH: &str = "rpc_protocol_epoch";
 const RPC_PIPELINE_GENERATION: &str = "rpc_pipeline_generation";
@@ -612,12 +610,12 @@ fn change_entry_row(
 }
 
 /// Encode a sorted key list (restart-required keys) as NUL-separated UTF-8.
-pub fn encode_keys(keys: &[String]) -> Vec<u8> {
+pub(crate) fn encode_keys(keys: &[String]) -> Vec<u8> {
     keys.join("\0").into_bytes()
 }
 
 /// Inverse of [`encode_keys`].
-pub fn decode_keys(bytes: &[u8]) -> Option<Vec<String>> {
+pub(crate) fn decode_keys(bytes: &[u8]) -> Option<Vec<String>> {
     if bytes.is_empty() {
         return Some(Vec::new());
     }

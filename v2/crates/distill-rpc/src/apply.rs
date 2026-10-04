@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use distill_store::served::{
     Change, ResolutionRow, ServedWrite,
-    SERVED_PIPELINE, SERVED_RESTART_KEYS,
+    SERVED_PIPELINE,
 };
 use distill_store::StoreError;
 
@@ -220,34 +220,25 @@ pub fn publish_runtime_pipeline_failure<W: ServedWrite>(
     Ok(true)
 }
 
-/// Stage the restart-required key set. Returns whether it changed.
-pub fn publish_restart_required<W: ServedWrite>(
+/// Announce a changed restart-required key set: the keys the store's
+/// pending restart (its only source) holds now, after `before`. Returns
+/// whether it changed.
+pub(crate) fn publish_restart_required<W: ServedWrite>(
     txn: &mut W,
+    before: &[String],
     keys: &[String],
 ) -> Result<bool, StoreError> {
-    let mut keys = keys.to_vec();
-    keys.sort();
-    keys.dedup();
-    let current = txn
-        .txn_served_blob(SERVED_RESTART_KEYS)?
-        .map(|bytes| {
-            distill_store::served::decode_keys(&bytes)
-                .ok_or_else(|| corrupt("restart-required keys are not UTF-8"))
-        })
-        .transpose()?
-        .unwrap_or_default();
-    if current == keys {
+    if before == keys {
         return Ok(false);
     }
-    txn.set_served_blob(
-        SERVED_RESTART_KEYS,
-        (!keys.is_empty())
-            .then(|| distill_store::served::encode_keys(&keys))
-            .as_deref(),
-    )?;
     if !keys.is_empty() {
         let version = txn.change_version();
-        txn.append_change(version, &Change::RestartRequired { keys })?;
+        txn.append_change(
+            version,
+            &Change::RestartRequired {
+                keys: keys.to_vec(),
+            },
+        )?;
     }
     Ok(true)
 }

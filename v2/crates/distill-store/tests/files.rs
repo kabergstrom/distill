@@ -231,22 +231,6 @@ fn stale_observation_cannot_acknowledge_newer_work_for_the_same_path() {
     assert_eq!(store.pending_file_work().unwrap().dirty.len(), 2);
 }
 
-// ---- clean watermark (§14) ----
-
-#[test]
-fn clean_watermark_roundtrips_durably() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = StoreConfig::new(dir.path().join(".distill"));
-    let mut store = Store::open(config.clone()).unwrap();
-    assert_eq!(store.clean_watermark().unwrap(), None);
-    store
-        .input_transaction(|txn| txn.set_clean_watermark(1_720_000_000))
-        .unwrap();
-    drop(store);
-    let store = Store::open(config).unwrap();
-    assert_eq!(store.clean_watermark().unwrap(), Some(1_720_000_000));
-}
-
 // ---- scan observation tables ----
 
 #[test]
