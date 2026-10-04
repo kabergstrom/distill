@@ -477,11 +477,15 @@ fn reference_path(reference: &mut AuthoredValue) -> Option<&mut String> {
         _ => None,
     }
 }
+
 /// The one reference walk of a rename: every asset/weak reference query in
-/// `value`, under options, the active variant, sequences, sets, and the
-/// values of string-keyed maps. `visit` returns whether it changed the
-/// query. `frames` are the struct/enum frames open on the path, which a
-/// back-reference re-enters (`distill_core::frames`).
+/// `value`, wherever the bundle walker validates one and the build's wire
+/// encoder resolves one (§5, §6) — under options, the active variant,
+/// sequences, sets, and both the keys and the values of maps.
+/// `visit` returns whether it changed the query. A set or non-string-keyed
+/// map whose canonical order (§6) a change broke is sorted again; a change
+/// that makes two of its elements or keys equal is an error. `frames` are
+/// the struct/enum frames open on the path, which a back-reference
 /// re-enters (`distill_core::frames`).
 fn visit_references<'s>(
     schema: &'s SchemaNode,
@@ -517,13 +521,26 @@ fn visit_references<'s>(
             frames.pop();
             changed
         }
-        SchemaNode::Vec(inner) | SchemaNode::Set(inner) | SchemaNode::Array { elem: inner, .. } => {
+        SchemaNode::Vec(inner) | SchemaNode::Array { elem: inner, .. } => {
             let AuthoredValue::Array(values) = value else {
                 return Ok(false);
             };
             let mut changed = false;
             for value in values {
                 changed |= visit_references(inner, value, frames, visit)?;
+            }
+            Ok(changed)
+        }
+        SchemaNode::Set(inner) => {
+            let AuthoredValue::Array(values) = value else {
+                return Ok(false);
+            };
+            let mut changed = false;
+            for value in values.iter_mut() {
+                changed |= visit_references(inner, value, frames, visit)?;
+            }
+            if changed {
+                sort_canonically(values, |element| element, "set elements")?;
             }
             Ok(changed)
         }
@@ -535,12 +552,30 @@ fn visit_references<'s>(
             }
         }
         SchemaNode::Map { key, value: item } => match value {
+            // A string key is never a reference.
             AuthoredValue::Object(values) if matches!(key.as_ref(), SchemaNode::String) => {
                 let mut changed = false;
                 for value in values.values_mut() {
                     changed |= visit_references(item, value, frames, visit)?;
                 }
                 Ok(changed)
+            }
+            // Any other key: `[key, value]` pairs in key order (§6).
+            AuthoredValue::Array(pairs) => {
+                let mut changed = false;
+                let mut keys_changed = false;
+                for pair in pairs.iter_mut() {
+                    if let AuthoredValue::Array(pair) = pair {
+                        if let [pair_key, pair_value] = pair.as_mut_slice() {
+                            keys_changed |= visit_references(key, pair_key, frames, visit)?;
+                            changed |= visit_references(item, pair_value, frames, visit)?;
+                        }
+                    }
+                }
+                if keys_changed {
+                    sort_canonically(pairs, pair_key, "map keys")?;
+                }
+                Ok(changed || keys_changed)
             }
             _ => Ok(false),
         },
@@ -575,6 +610,35 @@ fn visit_fields<'s>(
         }
     }
     Ok(changed)
+}
+
+fn pair_key(pair: &AuthoredValue) -> &AuthoredValue {
+    match pair {
+        AuthoredValue::Array(pair) if pair.len() == 2 => &pair[0],
+        other => other,
+    }
+}
+
+/// Restore §6's canonical order — ascending by the canonical encoded bytes
+/// of each item's `key` — after a rewrite changed some keys.
+fn sort_canonically(
+    items: &mut Vec<AuthoredValue>,
+    key: fn(&AuthoredValue) -> &AuthoredValue,
+    what: &str,
+) -> Result<(), RpcFailure> {
+    let mut keyed = std::mem::take(items)
+        .into_iter()
+        .map(|item| Ok((distill_json::write(key(&item)).map_err(invalid)?, item)))
+        .collect::<Result<Vec<_>, RpcFailure>>()?;
+    keyed.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    if let Some(pair) = keyed.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(invalid(format!(
+            "the rename would make two {what} equal: {}",
+            pair[0].0
+        )));
+    }
+    *items = keyed.into_iter().map(|(_, item)| item).collect();
+    Ok(())
 }
 
 fn validate_rooted_destination(
@@ -757,12 +821,12 @@ mod reference_tests {
         let references = bundle_path_references(&bundle);
         assert_eq!(
             references,
-            ["a", "b", "c", "d", "e", "f", "g", "h"]
+            ["a", "b", "c", "d", "e", "f", "g", "h", "number"]
                 .map(|name| format!("{name}.bundle"))
                 .into()
         );
         let candidates = references.iter().cloned().chain(
-            ["label", "number", "unknown", "unnamed", "x", "absent"]
+            ["label", "unknown", "unnamed", "x", "absent"]
                 .map(|name| format!("{name}.bundle")),
         );
         for from in candidates {
@@ -841,5 +905,240 @@ mod reference_tests {
                 .unwrap()
         );
         assert!(bundle_path_references(&rewritten).contains("moved.bundle"));
+    }
+
+    /// One entry under a schema whose root is `{ label: String, v: shape }`,
+    /// with a hash `write_bundle` accepts. `label` is a decoy: a plain
+    /// string naming a path, which no walker counts.
+    fn shaped_bundle(shape: SchemaNode, value: AuthoredValue) -> Bundle {
+        let schema = LogicalSchema {
+            root: SchemaNode::Struct {
+                rev: 0,
+                fields: vec![
+                    ("label".into(), 0, SchemaNode::String),
+                    ("v".into(), 0, shape),
+                ],
+            },
+        };
+        let hash = distill_schema::ngp_schema::node_hash(&schema.root).unwrap();
+        Bundle {
+            format_version: 1,
+            uuid: BundleUuid([2; 16]),
+            primary: None,
+            schemas: BTreeMap::from([(hash, schema)]),
+            assets: BTreeMap::from([(
+                "main".to_owned(),
+                AssetEntry {
+                    uuid: AssetUuid([4; 16]),
+                    type_uuid: TypeUuid([5; 16]),
+                    schema_hash: hash,
+                    authoring_only: false,
+                    data: object(&[("label", text("decoy.bundle")), ("v", value)]),
+                },
+            )]),
+        }
+    }
+
+    type ShapeCase = (&'static str, SchemaNode, AuthoredValue, &'static [&'static str]);
+
+    /// Every container shape a reference can sit under (§5), with the
+    /// paths it names. Two-reference cases name `a` and `b`, so a rename
+    /// of `a` to `z.bundle` reorders a set or a map's keys.
+    fn shape_cases() -> Vec<ShapeCase> {
+        let reference = || SchemaNode::AssetRef(TypeUuid([3; 16]));
+        let record = |fields: Vec<(&str, SchemaNode)>| SchemaNode::Struct {
+            rev: 0,
+            fields: fields
+                .into_iter()
+                .map(|(name, node)| (name.to_owned(), 0, node))
+                .collect(),
+        };
+        let byte = || SchemaNode::Primitive(PrimitiveKind::U8);
+        let map = |key, value| SchemaNode::Map {
+            key: Box::new(key),
+            value: Box::new(value),
+        };
+        let array = AuthoredValue::Array;
+        let pair = |key, value| AuthoredValue::Array(vec![key, value]);
+        let int = AuthoredValue::UInt;
+        let choice = || SchemaNode::Enum {
+            rev: 0,
+            variants: vec![
+                ("Named".into(), 0, record(vec![("0", SchemaNode::String)])),
+                ("Record".into(), 0, record(vec![("r", reference())])),
+            ],
+        };
+        vec![
+            ("asset reference", reference(), text("a.bundle"), &["a"]),
+            (
+                "weak reference by path and local id",
+                SchemaNode::WeakRef(TypeUuid([3; 16])),
+                object(&[("asset", text("x")), ("path", text("a.bundle"))]),
+                &["a"],
+            ),
+            (
+                "local id only",
+                reference(),
+                object(&[("asset", text("a.bundle"))]),
+                &[],
+            ),
+            (
+                "option, some",
+                SchemaNode::Option(Box::new(reference())),
+                text("a.bundle"),
+                &["a"],
+            ),
+            (
+                "option, none",
+                SchemaNode::Option(Box::new(reference())),
+                AuthoredValue::Null,
+                &[],
+            ),
+            (
+                "vec",
+                SchemaNode::Vec(Box::new(reference())),
+                array(vec![text("b.bundle"), text("a.bundle")]),
+                &["a", "b"],
+            ),
+            (
+                "nested vec",
+                SchemaNode::Vec(Box::new(SchemaNode::Vec(Box::new(reference())))),
+                array(vec![
+                    array(vec![text("a.bundle")]),
+                    array(vec![text("b.bundle")]),
+                ]),
+                &["a", "b"],
+            ),
+            (
+                "fixed array",
+                SchemaNode::Array {
+                    len: 2,
+                    elem: Box::new(reference()),
+                },
+                array(vec![text("b.bundle"), text("a.bundle")]),
+                &["a", "b"],
+            ),
+            (
+                "set",
+                SchemaNode::Set(Box::new(reference())),
+                array(vec![text("a.bundle"), text("b.bundle")]),
+                &["a", "b"],
+            ),
+            (
+                "string-keyed map: values, never keys",
+                map(SchemaNode::String, reference()),
+                object(&[("k.bundle", text("a.bundle"))]),
+                &["a"],
+            ),
+            (
+                "integer-keyed map values",
+                map(byte(), reference()),
+                array(vec![
+                    pair(int(1), text("b.bundle")),
+                    pair(int(2), text("a.bundle")),
+                ]),
+                &["a", "b"],
+            ),
+            (
+                "reference-keyed map keys",
+                map(reference(), byte()),
+                array(vec![
+                    pair(text("a.bundle"), int(1)),
+                    pair(text("b.bundle"), int(2)),
+                ]),
+                &["a", "b"],
+            ),
+            (
+                "struct-keyed map keys",
+                map(record(vec![("r", reference())]), SchemaNode::String),
+                array(vec![
+                    pair(object(&[("r", text("a.bundle"))]), text("k.bundle")),
+                    pair(object(&[("r", text("b.bundle"))]), text("k.bundle")),
+                ]),
+                &["a", "b"],
+            ),
+            (
+                "enum struct variant",
+                choice(),
+                object(&[("Record", object(&[("r", text("a.bundle"))]))]),
+                &["a"],
+            ),
+            (
+                "enum string variant",
+                choice(),
+                object(&[("Named", object(&[("0", text("a.bundle"))]))]),
+                &[],
+            ),
+            (
+                // Node { children: Map<u8, Node>, link: AssetRef }
+                "integer-keyed map values through a back-reference",
+                record(vec![
+                    ("children", map(byte(), SchemaNode::BackRef(0))),
+                    ("link", reference()),
+                ]),
+                object(&[
+                    (
+                        "children",
+                        array(vec![pair(
+                            int(1),
+                            object(&[("children", array(vec![])), ("link", text("b.bundle"))]),
+                        )]),
+                    ),
+                    ("link", text("a.bundle")),
+                ]),
+                &["a", "b"],
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_container_shape_stores_and_rewrites_the_same_references() {
+        for (case, shape, value, names) in shape_cases() {
+            let bundle = shaped_bundle(shape, value);
+            let bytes = distill_bundle::write_bundle(&bundle)
+                .unwrap_or_else(|error| panic!("{case}: fixture is not canonical: {error}"));
+            assert_eq!(
+                distill_bundle::parse_bundle(&bytes).unwrap(),
+                bundle,
+                "{case}"
+            );
+            let expected: BTreeSet<String> =
+                names.iter().map(|name| format!("{name}.bundle")).collect();
+            assert_eq!(bundle_path_references(&bundle), expected, "{case}");
+            for from in expected
+                .iter()
+                .map(String::as_str)
+                .chain(["decoy.bundle", "k.bundle", "x"])
+            {
+                let mut rewritten = bundle.clone();
+                let changed =
+                    rewrite_bundle_path_references(&mut rewritten, from, "z.bundle").unwrap();
+                assert_eq!(changed, expected.contains(from), "{case}: {from}");
+                // Still canonical: a set or map whose order the rewrite
+                // changed is sorted again.
+                let bytes = distill_bundle::write_bundle(&rewritten)
+                    .unwrap_or_else(|error| panic!("{case}: {from}: {error}"));
+                assert_eq!(
+                    distill_bundle::parse_bundle(&bytes).unwrap(),
+                    rewritten,
+                    "{case}: {from}"
+                );
+                let mut moved = expected.clone();
+                if moved.remove(from) {
+                    moved.insert("z.bundle".to_owned());
+                }
+                assert_eq!(bundle_path_references(&rewritten), moved, "{case}: {from}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_rewrite_that_merges_two_set_elements_is_refused() {
+        let bundle = shaped_bundle(
+            SchemaNode::Set(Box::new(SchemaNode::AssetRef(TypeUuid([3; 16])))),
+            AuthoredValue::Array(vec![text("a.bundle"), text("b.bundle")]),
+        );
+        let mut rewritten = bundle.clone();
+        assert!(rewrite_bundle_path_references(&mut rewritten, "a.bundle", "b.bundle").is_err());
     }
 }
