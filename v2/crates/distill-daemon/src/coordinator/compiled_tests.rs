@@ -965,6 +965,143 @@ fn a_complete_publication_revalidates_a_poisoned_skeleton_after_a_schema_edit() 
     }
 }
 
+/// The bytes of a bundle holding one labeled asset; `malformed` adds an
+/// unknown envelope key, which poisons it to its skeleton.
+fn labeled_bundle(bundle: u8, asset: u8, category: &str, malformed: bool) -> Vec<u8> {
+    let authority = labeled_authority(false);
+    let project = authority.project_type(LABEL_TYPE).unwrap();
+    let bytes = distill_bundle::write_bundle(&Bundle {
+        format_version: 1,
+        uuid: BundleUuid([bundle; 16]),
+        primary: Some("entry".into()),
+        schemas: BTreeMap::from([(project.logical_hash, project.logical_schema.clone())]),
+        assets: BTreeMap::from([(
+            "entry".into(),
+            AssetEntry {
+                uuid: AssetUuid([asset; 16]),
+                type_uuid: LABEL_TYPE,
+                schema_hash: project.logical_hash,
+                authoring_only: false,
+                data: AuthoredValue::Object(BTreeMap::from([(
+                    "category".to_owned(),
+                    AuthoredValue::Str(category.to_owned()),
+                )])),
+            },
+        )]),
+    })
+    .unwrap();
+    if !malformed {
+        return bytes;
+    }
+    let mut value = distill_json::parse(std::str::from_utf8(&bytes).unwrap()).unwrap();
+    let AuthoredValue::Object(envelope) = &mut value else {
+        panic!("a bundle envelope is an object");
+    };
+    envelope.insert("future-extension".to_owned(), AuthoredValue::UInt(1));
+    distill_json::write(&value).unwrap().into_bytes()
+}
+
+/// Publish `files` into `assets`, completely, over what `store` holds,
+/// then into a fresh store: the publication over old rows (the upsert
+/// fallback of a scan's bundle publication) leaves the rows the fresh one
+/// (plain inserts) does.
+fn assert_republication_matches_a_fresh_one(
+    temp: &tempfile::TempDir,
+    store: &mut Store,
+    scanner: &RootedScanner,
+    files: &[(&str, Vec<u8>)],
+) {
+    let assets = temp.path().join("assets");
+    for (name, bytes) in files {
+        std::fs::write(assets.join(name), bytes).unwrap();
+    }
+    let configuration = Configuration {
+        projection: PipelineProjection::build(
+            Vec::new(),
+            [9; 32],
+            &BTreeMap::from([("dev".to_owned(), build_target(false))]),
+            [LABEL_TYPE],
+        )
+        .unwrap(),
+        pipeline: pipeline_publication(&labeled_authority(false), 1),
+        authority: labeled_authority(false),
+    };
+    publish_completely(store, scanner, &configuration, &BTreeSet::new());
+    let mut fresh = Store::open(StoreConfig::new(temp.path().join("fresh"))).unwrap();
+    publish_completely(&mut fresh, scanner, &configuration, &BTreeSet::new());
+    let (republished, fresh) = (published_tables(store), published_tables(&fresh));
+    for table in ["bundles", "bundle_path_refs", "asset_tags", "errors"] {
+        assert_eq!(republished[table], fresh[table], "{table}");
+    }
+    // An asset row less its tag state (tag_poison, tag_module), which
+    // here only the fresh store's first tag epochs mark pending.
+    let assets = |tables: &BTreeMap<&str, Vec<String>>| {
+        tables["assets"]
+            .iter()
+            .map(|row| row.rsplitn(3, " | ").last().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(assets(&republished), assets(&fresh));
+}
+
+fn labeled_store(temp: &tempfile::TempDir, files: &[(&str, Vec<u8>)]) -> (Store, RootedScanner) {
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    for (name, bytes) in files {
+        std::fs::write(assets.join(name), bytes).unwrap();
+    }
+    let scanner = RootedScanner::new([AssetRoot::new("main", &assets)]).unwrap();
+    let mut store = Store::open(StoreConfig::new(temp.path().join("state"))).unwrap();
+    let configuration = Configuration {
+        projection: PipelineProjection::build(
+            Vec::new(),
+            [9; 32],
+            &BTreeMap::from([("dev".to_owned(), build_target(false))]),
+            [LABEL_TYPE],
+        )
+        .unwrap(),
+        pipeline: pipeline_publication(&labeled_authority(false), 1),
+        authority: labeled_authority(false),
+    };
+    publish_completely(&mut store, &scanner, &configuration, &BTreeSet::new());
+    (store, scanner)
+}
+
+/// A changed bundle that has a row republishes over it.
+#[test]
+fn a_scan_republishes_a_changed_bundle_over_its_row() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut store, scanner) = labeled_store(&temp, &[("a.bundle", labeled_bundle(0x70, 0x71, "enemy", false))]);
+    assert!(store.bundle(BundleUuid([0x70; 16])).unwrap().is_some());
+    assert_republication_matches_a_fresh_one(
+        &temp,
+        &mut store,
+        &scanner,
+        &[("a.bundle", labeled_bundle(0x70, 0x71, "ally", false))],
+    );
+}
+
+/// A new bundle whose asset still has a row, the skeleton of a bundle this
+/// scan poisons again without it, republishes over that row: the poisoned
+/// rewrite replaces its rows only after the new bundle is published.
+#[test]
+fn a_scan_publishes_a_new_bundle_over_its_assets_skeleton_row() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut store, scanner) = labeled_store(&temp, &[("a.bundle", labeled_bundle(0x70, 0x71, "enemy", true))]);
+    assert_eq!(store.poisoned_bundles().unwrap(), vec![BundleUuid([0x70; 16])]);
+    assert!(store.bundle(BundleUuid([0x72; 16])).unwrap().is_none());
+    assert_republication_matches_a_fresh_one(
+        &temp,
+        &mut store,
+        &scanner,
+        &[
+            ("a.bundle", labeled_bundle(0x70, 0x73, "enemy", true)),
+            ("b.bundle", labeled_bundle(0x72, 0x71, "enemy", false)),
+        ],
+    );
+    assert!(store.entry(AssetUuid([0x71; 16])).unwrap().is_some());
+}
+
 /// A snapshot whose version's compiled state the registry has released
 /// cannot see the pipeline that version served: its diagnostics expire,
 /// retryably, rather than claim a Ready pipeline it cannot see.
