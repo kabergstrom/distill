@@ -1294,7 +1294,29 @@ Write paths:
 Scale probe (20k assets, release; statements cold / edit / warm, then
 cold and warm seconds):
 - before: 821,071 / 123 / 58; 6.6–7.4 s and 3.1 s;
-- after: 500,235 / 66 / 30; 5.1 s and 2.8 s.
+- after: 500,235 / 66 / 30; 5.1 s and 2.8 s;
+- after the scan-publication statements (plain inserts for new bundles,
+  no per-entry resolution reads): 220,235 / 62 / 30;
+- after the final cleanup: 200,234 / 57 / 30; 4.8 s and 2.8 s.
+
+Final cleanup (schema 56, protocol 15):
+- The reconnect reasons are `StoreInstanceChanged` and
+  `PipelineEpochChanged`. A target leaves the set only with a pipeline
+  fence, so `rpc_targets` has no generation and its rows are upserts.
+  An asset delta is `Changed` or `Deleted`. A returning asset is
+  `Changed`, which takes a loader's `Dead` entry back to `Missing`.
+- Production code no longer carries test-only helpers. This removed
+  `AuthoringBackend::read_file`'s default, `register_importer` (the
+  importer tests import through the pipeline fixture), and the store,
+  daemon, loader and pack `pub` items only tests called.
+- An edit reads nothing twice:
+  - the scan's baseline subtree read serves the echo check;
+  - a claims replacement returns each pending bundle's claimants;
+  - one read of the scan's error family is both the claims' collisions
+    and the rows its write compares with;
+  - queued work carries its root's name;
+  - the import pass indexes the bundle rows the publication just wrote
+    without reading them back.
 
 ## 7. Test baseline
 
@@ -1347,3 +1369,5 @@ Atomic file writes everywhere, authoring writes as file writes (protocol
 replacing atomic.rs's 1, staging ignored by scanner and watcher, codegen
 M5, the file-hash plan, and the rename's conflict and cut-short retry
 tests).
+Final schema-min cleanup (schema 56, protocol 15): 1236 passed, no
+failures.
