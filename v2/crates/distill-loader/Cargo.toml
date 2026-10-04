@@ -16,5 +16,10 @@ distill-wire = { path = "../distill-wire" }
 tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
 
 [dev-dependencies]
+capnp = "0.26.2"
+capnp-futures = "0.26.1"
+futures = "0.3"
+libc = "0.2"
+tokio-util = { version = "0.7", features = ["compat"] }
 distill-test-project = { path = "../distill-daemon/tests/fixtures/test-project" }
 distill-rpc = { path = "../distill-rpc", features = ["test-hooks"] }
