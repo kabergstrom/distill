@@ -48,7 +48,15 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
 ] }
 
+[features]
+# Test drivers and instruments: the coordinator's single-step reconcile
+# drivers, `watched_imports_needing_reimport`, `ScanSnapshot::file_rows`, and
+# `ModuleHost::publish_candidate` with its epoch's token and failure report.
+test-hooks = []
+
 [dev-dependencies]
+# The integration tests use the test hooks.
+distill-daemon = { path = ".", features = ["test-hooks"] }
 distill-test-project = { path = "tests/fixtures/test-project" }
 distill-pipeline-fixture = { path = "tests/fixtures/pipeline-module" }
 rusqlite = { version = "0.32", features = ["bundled"] }

@@ -213,6 +213,7 @@ struct Affected<'a> {
 
 impl<'a> ImportScope<'a> {
     /// A scan only.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(super) const NONE: Self = Self {
         directories: false,
         watched: false,
@@ -229,6 +230,7 @@ impl<'a> ImportScope<'a> {
         }
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn directories(affected: Option<(&'a PendingFileWork, bool)>) -> Self {
         Self {
             directories: true,
@@ -237,6 +239,7 @@ impl<'a> ImportScope<'a> {
         }
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn watched(affected: Option<(&'a PendingFileWork, bool)>) -> Self {
         Self {
             watched: true,
@@ -264,6 +267,7 @@ impl<'a> ImportScope<'a> {
 }
 
 impl<'a> Affected<'a> {
+    #[cfg(any(test, feature = "test-hooks"))]
     fn supplied((work, capabilities_changed): (&'a PendingFileWork, bool)) -> Self {
         Self {
             work: Some(work),

@@ -722,6 +722,7 @@ impl PipelineEpoch {
         &self.0.staged.path
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn module_token(&self) -> &ModuleEpochToken {
         &self.0.token
     }
@@ -1126,6 +1127,7 @@ impl PipelineEpoch {
     /// Report any contained module callback failure, including drop/free/update
     /// thunks. The shared token makes the fence immediately visible to values
     /// and every snapshot that pins this epoch.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn report_runtime_failure(&self, error: impl Into<String>) {
         self.0
             .poison(PipelineFailureCode::PublishedCallbackRejected, error.into());
@@ -1374,6 +1376,7 @@ impl ModuleHost {
     ///
     /// A candidate awaiting source-walk (see [`CandidateRejection`]) leaves
     /// the Ready epoch published and returns it.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn publish_candidate(
         &mut self,
         source: &Path,

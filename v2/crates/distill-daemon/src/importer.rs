@@ -384,6 +384,7 @@ impl AuthoringService {
     /// reproduces under the current rooted filesystem and importer-capability
     /// projection, with the index refreshed for the pending work. The caller
     /// reruns these under the single-writer RPC CAS.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn watched_imports_needing_reimport(
         &self,
         store: &mut Store,

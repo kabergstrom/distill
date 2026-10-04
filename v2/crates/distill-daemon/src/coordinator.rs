@@ -62,6 +62,7 @@ use crate::watcher::{WatcherAction, WatcherBatch, WatcherQueue};
 mod compiled_tests;
 mod pass;
 
+#[cfg(any(test, feature = "test-hooks"))]
 use pass::ImportScope;
 pub use pass::PassOutcome;
 
@@ -1033,6 +1034,7 @@ impl DaemonCoordinator {
 
     /// Reconcile one complete identity-checked namespace scan, as a pass
     /// with no imports.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn reconcile_full_scan(
         &self,
         store: &mut Store,
@@ -1047,6 +1049,7 @@ impl DaemonCoordinator {
     /// Apply one native watcher batch by reopening only its affected paths or
     /// directory subtrees and merging those observations into the published
     /// state, as a pass with no imports.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn reconcile_incremental(
         &self,
         store: &mut Store,
@@ -1061,6 +1064,7 @@ impl DaemonCoordinator {
 
     /// Rerun every watched import whose complete outcome-bearing basis
     /// drifted, as one pass: all of them publish as one version.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn reconcile_watched_imports(
         &self,
         store: &mut Store,
@@ -1070,6 +1074,7 @@ impl DaemonCoordinator {
 
     /// Watcher-work variant that revalidates only read sets capable of
     /// observing one of `work`'s dirty paths.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn reconcile_watched_imports_affected(
         &self,
         store: &mut Store,
@@ -1085,6 +1090,7 @@ impl DaemonCoordinator {
     /// Discover and apply authored directory-import rules, as one pass.
     /// Orphaned prior outputs are deliberately retained and therefore never
     /// appear as deletion work.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn reconcile_directory_imports(
         &self,
         store: &mut Store,
@@ -1092,6 +1098,7 @@ impl DaemonCoordinator {
         self.import_pass(store, ImportScope::directories(None))
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn reconcile_directory_imports_affected(
         &self,
         store: &mut Store,
@@ -1106,6 +1113,7 @@ impl DaemonCoordinator {
 
     /// An imports-only pass. An importer failure with no bundle to hold its
     /// memo is this call's error, after the rest of the pass published.
+    #[cfg(any(test, feature = "test-hooks"))]
     fn import_pass(
         &self,
         store: &mut Store,

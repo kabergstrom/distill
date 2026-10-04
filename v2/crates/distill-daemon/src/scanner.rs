@@ -373,6 +373,7 @@ impl ScanSnapshot {
             && self.symlink_aliases == other.symlink_aliases
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn file_rows(&self) -> impl Iterator<Item = &ScannedFile> {
         self.files.values()
     }
