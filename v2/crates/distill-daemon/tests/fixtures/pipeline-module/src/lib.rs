@@ -1,9 +1,9 @@
 //! The pipeline module the daemon tests load: it serves every target and
 //! registers one processor, [`REFLECT`], which cooks a [`PARENT_TYPE`]
 //! asset to a [`COOKED_TYPE`] primary and a declared [`REFLECTION`] output
-//! of [`REFLECTION_TYPE`]: a derived child asset; and two importers,
-//! [`BYTE_IMPORTER`] and [`CHAIN_IMPORTER`], producing [`VALUE_TYPE`] from
-//! settings of [`SETTINGS_TYPE`].
+//! of [`REFLECTION_TYPE`]: a derived child asset; and three importers,
+//! [`BYTE_IMPORTER`], [`CHAIN_IMPORTER`] and [`SETTINGS_IMPORTER`],
+//! producing [`VALUE_TYPE`] from settings of [`SETTINGS_TYPE`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -46,6 +46,9 @@ pub const BYTE_IMPORTER: &str = "byte-importer";
 /// under its settings: a text source's number, or a bundle source's `asset`
 /// entry, so its sources may be other imports' outputs.
 pub const CHAIN_IMPORTER: &str = "chain-importer";
+/// Imports the sum of `scale.by` over the settings of its sources' imports
+/// (`read_settings`; a source no import names adds 0), under its settings.
+pub const SETTINGS_IMPORTER: &str = "settings-importer";
 
 /// A [`VALUE_TYPE`] value.
 pub fn value(value: u128) -> AuthoredValue {
@@ -190,6 +193,36 @@ impl PipelineImporter for ChainImporter {
     }
 }
 
+struct SettingsImporter;
+
+impl PipelineImporter for SettingsImporter {
+    fn import(
+        &self,
+        context: &mut dyn AuthoringImportContext,
+        settings: &AuthoredValue,
+    ) -> Result<ImportOutput, AuthoringImporterError> {
+        let mut value = 0;
+        for source in context.sources().to_vec() {
+            let Some(imported) = context.read_settings(&source.path)? else {
+                continue;
+            };
+            let by = match &imported {
+                AuthoredValue::Object(fields) => match fields.get("scale") {
+                    Some(AuthoredValue::Object(scale)) => match scale.get("by") {
+                        Some(AuthoredValue::UInt(by)) => Some(*by),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            };
+            value += by
+                .ok_or_else(|| AuthoringImporterError::rejected(8, format!("{imported:?}")))?;
+        }
+        output(apply(settings, value)?)
+    }
+}
+
 /// An importer's descriptor: version 1, settings a [`SETTINGS_TYPE`].
 fn importer(id: &str) -> ImporterDescriptor {
     ImporterDescriptor {
@@ -275,6 +308,9 @@ fn register(
         .into_result()?;
     arena
         .register_importer(importer(CHAIN_IMPORTER), ChainImporter)
+        .into_result()?;
+    arena
+        .register_importer(importer(SETTINGS_IMPORTER), SettingsImporter)
         .into_result()?;
     Ok(targets.iter().map(|target| target.name.clone()).collect())
 }

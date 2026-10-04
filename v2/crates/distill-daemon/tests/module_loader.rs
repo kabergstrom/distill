@@ -148,6 +148,7 @@ fn compiled_pipeline_cdylib_opens_registers_unloads_and_closes() {
             distill_pipeline_fixture::REFLECT,
             distill_pipeline_fixture::BYTE_IMPORTER,
             distill_pipeline_fixture::CHAIN_IMPORTER,
+            distill_pipeline_fixture::SETTINGS_IMPORTER,
         ]
     );
 

@@ -12,6 +12,7 @@ use distill_daemon::watcher::WatcherBatch;
 use distill_json::AuthoredValue;
 use distill_pipeline_fixture::{
     default_settings, settings, value as byte, value_of as byte_of, BYTE_IMPORTER, CHAIN_IMPORTER,
+    SETTINGS_IMPORTER,
 };
 use distill_rpc::{
     AuthoringValue, ImportRequest, InputVersion, TargetDefinition, TargetDefinitionHash,
@@ -1673,4 +1674,72 @@ fn if_changed_imports_skip_unchanged_settings_and_rerun_edited_ones() {
     import_if_changed(&coordinator, &["source.txt"], "imported.bundle", &object([]));
     assert_eq!(read().assets["$settings"].data, default_settings());
     assert_eq!(read().assets["asset"].data, byte(4));
+}
+
+/// `read_settings` gives an importer the `$settings` of the import of a
+/// path, and a settings edit of that import re-runs the reading import in
+/// the pass that publishes the edit.
+#[test]
+fn read_settings_returns_the_bundle_settings_and_an_edit_reruns_the_reader() {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("image.txt"), b"4").unwrap();
+    std::fs::write(assets.join("loose.txt"), b"9").unwrap();
+    let coordinator = DaemonCoordinator::open(
+        StoreConfig::new(temp.path().join(".distill")),
+        vec![AssetRoot::new("main", &assets)],
+        vec![target()],
+        64,
+    )
+    .unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    configure(&coordinator, temp.path(), &assets);
+    let value = |dest: &str| {
+        let bundle =
+            distill_bundle::parse_bundle(&std::fs::read(assets.join(dest)).unwrap()).unwrap();
+        byte_of(&bundle.assets["asset"].data)
+    };
+
+    import_with(
+        &coordinator,
+        BYTE_IMPORTER,
+        &["image.txt"],
+        "image.txt.bundle",
+        &settings([0, 0], 3),
+    );
+    let echo = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["image.txt.bundle"]), false)
+        .unwrap();
+    assert!(!echo.more_work);
+    // `image.txt`'s import has `scale.by` 3; `loose.txt` has no import.
+    import(
+        &coordinator,
+        SETTINGS_IMPORTER,
+        &["image.txt", "loose.txt"],
+        "reader.bundle",
+    );
+    let echo = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["reader.bundle"]), false)
+        .unwrap();
+    assert!(!echo.more_work);
+    assert_eq!(value("reader.bundle"), Some(3));
+
+    // Edit the image import's settings: publishing its bundle re-runs the
+    // reader.
+    import_with(
+        &coordinator,
+        BYTE_IMPORTER,
+        &["image.txt"],
+        "image.txt.bundle",
+        &settings([0, 0], 5),
+    );
+    assert_eq!(value("image.txt.bundle"), Some(20));
+    let outcome = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["image.txt.bundle"]), false)
+        .unwrap();
+    assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+    assert_eq!(outcome.imported.len(), 1, "the reader, and only it");
+    assert_eq!(value("reader.bundle"), Some(5));
 }
