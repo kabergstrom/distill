@@ -2247,7 +2247,6 @@ fn cas_and_served_point_statements_search_their_keys() {
     let candidates = store.lookup_candidates(crate::cas::record::KeyKind::Processor, &key).unwrap();
     let hash = installed[11];
     store.cas_read(&hash.0).unwrap();
-    store.cas_contains(&hash.0).unwrap();
     store.artifact_load_edges(hash).unwrap();
     store.served_entry_meta(asset).unwrap();
     // An inspection reads its bundle file at the published hash.
@@ -2322,10 +2321,6 @@ fn cas_and_served_point_statements_search_their_keys() {
         (
             "SELECT config_key FROM pending_restart WHERE generation = ? ORDER BY config_key",
             &["SEARCH pending_restart USING COVERING INDEX sqlite_autoindex_pending_restart_1 (generation=?)"],
-        ),
-        (
-            "SELECT EXISTS(SELECT ? FROM cas_extents WHERE content_hash = ?)",
-            &["SCAN CONSTANT ROW", "SCALAR SUBQUERY 1", "SEARCH cas_extents USING COVERING INDEX sqlite_autoindex_cas_extents_1 (content_hash=?)"],
         ),
         (
             "SELECT a.asset_uuid FROM assets a JOIN bundles b ON b.bundle_uuid = a.bundle_uuid WHERE a.terminal_type IS NOT NULL AND a.logical_hash IS NOT NULL AND b.poison IS NULL AND b.path = ? AND a.local_id = ? AND a.authoring_only = ?",

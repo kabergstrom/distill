@@ -63,14 +63,6 @@ pub struct FileState {
     pub content_hash: Option<ContentHash>,
 }
 
-/// The derived logical path index's three states (§13).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LogicalPathState {
-    Missing,
-    Unique(RootId),
-    Ambiguous(Vec<RootId>),
-}
-
 /// One changed path of the watcher work (§13's `file_work`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirtyEntry {
@@ -551,21 +543,6 @@ impl StoreReader {
                 },
             )
             .optional()?)
-    }
-
-    /// The derived logical path index (§13): which roots hold `path`.
-    pub fn logical_path(&self, path: &str) -> Result<LogicalPathState, StoreError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT root_id FROM files WHERE path = ?1 ORDER BY root_id")?;
-        let roots: Vec<RootId> = stmt
-            .query_map([path], |r| r.get::<_, i64>(0).map(RootId))?
-            .collect::<Result<_, _>>()?;
-        Ok(match roots.len() {
-            0 => LogicalPathState::Missing,
-            1 => LogicalPathState::Unique(roots[0]),
-            _ => LogicalPathState::Ambiguous(roots),
-        })
     }
 }
 

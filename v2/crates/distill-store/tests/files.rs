@@ -1,11 +1,8 @@
-//! §13 file-tracking tables: per-root physical rows, the derived logical
-//! path index with representable ambiguity, and the transactionally
+//! §13 file-tracking tables: per-root physical rows and the transactionally
 //! consumed dirty queue and rename log (§14's discipline).
 
 use distill_core::id::ContentHash;
-use distill_store::files::{
-    FileKind, FileObservation, FileState, LogicalPathState,
-};
+use distill_store::files::{FileKind, FileObservation, FileState};
 use distill_store::state::InputVersion;
 use distill_store::{Store, StoreConfig};
 
@@ -112,60 +109,6 @@ fn upsert_replaces_and_remove_deletes() {
         })
         .unwrap();
     assert!(store.file(root, "a.bundle").unwrap().is_none());
-}
-
-// ---- the derived logical path index ----
-
-#[test]
-fn logical_path_index_has_three_states() {
-    // §13: Missing, Unique(root), Ambiguous(roots) — ambiguity is
-    // representable, not pre-collapsed.
-    let (_d, mut store) = store();
-    assert_eq!(
-        store.logical_path("tex/rock.bundle").unwrap(),
-        LogicalPathState::Missing
-    );
-
-    let (main, _) = store
-        .input_transaction(|txn| {
-            let main = txn.intern_root("main")?;
-            txn.upsert_file(main, "tex/rock.bundle", &file_state(1).into(), InputVersion(1))?;
-            Ok(main)
-        })
-        .unwrap();
-    assert_eq!(
-        store.logical_path("tex/rock.bundle").unwrap(),
-        LogicalPathState::Unique(main)
-    );
-
-    let (engine, _) = store
-        .input_transaction(|txn| {
-            let engine = txn.intern_root("engine")?;
-            txn.upsert_file(engine, "tex/rock.bundle", &file_state(2).into(), InputVersion(2))?;
-            Ok(engine)
-        })
-        .unwrap();
-    match store.logical_path("tex/rock.bundle").unwrap() {
-        LogicalPathState::Ambiguous(mut roots) => {
-            roots.sort();
-            let mut expected = vec![main, engine];
-            expected.sort();
-            assert_eq!(roots, expected);
-        }
-        other => panic!("expected Ambiguous, got {other:?}"),
-    }
-
-    // Removing one observation collapses back to Unique.
-    store
-        .input_transaction(|txn| {
-            txn.remove_file(main, "tex/rock.bundle")?;
-            Ok(())
-        })
-        .unwrap();
-    assert_eq!(
-        store.logical_path("tex/rock.bundle").unwrap(),
-        LogicalPathState::Unique(engine)
-    );
 }
 
 // ---- dirty queue ----

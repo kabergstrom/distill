@@ -51,34 +51,6 @@ impl StoreConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChangeClass {
-    InputVersionedEpoch,
-    OperationalLive,
-    RestartOnly,
-}
-
-/// §18's total change-class table. Unknown keys return `None`: shipping
-/// one without adding a row is a detectable spec/implementation defect.
-pub fn change_class(key: &str) -> Option<ChangeClass> {
-    Some(match key {
-        "assets.roots"
-        | "assets.schema_path"
-        | "targets"
-        | "modules.pipeline_dylib"
-        | "tools" => ChangeClass::InputVersionedEpoch,
-        "pipeline.parallelism"
-        | "pipeline.max_dependency_depth"
-        | "pipeline.batch_reserved_workers"
-        | "cas.segment_size"
-        | "cas.cache_limit" => ChangeClass::OperationalLive,
-        "daemon.state_path" | "daemon.address" | "codegen.rs_mod_path" | "codegen.auto_codegen" => {
-            ChangeClass::RestartOnly
-        }
-        _ => return None,
-    })
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigValidationError {
     ParallelismZero,
@@ -228,11 +200,6 @@ impl Store {
 }
 
 impl StoreReader {
-
-    pub fn operational_config(&self) -> StoreConfig {
-        (*self.config).clone()
-    }
-
     pub fn pending_restart(&self) -> Result<Option<PendingRestart>, StoreError> {
         let generation: Option<i64> =
             self.conn

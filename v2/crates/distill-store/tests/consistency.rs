@@ -183,10 +183,6 @@ fn multi_table_input_transactions_are_all_or_nothing() {
     assert!(store.bundle(BundleUuid([1u8; 16])).unwrap().is_none());
     assert!(store.tool("tool").unwrap().is_none());
     assert_eq!(store.pipeline_module_hash().unwrap(), None);
-    assert_eq!(
-        store.logical_path("a.bundle").unwrap(),
-        distill_store::files::LogicalPathState::Missing
-    );
 }
 
 #[test]

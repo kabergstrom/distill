@@ -1,35 +1,16 @@
-//! §18 configuration state: scheduler bounds/live resize, declared change
-//! classes, pending-restart generations, and configuration errors.
+//! §18 configuration state: scheduler bounds/live resize, pending-restart
+//! generations, and configuration errors.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use distill_store::config::{change_class, ChangeClass, ConfigValidationError, RestartOnlyChange};
-use distill_store::state::{ConfigurationError, ConfigurationState, DscpV1, OperationKind};
+use distill_store::config::{ConfigValidationError, RestartOnlyChange};
+use distill_store::state::{ConfigurationError, ConfigurationState, DscpV1};
 use distill_store::{Store, StoreConfig};
 
 fn open() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(StoreConfig::new(dir.path().join(".distill"))).unwrap();
     (dir, store)
-}
-
-#[test]
-fn batch_reservation_has_a_declared_operational_live_change_class() {
-    assert_eq!(
-        change_class("pipeline.batch_reserved_workers"),
-        Some(ChangeClass::OperationalLive)
-    );
-    assert_eq!(
-        change_class("daemon.address"),
-        Some(ChangeClass::RestartOnly)
-    );
-    assert_eq!(
-        change_class("targets"),
-        Some(ChangeClass::InputVersionedEpoch)
-    );
-    assert_eq!(change_class("assets.lineage_manifest"), None);
-    assert_eq!(change_class("daemon.displaced_retention_days"), None);
-    assert_eq!(change_class("future.unclassified"), None);
 }
 
 #[test]
@@ -62,7 +43,7 @@ fn scheduler_bounds_preserve_progress_for_both_classes() {
 #[test]
 fn operational_store_values_apply_without_copying_restart_state() {
     let (_dir, mut store) = open();
-    let original_state_path = store.operational_config().state_path;
+    let original_state_path = store.config().clone().state_path;
     let mut candidate = StoreConfig::new("/a/restart-only/path");
     candidate.segment_size = 4096;
     candidate.cache_limit = 8192;
@@ -70,7 +51,7 @@ fn operational_store_values_apply_without_copying_restart_state() {
     candidate.batch_reserved_workers = 2;
 
     store.apply_operational_config(&candidate).unwrap();
-    let applied = store.operational_config();
+    let applied = store.config().clone();
     assert_eq!(applied.state_path, original_state_path);
     assert_eq!(applied.segment_size, 4096);
     assert_eq!(applied.cache_limit, 8192);
@@ -150,7 +131,6 @@ fn invalid_configuration_candidate_publishes_typed_snapshot_error() {
         .unwrap();
     let state = store.configuration_state().unwrap();
     assert!(matches!(state, ConfigurationState::Failed { .. }));
-    let err = state.check(OperationKind::TargetBoundRpc).unwrap_err();
+    let err = state.epoch().unwrap_err();
     assert!(err.message.contains("non-loopback"));
-    assert!(state.check(OperationKind::SnapshotRead).is_ok());
 }

@@ -407,11 +407,6 @@ impl StoreReader {
         rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
     }
 
-    /// A served diagnostic blob ([`SERVED_PIPELINE`], ...).
-    pub fn served_blob(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
-        meta_get_blob(&self.conn, key)
-    }
-
     /// The pipeline reconnect generation every connection records at
     /// connect time.
     pub fn rpc_pipeline_generation(&self) -> Result<u64, StoreError> {
@@ -513,16 +508,6 @@ impl StoreReader {
             ))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
-    }
-
-    /// Whether the CAS indexes this hash.
-    pub fn cas_contains(&self, hash: &[u8; 32]) -> Result<bool, StoreError> {
-        Ok(self.conn
-            .prepare_cached("SELECT EXISTS(SELECT 1 FROM cas_extents WHERE content_hash = ?1)")?
-            .query_row(
-                [hash.as_slice()],
-                |row| row.get(0),
-            )?)
     }
 }
 

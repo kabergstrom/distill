@@ -75,14 +75,6 @@ pub struct SnapshotStamp {
     pub version: InputVersion,
 }
 
-impl SnapshotStamp {
-    /// Whether `other`'s version numbers are comparable with this stamp's
-    /// at all: bare `InputVersion`s are ordered only within one instance.
-    pub fn same_instance(&self, other: &SnapshotStamp) -> bool {
-        self.instance == other.instance
-    }
-}
-
 /// What a pipeline candidate publishes (§13): its module's content hash,
 /// stored, and the projections the store validates before publishing it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1893,90 +1885,6 @@ impl ConfigurationState {
         match self {
             ConfigurationState::Ready(epoch) => Ok(epoch),
             ConfigurationState::Failed { reason, .. } => Err(reason),
-        }
-    }
-
-    pub fn check(
-        &self,
-        op: OperationKind,
-    ) -> Result<Option<&Arc<ConfigurationEpoch>>, &ConfigurationError> {
-        if !op.requires_configuration() {
-            return Ok(None);
-        }
-        self.epoch().map(Some)
-    }
-}
-
-/// The operations §13's consistency contract classifies against a
-/// failed version. Pure-metadata reads never consult the epoch;
-/// everything needing the pipeline map, registry, defaults, or migration
-/// fns does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OperationKind {
-    /// Creating or reading a metadata snapshot is valid under a config
-    /// error; its state fields carry the error explicitly.
-    SnapshotRead,
-    /// Path-index resolution — pure metadata.
-    PathIndex,
-    /// Reading input versions / snapshot stamps — pure metadata.
-    InputVersionRead,
-    /// CAS reads by ContentHash/LayoutHash — pure metadata.
-    CasRead,
-    /// Pinning hashes to a lease — pure metadata.
-    LeasePin,
-    /// `load_current` — needs migration fns and the registry.
-    LoadCurrent,
-    /// Terminal-type queries — need the pipeline map.
-    TerminalTypeQuery,
-    /// The derived-output namespace — derived from assets × pinned
-    /// pipeline map (§9).
-    DerivedOutputNamespace,
-    /// Builds — need everything above.
-    Build,
-    /// Any authoring write depends on validated roots/output paths and
-    /// is refused while configuration has failed.
-    Authoring,
-    /// Target-bound RPC methods require a validated target definition
-    /// and expose the configuration error as a stable typed result.
-    TargetBoundRpc,
-}
-
-impl OperationKind {
-    /// Whether the operation needs the pipeline epoch — the exact §13
-    /// split between "remains valid under failure" and "fails
-    /// deterministically".
-    pub fn requires_epoch(self) -> bool {
-        match self {
-            OperationKind::PathIndex
-            | OperationKind::SnapshotRead
-            | OperationKind::InputVersionRead
-            | OperationKind::CasRead
-            | OperationKind::LeasePin
-            | OperationKind::TargetBoundRpc => false,
-            OperationKind::LoadCurrent
-            | OperationKind::TerminalTypeQuery
-            | OperationKind::DerivedOutputNamespace
-            | OperationKind::Build
-            | OperationKind::Authoring => true,
-        }
-    }
-
-    /// Whether the operation requires a validated configuration epoch.
-    /// Pure metadata and target-independent schema loading remain valid;
-    /// authoring, target/pipeline-map surfaces, and builds do not.
-    pub fn requires_configuration(self) -> bool {
-        match self {
-            OperationKind::SnapshotRead
-            | OperationKind::PathIndex
-            | OperationKind::InputVersionRead
-            | OperationKind::CasRead
-            | OperationKind::LeasePin
-            | OperationKind::LoadCurrent => false,
-            OperationKind::TerminalTypeQuery
-            | OperationKind::DerivedOutputNamespace
-            | OperationKind::Build
-            | OperationKind::Authoring
-            | OperationKind::TargetBoundRpc => true,
         }
     }
 }
