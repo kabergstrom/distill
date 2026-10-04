@@ -503,6 +503,23 @@ fn migration_function_registered(compiled: &Compiled, key: &MigrationKey) -> boo
 }
 
 impl AuthoringBackend for AuthoringService {
+    fn read_file(
+        &self,
+        snapshot: &StoreReader,
+        root: &str,
+        path: &str,
+    ) -> Option<Result<Vec<u8>, String>> {
+        let read = || {
+            let scanner = self.compiled(snapshot).map_err(|error| format!("{error:?}"))?;
+            let scanner = scanner.scanner();
+            let physical = scanner.physical_path(root, path).map_err(|error| error.to_string())?;
+            scanner
+                .read_identity_checked(&physical)
+                .map_err(|error| error.to_string())
+        };
+        Some(read())
+    }
+
     fn write_files(
         &self,
         store: &mut Store,

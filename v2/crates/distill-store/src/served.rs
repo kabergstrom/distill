@@ -39,58 +39,6 @@ pub(crate) const RPC_FENCE: &str = "SELECT
 /// Drop an artifact's load edges ahead of recording its latest install's.
 pub(crate) const DELETE_LOAD_EDGES: &str = "DELETE FROM artifact_load_edges WHERE content_hash = ?1";
 
-/// Encode an RPC authored value (canonical JSON plus its blob table) for
-/// `assets.authored_value`.
-pub fn encode_authored_value(canonical_value: &[u8], blobs: &[&[u8]]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(
-        12 + canonical_value.len() + blobs.iter().map(|blob| 8 + blob.len()).sum::<usize>(),
-    );
-    out.extend_from_slice(&(canonical_value.len() as u64).to_le_bytes());
-    out.extend_from_slice(canonical_value);
-    out.extend_from_slice(&(blobs.len() as u32).to_le_bytes());
-    for blob in blobs {
-        out.extend_from_slice(&(blob.len() as u64).to_le_bytes());
-        out.extend_from_slice(blob);
-    }
-    out
-}
-
-/// Inverse of [`encode_authored_value`]: `(canonical JSON, blobs)`.
-pub fn decode_authored_value(bytes: &[u8]) -> Result<(Vec<u8>, Vec<Vec<u8>>), StoreError> {
-    fn corrupt() -> StoreError {
-        StoreError::Sqlite(rusqlite::Error::InvalidColumnType(
-            0,
-            "authored_value".to_owned(),
-            rusqlite::types::Type::Blob,
-        ))
-    }
-    fn take<'a>(bytes: &mut &'a [u8], len: usize) -> Result<&'a [u8], StoreError> {
-        if bytes.len() < len {
-            return Err(corrupt());
-        }
-        let (head, tail) = bytes.split_at(len);
-        *bytes = tail;
-        Ok(head)
-    }
-    fn length(bytes: &mut &[u8]) -> Result<usize, StoreError> {
-        let raw = take(bytes, 8)?;
-        usize::try_from(u64::from_le_bytes(raw.try_into().expect("8 bytes"))).map_err(|_| corrupt())
-    }
-    let mut rest = bytes;
-    let json_len = length(&mut rest)?;
-    let json = take(&mut rest, json_len)?.to_vec();
-    let count = u32::from_le_bytes(take(&mut rest, 4)?.try_into().expect("4 bytes"));
-    let mut blobs = Vec::with_capacity(count.min(4096) as usize);
-    for _ in 0..count {
-        let len = length(&mut rest)?;
-        blobs.push(take(&mut rest, len)?.to_vec());
-    }
-    if !rest.is_empty() {
-        return Err(corrupt());
-    }
-    Ok((json, blobs))
-}
-
 /// One served authoring entry without its schema and value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServedEntryMeta {
@@ -103,15 +51,6 @@ pub struct ServedEntryMeta {
     pub logical_hash: LogicalHash,
     pub authoring_only: bool,
     pub tags: BTreeMap<String, Option<String>>,
-}
-
-/// One served authoring entry with its logical schema and authored value.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServedEntry {
-    pub meta: ServedEntryMeta,
-    pub schema_json: String,
-    /// [`encode_authored_value`] bytes.
-    pub authored_value: Vec<u8>,
 }
 
 /// An explicit `asset_resolutions` row.
@@ -259,8 +198,7 @@ const SERVED_ENTRY_COLUMNS: &str = "a.asset_uuid, a.bundle_uuid, a.local_id, b.p
      a.terminal_type, a.logical_hash, a.authoring_only";
 macro_rules! served_entry_where {
     () => {
-        "a.authored_value IS NOT NULL AND a.terminal_type IS NOT NULL
-       AND a.logical_hash IS NOT NULL AND b.poison IS NULL"
+        "a.terminal_type IS NOT NULL AND a.logical_hash IS NOT NULL AND b.poison IS NULL"
     };
 }
 pub(crate) const SERVED_ENTRY_WHERE: &str = served_entry_where!();
@@ -361,28 +299,6 @@ impl StoreReader {
         };
         meta.tags = self.asset_tag_map(asset)?;
         Ok(Some(meta))
-    }
-
-    /// One served authoring entry with schema and value.
-    pub fn served_entry(&self, asset: AssetUuid) -> Result<Option<ServedEntry>, StoreError> {
-        let Some(meta) = self.served_entry_meta(asset)? else {
-            return Ok(None);
-        };
-        let (schema_json, authored_value) = self.conn
-            .prepare_cached(
-                "SELECT s.schema_json, a.authored_value
-             FROM assets a JOIN schemas s ON s.logical_hash = a.logical_hash
-             WHERE a.asset_uuid = ?1",
-            )?
-            .query_row(
-                [asset.0.as_slice()],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
-            )?;
-        Ok(Some(ServedEntry {
-            meta,
-            schema_json,
-            authored_value,
-        }))
     }
 
     fn asset_tag_map(

@@ -23,7 +23,7 @@ use distill_store::{Store, StoreError, StoreReader};
 
 use crate::persist::decode_drifted_input;
 use crate::server::{
-    authoring_entry, entry_role, history_deltas, pipeline_failure,
+    entry_role, history_deltas, pipeline_failure,
     store_failure, ConnectionState,
     MetadataBinding, SnapshotHold, SnapshotTxn, DEFAULT_CHUNK_SIZE,
 };
@@ -525,20 +525,61 @@ fn resolve_named_in(
     })
 }
 
+/// Inspect `uuid` at `snapshot`: its metadata from the snapshot, its
+/// schema and value from its bundle file, verified against the hash the
+/// snapshot published. A file that no longer holds those bytes is
+/// [`AuthoringInspectResult::Drifted`].
 fn inspect_authoring(
+    server: &Server,
     snapshot: &StoreReader,
     stamp: SnapshotStamp,
     uuid: AssetUuid,
-) -> Result<AuthoringInspectResult, StoreError> {
-    let Some(entry) = snapshot.served_entry(uuid)? else {
-        if snapshot.asset_resolution(uuid)?.is_some() {
+) -> Result<AuthoringInspectResult, RpcFailure> {
+    let Some(meta) = snapshot.served_entry_meta(uuid).map_err(store_failure)? else {
+        if snapshot.asset_resolution(uuid).map_err(store_failure)?.is_some() {
             return Ok(AuthoringInspectResult::RoleIneligible {
                 observed: AuthoringEntryRole::Runtime,
             });
         }
         return Ok(AuthoringInspectResult::Missing);
     };
-    let entry = authoring_entry(entry)?;
+    let unpublished = || RpcFailure::InvalidQuery {
+        detail: format!("served entry {uuid} has no published bundle"),
+    };
+    let bundle = snapshot
+        .bundle(meta.bundle)
+        .map_err(store_failure)?
+        .ok_or_else(unpublished)?;
+    let root = snapshot
+        .root_name(bundle.root)
+        .map_err(store_failure)?
+        .ok_or_else(unpublished)?;
+    let read = server
+        .inner
+        .handle
+        .authoring_backend()
+        .read_file(snapshot, &root, &bundle.path)
+        .ok_or_else(|| RpcFailure::AuthoringBackendUnavailable {
+            operation: "inspect".to_owned(),
+        })?;
+    let bytes = match read {
+        Ok(bytes) if ContentHash(*blake3::hash(&bytes).as_bytes()) == bundle.content_hash => bytes,
+        _ => {
+            return Ok(AuthoringInspectResult::Drifted {
+                input: DriftedInput::File(bundle.path),
+                current: server.inner.current_stamp().map_err(store_failure)?,
+            })
+        }
+    };
+    let invalid = |detail: String| RpcFailure::InvalidQuery { detail };
+    let parsed = distill_bundle::parse_bundle(&bytes).map_err(|error| invalid(error.to_string()))?;
+    let entry = crate::server::bundle_authoring_entry(
+        &parsed,
+        &meta.local_id,
+        meta.normalized_path,
+        meta.terminal_type,
+    )
+    .map_err(invalid)?;
     Ok(AuthoringInspectResult::Inspection(AuthoringInspection {
         stamp,
         uuid: entry.uuid,
@@ -1017,11 +1058,10 @@ impl MetadataAuthoringSnapshot {
             Ok(txn) => txn,
             Err(result) => return result,
         };
-        MetadataNamespaceCall::Success(namespace_try!(inspect_authoring(
-            txn.snapshot(),
-            self.basis.snapshot,
-            uuid
-        )))
+        match inspect_authoring(&self.server, txn.snapshot(), self.basis.snapshot, uuid) {
+            Ok(result) => MetadataNamespaceCall::Success(result),
+            Err(error) => MetadataNamespaceCall::Error(error),
+        }
     }
 
     pub fn refresh(&self) -> MetadataCall<MetadataAuthoringSnapshot> {
@@ -2116,11 +2156,10 @@ impl AuthoringSnapshot {
             Ok(txn) => txn,
             Err(result) => return result,
         };
-        RpcResult::Success(rpc_try!(inspect_authoring(
-            txn.snapshot(),
-            self.basis.snapshot,
-            uuid
-        )))
+        match inspect_authoring(&self.server, txn.snapshot(), self.basis.snapshot, uuid) {
+            Ok(result) => RpcResult::Success(result),
+            Err(error) => RpcResult::Failure(error),
+        }
     }
 
     /// The content hash of the file this snapshot observed at `path` in
@@ -2195,7 +2234,7 @@ mod query_tests {
     use std::collections::BTreeMap;
 
     use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
-    use distill_store::bundles::{AssetRecord, BundleMeta, ServedAuthoring};
+    use distill_store::bundles::{AssetRecord, BundleMeta};
     use distill_store::{Store, StoreConfig};
 
     use super::*;
@@ -2271,10 +2310,7 @@ mod query_tests {
                             logical_hash: SCHEMA,
                             authoring_only,
                             tags,
-                            served: Some(ServedAuthoring {
-                                authored_value: Vec::new(),
-                                terminal_type: if index % 2 == 0 { GPU_MESH } else { TEXTURE },
-                            }),
+                            terminal_type: Some(if index % 2 == 0 { GPU_MESH } else { TEXTURE }),
                         })?;
                     }
                 }

@@ -4,7 +4,7 @@
 
 use distill_core::id::{AssetUuid, TypeUuid};
 use distill_store::served::{
-    decode_authored_value, encode_authored_value, Change, ResolutionRow, ServedWrite,
+    Change, ResolutionRow, ServedWrite,
 };
 use distill_store::state::InputVersion;
 use distill_store::{Store, StoreConfig};
@@ -99,15 +99,6 @@ fn rpc_targets_advance_generation_only_on_change() {
         .served_transaction(|txn| txn.bump_rpc_pipeline_generation())
         .unwrap();
     assert_eq!(store.rpc_fences().unwrap().pipeline_generation, 1);
-}
-
-#[test]
-fn authored_value_codec_roundtrips() {
-    let encoded = encode_authored_value(br#"{"a":1}"#, &[b"one", b""]);
-    let (json, blobs) = decode_authored_value(&encoded).unwrap();
-    assert_eq!(json, br#"{"a":1}"#);
-    assert_eq!(blobs, [b"one".to_vec(), Vec::new()]);
-    assert!(decode_authored_value(&encoded[..encoded.len() - 1]).is_err());
 }
 
 #[test]

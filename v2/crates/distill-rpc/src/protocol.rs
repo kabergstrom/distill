@@ -810,6 +810,19 @@ pub type ImportJob = Box<
 /// migration, or doctor services. Implementations prepare a side-effect-free
 /// commit; publication remains an atomic RPC-server CAS step.
 pub trait AuthoringBackend: Send + Sync + 'static {
+    /// The bytes of file `path` under root `root` as they are on disk now,
+    /// read through the daemon's root identity checks. `None`: the backend
+    /// has no filesystem authority. An `Err` is a file that cannot be read
+    /// now, which a reader verifying a published hash treats as drift.
+    fn read_file(
+        &self,
+        _snapshot: &distill_store::StoreReader,
+        _root: &str,
+        _path: &str,
+    ) -> Option<Result<Vec<u8>, String>> {
+        None
+    }
+
     /// Apply an ordinary authoring batch, planned against `base`, to the
     /// files it changes, and return what it wrote. The write is complete
     /// once the files are atomically on disk: the store follows through the
@@ -1092,6 +1105,12 @@ pub enum AuthoringInspectResult {
     Inspection(AuthoringInspection),
     Missing,
     RoleIneligible { observed: AuthoringEntryRole },
+    /// The entry's bundle file no longer holds the bytes the snapshot
+    /// published; a fresher snapshot (`current` or later) inspects it.
+    Drifted {
+        input: DriftedInput,
+        current: SnapshotStamp,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

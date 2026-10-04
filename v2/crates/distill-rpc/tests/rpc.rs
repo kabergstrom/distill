@@ -1105,10 +1105,23 @@ fn authoring_snapshot_refreshes_to_a_successor_stamp_without_tearing() {
     let hub = connect(&server, &[(1, false)]);
     let first = authoring_snapshot(&hub);
 
+    assert!(
+        matches!(first.inspect(first_entry.uuid).success().unwrap(), AuthoringInspectResult::Inspection(value) if value.stamp == first_stamp && value.value == first_entry.value)
+    );
+
+    // The value is the bundle file's, verified against the hash the
+    // snapshot published: a file rewritten since is drift, at the current
+    // version until the daemon publishes the edit.
     let mut replacement = first_entry.clone();
     replacement.value.blobs = vec![Arc::from([0xAA])];
-    let second_stamp = publish_entry(&mut project, &replacement);
     assert_ne!(replacement.value, first_entry.value);
+    write_entry(&mut project, &replacement);
+    let drifted = AuthoringInspectResult::Drifted {
+        input: DriftedInput::File(first_entry.normalized_path.clone()),
+        current: first_stamp,
+    };
+    assert_eq!(first.inspect(first_entry.uuid).success().unwrap(), drifted);
+    let second_stamp = project.publish();
 
     let old = first.inspect(first_entry.uuid).success().unwrap();
     let refreshed = first.refresh().success().unwrap();
@@ -1117,8 +1130,12 @@ fn authoring_snapshot_refreshes_to_a_successor_stamp_without_tearing() {
     assert_eq!(refreshed.stamp(), second_stamp);
     assert_eq!(first.basis().snapshot, first_stamp);
     assert_eq!(refreshed.basis().snapshot, second_stamp);
-    assert!(
-        matches!(old, AuthoringInspectResult::Inspection(value) if value.stamp == first_stamp && value.value == first_entry.value)
+    assert_eq!(
+        old,
+        AuthoringInspectResult::Drifted {
+            input: DriftedInput::File(first_entry.normalized_path.clone()),
+            current: second_stamp,
+        }
     );
     assert!(
         matches!(new, AuthoringInspectResult::Inspection(value) if value.stamp == second_stamp && value.value == replacement.value)

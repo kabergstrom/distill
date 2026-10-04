@@ -2976,6 +2976,9 @@ fn write_metadata_authoring_inspect_result(
                 .init_role_ineligible()
                 .set_observed(wire_authoring_role(observed));
         }
+        MetadataNamespaceCall::Success(AuthoringInspectResult::Drifted { input, current }) => {
+            write_drifted(result.init_drifted(), &input, current)
+        }
         MetadataNamespaceCall::ReconnectRequired { reason } => {
             write_metadata_reconnect(result.init_reconnect_required(), reason)
         }
@@ -3086,6 +3089,9 @@ fn write_authoring_inspect_result(
             result
                 .init_role_ineligible()
                 .set_observed(wire_authoring_role(observed));
+        }
+        RpcResult::Success(AuthoringInspectResult::Drifted { input, current }) => {
+            write_drifted(result.init_drifted(), &input, current)
         }
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
@@ -3308,16 +3314,7 @@ fn write_resolve_result(
             match terminal.value {
                 ResolveResult::Built { content_hash } => value.set_built(&content_hash.0),
                 ResolveResult::Drifted { input, current } => {
-                    let mut drifted = value.init_drifted();
-                    let mut wire_input = drifted.reborrow().init_input();
-                    match input {
-                        DriftedInput::File(path) => wire_input.set_file(path.as_str()),
-                        DriftedInput::Asset(asset) => wire_input.set_asset(&asset.0),
-                        DriftedInput::Query(query) => wire_input.set_query(query.as_str()),
-                        DriftedInput::Dylib => wire_input.set_dylib(()),
-                        DriftedInput::Tool(tool) => wire_input.set_tool(tool.as_str()),
-                    }
-                    write_stamp(drifted.init_current(), current);
+                    write_drifted(value.init_drifted(), &input, current)
                 }
                 ResolveResult::Failed { error } => value.set_failed(error.as_str()),
                 ResolveResult::Missing => value.set_missing(()),
@@ -3340,6 +3337,22 @@ fn write_resolve_result(
             write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }
     }
+}
+
+fn write_drifted(
+    mut drifted: schema::drifted_resolve::Builder<'_>,
+    input: &DriftedInput,
+    current: SnapshotStamp,
+) {
+    let mut wire_input = drifted.reborrow().init_input();
+    match input {
+        DriftedInput::File(path) => wire_input.set_file(path.as_str()),
+        DriftedInput::Asset(asset) => wire_input.set_asset(&asset.0),
+        DriftedInput::Query(query) => wire_input.set_query(query.as_str()),
+        DriftedInput::Dylib => wire_input.set_dylib(()),
+        DriftedInput::Tool(tool) => wire_input.set_tool(tool.as_str()),
+    }
+    write_stamp(drifted.init_current(), current);
 }
 
 fn write_runtime_type_policy_result(

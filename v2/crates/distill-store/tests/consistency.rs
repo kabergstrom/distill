@@ -150,7 +150,7 @@ fn multi_table_input_transactions_are_all_or_nothing() {
                 type_uuid: TypeUuid([3u8; 16]),
                 logical_hash: LogicalHash([4u8; 32]),
                 authoring_only: false,
-                served: None,
+                terminal_type: None,
                 tags: std::collections::BTreeMap::from([("t".into(), None)]),
             })?;
             txn.register_tool(

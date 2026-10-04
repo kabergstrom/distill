@@ -1012,7 +1012,7 @@ mod tests {
                         logical_hash: LogicalHash(logical_hash.0),
                         authoring_only: false,
                         tags: BTreeMap::new(),
-                        served: None,
+                        terminal_type: None,
                     })?;
                     Ok(root)
                 })
@@ -1278,7 +1278,7 @@ mod query_tests {
                             logical_hash: SCHEMA,
                             authoring_only,
                             tags,
-                            served: None,
+                            terminal_type: None,
                         })?;
                     }
                 }

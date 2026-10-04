@@ -208,7 +208,6 @@ fn assets_row_shape() {
             "type_uuid",
             "authoring_only",
             "logical_hash",
-            "authored_value",
             "terminal_type"
         ]
     );

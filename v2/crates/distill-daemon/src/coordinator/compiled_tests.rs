@@ -12,6 +12,8 @@ use distill_schema::ngp_schema::{LayoutIdentity, Schema, SchemaLayouts};
 use distill_store::state::InputVersion;
 
 use super::*;
+use distill_bundle::AssetEntry;
+use distill_json::AuthoredValue;
 use crate::epoch::ModuleAbiIdentity;
 
 type Hook = Box<dyn FnMut() -> Result<(), String>>;

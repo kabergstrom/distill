@@ -186,6 +186,7 @@ struct MetadataAuthoringInspectCall {
     error @3 :RpcError;
     missing @4 :Void;
     roleIneligible @5 :AuthoringRoleFailure;
+    drifted @6 :DriftedResolve;
   }
 }
 
@@ -630,6 +631,7 @@ struct AuthoringInspectCall {
     error @4 :RpcError;
     missing @5 :Void;
     roleIneligible @6 :AuthoringRoleFailure;
+    drifted @7 :DriftedResolve;
   }
 }
 

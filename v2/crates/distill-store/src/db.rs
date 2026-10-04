@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 41;
+pub const SCHEMA_VERSION: u32 = 42;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -226,10 +226,9 @@ CREATE TABLE assets (
     -- schema closure may be exactly what failed, and no read path
     -- serves a skeleton row's metadata while the poison stands.
     logical_hash BLOB,
-    -- The RPC-served authored value (canonical JSON + blob table, see
-    -- `served::encode_authored_value`) and terminal type. NULL for rows the
-    -- RPC namespace does not serve (skeleton rows, daemon-private rows).
-    authored_value BLOB,
+    -- The RPC-served terminal type. NULL for rows the RPC namespace does
+    -- not serve (skeleton rows, daemon-private rows). The authored value
+    -- is read from the bundle file, verified against its published hash.
     terminal_type  BLOB
 );
 -- A bundle's assets, and an asset by bundle and local id (a reference a

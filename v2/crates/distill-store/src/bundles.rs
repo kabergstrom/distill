@@ -87,18 +87,9 @@ pub struct AssetRecord {
     pub logical_hash: LogicalHash,
     pub authoring_only: bool,
     pub tags: BTreeMap<String, Option<String>>,
-    /// The RPC-served authored value and terminal type, both present for
-    /// an entry the RPC namespace serves (see [`crate::served`]).
-    pub served: Option<ServedAuthoring>,
-}
-
-/// The served half of an asset row: what the RPC namespace answers from
-/// without reading the bundle file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServedAuthoring {
-    /// [`crate::served::encode_authored_value`] bytes.
-    pub authored_value: Vec<u8>,
-    pub terminal_type: TypeUuid,
+    /// The terminal type of an entry the RPC namespace serves (see
+    /// [`crate::served`]); `None` for a row it does not serve.
+    pub terminal_type: Option<TypeUuid>,
 }
 
 /// The fully validated, complete namespace skeleton a malformed file's
@@ -288,13 +279,12 @@ impl InputTxn<'_> {
             .prepare_cached(
                 "INSERT INTO assets(
                  asset_uuid, bundle_uuid, local_id, type_uuid, logical_hash, authoring_only,
-                 authored_value, terminal_type
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 terminal_type
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(asset_uuid) DO UPDATE SET
                bundle_uuid = excluded.bundle_uuid, local_id = excluded.local_id,
                type_uuid = excluded.type_uuid, logical_hash = excluded.logical_hash,
                authoring_only = excluded.authoring_only,
-               authored_value = excluded.authored_value,
                terminal_type = excluded.terminal_type",
             )?
             .execute(
@@ -305,10 +295,7 @@ impl InputTxn<'_> {
                     rec.type_uuid.0.as_slice(),
                     rec.logical_hash.0.as_slice(),
                     i64::from(rec.authoring_only),
-                    rec.served.as_ref().map(|served| served.authored_value.as_slice()),
-                    rec.served
-                        .as_ref()
-                        .map(|served| served.terminal_type.0.to_vec()),
+                    rec.terminal_type.map(|terminal| terminal.0.to_vec()),
                 ],
             )?;
         self.txn

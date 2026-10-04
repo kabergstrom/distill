@@ -176,7 +176,7 @@ fn put_asset(
             .iter()
             .map(|(tag, value)| ((*tag).to_owned(), value.map(str::to_owned)))
             .collect(),
-        served: None,
+        terminal_type: None,
     })
 }
 

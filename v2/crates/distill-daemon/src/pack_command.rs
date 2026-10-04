@@ -186,8 +186,13 @@ async fn build_pack_at(
 
     for _ in 0..MAX_BASIS_RETRIES {
         let authoring = remote(metadata.authoring_snapshot().await, "pin authoring snapshot")?;
-        let (definition_stamp, definition) =
-            inspect_definition(&authoring, definition_asset, expected_schema).await?;
+        // A definition file that changed since the snapshot is read at the
+        // next one.
+        let Some((definition_stamp, definition)) =
+            inspect_definition(&authoring, definition_asset, expected_schema).await?
+        else {
+            continue;
+        };
         let definition_hash = bootstrap::target_hash(config, &authority, &definition.target)
             .map_err(|error| PackCommandError::Config(error.to_string()))?;
         let outcome = client
@@ -231,10 +236,10 @@ async fn inspect_definition(
     asset: AssetUuid,
     expected_schema: LogicalHash,
 ) -> Result<
-    (
+    Option<(
         SnapshotStamp,
         distill_build::trace::PackDefinitionControlValue,
-    ),
+    )>,
     PackCommandError,
 > {
     let inspection = match remote(snapshot.inspect(asset).await, "inspect PackDefinition")? {
@@ -243,6 +248,7 @@ async fn inspect_definition(
         AuthoringInspectResult::RoleIneligible { observed } => {
             return Err(PackCommandError::IneligibleDefinition { asset, observed })
         }
+        AuthoringInspectResult::Drifted { .. } => return Ok(None),
     };
     if inspection.role != AuthoringEntryRole::AuthoringOnly {
         return Err(PackCommandError::IneligibleDefinition {
@@ -263,7 +269,7 @@ async fn inspect_definition(
         });
     }
     let definition = decode_pack_definition(&inspection.value)?;
-    Ok((inspection.stamp, definition))
+    Ok(Some((inspection.stamp, definition)))
 }
 
 fn remote<T: fmt::Debug, E: fmt::Display>(

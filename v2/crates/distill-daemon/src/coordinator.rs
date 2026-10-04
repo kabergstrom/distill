@@ -17,20 +17,19 @@ use std::sync::mpsc;
 use rayon::ThreadPool;
 
 use distill_build::pipeline::Target;
-use distill_bundle::{AssetEntry, Bundle};
+use distill_bundle::Bundle;
 use distill_core::bootstrap::is_bootstrap_control_type;
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, TypeUuid};
-use distill_json::AuthoredValue;
 use distill_rpc::{
-    AssetDeltaState, AssetMutation, AuthoringEntry, AuthoringEntryRole, AuthoringMutation,
-    AuthoringValue, Commit, ConfigurationError, ConfigurationStatus, CoordinatedCommitError,
+    AssetDeltaState, AssetMutation, AuthoringEntry, AuthoringMutation,
+    Commit, ConfigurationError, ConfigurationStatus, CoordinatedCommitError,
     DerivedOutputEntry, DerivedOutputMutation, DriftedInput, PathMutation, PipelineDiagnostic,
     Server, ServerHandle, SnapshotStamp, StoredResolve, TargetDefinition, NamespaceError,
     RpcFailure, NamespaceErrorV1,
 };
 use distill_schema::ProjectSchemaAuthority;
 use distill_store::bundles::{
-    AssetRecord, BundleMeta, NamespaceSkeleton as StoreNamespaceSkeleton, ServedAuthoring,
+    AssetRecord, BundleMeta, NamespaceSkeleton as StoreNamespaceSkeleton,
     SkeletonEntry,
 };
 use distill_store::claims::{DerivedOutputClaim, SourceClaim, SourceClaims};
@@ -38,7 +37,7 @@ use distill_store::config::{PendingRestart, RestartOnlyChange};
 use distill_store::errors::ScanRejectionRecord;
 use distill_store::files::{FileObservation, PendingFileWork};
 use distill_store::pipeline::ValidatedPipelineEpoch;
-use distill_store::served::{encode_authored_value, ResolutionRow};
+use distill_store::served::ResolutionRow;
 use distill_store::state::{
     AssetClaimant, CleanupDisposition, ConfigurationState, DirectoryAliasSide, DscpV1,
     InputVersion, PipelineFailure, PipelineFailureCode, PipelineFailureOrigin,
@@ -2531,7 +2530,7 @@ fn publish_scan(
                     logical_hash: entry.schema_hash,
                     authoring_only: entry.authoring_only,
                     tags: BTreeMap::new(),
-                    served: Some(served_authoring(entry, projection)?),
+                    terminal_type: Some(projection.interface(entry.type_uuid).terminal),
                 })?;
                 transaction.set_tag_index_pending(entry.uuid, tag_epoch)?;
             }
@@ -2894,7 +2893,7 @@ fn publish_claimed(
                 logical_hash: entry.schema_hash,
                 authoring_only: entry.authoring_only,
                 tags: BTreeMap::new(),
-                served: Some(served_authoring(entry, projection)?),
+                terminal_type: Some(projection.interface(entry.type_uuid).terminal),
             })?;
             transaction.set_tag_index_pending(entry.uuid, tag_epoch)?;
         }
@@ -3058,7 +3057,6 @@ fn prepare_incremental_publication(
                     source.normalized_path.clone(),
                     bundle,
                     local_id,
-                    entry,
                     projection.interface(entry.type_uuid).terminal,
                 )?));
             }
@@ -3307,7 +3305,6 @@ fn rpc_commit(
                 source.normalized_path.clone(),
                 bundle,
                 local_id,
-                entry,
                 projection.interface(entry.type_uuid).terminal,
             )?));
         }
@@ -3422,82 +3419,10 @@ fn rpc_entry(
     normalized_path: String,
     bundle: &Bundle,
     local_id: &str,
-    entry: &AssetEntry,
     terminal_type: TypeUuid,
 ) -> Result<AuthoringEntry, StoreError> {
-    let schema = &bundle.schemas[&entry.schema_hash];
-    let logical_schema = distill_schema::ngp_schema::snapshot_to_json(schema).map_err(|error| {
-        StoreError::InvalidConfiguration {
-            error: format!("cannot serialize verified schema: {error}"),
-        }
-    })?;
-    let value = split_authoring_value(&entry.data)?;
-    Ok(AuthoringEntry {
-        uuid: entry.uuid,
-        bundle: bundle.uuid,
-        local_id: local_id.to_owned(),
-        normalized_path,
-        type_uuid: entry.type_uuid,
-        terminal_type,
-        schema_hash: entry.schema_hash,
-        logical_schema: Arc::from(logical_schema.into_bytes()),
-        role: if entry.authoring_only {
-            AuthoringEntryRole::AuthoringOnly
-        } else {
-            AuthoringEntryRole::Runtime
-        },
-        tags: BTreeMap::new(),
-        value,
-    })
-}
-
-/// The served authored value and terminal type an asset row carries (LOCKLESS.md
-/// §2.2): the same bytes the RPC authoring entry serves.
-fn served_authoring(
-    entry: &AssetEntry,
-    projection: &PipelineProjection,
-) -> Result<ServedAuthoring, StoreError> {
-    let value = split_authoring_value(&entry.data)?;
-    let blobs = value.blobs.iter().map(|blob| &blob[..]).collect::<Vec<_>>();
-    Ok(ServedAuthoring {
-        authored_value: encode_authored_value(&value.canonical_value, &blobs),
-        terminal_type: projection.interface(entry.type_uuid).terminal,
-    })
-}
-
-fn split_authoring_value(value: &AuthoredValue) -> Result<AuthoringValue, StoreError> {
-    fn rewrite(value: &AuthoredValue, blobs: &mut Vec<Arc<[u8]>>) -> AuthoredValue {
-        match value {
-            AuthoredValue::Blob(bytes) => {
-                let index = blobs.len() as u128;
-                blobs.push(Arc::from(bytes.clone()));
-                AuthoredValue::Object(BTreeMap::from([(
-                    "$distill_blob".to_owned(),
-                    AuthoredValue::UInt(index),
-                )]))
-            }
-            AuthoredValue::Array(values) => {
-                AuthoredValue::Array(values.iter().map(|value| rewrite(value, blobs)).collect())
-            }
-            AuthoredValue::Object(values) => AuthoredValue::Object(
-                values
-                    .iter()
-                    .map(|(key, value)| (key.clone(), rewrite(value, blobs)))
-                    .collect(),
-            ),
-            value => value.clone(),
-        }
-    }
-    let mut blobs = Vec::new();
-    let rewritten = rewrite(value, &mut blobs);
-    let canonical =
-        distill_json::write(&rewritten).map_err(|error| StoreError::InvalidConfiguration {
-            error: format!("cannot serialize authored value: {error}"),
-        })?;
-    Ok(AuthoringValue {
-        canonical_value: Arc::from(canonical.into_bytes()),
-        blobs,
-    })
+    distill_rpc::bundle_authoring_entry(bundle, local_id, normalized_path, terminal_type)
+        .map_err(|error| StoreError::InvalidConfiguration { error })
 }
 
 fn readable_source(source: &crate::scanner::ScannedBundle) -> ReadableBundleSource {
@@ -3890,7 +3815,7 @@ mod publish_diff_tests {
                                 logical_hash: LogicalHash([1; 32]),
                                 authoring_only: false,
                                 tags: BTreeMap::new(),
-                                served: None,
+                                terminal_type: None,
                             })?;
                         }
                     }
@@ -3971,6 +3896,8 @@ mod projection_tests {
     //! with the old projection's served interface.
 
     use super::*;
+    use distill_bundle::AssetEntry;
+    use distill_json::AuthoredValue;
     use crate::callbacks::ProcessorDescriptor;
     use crate::scanner::{AssetRoot, RootedScanner};
     use distill_build::outputs::OutputDecls;

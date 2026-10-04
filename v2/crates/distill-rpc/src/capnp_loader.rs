@@ -658,6 +658,10 @@ impl RemoteMetadataAuthoringSnapshot {
                     observed: decode_role(value?.get_observed()?),
                 }))
             }
+            schema::metadata_authoring_inspect_call::Which::Drifted(value) => {
+                let (input, current) = decode_drifted(value?)?;
+                Ok(RemoteCall::Success(AuthoringInspectResult::Drifted { input, current }))
+            }
             schema::metadata_authoring_inspect_call::Which::ReconnectRequired(value) => Ok(
                 RemoteCall::ReconnectRequired(decode_metadata_reconnect(value?.get_reason()?)),
             ),
@@ -790,6 +794,27 @@ impl RemoteSubscription {
     }
 }
 
+fn decode_drifted(
+    drifted: schema::drifted_resolve::Reader<'_>,
+) -> Result<(DriftedInput, SnapshotStamp), capnp::Error> {
+    let input = match drifted.get_input()?.which()? {
+        schema::drifted_input_value::Which::File(value) => {
+            DriftedInput::File(text(value?, "resolve.drifted.file")?)
+        }
+        schema::drifted_input_value::Which::Asset(value) => {
+            DriftedInput::Asset(AssetUuid(fixed::<16>(value?, "resolve.drifted.asset")?))
+        }
+        schema::drifted_input_value::Which::Query(value) => {
+            DriftedInput::Query(text(value?, "resolve.drifted.query")?)
+        }
+        schema::drifted_input_value::Which::Dylib(()) => DriftedInput::Dylib,
+        schema::drifted_input_value::Which::Tool(value) => {
+            DriftedInput::Tool(text(value?, "resolve.drifted.tool")?)
+        }
+    };
+    Ok((input, decode_stamp(drifted.get_current()?)?))
+}
+
 fn decode_resolve(
     value: schema::resolve_result::Reader<'_>,
 ) -> Result<ResolveResult, capnp::Error> {
@@ -798,27 +823,8 @@ fn decode_resolve(
             content_hash: ContentHash(fixed::<32>(hash?, "resolve.built")?),
         },
         schema::resolve_result::Which::Drifted(drifted) => {
-            let drifted = drifted?;
-            let input = drifted.get_input()?;
-            let input = match input.which()? {
-                schema::drifted_input_value::Which::File(value) => {
-                    DriftedInput::File(text(value?, "resolve.drifted.file")?)
-                }
-                schema::drifted_input_value::Which::Asset(value) => {
-                    DriftedInput::Asset(AssetUuid(fixed::<16>(value?, "resolve.drifted.asset")?))
-                }
-                schema::drifted_input_value::Which::Query(value) => {
-                    DriftedInput::Query(text(value?, "resolve.drifted.query")?)
-                }
-                schema::drifted_input_value::Which::Dylib(()) => DriftedInput::Dylib,
-                schema::drifted_input_value::Which::Tool(value) => {
-                    DriftedInput::Tool(text(value?, "resolve.drifted.tool")?)
-                }
-            };
-            ResolveResult::Drifted {
-                input,
-                current: decode_stamp(drifted.get_current()?)?,
-            }
+            let (input, current) = decode_drifted(drifted?)?;
+            ResolveResult::Drifted { input, current }
         }
         schema::resolve_result::Which::Failed(error) => ResolveResult::Failed {
             error: text(error?, "resolve.failed")?,

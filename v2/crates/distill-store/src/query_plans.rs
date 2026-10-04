@@ -11,7 +11,7 @@ use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid
 use rusqlite::Connection;
 
 use crate::bundles::{
-    AssetFilter, AssetRecord, BundleMeta, NamespaceSkeleton, ServedAuthoring, SkeletonEntry,
+    AssetFilter, AssetRecord, BundleMeta, NamespaceSkeleton, SkeletonEntry,
     TagIndexUpdate,
 };
 use crate::db::{ReaderConn, StoreReader};
@@ -127,10 +127,7 @@ fn populate(store: &mut Store, count: u32) {
                     logical_hash: SCHEMA,
                     authoring_only: false,
                     tags,
-                    served: Some(ServedAuthoring {
-                        authored_value: Vec::new(),
-                        terminal_type: RUNTIME_TYPE,
-                    }),
+                    terminal_type: Some(RUNTIME_TYPE),
                 })?;
                 if index % 1000 == 3 {
                     txn.upsert_asset(&AssetRecord {
@@ -141,7 +138,7 @@ fn populate(store: &mut Store, count: u32) {
                         logical_hash: SCHEMA,
                         authoring_only: true,
                         tags: BTreeMap::new(),
-                        served: None,
+                        terminal_type: None,
                     })?;
                 }
                 if index % 100 == 1 {
@@ -1889,7 +1886,10 @@ fn cas_and_served_point_statements_search_their_keys() {
     store.cas_read(&hash.0).unwrap();
     store.cas_contains(&hash.0).unwrap();
     store.artifact_load_edges(hash).unwrap();
-    store.served_entry(asset).unwrap();
+    store.served_entry_meta(asset).unwrap();
+    // An inspection reads its bundle file at the published hash.
+    store.bundle(BundleUuid([42; 16])).unwrap();
+    store.root_name(crate::files::RootId(1)).unwrap();
     store.asset_resolution(asset).unwrap();
     store.served_derived_output(asset).unwrap();
     store.served_path_candidates(&bundle_path(42)).unwrap();
@@ -1953,6 +1953,14 @@ fn cas_and_served_point_statements_search_their_keys() {
             &["SEARCH change_log"],
         ),
         (
+            "SELECT bundle_uuid, root_id, path, format_version, content_hash, origin_rules_bundle, origin_rule, origin_group_root, origin_group_path, import_watched FROM bundles WHERE bundle_uuid = ?",
+            &["SEARCH bundles USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)"],
+        ),
+        (
+            "SELECT name FROM roots WHERE root_id = ?",
+            &["SEARCH roots USING INTEGER PRIMARY KEY (rowid=?)"],
+        ),
+        (
             "SELECT (SELECT COALESCE(SUM(len), ?) FROM cas_extents) + (SELECT COALESCE(SUM(len), ?) FROM result_candidates)",
             &["SCAN CONSTANT ROW", "SCALAR SUBQUERY 1", "SCAN cas_extents USING COVERING INDEX cas_extents_by_segment", "SCALAR SUBQUERY 2", "SCAN result_candidates USING COVERING INDEX result_candidates_by_segment"],
         ),
@@ -1961,11 +1969,11 @@ fn cas_and_served_point_statements_search_their_keys() {
             &["SCAN CONSTANT ROW", "SCALAR SUBQUERY 1", "SEARCH cas_extents USING COVERING INDEX sqlite_autoindex_cas_extents_1 (content_hash=?)"],
         ),
         (
-            "SELECT a.asset_uuid FROM assets a JOIN bundles b ON b.bundle_uuid = a.bundle_uuid WHERE a.authored_value IS NOT NULL AND a.terminal_type IS NOT NULL AND a.logical_hash IS NOT NULL AND b.poison IS NULL AND b.path = ? AND a.local_id = ? AND a.authoring_only = ?",
+            "SELECT a.asset_uuid FROM assets a JOIN bundles b ON b.bundle_uuid = a.bundle_uuid WHERE a.terminal_type IS NOT NULL AND a.logical_hash IS NOT NULL AND b.poison IS NULL AND b.path = ? AND a.local_id = ? AND a.authoring_only = ?",
             &["SEARCH a USING INDEX assets_by_local_id (local_id=?)", "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)"],
         ),
         (
-            "SELECT a.asset_uuid, a.bundle_uuid, a.local_id, b.path, a.type_uuid, a.terminal_type, a.logical_hash, a.authoring_only FROM assets a JOIN bundles b ON b.bundle_uuid = a.bundle_uuid WHERE a.authored_value IS NOT NULL AND a.terminal_type IS NOT NULL AND a.logical_hash IS NOT NULL AND b.poison IS NULL AND a.asset_uuid = ?",
+            "SELECT a.asset_uuid, a.bundle_uuid, a.local_id, b.path, a.type_uuid, a.terminal_type, a.logical_hash, a.authoring_only FROM assets a JOIN bundles b ON b.bundle_uuid = a.bundle_uuid WHERE a.terminal_type IS NOT NULL AND a.logical_hash IS NOT NULL AND b.poison IS NULL AND a.asset_uuid = ?",
             &["SEARCH a USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)", "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)"],
         ),
         (
@@ -2011,10 +2019,6 @@ fn cas_and_served_point_statements_search_their_keys() {
         (
             "SELECT parent_uuid, output_key, terminal_type FROM derived_outputs WHERE child_uuid = ? AND terminal_type IS NOT NULL",
             &["SEARCH derived_outputs USING INDEX sqlite_autoindex_derived_outputs_1 (child_uuid=?)"],
-        ),
-        (
-            "SELECT s.schema_json, a.authored_value FROM assets a JOIN schemas s ON s.logical_hash = a.logical_hash WHERE a.asset_uuid = ?",
-            &["SEARCH a USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)", "SEARCH s USING INDEX sqlite_autoindex_schemas_1 (logical_hash=?)"],
         ),
         (
             "SELECT segment, offset, len FROM cas_extents WHERE content_hash = ?",

@@ -1231,27 +1231,72 @@ pub(crate) fn store_failure(error: StoreError) -> RpcFailure {
     }
 }
 
-/// Decode a served entry into the RPC authoring carrier.
-pub(crate) fn authoring_entry(
-    entry: distill_store::served::ServedEntry,
-) -> Result<AuthoringEntry, StoreError> {
-    let (canonical, blobs) = distill_store::served::decode_authored_value(&entry.authored_value)?;
-    let meta = entry.meta;
+/// The RPC authoring carrier of entry `local_id` of a parsed bundle file:
+/// its schema snapshot and value are the file's own.
+pub fn bundle_authoring_entry(
+    bundle: &distill_bundle::Bundle,
+    local_id: &str,
+    normalized_path: String,
+    terminal_type: TypeUuid,
+) -> Result<AuthoringEntry, String> {
+    let entry = bundle
+        .assets
+        .get(local_id)
+        .ok_or_else(|| format!("bundle has no entry {local_id:?}"))?;
+    let schema = bundle
+        .schemas
+        .get(&entry.schema_hash)
+        .ok_or_else(|| format!("bundle has no schema snapshot for entry {local_id:?}"))?;
+    let logical_schema = distill_schema::ngp_schema::snapshot_to_json(schema)
+        .map_err(|error| format!("cannot serialize verified schema: {error}"))?;
     Ok(AuthoringEntry {
-        uuid: meta.asset,
-        bundle: meta.bundle,
-        local_id: meta.local_id,
-        normalized_path: meta.normalized_path,
-        type_uuid: meta.type_uuid,
-        terminal_type: meta.terminal_type,
-        schema_hash: meta.logical_hash,
-        logical_schema: Arc::from(entry.schema_json.into_bytes()),
-        role: entry_role(meta.authoring_only),
-        tags: meta.tags,
-        value: AuthoringValue {
-            canonical_value: Arc::from(canonical),
-            blobs: blobs.into_iter().map(Arc::from).collect(),
-        },
+        uuid: entry.uuid,
+        bundle: bundle.uuid,
+        local_id: local_id.to_owned(),
+        normalized_path,
+        type_uuid: entry.type_uuid,
+        terminal_type,
+        schema_hash: entry.schema_hash,
+        logical_schema: Arc::from(logical_schema.into_bytes()),
+        role: entry_role(entry.authoring_only),
+        tags: BTreeMap::new(),
+        value: authoring_value(&entry.data)?,
+    })
+}
+
+/// An authored value as the RPC carries it: canonical JSON whose blobs are
+/// `{"$distill_blob": index}` into the blob table.
+fn authoring_value(value: &distill_json::AuthoredValue) -> Result<AuthoringValue, String> {
+    use distill_json::AuthoredValue;
+    fn rewrite(value: &AuthoredValue, blobs: &mut Vec<Arc<[u8]>>) -> AuthoredValue {
+        match value {
+            AuthoredValue::Blob(bytes) => {
+                let index = blobs.len() as u128;
+                blobs.push(Arc::from(bytes.clone()));
+                AuthoredValue::Object(BTreeMap::from([(
+                    "$distill_blob".to_owned(),
+                    AuthoredValue::UInt(index),
+                )]))
+            }
+            AuthoredValue::Array(values) => {
+                AuthoredValue::Array(values.iter().map(|value| rewrite(value, blobs)).collect())
+            }
+            AuthoredValue::Object(values) => AuthoredValue::Object(
+                values
+                    .iter()
+                    .map(|(key, value)| (key.clone(), rewrite(value, blobs)))
+                    .collect(),
+            ),
+            value => value.clone(),
+        }
+    }
+    let mut blobs = Vec::new();
+    let rewritten = rewrite(value, &mut blobs);
+    let canonical = distill_json::write(&rewritten)
+        .map_err(|error| format!("cannot serialize authored value: {error}"))?;
+    Ok(AuthoringValue {
+        canonical_value: Arc::from(canonical.into_bytes()),
+        blobs,
     })
 }
 

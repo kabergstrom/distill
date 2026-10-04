@@ -508,6 +508,7 @@ fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
         "error @4 :RpcError",
         "missing @5 :Void",
         "roleIneligible @6 :AuthoringRoleFailure",
+        "drifted @7 :DriftedResolve",
     ] {
         assert!(inspect.contains(arm), "missing authoring inspect arm {arm}");
     }
@@ -2135,6 +2136,18 @@ async fn remote_snapshot_serves_the_pack_surface() {
                 authoring.inspect(AssetUuid([99; 16])).await.unwrap().success(),
                 Some(AuthoringInspectResult::Missing)
             ));
+            // A definition file rewritten since the snapshot is drift over
+            // the wire too, at the version the daemon has published.
+            let mut rewritten = definition.clone();
+            rewritten.value.blobs = vec![Arc::from([0xAA])];
+            write_entry(&mut project, &rewritten);
+            assert_eq!(
+                authoring.inspect(definition.uuid).await.unwrap().success(),
+                Some(AuthoringInspectResult::Drifted {
+                    input: DriftedInput::File(definition.normalized_path.clone()),
+                    current: snapshot.basis().snapshot,
+                })
+            );
             drop(client);
             server_task.abort();
         })
