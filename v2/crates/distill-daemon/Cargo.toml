@@ -54,6 +54,7 @@ windows-sys = { version = "0.61", features = [
 test-hooks = []
 
 [dev-dependencies]
+distill-pipeline-fixture = { path = "tests/fixtures/pipeline-module" }
 distill-daemon = { path = ".", features = ["test-hooks"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 bincode = "1.3.1"

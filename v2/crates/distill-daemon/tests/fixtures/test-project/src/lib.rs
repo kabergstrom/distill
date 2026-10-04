@@ -11,10 +11,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use distill_bundle::{AssetEntry, Bundle, BUNDLE_FORMAT_VERSION};
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
+use distill_daemon::config::DaemonConfig;
 use distill_daemon::coordinator::DaemonCoordinator;
 use distill_daemon::scanner::AssetRoot;
 use distill_daemon::watcher::WatcherBatch;
@@ -24,7 +25,12 @@ use distill_rpc::{
     BuildPublication, BuildRequest, BuildStart, BuildTicket, BuildView, BuildWireTree, RpcFailure,
     Server, ServerHandle, SnapshotStamp, TargetDefinition,
 };
-use distill_schema::ngp_schema::{node_hash, LogicalSchema, SchemaNode};
+use distill_schema::ngp_schema::{
+    node_hash, Field, FieldAttrs, FieldIdentifier, FieldLayout, LayoutIdentity, LogicalSchema,
+    PrimitiveType, Schema, SchemaLayouts, SchemaNode, SchemaTypeId, TypeAttrs, TypeDef, TypeLayout,
+    TypePath,
+};
+use distill_schema::ProjectSchemaAuthority;
 use distill_store::{StoreConfig, StoreWriter};
 
 /// The root [`TestProject::write`] writes under.
@@ -114,6 +120,8 @@ pub struct TestProject {
     writer: StoreWriter,
     targets: Vec<TargetDefinition>,
     roots: Vec<String>,
+    /// The configuration's schema authority, once [`TestProject::configured`].
+    authority: Option<Arc<ProjectSchemaAuthority>>,
     /// Files written or removed since the last publication.
     touched: BTreeSet<PathBuf>,
     // Dropped last: the daemon holds files under it.
@@ -153,25 +161,109 @@ impl TestProject {
             writer,
             targets,
             roots,
+            authority: None,
             touched: BTreeSet::new(),
             dir,
         }
     }
 
+    /// An empty project with the one root [`ROOT`] and a configuration:
+    /// the target "dev" (`optimize` as given), the project schema
+    /// [`project_schema`] and the pipeline module `distill-pipeline-fixture`,
+    /// published as the daemon's process loop publishes a configuration
+    /// it observes. Its pipeline is Ready.
+    pub fn configured(optimize: bool) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(ROOT)).unwrap();
+        let schema = project_schema();
+        std::fs::write(dir.path().join("schema.json"), serde_json::to_vec(&schema).unwrap())
+            .unwrap();
+        let config = write_config(dir.path(), optimize);
+        let authority = configuration_authority(&config);
+        let mut project = Self::open(
+            dir,
+            config.target_definitions(authority.identity()).unwrap(),
+            vec![ROOT.to_owned()],
+        );
+        project.publish_configuration(&config, authority);
+        project
+    }
+
+    /// Edit the configuration so its target "dev" optimizes or not, and
+    /// publish it as the process loop does: one version whose target
+    /// definition changed, fencing every hub bound to the old one.
+    pub fn reconfigure(&mut self, optimize: bool) -> SnapshotStamp {
+        assert!(self.authority.is_some(), "the project is not configured");
+        let config = write_config(self.dir.path(), optimize);
+        let authority = configuration_authority(&config);
+        self.publish_configuration(&config, authority)
+    }
+
+    fn publish_configuration(
+        &mut self,
+        config: &DaemonConfig,
+        authority: Arc<ProjectSchemaAuthority>,
+    ) -> SnapshotStamp {
+        let candidate = config.configuration_candidate(&authority).unwrap();
+        self.targets = config.target_definitions(authority.identity()).unwrap();
+        self.authority = Some(authority);
+        self.coordinator
+            .publish_configuration_candidate(&mut self.writer, candidate)
+            .unwrap()
+    }
+
+    /// The target the daemon serves (the first, for a project with more).
+    pub fn target(&self) -> &TargetDefinition {
+        &self.targets[0]
+    }
+
+    /// A runtime asset of the configured project type `type_uuid` holding
+    /// `value`, authored under the type's current schema.
+    pub fn asset(
+        &self,
+        local_id: &str,
+        uuid: AssetUuid,
+        type_uuid: TypeUuid,
+        value: AuthoredValue,
+    ) -> Asset {
+        let authority = self.authority.as_ref().expect("the project is configured");
+        Asset {
+            local_id: local_id.to_owned(),
+            uuid,
+            type_uuid,
+            schema: authority
+                .project_type(type_uuid)
+                .expect("a project type")
+                .logical_schema
+                .root
+                .clone(),
+            value,
+            authoring_only: false,
+        }
+    }
+
     /// The same project after a daemon restart: its files and its store,
-    /// served by a new coordinator.
+    /// served by a new coordinator, which publishes its configuration
+    /// again as the process loop's startup does.
     pub fn restart(self) -> Self {
         let TestProject {
             coordinator,
             writer,
             targets,
             roots,
+            authority,
             dir,
             ..
         } = self;
         drop(writer);
         drop(coordinator);
-        Self::open(dir, targets, roots)
+        let mut project = Self::open(dir, targets, roots);
+        if authority.is_some() {
+            let config = DaemonConfig::load(project.path().join("distill.toml")).unwrap();
+            let authority = configuration_authority(&config);
+            project.publish_configuration(&config, authority);
+        }
+        project
     }
 
     /// The project's directory.
@@ -385,4 +477,207 @@ pub fn canonical_artifact(
             load_edges: Vec::new(),
         },
     )
+}
+
+/// A project type of the configured project: a struct of one `String`
+/// field `group`, a search tag.
+pub const TAGGED_TYPE: TypeUuid = TypeUuid([0xa4; 16]);
+pub use distill_pipeline_fixture::{
+    COOKED_TYPE, PARENT_TYPE, REFLECT, REFLECTION, REFLECTION_TYPE,
+};
+
+/// The configured project's schema: [`TAGGED_TYPE`], and the pipeline
+/// module's [`PARENT_TYPE`], [`COOKED_TYPE`] and [`REFLECTION_TYPE`] (each
+/// a struct of one `u8` field `value`), laid out for this host. Its
+/// source hashes are the pipeline module's.
+pub fn project_schema() -> Schema {
+    let type_def = |id: usize, kind, krate: &str, name: &str, uuid, fields| TypeDef {
+        id: SchemaTypeId(id),
+        kind,
+        path: TypePath {
+            name: Some(name.to_owned()),
+            containing_type: None,
+            modules: Vec::new(),
+            krate: krate.to_owned(),
+        },
+        uuid,
+        attrs: TypeAttrs::default(),
+        fields,
+        generic_parameters: Vec::new(),
+        generic_argument_ids: Vec::new(),
+        has_default: true,
+        generic_const_arguments: Vec::new(),
+        has_explicit_discriminants: false,
+    };
+    let field = |name: &str, type_id: usize, tag: bool| Field {
+        id: FieldIdentifier::Name(name.to_owned()),
+        type_id: SchemaTypeId(type_id),
+        attrs: FieldAttrs {
+            tag,
+            ..FieldAttrs::default()
+        },
+    };
+    let layout = |size: usize, align: usize, fields: Vec<FieldLayout>| TypeLayout {
+        size: Some(size as u64),
+        align: Some(align as u64),
+        layout_complete: true,
+        tag_encoding: None,
+        fields,
+    };
+    let at_zero = |size: usize| FieldLayout {
+        offset: Some(0),
+        field_size: Some(size as u64),
+    };
+    let string = std::mem::size_of::<String>();
+    let string_align = std::mem::align_of::<String>();
+    let mut types = vec![
+        type_def(0, PrimitiveType::U8, "core", "u8", None, Vec::new()),
+        type_def(1, PrimitiveType::String, "alloc", "String", None, Vec::new()),
+        type_def(
+            2,
+            PrimitiveType::Struct,
+            "fixture",
+            "Tagged",
+            Some(TAGGED_TYPE),
+            vec![field("group", 1, true)],
+        ),
+    ];
+    let mut layouts = vec![
+        layout(1, 1, Vec::new()),
+        layout(string, string_align, Vec::new()),
+        layout(string, string_align, vec![at_zero(string)]),
+    ];
+    for (name, uuid) in [
+        ("Parent", PARENT_TYPE),
+        ("Cooked", COOKED_TYPE),
+        ("Reflection", REFLECTION_TYPE),
+    ] {
+        types.push(type_def(
+            types.len(),
+            PrimitiveType::Struct,
+            "fixture",
+            name,
+            Some(uuid),
+            vec![field("value", 0, false)],
+        ));
+        layouts.push(layout(1, 1, vec![at_zero(1)]));
+    }
+    Schema {
+        source_hashes: BTreeMap::from([pipeline_module().1.clone()]),
+        type_ops_hash: String::new(),
+        layout_hashes: Default::default(),
+        rustc_version: String::new(),
+        types,
+        layouts: vec![SchemaLayouts {
+            identity: LayoutIdentity {
+                target_triple: host_triple(),
+                rustc: "rustc test-project".to_owned(),
+                algorithm_version: 1,
+            },
+            layouts,
+        }],
+    }
+}
+
+fn host_triple() -> String {
+    let arch = std::env::consts::ARCH;
+    match std::env::consts::OS {
+        "macos" => format!("{arch}-apple-darwin"),
+        "linux" => format!("{arch}-unknown-linux-gnu"),
+        "windows" => format!("{arch}-pc-windows-msvc"),
+        other => panic!("unsupported test OS {other}"),
+    }
+}
+
+/// Write the project's `distill.toml` (see [`TestProject::configured`])
+/// and load it.
+fn write_config(dir: &Path, optimize: bool) -> DaemonConfig {
+    let toml_path = |path: PathBuf| path.display().to_string().replace('\\', "/");
+    let config = format!(
+        r#"
+[daemon]
+address = "127.0.0.1:0"
+state_path = '{state}'
+[assets]
+roots = {{ {ROOT} = '{root}' }}
+schema_path = '{schema}'
+[modules]
+pipeline_dylib = '{module}'
+[targets.dev]
+os = "{os}"
+arch = "{arch}"
+apis = ["vulkan"]
+optimize = {optimize}
+[codegen]
+rs_mod_path = '{generated}'
+auto_codegen = false
+[pipeline]
+parallelism = 2
+max_dependency_depth = 64
+batch_reserved_workers = 1
+[cas]
+segment_size = "1MiB"
+cache_limit = "16MiB"
+"#,
+        state = toml_path(dir.join(".distill")),
+        root = toml_path(dir.join(ROOT)),
+        schema = toml_path(dir.join("schema.json")),
+        module = toml_path(pipeline_module().0.clone()),
+        os = std::env::consts::OS,
+        arch = std::env::consts::ARCH,
+        generated = toml_path(dir.join("generated")),
+    );
+    let path = dir.join("distill.toml");
+    std::fs::write(&path, config).unwrap();
+    DaemonConfig::load(path).unwrap()
+}
+
+/// The schema authority of `config`'s schema file, as the process loop
+/// reads it.
+fn configuration_authority(config: &DaemonConfig) -> Arc<ProjectSchemaAuthority> {
+    let bytes = std::fs::read(&config.assets.schema_path).unwrap();
+    Arc::new(ProjectSchemaAuthority::from_json(&bytes).unwrap())
+}
+
+/// The pipeline module `distill-pipeline-fixture`, built once per test
+/// process, and its source identity (crate name, source hash).
+fn pipeline_module() -> &'static (PathBuf, (String, String)) {
+    static MODULE: OnceLock<(PathBuf, (String, String))> = OnceLock::new();
+    MODULE.get_or_init(|| {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(5)
+            .unwrap();
+        let target_dir = workspace.join("target/pipeline-module-fixture");
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let output = std::process::Command::new(cargo)
+            .current_dir(workspace)
+            .env("CARGO_TARGET_DIR", &target_dir)
+            .args(["build", "--offline", "-p", "distill-pipeline-fixture"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "pipeline fixture build failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let module = target_dir.join("debug").join(if cfg!(target_os = "windows") {
+            "distill_pipeline_fixture.dll"
+        } else if cfg!(target_os = "macos") {
+            "libdistill_pipeline_fixture.dylib"
+        } else {
+            "libdistill_pipeline_fixture.so"
+        });
+        let staging = tempfile::tempdir().unwrap();
+        let staged =
+            ngp_module_host::stage_copy_to(&module, &staging.path().join(module.file_name().unwrap()))
+                .unwrap();
+        // SAFETY: the fixture was just built from this workspace and is
+        // opened only to read its bounded source-identity export.
+        let library = unsafe { ngp_module_host::HostedLibrary::open(staged) }.unwrap();
+        // SAFETY: the fixture derives the shared source-identity export.
+        let identity = unsafe { ngp_module_host::read_source_identity(&library) }.unwrap();
+        library.close();
+        (module, (identity.crate_name, identity.source_hash))
+    })
 }

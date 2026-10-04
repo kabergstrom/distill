@@ -106,7 +106,15 @@ fn compiled_pipeline_cdylib_opens_registers_unloads_and_closes() {
         module_abi: host_module_abi_identity(),
         source_hashes: BTreeMap::from([(source_identity.crate_name, source_identity.source_hash)]),
         layout_hashes: BTreeMap::new(),
-        schema_registry: BTreeMap::new(),
+        // The fixture's processor binds these types.
+        schema_registry: [
+            distill_pipeline_fixture::PARENT_TYPE,
+            distill_pipeline_fixture::COOKED_TYPE,
+            distill_pipeline_fixture::REFLECTION_TYPE,
+        ]
+        .into_iter()
+        .map(|type_uuid| (type_uuid, distill_core::id::LogicalHash([1; 32])))
+        .collect(),
         targets: vec![TargetDefinition {
             name: "desktop".to_owned(),
             fingerprint: [0x42; 32],
@@ -122,7 +130,15 @@ fn compiled_pipeline_cdylib_opens_registers_unloads_and_closes() {
         first.registrations().pipeline_targets,
         ["desktop".to_owned()].into_iter().collect()
     );
-    assert!(first.registrations().registrations.is_empty());
+    assert_eq!(
+        first
+            .registrations()
+            .registrations
+            .iter()
+            .map(|registration| registration.id.as_str())
+            .collect::<Vec<_>>(),
+        [distill_pipeline_fixture::REFLECT]
+    );
 
     let second = host
         .publish_candidate(&module_path, requirements.clone(), &mut loader)

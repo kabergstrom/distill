@@ -9,6 +9,8 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+distill-core = { path = "../../../../distill-core" }
+distill-json = { path = "../../../../distill-json" }
 distill-pipeline-api = { path = "../../../../distill-pipeline-api" }
 newgameplus-api-macros = { path = "../../../../../../../newgameplus/newgameplus-api-macros" }
 

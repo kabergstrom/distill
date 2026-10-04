@@ -8,7 +8,10 @@ use distill_store::config::RestartOnlyChange;
 use distill_schema::ngp_schema::{
     node_hash, snapshot_to_json, LogicalSchema, PrimitiveKind, SchemaNode,
 };
-use distill_test_project::{bundle_bytes, Asset, TestBuilds, TestProject, ROOT};
+use distill_test_project::{
+    bundle_bytes, Asset, TestBuilds, TestProject, PARENT_TYPE, REFLECTION, REFLECTION_TYPE, ROOT,
+    TAGGED_TYPE,
+};
 
 fn type_id(byte: u8) -> TypeUuid {
     TypeUuid([byte; 16])
@@ -348,6 +351,31 @@ fn drifted_resolve_builds_per_resolve_at_the_snapshot_and_publishes_canonical_ou
 
 /// The durable store's version is what a restarted daemon serves first.
 #[test]
+fn derived_child_resolution_builds_the_parent_and_selects_the_declared_output() {
+    let mut project = TestProject::configured(false);
+    let server = project.server();
+    let builds = TestBuilds::install(&server);
+    let parent = asset_id(1);
+    let asset = project.asset("parent", parent, PARENT_TYPE, object("value", AuthoredValue::UInt(5)));
+    project.write_bundle("parent.bundle", BundleUuid([2; 16]), Some("parent"), &[asset]);
+    project.publish();
+    let child = AssetUuid::v5(parent, REFLECTION);
+
+    let snapshot = snapshot(&connect_to(&server, project.target()));
+    let hash = match snapshot.resolve(child).success().unwrap().value {
+        ResolveResult::Built { content_hash } => content_hash,
+        other => panic!("expected built derived output, got {other:?}"),
+    };
+    assert!(matches!(snapshot.fetch(hash), RpcResult::Success(_)));
+    let requests = builds.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].0.entry.uuid, parent);
+    assert_eq!(requests[0].0.requested_asset, child);
+    assert_eq!(requests[0].0.output_key, REFLECTION);
+    assert_eq!(requests[0].0.requested_terminal_type, REFLECTION_TYPE);
+}
+
+#[test]
 fn production_bootstrap_starts_at_the_durable_store_version() {
     let mut project = project();
     publish_entry(&mut project, &authoring_entry(1, AuthoringEntryRole::Runtime));
@@ -521,6 +549,22 @@ fn connect(server: &Server, policies: &[(u8, bool)]) -> Hub {
         ConnectOutcome::Connected(connected) => connected.hub,
         other => panic!("expected connection, got {other:?}"),
     }
+}
+
+/// A hub bound to `target`, as served by a configured project.
+fn connect_to(server: &Server, target: &TargetDefinition) -> Hub {
+    match server
+        .root()
+        .connect(ConnectRequest::new(target.name(), target.definition_hash()))
+    {
+        ConnectOutcome::Connected(connected) => connected.hub,
+        other => panic!("expected connection, got {other:?}"),
+    }
+}
+
+/// The authored value of a configured project type of one field.
+fn object(field: &str, value: AuthoredValue) -> AuthoredValue {
+    AuthoredValue::Object(BTreeMap::from([(field.to_owned(), value)]))
 }
 
 fn snapshot(hub: &Hub) -> Snapshot {
