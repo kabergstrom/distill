@@ -303,9 +303,8 @@ fn derive_type_inner(
         }
         Class::Array { len, elem } => derive_array(ctx, id, len, elem, in_key),
         Class::Option(_) | Class::Enum => derive_enum(ctx, id, in_key),
-        Class::Struct | Class::Tuple | Class::AssetRef(_) | Class::WeakRef(_) => {
-            derive_record(ctx, id, in_key, false)
-        }
+        Class::Struct | Class::Tuple => derive_record(ctx, id, in_key, false),
+        Class::AssetRef(_) | Class::WeakRef(_) => derive_reference(ctx, id),
         Class::EnumVariant => Err(DeriveError::Unsupported {
             type_path: type_path(ctx, id),
             reason: "enum variant outside its enum".to_string(),
@@ -444,6 +443,41 @@ fn derive_array(
         wire_size,
         wire_align,
         diverged,
+    })
+}
+
+/// `AssetRef<T>`/`WeakAssetRef<T>`: the resolved UUID, 16 unrestricted
+/// bytes, as the native layout (`distill-asset` `AssetReflect`) describes
+/// it — a `[u8; 16]` array, not the record of its declared fields (a
+/// UUID newtype and a zero-sized marker), whose struct node the fixup
+/// planner could not pair with the native array.
+fn derive_reference(ctx: &mut Ctx<'_>, id: SchemaTypeId) -> Result<Derived, DeriveError> {
+    let (native_size, native_align) = measured(ctx, id)?;
+    if native_size != 16 || native_align != 1 {
+        return Err(DeriveError::Unsupported {
+            type_path: type_path(ctx, id),
+            reason: format!("reference measured {native_size} bytes, align {native_align}; expected 16, 1"),
+        });
+    }
+    Ok(Derived {
+        node: WireNode::Array {
+            offset: 0,
+            size: 16,
+            align: 1,
+            len: 16,
+            stride: 1,
+            elem: Box::new(WireNode::Primitive {
+                offset: 0,
+                size: 1,
+                align: 1,
+                kind: ScalarKind::U8,
+            }),
+        },
+        native_size,
+        native_align,
+        wire_size: 16,
+        wire_align: 1,
+        diverged: false,
     })
 }
 

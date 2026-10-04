@@ -853,7 +853,36 @@ fn mutual_recursion_counts_intervening_frames() {
 // --- framework types --------------------------------------------------------------------
 
 #[test]
-fn asset_refs_derive_as_their_ordinary_struct_shape() {
+fn asset_refs_derive_as_the_16_byte_uuid_array_native_layouts_describe() {
+    // `AssetRef<T>(AssetUuid, PhantomData<T>)`: the record of its declared
+    // fields would not pair with the native `[u8; 16]` (`AssetReflect`).
+    let s = schema(vec![
+        prim(0, PrimitiveType::U8),
+        array_ty(1, 16, 0),
+        prim(2, PrimitiveType::U32),
+        {
+            let (mut def, layout) = strukt(3, "AssetRef", 16, 1, vec![(named_field("0", 1), 0)]);
+            def.uuid = Some(ngp_schema::ASSET_REF_UUID);
+            def.generic_argument_ids = vec![SchemaTypeId(2)];
+            (def, layout)
+        },
+        strukt(4, "S", 20, 4, vec![(named_field("r", 3), 0), (named_field("c", 2), 16)]),
+    ]);
+    let uuid = WireNode::Array {
+        offset: 0,
+        size: 16,
+        align: 1,
+        len: 16,
+        stride: 1,
+        elem: Box::new(wprim(0, ScalarKind::U8)),
+    };
+    assert_eq!(derive(&s, 3).unwrap(), uuid);
+    assert_eq!(
+        derive(&s, 4).unwrap(),
+        wstruct(0, 20, 4, vec![wfield("r", 0, uuid), wfield("c", 1, wprim(16, ScalarKind::U32))])
+    );
+
+    // Any other measured geometry is not a reference this runtime reads.
     let s = schema(vec![
         prim(0, PrimitiveType::U128),
         prim(1, PrimitiveType::U32),
@@ -864,16 +893,7 @@ fn asset_refs_derive_as_their_ordinary_struct_shape() {
             (def, layout)
         },
     ]);
-    let wire = derive(&s, 2).unwrap();
-    assert_eq!(
-        wire,
-        wstruct(
-            0,
-            16,
-            8,
-            vec![wfield("uuid", 0, wprim(0, ScalarKind::U128))]
-        )
-    );
+    assert!(matches!(derive(&s, 2), Err(DeriveError::Unsupported { .. })));
 }
 
 // --- errors -------------------------------------------------------------------------------
