@@ -96,6 +96,69 @@ pub(super) enum ScanStep {
     Rejection(Box<RejectionStep>),
 }
 
+/// Why applying a scan step failed: a file its publication read changed
+/// since the step observed it (retried once the watcher reports the
+/// change), or anything else.
+enum StepFailure {
+    Drifted { root: String, path: String },
+    Failed(String),
+}
+
+impl From<String> for StepFailure {
+    fn from(error: String) -> Self {
+        StepFailure::Failed(error)
+    }
+}
+
+impl From<StoreError> for StepFailure {
+    fn from(error: StoreError) -> Self {
+        match error {
+            StoreError::Drifted { root, path } => StepFailure::Drifted { root, path },
+            error => StepFailure::Failed(error.to_string()),
+        }
+    }
+}
+
+impl StepFailure {
+    /// The failure as a pass input's error message, remembering a drift in
+    /// `drift` (scoped to the one pass) so the pass reports it typed.
+    fn noted(self, drift: &std::cell::Cell<Option<ScanKey>>) -> String {
+        match self {
+            StepFailure::Drifted { root, path } => {
+                let message = format!("{root}:{path} changed on disk since it was published");
+                drift.set(Some((root, path)));
+                message
+            }
+            StepFailure::Failed(error) => error,
+        }
+    }
+}
+
+/// The pass's error: a drift its input noted, else `error`.
+fn pass_error(
+    drift: &std::cell::Cell<Option<ScanKey>>,
+    error: CoordinatedCommitError,
+) -> CoordinatorError {
+    match drift.take() {
+        Some((root, path)) => CoordinatorError::Drifted { root, path },
+        None => CoordinatorError::Coordinated(error),
+    }
+}
+
+impl ScanStep {
+    /// The bundle this step's scan read at (`root`, `path`): the bytes its
+    /// publication observes, which a reader of that path in the step's
+    /// input uses instead of reading the file again.
+    fn fresh_bundle(&self, root: &str, path: &str) -> Option<Arc<ScannedBundle>> {
+        let key = (root.to_owned(), path.to_owned());
+        match self {
+            ScanStep::Incremental(step) => step.delta.observed_bundle(&key).cloned(),
+            ScanStep::Full(step) => step.candidate.scan.bundles.get(&key).cloned(),
+            _ => None,
+        }
+    }
+}
+
 pub(super) struct IncrementalStep {
     delta: ScanDelta,
     claims: Vec<SourceClaims>,
@@ -305,6 +368,7 @@ impl DaemonCoordinator {
         // rolls back (taking the index rows it built with it), and the
         // imports run outside any write.
         let mut planned = None;
+        let drift = std::cell::Cell::new(None);
         let mut more_work = false;
         let published = self.server.coordinated_maybe_commit(store, base, |store| {
             if scope.loop_pass {
@@ -313,13 +377,15 @@ impl DaemonCoordinator {
                 self.sync_runtime_pipeline_failure(store)
                     .map_err(|error| error.to_string())?;
             }
-            let mut commit = self.apply_scan_step(store, &step)?;
+            let mut commit = self
+                .apply_scan_step(store, &step)
+                .map_err(|failure| failure.noted(&drift))?;
             if scope.imports() {
                 let work = match scope.affected.and_then(|affected| affected.work) {
                     Some(work) => work.clone(),
                     None => store.pending_file_work().map_err(|error| error.to_string())?,
                 };
-                let imports = self.discover(store, &work, scope, None)?;
+                let imports = self.discover(store, &step, &work, scope, None)?;
                 if !imports.is_empty() {
                     let mut plans = Vec::with_capacity(imports.len());
                     for import in imports {
@@ -348,7 +414,7 @@ impl DaemonCoordinator {
         if let Some(planned) = planned {
             return self.pass_with_imports(store, base, step, scope, planned);
         }
-        let published = published.map_err(CoordinatorError::Coordinated)?;
+        let published = published.map_err(|error| pass_error(&drift, error))?;
         self.finish_scan_step(&step);
         Ok(PassOutcome {
             stamp: match published {
@@ -379,13 +445,16 @@ impl DaemonCoordinator {
 
         let mut more_work = chain.truncated;
         let mut failures = chain.failures;
+        let drift = std::cell::Cell::new(None);
         let mut imported = Vec::new();
         let published = self.server.coordinated_maybe_commit(store, base, |store| {
             if scope.loop_pass {
                 self.sync_runtime_pipeline_failure(store)
                     .map_err(|error| error.to_string())?;
             }
-            let mut commit = self.apply_scan_step(store, &step)?;
+            let mut commit = self
+                .apply_scan_step(store, &step)
+                .map_err(|failure| failure.noted(&drift))?;
             self.refine_scan_tags(store, &step, &mut commit)?;
             let work = match scope.affected.and_then(|affected| affected.work) {
                 Some(work) => work.clone(),
@@ -399,7 +468,7 @@ impl DaemonCoordinator {
             let mut waiting = Vec::new();
             for level in 0..levels.len() {
                 let mut outputs = Vec::new();
-                for import in self.discover(store, &level_work, level_scope, None)? {
+                for import in self.discover(store, &step, &level_work, level_scope, None)? {
                     let Some(index) = levels[level]
                         .iter()
                         .position(|(planned, _)| *planned == import)
@@ -466,7 +535,7 @@ impl DaemonCoordinator {
             }
             Ok(commit)
         });
-        let published = published.map_err(CoordinatorError::Coordinated)?;
+        let published = published.map_err(|error| pass_error(&drift, error))?;
         self.finish_scan_step(&step);
         Ok(PassOutcome {
             stamp: match published {
@@ -606,7 +675,7 @@ impl DaemonCoordinator {
                     let work = published_paths_work(store, std::slice::from_ref(key))
                         .map_err(publication)?;
                     for import in self
-                        .discover(store, &work, scope.chained(), Some(&overlay))
+                        .discover(store, step, &work, scope.chained(), Some(&overlay))
                         .map_err(publication)?
                     {
                         let Some(destination) = self
@@ -701,7 +770,10 @@ impl DaemonCoordinator {
                     observed,
                 }));
             }
-            self.apply_scan_step(store, step).map_err(publication)?;
+            self.apply_scan_step(store, step).map_err(|failure| match failure {
+                StepFailure::Drifted { root, path } => CoordinatorError::Drifted { root, path },
+                StepFailure::Failed(error) => publication(error),
+            })?;
             plan(store)
         }));
         let rolled_back = store.finish_input(false);
@@ -720,6 +792,7 @@ impl DaemonCoordinator {
     fn discover(
         &self,
         store: &mut Store,
+        step: &ScanStep,
         work: &PendingFileWork,
         scope: ImportScope<'_>,
         outputs: Option<&FileOverlay>,
@@ -729,7 +802,7 @@ impl DaemonCoordinator {
         // `work` names, parsed once each.
         let refreshed = self
             .authoring
-            .refresh_import_index(store, &work.dirty)
+            .refresh_import_index(store, &work.dirty, |root, path| step.fresh_bundle(root, path))
             .map_err(failure)?;
         // `None` revalidates every import.
         let affected = scope.affected.map(|affected| {
@@ -995,7 +1068,7 @@ impl DaemonCoordinator {
         &self,
         store: &mut Store,
         step: &ScanStep,
-    ) -> Result<Option<Commit>, String> {
+    ) -> Result<Option<Commit>, StepFailure> {
         match step {
             ScanStep::Unchanged => Ok(None),
             ScanStep::Diagnostics { under, rows } => {
@@ -1016,6 +1089,7 @@ impl DaemonCoordinator {
                 let inputs = PlanInputs {
                     authority: authority.as_deref(),
                     fresh: fresh_bundles(&step.delta),
+                    scanner: tags.compiled.scanner(),
                 };
                 let commit = publish_incremental_scan(
                     store,
@@ -1027,7 +1101,7 @@ impl DaemonCoordinator {
                     tags.compiled.projection(),
                     tags.tag_epoch,
                 )
-                .map_err(|error| error.to_string())?;
+                ?;
                 Ok(Some(commit))
             }
             ScanStep::Full(step) => {

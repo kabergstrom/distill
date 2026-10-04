@@ -19,7 +19,7 @@ use distill_store::db::StoreReader;
 use distill_store::Current;
 use distill_store::error::StoreError;
 use distill_store::files::{
-    FileKind, FileObservation, FileState, ObservedBundleFile, ObservedDiagnostic, ObservedDirectory,
+    FileKind, FileObservation, FileState, ObservedDiagnostic, ObservedDirectory,
     ObservedFile,
 };
 use distill_store::state::{PhysicalPathClaim, PhysicalPathFailureCode, PlatformPathBytes};
@@ -431,6 +431,11 @@ impl ScanDelta {
         self.observed.bundles.values().map(AsRef::as_ref)
     }
 
+    /// The bundle this delta read at `key`, if it observed one there.
+    pub(crate) fn observed_bundle(&self, key: &(String, String)) -> Option<&Arc<ScannedBundle>> {
+        self.observed.bundles.get(key)
+    }
+
     pub(crate) fn observed_bundle_entries(
         &self,
     ) -> impl Iterator<Item = (&(String, String), &Arc<ScannedBundle>)> {
@@ -584,14 +589,20 @@ impl ScanBaseline for StoredBaseline<'_> {
 impl ScanSnapshot {
     /// The complete published observation, from the store's scan tables:
     /// the oracle the bounded readers are compared with. No publication
-    /// loads it.
+    /// loads it. A bundle is its `files` row's hash: the store keeps no
+    /// bytes, and the oracle compares only hashes.
     #[cfg(test)]
     pub(crate) fn load(reader: &StoreReader) -> Result<Self, StoreError> {
+        let mut bundles = Vec::new();
+        reader.for_each_bundle_file_hash(|root_name, path, hash| {
+            bundles.push((root_name, path, hash));
+            Ok(())
+        })?;
         Self::from_rows(
             reader.observed_files()?,
             reader.observed_directories()?,
             reader.scan_diagnostics()?,
-            reader.bundle_files()?,
+            bundles,
         )
     }
 
@@ -604,7 +615,7 @@ impl ScanSnapshot {
         files: Vec<ObservedFile>,
         directories: Vec<ObservedDirectory>,
         diagnostics: Vec<ObservedDiagnostic>,
-        bundles: Vec<ObservedBundleFile>,
+        bundles: Vec<(String, String, [u8; 32])>,
     ) -> Result<Self, StoreError> {
         let mut snapshot = Self::default();
         for row in files {
@@ -623,11 +634,10 @@ impl ScanSnapshot {
             let (key, diagnostic) = diagnostic_row(row)?;
             snapshot.diagnostics.insert(key, diagnostic);
         }
-        for row in bundles {
-            let bundle = scanned_bundle(&row.root_name, &row.path, row.bytes);
-            snapshot
-                .bundles
-                .insert((row.root_name, row.path), Arc::new(bundle));
+        for (root_name, path, hash) in bundles {
+            let mut bundle = scanned_bundle(&root_name, &path, Vec::new());
+            bundle.file_hash = BundleFileHash(hash);
+            snapshot.bundles.insert((root_name, path), Arc::new(bundle));
         }
         rebuild_reverse_indexes(&mut snapshot).map_err(|error| {
             StoreError::InvalidConfiguration {
@@ -1377,6 +1387,31 @@ impl RootedScanner {
         let mut next = baseline.clone();
         next.apply_delta(delta);
         Ok(Some(next))
+    }
+
+    /// The bundle at (`root`, `path`) as the reader's version observed it:
+    /// the file's bytes, read through the scan's identity checks, when they
+    /// hash to that version's `files` content hash. The store keeps no copy
+    /// of a file's bytes. A file that is gone, unreadable or holds other
+    /// bytes changed since the version observed it: `StoreError::Drifted`,
+    /// which the watcher reports and the caller retries once published.
+    pub(crate) fn read_published_bundle(
+        &self,
+        reader: &StoreReader,
+        root: &str,
+        path: &str,
+    ) -> Result<ScannedBundle, StoreError> {
+        let drifted = || StoreError::Drifted {
+            root: root.to_owned(),
+            path: path.to_owned(),
+        };
+        let expected = reader.file_content_hash(root, path)?.ok_or_else(drifted)?;
+        let physical = self.physical_path(root, path).map_err(|_| drifted())?;
+        let bytes = self.read_identity_checked(&physical).map_err(|_| drifted())?;
+        if ContentHash(*blake3::hash(&bytes).as_bytes()) != expected {
+            return Err(drifted());
+        }
+        Ok(scanned_bundle(root, path, bytes))
     }
 
     pub fn read_identity_checked(&self, path: &Path) -> Result<Vec<u8>, ScanError> {
@@ -2869,9 +2904,6 @@ mod published_compare_tests {
                 for (key, file) in scan.file_observations() {
                     let root = txn.intern_root(&key.0)?;
                     txn.upsert_file(root, &key.1, &file, version)?;
-                    if let Some(bundle) = scan.bundles.get(key) {
-                        txn.set_bundle_file(root, &key.1, &bundle.bytes)?;
-                    }
                 }
                 txn.replace_scan_structure(
                     None,

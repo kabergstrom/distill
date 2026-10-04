@@ -62,7 +62,6 @@ fn every_section_13_table_exists() {
     // codegen_outputs (§20's daemon-owned expected-preimage authority).
     let expected: BTreeSet<String> = [
         "files",
-        "bundle_files",
         "directories",
         "scan_diagnostics",
         "source_claims",

@@ -260,7 +260,6 @@ fn a_transaction_view_reads_its_own_uncommitted_scan_rows() {
     let failed = store.input_transaction::<(), _>(|txn| {
         let root = txn.intern_root("main")?;
         txn.upsert_file(root, "tex/rock.bundle", &observation, InputVersion(1))?;
-        txn.set_bundle_file(root, "tex/rock.bundle", b"bundle bytes")?;
         let view = txn.reader();
         let row = view.observed_file("main", "tex/rock.bundle")?.unwrap();
         assert_eq!(row.file, observation);
@@ -271,17 +270,12 @@ fn a_transaction_view_reads_its_own_uncommitted_scan_rows() {
                 .collect::<Vec<_>>(),
             ["tex/rock.bundle"]
         );
-        assert_eq!(
-            view.bundle_file("main", "tex/rock.bundle")?.as_deref(),
-            Some(&b"bundle bytes"[..])
-        );
         Err(distill_store::StoreError::Rejected {
             detail: "roll back".to_owned(),
         })
     });
     assert!(failed.is_err());
     assert_eq!(store.observed_file("main", "tex/rock.bundle").unwrap(), None);
-    assert_eq!(store.bundle_file("main", "tex/rock.bundle").unwrap(), None);
 }
 
 #[test]

@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 40;
+pub const SCHEMA_VERSION: u32 = 41;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -58,18 +58,6 @@ CREATE INDEX files_by_name ON files(name);
 CREATE INDEX files_by_ext ON files(ext) WHERE ext IS NOT NULL;
 CREATE INDEX files_by_symlink_target ON files(symlink_target)
     WHERE symlink_target IS NOT NULL;
--- The bytes of every observed `.bundle` file, as read by the scan that
--- recorded its `files` row, and their blake3 hash (the bundle's file hash),
--- so an observation compares without reading the bytes.
-CREATE TABLE bundle_files (
-    root_id INTEGER NOT NULL,
-    path    TEXT NOT NULL,
-    -- Before `bytes`: a row larger than a page keeps its tail on overflow
-    -- pages, so a read of the hash alone never walks the bytes.
-    hash    BLOB NOT NULL CHECK (length(hash) = 32),
-    bytes   BLOB NOT NULL,
-    PRIMARY KEY (root_id, path)
-);
 -- Every traversed directory (the root itself at path ''), for alias checks.
 -- Two directories never share a canonical path: the scanner rejects an
 -- alias before publishing, and the unique index enforces it at write.

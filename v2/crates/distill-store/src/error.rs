@@ -21,6 +21,11 @@ pub enum StoreError {
     /// A served-state publication failed validation inside its
     /// transaction, which rolled back.
     Rejected { detail: String },
+    /// A file changed on disk since the version a read was answering for
+    /// observed it: its bytes no longer hash to what that version recorded.
+    /// The store holds no copy of file content; the watcher reports the
+    /// change, and the read is retried once the change is published.
+    Drifted { root: String, path: String },
     /// Persisted DSVP bytes were malformed or non-canonical.
     InvalidNamespaceError(crate::state::NamespaceErrorDecodeError),
     /// Persisted DSPP fields were unknown, noncanonical, or inconsistent.
@@ -137,6 +142,9 @@ impl fmt::Display for StoreError {
                  daemon state is disposable — recreate it"
             ),
             StoreError::Rejected { detail } => write!(f, "publication rejected: {detail}"),
+            StoreError::Drifted { root, path } => {
+                write!(f, "{root}:{path} changed on disk since it was published")
+            }
             StoreError::InvalidNamespaceError(error) => error.fmt(f),
             StoreError::InvalidPipelineFailure(error) => error.fmt(f),
             StoreError::InvalidBootstrapSpec(error) => {

@@ -630,7 +630,6 @@ fn publish_completely(
 fn published_tables(store: &Store) -> BTreeMap<&'static str, Vec<String>> {
     [
         "files",
-        "bundle_files",
         "directories",
         "source_claims",
         "claim_collisions",
@@ -699,6 +698,7 @@ fn assert_reconfiguration_matches_oracle(before: &Configuration, after: &Configu
     BUNDLE_READS.with(|reads| reads.set(0));
     publish_reconfiguration(
         &mut store,
+        &scanner,
         &after.pipeline,
         &after.projection,
         &retyped,
@@ -933,6 +933,7 @@ fn a_complete_publication_revalidates_a_poisoned_skeleton_after_a_schema_edit() 
     publish_completely(&mut complete, &scanner, &after, &BTreeSet::new());
     publish_reconfiguration(
         &mut reconfigured,
+        &scanner,
         &after.pipeline,
         &after.projection,
         &BTreeSet::new(),

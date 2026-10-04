@@ -806,6 +806,7 @@ impl DaemonCoordinator {
                     ),
                     _ => publish_reconfiguration(
                         store,
+                        &scanner,
                         &pipeline,
                         &projection,
                         &retyped,
@@ -1508,6 +1509,10 @@ pub enum CoordinatorError {
     PipelineAwaitingSchema(String),
     /// No compiled state serves the store's version (`crate::compiled`).
     Compiled(CompiledLookupError),
+    /// A file the pass read changed on disk since its version observed it
+    /// (`StoreError::Drifted`): nothing was published, the watcher reports
+    /// the change, and the pass is retried.
+    Drifted { root: String, path: String },
 }
 
 impl std::fmt::Display for CoordinatorError {
@@ -1526,7 +1531,10 @@ impl From<ScanError> for CoordinatorError {
 
 impl From<StoreError> for CoordinatorError {
     fn from(error: StoreError) -> Self {
-        Self::InvalidManifest(error.to_string())
+        match error {
+            StoreError::Drifted { root, path } => Self::Drifted { root, path },
+            error => Self::InvalidManifest(error.to_string()),
+        }
     }
 }
 
@@ -1800,8 +1808,10 @@ fn bundle_claims<'a>(
 struct PlanInputs<'a> {
     authority: Option<&'a ProjectSchemaAuthority>,
     /// The bundles this scan read, by (root, path); other claimed sources
-    /// are parsed from their stored bytes.
+    /// are read from their files through `scanner`, verified against the
+    /// content hash the store observed.
     fresh: BTreeMap<ScanKey, Arc<ScannedBundle>>,
+    scanner: &'a RootedScanner,
 }
 
 fn fresh_bundles(delta: &ScanDelta) -> BTreeMap<ScanKey, Arc<ScannedBundle>> {
@@ -1813,19 +1823,14 @@ fn fresh_bundles(delta: &ScanDelta) -> BTreeMap<ScanKey, Arc<ScannedBundle>> {
 
 fn claimed_source(
     reader: &StoreReader,
-    fresh: &BTreeMap<ScanKey, Arc<ScannedBundle>>,
+    inputs: &PlanInputs<'_>,
     root_name: &str,
     path: &str,
 ) -> Result<Arc<ScannedBundle>, StoreError> {
-    if let Some(source) = fresh.get(&(root_name.to_owned(), path.to_owned())) {
+    if let Some(source) = inputs.fresh.get(&(root_name.to_owned(), path.to_owned())) {
         return Ok(Arc::clone(source));
     }
-    let bytes = reader
-        .bundle_file(root_name, path)?
-        .ok_or_else(|| StoreError::InvalidConfiguration {
-            error: format!("claimed bundle {root_name}:{path} has no stored bytes"),
-        })?;
-    Ok(Arc::new(crate::scanner::scanned_bundle(root_name, path, bytes)))
+    Ok(Arc::new(inputs.scanner.read_published_bundle(reader, root_name, path)?))
 }
 
 fn incremental_plan(
@@ -1845,7 +1850,7 @@ fn incremental_plan(
             .map(|source| {
                 claimed_source(
                     reader,
-                    &inputs.fresh,
+                    inputs,
                     &source.root_name,
                     &source.normalized_path,
                 )
@@ -2435,9 +2440,6 @@ fn publish_scan(
                 continue;
             };
             transaction.upsert_file(root, &key.1, &file, observation)?;
-            if let Some(bundle) = candidate.scan.bundles.get(key) {
-                transaction.set_bundle_file(root, &key.1, &bundle.bytes)?;
-            }
             if dirty {
                 transaction.push_dirty(root, &key.1, true, observation)?;
             }
@@ -2611,6 +2613,7 @@ fn reschemaed_poisoned_sources(
 /// are the refinement's. Nothing here reads a bundle outside those sets.
 fn publish_reconfiguration(
     store: &mut Store,
+    scanner: &RootedScanner,
     pipeline: &ConfigurationPipelinePublication,
     projection: &PipelineProjection,
     retyped: &BTreeSet<TypeUuid>,
@@ -2632,12 +2635,9 @@ fn publish_reconfiguration(
     let mut claims = Vec::new();
     let mut forced = BTreeSet::new();
     for (root_name, path) in &keys {
-        let Some(bytes) = store.bundle_file(root_name, path)? else {
-            continue;
-        };
         #[cfg(test)]
         compiled_tests::source_reclaimed();
-        let source = Arc::new(crate::scanner::scanned_bundle(root_name, path, bytes));
+        let source = Arc::new(scanner.read_published_bundle(store, root_name, path)?);
         claims.push(source_claims(&source, projection, Some(authority)).map_err(|error| {
             StoreError::InvalidConfiguration {
                 error: error.to_string(),
@@ -2671,6 +2671,7 @@ fn publish_reconfiguration(
             &PlanInputs {
                 authority: Some(authority),
                 fresh,
+                scanner,
             },
             projection,
             tag_epoch,
@@ -2688,8 +2689,6 @@ struct IncrementalFileMutation {
     path: String,
     /// The new row; `None` removes it.
     file: Option<FileObservation>,
-    /// The bytes of a new or changed `.bundle` row.
-    bundle: Option<Arc<ScannedBundle>>,
     /// Whether the tree state changed (watcher work for importers).
     dirty: bool,
 }
@@ -2760,9 +2759,6 @@ fn publish_incremental_scan(
             match &mutation.file {
                 Some(file) => {
                     transaction.upsert_file(root, &mutation.path, file, observation)?;
-                    if let Some(bundle) = &mutation.bundle {
-                        transaction.set_bundle_file(root, &mutation.path, &bundle.bytes)?;
-                    }
                     if mutation.dirty {
                         transaction.push_dirty(root, &mutation.path, true, observation)?;
                     }
@@ -2944,8 +2940,11 @@ fn prepare_incremental_publication(
     projection: &PipelineProjection,
     forced: &BTreeSet<BundleUuid>,
 ) -> Result<IncrementalPublication, StoreError> {
-    let plan = incremental_plan(store, inputs).map_err(|error| StoreError::InvalidConfiguration {
-        error: error.to_string(),
+    let plan = incremental_plan(store, inputs).map_err(|error| match error {
+        CoordinatorError::Drifted { root, path } => StoreError::Drifted { root, path },
+        error => StoreError::InvalidConfiguration {
+            error: error.to_string(),
+        },
     })?;
     let configuration_generation = configuration_generation(store)?;
     let mut durable_bundles = BTreeMap::new();
@@ -3144,7 +3143,6 @@ fn incremental_file_mutations(
             let after = current.get(&key);
             (before != after).then(|| IncrementalFileMutation {
                 dirty: before.map(|file| &file.state) != after.map(|file| &file.state),
-                bundle: after.and_then(|_| observed.bundles.get(&key).cloned()),
                 file: after.cloned(),
                 root_name: key.0,
                 path: key.1,
@@ -3222,6 +3220,7 @@ pub(crate) fn publish_incremental_paths(
     let inputs = PlanInputs {
         authority: authority.as_deref(),
         fresh: fresh_bundles(&delta),
+        scanner,
     };
     let mut commit = publish_incremental_scan(
         store,

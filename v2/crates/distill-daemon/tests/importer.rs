@@ -842,12 +842,33 @@ fn imported_sources(
     (temp, assets, coordinator)
 }
 
-/// The value each `{stem}.bundle` holds in `store`, `None` while it has none.
-fn generated_values(store: &distill_store::StoreReader, stems: &[&str]) -> Vec<Option<u128>> {
+/// The content hash each `{stem}.bundle` has in `store`'s version, `None`
+/// while it has none: the store records a file's identity, never its bytes.
+fn generated_hashes(
+    store: &distill_store::StoreReader,
+    stems: &[&str],
+) -> Vec<Option<distill_core::id::ContentHash>> {
     stems
         .iter()
-        .map(|stem| {
-            let bytes = store.bundle_file("main", &format!("{stem}.bundle")).unwrap()?;
+        .map(|stem| store.file_content_hash("main", &format!("{stem}.bundle")).unwrap())
+        .collect()
+}
+
+/// The value each `{stem}.bundle` holds in `store`'s version, `None` while
+/// it has none: read from the file, which must be the one that version
+/// observed.
+fn generated_values(
+    store: &distill_store::StoreReader,
+    assets: &std::path::Path,
+    stems: &[&str],
+) -> Vec<Option<u128>> {
+    stems
+        .iter()
+        .zip(generated_hashes(store, stems))
+        .map(|(stem, hash)| {
+            let hash = hash?;
+            let bytes = std::fs::read(assets.join(format!("{stem}.bundle"))).unwrap();
+            assert_eq!(*blake3::hash(&bytes).as_bytes(), hash.0, "{stem}.bundle is the published file");
             match distill_bundle::parse_bundle(&bytes).unwrap().assets["asset"].data {
                 AuthoredValue::UInt(value) => Some(value),
                 ref other => panic!("unexpected value {other:?}"),
@@ -922,6 +943,8 @@ fn a_burst_across_bundles_publishes_one_version() {
         imported_sources(&[("a", "1"), ("b", "2"), ("c", "3")], PacedImporter::new);
     let mut writer = coordinator.open_writer().unwrap();
     let base = writer.input_version().unwrap();
+    let old_hashes = generated_hashes(&writer, &stems);
+    assert_eq!(generated_values(&writer, &assets, &stems), [Some(1), Some(2), Some(3)]);
 
     std::fs::write(assets.join("a.src"), b"9").unwrap();
     std::fs::write(assets.join("b.src"), b"5").unwrap();
@@ -933,7 +956,7 @@ fn a_burst_across_bundles_publishes_one_version() {
             loop {
                 let finished = done.load(std::sync::atomic::Ordering::Acquire);
                 let snapshot = coordinator.open_reader().unwrap().begin_snapshot().unwrap();
-                seen.push((snapshot.input_version().unwrap(), generated_values(&snapshot, &stems)));
+                seen.push((snapshot.input_version().unwrap(), generated_hashes(&snapshot, &stems)));
                 if finished {
                     return seen;
                 }
@@ -951,19 +974,20 @@ fn a_burst_across_bundles_publishes_one_version() {
     assert_eq!(outcome.imported.len(), 3);
     assert!(!outcome.more_work);
     assert!(outcome.failures.is_empty());
-    let old = vec![Some(1), Some(2), Some(3)];
-    let new = vec![Some(9), Some(5), Some(1)];
-    for (observed, values) in &seen {
+    let reader = coordinator.open_reader().unwrap();
+    assert_eq!(generated_values(&reader, &assets, &stems), [Some(9), Some(5), Some(1)]);
+    let new_hashes = generated_hashes(&reader, &stems);
+    assert!(old_hashes.iter().zip(&new_hashes).all(|(old, new)| old != new));
+    for (observed, hashes) in &seen {
         if *observed == base {
-            assert_eq!(values, &old, "the base holds every old bundle");
+            assert_eq!(hashes, &old_hashes, "the base holds every old bundle");
         } else {
             assert_eq!(*observed, version);
-            assert_eq!(values, &new, "the pass's version holds every new bundle");
+            assert_eq!(hashes, &new_hashes, "the pass's version holds every new bundle");
         }
     }
     assert_eq!(seen.last().unwrap().0, version);
 
-    let reader = coordinator.open_reader().unwrap();
     assert_changes_exactly(&changed_assets(&reader, version), &assets, &stems);
     // The sources' work is acknowledged with the pass; the outputs it wrote
     // are the next pass's work.
@@ -1042,7 +1066,7 @@ fn an_rpc_write_during_a_pass_makes_it_stale_and_its_retry_applies_everything_on
     let reader = coordinator.open_reader().unwrap();
     assert_eq!(reader.input_version().unwrap(), InputVersion(base.0 + 1));
     assert_eq!(
-        generated_values(&reader, &["a", "b", "c"]),
+        generated_values(&reader, &assets, &["a", "b", "c"]),
         [Some(1), Some(2), Some(3)],
         "the stale pass published nothing"
     );
@@ -1053,7 +1077,7 @@ fn an_rpc_write_during_a_pass_makes_it_stale_and_its_retry_applies_everything_on
     assert_eq!(outcome.imported.len(), 3);
     let reader = coordinator.open_reader().unwrap();
     assert_eq!(
-        generated_values(&reader, &["a", "b", "c", "explicit"]),
+        generated_values(&reader, &assets, &["a", "b", "c", "explicit"]),
         [Some(4), Some(5), Some(6), Some(7)]
     );
     // Each publication's assets change once, in its own version.
@@ -1100,7 +1124,7 @@ fn an_import_failure_in_a_pass_keeps_its_last_good_bundle_while_the_rest_publish
     assert!(!outcome.more_work);
     let reader = coordinator.open_reader().unwrap();
     assert_eq!(
-        generated_values(&reader, &["a", "b", "c", "d"]),
+        generated_values(&reader, &assets, &["a", "b", "c", "d"]),
         [Some(4), Some(2), Some(6), None]
     );
     let failures = import_failures(&coordinator);
@@ -1242,7 +1266,7 @@ fn assert_chain_publishes_in_one_version(stems: &[&str]) {
     let mut all = vec!["a"];
     all.extend_from_slice(stems);
     let reader = coordinator.open_reader().unwrap();
-    let before = generated_values(&reader, &all);
+    let before = generated_values(&reader, &assets, &all);
     assert_eq!(
         before,
         (1..=all.len() as u128).map(Some).collect::<Vec<_>>(),
@@ -1264,7 +1288,7 @@ fn assert_chain_publishes_in_one_version(stems: &[&str]) {
     let reader = coordinator.open_reader().unwrap();
     assert_eq!(reader.input_version().unwrap(), version);
     assert_eq!(
-        generated_values(&reader, &all),
+        generated_values(&reader, &assets, &all),
         (5..5 + all.len() as u128).map(Some).collect::<Vec<_>>(),
         "every level of the chain is in the pass's version"
     );
@@ -1322,7 +1346,7 @@ fn a_chain_deeper_than_the_bound_continues_in_the_next_pass() {
     let reader = coordinator.open_reader().unwrap();
     let mut expected = (20..29).map(Some).collect::<Vec<_>>();
     expected.extend([Some(10), Some(11)]);
-    assert_eq!(generated_values(&reader, &all), expected);
+    assert_eq!(generated_values(&reader, &assets, &all), expected);
 
     let second = coordinator
         .reconcile_batch(&mut writer, &batch(&assets, &[]), false)
@@ -1332,7 +1356,7 @@ fn a_chain_deeper_than_the_bound_continues_in_the_next_pass() {
     assert!(second.failures.is_empty(), "{:?}", second.failures);
     let reader = coordinator.open_reader().unwrap();
     assert_eq!(
-        generated_values(&reader, &all),
+        generated_values(&reader, &assets, &all),
         (20..31).map(Some).collect::<Vec<_>>()
     );
 }
@@ -1352,7 +1376,7 @@ fn an_import_cycle_is_cut_and_reported() {
         .reconcile_batch(&mut writer, &batch(&assets, &["y.bundle"]), false)
         .unwrap();
     let reader = coordinator.open_reader().unwrap();
-    let before = generated_values(&reader, &["a", "x", "y"]);
+    let before = generated_values(&reader, &assets, &["a", "x", "y"]);
     let base = writer.input_version().unwrap();
 
     std::fs::write(assets.join("a.src"), b"50").unwrap();
@@ -1368,8 +1392,8 @@ fn an_import_cycle_is_cut_and_reported() {
         outcome.failures
     );
     let reader = coordinator.open_reader().unwrap();
-    assert_eq!(generated_values(&reader, &["a"]), [Some(50)]);
-    let [_, Some(x), Some(_)] = generated_values(&reader, &["a", "x", "y"])[..] else {
+    assert_eq!(generated_values(&reader, &assets, &["a"]), [Some(50)]);
+    let [_, Some(x), Some(_)] = generated_values(&reader, &assets, &["a", "x", "y"])[..] else {
         panic!("{before:?}");
     };
     assert_eq!(x, 51, "x read a's new output");

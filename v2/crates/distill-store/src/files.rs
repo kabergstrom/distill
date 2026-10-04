@@ -158,14 +158,6 @@ pub struct ObservedDiagnostic {
     pub detail: Vec<u8>,
 }
 
-/// The bytes the scan read for one `.bundle` file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ObservedBundleFile {
-    pub root_name: String,
-    pub path: String,
-    pub bytes: Vec<u8>,
-}
-
 impl InputTxn<'_> {
     /// Intern a root name to its process-local id, creating it if new.
     pub fn intern_root(&mut self, name: &str) -> Result<RootId, StoreError> {
@@ -208,32 +200,12 @@ impl InputTxn<'_> {
         Ok(())
     }
 
-    /// Remove a (root, path) row and its bundle bytes; `Ok(false)` when it
-    /// was absent.
+    /// Remove a (root, path) row; `Ok(false)` when it was absent.
     pub fn remove_file(&mut self, root: RootId, path: &str) -> Result<bool, StoreError> {
-        self.txn
-            .prepare_cached("DELETE FROM bundle_files WHERE root_id = ?1 AND path = ?2")?
-            .execute(rusqlite::params![root.0, path])?;
         let n = self.txn
             .prepare_cached("DELETE FROM files WHERE root_id = ?1 AND path = ?2")?
             .execute(rusqlite::params![root.0, path])?;
         Ok(n > 0)
-    }
-
-    /// Record the bytes the scan read for a `.bundle` file's row.
-    pub fn set_bundle_file(
-        &mut self,
-        root: RootId,
-        path: &str,
-        bytes: &[u8],
-    ) -> Result<(), StoreError> {
-        self.txn
-            .prepare_cached(
-                "INSERT INTO bundle_files(root_id, path, bytes, hash) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(root_id, path) DO UPDATE SET bytes = excluded.bytes, hash = excluded.hash",
-            )?
-            .execute(rusqlite::params![root.0, path, bytes, blake3::hash(bytes).as_bytes().as_slice()])?;
-        Ok(())
     }
 
     /// Replace the directory and diagnostic rows under `under` (every row
@@ -816,24 +788,8 @@ impl StoreReader {
         )
     }
 
-    /// Every observed `.bundle` file's bytes, in (root name, path) order.
-    pub fn bundle_files(&self) -> Result<Vec<ObservedBundleFile>, StoreError> {
-        self.query_rows(
-            "SELECT r.name, t.path, t.bytes
-             FROM bundle_files t JOIN roots r USING (root_id) ORDER BY r.name, t.path",
-            [],
-            |row| {
-                Ok(ObservedBundleFile {
-                    root_name: row.get(0)?,
-                    path: row.get(1)?,
-                    bytes: row.get(2)?,
-                })
-            },
-        )
-    }
-
     /// The (path, blake3 hash) of each observed `.bundle` file at or below
-    /// `prefix` in `root_name`, in path order, without reading its bytes.
+    /// `prefix` in `root_name`, in path order: its `files` content hash.
     pub fn bundle_file_hashes_under(
         &self,
         root_name: &str,
@@ -841,8 +797,9 @@ impl StoreReader {
     ) -> Result<Vec<(String, [u8; 32])>, StoreError> {
         self.query_rows(
             &format!(
-                "SELECT t.path, t.hash FROM bundle_files t JOIN roots r USING (root_id)
-                 WHERE {} ORDER BY t.path",
+                "SELECT t.path, t.content_hash FROM files t JOIN roots r USING (root_id)
+                 WHERE {} AND +t.ext = 'bundle' AND t.content_hash IS NOT NULL
+                 ORDER BY t.path",
                 under_sql(prefix)
             ),
             rusqlite::params![root_name, prefix],
@@ -879,18 +836,6 @@ impl StoreReader {
             hash.copy_from_slice(&bytes);
             ContentHash(hash)
         }))
-    }
-
-    /// One observed `.bundle` file's bytes.
-    pub fn bundle_file(&self, root_name: &str, path: &str) -> Result<Option<Vec<u8>>, StoreError> {
-        Ok(self
-            .conn
-            .prepare_cached(
-                "SELECT t.bytes FROM bundle_files t JOIN roots r USING (root_id)
-                 WHERE r.name = ?1 AND t.path = ?2",
-            )?
-            .query_row(rusqlite::params![root_name, path], |row| row.get(0))
-            .optional()?)
     }
 }
 
@@ -1080,14 +1025,16 @@ impl StoreReader {
     }
 
     /// Visit every observed `.bundle` file's (root name, path, blake3 hash)
-    /// in (root name, path) order, without reading its bytes.
+    /// in (root name, path) order: its `files` content hash.
     pub fn for_each_bundle_file_hash(
         &self,
         mut visit: impl FnMut(String, String, [u8; 32]) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
         let mut statement = self.conn.prepare_cached(
-            "SELECT r.name, t.path, t.hash
-             FROM bundle_files t JOIN roots r USING (root_id) ORDER BY r.name, t.path",
+            "SELECT r.name, t.path, t.content_hash
+             FROM files t JOIN roots r USING (root_id)
+             WHERE t.ext = 'bundle' AND t.content_hash IS NOT NULL
+             ORDER BY r.name, t.path",
         )?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {

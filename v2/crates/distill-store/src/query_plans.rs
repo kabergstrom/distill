@@ -68,7 +68,6 @@ fn populate(store: &mut Store, count: u32) {
                     }),
                     version,
                 )?;
-                txn.set_bundle_file(root, &path, &bytes)?;
                 if index % 1000 == 3 {
                     let png = format!("d{:02}/t{index:05}.png", index % 50);
                     txn.upsert_file(
@@ -798,54 +797,6 @@ fn the_bundle_asset_walk_sorts_one_bundle_at_a_time() {
     );
 }
 
-/// A bundle file's hash precedes its bytes in its row, so reading every
-/// hash reads the rows' first pages, never the overflow pages that hold
-/// the bytes of a bundle larger than a page. SQLite reads overflow pages
-/// around its page cache, so this counts the bytes the reading thread
-/// read from files.
-#[cfg(target_os = "linux")]
-#[test]
-fn reading_bundle_file_hashes_skips_their_bytes() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut store = Store::open(StoreConfig::new(dir.path().join(".distill"))).unwrap();
-    store
-        .input_transaction(|txn| {
-            let root = txn.intern_root("main")?;
-            for index in 0..200u32 {
-                let bytes = vec![index as u8; 16 * 1024];
-                txn.set_bundle_file(root, &bundle_path(index), &bytes)?;
-            }
-            Ok(())
-        })
-        .unwrap();
-    // Bytes this thread has read from files.
-    fn read_bytes() -> u64 {
-        let io = std::fs::read_to_string("/proc/thread-self/io").unwrap();
-        let line = io.lines().find(|line| line.starts_with("rchar:")).unwrap();
-        line["rchar:".len()..].trim().parse().unwrap()
-    }
-    fn read(read: impl FnOnce()) -> u64 {
-        let before = read_bytes();
-        read();
-        read_bytes() - before
-    }
-    let reader = store.reader().unwrap();
-    let mut hashes = 0;
-    let hash_read = read(|| {
-        reader
-            .for_each_bundle_file_hash(|_, _, _| {
-                hashes += 1;
-                Ok(())
-            })
-            .unwrap();
-    });
-    let bytes_read = read(|| drop(reader.bundle_files().unwrap()));
-    assert_eq!(hashes, 200);
-    println!("hashes: {hash_read} bytes read; bundle bytes: {bytes_read}");
-    assert!(hash_read <= 512 * 1024, "{hash_read} bytes read");
-    assert!(bytes_read >= 20 * hash_read, "{hash_read} against {bytes_read} bytes read");
-}
-
 /// Scan-structure and claim rows under every scanned bundle's directory,
 /// and a symlink beside every hundredth bundle, for the subtree reads.
 fn populate_scan_structure(store: &mut Store, count: u32) {
@@ -963,7 +914,7 @@ fn subtree_reads_search_one_key_range() {
         let plans = reads.iter().map(|(_, plan)| plan.clone()).collect::<Vec<_>>();
         assert_eq!(
             plans,
-            ["files", "directories", "scan_diagnostics", "bundle_files"].map(read),
+            ["files", "directories", "scan_diagnostics", "files"].map(read),
             "{prefix:?}: {reads:#?}"
         );
         let exists = subtree_plans(&mut store, |store| {
@@ -2142,4 +2093,35 @@ fn a_file_content_hash_searches_two_keys() {
     );
     assert_eq!(reader.file_content_hash("alt", &path).unwrap(), None);
     assert_eq!(reader.file_content_hash("main", "missing").unwrap(), None);
+}
+
+
+/// The complete published observation's bundle hashes (the full scan's
+/// comparison of its candidate with the store) are the `files` rows of
+/// `.bundle` files, read through their extension index; the store keeps no
+/// bundle bytes.
+#[test]
+fn every_bundle_file_hash_is_one_extension_search() {
+    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, mut store) = store_with(200);
+    let plans = subtree_plans(&mut store, |store| {
+        let mut count = 0;
+        store
+            .for_each_bundle_file_hash(|_, _, _| {
+                count += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(count, 200);
+    });
+    assert_eq!(plans.len(), 1, "{plans:#?}");
+    assert_eq!(
+        plans[0].1,
+        [
+            "SEARCH t USING INDEX files_by_ext (ext=?)",
+            "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)",
+            "USE TEMP B-TREE FOR ORDER BY",
+        ],
+        "{plans:#?}"
+    );
 }

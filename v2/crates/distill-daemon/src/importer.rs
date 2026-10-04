@@ -38,7 +38,7 @@ use globset::Glob;
 
 use crate::authoring::{invalid, require_base, AuthoringService};
 use crate::compiled::Compiled;
-use crate::scanner::{RootedScanner, ScanError};
+use crate::scanner::{RootedScanner, ScanError, ScannedBundle};
 use distill_store::files::{FileKind, GlobKeys, ObservedFile, PathSelection, GLOBSET_META};
 
 pub use distill_pipeline_api::importer::{
@@ -159,8 +159,9 @@ impl AuthoringService {
         &self,
         store: &mut Store,
         dirty: &[distill_store::files::DirtyEntry],
+        fresh: impl Fn(&str, &str) -> Option<Arc<ScannedBundle>>,
     ) -> Result<IndexRefresh, RpcFailure> {
-        let (changed, previous) = self.refresh_dirty_import_index(store, dirty)?;
+        let (changed, previous) = self.refresh_dirty_import_index(store, dirty, fresh)?;
         Ok(IndexRefresh { changed, previous })
     }
 
@@ -170,8 +171,10 @@ impl AuthoringService {
         &self,
         store: &mut Store,
         dirty: &[distill_store::files::DirtyEntry],
+        fresh: impl Fn(&str, &str) -> Option<Arc<ScannedBundle>>,
     ) -> Result<(BTreeSet<(String, String)>, Vec<DirectoryRuleSource>), RpcFailure> {
         store.write_transaction_with(invalid, |store| {
+            let compiled = self.compiled(store)?;
             let keys = dirty
                 .iter()
                 .filter(|entry| entry.path.ends_with(".bundle"))
@@ -179,11 +182,25 @@ impl AuthoringService {
                 .collect::<BTreeMap<_, _>>();
             let mut rows = Vec::new();
             for ((root, path), root_id) in &keys {
-                let Some(bytes) = store.bundle_file(root, path).map_err(invalid)? else {
-                    continue;
+                // The bytes the pass's scan read, else the file as this
+                // input observed it. A removed source has no row; one that
+                // changed since the input observed it is Drifted, and the
+                // pass is retried.
+                let source = match fresh(root, path) {
+                    Some(source) => source,
+                    None => {
+                        if store.file_content_hash(root, path).map_err(invalid)?.is_none() {
+                            continue;
+                        }
+                        Arc::new(
+                            compiled
+                                .scanner()
+                                .read_published_bundle(store, root, path)
+                                .map_err(invalid)?,
+                        )
+                    }
                 };
-                let source = crate::scanner::scanned_bundle(root, path, bytes);
-                let Ok(bundle) = source.parsed else {
+                let Ok(bundle) = source.parsed.clone() else {
                     continue;
                 };
                 let Some(meta) = store.bundle(bundle.uuid).map_err(invalid)? else {
@@ -322,7 +339,7 @@ impl AuthoringService {
         store: &mut Store,
     ) -> Result<Vec<BundleUuid>, RpcFailure> {
         let pending = store.pending_file_work().map_err(invalid)?;
-        self.refresh_import_index(store, &pending.dirty)?;
+        self.refresh_import_index(store, &pending.dirty, |_, _| None)?;
         self.watched_imports_due(store, None, None)
     }
 
@@ -1765,16 +1782,17 @@ impl AuthoringService {
             .root_name(meta.root)
             .map_err(invalid)?
             .ok_or_else(|| invalid("bundle root identity is missing"))?;
-        let bytes = store
-            .bundle_file(&root, &meta.path)
-            .map_err(invalid)?
-            .ok_or_else(|| invalid("durable bundle is missing from the published scan"))?;
-        if ContentHash(*blake3::hash(&bytes).as_bytes()) != meta.content_hash {
+        let source = self
+            .compiled(store)?
+            .scanner()
+            .read_published_bundle(store, &root, &meta.path)
+            .map_err(invalid)?;
+        if source.file_hash.0 != meta.content_hash.0 {
             return Err(invalid(
                 "published scan does not match durable bundle metadata",
             ));
         }
-        let bundle = distill_bundle::parse_bundle(&bytes).map_err(invalid)?;
+        let bundle = source.parsed.map_err(invalid)?;
         Ok((root, bundle))
     }
 

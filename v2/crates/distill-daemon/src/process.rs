@@ -554,6 +554,16 @@ impl ProcessLoop {
                 tracing::debug!(?expected, ?observed, "reconciliation raced a publication; requeued");
                 self.queue.requeue_action(retry_action);
             }
+            // A file the pass read changed since its version observed it:
+            // nothing was published. The change is the watcher's to report;
+            // invalidating the path makes sure the retry rescans it.
+            Err(CoordinatorError::Drifted { root, path }) => {
+                tracing::debug!(%root, %path, "reconciliation read a drifted file; requeued");
+                self.queue.requeue_action(retry_action);
+                if let Ok(physical) = self.coordinator.scanner().physical_path(&root, &path) {
+                    self.queue.push(WatcherEvent::Invalidate(vec![physical]));
+                }
+            }
             Err(error) => {
                 tracing::warn!(%error, "reconciliation failed; requeued");
                 self.errors.send_replace(Some(error.to_string()));
