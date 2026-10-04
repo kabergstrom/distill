@@ -150,14 +150,16 @@ impl StoreReader {
     /// committed version.
     pub fn begin_snapshot(self) -> Result<StoreSnapshot, StoreError> {
         self.conn.execute_batch("BEGIN DEFERRED")?;
+        self.counters.begin();
         // The first read establishes the WAL read mark.
-        let stamp = match meta_get_u64(&self.conn, "input_version") {
+        let stamp = match self.input_version() {
             Ok(version) => SnapshotStamp {
                 instance: self.instance_id(),
-                version: InputVersion(version.unwrap_or(0)),
+                version,
             },
             Err(error) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
+                self.counters.end();
                 return Err(error);
             }
         };
@@ -176,7 +178,9 @@ impl StoreSnapshot {
     /// End the read transaction and return the connection for reuse.
     pub fn into_reader(mut self) -> Result<StoreReader, StoreError> {
         let reader = self.reader.take().expect("snapshot owns its reader");
-        reader.conn.execute_batch("ROLLBACK")?;
+        let ended = reader.conn.execute_batch("ROLLBACK");
+        reader.counters.end();
+        ended?;
         Ok(reader)
     }
 }
@@ -193,6 +197,7 @@ impl Drop for StoreSnapshot {
     fn drop(&mut self) {
         if let Some(reader) = self.reader.take() {
             let _ = reader.conn.execute_batch("ROLLBACK");
+            reader.counters.end();
         }
     }
 }
@@ -845,7 +850,7 @@ impl crate::db::Store {
     {
         self.write_txn(|store| {
             let txn: &Connection = &store.read.conn;
-            let version = InputVersion(meta_get_u64(txn, "input_version")?.unwrap_or(0));
+            let version = store.read.input_version()?;
             f(&mut ServedTxn { txn, version })
         })
     }

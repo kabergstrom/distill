@@ -103,7 +103,7 @@ read transaction:
 
 | Field | Destination |
 |---|---|
-| `current` | `store_meta.input_version`. `advance_empty_version` also becomes a real transaction. |
+| `current` | `store_meta.input_version`. `advance_empty_version` also becomes a real transaction. (schema-min: a transaction reads each counter, `input_version`, `compiled_version` and `configuration_generation`, once; the value lives from its `BEGIN` to its end and is never kept across transactions.) |
 | `views[*].assets` (Built/Drifted/Failed/Deleted{at}) | An `assets` row → `Drifted{Asset}`; a derived output → `Drifted{Asset(parent)}`; otherwise its namespace error (own UUID collision, else its bundle UUID's) → Failed; nothing → Missing, deleted or never published (schema-min: no `asset_resolutions` table). |
 | `views[*].authoring` | `bundles` / `assets` / `asset_tags` / `schemas`. New `assets` columns hold the encoded authored value (canonical JSON + blobs) and `terminal_type`, so a snapshot never reads a file. |
 | `views[*].paths` | `bundles.primary_asset` by path (schema 49; was `path_index`); several roots at one path is the ambiguity. |

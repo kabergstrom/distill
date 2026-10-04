@@ -127,6 +127,7 @@ impl Drop for StoreWriter {
         // back first.
         if !self.0.read.conn.is_autocommit() {
             let _ = self.0.read.conn.execute_batch("ROLLBACK");
+            self.0.read.counters.end();
         }
         if let Err(error) = self.0.seal_active() {
             tracing::warn!(%error, "sealing a closing writer's segment failed");

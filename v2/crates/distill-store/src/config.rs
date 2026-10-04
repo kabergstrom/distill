@@ -12,13 +12,12 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 
-use crate::db::{meta_get_u64, meta_set_u64, InputTxn, Store, StoreReader};
+use crate::db::{InputTxn, Store, StoreReader};
 use crate::error::StoreError;
 use crate::state::{ConfigurationEpoch, ConfigurationState};
 
 /// `store_meta` key of the active configuration generation: the last ready
 /// configuration's, or the adopted restart's.
-const CONFIGURATION_GENERATION: &str = "configuration_generation";
 
 /// Store-side configuration. Defaults match §18's example config.
 #[derive(Debug, Clone)]
@@ -188,7 +187,7 @@ impl Store {
         rows.dedup_by(|a, b| a.0 == b.0);
         let generation = self
             .write_txn(|store| {
-                let active = meta_get_u64(&store.conn, CONFIGURATION_GENERATION)?.unwrap_or(0);
+                let active = store.configuration_generation()?;
                 let prior = store.conn
                     .prepare_cached("SELECT COALESCE(MAX(generation), 0) FROM pending_restart")?
                     .query_row(
@@ -272,7 +271,10 @@ impl StoreReader {
 
     /// The active configuration generation (0 before any).
     pub fn configuration_generation(&self) -> Result<u64, StoreError> {
-        Ok(meta_get_u64(&self.conn, CONFIGURATION_GENERATION)?.unwrap_or(0))
+        Ok(self
+            .counters
+            .get(&self.conn, crate::db::Counter::ConfigurationGeneration)?
+            .unwrap_or(0))
     }
 }
 
@@ -281,7 +283,8 @@ impl InputTxn<'_> {
     /// when it changes.
     pub(crate) fn set_configuration_generation(&mut self, generation: u64) -> Result<(), StoreError> {
         if self.reader().configuration_generation()? != generation {
-            meta_set_u64(&self.txn, CONFIGURATION_GENERATION, generation)?;
+            self.counters
+                .set(self.txn, crate::db::Counter::ConfigurationGeneration, generation)?;
         }
         Ok(())
     }

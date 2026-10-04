@@ -716,6 +716,44 @@ fn a_derived_child_resolves_by_point_reads() {
     assert!(many <= few + 24, "{few} {many}");
 }
 
+/// A transaction reads each `store_meta` counter once, sees its own
+/// writes, and keeps nothing past its end.
+#[test]
+fn a_transaction_reads_each_counter_once() {
+    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, mut store) = store_with(0);
+    TRACED.lock().unwrap().clear();
+    store.read.conn.trace(Some(trace));
+    let ((), version) = store
+        .input_transaction(|txn| {
+            for _ in 0..3 {
+                txn.reader().input_version()?;
+                txn.reader().compiled_version()?;
+                txn.reader().configuration_generation()?;
+            }
+            txn.mark_compiled()?;
+            assert_eq!(txn.reader().compiled_version()?, Some(txn.version()));
+            Ok(())
+        })
+        .unwrap();
+    store.read.conn.trace(None);
+    let statements = std::mem::take(&mut *TRACED.lock().unwrap());
+    for key in ["input_version", "compiled_version", "configuration_generation"] {
+        let reads = statements
+            .iter()
+            .filter(|sql| sql.contains(&format!("FROM store_meta WHERE key = '{key}'")))
+            .count();
+        assert_eq!(reads, 1, "{key}: {statements:#?}");
+    }
+    // Outside a transaction each read goes to the database.
+    assert_eq!(store.input_version().unwrap(), version);
+    assert_eq!(store.compiled_version().unwrap(), Some(version));
+    let other = store.reader().unwrap();
+    store.input_transaction(|_| Ok(())).unwrap();
+    assert_eq!(other.input_version().unwrap(), crate::state::InputVersion(version.0 + 1));
+    assert_eq!(store.input_version().unwrap(), crate::state::InputVersion(version.0 + 1));
+}
+
 /// A rewritten bundle reads its assets and drops each vanished one (and
 /// its tags) by key.
 #[test]

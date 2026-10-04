@@ -395,6 +395,90 @@ pub struct StoreReader {
     pub(crate) conn: ReaderConn,
     pub(crate) config: Arc<StoreConfig>,
     instance_id: StoreInstanceId,
+    /// The counters the connection's open transaction read or wrote.
+    pub(crate) counters: Arc<Counters>,
+}
+
+/// A `store_meta` counter read through [`Counters`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Counter {
+    InputVersion,
+    CompiledVersion,
+    ConfigurationGeneration,
+}
+
+impl Counter {
+    fn key(self) -> &'static str {
+        match self {
+            Self::InputVersion => "input_version",
+            Self::CompiledVersion => "compiled_version",
+            Self::ConfigurationGeneration => "configuration_generation",
+        }
+    }
+}
+
+/// The `store_meta` counters one transaction read or wrote, so it reads
+/// each once: a value of that transaction only, kept from its `BEGIN` to
+/// its end (and forgotten when an isolated write rolls back), never across
+/// transactions. Outside a transaction every read goes to the database.
+#[derive(Debug, Default)]
+pub(crate) struct Counters {
+    active: std::sync::atomic::AtomicBool,
+    values: [std::sync::atomic::AtomicU64; 3],
+}
+
+/// Not read in this transaction.
+const COUNTER_UNKNOWN: u64 = u64::MAX;
+/// Read, and absent.
+const COUNTER_ABSENT: u64 = u64::MAX - 1;
+
+impl Counters {
+    /// A transaction began on the connection.
+    pub(crate) fn begin(&self) {
+        self.forget();
+        self.active.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The connection's transaction ended.
+    pub(crate) fn end(&self) {
+        self.active.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.forget();
+    }
+
+    /// Writes this transaction kept rolled back.
+    pub(crate) fn forget(&self) {
+        for value in &self.values {
+            value.store(COUNTER_UNKNOWN, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn get(&self, conn: &Connection, counter: Counter) -> Result<Option<u64>, StoreError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let active = self.active.load(Relaxed);
+        if active {
+            match self.values[counter as usize].load(Relaxed) {
+                COUNTER_UNKNOWN => {}
+                COUNTER_ABSENT => return Ok(None),
+                value => return Ok(Some(value)),
+            }
+        }
+        let value = meta_get_u64(conn, counter.key())?;
+        if active {
+            self.values[counter as usize].store(value.unwrap_or(COUNTER_ABSENT), Relaxed);
+        }
+        Ok(value)
+    }
+
+    pub(crate) fn set(&self, conn: &Connection, counter: Counter, value: u64) -> Result<(), StoreError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        meta_set_u64(conn, counter.key(), value)?;
+        if self.active.load(Relaxed) && value < COUNTER_ABSENT {
+            self.values[counter as usize].store(value, Relaxed);
+        } else {
+            self.values[counter as usize].store(COUNTER_UNKNOWN, Relaxed);
+        }
+        Ok(())
+    }
 }
 
 /// The connection a [`StoreReader`] reads through: its own, or the open
@@ -557,6 +641,7 @@ impl Store {
                 conn: ReaderConn::Owned(conn),
                 config: Arc::new(config),
                 instance_id,
+                counters: Default::default(),
             },
             cas: crate::cas::store::CasInner::new(cas_dir),
             input: InputState::Closed,
@@ -605,6 +690,7 @@ impl Store {
                 conn: ReaderConn::Owned(conn),
                 config,
                 instance_id,
+                counters: Default::default(),
             },
             cas: crate::cas::store::CasInner::new(cas_dir),
             input: InputState::Closed,
@@ -693,6 +779,7 @@ impl Store {
         let out = {
             let mut input_txn = InputTxn {
             txn,
+            counters: Arc::clone(&self.read.counters),
             base_stamp: SnapshotStamp {
                 instance,
                 version: base,
@@ -705,7 +792,7 @@ impl Store {
                 queued_work: &mut self.queued_work,
             };
             f(&mut input_txn).and_then(|out| {
-                meta_set_u64(input_txn.txn, "input_version", version.0)?;
+                input_txn.counters.set(input_txn.txn, Counter::InputVersion, version.0)?;
                 Ok(out)
             })
         };
@@ -742,11 +829,12 @@ impl Store {
         assert_eq!(self.input, InputState::Armed, "an input begins once armed");
         self.refresh_config();
         self.read.conn.execute_batch("BEGIN IMMEDIATE")?;
+        self.read.counters.begin();
         self.nested_failure = false;
-        let base = match meta_get_u64(&self.read.conn, "input_version") {
-            Ok(version) => InputVersion(version.unwrap_or(0)),
+        let base = match self.read.input_version() {
+            Ok(version) => version,
             Err(error) => {
-                let _ = self.read.conn.execute_batch("ROLLBACK");
+                let _ = self.end_txn("ROLLBACK");
                 return Err(error);
             }
         };
@@ -772,13 +860,13 @@ impl Store {
         if keep && failed {
             drop(staged);
             self.queued_work.reset();
-            self.read.conn.execute_batch("ROLLBACK")?;
+            self.end_txn("ROLLBACK")?;
             return Err(nested_failure());
         }
         if keep {
             if let Err(error) = self.queued_work.flush(&self.read.conn) {
                 self.queued_work.reset();
-                let _ = self.read.conn.execute_batch("ROLLBACK");
+                let _ = self.end_txn("ROLLBACK");
                 return Err(error);
             }
             self.queued_work.reset();
@@ -788,30 +876,30 @@ impl Store {
             // none behind (a crash between the two leaves one, under its
             // content address, for the next registration of it to reuse).
             let mut created = Vec::new();
-            let published = staged.into_iter().try_for_each(|package| {
-                created.extend(package.publish()?);
-                Ok::<_, StoreError>(())
+            // The version it commits: this transaction's own counter.
+            let version = self.read.input_version();
+            let published = version.and_then(|version| {
+                staged.into_iter().try_for_each(|package| {
+                    created.extend(package.publish()?);
+                    Ok::<_, StoreError>(())
+                })?;
+                Ok(version)
             });
-            let committed = published.and_then(|()| {
-                self.read
-                    .conn
-                    .execute_batch("COMMIT")
-                    .map_err(StoreError::from)
-            });
+            let committed = published.and_then(|version| self.end_txn("COMMIT").map(|()| version));
             match committed {
-                Ok(()) => return Ok(self.input_version()?),
+                Ok(version) => return Ok(version),
                 Err(error) => {
                     for root in created {
                         let _ = std::fs::remove_dir_all(root);
                     }
-                    let _ = self.read.conn.execute_batch("ROLLBACK");
+                    let _ = self.end_txn("ROLLBACK");
                     return Err(error);
                 }
             }
         }
         drop(staged);
         self.queued_work.reset();
-        self.read.conn.execute_batch("ROLLBACK")?;
+        self.end_txn("ROLLBACK")?;
         Ok(base)
     }
 
@@ -838,6 +926,7 @@ impl Store {
         }
         self.refresh_config();
         self.read.conn.execute_batch("BEGIN IMMEDIATE")?;
+        self.read.counters.begin();
         self.nested_failure = false;
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
         let out = match out {
@@ -847,7 +936,7 @@ impl Store {
             Ok(Ok(value)) => match self
                 .queued_work
                 .flush(&self.read.conn)
-                .and_then(|()| Ok(self.read.conn.execute_batch("COMMIT")?))
+                .and_then(|()| self.end_txn("COMMIT"))
             {
                 Ok(()) => {
                     self.queued_work.reset();
@@ -858,13 +947,21 @@ impl Store {
             Ok(Err(error)) => Err(error),
             Err(panic) => {
                 self.queued_work.reset();
-                let _ = self.read.conn.execute_batch("ROLLBACK");
+                let _ = self.end_txn("ROLLBACK");
                 std::panic::resume_unwind(panic)
             }
         };
         self.queued_work.reset();
-        let _ = self.read.conn.execute_batch("ROLLBACK");
+        let _ = self.end_txn("ROLLBACK");
         out
+    }
+
+    /// End the open transaction with `sql` (`COMMIT` or `ROLLBACK`); its
+    /// counters go with it.
+    fn end_txn(&self, sql: &str) -> Result<(), StoreError> {
+        let ended = self.read.conn.execute_batch(sql);
+        self.read.counters.end();
+        Ok(ended?)
     }
 
     /// [`Store::write_txn`], except that inside an open transaction `f` is
@@ -889,6 +986,7 @@ impl Store {
         }
         self.queued_work.restore(queued);
         self.nested_failure = failed;
+        self.read.counters.forget();
         let _ = self
             .read
             .conn
@@ -1033,6 +1131,7 @@ impl StoreReader {
             conn: ReaderConn::Owned(conn),
             config: Arc::new(config),
             instance_id,
+            counters: Default::default(),
         })
     }
 
@@ -1116,7 +1215,7 @@ impl StoreReader {
 
     /// The committed input version visible to this connection.
     pub fn input_version(&self) -> Result<InputVersion, StoreError> {
-        Ok(InputVersion(meta_get_u64(&self.conn, "input_version")?.unwrap_or(0)))
+        Ok(InputVersion(self.counters.get(&self.conn, Counter::InputVersion)?.unwrap_or(0)))
     }
 
     /// The committed memo sequence visible to this connection.
@@ -1138,7 +1237,7 @@ impl StoreReader {
     /// roots): what in-memory state derived from it is keyed by. `None`
     /// until a publication records one.
     pub fn compiled_version(&self) -> Result<Option<InputVersion>, StoreError> {
-        Ok(meta_get_u64(&self.conn, "compiled_version")?.map(InputVersion))
+        Ok(self.counters.get(&self.conn, Counter::CompiledVersion)?.map(InputVersion))
     }
 
 }
@@ -1149,6 +1248,8 @@ impl StoreReader {
 /// everything back.
 pub struct InputTxn<'a> {
     pub(crate) txn: &'a Connection,
+    /// The counters of the transaction `txn` is.
+    pub(crate) counters: Arc<Counters>,
     base_stamp: SnapshotStamp,
     version: InputVersion,
     pub(crate) state_path: PathBuf,
@@ -1178,6 +1279,7 @@ impl InputTxn<'_> {
                 conn: ReaderConn::Lent(NonNull::from(self.txn)),
                 config: Arc::clone(&self.config),
                 instance_id: self.base_stamp.instance,
+                counters: Arc::clone(&self.counters),
             },
             _txn: PhantomData,
         }
@@ -1191,7 +1293,7 @@ impl InputTxn<'_> {
     /// Record that this input publishes the daemon's compiled configuration
     /// state (see [`StoreReader::compiled_version`]).
     pub fn mark_compiled(&mut self) -> Result<(), StoreError> {
-        meta_set_u64(&self.txn, "compiled_version", self.version.0)
+        self.counters.set(self.txn, Counter::CompiledVersion, self.version.0)
     }
 }
 
