@@ -651,6 +651,94 @@ fn explicit_import_settings_reach_the_importer() {
     assert_eq!(imported.assets["asset"].data, byte((4 + 1) * 3));
 }
 
+/// Explicit import settings that leave out fields take the importer's
+/// defaults, a nested struct field by field; `$settings` records the whole
+/// value the importer ran with.
+#[test]
+fn explicit_import_settings_leaving_out_fields_take_the_defaults() {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("empty.txt"), b"4").unwrap();
+    std::fs::write(assets.join("partial.txt"), b"4").unwrap();
+    let coordinator = DaemonCoordinator::open(
+        StoreConfig::new(temp.path().join(".distill")),
+        vec![AssetRoot::new("main", &assets)],
+        vec![target()],
+        64,
+    )
+    .unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    configure(&coordinator, temp.path(), &assets);
+
+    import_with(
+        &coordinator,
+        BYTE_IMPORTER,
+        &["empty.txt"],
+        "empty.bundle",
+        &object([]),
+    );
+    let partial = object([("scale", object([]))]);
+    import_with(
+        &coordinator,
+        BYTE_IMPORTER,
+        &["partial.txt"],
+        "partial.bundle",
+        &partial,
+    );
+    for dest in ["empty.bundle", "partial.bundle"] {
+        let imported =
+            distill_bundle::parse_bundle(&std::fs::read(assets.join(dest)).unwrap()).unwrap();
+        assert_eq!(imported.assets["$settings"].data, default_settings());
+        assert_eq!(imported.assets["asset"].data, byte(4));
+    }
+}
+
+/// A directory rule's settings that leave out fields take the importer's
+/// defaults, so a rule names only what it changes.
+#[test]
+fn directory_rule_settings_leaving_out_fields_take_the_defaults() {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    let rule_settings = object([("scale", object([("by", AuthoredValue::UInt(2))]))]);
+    std::fs::write(
+        assets.join("rules.bundle"),
+        directory_rules_bundle_with(true, &rule_settings),
+    )
+    .unwrap();
+    std::fs::write(assets.join("foo.src"), b"4").unwrap();
+    let coordinator = DaemonCoordinator::open(
+        StoreConfig::new(temp.path().join(".distill")),
+        vec![AssetRoot::new("main", &assets)],
+        vec![target()],
+        64,
+    )
+    .unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    configure(&coordinator, temp.path(), &assets);
+
+    assert_eq!(
+        coordinator
+            .reconcile_directory_imports(&mut writer)
+            .unwrap()
+            .len(),
+        1
+    );
+    let generated =
+        distill_bundle::parse_bundle(&std::fs::read(assets.join("foo.bundle")).unwrap()).unwrap();
+    assert_eq!(generated.assets["$settings"].data, settings([0, 0], 2));
+    assert_eq!(generated.assets["asset"].data, byte(4 * 2));
+    // Unchanged rules and sources: the completed settings match what the
+    // output recorded, so nothing reimports.
+    assert!(coordinator
+        .reconcile_directory_imports(&mut writer)
+        .unwrap()
+        .is_empty());
+}
+
 /// Deleting a rules source orphans what its rules generated, found from
 /// the work alone: the removed rules bundle no longer has a row, and the
 /// bundles it generated still name it.

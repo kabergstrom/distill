@@ -35,4 +35,7 @@ pub use server::{
     MAX_SUBSCRIBED_ASSETS, MAX_SUBSCRIBED_PATHS,
 };
 pub use target::{TargetDefinition, TargetSetError};
-pub use validate::{decode_asset_reference_query, decode_authoring_payload};
+pub use validate::{
+    complete_settings, decode_asset_reference_query, decode_authoring_payload,
+    decode_settings_payload,
+};

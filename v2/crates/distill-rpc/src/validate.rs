@@ -133,6 +133,27 @@ pub fn decode_authoring_payload(
     logical_schema: &[u8],
     authored_value: &AuthoringValue,
 ) -> Result<AuthoredValue, AuthoringValueError> {
+    decode_payload(schema_hash, logical_schema, authored_value, None)
+}
+
+/// `decode_authoring_payload` for an importer's settings: a struct field the
+/// authored value leaves out takes the importer's `defaults` (see
+/// [`complete_settings`]) before the value is checked against the schema.
+pub fn decode_settings_payload(
+    schema_hash: LogicalHash,
+    logical_schema: &[u8],
+    authored_value: &AuthoringValue,
+    defaults: &AuthoredValue,
+) -> Result<AuthoredValue, AuthoringValueError> {
+    decode_payload(schema_hash, logical_schema, authored_value, Some(defaults))
+}
+
+fn decode_payload(
+    schema_hash: LogicalHash,
+    logical_schema: &[u8],
+    authored_value: &AuthoringValue,
+    defaults: Option<&AuthoredValue>,
+) -> Result<AuthoredValue, AuthoringValueError> {
     let schema_text =
         std::str::from_utf8(logical_schema).map_err(|_| AuthoringValueError::LogicalSchemaUtf8)?;
     let schema = verify_snapshot(schema_text, schema_hash)
@@ -145,6 +166,9 @@ pub fn decode_authoring_payload(
         .map_err(|error| AuthoringValueError::ValueInvalid(error.to_string()))?;
     if rewritten != value_text {
         return Err(AuthoringValueError::ValueNotCanonical);
+    }
+    if let Some(defaults) = defaults {
+        complete_settings(&schema.root, &mut value, defaults);
     }
     let blob_count = u32::try_from(authored_value.blobs.len()).map_err(|_| {
         AuthoringValueError::SchemaValueShape {
@@ -165,6 +189,44 @@ pub fn decode_authoring_payload(
         &authored_value.blobs,
     );
     Ok(value)
+}
+
+/// Fill the fields an authored importer-settings value leaves out of a struct
+/// from `defaults`, the importer's default settings: a missing field takes
+/// the default's, a present struct field is completed the same way, anything
+/// else stays as authored (an enum keeps its authored variant whole). A
+/// default holding a blob is never filled in: a blob is authored, so leaving
+/// it out stays the missing-field error.
+pub fn complete_settings(schema: &SchemaNode, value: &mut AuthoredValue, defaults: &AuthoredValue) {
+    let (
+        SchemaNode::Struct { fields, .. },
+        AuthoredValue::Object(object),
+        AuthoredValue::Object(defaults),
+    ) = (schema, value, defaults)
+    else {
+        return;
+    };
+    for (name, _, field_schema) in fields {
+        let Some(default) = defaults.get(name) else {
+            continue;
+        };
+        match object.get_mut(name) {
+            Some(field) => complete_settings(field_schema, field, default),
+            None if !holds_blob(default) => {
+                object.insert(name.clone(), default.clone());
+            }
+            None => {}
+        }
+    }
+}
+
+fn holds_blob(value: &AuthoredValue) -> bool {
+    match value {
+        AuthoredValue::Blob(_) => true,
+        AuthoredValue::Array(items) => items.iter().any(holds_blob),
+        AuthoredValue::Object(fields) => fields.values().any(holds_blob),
+        _ => false,
+    }
 }
 
 pub(crate) fn materialize_blob_tokens<'s>(

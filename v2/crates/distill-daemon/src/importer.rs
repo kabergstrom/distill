@@ -25,7 +25,8 @@ use distill_core::bootstrap::{
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_json::AuthoredValue;
 use distill_rpc::{
-    decode_authoring_payload, ImportRequest, InputVersion, PreparedImportCommit, RpcFailure,
+    complete_settings, decode_settings_payload, ImportRequest, InputVersion, PreparedImportCommit,
+    RpcFailure,
 };
 use distill_schema::ngp_schema::{node_hash, snapshot_to_json, LogicalSchema};
 use distill_store::bundles::{BundleMeta, DirectoryOrigin as StoredDirectoryOrigin};
@@ -548,7 +549,14 @@ impl AuthoringService {
             else {
                 continue;
             };
-            let task = indexed_directory_task(entry, *rule_index, group, sources)?;
+            let mut task = indexed_directory_task(entry, *rule_index, group, sources)?;
+            if let Some(importer) = compiled.pipeline_importers().get(&task.importer) {
+                complete_settings(
+                    &importer.settings_schema.root,
+                    &mut task.settings,
+                    &importer.default_settings,
+                );
+            }
             let origin = directory_task_origin(&task);
             active_origins.insert(origin.clone());
             touched_origins.insert(origin);
@@ -1096,10 +1104,11 @@ impl AuthoringService {
         let compiled = self.compiled(store)?;
         let importer = self.registered_importer(&compiled, &request.importer)?;
         let settings_snapshot = snapshot_to_json(&importer.settings_schema).map_err(invalid)?;
-        let settings = decode_authoring_payload(
+        let settings = decode_settings_payload(
             importer.settings_hash,
             settings_snapshot.as_bytes(),
             &request.settings,
+            &importer.default_settings,
         )
         .map_err(|error| invalid(format!("invalid importer settings: {error:?}")))?;
 
