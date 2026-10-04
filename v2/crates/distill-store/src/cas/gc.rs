@@ -566,7 +566,7 @@ mod tests {
         // A sample past the last hash falls back to the first: one more.
         let fallbacks = statements
             .iter()
-            .filter(|sql| sql.contains("content_hash >= X''"))
+            .filter(|sql| sql.contains("content_hash >= zeroblob(0)"))
             .count();
         let sums = statements.iter().filter(|sql| sql.as_str() == LIVE_BYTES).count();
         (sweep.evicted, statements.len() - fallbacks, sums)
