@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -7,7 +7,7 @@ use std::time::Duration;
 use distill_build::query::AssetQuery as BuildAssetQuery;
 use distill_build::trace::PackDefinitionControlValue;
 use distill_bundle::PathComponent;
-use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
+use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_pack::builder::{
     build_pack, build_publish_and_activate_pack, decode_pack_definition, PackBuildError,
     PackBuildOutput, PackBuildTarget,
@@ -16,16 +16,14 @@ use distill_pack::{
     activate, archive_filename, manifest_filename, manifest_hash, publish_archive,
     publish_manifest, read_current, PackTarget, PackfileIO, RuntimeTarget,
 };
-use distill_rpc::{
-    ArtifactPayload, AssetDeltaState, AssetMutation, AuthoringEntry, AuthoringEntryRole,
-    AuthoringMutation, AuthoringValue, BuildAnswer, BuildBackend, BuildRequest, BuildStart, BuildView, Commit,
-    ConnectRequest, PathMutation, RpcFailure, RuntimeTypePolicy,
-    RuntimeTypePolicyRequest, ServedLoadEdge, Server, StoreInstanceId, StoredResolve,
-    SnapshotPolicy, TargetDefinition, TargetDefinitionHash,
-};
 use distill_rpc::capnp_loader::{RemoteHub, RemoteSnapshot};
 use distill_rpc::capnp_transport::{CapnpClient, StagedListener};
-use distill_schema::ngp_schema::{node_hash, SchemaNode};
+use distill_rpc::{
+    ArtifactPayload, AuthoringValue, BuildAnswer, BuildBackend, BuildRequest, BuildStart,
+    BuildView, ConnectRequest, RpcFailure, RuntimeTypePolicy, RuntimeTypePolicyRequest,
+    ServedLoadEdge, Server, SnapshotPolicy, TargetDefinition, TargetDefinitionHash,
+};
+use distill_test_project::{Asset, TestProject};
 use distill_wire::artifact::{content_hash, write_artifact, ArtifactHeader};
 use distill_wire::dswl::{dswl_bytes, dswl_hash};
 use distill_wire::wire::WireNode;
@@ -34,21 +32,31 @@ use tokio::task::LocalSet;
 const TARGET_HASH: [u8; 32] = [7; 32];
 
 struct Fixture {
+    // The daemon and its files, held for the fixture's lifetime.
+    _project: TestProject,
     server: Server,
     root: AssetUuid,
     child: AssetUuid,
     target: PackTarget,
 }
 
+/// Answers each build with the artifact installed for its asset, and every
+/// type's runtime policy with the one the test chose.
 struct TypePolicyBackend {
     build_only: bool,
+    built: BTreeMap<AssetUuid, ContentHash>,
 }
 
 impl BuildBackend for TypePolicyBackend {
     fn start(&self, _view: BuildView<'_>, request: &BuildRequest) -> BuildStart {
-        BuildStart::Answered(Ok(BuildAnswer::Drifted {
-            input: request.drifted_input.clone(),
-        }))
+        BuildStart::Answered(match self.built.get(&request.requested_asset) {
+            Some(content_hash) => Ok(BuildAnswer::Built {
+                content_hash: *content_hash,
+            }),
+            None => Ok(BuildAnswer::Drifted {
+                input: request.drifted_input.clone(),
+            }),
+        })
     }
 
     fn runtime_type_policy(
@@ -70,12 +78,16 @@ fn fixture_with_policy(build_only: bool) -> Fixture {
     fixture_with_policy_and_cycle(build_only, false)
 }
 
+/// A daemon serving `dev` over two runtime assets, each the primary
+/// (`main`) of its own bundle file: `root` (assets/root.bundle) loads
+/// `child` (assets/child.bundle), and with `cycle` the child loads the
+/// root back. Their builds answer the artifacts installed here.
 fn fixture_with_policy_and_cycle(build_only: bool, cycle: bool) -> Fixture {
     let runtime_type = TypeUuid([21; 16]);
     let logical_hash = LogicalHash([31; 32]);
     let target_definition = TargetDefinition::new("dev", TargetDefinitionHash(TARGET_HASH));
-    let server = Server::new(StoreInstanceId([9; 16]), vec![target_definition]).unwrap();
-    server.install_build_backend(Arc::new(TypePolicyBackend { build_only }));
+    let mut project = TestProject::new(vec![target_definition]);
+    let server = project.server();
 
     let root = AssetUuid([1; 16]);
     let child = AssetUuid([2; 16]);
@@ -112,44 +124,23 @@ fn fixture_with_policy_and_cycle(build_only: bool, cycle: bool) -> Fixture {
     );
     server.install_artifact(child_row.0, child_row.1).unwrap();
     server.install_artifact(root_row.0, root_row.1).unwrap();
+    server.install_build_backend(Arc::new(TypePolicyBackend {
+        build_only,
+        built: BTreeMap::from([(root, root_row.0), (child, child_row.0)]),
+    }));
 
-    server
-        .commit(Commit {
-            authoring: vec![
-                AuthoringMutation::Set(entry(root, runtime_type, "assets/root.bundle")),
-                AuthoringMutation::Set(entry(child, runtime_type, "assets/child.bundle")),
-            ],
-            assets: vec![
-                AssetMutation::Set {
-                    uuid: root,
-                    resolution: StoredResolve::Built {
-                        content_hash: root_row.0,
-                    },
-                    delta: AssetDeltaState::Changed,
-                },
-                AssetMutation::Set {
-                    uuid: child,
-                    resolution: StoredResolve::Built {
-                        content_hash: child_row.0,
-                    },
-                    delta: AssetDeltaState::Changed,
-                },
-            ],
-            paths: vec![
-                PathMutation::Set {
-                    path: "assets/root.bundle".into(),
-                    candidates: BTreeSet::from([root]),
-                },
-                PathMutation::Set {
-                    path: "assets/child.bundle".into(),
-                    candidates: BTreeSet::from([child]),
-                },
-            ],
-            ..Commit::default()
-        })
-        .unwrap();
+    for (uuid, path) in [(root, "assets/root.bundle"), (child, "assets/child.bundle")] {
+        project.write_bundle(
+            path,
+            BundleUuid(uuid.0),
+            Some("main"),
+            &[Asset::blob("main", uuid, runtime_type, b"source")],
+        );
+    }
+    project.publish();
 
     Fixture {
+        _project: project,
         server,
         root,
         child,
@@ -212,7 +203,7 @@ fn artifact_row(
     layout_hash: distill_core::id::LayoutHash,
     load_edges: Vec<ServedLoadEdge>,
     blob: Option<Arc<[u8]>>,
-) -> (distill_core::id::ContentHash, ArtifactPayload) {
+) -> (ContentHash, ArtifactPayload) {
     let load_deps = load_edges.iter().map(|edge| edge.asset).collect::<Vec<_>>();
     let blob_inputs = blob
         .iter()
@@ -244,26 +235,6 @@ fn artifact_row(
             load_edges,
         },
     )
-}
-
-fn entry(uuid: AssetUuid, runtime_type: TypeUuid, path: &str) -> AuthoringEntry {
-    let schema_hash = node_hash(&SchemaNode::Blob).unwrap();
-    AuthoringEntry {
-        uuid,
-        bundle: BundleUuid(uuid.0),
-        local_id: "main".into(),
-        normalized_path: path.into(),
-        type_uuid: runtime_type,
-        terminal_type: runtime_type,
-        schema_hash,
-        logical_schema: Arc::from(&b"\"blob\""[..]),
-        role: AuthoringEntryRole::Runtime,
-        tags: BTreeMap::new(),
-        value: AuthoringValue {
-            canonical_value: Arc::from(&b"{\"$distill_blob\":0}"[..]),
-            blobs: vec![Arc::from(&b"source"[..])],
-        },
-    }
 }
 
 fn definition(root: AssetUuid) -> PackDefinitionControlValue {
