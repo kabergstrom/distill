@@ -1212,8 +1212,15 @@ mod cas_pass_tests {
             .unwrap();
     }
 
+    /// Held across a traced pass: tests run in parallel and share
+    /// `STATEMENTS`, so two passes at once would take each other's.
+    static TRACED_PASS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The statements one pass runs.
     fn pass(store: &mut Store, swept: &mut Option<(u64, u64)>) -> Vec<String> {
+        let _traced = TRACED_PASS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut sweeper = SegmentSweeper::new(std::time::Duration::ZERO);
         store.trace_statements(Some(record_statement));
         STATEMENTS.lock().unwrap().clear();
