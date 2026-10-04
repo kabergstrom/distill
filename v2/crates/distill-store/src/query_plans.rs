@@ -1307,15 +1307,23 @@ fn runtime_entry_types_are_one_statement() {
     assert!(answered[1] > 9 * answered[0] && answered[0] > 0, "{answered:?}");
 }
 
-/// A candidate bucket's rows are one search of its primary key.
+/// A candidate bucket's rows are one search of its primary key, and a
+/// candidate with what it names one search of each table's.
 #[test]
 fn candidate_rows_search_their_bucket() {
     let (_dir, store) = store_with(10);
     assert_eq!(
         store.query_plan_details(crate::cas::store::CANDIDATE_ROWS).unwrap(),
         [
-            "SEARCH result_candidates USING INDEX sqlite_autoindex_result_candidates_1 (key_kind=? AND static_key=?)",
+            "SEARCH results USING INDEX sqlite_autoindex_results_1 (key_kind=? AND static_key=?)",
             "USE TEMP B-TREE FOR ORDER BY",
+        ]
+    );
+    assert_eq!(
+        store.query_plan_details(crate::cas::store::CANDIDATE).unwrap(),
+        [
+            "SEARCH r USING INDEX sqlite_autoindex_results_1 (key_kind=? AND static_key=? AND trace_digest=?)",
+            "SEARCH o USING PRIMARY KEY (key_kind=? AND static_key=? AND trace_digest=?) LEFT-JOIN",
         ]
     );
 }
@@ -1545,7 +1553,8 @@ fn pass_bookkeeping_statements_search_their_indexes() {
 #[test]
 fn cas_statements_search_their_indexes() {
     use crate::cas::gc::{
-        COMPACTION_CANDIDATES, EVICT_RESULT_ROW, LIVE_BYTES, SEGMENTS_IN_STATE,
+        COMPACTION_CANDIDATES, EVICT_RESULT_ROW, LIVE_BYTES, RELEASE_EXTENT, RESULT_EXTENTS,
+        SEGMENTS_IN_STATE, SEGMENT_EXTENTS,
     };
     use crate::cas::store::{ACTIVE_SEGMENT, SEAL_ACTIVE_SEGMENT, SEAL_SEGMENT};
     use crate::served::DELETE_LOAD_EDGES;
@@ -1558,24 +1567,37 @@ fn cas_statements_search_their_indexes() {
             &["SEARCH cas_segments USING INDEX cas_segments_open (owner=?)"],
         ),
         (SEAL_SEGMENT, &["SEARCH cas_segments USING INTEGER PRIMARY KEY (rowid=?)"]),
+        // A result goes with its `result_outputs` rows (the cascade
+        // searches their primary key), whose extents it reads first.
         (
             EVICT_RESULT_ROW,
-            &["SEARCH result_candidates USING INDEX sqlite_autoindex_result_candidates_1 (key_kind=? AND static_key=? AND trace_digest=?)"],
+            &["SEARCH results USING INDEX sqlite_autoindex_results_1 (key_kind=? AND static_key=? AND trace_digest=?)", "SEARCH result_outputs USING PRIMARY KEY (key_kind=? AND static_key=? AND trace_digest=?)"],
         ),
-        // The CAS's live bytes: a sum over two covering indexes, never a
-        // table page.
         (
-            LIVE_BYTES,
+            RESULT_EXTENTS,
+            &["SEARCH result_outputs USING PRIMARY KEY (key_kind=? AND static_key=? AND trace_digest=?)"],
+        ),
+        // An extent goes when no holder names it: one search of each
+        // holder table's hash index, then the foreign keys' (the load
+        // edges cascade).
+        (
+            RELEASE_EXTENT,
             &[
-                "SCAN CONSTANT ROW",
+                "SEARCH cas_extents USING INDEX sqlite_autoindex_cas_extents_1 (content_hash=?)",
                 "SCALAR SUBQUERY 1",
-                "SCAN cas_extents USING COVERING INDEX cas_extents_by_segment",
+                "SEARCH cas_refs USING COVERING INDEX cas_refs_by_hash (content_hash=?)",
                 "SCALAR SUBQUERY 2",
-                "SCAN result_candidates USING COVERING INDEX result_candidates_by_segment",
+                "SEARCH result_outputs USING COVERING INDEX result_outputs_by_hash (content_hash=?)",
+                "SEARCH artifact_load_edges USING COVERING INDEX sqlite_autoindex_artifact_load_edges_1 (content_hash=?)",
+                "SEARCH cas_refs USING COVERING INDEX cas_refs_by_hash (content_hash=?)",
+                "SEARCH result_outputs USING COVERING INDEX result_outputs_by_hash (content_hash=?)",
             ],
         ),
+        // The CAS's live bytes: a sum over the covering index, never a
+        // table page.
+        (LIVE_BYTES, &["SCAN cas_extents USING COVERING INDEX cas_extents_by_segment"]),
         // Each sealed segment (and this writer's open one) with its live
-        // bytes: two covering-index range sums per segment.
+        // bytes: a covering-index range sum per segment.
         (
             COMPACTION_CANDIDATES,
             &[
@@ -1584,15 +1606,16 @@ fn cas_statements_search_their_indexes() {
                 "SEARCH s USING INDEX cas_segments_by_state (state=?)",
                 "CORRELATED SCALAR SUBQUERY 1",
                 "SEARCH cas_extents USING COVERING INDEX cas_extents_by_segment (segment=?)",
-                "CORRELATED SCALAR SUBQUERY 2",
-                "SEARCH result_candidates USING COVERING INDEX result_candidates_by_segment (segment=?)",
                 "RIGHT",
                 "SEARCH s USING INDEX cas_segments_open (owner=?)",
-                "CORRELATED SCALAR SUBQUERY 4",
+                "CORRELATED SCALAR SUBQUERY 3",
                 "SEARCH cas_extents USING COVERING INDEX cas_extents_by_segment (segment=?)",
-                "CORRELATED SCALAR SUBQUERY 5",
-                "SEARCH result_candidates USING COVERING INDEX result_candidates_by_segment (segment=?)",
             ],
+        ),
+        // A compacted segment's extents.
+        (
+            SEGMENT_EXTENTS,
+            &["SEARCH cas_extents USING INDEX cas_extents_by_segment (segment=?)"],
         ),
         (
             SEGMENTS_IN_STATE,
@@ -1617,11 +1640,11 @@ fn cas_statements_search_their_indexes() {
 #[test]
 fn cas_verification_reads_per_segment() {
     use crate::cas::store::{VERIFY_SEGMENTS, VERIFY_SEGMENT_EXTENTS};
-    use crate::cas::{BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
+    use crate::cas::{BuildCommit, CommitOutcome, OutputSpec};
     let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let mut config = crate::StoreConfig::new(dir.path().join("state"));
-    config.segment_size = 4096;
+    config.segment_size = 512;
     let mut store = Store::open(config).unwrap();
     for index in 0..300u32 {
         let mut key = [0u8; 32];
@@ -1632,10 +1655,8 @@ fn cas_verification_reads_per_segment() {
                 key_kind: crate::cas::record::KeyKind::Processor,
                 static_input_key: key,
                 asset_uuid: distill_core::id::AssetUuid([7; 16]),
-                static_inputs_canonical: vec![],
                 trace: vec![1],
                 outcome: CommitOutcome::Success {
-                    payload_kind: PayloadKind::ProcessorOutput,
                     outputs: vec![OutputSpec {
                         output_key: String::new(),
                         type_uuids: vec![],
@@ -1868,7 +1889,7 @@ fn statement_shape(sql: &str) -> String {
 /// key it is given, except the whole-table reads named here.
 #[test]
 fn cas_and_served_point_statements_search_their_keys() {
-    use crate::cas::{BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
+    use crate::cas::{BuildCommit, CommitOutcome, OutputSpec};
     let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let mut config = crate::StoreConfig::new(dir.path().join(".distill"));
@@ -1892,10 +1913,8 @@ fn cas_and_served_point_statements_search_their_keys() {
             key_kind: crate::cas::record::KeyKind::Processor,
             static_input_key: key,
             asset_uuid: asset,
-            static_inputs_canonical: vec![],
             trace: vec![1],
             outcome: CommitOutcome::Success {
-                payload_kind: PayloadKind::ProcessorOutput,
                 outputs: vec![OutputSpec {
                     output_key: String::new(),
                     type_uuids: vec![],
@@ -1938,7 +1957,7 @@ fn cas_and_served_point_statements_search_their_keys() {
     let compaction = store.compact().unwrap();
     store.enforce_cache_limit().unwrap();
     store.read.conn.trace(None);
-    assert!(compaction.records_copied > 0, "{compaction:?}");
+    assert!(compaction.extents_copied > 0, "{compaction:?}");
     let statements = std::mem::take(&mut *TRACED.lock().unwrap());
     let mut plans = BTreeMap::new();
     for sql in statements {
@@ -1959,18 +1978,6 @@ fn cas_and_served_point_statements_search_their_keys() {
             &["SEARCH artifact_load_edges USING COVERING INDEX sqlite_autoindex_artifact_load_edges_1 (content_hash=?)"],
         ),
         (
-            "DELETE FROM cas_extents WHERE content_hash = ? AND NOT EXISTS (SELECT ? FROM cas_refs WHERE content_hash = ?) RETURNING len",
-            &["SEARCH cas_extents USING INDEX sqlite_autoindex_cas_extents_1 (content_hash=?)", "SCALAR SUBQUERY 1", "SEARCH cas_refs USING COVERING INDEX cas_refs_by_hash (content_hash=?)", "SEARCH artifact_load_edges USING COVERING INDEX sqlite_autoindex_artifact_load_edges_1 (content_hash=?)", "SEARCH cas_refs USING COVERING INDEX cas_refs_by_hash (content_hash=?)"],
-        ),
-        (
-            "DELETE FROM cas_refs WHERE holder_kind = ? AND holder = ?",
-            &["SEARCH cas_refs USING PRIMARY KEY (holder_kind=? AND holder=?)"],
-        ),
-        (
-            "DELETE FROM result_candidates WHERE key_kind = ? AND static_key = ? AND trace_digest = ? RETURNING len",
-            &["SEARCH result_candidates USING INDEX sqlite_autoindex_result_candidates_1 (key_kind=? AND static_key=? AND trace_digest=?)"],
-        ),
-        (
             "SELECT ? FROM cas_extents WHERE content_hash = ?",
             &["SEARCH cas_extents USING COVERING INDEX sqlite_autoindex_cas_extents_1 (content_hash=?)"],
         ),
@@ -1985,10 +1992,6 @@ fn cas_and_served_point_statements_search_their_keys() {
         (
             "SELECT name FROM roots WHERE root_id = ?",
             &["SEARCH roots USING INTEGER PRIMARY KEY (rowid=?)"],
-        ),
-        (
-            "SELECT (SELECT COALESCE(SUM(len), ?) FROM cas_extents) + (SELECT COALESCE(SUM(len), ?) FROM result_candidates)",
-            &["SCAN CONSTANT ROW", "SCALAR SUBQUERY 1", "SCAN cas_extents USING COVERING INDEX cas_extents_by_segment", "SCALAR SUBQUERY 2", "SCAN result_candidates USING COVERING INDEX result_candidates_by_segment"],
         ),
         (
             "SELECT MAX(generation) FROM pending_restart",
@@ -2019,14 +2022,6 @@ fn cas_and_served_point_statements_search_their_keys() {
             &["SEARCH artifact_load_edges USING INDEX sqlite_autoindex_artifact_load_edges_1 (content_hash=?)"],
         ),
         (
-            "SELECT content_hash FROM cas_refs WHERE holder_kind = ? AND holder = ?",
-            &["SEARCH cas_refs USING PRIMARY KEY (holder_kind=? AND holder=?)"],
-        ),
-        (
-            "SELECT content_hash, offset FROM cas_extents WHERE segment = ?",
-            &["SEARCH cas_extents USING INDEX cas_extents_by_segment (segment=?)"],
-        ),
-        (
             "SELECT file_name FROM cas_segments WHERE segment_id = ?",
             &["SEARCH cas_segments USING INTEGER PRIMARY KEY (rowid=?)"],
         ),
@@ -2041,10 +2036,6 @@ fn cas_and_served_point_statements_search_their_keys() {
         (
             "SELECT name, definition_hash, generation FROM rpc_targets WHERE name = ?",
             &["SEARCH rpc_targets USING INDEX sqlite_autoindex_rpc_targets_1 (name=?)"],
-        ),
-        (
-            "SELECT offset, key_kind, static_key, trace_digest FROM result_candidates WHERE segment = ?",
-            &["SEARCH result_candidates USING INDEX result_candidates_by_segment (segment=?)"],
         ),
         (
             "SELECT parent_uuid, output_key FROM derived_outputs WHERE child_uuid = ?",
@@ -2063,20 +2054,12 @@ fn cas_and_served_point_statements_search_their_keys() {
             &["SEARCH cas_segments USING COVERING INDEX cas_segments_open (owner=?)"],
         ),
         (
-            "SELECT segment_id, file_name, segment_kind, indexed_len, (SELECT COALESCE(SUM(len), ?) FROM cas_extents WHERE segment = s.segment_id) + (SELECT COALESCE(SUM(len), ?) FROM result_candidates WHERE segment = s.segment_id) FROM cas_segments s WHERE state = ? UNION ALL SELECT segment_id, file_name, segment_kind, indexed_len, (SELECT COALESCE(SUM(len), ?) FROM cas_extents WHERE segment = s.segment_id) + (SELECT COALESCE(SUM(len), ?) FROM result_candidates WHERE segment = s.segment_id) FROM cas_segments s WHERE owner = ? AND state = ? AND segment_kind = ? ORDER BY segment_id",
-            &["MERGE (UNION ALL)", "LEFT", "SEARCH s USING INDEX cas_segments_by_state (state=?)", "CORRELATED SCALAR SUBQUERY 1", "SEARCH cas_extents USING COVERING INDEX cas_extents_by_segment (segment=?)", "CORRELATED SCALAR SUBQUERY 2", "SEARCH result_candidates USING COVERING INDEX result_candidates_by_segment (segment=?)", "RIGHT", "SEARCH s USING INDEX cas_segments_open (owner=?)", "CORRELATED SCALAR SUBQUERY 4", "SEARCH cas_extents USING COVERING INDEX cas_extents_by_segment (segment=?)", "CORRELATED SCALAR SUBQUERY 5", "SEARCH result_candidates USING COVERING INDEX result_candidates_by_segment (segment=?)"],
-        ),
-        (
             "SELECT seq, version, kind, asset_uuid, state, subject, detail FROM change_log WHERE seq > ? ORDER BY seq",
             &["SEARCH change_log USING INTEGER PRIMARY KEY (rowid>?)"],
         ),
         (
             "SELECT tag, value FROM asset_tags WHERE asset_uuid = ? ORDER BY tag",
             &["SEARCH asset_tags USING INDEX sqlite_autoindex_asset_tags_1 (asset_uuid=?)"],
-        ),
-        (
-            "SELECT trace_digest, memo_seq, segment, offset, len FROM result_candidates WHERE key_kind = ? AND static_key = ? ORDER BY memo_seq DESC",
-            &["SEARCH result_candidates USING INDEX sqlite_autoindex_result_candidates_1 (key_kind=? AND static_key=?)", "USE TEMP B-TREE FOR ORDER BY"],
         ),
         (
             "SELECT value FROM store_meta WHERE key = ?",
@@ -2097,6 +2080,74 @@ fn cas_and_served_point_statements_search_their_keys() {
         (
             "UPDATE cas_segments SET state = ? WHERE segment_id = ?",
             &["SEARCH cas_segments USING INTEGER PRIMARY KEY (rowid=?)"],
+        ),
+        // A result goes with its outputs (the cascade's search), an
+        // install with its references, and an extent once neither holder
+        // table names it (the foreign keys' searches).
+        (
+            "DELETE FROM cas_extents WHERE content_hash = ? AND NOT EXISTS (SELECT ? FROM cas_refs WHERE content_hash = ?) AND NOT EXISTS (SELECT ? FROM result_outputs WHERE content_hash = ?) RETURNING len",
+            &[
+                "SEARCH cas_extents USING INDEX sqlite_autoindex_cas_extents_1 (content_hash=?)",
+                "SCALAR SUBQUERY 1",
+                "SEARCH cas_refs USING COVERING INDEX cas_refs_by_hash (content_hash=?)",
+                "SCALAR SUBQUERY 2",
+                "SEARCH result_outputs USING COVERING INDEX result_outputs_by_hash (content_hash=?)",
+                "SEARCH artifact_load_edges USING COVERING INDEX sqlite_autoindex_artifact_load_edges_1 (content_hash=?)",
+                "SEARCH cas_refs USING COVERING INDEX cas_refs_by_hash (content_hash=?)",
+                "SEARCH result_outputs USING COVERING INDEX result_outputs_by_hash (content_hash=?)",
+            ],
+        ),
+        (
+            "DELETE FROM cas_refs WHERE holder = ? RETURNING content_hash",
+            &["SEARCH cas_refs USING PRIMARY KEY (holder=?)"],
+        ),
+        (
+            "DELETE FROM results WHERE key_kind = ? AND static_key = ? AND trace_digest = ? RETURNING ?",
+            &[
+                "SEARCH results USING INDEX sqlite_autoindex_results_1 (key_kind=? AND static_key=? AND trace_digest=?)",
+                "SEARCH result_outputs USING PRIMARY KEY (key_kind=? AND static_key=? AND trace_digest=?)",
+            ],
+        ),
+        (
+            "SELECT COALESCE(SUM(len), ?) FROM cas_extents",
+            &["SCAN cas_extents USING COVERING INDEX cas_extents_by_segment"],
+        ),
+        (
+            "SELECT content_hash FROM result_outputs WHERE key_kind = ? AND static_key = ? AND trace_digest = ?",
+            &["SEARCH result_outputs USING PRIMARY KEY (key_kind=? AND static_key=? AND trace_digest=?)"],
+        ),
+        (
+            "SELECT content_hash, offset, len FROM cas_extents WHERE segment = ?",
+            &["SEARCH cas_extents USING INDEX cas_extents_by_segment (segment=?)"],
+        ),
+        // A candidate and what it names: one search of each primary key.
+        (
+            "SELECT r.asset_uuid, r.trace, r.failure, o.role, o.name, o.types, o.content_hash FROM results r LEFT JOIN result_outputs o ON o.key_kind = r.key_kind AND o.static_key = r.static_key AND o.trace_digest = r.trace_digest WHERE r.key_kind = ? AND r.static_key = ? AND r.trace_digest = ? ORDER BY o.role, o.name",
+            &[
+                "SEARCH r USING INDEX sqlite_autoindex_results_1 (key_kind=? AND static_key=? AND trace_digest=?)",
+                "SEARCH o USING PRIMARY KEY (key_kind=? AND static_key=? AND trace_digest=?) LEFT-JOIN",
+            ],
+        ),
+        (
+            "SELECT segment_id, file_name, segment_kind, indexed_len, (SELECT COALESCE(SUM(len), ?) FROM cas_extents WHERE segment = s.segment_id) FROM cas_segments s WHERE state = ? UNION ALL SELECT segment_id, file_name, segment_kind, indexed_len, (SELECT COALESCE(SUM(len), ?) FROM cas_extents WHERE segment = s.segment_id) FROM cas_segments s WHERE owner = ? AND state = ? AND segment_kind = ? ORDER BY segment_id",
+            &[
+                "MERGE (UNION ALL)",
+                "LEFT",
+                "SEARCH s USING INDEX cas_segments_by_state (state=?)",
+                "CORRELATED SCALAR SUBQUERY 1",
+                "SEARCH cas_extents USING COVERING INDEX cas_extents_by_segment (segment=?)",
+                "RIGHT",
+                "SEARCH s USING INDEX cas_segments_open (owner=?)",
+                "CORRELATED SCALAR SUBQUERY 3",
+                "SEARCH cas_extents USING COVERING INDEX cas_extents_by_segment (segment=?)",
+            ],
+        ),
+        (
+            "SELECT trace_digest, memo_seq FROM results WHERE key_kind = ? AND static_key = ? ORDER BY memo_seq DESC",
+            &[
+                "SEARCH results USING INDEX sqlite_autoindex_results_1 (key_kind=? AND static_key=?)",
+                "USE TEMP B-TREE FOR ORDER BY",
+            ],
         ),
     ];
     let expected = expected

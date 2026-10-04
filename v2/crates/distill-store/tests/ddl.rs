@@ -54,7 +54,7 @@ fn every_section_13_table_exists() {
     // The §13 table inventory, plus the store-internal tables §13/§14
     // require: store_meta (instance id, counters, watermark, poisons,
     // CAS segment ids), asset_tags (the `assets` search tags),
-    // result_candidates / derived_outputs /
+    // results / result_outputs / derived_outputs /
     // cas_extents / cas_segments (the three roles of §13's `artifacts`
     // row), cas_refs (what keeps each extent indexed), bundle_path_refs
     // (the reference fields a rename rewrites), and
@@ -78,7 +78,8 @@ fn every_section_13_table_exists() {
         "asset_tag_index",
         "tag_epochs",
         "path_index",
-        "result_candidates",
+        "results",
+        "result_outputs",
         "derived_outputs",
         "cas_extents",
         "cas_segments",
@@ -254,23 +255,31 @@ fn pending_restart_is_representable() {
 #[test]
 fn candidate_buckets_are_keyed_by_key_kind_static_key_and_trace_digest() {
     // §13/§9: static-input-key digest → candidate bucket, keyed
-    // secondarily by trace digest; commits append candidates, never
-    // overwrite; result records are tagged by key kind.
+    // secondarily by trace digest; a result row is tagged by key kind and
+    // its outputs are rows of their own, naming content hashes.
     let dir = tempfile::tempdir().unwrap();
     let conn = open_conn(&dir);
     assert_eq!(
-        pk_columns(&conn, "result_candidates"),
+        pk_columns(&conn, "results"),
         ["key_kind", "static_key", "trace_digest"]
     );
-    let cols = columns(&conn, "result_candidates");
+    assert_eq!(
+        pk_columns(&conn, "result_outputs"),
+        ["key_kind", "static_key", "trace_digest", "role", "name"]
+    );
+    assert_eq!(
+        columns(&conn, "result_outputs"),
+        ["key_kind", "static_key", "trace_digest", "role", "name", "types", "content_hash"]
+    );
+    let cols = columns(&conn, "results");
     for required in [
         "key_kind",
         "static_key",
         "trace_digest",
         "memo_seq",
-        "segment",
-        "offset",
-        "len",
+        "asset_uuid",
+        "trace",
+        "failure",
     ] {
         assert!(
             cols.iter().any(|c| c == required),
@@ -292,7 +301,7 @@ fn extent_index_holds_the_only_physical_location() {
     );
     assert_eq!(pk_columns(&conn, "cas_extents"), ["content_hash"]);
     // And no other artifact table sneaks a physical location in.
-    for table in ["derived_outputs", "assets", "bundles"] {
+    for table in ["results", "result_outputs", "derived_outputs", "assets", "bundles"] {
         let cols = columns(&conn, table);
         assert!(
             !cols.iter().any(|c| c == "offset" || c == "segment"),

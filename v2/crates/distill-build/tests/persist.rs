@@ -8,7 +8,7 @@ use distill_build::trace::{
 };
 use distill_core::id::{AssetUuid, BundleFileHash, ContentHash, TypeUuid};
 use distill_store::cas::record::KeyKind;
-use distill_store::cas::{BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
+use distill_store::cas::{BuildCommit, CommitOutcome, OutputSpec};
 use distill_store::{Store, StoreConfig};
 
 #[derive(Default)]
@@ -64,10 +64,8 @@ fn commit(store: &mut Store, key: [u8; 32], asset: AssetUuid, trace: Vec<TraceOp
             key_kind: KeyKind::Processor,
             static_input_key: key,
             asset_uuid: asset,
-            static_inputs_canonical: b"static".to_vec(),
             trace: trace_payload_bytes(&trace),
             outcome: CommitOutcome::Success {
-                payload_kind: PayloadKind::ProcessorOutput,
                 outputs: vec![OutputSpec {
                     output_key: String::new(),
                     type_uuids: vec![TypeUuid([3; 16])],

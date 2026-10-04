@@ -27,7 +27,7 @@ use distill_build::dslf::{
     OutputBindingFailureV1, OutputBindingSlotV1,
 };
 use distill_build::keys::{
-    build_import_digest, node_canonical_bytes, node_digest, static_inputs_canonical_bytes,
+    build_import_digest, node_digest,
     static_inputs_digest, AppliedMigration, AutomaticMigration, BuildImportInputs, NodeInputs,
     NodeStage, NodeType, OutputHash, StaticInputs,
 };
@@ -67,7 +67,7 @@ use distill_store::cas::record::{
     FailureCause as StoreFailureCause, FailureFingerprint as StoreFailureFingerprint, KeyKind,
     LocalFailureClass as StoreLocalFailureClass, ResultOutcome,
 };
-use distill_store::cas::{AuxSpec, BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
+use distill_store::cas::{AuxSpec, BuildCommit, CommitOutcome, OutputSpec};
 use distill_store::pipeline::RegisteredTool;
 use distill_store::state::SnapshotStamp;
 use distill_store::served::StoreSnapshot;
@@ -527,10 +527,9 @@ fn pipeline_registry(epoch: &PipelineEpoch) -> Result<PipelineRegistry, String> 
     .map_err(|error| format!("{error:?}"))
 }
 
-/// A node's DSNK key and the canonical bytes its result record keeps.
+/// A node's DSNK key.
 struct NodeKey {
     digest: [u8; 32],
-    canonical: Vec<u8>,
 }
 
 /// The key of `asset`'s node at `reader`'s state under `env`, or `None`
@@ -616,7 +615,6 @@ fn node_key(
     };
     Ok(Some(NodeKey {
         digest: node_digest(&inputs),
-        canonical: node_canonical_bytes(&inputs),
     }))
 }
 
@@ -2910,10 +2908,8 @@ fn commit_processor_stage(
             key_kind: KeyKind::Processor,
             static_input_key: static_inputs_digest(static_inputs),
             asset_uuid: loaded.entry.uuid,
-            static_inputs_canonical: static_inputs_canonical_bytes(static_inputs),
             trace: trace_payload_bytes(trace),
             outcome: CommitOutcome::Success {
-                payload_kind: PayloadKind::ProcessorOutput,
                 outputs: outputs
                     .iter()
                     .map(|output| OutputSpec {
@@ -2946,7 +2942,6 @@ fn commit_processor_failure(
             key_kind: KeyKind::Processor,
             static_input_key: static_inputs_digest(static_inputs),
             asset_uuid: loaded.entry.uuid,
-            static_inputs_canonical: static_inputs_canonical_bytes(static_inputs),
             trace: trace_payload_bytes(trace),
             outcome: CommitOutcome::Failure { cause },
             wire_trees: Vec::new(),
@@ -3147,10 +3142,8 @@ fn assemble_pending(
                 key_kind: KeyKind::Node,
                 static_input_key: key.digest,
                 asset_uuid: asset,
-                static_inputs_canonical: key.canonical,
                 trace: trace_payload_bytes(&trace),
                 outcome: CommitOutcome::Success {
-                    payload_kind: PayloadKind::ProcessorOutput,
                     outputs: pending
                         .iter()
                         .map(|artifact| OutputSpec {
@@ -3557,7 +3550,6 @@ fn commit_build_import_failure(
             key_kind: KeyKind::BuildImport,
             static_input_key: key,
             asset_uuid: loaded.entry.uuid,
-            static_inputs_canonical: Vec::new(),
             trace: trace_payload_bytes(trace),
             outcome: CommitOutcome::Failure { cause },
             wire_trees: Vec::new(),
@@ -3899,7 +3891,6 @@ fn encode_or_hydrate(
                         key_kind: KeyKind::BuildImport,
                         static_input_key: key,
                         asset_uuid: loaded.entry.uuid,
-                        static_inputs_canonical: Vec::new(),
                         trace: trace_payload_bytes(&trace),
                         outcome: CommitOutcome::Failure {
                             cause: StoreFailureCause::Local(StoreFailureFingerprint::Local {
@@ -3981,10 +3972,8 @@ fn encode_or_hydrate(
                 key_kind: KeyKind::BuildImport,
                 static_input_key: key,
                 asset_uuid: loaded.entry.uuid,
-                static_inputs_canonical: Vec::new(),
                 trace: trace_payload_bytes(&trace),
                 outcome: CommitOutcome::Success {
-                    payload_kind: PayloadKind::ImportEncoding,
                     outputs: vec![OutputSpec {
                         output_key: String::new(),
                         type_uuids: types,

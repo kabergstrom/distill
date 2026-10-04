@@ -1,14 +1,13 @@
-//! §13 log-structured CAS behavior: append/commit/read roundtrips, the
-//! result record as commit marker, candidate buckets that append and
-//! never overwrite, wire trees as
-//! first-class records, and segment rolling.
+//! §13 log-structured CAS behavior: append/commit/read roundtrips,
+//! candidate buckets that append and never overwrite, wire trees as
+//! first-class extents, and segment rolling.
 
 use distill_core::id::{AssetUuid, BundleFileHash, ContentHash};
 use distill_store::cas::record::{
-    decode_record, CapabilityKey, FailureCause, FailureFingerprint, KeyKind, LocalFailureClass,
+    CapabilityKey, FailureCause, FailureFingerprint, KeyKind, LocalFailureClass,
     ResultOutcome,
 };
-use distill_store::cas::{AuxSpec, BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
+use distill_store::cas::{AuxSpec, BuildCommit, CommitOutcome, OutputSpec};
 use distill_store::state::{
     ReadableBundleSource, SkeletonFailureCode, NamespaceError, NamespaceErrorV1,
 };
@@ -45,10 +44,8 @@ fn success_commit(static_key: [u8; 32], trace: &[u8]) -> BuildCommit {
         key_kind: KeyKind::Processor,
         static_input_key: static_key,
         asset_uuid: PARENT,
-        static_inputs_canonical: b"canonical static inputs".to_vec(),
         trace: trace.to_vec(),
         outcome: CommitOutcome::Success {
-            payload_kind: PayloadKind::ProcessorOutput,
             outputs: vec![
                 OutputSpec {
                     output_key: String::new(),
@@ -163,10 +160,6 @@ fn lookup_finds_the_committed_candidate() {
     let c = &candidates[0];
     assert_eq!(c.asset_uuid, PARENT);
     assert_eq!(c.payload.trace, b"trace");
-    assert_eq!(
-        c.payload.static_inputs_canonical,
-        b"canonical static inputs"
-    );
     match &c.payload.outcome {
         ResultOutcome::Success { outputs, aux } => {
             assert_eq!(outputs.len(), 2);
@@ -224,9 +217,9 @@ fn commits_append_to_the_bucket_never_overwrite() {
 }
 
 #[test]
-fn a_commit_naming_payloads_already_in_the_cas_appends_only_its_result() {
+fn a_commit_naming_payloads_already_in_the_cas_appends_nothing() {
     // A node result names the bytes its last stage committed: the second
-    // commit indexes a new candidate without appending the payloads again.
+    // commit indexes a new candidate without appending anything.
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(StoreConfig::new(dir.path().join(".distill"))).unwrap();
     declare_child(&mut store, PARENT, "normals");
@@ -246,13 +239,8 @@ fn a_commit_naming_payloads_already_in_the_cas_appends_only_its_result() {
     node.key_kind = KeyKind::Node;
     store.commit_build(node).unwrap();
     let appended = segment_bytes() - before;
-    let payloads = (b"primary artifact bytes".len()
-        + b"normals artifact bytes".len()
-        + b"debug bytes".len()) as u64;
-    assert!(
-        appended + payloads <= first,
-        "only the result record is appended: {appended} bytes after {first}"
-    );
+    assert!(first > 0);
+    assert_eq!(appended, 0, "a segment holds only the bytes");
     let candidates = store.lookup_candidates(KeyKind::Node, &[2u8; 32]).unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].payload.key_kind, KeyKind::Node);
@@ -309,7 +297,6 @@ fn build_import_results_carry_exactly_one_output_row() {
     let (_d, mut store) = store();
     let mut commit = success_commit([2u8; 32], b"bi-trace");
     commit.key_kind = KeyKind::BuildImport;
-    commit.static_inputs_canonical = Vec::new();
     // Two outputs: arity error.
     let err = store.commit_build(commit).unwrap_err();
     match err {
@@ -323,10 +310,8 @@ fn build_import_results_carry_exactly_one_output_row() {
         key_kind: KeyKind::BuildImport,
         static_input_key: [2u8; 32],
         asset_uuid: PARENT,
-        static_inputs_canonical: Vec::new(),
         trace: b"bi-trace".to_vec(),
         outcome: CommitOutcome::Success {
-            payload_kind: PayloadKind::ImportEncoding,
             outputs: vec![OutputSpec {
                 output_key: String::new(),
                 type_uuids: vec![],
@@ -356,7 +341,6 @@ fn failure_records_commit_index_and_carry_no_outputs() {
         key_kind: KeyKind::Processor,
         static_input_key: [3u8; 32],
         asset_uuid: PARENT,
-        static_inputs_canonical: b"si".to_vec(),
         trace: b"trace incl failing op".to_vec(),
         outcome: CommitOutcome::Failure {
             cause: FailureCause::Op,
@@ -393,7 +377,6 @@ fn a_capability_miss_memoizes_with_its_requested_key() {
         key_kind: KeyKind::Processor,
         static_input_key: [4u8; 32],
         asset_uuid: PARENT,
-        static_inputs_canonical: b"si".to_vec(),
         // The trace ends in the TraceOp::Capability miss (§9); its bytes
         // are opaque to the store.
         trace: b"...capability(v2-to-v3) -> Err(MissingCapability)".to_vec(),
@@ -424,7 +407,6 @@ fn a_deterministic_local_failure_memoizes_with_an_empty_trace() {
         key_kind: KeyKind::Processor,
         static_input_key: [5u8; 32],
         asset_uuid: PARENT,
-        static_inputs_canonical: b"si".to_vec(),
         trace: Vec::new(),
         outcome: CommitOutcome::Failure {
             cause: FailureCause::Local(FailureFingerprint::Local {
@@ -483,7 +465,7 @@ fn the_namespace_is_the_only_authority_for_child_resolution() {
     assert!(store.resolve_child(child).unwrap().is_some());
 
     // The namespace retires the key at a later input version; the memo
-    // row (the result record) still exists — resolution must miss.
+    // row (the `results` row) still exists — resolution must miss.
     store
         .input_transaction(|txn| txn.remove_derived_output(child))
         .unwrap();
@@ -518,10 +500,8 @@ fn segments_roll_at_the_size_cap() {
             key_kind: KeyKind::Processor,
             static_input_key: [i; 32],
             asset_uuid: PARENT,
-            static_inputs_canonical: vec![],
             trace: vec![i],
             outcome: CommitOutcome::Success {
-                payload_kind: PayloadKind::ProcessorOutput,
                 outputs: vec![OutputSpec {
                     output_key: String::new(),
                     type_uuids: vec![],
@@ -576,10 +556,8 @@ fn a_record_larger_than_the_cap_gets_one_typed_dedicated_oversize_segment() {
             key_kind: KeyKind::Processor,
             static_input_key: [0x33; 32],
             asset_uuid: PARENT,
-            static_inputs_canonical: vec![],
             trace: b"oversize".to_vec(),
             outcome: CommitOutcome::Success {
-                payload_kind: PayloadKind::ProcessorOutput,
                 outputs: vec![OutputSpec {
                     output_key: String::new(),
                     type_uuids: vec![],
@@ -593,13 +571,8 @@ fn a_record_larger_than_the_cap_gets_one_typed_dedicated_oversize_segment() {
     let oversized = oversize_files(&config);
     assert_eq!(oversized.len(), 1);
     let bytes = std::fs::read(&oversized[0]).unwrap();
-    let decoded = decode_record(&bytes, 0, 0).unwrap();
-    assert_eq!(
-        decoded.encoded_len as usize,
-        bytes.len(),
-        "exactly one record per file"
-    );
-    assert!(decoded.encoded_len > config.segment_size);
+    assert_eq!(bytes, payload, "exactly the one extent");
+    assert!(bytes.len() as u64 > config.segment_size);
     assert_eq!(store.cas_read(&receipt.outputs[0].1 .0).unwrap(), payload);
 
     store.compact().unwrap();
@@ -609,8 +582,7 @@ fn a_record_larger_than_the_cap_gets_one_typed_dedicated_oversize_segment() {
         "compaction leaves a live oversize segment alone"
     );
 
-    // A reopen keeps the oversize payload and its result record in
-    // another segment.
+    // A reopen keeps the oversize payload in a segment of its own.
     drop(store);
     let (reopened, recovery) = Store::open_with_recovery(config).unwrap();
     assert_eq!(recovery, distill_store::cas::RecoveryReport::default());

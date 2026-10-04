@@ -1,5 +1,5 @@
-//! §13 crash safety: the transaction that indexes a record group is its
-//! commit. Recovery cuts bytes past the index (rolled back or interrupted:
+//! §13 crash safety: the transaction that indexes a group of extents is
+//! its commit. Recovery cuts bytes past the index (rolled back or interrupted:
 //! uncommitted), reports a lost tail without changing anything, and
 //! deletes dead segments — each asserted through the typed
 //! `RecoveryReport` and post-recovery reads. A segment file no row names
@@ -7,8 +7,8 @@
 //! allocation of its id.
 
 use distill_core::id::AssetUuid;
-use distill_store::cas::record::{encode_record, KeyKind, Record, RecordKind};
-use distill_store::cas::{BuildCommit, CommitOutcome, OutputSpec, PayloadKind, RecoveryReport};
+use distill_store::cas::record::KeyKind;
+use distill_store::cas::{BuildCommit, CommitOutcome, OutputSpec, RecoveryReport};
 use distill_store::{Store, StoreConfig, StoreError};
 
 const PARENT: AssetUuid = AssetUuid([7u8; 16]);
@@ -24,10 +24,8 @@ fn commit(store: &mut Store, key: u8, bytes: &[u8]) -> [u8; 32] {
             key_kind: KeyKind::Processor,
             static_input_key: [key; 32],
             asset_uuid: PARENT,
-            static_inputs_canonical: vec![],
             trace: vec![key],
             outcome: CommitOutcome::Success {
-                payload_kind: PayloadKind::ProcessorOutput,
                 outputs: vec![OutputSpec {
                     output_key: String::new(),
                     type_uuids: vec![],
@@ -67,48 +65,20 @@ fn a_clean_reopen_recovers_nothing() {
 #[test]
 fn bytes_past_the_index_are_cut_off_and_publish_nothing() {
     // What a rolled-back or interrupted transaction appended: here a whole
-    // valid group (payload and result record) and a torn record after it.
-    // None of it committed, so none of it is adopted.
+    // extent and a torn one after it. None of it committed, so none of it
+    // is adopted.
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
     let committed = commit(&mut store, 1, b"committed artifact");
     drop(store);
 
     let payload = b"uncommitted artifact".to_vec();
-    let payload_record = encode_record(&Record {
-        kind: RecordKind::ProcessorOutput,
-        asset_uuid: PARENT,
-        static_input_key: vec![],
-        output_key: String::new(),
-        payload: payload.clone(),
-    });
-    let result = distill_store::cas::record::ResultPayload {
-        key_kind: KeyKind::Processor,
-        static_inputs_canonical: vec![],
-        trace: b"uncommitted trace".to_vec(),
-        outcome: distill_store::cas::record::ResultOutcome::Success {
-            outputs: vec![distill_store::cas::record::OutputRow {
-                output_key: String::new(),
-                type_uuids: vec![],
-                content_hash: distill_core::id::ContentHash(*blake3::hash(&payload).as_bytes()),
-            }],
-            aux: vec![],
-        },
-    };
-    let result_record = encode_record(&Record {
-        kind: RecordKind::Result,
-        asset_uuid: PARENT,
-        static_input_key: vec![9u8; 32],
-        output_key: String::new(),
-        payload: result.encode(),
-    });
     let seg = segment_files(&dir).pop().unwrap();
     let indexed = std::fs::metadata(&seg).unwrap().len();
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new().append(true).open(&seg).unwrap();
-    f.write_all(&payload_record).unwrap();
-    f.write_all(&result_record).unwrap();
-    f.write_all(&payload_record[..20]).unwrap();
+    f.write_all(&payload).unwrap();
+    f.write_all(&payload[..10]).unwrap();
     f.sync_all().unwrap();
     drop(f);
 
@@ -141,9 +111,9 @@ fn a_lost_tail_is_reported_and_changes_nothing() {
     config.segment_size = 256;
     let mut store = Store::open(config.clone()).unwrap();
     let edges = [(AssetUuid([9; 16]), TypeUuid([1; 16]))];
-    let installed = store.put_artifact(PARENT, &[5u8; 150], &edges).unwrap();
+    let installed = store.put_artifact(PARENT, &[5u8; 250], &edges).unwrap();
     let first = commit(&mut store, 1, b"first artifact");
-    commit(&mut store, 2, b"second artifact");
+    let second = commit(&mut store, 2, b"second artifact");
     drop(store);
 
     let files = segment_files(&dir);
@@ -163,10 +133,11 @@ fn a_lost_tail_is_reported_and_changes_nothing() {
         assert_eq!(recovery.lost_tails[0].1, full - 7);
         assert_eq!(recovery.truncated_tails, []);
         assert_eq!(std::fs::metadata(last).unwrap().len(), full - 7, "nothing was cut or grown");
-        assert!(store.lookup_candidates(KeyKind::Processor, &[2u8; 32]).is_err(), "the lost result record reads as an error");
+        assert_eq!(store.lookup_candidates(KeyKind::Processor, &[2u8; 32]).unwrap().len(), 1);
+        assert!(store.cas_read(&second).is_err(), "the lost bytes read as an error");
         assert_eq!(store.cas_read(&first).unwrap(), b"first artifact");
         assert_eq!(store.lookup_candidates(KeyKind::Processor, &[1u8; 32]).unwrap().len(), 1);
-        assert_eq!(store.cas_read(&installed.0).unwrap(), [5u8; 150]);
+        assert_eq!(store.cas_read(&installed.0).unwrap(), [5u8; 250]);
         assert_eq!(store.artifact_load_edges(ContentHash(installed.0)).unwrap(), edges);
     }
 }
@@ -250,10 +221,8 @@ fn node_publication(key: u8) -> (BuildCommit, Vec<u8>) {
         key_kind: KeyKind::Node,
         static_input_key: [key; 32],
         asset_uuid: AssetUuid([key; 16]),
-        static_inputs_canonical: vec![],
         trace: vec![key],
         outcome: CommitOutcome::Success {
-            payload_kind: PayloadKind::ProcessorOutput,
             outputs: vec![OutputSpec {
                 output_key: String::new(),
                 type_uuids: vec![],

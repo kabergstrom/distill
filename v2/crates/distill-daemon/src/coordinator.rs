@@ -1119,7 +1119,7 @@ pub(crate) fn maintain_cas(
 mod cas_pass_tests {
     use super::*;
     use distill_store::cas::record::KeyKind;
-    use distill_store::cas::{BuildCommit, CommitOutcome, OutputSpec, PayloadKind, SegmentSweeper};
+    use distill_store::cas::{BuildCommit, CommitOutcome, OutputSpec, SegmentSweeper};
 
     static STATEMENTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
@@ -1134,10 +1134,8 @@ mod cas_pass_tests {
                 key_kind: KeyKind::Processor,
                 static_input_key: [key; 32],
                 asset_uuid: AssetUuid([7; 16]),
-                static_inputs_canonical: vec![],
                 trace: vec![key],
                 outcome: CommitOutcome::Success {
-                    payload_kind: PayloadKind::ProcessorOutput,
                     outputs: vec![OutputSpec {
                         output_key: String::new(),
                         type_uuids: vec![],

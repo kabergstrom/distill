@@ -3509,9 +3509,9 @@ across eviction, daemon restart, or `.distill` loss can always resolve
 it (UUIDv5 is one-way; without this, a remembered child would be
 permanently orphaned). This snapshot-scoped index is the **only
 authority** for child resolution: anything recovered from historical
-CAS result records is memo data, never a namespace claim — a child UUID resolves at a snapshot iff that
+CAS results is memo data, never a namespace claim — a child UUID resolves at a snapshot iff that
 snapshot derives it, so a retired output key's UUID can later be minted
-for authored data without a stale result record resurrecting the old
+for authored data without a stale result resurrecting the old
 claim. The index is validated against authored UUIDs at
 publication (§7) — collisions surface before the version is queryable,
 never as ordering-dependent resolution. No artifact is created —
@@ -4937,7 +4937,7 @@ All daemon state is disposable (§2) and lives under `.distill/` (gitignored).
 | `assets` | asset uuid → bundle uuid, local_id, type_uuid, logical hash, search tags, terminal type. A pipeline-map change republishes the rows of every bundle holding an asset whose terminal type it changes, whether or not the bundle changed |
 | `path_index` | path/primary resolution index |
 | `schemas` | logical hash → schema JSON (cache, rebuilt from bundle snapshots) |
-| `artifacts` | static-input-key digest → candidate bucket: (trace digest → trace + output table), revalidated most-recent-first on lookup (§9 — the build-cache lookup; the full input hash is never stored, and commits append candidates, never overwrite); derived-output: child uuid → (parent uuid, output key) — input-versioned, derived per published version from its assets × pinned pipeline map (§9), the only authority for child resolution, commit rows verified against it; ContentHash → segment, offset, len (the CAS extent index) |
+| `artifacts` | `results` + `result_outputs`: static-input-key digest → candidate bucket: (trace digest → trace + output table, whose rows are the pins), revalidated most-recent-first on lookup (§9 — the build-cache lookup; the full input hash is never stored, and commits append candidates, never overwrite); derived-output: child uuid → (parent uuid, output key) — input-versioned, derived per published version from its assets × pinned pipeline map (§9), the only authority for child resolution, commit rows verified against it; ContentHash → segment, offset, len (the CAS extent index) |
 | `pipeline_state` | importer/processor registrations and versions; the pipeline dylib content hash; the exact canonical target rows; and the candidate `(TypeUuid, DSLH)` schema map. Publication compares the schema map with source-controlled active lineage and makes the whole PipelineEpoch an input-hash input wherever pipeline code or policy runs |
 | `tools` | **ToolEpoch** state (§9): tool key → (`ToolExecutionIdentityV2`, DSCT hash, optional staged package root) — input-versioned. Package registrations snapshot and stage their complete directory no-replace; ambient registrations retain an explicit absolute launcher and toolchain identity, and are nonmemoizable unless they carry a trusted fingerprint. No row resolves to a library handle: runtime `dlopen` in pipeline code and a staged-library API are banned (§3, §9) |
 | `schema_lineage` | disposable projection of the source-controlled `SchemaLineageManifest`: per type, the append-only accepted epoch vector `(digest, forward_parent)`, current cursor, explicit `Active \| Retired` authority state, and verified `DSSL` (§5, §6, §11). Startup rebuilds it only from that manifest; non-bootstrap `EntryLineageV1::Manifest` stamps and migration-endpoint stamps are checked against it but never unioned into authority. Forward ancestry follows parent links from current. Explicit rollback moves the cursor only after complete reverse-edge validation; ordinary acceptance appends and advances; retire/reactivate preserve history and require exact stale-base candidate checks including the metadata/control SnapshotStamp used for retirement's negative proof. Every input publication enforces that Retired types have no live entries/endpoints; violation publishes typed RetiredTypeReferenced authority poison. A missing/duplicate manifest leaves this table unavailable and hard-stops schema-dependent work; only §6's unbound exact-basis local repair surface remains mutable until one valid authority publishes |
@@ -5037,126 +5037,105 @@ fails the build.
 
 ### Log-structured CAS (artifact store)
 
-Append-only segment files of framed records, pinned:
+Append-only segment files of content-addressed bytes and nothing else: an
+extent is the raw bytes whose blake3 is its `ContentHash` (§5 byte-identity
+exception), with no frame, header, checksum or padding. What an extent is
+lives in SQLite: `cas_extents` maps `ContentHash → segment, offset, len`,
+and the rows that hold an extent say what it is for. Reads check the bytes
+against the hash.
 
-```
-magic        u32 LE  "DSR1"
-version      u8
-kind         u8      payload (import encoding / processor output /
-                     debug / wire tree) or result (commit marker, see below)
-key_len      u16 LE
-out_key_len  u16 LE
-asset_uuid   [u8; 16]
-payload_len  u64 LE
-content_hash [u8; 32]  raw blake3 of payload (§5 byte-identity exception)
-crc32c       u32 LE    over the exact disjoint ranges pinned below
-static_input_key [u8; key_len]
-output_key   [u8; out_key_len]  UTF-8; empty for the primary output
-payload      [u8; payload_len]
-pad          zeros to 16-byte alignment
-```
-
-CRC-32C coverage is exactly: (1) the contiguous header bytes beginning
-at `kind` and ending after `content_hash`, inclusive, then (2)
-`static_input_key`, (3) `output_key`, and (4) `payload`. `magic`,
-`version`, the `crc32c` field itself, and padding are excluded. There is
-no zeroed-field or fixed-point interpretation of “kind…payload”.
-
-All lengths are checked before allocation. Payload records carry the
-**parent** asset UUID and their output key (the primary's key is the empty
-string), so children derive as `UUIDv5(asset_uuid, output_key)`. A build
-appends its payload records first and one **result record** last.
-Result records are **tagged by key kind** (a `key_kind` byte in the
-result payload): the two lookup keys have different shapes, and neither
-is shoehorned into the other's grammar. A **build-import result**
-(`key_kind = DSBI`) carries the §8 `"DSBI"` pre-key digest as
-`static_input_key`, the entry's UUID, its discovered trace — the
-reference resolutions and plan-selection queries `load_current`
-produced (§8, §11) — and its single output row; the index rebuild row
-is `DSBI digest → candidate bucket`, keyed secondarily by trace digest
-exactly as for processor results.
-A **processor result** (`key_kind = DSSI`) carries the
-`StaticInputs`' 32-byte `"DSSI"` digest (§5's canonical encoding) as
-`static_input_key` — raw `StaticInputs` are unbounded composites that would burst
-`key_len`, so the full canonical encoding rides in the result payload
-for index rebuild — plus the parent UUID, the serialized dependency trace,
-the complete typed output table (`output_key → type uuids, ContentHash`), and an
-**auxiliary-payload table** (`debug key → ContentHash`) covering the build's
-cache-internal debug records (§16's intermediates) as its payload.
+A build result is SQLite rows, not a segment record. `results` is the
+**candidate bucket**: `(key_kind, static_input_key, trace digest) →`
+memo sequence, parent asset UUID, serialized dependency trace, and either
+nothing (a success) or the encoded terminal `FailureCause` (a failure).
+`result_outputs` holds its tables, one row per entry, each naming a
+`ContentHash` (a foreign key to `cas_extents`): role 0 the typed output
+table (`output_key → type uuids, ContentHash`; the primary's key is the
+empty string, so children derive as `UUIDv5(asset_uuid, output_key)`),
+role 1 the **auxiliary-payload table** (`debug key → ContentHash`, §16's
+intermediates), role 2 the wire trees the outputs' headers name. The rows
+are the pins: an extent is held exactly while some `result_outputs` row or
+install's `cas_refs` row names it, and deleting a `results` row takes its
+outputs with it (`ON DELETE CASCADE`).
+Results are **tagged by key kind**: the two lookup keys have different
+shapes, and neither is shoehorned into the other's grammar. A
+**build-import result** (`key_kind = DSBI`) is keyed by the §8 `"DSBI"`
+pre-key digest and carries the entry's UUID, its discovered trace — the
+reference resolutions and plan-selection queries `load_current` produced
+(§8, §11) — and its single output row. A **processor result**
+(`key_kind = DSSI`) is keyed by the `StaticInputs`' 32-byte `"DSSI"`
+digest (§5's canonical encoding); the raw `StaticInputs` are not stored —
+nothing reads them back.
 Auxiliary payloads pin and evict with the result exactly like outputs but
-never appear in derived-output rows, manifests, or load-dep closures; a
-debug record covered by no committed result record is garbage.
-**Wire trees are first-class CAS records** (§12's persistence promise
-made concrete): every DSWL tree the daemon encodes against commits as a
-`wire tree` payload record whose payload is the canonical DSWL
-serialization — its blake3 *is* the LayoutHash, so the extent index row
-is `LayoutHash → segment, offset, len`, rebuilt from a segment scan like
-every index — committed durably **before** any result record whose
+never appear in derived-output rows, manifests, or load-dep closures.
+**Wire trees are first-class CAS extents** (§12's persistence promise
+made concrete): every DSWL tree the daemon encodes against commits as an
+extent whose bytes are the canonical DSWL serialization — its blake3 *is*
+the LayoutHash — committed in the same transaction as any result whose
 output headers name that `layout_hash`. Results **pin their wire trees
-exactly like outputs**: the pin/evict unit extends to every wire tree
-any output's header references, and eviction may retire a wire-tree
-record only when no current or last-good manifest entry, live lease,
+exactly like outputs** (role 2): the pin/evict unit extends to every wire
+tree any output's header references, and eviction may retire a wire-tree
+extent only when no current or last-good manifest entry, live lease,
 in-flight build, or open pack-build session references its hash (the
 observability rule below). This is what makes `Hub.wireTree` (§17) and
 the pack wire-tree table (§16) unconditionally serviceable: any artifact
 fetchable by ContentHash has its producing tree fetchable by LayoutHash,
 across eviction, restart, and epoch retirement.
-A result record may instead carry a **failure outcome** — the typed
-error, the discovered trace (possibly empty), and the terminal
-**`FailureCause`** (§9): for a failing context operation the trace
-ends in its `Observed::Err` entry; for a deterministic local
-failure — validator diagnostics, migration-plan validation, a
-processor `BuildError` — the cause is `Local(fingerprint)` with no
-synthetic op invented. Either way it is revalidated on lookup exactly
-like a success (a `Capability` miss revalidates against the snapshot's
-pipeline epoch, so a failure minted by a missing registration heals on
-the first epoch that supplies it), no output rows — committed, indexed, and rebuilt by the same
-segment-scan rules: deterministic build failures memoize at their basis
-(§15's quiescence — an unchanged basis answers from the record instead
-of rebuilding once per client), while transient infrastructure errors
-(I/O outside the tree, a module crash) are typed apart and never
-memoized. **The write transaction that indexes a record group is its
-commit**: payloads first, the result record last, one fsync per touched
-segment, then the group's index rows, all in one SQLite write transaction
-(the caller's, when a node publishes its result with its artifact
-installs and their load edges). A group whose transaction rolls back, or
-that a crash interrupts before COMMIT, publishes nothing — a crash after
-output 2 of 3 publishes nothing — and its bytes past the segment's
-indexed length are dead. The index maps by role:
-`static-input key → candidate bucket` (every committed result record for
-the key, keyed secondarily by trace digest, §9) from processor result
-records, `DSBI digest → candidate bucket` from build-import result
-records, `ContentHash → location` from payload records. The
-derived-output *namespace* is deliberately not among them: historical
-result tables are memos, and child resolution consults only the current
-version's derived index (§9) — a retired child UUID is never resurrected
-by an old record. Segments
-roll at a size cap; a record whose framed size exceeds the cap is
-written instead as a dedicated **oversize segment** — one record per
-file, the same record grammar, named and typed as oversize in
-`cas_segments`, indexed, compacted, and evicted exactly
-like any segment — so an oversized artifact (blobs are unbounded, §4,
-§16) is representable, never rejected or truncated. SQLite indexes
-them; reads mmap and slice. Write order:
-append, fsync the segment, then insert the index rows; segment creation and
-deletion also fsync the directory. **SQLite is the authority** on what
-committed and on which segments exist (`cas_segments`, each writer's
-segment found by its row; one open regular segment per writer is a
-unique index, not a sweep). Recovery truncates each segment to its indexed
-length. A segment file shorter than its indexed length lost committed
-records to something outside the store (an external truncation, a lying
-fsync): recovery reports it and changes nothing, and reads of the lost
-records fail. Allocation's commit point is `next_segment_id`: a file at or
-past it belongs to an allocation that never committed, and the next
-allocation of its id truncates it, so nothing scans for unnamed files.
+A result may instead carry a **failure outcome** — the discovered trace
+(possibly empty) and the terminal **`FailureCause`** (§9): for a failing
+context operation the trace ends in its `Observed::Err` entry; for a
+deterministic local failure — validator diagnostics, migration-plan
+validation, a processor `BuildError` — the cause is `Local(fingerprint)`
+with no synthetic op invented. Either way it is revalidated on lookup
+exactly like a success (a `Capability` miss revalidates against the
+snapshot's pipeline epoch, so a failure minted by a missing registration
+heals on the first epoch that supplies it), with no output rows:
+deterministic build failures memoize at their basis (§15's quiescence —
+an unchanged basis answers from the row instead of rebuilding once per
+client), while transient infrastructure errors (I/O outside the tree, a
+module crash) are typed apart and never memoized.
+
+**The write transaction that indexes a group is its commit**: the bytes
+not yet in the CAS are appended first, one fsync per touched segment,
+then the extent rows, the `results` row and its `result_outputs` rows,
+all in one SQLite write transaction (the caller's, when a node publishes
+its result with its artifact installs and their load edges). A re-commit
+of the same key and trace replaces the earlier result in that
+transaction. A group whose transaction rolls back, or that a crash
+interrupts before COMMIT, publishes nothing — a crash after output 2 of 3
+publishes nothing — and its bytes past the segment's indexed length are
+dead. A lookup reads one indexed bucket: the key's `results` rows,
+most-recent-first, then the chosen candidate's row and its outputs by
+primary key. The derived-output *namespace* is deliberately not derived
+from results: historical results are memos, and child resolution
+consults only the current version's derived index (§9) — a retired child
+UUID is never resurrected by an old result. Segments roll at a size cap;
+an extent larger than the cap is written instead as a dedicated
+**oversize segment** — one extent per file, named and typed as oversize
+in `cas_segments`, indexed, compacted, and evicted exactly like any
+segment — so an oversized artifact (blobs are unbounded, §4, §16) is
+representable, never rejected or truncated. Reads mmap and slice. Write
+order: append, fsync the segment, then insert the index rows; segment
+creation and deletion also fsync the directory. **SQLite is the
+authority** on what committed and on which segments exist
+(`cas_segments`, each writer's segment found by its row; one open regular
+segment per writer is a unique index, not a sweep). Recovery truncates
+each segment to its indexed length. A segment file shorter than its
+indexed length lost committed bytes to something outside the store (an
+external truncation, a lying fsync): recovery reports it and changes
+nothing, and reads of the lost extents fail. Allocation's commit point is
+`next_segment_id`: a file at or past it belongs to an allocation that
+never committed, and the next allocation of its id truncates it, so
+nothing scans for unnamed files.
 Compaction is one SQLite write transaction: it allocates its destination
-segments sealed, writes and fsyncs them, repoints the index and marks the
-old segments dead; their files are deleted only after a grace period past
-the read bound. A release deletes the extents only it held in its own
-transaction (`cas_refs` has a foreign key to `cas_extents`), so there is
-nothing to prune. Live bytes, whole and per segment, are sums over
-covering `(segment, len)` indexes on `cas_extents` and
-`result_candidates`. GC is Bitcask-style
+segments sealed, copies the live extents, fsyncs them, repoints
+`cas_extents` and marks the old segments dead; their files are deleted
+only after a grace period past the read bound. Evicting a result deletes
+its `results` row (its outputs cascade) and, in the same transaction,
+each extent no other row holds; a release of an install does the same for
+its `cas_refs`. Foreign keys refuse to drop a held extent, so there is
+nothing to prune. Live bytes, whole and per segment, are sums over the
+covering `(segment, len)` index on `cas_extents`. GC is Bitcask-style
 compaction driven by the size cap (random eviction, each victim one
 sampled index probe; the pass runs only after the CAS index changed) — everything in the CAS
 is rebuildable, so eviction is always safe. But never observable: eviction
@@ -7597,7 +7576,7 @@ input hash.
   refactored in-repo to run behind `ProcessContext` — rafx is ours to
   change.
 - SPIR-V and generated HLSL intermediates are cache-internal debug payloads
-  stored under the cook's result record's auxiliary-payload table (§13) —
+  stored under the cook's result's auxiliary-payload table (§13) —
   dumpable via `distill dump-intermediates`, never pullable artifacts,
   never in manifests; `processed_shaders/` and committed `cooked_shaders/`
   disappear.
@@ -7812,11 +7791,11 @@ put production image codecs, mesh optimization, or shader compilers in core.
   map) that makes
   UUIDv5 children resolvable; results pin and evict as one unit, and
   chains aggregate — pinning a terminal artifact pins the terminal primary
-  plus every stage's extras. Result records also own an auxiliary-payload
-  table (`debug key → ContentHash`) for cache-internal debug records; durably, a
-  trailing **result record** is the commit marker — recovery never adopts
-  a partial output group, and uncovered payloads (debug included) are
-  garbage.
+  plus every stage's extras. A result also owns an auxiliary-payload
+  table (`debug key → ContentHash`) for cache-internal debug records; durably,
+  the transaction that indexes the group is its commit — a partial output
+  group publishes nothing, and an extent no row holds is released in the
+  transaction that drops its last holder.
 - **Static output declarations** (§9): processors declare a closed
   output-key set with types at registration; extras are terminal,
   target-invariant, and chain-unique — collision-free child UUIDs and

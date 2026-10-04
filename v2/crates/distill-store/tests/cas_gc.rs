@@ -8,7 +8,7 @@ use std::time::Duration;
 use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
 use distill_store::cas::record::KeyKind;
 use distill_store::cas::{
-    AuxSpec, BuildCommit, CommitOutcome, OutputSpec, PayloadKind, SegmentSweeper,
+    AuxSpec, BuildCommit, CommitOutcome, OutputSpec, SegmentSweeper,
 };
 use distill_store::{Store, StoreConfig, StoreError};
 use distill_wire::artifact::{write_artifact, ArtifactHeader};
@@ -33,10 +33,8 @@ fn commit_with_aux(
             key_kind: KeyKind::Processor,
             static_input_key: [key; 32],
             asset_uuid: PARENT,
-            static_inputs_canonical: vec![],
             trace: vec![key],
             outcome: CommitOutcome::Success {
-                payload_kind: PayloadKind::ProcessorOutput,
                 outputs: vec![OutputSpec {
                     output_key: String::new(),
                     type_uuids: vec![],
@@ -68,10 +66,8 @@ fn commit_artifact(
             key_kind: KeyKind::Processor,
             static_input_key: [key; 32],
             asset_uuid: PARENT,
-            static_inputs_canonical: vec![],
             trace: vec![key],
             outcome: CommitOutcome::Success {
-                payload_kind: PayloadKind::ProcessorOutput,
                 outputs: vec![OutputSpec {
                     output_key: String::new(),
                     type_uuids: vec![],
@@ -206,10 +202,8 @@ fn a_commit_naming_an_absent_wire_tree_is_refused() {
         key_kind: KeyKind::Processor,
         static_input_key: [1; 32],
         asset_uuid: PARENT,
-        static_inputs_canonical: vec![],
         trace: vec![1],
         outcome: CommitOutcome::Success {
-            payload_kind: PayloadKind::ProcessorOutput,
             outputs: vec![OutputSpec {
                 output_key: String::new(),
                 type_uuids: vec![],
@@ -370,7 +364,9 @@ fn compaction_keeps_a_shared_payload_for_its_surviving_result() {
 }
 
 #[test]
-fn compaction_preserves_failure_records() {
+fn compaction_leaves_failure_results() {
+    // A failure result is a row with no bytes: compacting the segments
+    // around it changes nothing it reads.
     // Failure records memoize at their basis (§13) — compaction must
     // carry them like any committed result.
     let dir = tempfile::tempdir().unwrap();
@@ -381,7 +377,6 @@ fn compaction_preserves_failure_records() {
             key_kind: KeyKind::Processor,
             static_input_key: [5u8; 32],
             asset_uuid: PARENT,
-            static_inputs_canonical: vec![],
             trace: b"failing trace".to_vec(),
             outcome: CommitOutcome::Failure {
                 cause: distill_store::cas::record::FailureCause::Local(
@@ -396,7 +391,7 @@ fn compaction_preserves_failure_records() {
     assert!(store
         .evict_result(KeyKind::Processor, &[6u8; 32], &digest)
         .unwrap());
-    assert!(store.compact().unwrap().records_copied > 0);
+    store.compact().unwrap();
     let candidates = store
         .lookup_candidates(KeyKind::Processor, &[5u8; 32])
         .unwrap();

@@ -167,7 +167,7 @@ fn a_failed_nested_write_rolls_back_only_its_own_writes() {
 fn a_failed_inline_build_flush_commits_no_partial_node() {
     use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
     use distill_store::cas::record::KeyKind;
-    use distill_store::cas::{BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
+    use distill_store::cas::{BuildCommit, CommitOutcome, OutputSpec};
     use distill_store::StoreError;
     use distill_wire::artifact::{write_artifact, ArtifactHeader};
     use distill_wire::dswl::{dswl_bytes, dswl_hash};
@@ -195,10 +195,8 @@ fn a_failed_inline_build_flush_commits_no_partial_node() {
             key_kind: KeyKind::Node,
             static_input_key: [key; 32],
             asset_uuid: AssetUuid([key; 16]),
-            static_inputs_canonical: vec![],
             trace: vec![key],
             outcome: CommitOutcome::Success {
-                payload_kind: PayloadKind::ProcessorOutput,
                 outputs: vec![OutputSpec {
                     output_key: String::new(),
                     type_uuids: vec![],

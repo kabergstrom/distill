@@ -241,7 +241,7 @@ pub fn trace_canonical_bytes(trace: &[TraceOp]) -> Vec<u8> {
     encoder.into_bytes()
 }
 
-/// The serialized trace body stored in a result record. The CAS applies the
+/// The serialized trace body stored in a `results` row. The CAS applies the
 /// `DSTR` domain and version to these bytes when deriving the candidate's
 /// secondary key, so storing the already-prefixed preimage would apply the
 /// domain twice.

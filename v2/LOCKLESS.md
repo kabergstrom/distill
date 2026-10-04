@@ -1183,7 +1183,7 @@ should reach zero by the end of phase 6.
   of an id truncates its file), and a lost tail is reported, not evicted.
   `live_len` and its six triggers are gone: the live bytes and each
   compaction candidate's are sums over covering `(segment, len)` indexes
-  on `cas_extents` and `result_candidates`.
+  on `cas_extents`.
 - **Claims survive a restart.** `source_claims` is input state committed
   with the publication it describes; open no longer clears it, so a warm
   restart's full publication diffs against it and writes only what

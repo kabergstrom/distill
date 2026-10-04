@@ -3,14 +3,14 @@
 //!
 //! Eviction is always *safe*: everything in the CAS is rebuildable. It
 //! deletes index rows only; a reader that loses the race sees a cache
-//! miss. `cas_refs` says what keeps each extent indexed, with a foreign
-//! key to `cas_extents`: releasing a holder deletes, in the same
-//! transaction, each extent only it held, and the key refuses to drop an
-//! extent something still references. No extent outlives its last
-//! reference and no reference outlives its extent, so nothing is ever
-//! pruned.
+//! miss. What keeps an extent indexed is a holder naming it: a result (its
+//! `result_outputs` rows) or an install (its `cas_refs` rows), each with a
+//! foreign key to `cas_extents`. Releasing a holder deletes, in the same
+//! transaction, each extent nothing names any more, and the keys refuse to
+//! drop an extent something still names. No extent outlives its last
+//! holder and no holder outlives its extent, so nothing is ever pruned.
 //!
-//! Compaction copies the live records of mostly-dead segments into new,
+//! Compaction copies the live extents of mostly-dead segments into new,
 //! sealed segments and repoints the index, all in one write transaction:
 //! it allocates, writes, fsyncs and indexes the copies and kills the old
 //! segments together, or (rolling back) none of it. It never rewrites a
@@ -19,13 +19,13 @@
 //! in [`crate::cas`]).
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::{Duration, Instant};
 
-use crate::cas::record::{decode_record, KeyKind, RecordKind, RECORD_HEADER_LEN};
+use crate::cas::record::KeyKind;
 use crate::cas::store::{
-    count_cas_write, fsync_dir, read_segment, segment_file_name, segment_open_options, SegmentKind,
-    HOLDER_INSTALLED, HOLDER_RESULT, SEGMENT_DEAD, SEGMENT_OPEN, SEGMENT_SEALED,
+    count_cas_write, fsync_dir, segment_file_name, segment_open_options, SegmentKind,
+    SEGMENT_DEAD, SEGMENT_OPEN, SEGMENT_SEALED,
 };
 use crate::db::Store;
 use crate::error::StoreError;
@@ -35,15 +35,15 @@ use crate::error::StoreError;
 pub struct EvictionSweep {
     /// Units evicted (whole results or installs).
     pub evicted: usize,
-    /// Bytes still indexed after the sweep: extents and result records.
+    /// Extent bytes still indexed after the sweep.
     pub live_bytes: u64,
 }
 
 /// What a compaction did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionReport {
-    /// Live records copied into new segments.
-    pub records_copied: usize,
+    /// Live extents copied into new segments.
+    pub extents_copied: usize,
     /// Indexed bytes of the segments that died, less the bytes copied.
     pub reclaimed_bytes: u64,
     /// Segments that died. Their files stay until [`SegmentSweeper`]
@@ -51,31 +51,14 @@ pub struct CompactionReport {
     pub dead_segments: Vec<u64>,
 }
 
-/// Drop one holder's references and the extents only it held; the extent
-/// bytes that freed.
-fn release_holder(
-    txn: &rusqlite::Connection,
-    holder_kind: i64,
-    holder: &[u8],
-) -> Result<u64, StoreError> {
+/// Delete the extents of `hashes` nothing holds any more; the bytes that
+/// freed.
+fn release_extents(txn: &rusqlite::Connection, hashes: Vec<Vec<u8>>) -> Result<u64, StoreError> {
     use rusqlite::OptionalExtension;
-    let hashes: Vec<Vec<u8>> = {
-        let mut statement = txn.prepare_cached(
-            "SELECT content_hash FROM cas_refs WHERE holder_kind = ?1 AND holder = ?2",
-        )?;
-        let rows = statement.query_map(rusqlite::params![holder_kind, holder], |row| row.get(0))?;
-        rows.collect::<Result<_, _>>()?
-    };
-    txn.prepare_cached("DELETE FROM cas_refs WHERE holder_kind = ?1 AND holder = ?2")?
-        .execute(rusqlite::params![holder_kind, holder])?;
     let mut freed = 0;
     for hash in hashes {
         freed += txn
-            .prepare_cached(
-                "DELETE FROM cas_extents WHERE content_hash = ?1
-                   AND NOT EXISTS (SELECT 1 FROM cas_refs WHERE content_hash = ?1)
-                 RETURNING len",
-            )?
+            .prepare_cached(RELEASE_EXTENT)?
             .query_row([hash], |row| row.get::<_, i64>(0))
             .optional()?
             .map_or(0, |len| len as u64);
@@ -83,97 +66,98 @@ fn release_holder(
     Ok(freed)
 }
 
-/// Delete one result's candidate row, returning its record's length.
-pub(crate) const EVICT_RESULT_ROW: &str = "DELETE FROM result_candidates
-     WHERE key_kind = ?1 AND static_key = ?2 AND trace_digest = ?3 RETURNING len";
+/// Delete extent `?1` when nothing holds it.
+pub(crate) const RELEASE_EXTENT: &str = "DELETE FROM cas_extents WHERE content_hash = ?1
+       AND NOT EXISTS (SELECT 1 FROM cas_refs WHERE content_hash = ?1)
+       AND NOT EXISTS (SELECT 1 FROM result_outputs WHERE content_hash = ?1)
+     RETURNING len";
 
-/// Evict one result row and everything only it held; `None` when there is
-/// no such row, else the bytes that freed (its record and extents).
+/// Drop one install's references and the extents only it held; the
+/// extent bytes that freed.
+fn release_install(txn: &rusqlite::Connection, holder: &[u8]) -> Result<u64, StoreError> {
+    let hashes: Vec<Vec<u8>> = {
+        let mut statement =
+            txn.prepare_cached("DELETE FROM cas_refs WHERE holder = ?1 RETURNING content_hash")?;
+        let rows = statement.query_map([holder], |row| row.get(0))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    release_extents(txn, hashes)
+}
+
+/// The extents one result names: deleted with it (by the cascade).
+pub(crate) const RESULT_EXTENTS: &str = "SELECT content_hash FROM result_outputs
+     WHERE key_kind = ?1 AND static_key = ?2 AND trace_digest = ?3";
+/// Delete one result; its `result_outputs` rows go with it.
+pub(crate) const EVICT_RESULT_ROW: &str = "DELETE FROM results
+     WHERE key_kind = ?1 AND static_key = ?2 AND trace_digest = ?3 RETURNING 1";
+
+/// Evict one result and everything only it held; `None` when there is no
+/// such result, else the extent bytes that freed.
 pub(crate) fn evict_result_rows(
     txn: &rusqlite::Connection,
-    key_kind: i64,
-    static_key: &[u8],
-    trace_digest: &[u8],
+    key_kind: KeyKind,
+    static_key: &[u8; 32],
+    trace_digest: &[u8; 32],
 ) -> Result<Option<u64>, StoreError> {
     use rusqlite::OptionalExtension;
-    let Some(record) = txn
+    let key = rusqlite::params![key_kind as i64, static_key.as_slice(), trace_digest.as_slice()];
+    let hashes: Vec<Vec<u8>> = {
+        let mut statement = txn.prepare_cached(RESULT_EXTENTS)?;
+        let rows = statement.query_map(key, |row| row.get(0))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    if txn
         .prepare_cached(EVICT_RESULT_ROW)?
-        .query_row(rusqlite::params![key_kind, static_key, trace_digest], |row| {
-            row.get::<_, i64>(0)
-        })
+        .query_row(key, |_| Ok(()))
         .optional()?
-    else {
+        .is_none()
+    {
         return Ok(None);
-    };
-    let mut holder = Vec::with_capacity(65);
-    holder.push(key_kind as u8);
-    holder.extend_from_slice(static_key);
-    holder.extend_from_slice(trace_digest);
-    Ok(Some(record as u64 + release_holder(txn, HOLDER_RESULT, &holder)?))
-}
-
-/// Evict one holder: a result (its candidate row too) or an install, and
-/// what only it held; the bytes that freed. A result holder whose row is
-/// gone still has its references released.
-pub(crate) fn evict_holder(
-    txn: &rusqlite::Connection,
-    holder_kind: i64,
-    holder: &[u8],
-) -> Result<u64, StoreError> {
-    let row = if holder_kind == HOLDER_RESULT && holder.len() == 65 {
-        evict_result_rows(txn, i64::from(holder[0]), &holder[1..33], &holder[33..65])?
-    } else {
-        None
-    };
-    match row {
-        Some(freed) => Ok(freed),
-        None => release_holder(txn, holder_kind, holder),
     }
+    release_extents(txn, hashes).map(Some)
 }
 
-/// One eviction victim, sampled: the holder of the first reference at or
-/// after a random content hash (`cas_refs_by_hash`), so a holder is drawn
-/// about in proportion to the extents it holds.
-pub(crate) const SAMPLE_HOLDER: &str = "SELECT holder_kind, holder FROM cas_refs
-     WHERE content_hash >= randomblob(32) ORDER BY content_hash LIMIT 1";
-/// The holder of the least reference, when the random hash lay past them.
-pub(crate) const FIRST_HOLDER: &str =
-    "SELECT holder_kind, holder FROM cas_refs ORDER BY content_hash LIMIT 1";
-/// The bytes the index holds: its extents and result records, each summed
-/// over its `(segment, len)` covering index. Run only when the CAS index
-/// changed since the last pass (`store_meta.cas_writes`).
-pub(crate) const LIVE_BYTES: &str = "SELECT
-     (SELECT COALESCE(SUM(len), 0) FROM cas_extents)
-     + (SELECT COALESCE(SUM(len), 0) FROM result_candidates)";
+/// One eviction victim, sampled: the holder of the first extent at or
+/// after content hash `?1` — a result (`key_kind`, `static_key`,
+/// `trace_digest`) or an install (`static_key` = the holder, the others
+/// NULL) — so a holder is drawn about in proportion to the extents it
+/// holds. Bound to a random hash, then, past the last, to the empty blob
+/// (which sorts first).
+pub(crate) const SAMPLE_HOLDER: &str = "SELECT * FROM (
+       SELECT content_hash, key_kind, static_key, trace_digest FROM result_outputs
+       WHERE content_hash >= ?1 ORDER BY content_hash LIMIT 1)
+     UNION ALL
+     SELECT * FROM (
+       SELECT content_hash, NULL, holder, NULL FROM cas_refs
+       WHERE content_hash >= ?1 ORDER BY content_hash LIMIT 1)
+     ORDER BY 1 LIMIT 1";
+/// The extent bytes the index holds, summed over the `(segment, len)`
+/// covering index. Run only when the CAS index changed since the last
+/// pass (`store_meta.cas_writes`).
+pub(crate) const LIVE_BYTES: &str = "SELECT COALESCE(SUM(len), 0) FROM cas_extents";
 /// The segments compaction considers, each with the bytes the index holds
-/// in it (one covering-index range per table): the sealed ones (state
-/// `?1`, a key range of `cas_segments_by_state`) and the compacting writer
-/// `?2`'s open segment (the unique partial index the literals select).
+/// in it (a covering-index range): the sealed ones (state `?1`, a key
+/// range of `cas_segments_by_state`) and the compacting writer `?2`'s open
+/// segment (the unique partial index the literals select).
 pub(crate) const COMPACTION_CANDIDATES: &str =
     "SELECT segment_id, file_name, segment_kind, indexed_len,
        (SELECT COALESCE(SUM(len), 0) FROM cas_extents WHERE segment = s.segment_id)
-       + (SELECT COALESCE(SUM(len), 0) FROM result_candidates WHERE segment = s.segment_id)
      FROM cas_segments s WHERE state = ?1
      UNION ALL
      SELECT segment_id, file_name, segment_kind, indexed_len,
        (SELECT COALESCE(SUM(len), 0) FROM cas_extents WHERE segment = s.segment_id)
-       + (SELECT COALESCE(SUM(len), 0) FROM result_candidates WHERE segment = s.segment_id)
      FROM cas_segments s WHERE owner = ?2 AND state = 0 AND segment_kind = 0
      ORDER BY segment_id";
 const _: () = assert!(SEGMENT_OPEN == 0);
 /// The segments in state `?1`.
 pub(crate) const SEGMENTS_IN_STATE: &str =
     "SELECT segment_id, file_name FROM cas_segments WHERE state = ?1";
+/// The extents segment `?1` holds, where they lie.
+pub(crate) const SEGMENT_EXTENTS: &str =
+    "SELECT content_hash, offset, len FROM cas_extents WHERE segment = ?1";
 /// Most victims one sweep samples; a sweep that stops short leaves the rest
 /// to the next pass.
 const MAX_VICTIMS: usize = 4096;
-
-/// A record compaction copies, and the index row that points at it.
-enum Moved {
-    /// An extent, and its payload's offset within the record.
-    Extent([u8; 32], u64),
-    Result(i64, Vec<u8>, Vec<u8>),
-}
 
 impl Store {
     /// Evict one committed result as a whole unit. `Ok(false)` when the
@@ -187,13 +171,7 @@ impl Store {
     ) -> Result<bool, StoreError> {
         self.write_txn(|store| {
             count_cas_write(&store.conn)?;
-            Ok(evict_result_rows(
-                &store.conn,
-                key_kind as i64,
-                static_key.as_slice(),
-                trace_digest.as_slice(),
-            )?
-            .is_some())
+            Ok(evict_result_rows(&store.conn, key_kind, static_key, trace_digest)?.is_some())
         })
     }
 
@@ -201,7 +179,7 @@ impl Store {
     pub fn evict_installed(&mut self, hash: &[u8; 32]) -> Result<(), StoreError> {
         self.write_txn(|store| {
             count_cas_write(&store.conn)?;
-            release_holder(&store.conn, HOLDER_INSTALLED, hash).map(drop)
+            release_install(&store.conn, hash).map(drop)
         })
     }
 
@@ -224,19 +202,38 @@ impl Store {
                 .query_row([], |r| r.get::<_, i64>(0))? as u64;
             let mut evicted = 0usize;
             while live_bytes > cache_limit && evicted < MAX_VICTIMS {
-                let sample = |sql| {
-                    txn.prepare_cached(sql)?
-                        .query_row([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))
-                        .optional()
+                type Victim = (Option<i64>, Vec<u8>, Option<Vec<u8>>);
+                let sample = |from: &[u8]| -> Result<Option<Victim>, StoreError> {
+                    Ok(txn
+                        .prepare_cached(SAMPLE_HOLDER)?
+                        .query_row([from], |r| Ok((r.get(1)?, r.get(2)?, r.get(3)?)))
+                        .optional()?)
                 };
-                let victim = match sample(SAMPLE_HOLDER)? {
+                let mut from = [0u8; 32];
+                getrandom::getrandom(&mut from).expect("OS randomness unavailable");
+                let victim = match sample(&from)? {
                     Some(victim) => Some(victim),
-                    None => sample(FIRST_HOLDER)?,
+                    None => sample(&[])?,
                 };
-                let Some((holder_kind, holder)) = victim else {
-                    break;
+                let freed = match victim {
+                    None => break,
+                    Some((Some(key_kind), static_key, Some(trace_digest))) => {
+                        let key_kind = u8::try_from(key_kind)
+                            .ok()
+                            .and_then(KeyKind::from_byte)
+                            .ok_or_else(|| StoreError::BadResultPayload {
+                                detail: format!("unknown key kind {key_kind}"),
+                            })?;
+                        evict_result_rows(
+                            txn,
+                            key_kind,
+                            &crate::bundles::blob32(static_key),
+                            &crate::bundles::blob32(trace_digest),
+                        )?
+                        .unwrap_or(0)
+                    }
+                    Some((_, holder, _)) => release_install(txn, &holder)?,
                 };
-                let freed = evict_holder(txn, holder_kind, &holder)?;
                 evicted += 1;
                 live_bytes = live_bytes.saturating_sub(freed);
             }
@@ -248,7 +245,7 @@ impl Store {
     }
 
     /// The segments compaction acts on: those nothing references (they
-    /// die) and regular ones whose live records fill at most half of them
+    /// die) and regular ones whose live extents fill at most half of them
     /// (copied, then they die). A sealed segment, or this writer's open one.
     fn compaction_candidates(&self) -> Result<Vec<CompactionCandidate>, StoreError> {
         let mut statement = self.conn.prepare_cached(COMPACTION_CANDIDATES)?;
@@ -281,7 +278,7 @@ impl Store {
     }
 
     /// Compact the CAS. A sealed segment (or this writer's open one) that
-    /// nothing references any more dies; a regular one whose live records
+    /// nothing references any more dies; a regular one whose live extents
     /// fill at most half of it has them copied into new sealed segments,
     /// the index repointed, and then dies. Everything after the first read
     /// is one write transaction: the copies' segments are allocated,
@@ -294,7 +291,7 @@ impl Store {
         // Nothing to compact is answered without the write lock.
         if self.compaction_candidates()?.is_empty() {
             return Ok(CompactionReport {
-                records_copied: 0,
+                extents_copied: 0,
                 reclaimed_bytes: 0,
                 dead_segments: Vec::new(),
             });
@@ -305,75 +302,37 @@ impl Store {
     fn compact_locked(&mut self) -> Result<CompactionReport, StoreError> {
         let candidates = self.compaction_candidates()?;
         let mut victims = Vec::new();
-        // (record bytes, old segment, old record offset, index row).
-        let mut payloads: Vec<(Vec<u8>, u64, u64, Moved)> = Vec::new();
-        let mut results: Vec<(Vec<u8>, u64, u64, Moved)> = Vec::new();
+        // (extent bytes, old segment, old offset, hash).
+        let mut extents: Vec<(Vec<u8>, u64, u64, Vec<u8>)> = Vec::new();
         for candidate in &candidates {
             victims.push(candidate.id);
             if candidate.live == 0 {
                 continue;
             }
-            let extents: HashMap<[u8; 32], u64> = {
-                let mut statement = self
-                    .conn
-                    .prepare_cached("SELECT content_hash, offset FROM cas_extents WHERE segment = ?1")?;
-                let rows = statement.query_map([candidate.id as i64], |row| {
-                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
-                })?;
-                let mut out = HashMap::new();
-                for row in rows {
-                    let (hash, offset) = row?;
-                    out.insert(crate::bundles::blob32(hash), offset as u64);
-                }
-                out
-            };
-            type ResultKey = (i64, Vec<u8>, Vec<u8>);
-            let result_rows: HashMap<u64, ResultKey> = {
-                let mut statement = self.conn.prepare_cached(
-                    "SELECT offset, key_kind, static_key, trace_digest FROM result_candidates
-                     WHERE segment = ?1",
-                )?;
-                let rows = statement.query_map([candidate.id as i64], |row| {
-                    Ok((row.get::<_, i64>(0)?, (row.get(1)?, row.get(2)?, row.get(3)?)))
-                })?;
-                let mut out = HashMap::new();
-                for row in rows {
-                    let (offset, key) = row?;
-                    out.insert(offset as u64, key);
-                }
-                out
-            };
-            let data = read_segment(&self.cas.dir.join(&candidate.name))?;
-            let end = (candidate.indexed_len as usize).min(data.len());
-            let mut position = 0u64;
-            while (position as usize) < end {
-                let decoded = decode_record(&data[position as usize..end], candidate.id, position)?;
-                let record = &decoded.record;
-                let bytes = data[position as usize..(position + decoded.encoded_len) as usize].to_vec();
-                if record.kind == RecordKind::Result {
-                    if let Some((kind, static_key, trace)) = result_rows.get(&position) {
-                        let moved = Moved::Result(*kind, static_key.clone(), trace.clone());
-                        results.push((bytes, candidate.id, position, moved));
-                    }
-                } else {
-                    let payload_start = RECORD_HEADER_LEN as u64
-                        + record.static_input_key.len() as u64
-                        + record.output_key.len() as u64;
-                    if extents.get(&decoded.content_hash) == Some(&(position + payload_start)) {
-                        let moved = Moved::Extent(decoded.content_hash, payload_start);
-                        payloads.push((bytes, candidate.id, position, moved));
-                    }
-                }
-                position += decoded.encoded_len;
+            let path = self.cas.dir.join(&candidate.name);
+            let mut file = segment_open_options()
+                .read(true)
+                .open(&path)
+                .map_err(|source| StoreError::Io { path: path.clone(), source })?;
+            let mut statement = self.conn.prepare_cached(SEGMENT_EXTENTS)?;
+            let mut rows = statement.query([candidate.id as i64])?;
+            while let Some(row) = rows.next()? {
+                let hash: Vec<u8> = row.get(0)?;
+                let offset = row.get::<_, i64>(1)? as u64;
+                let mut bytes = vec![0u8; row.get::<_, i64>(2)? as usize];
+                file.seek(SeekFrom::Start(offset))
+                    .and_then(|_| file.read_exact(&mut bytes))
+                    .map_err(|source| StoreError::Io { path: path.clone(), source })?;
+                extents.push((bytes, candidate.id, offset, hash));
             }
         }
         // Lay the copies out in new segments, rolling at the cap.
         let segment_size = self.config.segment_size;
         let mut written: Vec<Vec<u8>> = Vec::new();
-        // (destination index in `written`, offset, len, old segment, old
-        // offset, index row).
+        // (destination index in `written`, offset, old segment, old
+        // offset, hash).
         let mut moves = Vec::new();
-        for (bytes, old_segment, old_offset, moved) in payloads.into_iter().chain(results) {
+        for (bytes, old_segment, old_offset, hash) in extents {
             let roll = match written.last() {
                 None => true,
                 Some(segment) => {
@@ -387,7 +346,7 @@ impl Store {
             let segment = &mut written[index];
             let offset = segment.len() as u64;
             segment.extend_from_slice(&bytes);
-            moves.push((index, offset, bytes.len() as u64, old_segment, old_offset, moved));
+            moves.push((index, offset, old_segment, old_offset, hash));
         }
         // Each copy's segment is allocated sealed (no writer appends to
         // it), then written and fsynced before the index names it.
@@ -406,50 +365,28 @@ impl Store {
             destinations.push(id);
         }
 
-        let records_copied = moves.len();
+        let extents_copied = moves.len();
         let copied_bytes: u64 = written.iter().map(|bytes| bytes.len() as u64).sum();
         let txn = &*self.conn;
         count_cas_write(txn)?;
-        for (index, offset, len, old_segment, old_offset, moved) in &moves {
-            let segment = destinations[*index];
-            match moved {
-                Moved::Extent(hash, payload_start) => {
-                    txn.prepare_cached(
-                        "UPDATE cas_extents SET segment = ?2, offset = ?3
-                         WHERE content_hash = ?1 AND segment = ?4 AND offset = ?5",
-                    )?
-                    .execute(rusqlite::params![
-                        hash.as_slice(),
-                        segment as i64,
-                        (*offset + *payload_start) as i64,
-                        *old_segment as i64,
-                        (*old_offset + *payload_start) as i64
-                    ])?;
-                }
-                Moved::Result(kind, static_key, trace) => {
-                    txn.prepare_cached(
-                        "UPDATE result_candidates SET segment = ?4, offset = ?5, len = ?6
-                         WHERE key_kind = ?1 AND static_key = ?2 AND trace_digest = ?3
-                           AND segment = ?7 AND offset = ?8",
-                    )?
-                    .execute(rusqlite::params![
-                        kind,
-                        static_key.as_slice(),
-                        trace.as_slice(),
-                        segment as i64,
-                        *offset as i64,
-                        *len as i64,
-                        *old_segment as i64,
-                        *old_offset as i64
-                    ])?;
-                }
-            }
+        for (index, offset, old_segment, old_offset, hash) in &moves {
+            txn.prepare_cached(
+                "UPDATE cas_extents SET segment = ?2, offset = ?3
+                 WHERE content_hash = ?1 AND segment = ?4 AND offset = ?5",
+            )?
+            .execute(rusqlite::params![
+                hash.as_slice(),
+                destinations[*index] as i64,
+                *offset as i64,
+                *old_segment as i64,
+                *old_offset as i64
+            ])?;
         }
         for (id, bytes) in destinations.iter().zip(&written) {
             txn.prepare_cached("UPDATE cas_segments SET indexed_len = ?2 WHERE segment_id = ?1")?
                 .execute(rusqlite::params![*id as i64, bytes.len() as i64])?;
         }
-        // Every live record of a victim moved in this transaction, which
+        // Every live extent of a victim moved in this transaction, which
         // holds the write lock: nothing references a victim now.
         for victim in &victims {
             txn.prepare_cached("UPDATE cas_segments SET state = ?2 WHERE segment_id = ?1")?
@@ -457,7 +394,7 @@ impl Store {
         }
         let dead_bytes: u64 = candidates.iter().map(|candidate| candidate.indexed_len).sum();
         Ok(CompactionReport {
-            records_copied,
+            extents_copied,
             reclaimed_bytes: dead_bytes.saturating_sub(copied_bytes),
             dead_segments: victims,
         })
@@ -551,25 +488,31 @@ mod tests {
     use distill_wire::wire::WireNode;
 
     use crate::cas::record::KeyKind;
-    use crate::cas::{BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
+    use crate::cas::{BuildCommit, CommitOutcome, OutputSpec};
     use crate::{Store, StoreConfig, StoreError};
 
-    use super::{FIRST_HOLDER, LIVE_BYTES, SAMPLE_HOLDER};
+    use super::{LIVE_BYTES, SAMPLE_HOLDER};
 
     #[test]
     fn eviction_reads_are_planned_on_indexes() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(StoreConfig::new(dir.path().join("state"))).unwrap();
-        let cases: &[(&str, &[&str])] = &[
-            (
-                SAMPLE_HOLDER,
-                &["SEARCH cas_refs USING COVERING INDEX cas_refs_by_hash (content_hash>?)"],
-            ),
-            (FIRST_HOLDER, &["SCAN cas_refs USING COVERING INDEX cas_refs_by_hash"]),
-        ];
-        for (sql, expected) in cases {
-            assert_eq!(&store.query_plan_details(sql).unwrap(), expected, "{sql}");
-        }
+        assert_eq!(
+            store.query_plan_details(SAMPLE_HOLDER).unwrap(),
+            [
+                "MERGE (UNION ALL)",
+                "LEFT",
+                "CO-ROUTINE (subquery-1)",
+                "SEARCH result_outputs USING COVERING INDEX result_outputs_by_hash (content_hash>?)",
+                "SCAN (subquery-1)",
+                "USE TEMP B-TREE FOR ORDER BY",
+                "RIGHT",
+                "CO-ROUTINE (subquery-3)",
+                "SEARCH cas_refs USING COVERING INDEX cas_refs_by_hash (content_hash>?)",
+                "SCAN (subquery-3)",
+                "USE TEMP B-TREE FOR ORDER BY",
+            ]
+        );
     }
 
     static STATEMENTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
@@ -587,10 +530,8 @@ mod tests {
                 key_kind: KeyKind::Processor,
                 static_input_key: key,
                 asset_uuid: AssetUuid([7; 16]),
-                static_inputs_canonical: vec![],
                 trace: vec![1],
                 outcome: CommitOutcome::Success {
-                    payload_kind: PayloadKind::ProcessorOutput,
                     outputs: vec![OutputSpec {
                         output_key: String::new(),
                         type_uuids: vec![],
@@ -623,7 +564,10 @@ mod tests {
         store.trace_statements(None);
         let statements = std::mem::take(&mut *STATEMENTS.lock().unwrap());
         // A sample past the last hash falls back to the first: one more.
-        let fallbacks = statements.iter().filter(|sql| sql.as_str() == FIRST_HOLDER).count();
+        let fallbacks = statements
+            .iter()
+            .filter(|sql| sql.contains("content_hash >= X''"))
+            .count();
         let sums = statements.iter().filter(|sql| sql.as_str() == LIVE_BYTES).count();
         (sweep.evicted, statements.len() - fallbacks, sums)
     }
@@ -646,7 +590,7 @@ mod tests {
     /// What a CAS pass within the cap (sweep and compaction) and a reopen
     /// with nothing to recover fetch over `results` committed results:
     /// `(pass pages, open pages, covering-index pages, table pages)`, the
-    /// last two for `cas_extents` and `result_candidates`.
+    /// last two for `cas_extents`.
     fn pass_and_open_pages(results: u32) -> (u64, u64, u64, u64) {
         let dir = tempfile::tempdir().unwrap();
         let config = StoreConfig::new(dir.path().join("state"));
@@ -668,16 +612,16 @@ mod tests {
                 )
                 .unwrap() as u64
         };
-        let index_pages = pages("'cas_extents_by_segment', 'result_candidates_by_segment'");
-        let table_pages = pages("'cas_extents', 'result_candidates'");
+        let index_pages = pages("'cas_extents_by_segment'");
+        let table_pages = pages("'cas_extents'");
         drop(store);
         let (store, recovery) = Store::open_with_recovery(config).unwrap();
         assert_eq!(recovery, crate::cas::RecoveryReport::default());
         (pass, store.pages_fetched().unwrap(), index_pages, table_pages)
     }
 
-    /// The live bytes and each compactable segment's are sums over the two
-    /// covering indexes, read once each: the pass grows with those indexes'
+    /// The live bytes and each compactable segment's are sums over the
+    /// covering index, read once each: the pass grows with those indexes'
     /// pages and reads no table page. Recovery reads segment rows only and
     /// does not grow with the CAS at all.
     #[test]
@@ -713,7 +657,9 @@ mod tests {
                 .conn
                 .query_row(
                     "SELECT COUNT(*) FROM cas_extents e WHERE NOT EXISTS
-                       (SELECT 1 FROM cas_refs r WHERE r.content_hash = e.content_hash)",
+                       (SELECT 1 FROM cas_refs r WHERE r.content_hash = e.content_hash)
+                     AND NOT EXISTS
+                       (SELECT 1 FROM result_outputs o WHERE o.content_hash = e.content_hash)",
                     [],
                     |row| row.get(0),
                 )
@@ -722,13 +668,14 @@ mod tests {
             assert!(open_segments(store) <= 1);
         };
         check(&store);
-        for key in digests.iter().step_by(3) {
+        // Two in three go: the survivors fill under half of each segment.
+        for key in digests.iter().enumerate().filter(|(index, _)| index % 3 != 1).map(|(_, key)| key) {
             let digest = store.lookup_candidates(KeyKind::Processor, key).unwrap()[0].trace_digest;
             assert!(store.evict_result(KeyKind::Processor, key, &digest).unwrap());
         }
         check(&store);
         let compaction = store.compact().unwrap();
-        assert!(compaction.records_copied > 0);
+        assert!(compaction.extents_copied > 0);
         assert!(!compaction.dead_segments.is_empty());
         check(&store);
         for key in digests.iter().skip(1).step_by(3) {
@@ -818,10 +765,8 @@ mod tests {
                 key_kind: KeyKind::Processor,
                 static_input_key: [1; 32],
                 asset_uuid: AssetUuid([7; 16]),
-                static_inputs_canonical: vec![],
                 trace: vec![1],
                 outcome: CommitOutcome::Success {
-                    payload_kind: PayloadKind::ProcessorOutput,
                     outputs: vec![OutputSpec {
                         output_key: String::new(),
                         type_uuids: vec![],
@@ -836,7 +781,7 @@ mod tests {
         let dangling: i64 = a
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM cas_refs r WHERE NOT EXISTS
+                "SELECT COUNT(*) FROM result_outputs r WHERE NOT EXISTS
                    (SELECT 1 FROM cas_extents e WHERE e.content_hash = r.content_hash)",
                 [],
                 |row| row.get(0),
@@ -867,7 +812,7 @@ mod tests {
     #[test]
     fn compaction_never_kills_a_segment_a_group_is_being_written_to() {
         // Writer `b` commits a group that rolls its segment mid-group: the
-        // output lands in S0, the result record in S1. Before `b`'s index
+        // first output lands in S0, the second in S1. Before `b`'s index
         // rows commit, writer `a` runs the CAS pass. S0 must not look like a
         // sealed segment nothing references.
         let dir = tempfile::tempdir().unwrap();
@@ -888,25 +833,33 @@ mod tests {
         }));
         let output = vec![9u8; 300];
         let hash = *blake3::hash(&output).as_bytes();
+        let second = vec![8u8; 300];
+        let second_hash = *blake3::hash(&second).as_bytes();
         b.commit_build(BuildCommit {
             wire_trees: Vec::new(),
             key_kind: KeyKind::Processor,
             static_input_key: [1; 32],
             asset_uuid: AssetUuid([7; 16]),
-            static_inputs_canonical: vec![],
             trace: vec![1],
             outcome: CommitOutcome::Success {
-                payload_kind: PayloadKind::ProcessorOutput,
-                outputs: vec![OutputSpec {
-                    output_key: String::new(),
-                    type_uuids: vec![],
-                    bytes: output.clone(),
-                }],
+                outputs: vec![
+                    OutputSpec {
+                        output_key: String::new(),
+                        type_uuids: vec![],
+                        bytes: output.clone(),
+                    },
+                    OutputSpec {
+                        output_key: "second".to_owned(),
+                        type_uuids: vec![],
+                        bytes: second.clone(),
+                    },
+                ],
                 aux: vec![],
             },
         })
         .unwrap();
         b.before_commit = None;
+        assert_eq!(b.cas_read(&second_hash).unwrap(), second);
         let read = b.cas_read(&hash);
         assert!(
             read.as_deref().ok() == Some(output.as_slice()),
@@ -1035,7 +988,7 @@ mod tests {
         // left. A savepoint whose allocation no later one reuses leaves only
         // a file past `next_segment_id`: nothing deletes it, and the next
         // allocation of its id truncates it.
-        let payload = |byte: u8| vec![byte; 100];
+        let payload = |byte: u8| vec![byte; 200];
         let dir = tempfile::tempdir().unwrap();
         let mut config = StoreConfig::new(dir.path().join("state"));
         config.segment_size = 256;

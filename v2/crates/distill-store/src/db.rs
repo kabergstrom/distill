@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 45;
+pub const SCHEMA_VERSION: u32 = 46;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -291,25 +291,44 @@ CREATE TABLE path_index (
     PRIMARY KEY (path, root_id)
 );
 CREATE INDEX path_index_by_asset ON path_index(asset_uuid);
-CREATE TABLE result_candidates (
+-- A committed build result (§13): one candidate of the bucket its
+-- static-input key names, the memo of one dependency trace. `failure` is
+-- the encoded `FailureCause` of a deterministic failure, NULL for a
+-- success. Its outputs are its `result_outputs` rows.
+CREATE TABLE results (
     key_kind     INTEGER NOT NULL,
     static_key   BLOB NOT NULL,
     trace_digest BLOB NOT NULL,
     memo_seq     INTEGER NOT NULL,
-    segment      INTEGER NOT NULL,
-    offset       INTEGER NOT NULL,
-    len          INTEGER NOT NULL,
+    asset_uuid   BLOB NOT NULL,
+    trace        BLOB NOT NULL,
+    failure      BLOB,
     PRIMARY KEY (key_kind, static_key, trace_digest)
 );
+-- What a result names in the CAS, and so holds there. role 0: an output
+-- (name = its output key, types = its type uuids, 16 bytes each); 1: an
+-- aux payload (name = its debug key); 2: the wire tree output `name`
+-- names. The foreign keys go with the result and refuse to drop an
+-- extent a result still names.
+CREATE TABLE result_outputs (
+    key_kind     INTEGER NOT NULL,
+    static_key   BLOB NOT NULL,
+    trace_digest BLOB NOT NULL,
+    role         INTEGER NOT NULL CHECK (role IN (0, 1, 2)),
+    name         TEXT NOT NULL,
+    types        BLOB,
+    content_hash BLOB NOT NULL REFERENCES cas_extents(content_hash),
+    PRIMARY KEY (key_kind, static_key, trace_digest, role, name),
+    FOREIGN KEY (key_kind, static_key, trace_digest)
+        REFERENCES results(key_kind, static_key, trace_digest) ON DELETE CASCADE
+) WITHOUT ROWID;
+CREATE INDEX result_outputs_by_hash ON result_outputs(content_hash);
 CREATE TABLE derived_outputs (
     child_uuid  BLOB NOT NULL PRIMARY KEY,
     parent_uuid BLOB NOT NULL,
     output_key  TEXT NOT NULL,
     terminal_type BLOB
 );
--- Schema 40: a segment's result records with their lengths, so the bytes
--- a segment holds are a covering-index sum.
-CREATE INDEX result_candidates_by_segment ON result_candidates(segment, len);
 CREATE TABLE cas_extents (
     content_hash BLOB NOT NULL PRIMARY KEY,
     segment      INTEGER NOT NULL,
@@ -319,17 +338,15 @@ CREATE TABLE cas_extents (
 -- Schema 40: a segment's extents with their lengths: the bytes a segment
 -- holds, and the CAS's live bytes, are covering-index sums.
 CREATE INDEX cas_extents_by_segment ON cas_extents(segment, len);
--- What keeps an extent indexed. holder_kind 0: a result (holder = key_kind
--- byte, static key, trace digest) names its outputs, aux payloads and
--- output wire trees. holder_kind 1: an installed artifact or wire tree
--- (holder = its own hash). Releasing a holder deletes, in the same
+-- What an install holds: an installed artifact or wire tree (holder = its
+-- own hash) holds itself and the wire tree an artifact names. Releasing
+-- a holder (or a result, see `result_outputs`) deletes, in the same
 -- transaction, each extent it held that nothing else references; the
 -- foreign key refuses to drop an extent something still references.
 CREATE TABLE cas_refs (
-    holder_kind  INTEGER NOT NULL CHECK (holder_kind IN (0, 1)),
     holder       BLOB NOT NULL,
     content_hash BLOB NOT NULL REFERENCES cas_extents(content_hash),
-    PRIMARY KEY (holder_kind, holder, content_hash)
+    PRIMARY KEY (holder, content_hash)
 ) WITHOUT ROWID;
 CREATE INDEX cas_refs_by_hash ON cas_refs(content_hash);
 -- Every segment file. state 0: a writer may still append; 1: sealed;

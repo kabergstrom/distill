@@ -33,14 +33,6 @@ pub fn static_inputs_digest(inputs: &StaticInputs) -> [u8; 32] {
     domain_digest(DSSI, 1, |e| encode_static(e, inputs))
 }
 
-/// Canonical DSSI body retained in result records for audit/recovery.  The
-/// CAS index still keys only on [`static_inputs_digest`].
-pub fn static_inputs_canonical_bytes(inputs: &StaticInputs) -> Vec<u8> {
-    let mut encoder = CanonicalEncoder::new();
-    encode_static(&mut encoder, inputs);
-    encoder.into_bytes()
-}
-
 fn encode_static(e: &mut CanonicalEncoder, inputs: &StaticInputs) {
     e.raw(&inputs.asset.0);
     e.u16(inputs.stage);
@@ -205,13 +197,6 @@ pub struct NodeInputs {
 /// The `"DSNK"` node key.
 pub fn node_digest(inputs: &NodeInputs) -> [u8; 32] {
     domain_digest(DSNK, 2, |e| encode_node(e, inputs))
-}
-
-/// Canonical DSNK body retained in the node's result record.
-pub fn node_canonical_bytes(inputs: &NodeInputs) -> Vec<u8> {
-    let mut encoder = CanonicalEncoder::new();
-    encode_node(&mut encoder, inputs);
-    encoder.into_bytes()
 }
 
 fn encode_node(e: &mut CanonicalEncoder, inputs: &NodeInputs) {

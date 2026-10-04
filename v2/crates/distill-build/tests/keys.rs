@@ -227,7 +227,7 @@ fn node_inputs() -> distill_build::keys::NodeInputs {
 
 #[test]
 fn the_node_key_covers_static_inputs_only_and_ignores_declaration_order() {
-    use distill_build::keys::{node_canonical_bytes, node_digest};
+    use distill_build::keys::node_digest;
     let inputs = node_inputs();
     let key = node_digest(&inputs);
     assert_eq!(key, node_digest(&inputs.clone()));
@@ -260,6 +260,4 @@ fn the_node_key_covers_static_inputs_only_and_ignores_declaration_order() {
         key,
         "a build-only policy change is a new node"
     );
-
-    assert!(!node_canonical_bytes(&inputs).is_empty());
 }

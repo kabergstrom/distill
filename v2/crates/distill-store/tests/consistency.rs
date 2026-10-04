@@ -9,7 +9,7 @@ use distill_core::target_set::CanonicalTargetSet;
 use distill_core::tool::ToolCwdPolicy;
 use distill_store::bundles::{AssetRecord, BundleMeta};
 use distill_store::cas::record::KeyKind;
-use distill_store::cas::{BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
+use distill_store::cas::{BuildCommit, CommitOutcome, OutputSpec};
 use distill_store::pipeline::ValidatedPipelineEpoch;
 use distill_store::pipeline::{ResolvedToolPackageFile, ResolvedToolSourceV2, ToolRegistrationV2};
 use distill_store::state::{
@@ -70,10 +70,8 @@ fn commit(store: &mut Store, key: u8) {
             key_kind: KeyKind::Processor,
             static_input_key: [key; 32],
             asset_uuid: AssetUuid([7u8; 16]),
-            static_inputs_canonical: vec![],
             trace: vec![key],
             outcome: CommitOutcome::Success {
-                payload_kind: PayloadKind::ProcessorOutput,
                 outputs: vec![OutputSpec {
                     output_key: String::new(),
                     type_uuids: vec![],
