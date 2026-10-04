@@ -484,7 +484,15 @@ fn replace(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 /// `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`:
-/// an atomic replace on one volume, durable when it returns.
+/// an atomic replace on one volume.
+///
+/// `MoveFileExW` refuses (`ERROR_ACCESS_DENIED`) to replace a target any
+/// process holds open, even one opened with `FILE_SHARE_DELETE` (a reader
+/// of the old bytes, the scanner hashing it). [`fs::rename`] then retries
+/// as a POSIX-semantics rename (`FileRenameInfoEx`), which replaces the
+/// name while such handles go on reading the old file. A holder without
+/// `FILE_SHARE_DELETE` still blocks it: the call fails and the target is
+/// unchanged.
 #[cfg(windows)]
 fn replace(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
@@ -497,20 +505,25 @@ fn replace(from: &Path, to: &Path) -> io::Result<()> {
             .chain(std::iter::once(0))
             .collect::<Vec<u16>>()
     };
-    let (from, to) = (wide(from), wide(to));
+    let (from_wide, to_wide) = (wide(from), wide(to));
     // SAFETY: both arguments are NUL-terminated UTF-16 strings that outlive
     // the call.
     let moved = unsafe {
         MoveFileExW(
-            from.as_ptr(),
-            to.as_ptr(),
+            from_wide.as_ptr(),
+            to_wide.as_ptr(),
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
     };
-    if moved == 0 {
-        Err(io::Error::last_os_error())
+    if moved != 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) {
+        fs::rename(from, to)
     } else {
-        Ok(())
+        Err(error)
     }
 }
 
@@ -639,6 +652,26 @@ mod tests {
         ));
         assert_eq!(fs::read(&to).unwrap(), b"a");
         assert_eq!(fs::read(&from).unwrap(), b"c");
+    }
+
+    /// A reader holding the target open (with `FILE_SHARE_DELETE`, as std
+    /// opens files) does not block the replace, even on Windows, and goes
+    /// on reading the old bytes.
+    #[test]
+    fn a_target_held_open_is_replaced_and_the_holder_reads_the_old_bytes() {
+        use std::io::Read;
+
+        let temp = tempfile::tempdir().unwrap();
+        let owner = temp.path();
+        let target = owner.join("file.bundle");
+        write(owner, &target, b"old", Expected::Absent).unwrap();
+        let mut held = File::open(&target).unwrap();
+        write(owner, &target, b"new", Expected::Hash(content_hash(b"old"))).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        let mut read = Vec::new();
+        held.read_to_end(&mut read).unwrap();
+        assert_eq!(read, b"old");
+        assert!(names(&staging_dir(owner)).is_empty());
     }
 
     #[test]
