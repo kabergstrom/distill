@@ -294,7 +294,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
         .reconcile_incremental(
             &mut writer,
             &WatcherBatch {
-                paths: vec![assets.join("source.txt")],
+                paths: vec![event_root(&assets).join("source.txt")],
                 renames: Vec::new(),
             },
         )
@@ -318,7 +318,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
         .reconcile_incremental(
             &mut writer,
             &WatcherBatch {
-                paths: vec![assets.join("source.txt")],
+                paths: vec![event_root(&assets).join("source.txt")],
                 renames: Vec::new(),
             },
         )
@@ -367,7 +367,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
         .reconcile_incremental(
             &mut writer,
             &WatcherBatch {
-                paths: vec![assets.join("source.txt")],
+                paths: vec![event_root(&assets).join("source.txt")],
                 renames: Vec::new(),
             },
         )
@@ -395,7 +395,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
         .reconcile_incremental(
             &mut writer,
             &WatcherBatch {
-                paths: vec![assets.join("source.txt")],
+                paths: vec![event_root(&assets).join("source.txt")],
                 renames: Vec::new(),
             },
         )
@@ -424,7 +424,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
         .reconcile_incremental(
             &mut writer,
             &WatcherBatch {
-                paths: vec![assets.join("source.txt")],
+                paths: vec![event_root(&assets).join("source.txt")],
                 renames: Vec::new(),
             },
         )
@@ -490,7 +490,7 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
         .reconcile_incremental(
             &mut writer,
             &WatcherBatch {
-                paths: vec![assets.join("foo.src")],
+                paths: vec![event_root(&assets).join("foo.src")],
                 renames: Vec::new(),
             },
         )
@@ -692,7 +692,7 @@ fn removing_a_rules_source_orphans_its_outputs_incrementally() {
         .reconcile_incremental(
             &mut writer,
             &WatcherBatch {
-                paths: vec![assets.join("rules.bundle")],
+                paths: vec![event_root(&assets).join("rules.bundle")],
                 renames: Vec::new(),
             },
         )
@@ -825,7 +825,7 @@ fn reverting_a_failed_watched_import_clears_its_failure_incrementally() {
             .reconcile_incremental(
                 &mut writer,
                 &WatcherBatch {
-                    paths: vec![assets.join("source.txt")],
+                    paths: vec![event_root(&assets).join("source.txt")],
                     renames: Vec::new(),
                 },
             )
@@ -977,7 +977,15 @@ fn changed_assets(store: &distill_store::StoreReader, version: InputVersion) -> 
         .collect()
 }
 
+/// `assets` as the watcher reports events under it: the configured root,
+/// which the configuration canonicalizes (on Windows a `\\?\` verbatim
+/// path, which a plain path under the same directory does not match).
+fn event_root(assets: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(assets).unwrap()
+}
+
 fn batch(assets: &std::path::Path, files: &[&str]) -> WatcherBatch {
+    let assets = event_root(assets);
     WatcherBatch {
         paths: files.iter().map(|file| assets.join(file)).collect(),
         renames: Vec::new(),
@@ -1463,7 +1471,7 @@ fn a_failed_rpc_reimport_commits_only_its_memo() {
         .reconcile_incremental(
             &mut writer,
             &WatcherBatch {
-                paths: vec![assets.join("source.txt")],
+                paths: vec![event_root(&assets).join("source.txt")],
                 renames: Vec::new(),
             },
         )
