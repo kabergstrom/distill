@@ -1206,6 +1206,7 @@ impl StoreReader {
     /// How many database pages this connection has fetched since it opened
     /// (page-cache hits plus misses): a deterministic measure of how much of
     /// the database its reads touched, for tests that pin a query's cost.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn pages_fetched(&self) -> Result<u64, StoreError> {
         use rusqlite::ffi;
         let mut total = 0;

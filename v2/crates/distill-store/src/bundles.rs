@@ -356,6 +356,7 @@ impl InputTxn<'_> {
 
     /// Publish (or republish) an asset row whose tags are `rec.tags`;
     /// tags replace wholesale.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn upsert_asset(&mut self, rec: &AssetRecord) -> Result<(), StoreError> {
         self.write_asset(rec, None)
     }
@@ -410,6 +411,7 @@ impl InputTxn<'_> {
 
     /// Mark an asset's tags pending a refinement (the conservative half of
     /// a two-phase tag publication, see [`Self::upsert_pending_asset`]).
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn set_tag_index_pending(&mut self, asset: AssetUuid) -> Result<(), StoreError> {
         self.txn
             .prepare_cached(
@@ -617,6 +619,7 @@ impl Store {
 
 impl StoreReader {
     /// `asset`'s tag state; `None` when it has no row.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn tag_index_state(&self, asset: AssetUuid) -> Result<Option<TagIndexState>, StoreError> {
         Ok(self
             .conn
@@ -658,8 +661,9 @@ impl StoreReader {
             .optional()?)
     }
 
-    /// Complete deterministic bundle projection used to synthesize deletes
-    /// during startup reconciliation and to hydrate the RPC metadata index.
+    /// Every bundle row, ordered by bundle: a whole-namespace bulk read no
+    /// publication makes, for tests to compare the bounded reads against.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn all_bundles(&self) -> Result<Vec<BundleMeta>, StoreError> {
         self.query_rows(
             &format!("SELECT {BUNDLE_COLUMNS} FROM bundles ORDER BY bundle_uuid"),
@@ -803,8 +807,9 @@ impl StoreReader {
     }
 
     /// Raw deterministic asset identity set, including poisoned skeleton rows.
-    /// Startup reconciliation uses it only to remove identities absent from a
-    /// healed full scan; it does not expose skeleton metadata.
+    /// A whole-namespace bulk read no publication makes, for tests to compare
+    /// the bounded reads against.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn all_asset_ids(&self) -> Result<Vec<AssetUuid>, StoreError> {
         let mut statement = self
             .conn
@@ -901,6 +906,7 @@ impl StoreReader {
     /// Raw deterministic asset-to-bundle projection, including poisoned
     /// skeleton rows. A whole-namespace bulk read no publication makes: the
     /// tests compare the bounded reads against it.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn all_asset_bundles(&self) -> Result<BTreeMap<AssetUuid, BundleUuid>, StoreError> {
         let mut statement = self
             .conn

@@ -167,6 +167,7 @@ impl Store {
     /// Evict one committed result as a whole unit. `Ok(false)` when the
     /// candidate does not exist. Shared extents survive while anything
     /// else still references them.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn evict_result(
         &mut self,
         key_kind: KeyKind,
@@ -180,6 +181,7 @@ impl Store {
     }
 
     /// Evict one installed artifact or wire tree, and what only it held.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn evict_installed(&mut self, hash: &[u8; 32]) -> Result<(), StoreError> {
         self.write_txn(|store| {
             count_cas_write(&store.conn)?;

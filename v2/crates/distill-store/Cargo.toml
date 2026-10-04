@@ -18,12 +18,17 @@ getrandom = "0.2"
 unicode-normalization.workspace = true
 
 [features]
-# Statement tracing and query plans, for tests that check how the store is
-# read (`StoreReader::trace_statements`, `StoreReader::query_plan_details`).
+# Test instruments and setup writers: statement tracing and query plans for
+# tests that check how the store is read (`StoreReader::trace_statements`,
+# `StoreReader::query_plan_details`, `pages_fetched`), whole-table reads the
+# bounded reads are compared against, and row writers and CAS evictions
+# tests set state up with.
 test-hooks = ["rusqlite/trace"]
 
 [dev-dependencies]
 tempfile = "3"
+# The integration tests use the test hooks.
+distill-store = { path = ".", features = ["test-hooks"] }
 blake3 = { workspace = true }
 # `trace` lets the query-plan tests capture the statements readers issue.
 rusqlite = { version = "0.32", features = ["bundled", "trace"] }

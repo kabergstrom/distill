@@ -750,6 +750,7 @@ impl StoreReader {
     /// a caller that stops at the first candidate that holds reads the
     /// bucket's rows by [`Self::candidate_rows`] and each record by
     /// [`Self::read_candidate`] as it reaches it.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn lookup_candidates(
         &self,
         key_kind: KeyKind,

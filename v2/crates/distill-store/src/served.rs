@@ -239,6 +239,7 @@ fn served_entry_meta_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServedEntr
 
 impl StoreReader {
     /// Every served authoring entry, ordered by asset, with tags.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn served_entries(&self) -> Result<Vec<ServedEntryMeta>, StoreError> {
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT {SERVED_ENTRY_COLUMNS} {SERVED_ENTRY_FROM} ORDER BY a.asset_uuid"
@@ -404,6 +405,7 @@ impl StoreReader {
 
     /// Served assets whose tag index is poisoned (pending or failed), with
     /// the owning bundle.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn tag_poisoned_assets(&self) -> Result<Vec<(AssetUuid, BundleUuid)>, StoreError> {
         let mut statement = self.conn.prepare_cached(
             "SELECT asset_uuid, bundle_uuid FROM assets INDEXED BY assets_tag_poisoned
