@@ -2,13 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use distill_core::id::BundleFileHash;
 use distill_json::AuthoredValue;
 use distill_rpc::*;
 use distill_schema::ngp_schema::{
     node_hash, snapshot_to_json, LogicalSchema, PrimitiveKind, SchemaNode,
 };
-use distill_test_project::{Asset, TestBuilds, TestProject};
+use distill_test_project::{bundle_bytes, Asset, TestBuilds, TestProject, ROOT};
 
 fn type_id(byte: u8) -> TypeUuid {
     TypeUuid([byte; 16])
@@ -528,21 +527,83 @@ fn snapshot(hub: &Hub) -> Snapshot {
     }
 }
 
-fn set_asset(uuid: AssetUuid, resolution: StoredResolve, delta: AssetDeltaState) -> AssetMutation {
-    AssetMutation::Set {
-        uuid,
-        resolution,
-        delta,
+/// Offer `commit` to the server as the next version: what its commit
+/// validation makes of it. A rejected commit publishes nothing.
+fn offer(server: &Server, commit: Commit) -> Result<SnapshotStamp, AdminError> {
+    let before = server.current_stamp().unwrap();
+    match server.coordinated_commit(before.version, |_| Ok(commit)) {
+        Ok(stamp) => Ok(stamp),
+        Err(CoordinatedCommitError::Invalid(error)) => {
+            assert_eq!(server.current_stamp().unwrap(), before);
+            Err(error)
+        }
+        Err(other) => panic!("expected a validated commit, got {other:?}"),
     }
 }
 
-fn commit_one(server: &Server, mutation: AssetMutation) -> SnapshotStamp {
-    server
-        .commit(Commit {
-            assets: vec![mutation],
-            ..Commit::default()
-        })
+/// The daemon publishes `failure` as a rejected pipeline candidate.
+fn reject_pipeline(project: &TestProject, failure: PipelineFailure) -> SnapshotStamp {
+    let mut writer = project.coordinator().open_writer().unwrap();
+    project
+        .coordinator()
+        .publish_pipeline_rejection(&mut writer, failure)
         .unwrap()
+}
+
+/// The daemon publishes a rejected configuration source.
+fn reject_configuration(project: &TestProject, reason: DscpV1, message: &str) -> SnapshotStamp {
+    let mut writer = project.coordinator().open_writer().unwrap();
+    project
+        .coordinator()
+        .publish_configuration_rejection(&mut writer, reason, message)
+        .unwrap()
+}
+
+/// A second RPC server over `project`'s store, with `backend` as its
+/// authoring backend.
+fn server_over(project: &TestProject, backend: Arc<dyn AuthoringBackend>) -> Server {
+    let handle = ServerHandle::open(backend, Arc::clone(project.coordinator().opener()));
+    Server::open(&handle)
+}
+
+/// Hand the files an authoring write wrote to the watcher: the next
+/// [`TestProject::publish`] publishes them.
+fn touch_written(project: &mut TestProject, receipt: &WriteReceipt) {
+    for file in &receipt.files {
+        let bytes = std::fs::read(project.root(&file.root).join(&file.path)).unwrap();
+        project.write_in(&file.root, &file.path, bytes);
+    }
+}
+
+/// A build backend answering every build with the artifact set for the
+/// requester's input version.
+#[derive(Default)]
+struct BuildsByVersion {
+    built: Mutex<BTreeMap<InputVersion, ContentHash>>,
+}
+
+impl BuildsByVersion {
+    fn install(server: &Server) -> Arc<Self> {
+        let builds = Arc::new(Self::default());
+        server.install_build_backend(builds.clone());
+        builds
+    }
+
+    fn answer(&self, at: SnapshotStamp, content_hash: ContentHash) {
+        self.built.lock().unwrap().insert(at.version, content_hash);
+    }
+}
+
+impl BuildBackend for BuildsByVersion {
+    fn start(&self, view: BuildView<'_>, _request: &BuildRequest) -> BuildStart {
+        let content_hash = *self
+            .built
+            .lock()
+            .unwrap()
+            .get(&view.stamp.version)
+            .expect("an artifact for the requester's version");
+        BuildStart::Answered(Ok(BuildAnswer::Built { content_hash }))
+    }
 }
 
 fn assert_reconnect<T: std::fmt::Debug>(result: RpcResult<T>, reason: ReconnectReason) {
@@ -593,15 +654,12 @@ fn authoring_payload_decoder_materializes_authenticated_blob_bytes() {
 
 #[test]
 fn tag_queries_fail_when_other_selectors_could_include_a_poisoned_entry() {
-    let server = server_with(&[(1, false), (2, false)]);
+    // Without a project schema the daemon's tag index stays pending: the
+    // entry's bundle is poisoned.
+    let mut project = project();
+    let server = project.server();
     let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
-    server
-        .commit(Commit {
-            authoring: vec![AuthoringMutation::Set(entry.clone())],
-            tag_poisons: Some(BTreeMap::from([(entry.uuid, entry.bundle)])),
-            ..Commit::default()
-        })
-        .unwrap();
+    publish_entry(&mut project, &entry);
     let hub = connect(&server, &[(1, false), (2, false)]);
     let pinned = snapshot(&hub);
     assert_eq!(
@@ -638,19 +696,23 @@ fn tag_queries_fail_when_other_selectors_could_include_a_poisoned_entry() {
 
 #[test]
 fn authoring_commit_authenticates_schema_and_exact_blob_index_coverage() {
-    let server = server_with(&[(1, false)]);
+    let mut project = project();
+    let server = project.server();
     let valid = authoring_entry(1, AuthoringEntryRole::AuthoringOnly);
-    server
-        .commit(Commit {
-            authoring: vec![AuthoringMutation::Set(valid.clone())],
-            ..Commit::default()
-        })
-        .unwrap();
+    publish_entry(&mut project, &valid);
+    // The daemon serves the valid entry as authored.
+    assert!(matches!(
+        authoring_snapshot(&connect(&server, &[])).inspect(valid.uuid),
+        RpcResult::Success(AuthoringInspectResult::Inspection(inspection))
+            if inspection.schema_hash == valid.schema_hash
+                && inspection.logical_schema == valid.logical_schema
+                && inspection.value == valid.value
+    ));
 
     let mut malformed = valid.clone();
     malformed.value.canonical_value = Arc::from(&b"0"[..]);
     assert!(matches!(
-        server.commit(Commit {
+        offer(&server, Commit {
             authoring: vec![AuthoringMutation::Set(malformed)],
             ..Commit::default()
         }),
@@ -670,7 +732,7 @@ fn authoring_commit_authenticates_schema_and_exact_blob_index_coverage() {
     duplicate.value.canonical_value =
         Arc::from(&b"[{\"$distill_blob\":0},{\"$distill_blob\":0}]"[..]);
     assert!(matches!(
-        server.commit(Commit {
+        offer(&server, Commit {
             authoring: vec![AuthoringMutation::Set(duplicate)],
             ..Commit::default()
         }),
@@ -683,7 +745,7 @@ fn authoring_commit_authenticates_schema_and_exact_blob_index_coverage() {
     let mut tampered_schema = valid;
     tampered_schema.schema_hash = LogicalHash([0; 32]);
     assert!(matches!(
-        server.commit(Commit {
+        offer(&server, Commit {
             authoring: vec![AuthoringMutation::Set(tampered_schema)],
             ..Commit::default()
         }),
@@ -696,7 +758,8 @@ fn authoring_commit_authenticates_schema_and_exact_blob_index_coverage() {
 
 #[test]
 fn authoring_schema_walk_type_checks_primitive_and_reference_leaves() {
-    let server = server_with(&[(1, false)]);
+    let project = project();
+    let server = project.server();
     let mut entry = authoring_entry(1, AuthoringEntryRole::Runtime);
     let primitive = SchemaNode::Primitive(PrimitiveKind::U8);
     entry.schema_hash = node_hash(&primitive).unwrap();
@@ -708,7 +771,7 @@ fn authoring_schema_walk_type_checks_primitive_and_reference_leaves() {
     entry.value.canonical_value = Arc::from(&b"{\"$distill_blob\":0}"[..]);
     entry.value.blobs.clear();
     assert!(matches!(
-        server.commit(Commit {
+        offer(&server, Commit {
             authoring: vec![AuthoringMutation::Set(entry.clone())],
             ..Commit::default()
         }),
@@ -727,7 +790,7 @@ fn authoring_schema_walk_type_checks_primitive_and_reference_leaves() {
     );
     entry.value.canonical_value = Arc::from(&b"{\"$distill_blob\":0}"[..]);
     assert!(matches!(
-        server.commit(Commit {
+        offer(&server, Commit {
             authoring: vec![AuthoringMutation::Set(entry)],
             ..Commit::default()
         }),
@@ -773,19 +836,16 @@ fn asset_reference_query_uses_uuid_precedence_and_rejects_noncanonical_selectors
     assert!(decode_asset_reference_query(&selector(None, Some(&"x".repeat(256)))).is_err());
 }
 
-fn test_namespace_error() -> NamespaceError {
-    NamespaceError::new(
-        NamespaceErrorV1::IncompleteSkeleton {
-            source: ReadableBundleSource {
-                root_name: "assets".to_owned(),
-                normalized_path: "broken.asset".to_owned(),
-                file_hash: BundleFileHash([4; 32]),
-            },
-            failure: SkeletonFailureCode::EnvelopeMalformed,
-        },
-        "broken bundle",
+/// Whether `errors` is the one namespace error the daemon reports for the
+/// malformed bundle file `path` under the root [`distill_test_project::ROOT`].
+fn names_malformed_file(errors: &[NamespaceError], path: &str) -> bool {
+    matches!(
+        errors,
+        [NamespaceError {
+            detail: NamespaceErrorV1::IncompleteSkeleton { source, .. },
+            ..
+        }] if source.root_name == distill_test_project::ROOT && source.normalized_path == path
     )
-    .unwrap()
 }
 
 fn test_pipeline_failure() -> PipelineFailure {
@@ -800,42 +860,35 @@ fn test_pipeline_failure() -> PipelineFailure {
 
 #[test]
 fn metadata_namespace_calls_serve_around_a_namespace_error() {
-    let server = server_with(&[(1, false)]);
-    let entry = authoring_entry(1, AuthoringEntryRole::AuthoringOnly);
-    let error = test_namespace_error();
-    server
-        .commit(Commit {
-            authoring: vec![AuthoringMutation::Set(entry.clone())],
-            paths: vec![PathMutation::Set {
-                path: entry.normalized_path.clone(),
-                candidates: BTreeSet::from([entry.uuid]),
-            }],
-            pipeline: Some(PipelineDiagnostic::Failed(test_pipeline_failure())),
-            namespace_errors: Some(vec![error.clone()]),
-            ..Commit::default()
-        })
-        .unwrap();
+    let mut project = project();
+    let server = project.server();
+    // A runtime entry: a bundle's primary, which its path resolves to, is
+    // never authoring-only.
+    let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
+    write_entry(&mut project, &entry);
+    project.write("broken.bundle", b"not a bundle");
+    project.publish();
+    let failure = test_pipeline_failure();
+    let stamp = reject_pipeline(&project, failure.clone());
     let connected = server
         .root()
         .metadata(PROTOCOL_VERSION)
         .connected()
         .unwrap();
     let diagnostics = connected.hub.diagnostics().success().unwrap();
-    assert_eq!(diagnostics.namespace_errors, vec![error]);
-    assert!(matches!(
-        diagnostics.pipeline,
-        PipelineDiagnostic::Failed(_)
-    ));
+    assert!(
+        names_malformed_file(&diagnostics.namespace_errors, "broken.bundle"),
+        "{:?}",
+        diagnostics.namespace_errors
+    );
+    assert_eq!(diagnostics.pipeline, PipelineDiagnostic::Failed(failure));
     let snapshot = connected.hub.snapshot().success().unwrap();
-    assert!(matches!(
-        snapshot.version(),
-        MetadataCall::Success(InputVersion(1))
-    ));
+    assert_eq!(snapshot.version(), MetadataCall::Success(stamp.version));
     // The error is about one file: the rest of the namespace serves.
     let query = PureMetadataQuery {
         bundle: Some(entry.bundle),
         authored_type: Some(entry.type_uuid),
-        role: Some(AuthoringEntryRole::AuthoringOnly),
+        role: Some(AuthoringEntryRole::Runtime),
         normalized_path_prefix: Some("bundle-1".to_owned()),
         ..PureMetadataQuery::default()
     };
@@ -848,18 +901,14 @@ fn metadata_namespace_calls_serve_around_a_namespace_error() {
         entry.normalized_path
     );
     assert_eq!(
-        snapshot.resolve_path("bundle-1.asset"),
+        snapshot.resolve_path(&entry.normalized_path),
         MetadataNamespaceCall::Success(PathResolveResult::Resolved(entry.uuid))
     );
     let authoring = connected.hub.authoring_snapshot().success().unwrap();
     assert!(authoring.inspect(entry.uuid).success().is_some());
 
-    server
-        .commit(Commit {
-            namespace_errors: Some(vec![]),
-            ..Commit::default()
-        })
-        .unwrap();
+    project.remove("broken.bundle");
+    project.publish();
     assert!(connected
         .hub
         .diagnostics()
@@ -871,14 +920,20 @@ fn metadata_namespace_calls_serve_around_a_namespace_error() {
 
 #[test]
 fn target_snapshot_namespace_calls_serve_around_a_namespace_error() {
-    let server = server_with(&[(1, false)]);
+    let mut project = project();
+    let server = project.server();
     let hub = connect(&server, &[(1, false)]);
-    server
-        .commit(Commit {
-            namespace_errors: Some(vec![test_namespace_error()]),
-            ..Commit::default()
-        })
+    project.write("broken.bundle", b"not a bundle");
+    project.publish();
+    let metadata = server
+        .root()
+        .metadata(PROTOCOL_VERSION)
+        .connected()
         .unwrap();
+    assert!(names_malformed_file(
+        &metadata.hub.diagnostics().success().unwrap().namespace_errors,
+        "broken.bundle"
+    ));
     let snapshot = snapshot(&hub);
     let authoring = authoring_snapshot(&hub);
     assert!(snapshot
@@ -904,7 +959,8 @@ fn target_snapshot_namespace_calls_serve_around_a_namespace_error() {
 
 #[test]
 fn unbound_metadata_bootstrap_survives_a_configuration_error_and_has_no_runtime_surface() {
-    let server = server_with(&[(1, false)]);
+    let mut project = project();
+    let server = project.server();
     let entry = authoring_entry(1, AuthoringEntryRole::AuthoringOnly);
     let (hash, payload) = canonical_artifact(
         entry.uuid,
@@ -917,17 +973,10 @@ fn unbound_metadata_bootstrap_survives_a_configuration_error_and_has_no_runtime_
         Vec::new(),
     );
     server.install_artifact(hash, payload).unwrap();
-    let error = ConfigurationError::from_reason(
-        &DscpV1::MalformedConfiguration { file_hash: [4; 32] },
-        "invalid staged configuration",
-    );
-    let stamp = server
-        .commit(Commit {
-            authoring: vec![AuthoringMutation::Set(entry.clone())],
-            configuration: Some(ConfigurationStatus::Failed(error.clone())),
-            ..Commit::default()
-        })
-        .unwrap();
+    let reason = DscpV1::MalformedConfiguration { file_hash: [4; 32] };
+    let error = ConfigurationError::from_reason(&reason, "invalid staged configuration");
+    publish_entry(&mut project, &entry);
+    let stamp = reject_configuration(&project, reason, "invalid staged configuration");
 
     let connected = match server.root().metadata(PROTOCOL_VERSION) {
         MetadataConnectOutcome::Connected(connected) => connected,
@@ -953,34 +1002,18 @@ fn unbound_metadata_bootstrap_survives_a_configuration_error_and_has_no_runtime_
 
 #[test]
 fn authoring_snapshot_pins_role_inclusive_metadata_without_runtime_escape() {
-    let server = server_with(&[(1, false), (2, false)]);
+    let mut project = project();
+    let server = project.server();
     let runtime = authoring_entry(1, AuthoringEntryRole::Runtime);
     let tooling = authoring_entry(2, AuthoringEntryRole::AuthoringOnly);
-    let stamp = server
-        .commit(Commit {
-            assets: vec![
-                set_asset(
-                    tooling.uuid,
-                    StoredResolve::Built {
-                        content_hash: content_hash(9),
-                    },
-                    AssetDeltaState::Changed,
-                ),
-                set_asset(
-                    asset_id(99),
-                    StoredResolve::Built {
-                        content_hash: content_hash(10),
-                    },
-                    AssetDeltaState::Changed,
-                ),
-            ],
-            authoring: vec![
-                AuthoringMutation::Set(runtime.clone()),
-                AuthoringMutation::Set(tooling.clone()),
-            ],
-            ..Commit::default()
-        })
-        .unwrap();
+    // A runtime resolution with no authoring entry: the asset 99 the
+    // namespace deleted resolves Deleted.
+    let removed = authoring_entry(99, AuthoringEntryRole::Runtime);
+    publish_entry(&mut project, &removed);
+    project.remove(&removed.normalized_path);
+    write_entry(&mut project, &runtime);
+    write_entry(&mut project, &tooling);
+    let stamp = project.publish();
     let hub = connect(&server, &[(1, false), (2, false)]);
     let pinned = authoring_snapshot(&hub);
 
@@ -1001,23 +1034,35 @@ fn authoring_snapshot_pins_role_inclusive_metadata_without_runtime_escape() {
         }),
         RpcResult::Success(vec![tooling.uuid])
     );
+    // Without a project schema the daemon's tag index is pending: every
+    // other selector is served, a tag selector names the poisoned bundle.
+    let every_selector_but_tags = AssetQuery {
+        uuid: Some(tooling.uuid),
+        bundle_path: Some(tooling.normalized_path.clone()),
+        local_id: Some(tooling.local_id.clone()),
+        bundle_uuid: Some(tooling.bundle),
+        authored_type: Some(tooling.type_uuid),
+        terminal_type: Some(tooling.terminal_type),
+        tag: None,
+        path_prefix: Some("bundle-".to_owned()),
+        path_glob: Some("bundle-?.bundle".to_owned()),
+        authoring_only: Some(true),
+    };
+    assert_eq!(
+        pinned.query(every_selector_but_tags.clone()),
+        RpcResult::Success(vec![tooling.uuid])
+    );
     assert_eq!(
         pinned.query(AssetQuery {
-            uuid: Some(tooling.uuid),
-            bundle_path: Some(tooling.normalized_path.clone()),
-            local_id: Some(tooling.local_id.clone()),
-            bundle_uuid: Some(tooling.bundle),
-            authored_type: Some(tooling.type_uuid),
-            terminal_type: Some(tooling.terminal_type),
             tag: Some(TagSelector {
                 tag: "group".to_owned(),
                 value: Some("group-2".to_owned()),
             }),
-            path_prefix: Some("bundle-".to_owned()),
-            path_glob: Some("bundle-?.asset".to_owned()),
-            authoring_only: Some(true),
+            ..every_selector_but_tags
         }),
-        RpcResult::Success(vec![tooling.uuid])
+        RpcResult::Failure(RpcFailure::TagIndexPoisoned {
+            bundles: vec![tooling.bundle],
+        })
     );
     match pinned.inspect(tooling.uuid) {
         RpcResult::Success(AuthoringInspectResult::Inspection(inspection)) => {
@@ -1053,25 +1098,17 @@ fn authoring_snapshot_pins_role_inclusive_metadata_without_runtime_escape() {
 
 #[test]
 fn authoring_snapshot_refreshes_to_a_successor_stamp_without_tearing() {
-    let server = server_with(&[(1, false)]);
+    let mut project = project();
+    let server = project.server();
     let first_entry = authoring_entry(1, AuthoringEntryRole::AuthoringOnly);
-    let first_stamp = server
-        .commit(Commit {
-            authoring: vec![AuthoringMutation::Set(first_entry.clone())],
-            ..Commit::default()
-        })
-        .unwrap();
+    let first_stamp = publish_entry(&mut project, &first_entry);
     let hub = connect(&server, &[(1, false)]);
     let first = authoring_snapshot(&hub);
 
     let mut replacement = first_entry.clone();
-    replacement.value.canonical_value = Arc::from(&b"{\"$distill_blob\":0}"[..]);
-    let second_stamp = server
-        .commit(Commit {
-            authoring: vec![AuthoringMutation::Set(replacement.clone())],
-            ..Commit::default()
-        })
-        .unwrap();
+    replacement.value.blobs = vec![Arc::from([0xAA])];
+    let second_stamp = publish_entry(&mut project, &replacement);
+    assert_ne!(replacement.value, first_entry.value);
 
     let old = first.inspect(first_entry.uuid).success().unwrap();
     let refreshed = first.refresh().success().unwrap();
@@ -1090,7 +1127,8 @@ fn authoring_snapshot_refreshes_to_a_successor_stamp_without_tearing() {
 
 #[test]
 fn every_authoring_snapshot_method_is_expiry_and_generation_fenced() {
-    let server = server_with(&[(1, false)]);
+    let project = project();
+    let server = project.server();
     let hub = connect(&server, &[(1, false)]);
     let expired = authoring_snapshot(&hub);
     expired.expire();
@@ -1125,20 +1163,16 @@ fn every_authoring_snapshot_method_is_expiry_and_generation_fenced() {
 
 #[test]
 fn authoring_inspection_is_a_pinned_pure_metadata_read_under_configuration_error() {
-    let server = server_with(&[(1, false)]);
+    let mut project = project();
+    let server = project.server();
     let hub = connect(&server, &[(1, false)]);
     let entry = authoring_entry(1, AuthoringEntryRole::AuthoringOnly);
-    let error = ConfigurationError::from_reason(
-        &DscpV1::MalformedConfiguration { file_hash: [9; 32] },
+    publish_entry(&mut project, &entry);
+    let failed_stamp = reject_configuration(
+        &project,
+        DscpV1::MalformedConfiguration { file_hash: [9; 32] },
         "invalid staged configuration",
     );
-    let failed_stamp = server
-        .commit(Commit {
-            authoring: vec![AuthoringMutation::Set(entry.clone())],
-            configuration: Some(ConfigurationStatus::Failed(error)),
-            ..Commit::default()
-        })
-        .unwrap();
 
     let pinned = authoring_snapshot(&hub);
     assert_eq!(pinned.stamp(), failed_stamp);
@@ -1195,7 +1229,8 @@ fn staging_accepts_only_numeric_loopback_addresses() {
 
 #[test]
 fn connect_rejects_protocol_target_and_definition_mismatches() {
-    let server = server_with(&[(1, false)]);
+    let project = project();
+    let server = project.server();
     let mut protocol = request_for(7, 1, &[(1, false)]);
     protocol.protocol += 1;
     assert!(matches!(
@@ -1218,14 +1253,11 @@ fn connect_rejects_protocol_target_and_definition_mismatches() {
 
 #[test]
 fn connect_canonicalizes_equivalent_target_names() {
-    let server = Server::new(
-        StoreInstanceId([9; 16]),
-        vec![TargetDefinition::new(
-            "t\u{e9}st",
-            TargetDefinitionHash([7; 32]),
-        )],
-    )
-    .unwrap();
+    let project = TestProject::new(vec![TargetDefinition::new(
+        "t\u{e9}st",
+        TargetDefinitionHash([7; 32]),
+    )]);
+    let server = project.server();
 
     assert!(matches!(
         server.root().connect(ConnectRequest::new(
@@ -1238,7 +1270,9 @@ fn connect_canonicalizes_equivalent_target_names() {
 
 #[test]
 fn resolve_path_and_fetch_terminal_outcomes_all_carry_the_snapshot_basis() {
-    let server = server_with(&[(1, false)]);
+    let mut project = TestProject::with_roots(vec![target_with(7, &[])], &[ROOT, "alt"]);
+    let server = project.server();
+    let builds = TestBuilds::install(&server);
     let hub = connect(&server, &[(1, false)]);
     let built = asset_id(1);
     let failed = asset_id(2);
@@ -1256,50 +1290,31 @@ fn resolve_path_and_fetch_terminal_outcomes_all_carry_the_snapshot_basis() {
     );
     let structural_len = payload.structural.len();
     server.install_artifact(hash, payload).unwrap();
-    let mut unique = BTreeSet::new();
-    unique.insert(built);
-    let mut ambiguous = BTreeSet::new();
-    ambiguous.insert(built);
-    ambiguous.insert(failed);
-    let stamp = server
-        .commit(Commit {
-            assets: vec![
-                set_asset(
-                    built,
-                    StoredResolve::Built { content_hash: hash },
-                    AssetDeltaState::Changed,
-                ),
-                set_asset(
-                    failed,
-                    StoredResolve::Failed {
-                        error: "compiler failed".to_owned(),
-                    },
-                    AssetDeltaState::Changed,
-                ),
-                set_asset(
-                    drifted,
-                    StoredResolve::Drifted {
-                        input: DriftedInput::File("shader.glsl".to_owned()),
-                    },
-                    AssetDeltaState::Changed,
-                ),
-                set_asset(deleted, StoredResolve::Deleted, AssetDeltaState::Deleted),
-            ],
-            authoring: Vec::new(),
-            paths: vec![
-                PathMutation::Set {
-                    path: "textures/a.asset".to_owned(),
-                    candidates: unique,
-                },
-                PathMutation::Set {
-                    path: "ambiguous.asset".to_owned(),
-                    candidates: ambiguous,
-                },
-            ],
-            configuration: None,
-            ..Commit::default()
-        })
-        .unwrap();
+    builds.answer(built, Ok(BuildAnswer::Built { content_hash: hash }));
+    builds.answer(
+        drifted,
+        Ok(BuildAnswer::Drifted {
+            input: DriftedInput::File("shader.glsl".to_owned()),
+        }),
+    );
+    let primary = |byte: u8| Asset::blob("main", asset_id(byte), type_id(byte), &[byte]);
+    project.write_bundle("deleted.bundle", BundleUuid([4; 16]), Some("main"), &[primary(4)]);
+    project.publish();
+    project.remove("deleted.bundle");
+    project.write_bundle("textures/a.bundle", BundleUuid([1; 16]), Some("main"), &[primary(1)]);
+    // One asset in two bundle files: the claim collision withholds it, and
+    // it resolves to its error.
+    project.write_bundle("failed-a.bundle", BundleUuid([2; 16]), Some("main"), &[primary(2)]);
+    project.write_bundle("failed-b.bundle", BundleUuid([12; 16]), Some("main"), &[primary(2)]);
+    project.write_bundle("drifted.bundle", BundleUuid([3; 16]), Some("main"), &[primary(3)]);
+    // One path in two roots: ambiguous between their primaries.
+    project.write_bundle("ambiguous.bundle", BundleUuid([5; 16]), Some("main"), &[primary(5)]);
+    project.write_in(
+        "alt",
+        "ambiguous.bundle",
+        bundle_bytes(BundleUuid([6; 16]), Some("main"), &[primary(6)]),
+    );
+    let stamp = project.publish();
     let snap = snapshot(&hub);
 
     let built_result = snap.resolve(built).success().unwrap();
@@ -1328,20 +1343,20 @@ fn resolve_path_and_fetch_terminal_outcomes_all_carry_the_snapshot_basis() {
         ResolveResult::Deleted { at: stamp }
     );
 
-    let path = snap.resolve_path("textures/a.asset").success().unwrap();
+    let path = snap.resolve_path("textures/a.bundle").success().unwrap();
     assert_eq!(path.basis.snapshot, stamp);
     assert_eq!(path.value, PathResolveResult::Resolved(built));
     assert_eq!(
-        snap.resolve_path("missing.asset").success().unwrap().value,
+        snap.resolve_path("missing.bundle").success().unwrap().value,
         PathResolveResult::Missing
     );
     assert_eq!(
-        snap.resolve_path("ambiguous.asset")
+        snap.resolve_path("ambiguous.bundle")
             .success()
             .unwrap()
             .value,
         PathResolveResult::Failed(PathResolveFailure::Ambiguous {
-            candidates: vec![built, failed],
+            candidates: vec![asset_id(5), asset_id(6)],
         })
     );
 
@@ -1366,9 +1381,13 @@ fn resolve_path_and_fetch_terminal_outcomes_all_carry_the_snapshot_basis() {
 
 #[test]
 fn snapshots_pin_old_metadata_and_refresh_repins_latest() {
-    let server = server_with(&[(1, false)]);
+    let mut project = project();
+    let server = project.server();
+    // Each version's resolve is built at the requester's own snapshot.
+    let builds = BuildsByVersion::install(&server);
     let hub = connect(&server, &[(1, false)]);
-    let uuid = asset_id(1);
+    let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
+    let uuid = entry.uuid;
     let (first, first_payload) = canonical_artifact(
         uuid,
         type_id(1),
@@ -1392,28 +1411,21 @@ fn snapshots_pin_old_metadata_and_refresh_repins_latest() {
     for (hash, payload) in [(first, first_payload), (second, second_payload)] {
         server.install_artifact(hash, payload).unwrap();
     }
-    commit_one(
-        &server,
-        set_asset(
-            uuid,
-            StoredResolve::Built {
-                content_hash: first,
-            },
-            AssetDeltaState::Changed,
-        ),
-    );
+    let first_stamp = publish_entry(&mut project, &entry);
+    builds.answer(first_stamp, first);
     let old = snapshot(&hub);
-    commit_one(
-        &server,
-        set_asset(
-            uuid,
-            StoredResolve::Built {
-                content_hash: second,
-            },
-            AssetDeltaState::Changed,
-        ),
-    );
+    // The bundle moves and its value changes.
+    let mut moved = entry.clone();
+    moved.normalized_path = "moved/bundle-1.bundle".to_owned();
+    moved.value.blobs = vec![Arc::from([0xAA])];
+    project.remove(&entry.normalized_path);
+    let second_stamp = publish_entry(&mut project, &moved);
+    builds.answer(second_stamp, second);
 
+    assert_eq!(
+        old.entry(uuid).success().unwrap().normalized_path,
+        entry.normalized_path
+    );
     assert_eq!(
         old.resolve(uuid).success().unwrap().value,
         ResolveResult::Built {
@@ -1421,7 +1433,11 @@ fn snapshots_pin_old_metadata_and_refresh_repins_latest() {
         }
     );
     let refreshed = old.refresh().success().unwrap();
-    assert_eq!(refreshed.version(), RpcResult::Success(InputVersion(2)));
+    assert_eq!(refreshed.version(), RpcResult::Success(second_stamp.version));
+    assert_eq!(
+        refreshed.entry(uuid).success().unwrap().normalized_path,
+        moved.normalized_path
+    );
     assert_eq!(
         refreshed.resolve(uuid).success().unwrap().value,
         ResolveResult::Built {
@@ -1432,25 +1448,26 @@ fn snapshots_pin_old_metadata_and_refresh_repins_latest() {
 
 #[test]
 fn deleted_result_preserves_the_deleting_stamp_across_later_commits() {
-    let server = server_with(&[(1, false)]);
+    let mut project = project();
+    let server = project.server();
     let hub = connect(&server, &[(1, false)]);
-    let uuid = asset_id(1);
-    let deleted_at = commit_one(
-        &server,
-        set_asset(uuid, StoredResolve::Deleted, AssetDeltaState::Deleted),
-    );
-    server.commit(Commit::default()).unwrap();
+    let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
+    publish_entry(&mut project, &entry);
+    project.remove(&entry.normalized_path);
+    let deleted_at = project.publish();
+    let later = publish_unrelated(&mut project);
     let snap = snapshot(&hub);
-    assert_eq!(snap.version(), RpcResult::Success(InputVersion(2)));
+    assert_eq!(snap.version(), RpcResult::Success(later.version));
     assert_eq!(
-        snap.resolve(uuid).success().unwrap().value,
+        snap.resolve(entry.uuid).success().unwrap().value,
         ResolveResult::Deleted { at: deleted_at }
     );
 }
 
 #[test]
 fn configuration_error_is_snapshot_pinned_and_typed_without_blocking_safe_reads() {
-    let server = server_with(&[(1, false)]);
+    let project = project();
+    let server = project.server();
     let hub = connect(&server, &[(1, false)]);
     let (hash, payload) = canonical_artifact(
         asset_id(1),
@@ -1467,12 +1484,7 @@ fn configuration_error_is_snapshot_pinned_and_typed_without_blocking_safe_reads(
         address: "198.51.100.7:7331".to_owned(),
     };
     let error = ConfigurationError::from_reason(&reason, "daemon.address is not loopback");
-    server
-        .commit(Commit {
-            configuration: Some(ConfigurationStatus::Failed(error.clone())),
-            ..Commit::default()
-        })
-        .unwrap();
+    let stamp = reject_configuration(&project, reason.clone(), "daemon.address is not loopback");
     let failed = snapshot(&hub);
 
     assert_eq!(
@@ -1490,7 +1502,7 @@ fn configuration_error_is_snapshot_pinned_and_typed_without_blocking_safe_reads(
     assert!(matches!(hub.fetch(&failed, hash), RpcResult::Success(_)));
     assert!(matches!(failed.refresh(), RpcResult::Success(_)));
     assert!(matches!(
-        hub.subscribe(InputVersion(1), vec![], vec![]),
+        hub.subscribe(stamp.version, vec![], vec![]),
         RpcResult::Success(_)
     ));
     assert_eq!(
@@ -1505,24 +1517,24 @@ fn configuration_error_is_snapshot_pinned_and_typed_without_blocking_safe_reads(
 
 #[test]
 fn connect_returns_typed_pipeline_unavailable_without_minting_a_hub() {
-    let server = server_with(&[(1, false)]);
+    let project = project();
+    let server = project.server();
     let failure = test_pipeline_failure();
-    server
-        .commit(Commit {
-            pipeline: Some(PipelineDiagnostic::Failed(failure.clone())),
-            ..Commit::default()
-        })
-        .unwrap();
+    let rejected = reject_pipeline(&project, failure.clone());
 
     assert_eq!(
         server.root().connect(request_for(7, 2, &[(1, false)])),
         ConnectOutcome::PipelineUnavailable(PipelineUnavailableDiagnostic::PipelineFailure(failure))
     );
 
+    // No daemon path returns a project without a pipeline module to Ready:
+    // the coordinator's step is published by hand.
     server
-        .commit(Commit {
-            pipeline: Some(PipelineDiagnostic::Ready),
-            ..Commit::default()
+        .coordinated_commit(rejected.version, |_| {
+            Ok(Commit {
+                pipeline: Some(PipelineDiagnostic::Ready),
+                ..Commit::default()
+            })
         })
         .unwrap();
     let connected = match server.root().connect(request_for(7, 3, &[(1, false)])) {
@@ -1534,21 +1546,10 @@ fn connect_returns_typed_pipeline_unavailable_without_minting_a_hub() {
 
 #[test]
 fn published_runtime_failure_fences_shared_epoch_without_minting_a_version() {
-    let server = server_with(&[(1, false)]);
+    let mut project = project();
+    let server = project.server();
     let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
-    let stamp = server
-        .commit(Commit {
-            assets: vec![set_asset(
-                entry.uuid,
-                StoredResolve::Drifted {
-                    input: DriftedInput::Asset(entry.uuid),
-                },
-                AssetDeltaState::Changed,
-            )],
-            authoring: vec![AuthoringMutation::Set(entry.clone())],
-            ..Commit::default()
-        })
-        .unwrap();
+    let stamp = publish_entry(&mut project, &entry);
     let hub = connect(&server, &[(1, false)]);
     let pinned = snapshot(&hub);
     let failure = PipelineFailure::new(
@@ -1611,7 +1612,8 @@ fn published_runtime_failure_fences_shared_epoch_without_minting_a_version() {
 
 #[test]
 fn commit_rejects_unauthenticated_dscp_and_noncanonical_typed_pipeline_diagnostics() {
-    let server = server_with(&[(1, false)]);
+    let project = project();
+    let server = project.server();
     let before = server.current_stamp().unwrap();
     let mut error = ConfigurationError::from_reason(
         &DscpV1::MalformedConfiguration { file_hash: [1; 32] },
@@ -1619,7 +1621,7 @@ fn commit_rejects_unauthenticated_dscp_and_noncanonical_typed_pipeline_diagnosti
     );
     error.reason_hash = [2; 32];
     assert!(matches!(
-        server.commit(Commit {
+        offer(&server, Commit {
             configuration: Some(ConfigurationStatus::Failed(error)),
             ..Commit::default()
         }),
@@ -1629,7 +1631,7 @@ fn commit_rejects_unauthenticated_dscp_and_noncanonical_typed_pipeline_diagnosti
     let mut tampered = test_pipeline_failure();
     tampered.identity = [0; 32];
     assert!(matches!(
-        server.commit(Commit {
+        offer(&server, Commit {
             pipeline: Some(PipelineDiagnostic::Failed(tampered)),
             ..Commit::default()
         }),
@@ -1640,48 +1642,29 @@ fn commit_rejects_unauthenticated_dscp_and_noncanonical_typed_pipeline_diagnosti
 
 #[test]
 fn initial_subscription_delta_is_cursor_bound_ordered_and_filters_assets_and_paths() {
-    let server = server_with(&[(1, false)]);
+    let mut project = project();
+    let server = project.server();
     let hub = connect(&server, &[(1, false)]);
     let watched = asset_id(1);
     let ignored = asset_id(2);
-    server
-        .commit(Commit {
-            assets: vec![set_asset(
-                watched,
-                StoredResolve::Failed {
-                    error: "first".to_owned(),
-                },
-                AssetDeltaState::Changed,
-            )],
-            authoring: Vec::new(),
-            paths: vec![PathMutation::Set {
-                path: "watched.asset".to_owned(),
-                candidates: BTreeSet::from([watched]),
-            }],
-            configuration: None,
-            ..Commit::default()
-        })
-        .unwrap();
-    server
-        .commit(Commit {
-            assets: vec![
-                set_asset(watched, StoredResolve::Deleted, AssetDeltaState::Deleted),
-                set_asset(ignored, StoredResolve::Deleted, AssetDeltaState::Deleted),
-            ],
-            authoring: Vec::new(),
-            paths: vec![PathMutation::Remove {
-                path: "watched.asset".to_owned(),
-            }],
-            configuration: None,
-            ..Commit::default()
-        })
-        .unwrap();
+    let primary = |byte: u8| Asset::blob("main", asset_id(byte), type_id(byte), &[byte]);
+    project.write_bundle("watched.bundle", BundleUuid([1; 16]), Some("main"), &[primary(1)]);
+    project.write_bundle(
+        "ignored.bundle",
+        BundleUuid([2; 16]),
+        Some("main"),
+        &[Asset::blob("main", ignored, type_id(2), &[2])],
+    );
+    project.publish();
+    project.remove("watched.bundle");
+    project.remove("ignored.bundle");
+    project.publish();
 
     let install = hub
         .subscribe(
             InputVersion(0),
             vec![watched],
-            vec!["watched.asset".to_owned()],
+            vec!["watched.bundle".to_owned()],
         )
         .success()
         .unwrap();
@@ -1700,10 +1683,10 @@ fn initial_subscription_delta_is_cursor_bound_ordered_and_filters_assets_and_pat
             assert_eq!(deltas.len(), 2);
             assert_eq!(deltas[0].basis.snapshot.version, InputVersion(1));
             assert_eq!(deltas[0].assets, vec![(watched, AssetDeltaState::Changed)]);
-            assert_eq!(deltas[0].paths, vec!["watched.asset"]);
+            assert_eq!(deltas[0].paths, vec!["watched.bundle"]);
             assert_eq!(deltas[1].basis.snapshot.version, InputVersion(2));
             assert_eq!(deltas[1].assets, vec![(watched, AssetDeltaState::Deleted)]);
-            assert_eq!(deltas[1].paths, vec!["watched.asset"]);
+            assert_eq!(deltas[1].paths, vec!["watched.bundle"]);
         }
         other => panic!("expected initial delta, got {other:?}"),
     }
@@ -1712,9 +1695,11 @@ fn initial_subscription_delta_is_cursor_bound_ordered_and_filters_assets_and_pat
 
 #[test]
 fn live_delta_types_changed_deleted_and_restored_and_every_event_has_a_basis() {
-    let server = server_with(&[(1, false)]);
+    let mut project = project();
+    let server = project.server();
     let hub = connect(&server, &[(1, false)]);
-    let uuid = asset_id(1);
+    let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
+    let uuid = entry.uuid;
     let install = hub
         .subscribe(InputVersion(0), vec![uuid], vec![])
         .success()
@@ -1724,76 +1709,76 @@ fn live_delta_types_changed_deleted_and_restored_and_every_event_has_a_basis() {
         Some(StreamEvent::InitialDelta { .. })
     ));
 
-    for (version, delta) in [
-        AssetDeltaState::Changed,
-        AssetDeltaState::Deleted,
-        AssetDeltaState::Restored,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        commit_one(&server, set_asset(uuid, StoredResolve::Deleted, delta));
+    // The bundle appears, goes and comes back. The daemon publishes a
+    // returning asset as Changed: it never publishes Restored.
+    for (remove, delta) in [
+        (false, AssetDeltaState::Changed),
+        (true, AssetDeltaState::Deleted),
+        (false, AssetDeltaState::Changed),
+    ] {
+        let stamp = if remove {
+            project.remove(&entry.normalized_path);
+            project.publish()
+        } else {
+            publish_entry(&mut project, &entry)
+        };
         let event = install.deltas.next().unwrap();
-        assert_eq!(
-            event.basis().snapshot.version,
-            InputVersion(version as u64 + 1)
-        );
-        assert!(matches!(
-            event,
-            StreamEvent::Delta(Delta { assets, .. }) if assets == vec![(uuid, delta)]
-        ));
+        assert_eq!(event.basis().snapshot, stamp);
+        assert!(matches!(&event,
+            StreamEvent::Delta(Delta { assets, .. }) if *assets == vec![(uuid, delta)]
+        ), "{event:?}");
     }
 }
 
 #[test]
 fn repeated_subscribe_unions_names_on_one_stream_and_unsubscribe_removes_them() {
-    let server = server_with(&[(1, false)]);
+    let mut project = project();
+    let server = project.server();
     let hub = connect(&server, &[(1, false)]);
-    let first = asset_id(1);
-    let second = asset_id(2);
+    let first_entry = authoring_entry(1, AuthoringEntryRole::Runtime);
+    let second_entry = authoring_entry(2, AuthoringEntryRole::Runtime);
+    let (first, second) = (first_entry.uuid, second_entry.uuid);
+    write_entry(&mut project, &first_entry);
+    write_entry(&mut project, &second_entry);
+    let since = project.publish().version;
     let first_install = hub
-        .subscribe(InputVersion(0), vec![first], vec![])
+        .subscribe(since, vec![first], vec![])
         .success()
         .unwrap();
     first_install.deltas.next().unwrap();
-    commit_one(
-        &server,
-        set_asset(second, StoredResolve::Deleted, AssetDeltaState::Deleted),
-    );
+    project.remove(&second_entry.normalized_path);
+    let removed = project.publish();
     assert!(first_install.deltas.next().is_none());
 
     let second_install = hub
-        .subscribe(InputVersion(0), vec![second], vec![])
+        .subscribe(since, vec![second], vec![])
         .success()
         .unwrap();
     assert!(matches!(
         first_install.deltas.next(),
         Some(StreamEvent::Delta(Delta { basis, assets, .. }))
-            if basis.snapshot.version == InputVersion(1)
+            if basis.snapshot == removed
                 && assets == vec![(second, AssetDeltaState::Deleted)]
     ));
     assert!(second_install.deltas.next().is_none());
 
     assert_eq!(hub.unsubscribe(vec![first], vec![]), RpcResult::Success(()));
-    server
-        .commit(Commit {
-            assets: vec![
-                set_asset(first, StoredResolve::Deleted, AssetDeltaState::Deleted),
-                set_asset(second, StoredResolve::Deleted, AssetDeltaState::Restored),
-            ],
-            ..Commit::default()
-        })
-        .unwrap();
+    // The first goes, the second comes back (the daemon publishes a
+    // returning asset as Changed).
+    project.remove(&first_entry.normalized_path);
+    write_entry(&mut project, &second_entry);
+    project.publish();
     assert!(matches!(
         first_install.deltas.next(),
         Some(StreamEvent::Delta(Delta { assets, .. }))
-            if assets == vec![(second, AssetDeltaState::Restored)]
+            if assets == vec![(second, AssetDeltaState::Changed)]
     ));
 }
 
 #[test]
 fn subscription_asset_and_path_sets_have_typed_cardinality_limits() {
-    let server = server_with(&[(1, false)]);
+    let project = project();
+    let server = project.server();
     let hub = connect(&server, &[(1, false)]);
     let assets = (0..MAX_SUBSCRIBED_ASSETS)
         .map(|index| AssetUuid((index as u128).to_le_bytes()))
@@ -1832,24 +1817,13 @@ fn subscription_asset_and_path_sets_have_typed_cardinality_limits() {
 
 #[test]
 fn old_history_returns_resync_marker_and_future_cursor_is_typed_failure() {
-    let server = server_with(&[(1, false)]);
+    let mut project = project();
+    let server = project.server();
     let hub = connect(&server, &[(1, false)]);
-    commit_one(
-        &server,
-        set_asset(
-            asset_id(1),
-            StoredResolve::Deleted,
-            AssetDeltaState::Deleted,
-        ),
-    );
-    commit_one(
-        &server,
-        set_asset(
-            asset_id(1),
-            StoredResolve::Deleted,
-            AssetDeltaState::Restored,
-        ),
-    );
+    let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
+    publish_entry(&mut project, &entry);
+    project.remove(&entry.normalized_path);
+    assert_eq!(project.publish().version, InputVersion(2));
     server.discard_history_before(InputVersion(1)).unwrap();
 
     let install = hub
@@ -1874,7 +1848,8 @@ fn old_history_returns_resync_marker_and_future_cursor_is_typed_failure() {
 
 #[test]
 fn slow_subscription_queue_is_bounded_by_a_resync_marker() {
-    let server = server_with(&[(1, false)]);
+    let mut project = project();
+    let server = project.server();
     let hub = connect(&server, &[(1, false)]);
     let watched = asset_id(1);
     let install = hub
@@ -1886,17 +1861,15 @@ fn slow_subscription_queue_is_bounded_by_a_resync_marker() {
         Some(StreamEvent::InitialDelta { .. })
     ));
 
-    for version in 1..=1025 {
-        commit_one(
-            &server,
-            set_asset(
-                watched,
-                StoredResolve::Failed {
-                    error: version.to_string(),
-                },
-                AssetDeltaState::Changed,
-            ),
+    // The watched asset changes in each of 1025 versions.
+    for version in 1..=1025_u16 {
+        project.write_bundle(
+            "watched.bundle",
+            BundleUuid([1; 16]),
+            Some("main"),
+            &[Asset::blob("main", watched, type_id(1), &version.to_le_bytes())],
         );
+        assert_eq!(project.publish().version, InputVersion(version.into()));
     }
 
     assert!(matches!(
@@ -1911,7 +1884,8 @@ fn slow_subscription_queue_is_bounded_by_a_resync_marker() {
 
 #[test]
 fn restart_required_names_sorted_unique_keys_without_advancing_version() {
-    let server = server_with(&[(1, false)]);
+    let project = project();
+    let server = project.server();
     let hub = connect(&server, &[(1, false)]);
     let install = hub
         .subscribe(InputVersion(0), vec![], vec![])
@@ -1941,7 +1915,8 @@ fn restart_required_names_sorted_unique_keys_without_advancing_version() {
 
 #[test]
 fn pending_restart_state_is_queued_after_the_cursor_bound_first_message() {
-    let server = server_with(&[(1, false)]);
+    let project = project();
+    let server = project.server();
     let hub = connect(&server, &[(1, false)]);
     server.restart_required(vec!["daemon.address".to_owned()]).unwrap();
     let install = hub
@@ -1963,7 +1938,8 @@ fn pending_restart_state_is_queued_after_the_cursor_bound_first_message() {
 
 #[test]
 fn restart_required_replaces_the_prior_pending_key_set() {
-    let server = server_with(&[(1, false)]);
+    let project = project();
+    let server = project.server();
     let hub = connect(&server, &[(1, false)]);
     server.restart_required(vec!["daemon.address".to_owned()]).unwrap();
     server.restart_required(vec!["codegen.auto_codegen".to_owned()]).unwrap();
@@ -1983,19 +1959,20 @@ fn restart_required_replaces_the_prior_pending_key_set() {
 
 #[test]
 fn delta_stream_capability_keeps_the_connection_alive_after_hub_drop() {
-    let server = server_with(&[(1, false)]);
+    let mut project = project();
+    let server = project.server();
     let hub = connect(&server, &[(1, false)]);
-    let uuid = asset_id(1);
+    let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
+    let uuid = entry.uuid;
+    let since = publish_entry(&mut project, &entry).version;
     let install = hub
-        .subscribe(InputVersion(0), vec![uuid], vec![])
+        .subscribe(since, vec![uuid], vec![])
         .success()
         .unwrap();
     install.deltas.next().unwrap();
     drop(hub);
-    commit_one(
-        &server,
-        set_asset(uuid, StoredResolve::Deleted, AssetDeltaState::Deleted),
-    );
+    project.remove(&entry.normalized_path);
+    project.publish();
     assert!(matches!(
         install.deltas.next(),
         Some(StreamEvent::Delta(Delta { assets, .. }))
@@ -2005,7 +1982,8 @@ fn delta_stream_capability_keeps_the_connection_alive_after_hub_drop() {
 
 #[test]
 fn target_definition_change_fences_every_target_bound_method_and_prompts_stream() {
-    let server = server_with(&[(1, false)]);
+    let project = project();
+    let server = project.server();
     let hub = connect(&server, &[(1, false)]);
     let snap = snapshot(&hub);
     let install = hub
@@ -2039,7 +2017,8 @@ fn target_definition_change_fences_every_target_bound_method_and_prompts_stream(
 
 #[test]
 fn pipeline_epoch_change_fences_every_target_bound_capability_and_prompts_stream() {
-    let server = server_with(&[(1, false)]);
+    let project = project();
+    let server = project.server();
     let hub = connect(&server, &[(1, false)]);
     let snapshot = snapshot(&hub);
     let install = hub
@@ -2048,13 +2027,8 @@ fn pipeline_epoch_change_fences_every_target_bound_capability_and_prompts_stream
         .unwrap();
     install.deltas.next().unwrap();
 
-    server
-        .commit(Commit {
-            pipeline: Some(PipelineDiagnostic::Ready),
-            pipeline_epoch_changed: true,
-            ..Commit::default()
-        })
-        .unwrap();
+    // A rejected pipeline candidate changes the pipeline epoch.
+    reject_pipeline(&project, test_pipeline_failure());
 
     assert!(matches!(
         install.deltas.next(),
@@ -2074,35 +2048,42 @@ fn pipeline_epoch_change_fences_every_target_bound_capability_and_prompts_stream
 
 #[test]
 fn unchanged_pipeline_diagnostic_does_not_create_a_false_epoch_fence() {
-    let server = server_with(&[(1, false)]);
+    let mut project = project();
+    let server = project.server();
     let hub = connect(&server, &[(1, false)]);
-    server
-        .commit(Commit {
-            pipeline: Some(PipelineDiagnostic::Ready),
-            ..Commit::default()
-        })
-        .unwrap();
+    // Every scan publication carries the pipeline diagnostic, here the
+    // unchanged Ready.
+    publish_unrelated(&mut project);
     assert!(matches!(hub.snapshot(), RpcResult::Success(_)));
 }
 
 #[test]
 fn hub_authoring_and_wire_tree_surface_is_versioned_typed_and_generation_first() {
+    let mut project = project();
+    let daemon = project.server();
+    // The daemon's authoring service writes files; a second server over
+    // the same store records imports, reimports and operations.
     let backend = Arc::new(RecordingAuthoringBackend::default());
-    let server = Server::new_with_authoring_backend(
-        StoreInstanceId([9; 16]),
-        vec![target_with(7, &[(1, false)])],
-        backend.clone(),
-    )
-    .unwrap();
-    let hub = connect(&server, &[(1, false)]);
+    let server = server_over(&project, backend.clone());
+    let hub = connect(&daemon, &[(1, false)]);
+    let recording = connect(&server, &[(1, false)]);
     let mut entry = authoring_entry(21, AuthoringEntryRole::Runtime);
     entry.type_uuid = type_id(1);
     entry.terminal_type = type_id(1);
-    assert_eq!(
-        hub.write(InputVersion(0), vec![AuthoringOp::Set(entry.clone())], false),
-        RpcResult::Success(WriteReceipt::default())
-    );
-    assert_eq!(server.current_stamp().unwrap().version, InputVersion(1));
+    // The daemon writes the new bundle file and names it; the watcher
+    // publishes it.
+    let receipt = hub
+        .write(InputVersion(0), vec![AuthoringOp::Set(entry.clone())], false)
+        .success()
+        .unwrap();
+    assert!(matches!(
+        &receipt.files[..],
+        [WrittenFile { root, path, content_hash: Some(_) }]
+            if root == distill_test_project::ROOT && *path == entry.normalized_path
+    ));
+    assert_eq!(server.current_stamp().unwrap().version, InputVersion(0));
+    touch_written(&mut project, &receipt);
+    assert_eq!(project.publish().version, InputVersion(1));
     assert_eq!(
         snapshot(&hub)
             .entry(entry.uuid)
@@ -2144,15 +2125,15 @@ fn hub_authoring_and_wire_tree_surface_is_versioned_typed_and_generation_first()
         root: "assets".to_owned(),
     };
     assert_eq!(
-        hub.import(InputVersion(1), import_request.clone()),
+        recording.import(InputVersion(1), import_request.clone()),
         RpcResult::Success(BundleUuid([70; 16]))
     );
     assert_eq!(
-        hub.reimport(InputVersion(2), BundleUuid([70; 16])),
+        recording.reimport(InputVersion(2), BundleUuid([70; 16])),
         RpcResult::Success(BundleUuid([70; 16]))
     );
     let operation = LongRunningOp::Doctor(Arc::from(&b"verify-cas"[..]));
-    let progress = hub
+    let progress = recording
         .operation(InputVersion(3), operation.clone())
         .success()
         .unwrap();
@@ -2163,7 +2144,7 @@ fn hub_authoring_and_wire_tree_surface_is_versioned_typed_and_generation_first()
     assert_eq!(events[2].state, AuthoringProgressState::Completed);
     assert_eq!(server.current_stamp().unwrap().version, InputVersion(4));
     let cancelled_operation = LongRunningOp::Doctor(Arc::from(&b"cancel-me"[..]));
-    let mut cancellable = hub
+    let mut cancellable = recording
         .operation(InputVersion(4), cancelled_operation.clone())
         .success()
         .unwrap();
@@ -2205,16 +2186,6 @@ fn hub_authoring_and_wire_tree_surface_is_versioned_typed_and_generation_first()
     server
         .install_artifact(wire_artifact_hash, wire_artifact)
         .unwrap();
-    commit_one(
-        &server,
-        set_asset(
-            asset_id(1),
-            StoredResolve::Built {
-                content_hash: wire_artifact_hash,
-            },
-            AssetDeltaState::Changed,
-        ),
-    );
     assert_eq!(hub.wire_tree(hash), RpcResult::Success(tree));
 
     let snapshot = snapshot(&hub);
@@ -2272,8 +2243,31 @@ fn long_running_operation_payloads_are_canonical_and_closed() {
 
 #[test]
 fn missing_authoring_backend_is_typed_and_never_advances_the_input_version() {
-    let server = server_with(&[(1, false)]);
+    // A server whose authoring backend has no filesystem authority cannot
+    // write: it says so, and publishes nothing.
+    let mut project = project();
+    let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
+    let base = publish_entry(&mut project, &entry);
+    let server = server_over(&project, Arc::new(RecordingAuthoringBackend::default()));
     let hub = connect(&server, &[(1, false)]);
+    assert_eq!(
+        hub.write(
+            base.version,
+            vec![AuthoringOp::Remove { uuid: entry.uuid }],
+            false
+        ),
+        RpcResult::Failure(RpcFailure::AuthoringBackendUnavailable {
+            operation: "write".to_owned(),
+        })
+    );
+    assert!(project
+        .root(distill_test_project::ROOT)
+        .join(&entry.normalized_path)
+        .exists());
+    assert_eq!(server.current_stamp().unwrap(), base);
+
+    // The daemon has no importer the project does not provide.
+    let daemon = connect(&project.server(), &[(1, false)]);
     let request = ImportRequest {
         importer: "image-importer".to_owned(),
         sources: vec!["source/image.png".to_owned()],
@@ -2286,17 +2280,18 @@ fn missing_authoring_backend_is_typed_and_never_advances_the_input_version() {
         root: String::new(),
     };
     assert_eq!(
-        hub.import(InputVersion(0), request),
-        RpcResult::Failure(RpcFailure::AuthoringBackendUnavailable {
-            operation: "import".to_owned(),
+        daemon.import(base.version, request),
+        RpcResult::Failure(RpcFailure::InvalidAuthoringRequest {
+            detail: "importer \"image-importer\" is not registered".to_owned(),
         })
     );
-    assert_eq!(server.current_stamp().unwrap().version, InputVersion(0));
+    assert_eq!(server.current_stamp().unwrap(), base);
 }
 
 #[test]
 fn fence_is_the_guarantee_even_if_reconnect_event_is_not_consumed() {
-    let server = server_with(&[(1, false)]);
+    let project = project();
+    let server = project.server();
     let hub = connect(&server, &[(1, false)]);
     let snap = snapshot(&hub);
     let _unpolled = hub
@@ -2314,7 +2309,8 @@ fn fence_is_the_guarantee_even_if_reconnect_event_is_not_consumed() {
 
 #[test]
 fn expired_and_foreign_snapshots_fail_without_serving_data() {
-    let server = server_with(&[(1, false)]);
+    let project = project();
+    let server = project.server();
     let first_hub = connect(&server, &[(1, false)]);
     let second_hub = connect(&server, &[(1, false)]);
     let first = snapshot(&first_hub);
@@ -2345,28 +2341,23 @@ fn expired_and_foreign_snapshots_fail_without_serving_data() {
 
 #[test]
 fn commit_validation_is_atomic_for_duplicate_names_and_invalid_paths() {
-    let server = server_with(&[(1, false)]);
+    let project = project();
+    let server = project.server();
     let before = server.current_stamp().unwrap();
+    let deleted = AssetMutation::Set {
+        uuid: asset_id(1),
+        resolution: StoredResolve::Deleted,
+        delta: AssetDeltaState::Deleted,
+    };
     assert!(matches!(
-        server.commit(Commit {
-            assets: vec![
-                set_asset(
-                    asset_id(1),
-                    StoredResolve::Deleted,
-                    AssetDeltaState::Deleted
-                ),
-                set_asset(
-                    asset_id(1),
-                    StoredResolve::Deleted,
-                    AssetDeltaState::Deleted
-                ),
-            ],
+        offer(&server, Commit {
+            assets: vec![deleted.clone(), deleted],
             ..Commit::default()
         }),
         Err(AdminError::DuplicateAssetMutation { .. })
     ));
     assert!(matches!(
-        server.commit(Commit {
+        offer(&server, Commit {
             paths: vec![PathMutation::Remove {
                 path: "../escape".to_owned(),
             }],
@@ -2375,7 +2366,7 @@ fn commit_validation_is_atomic_for_duplicate_names_and_invalid_paths() {
         Err(AdminError::InvalidPath { .. })
     ));
     assert!(matches!(
-        server.commit(Commit {
+        offer(&server, Commit {
             paths: vec![PathMutation::Remove {
                 path: "cafe\u{301}.asset".to_owned(),
             }],
@@ -2384,7 +2375,7 @@ fn commit_validation_is_atomic_for_duplicate_names_and_invalid_paths() {
         Err(AdminError::InvalidPath { .. })
     ));
     assert!(matches!(
-        server.commit(Commit {
+        offer(&server, Commit {
             paths: vec![PathMutation::Remove {
                 path: "nul\0.asset".to_owned(),
             }],
@@ -2393,7 +2384,7 @@ fn commit_validation_is_atomic_for_duplicate_names_and_invalid_paths() {
         Err(AdminError::InvalidPath { .. })
     ));
     assert_eq!(
-        server.commit(Commit {
+        offer(&server, Commit {
             paths: vec![PathMutation::Set {
                 path: "empty.asset".to_owned(),
                 candidates: BTreeSet::new(),
@@ -2409,12 +2400,13 @@ fn commit_validation_is_atomic_for_duplicate_names_and_invalid_paths() {
 
 #[test]
 fn authoring_identity_validation_rejects_reserved_local_ids_and_noncanonical_tags_atomically() {
-    let server = server_with(&[(1, false)]);
+    let project = project();
+    let server = project.server();
     let before = server.current_stamp().unwrap();
     let mut reserved = authoring_entry(1, AuthoringEntryRole::Runtime);
     reserved.local_id = "$generated".to_owned();
     assert!(matches!(
-        server.commit(Commit {
+        offer(&server, Commit {
             authoring: vec![AuthoringMutation::Set(reserved)],
             ..Commit::default()
         }),
@@ -2423,7 +2415,7 @@ fn authoring_identity_validation_rejects_reserved_local_ids_and_noncanonical_tag
     let mut bad_tag = authoring_entry(1, AuthoringEntryRole::Runtime);
     bad_tag.tags = std::collections::BTreeMap::from([("bad\0tag".to_owned(), None)]);
     assert!(matches!(
-        server.commit(Commit {
+        offer(&server, Commit {
             authoring: vec![AuthoringMutation::Set(bad_tag)],
             ..Commit::default()
         }),
@@ -2434,7 +2426,8 @@ fn authoring_identity_validation_rejects_reserved_local_ids_and_noncanonical_tag
 
 #[test]
 fn wire_tree_coverage_keeps_pinned_compatible_artifact_references() {
-    let server = server_with(&[(1, false), (2, false)]);
+    let mut project = project();
+    let server = project.server();
     let hub = connect(&server, &[(1, false)]);
     let node = distill_wire::wire::WireNode::Unit { offset: 0 };
     let tree: Arc<[u8]> = Arc::from(distill_wire::dswl::dswl_bytes(&node).unwrap());
@@ -2465,42 +2458,40 @@ fn wire_tree_coverage_keeps_pinned_compatible_artifact_references() {
         .install_artifact(historical_hash, historical)
         .unwrap();
     server.install_artifact(current_hash, current).unwrap();
-    commit_one(
-        &server,
-        set_asset(
-            asset,
-            StoredResolve::Built {
-                content_hash: historical_hash,
-            },
-            AssetDeltaState::Changed,
-        ),
+    // The asset resolves to the historical artifact, then to the current
+    // one, then is deleted.
+    let builds = BuildsByVersion::install(&server);
+    let entry = authoring_entry(9, AuthoringEntryRole::Runtime);
+    let historical_stamp = publish_entry(&mut project, &entry);
+    builds.answer(historical_stamp, historical_hash);
+    assert_eq!(
+        snapshot(&hub).resolve(asset).success().unwrap().value,
+        ResolveResult::Built {
+            content_hash: historical_hash
+        }
     );
-    commit_one(
-        &server,
-        set_asset(
-            asset,
-            StoredResolve::Built {
-                content_hash: current_hash,
-            },
-            AssetDeltaState::Changed,
-        ),
+    let mut changed = entry.clone();
+    changed.value.blobs = vec![Arc::from([0xAA])];
+    let current_stamp = publish_entry(&mut project, &changed);
+    builds.answer(current_stamp, current_hash);
+    assert_eq!(
+        snapshot(&hub).resolve(asset).success().unwrap().value,
+        ResolveResult::Built {
+            content_hash: current_hash
+        }
     );
 
     assert_eq!(hub.wire_tree(layout_hash), RpcResult::Success(tree.clone()));
 
-    commit_one(
-        &server,
-        AssetMutation::Remove {
-            uuid: asset,
-            delta: AssetDeltaState::Deleted,
-        },
-    );
+    project.remove(&entry.normalized_path);
+    project.publish();
     assert_eq!(hub.wire_tree(layout_hash), RpcResult::Success(tree));
 }
 
 #[test]
 fn artifact_install_authenticates_header_hash_and_direct_typed_load_edges() {
-    let server = server_with(&[(1, false), (2, false)]);
+    let mut project = project();
+    let server = project.server();
     let (hash, payload) = canonical_artifact(
         asset_id(1),
         type_id(2),
@@ -2526,15 +2517,19 @@ fn artifact_install_authenticates_header_hash_and_direct_typed_load_edges() {
     ));
 
     server.install_artifact(hash, payload).unwrap();
-    commit_one(
-        &server,
-        set_asset(
-            asset_id(1),
-            StoredResolve::Built { content_hash: hash },
-            AssetDeltaState::Changed,
-        ),
-    );
+    // The asset 1 resolves to it; its direct dependency, the asset 2, is
+    // not in the namespace.
+    let builds = TestBuilds::install(&server);
+    builds.answer(asset_id(1), Ok(BuildAnswer::Built { content_hash: hash }));
+    let mut entry = authoring_entry(1, AuthoringEntryRole::Runtime);
+    entry.type_uuid = type_id(2);
+    entry.terminal_type = type_id(2);
+    publish_entry(&mut project, &entry);
     let hub = connect(&server, &[(1, false), (2, false)]);
+    assert_eq!(
+        snapshot(&hub).resolve(asset_id(1)).success().unwrap().value,
+        ResolveResult::Built { content_hash: hash }
+    );
     let RpcResult::Success(fetched) = snapshot(&hub).fetch(hash) else {
         panic!("an authenticated artifact with unresolved direct edges must remain fetchable");
     };
@@ -2549,7 +2544,8 @@ fn artifact_install_authenticates_header_hash_and_direct_typed_load_edges() {
 
 #[test]
 fn an_artifact_s_load_edges_are_its_latest_install_s() {
-    let server = server_with(&[(1, false)]);
+    let project = project();
+    let server = project.server();
     let (hash, first) = canonical_artifact(
         asset_id(1),
         type_id(1),
@@ -2568,14 +2564,6 @@ fn an_artifact_s_load_edges_are_its_latest_install_s() {
     let mut different_edges = first.clone();
     different_edges.load_edges[0].expected_terminal = type_id(3);
     assert_eq!(server.install_artifact(hash, different_edges), Ok(()));
-    commit_one(
-        &server,
-        set_asset(
-            asset_id(1),
-            StoredResolve::Built { content_hash: hash },
-            AssetDeltaState::Changed,
-        ),
-    );
     let hub = connect(&server, &[(1, false), (2, false)]);
     let RpcResult::Success(fetched) = snapshot(&hub).fetch(hash) else {
         panic!("an installed artifact must be fetchable");
@@ -2591,7 +2579,8 @@ fn an_artifact_s_load_edges_are_its_latest_install_s() {
 
 #[test]
 fn coordinated_target_set_replacement_advances_once_and_fences_changed_or_removed_hubs() {
-    let server = server_with(&[(1, false)]);
+    let project = project();
+    let server = project.server();
     let changed = connect(&server, &[(1, false)]);
     let stamp = server
         .coordinated_replace_target_set(
@@ -2705,37 +2694,33 @@ impl AuthoringBackend for PartialFailBackend {
 /// failed input would otherwise commit as a version with no change log).
 #[test]
 fn a_failed_backend_step_commits_nothing_it_wrote() {
-    let server = Server::new_at_version_with_authoring_backend(
-        StoreInstanceId([9; 16]),
-        InputVersion(8),
-        vec![target_with(7, &[(1, false)])],
-        Arc::new(PartialFailBackend),
-    )
-    .unwrap();
+    let mut project = project();
+    let base = publish_unrelated(&mut project).version;
+    let server = server_over(&project, Arc::new(PartialFailBackend));
     let hub = connect(&server, &[(1, false)]);
     let unchanged = |root: &str| {
-        assert_eq!(server.current_stamp().unwrap().version, InputVersion(8), "{root}");
+        assert_eq!(server.current_stamp().unwrap().version, base, "{root}");
         server.with_writer(|store| {
             assert_eq!(store.root_id(root).unwrap(), None, "{root} committed");
-            assert_eq!(store.input_version().unwrap(), InputVersion(8), "{root}");
+            assert_eq!(store.input_version().unwrap(), base, "{root}");
         });
     };
 
     let write = hub.write(
-        InputVersion(8),
+        base,
         vec![AuthoringOp::Remove { uuid: asset_id(7) }],
         false,
     );
     assert!(matches!(write, RpcResult::Failure(_)), "{write:?}");
     unchanged("partial-write");
 
-    let reimport = hub.reimport(InputVersion(8), BundleUuid([0xAA; 16]));
+    let reimport = hub.reimport(base, BundleUuid([0xAA; 16]));
     assert!(matches!(reimport, RpcResult::Failure(_)), "{reimport:?}");
     unchanged("partial-reimport");
 
     let progress = hub
         .operation(
-            InputVersion(8),
+            base,
             LongRunningOp::RenameWithFixups(Arc::from(&b"rename"[..])),
         )
         .success()
@@ -2753,7 +2738,8 @@ fn a_failed_backend_step_commits_nothing_it_wrote() {
 /// publishes nothing; the server keeps serving.
 #[test]
 fn a_failed_served_write_returns_the_store_error() {
-    let server = server_with(&[(1, false)]);
+    let mut project = project();
+    let server = project.server();
     let before = server.current_stamp().unwrap();
     let db = server.with_writer(|store| store.state_path().join("meta.sqlite"));
     rusqlite::Connection::open(&db)
@@ -2777,10 +2763,7 @@ fn a_failed_served_write_returns_the_store_error() {
         server.replace_target(TargetDefinition::new("absent", TargetDefinitionHash([1; 32]))),
         Err(distill_rpc::AdminWriteError::Invalid(AdminError::UnknownTarget { .. }))
     ));
-    commit_one(
-        &server,
-        set_asset(asset_id(1), StoredResolve::Deleted, AssetDeltaState::Restored),
-    );
+    publish_unrelated(&mut project);
     assert!(server.discard_history_before(InputVersion(2)).is_err());
     assert_eq!(server.current_stamp().unwrap().version.0, before.version.0 + 1);
 }
@@ -2789,7 +2772,8 @@ fn a_failed_served_write_returns_the_store_error() {
 /// when the served write fails, the persisted failure rolls back with it.
 #[test]
 fn a_runtime_pipeline_failure_persists_with_its_fence_or_not_at_all() {
-    let server = server_with(&[(1, false)]);
+    let project = project();
+    let server = project.server();
     let failure = PipelineFailure::new(
         PipelineFailureCode::PublishedCallbackPanic,
         PipelineFailureOrigin::PublishedRuntime,
@@ -2831,17 +2815,12 @@ fn a_runtime_pipeline_failure_persists_with_its_fence_or_not_at_all() {
 /// effect changes nothing, so it publishes no version.
 #[test]
 fn an_unchanged_protocol_epoch_or_target_publishes_no_version() {
-    let server = server_with(&[(1, false)]);
+    let project = project();
+    let server = project.server();
     let before = server.current_stamp().unwrap();
     assert_eq!(server.replace_protocol_epoch(PROTOCOL_VERSION).unwrap(), before);
     assert_eq!(server.replace_target(target_with(7, &[(1, false)])).unwrap(), before);
     assert_eq!(server.current_stamp().unwrap(), before);
     let changed = server.replace_protocol_epoch(PROTOCOL_VERSION + 1).unwrap();
     assert_eq!(changed.version.0, before.version.0 + 1);
-}
-
-// TODO(schema-min phase 5): the embedded server the unconverted tests below
-// still use; removed with embedded Full apply mode.
-fn server_with(policies: &[(u8, bool)]) -> Server {
-    Server::new(StoreInstanceId([9; 16]), vec![target_with(7, policies)]).unwrap()
 }
