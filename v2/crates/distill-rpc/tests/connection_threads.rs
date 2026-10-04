@@ -16,6 +16,7 @@ use distill_rpc::capnp_transport::{
     schema, CapnpClient, ConnectionHandle, RemoteConnectOutcome, StagedListener,
 };
 use distill_rpc::*;
+use distill_test_project::{Asset, TestProject};
 
 const TARGET_HASH: TargetDefinitionHash = TargetDefinitionHash([7; 32]);
 /// `runtime_type_policy` of this type blocks until the test releases it.
@@ -129,15 +130,28 @@ impl Gate {
     }
 }
 
+/// Answers each build with the artifact installed for its asset (a build
+/// of `ASSET` at a version in `by_version` with that version's), and
+/// stalls or panics on the runtime policy of `STALL` or `PANIC`.
 struct TestBackend {
     gate: Arc<Gate>,
+    built: BTreeMap<AssetUuid, ContentHash>,
+    by_version: Mutex<BTreeMap<InputVersion, ContentHash>>,
 }
 
 impl BuildBackend for TestBackend {
-    fn start(&self, _view: BuildView<'_>, request: &BuildRequest) -> BuildStart {
-        BuildStart::Answered(Ok(BuildAnswer::Drifted {
-            input: request.drifted_input.clone(),
-        }))
+    fn start(&self, view: BuildView<'_>, request: &BuildRequest) -> BuildStart {
+        let at_version = (request.requested_asset == ASSET)
+            .then(|| self.by_version.lock().unwrap().get(&view.stamp.version).copied())
+            .flatten();
+        BuildStart::Answered(
+            match at_version.or_else(|| self.built.get(&request.requested_asset).copied()) {
+                Some(content_hash) => Ok(BuildAnswer::Built { content_hash }),
+                None => Ok(BuildAnswer::Drifted {
+                    input: request.drifted_input.clone(),
+                }),
+            },
+        )
     }
 
     fn runtime_type_policy(
@@ -184,50 +198,82 @@ fn artifact(asset: AssetUuid, fixed: &[u8]) -> (ContentHash, ArtifactPayload) {
     )
 }
 
+/// The type of every authored asset and artifact here.
+const TYPE: TypeUuid = TypeUuid([1; 16]);
+/// The bundle file holding `ASSET`.
+const ASSET_FILE: &str = "asset.bundle";
+/// A second bundle file claiming `ASSET`, which withholds it.
+const DUPLICATE_FILE: &str = "duplicate.bundle";
+
+/// An empty project whose daemon serves the target "dev".
+fn project() -> TestProject {
+    TestProject::new(vec![TargetDefinition::new("dev", TARGET_HASH)])
+}
+
+/// Author `ASSET` holding `value`, as the primary of its own bundle file.
+fn write_asset(project: &mut TestProject, value: u8) {
+    project.write_bundle(
+        ASSET_FILE,
+        BundleUuid([44; 16]),
+        Some("asset"),
+        &[Asset::uint("asset", ASSET, TYPE, value)],
+    );
+}
+
+/// Author a second bundle file claiming `ASSET`: the daemon withholds it,
+/// and serves it failed with [`collision_error`].
+fn write_duplicate(project: &mut TestProject) {
+    project.write_bundle(
+        DUPLICATE_FILE,
+        BundleUuid([46; 16]),
+        None,
+        &[Asset::uint("duplicate", ASSET, TYPE, 0)],
+    );
+}
+
+/// What a resolve of `ASSET` answers while two bundle files claim it.
+fn collision_error() -> String {
+    format!("duplicate asset UUID {ASSET}")
+}
+
 struct Fixture {
+    // The daemon and its files, held for the fixture's lifetime.
+    project: TestProject,
     server: Server,
+    backend: Arc<TestBackend>,
     gate: Arc<Gate>,
     hash: ContentHash,
     large: ContentHash,
 }
 
-/// An embedded server whose `ASSET` is built and whose `LARGE` artifact
-/// is 8 MiB.
+/// A daemon serving `ASSET` and `LARGE`, each authored in its own bundle
+/// file; their builds answer the installed artifacts, `LARGE`'s 8 MiB.
 fn fixture() -> Fixture {
-    let server = Server::new(
-        StoreInstanceId([9; 16]),
-        vec![TargetDefinition::new("dev", TARGET_HASH)],
-    )
-    .unwrap();
+    let mut project = project();
+    let server = project.server();
     let gate = Arc::new(Gate::default());
-    server.install_build_backend(Arc::new(TestBackend {
-        gate: Arc::clone(&gate),
-    }));
     let (hash, payload) = artifact(ASSET, &[7, 8, 9]);
     server.install_artifact(hash, payload).unwrap();
     let (large, payload) = artifact(LARGE, &vec![0x5a; 8 << 20]);
     server.install_artifact(large, payload).unwrap();
-    server
-        .commit(Commit {
-            assets: vec![
-                AssetMutation::Set {
-                    uuid: ASSET,
-                    resolution: StoredResolve::Built { content_hash: hash },
-                    delta: AssetDeltaState::Changed,
-                },
-                AssetMutation::Set {
-                    uuid: LARGE,
-                    resolution: StoredResolve::Built {
-                        content_hash: large,
-                    },
-                    delta: AssetDeltaState::Changed,
-                },
-            ],
-            ..Commit::default()
-        })
-        .unwrap();
+    let backend = Arc::new(TestBackend {
+        gate: Arc::clone(&gate),
+        built: BTreeMap::from([(ASSET, hash), (LARGE, large)]),
+        by_version: Mutex::new(BTreeMap::new()),
+    });
+    server.install_build_backend(backend.clone());
+    write_asset(&mut project, 1);
+    project.write_bundle(
+        "large.bundle",
+        BundleUuid([45; 16]),
+        Some("large"),
+        &[Asset::uint("large", LARGE, TYPE, 1)],
+    );
+    project.publish();
     Fixture {
+        project,
         server,
+        backend,
         gate,
         hash,
         large,
@@ -362,7 +408,11 @@ async fn resolve_built(snapshot: &RemoteSnapshot, expected: ContentHash) {
 fn a_stalled_request_on_one_connection_does_not_delay_another() {
     watchdog(Duration::from_secs(60), || {
         let Fixture {
-            server, gate, hash, ..
+            project: _project,
+            server,
+            gate,
+            hash,
+            ..
         } = fixture();
         let (address_tx, address_rx) = mpsc::channel();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -452,7 +502,7 @@ fn a_stalled_request_on_one_connection_does_not_delay_another() {
 #[test]
 fn connections_up_to_the_bound_are_served_at_once_and_one_more_is_refused() {
     watchdog(Duration::from_secs(60), || {
-        let Fixture { server, hash, .. } = fixture();
+        let Fixture { project: _project, server, hash, .. } = fixture();
         server
             .install_snapshot_policy(SnapshotPolicy {
                 max_connections: 4,
@@ -526,7 +576,7 @@ fn connections_up_to_the_bound_are_served_at_once_and_one_more_is_refused() {
 #[test]
 fn deltas_and_fences_reach_every_connection() {
     watchdog(Duration::from_secs(60), || {
-        let Fixture { server, .. } = fixture();
+        let Fixture { mut project, server, .. } = fixture();
         let daemon = Daemon::start(server.root());
         let address = daemon.address;
         let since = server.current_stamp().unwrap().version;
@@ -566,18 +616,9 @@ fn deltas_and_fences_reach_every_connection() {
             ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         }
 
-        let changed = server
-            .commit(Commit {
-                assets: vec![AssetMutation::Set {
-                    uuid: ASSET,
-                    resolution: StoredResolve::Failed {
-                        error: "changed".into(),
-                    },
-                    delta: AssetDeltaState::Changed,
-                }],
-                ..Commit::default()
-            })
-            .unwrap();
+        // `ASSET` changes: its bundle file now holds another value.
+        write_asset(&mut project, 2);
+        let changed = project.publish();
         let mut deltas = BTreeMap::new();
         for _ in 0..4 {
             let (index, event) = event_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -628,7 +669,7 @@ fn deltas_and_fences_reach_every_connection() {
 #[test]
 fn the_snapshot_bound_and_ttl_hold_across_connection_threads() {
     watchdog(Duration::from_secs(60), || {
-        let Fixture { server, hash, .. } = fixture();
+        let Fixture { project: _project, server, hash, .. } = fixture();
         server
             .install_snapshot_policy(SnapshotPolicy {
                 ttl: Duration::from_millis(1500),
@@ -712,7 +753,11 @@ fn the_snapshot_bound_and_ttl_hold_across_connection_threads() {
 fn a_connection_dropped_mid_fetch_releases_everything() {
     watchdog(Duration::from_secs(60), || {
         let Fixture {
-            server, hash, large, ..
+            project: _project,
+            server,
+            hash,
+            large,
+            ..
         } = fixture();
         let daemon = Daemon::start(server.root());
         let address = daemon.address;
@@ -756,7 +801,7 @@ fn a_connection_dropped_mid_fetch_releases_everything() {
 #[test]
 fn shutdown_is_prompt_with_stuck_clients() {
     watchdog(Duration::from_secs(60), || {
-        let Fixture { server, gate, .. } = fixture();
+        let Fixture { project: _project, server, gate, .. } = fixture();
         let daemon = Daemon::start(server.root());
         let address = daemon.address;
 
@@ -824,7 +869,7 @@ fn shutdown_is_prompt_with_stuck_clients() {
 #[test]
 fn a_panic_ends_only_its_own_connection() {
     watchdog(Duration::from_secs(60), || {
-        let Fixture { server, hash, .. } = fixture();
+        let Fixture { project: _project, server, hash, .. } = fixture();
         let daemon = Daemon::start(server.root());
         let address = daemon.address;
 
@@ -881,17 +926,35 @@ fn a_panic_ends_only_its_own_connection() {
 // 8. Stress
 
 /// Clients resolve, fetch, refresh, follow their delta streams, and
-/// reconnect while the store publishes. Every answer must match the
+/// reconnect while the daemon publishes. Every answer must match the
 /// version it is stamped with, and everything is released at the end.
 #[test]
 fn concurrent_snapshots_resolves_fetches_and_commits_stay_consistent() {
     watchdog(Duration::from_secs(120), || {
-        let Fixture { server, hash, .. } = fixture();
+        let Fixture {
+            mut project,
+            server,
+            backend,
+            hash,
+            ..
+        } = fixture();
         let daemon = Daemon::start(server.root());
         let address = daemon.address;
         let base = server.current_stamp().unwrap().version;
         const CLIENTS: usize = 6;
         const COMMITS: u64 = 120;
+
+        // Each even generation's build of `ASSET` answers an artifact of its
+        // own, installed before any client resolves.
+        let by_version = (1..=COMMITS)
+            .filter(|generation| generation % 2 == 0)
+            .map(|generation| {
+                let (content_hash, payload) = artifact(ASSET, &generation.to_le_bytes());
+                server.install_artifact(content_hash, payload).unwrap();
+                (InputVersion(base.0 + generation), content_hash)
+            })
+            .collect::<BTreeMap<_, _>>();
+        *backend.by_version.lock().unwrap() = by_version.clone();
 
         let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let mut clients = Vec::new();
@@ -917,8 +980,7 @@ fn concurrent_snapshots_resolves_fetches_and_commits_stay_consistent() {
                             RemoteCall::Success(terminal) => {
                                 assert_eq!(terminal.basis.snapshot.version, stamp);
                                 if let ResolveResult::Built { content_hash } = &terminal.value {
-                                    assert_eq!(*content_hash, hash);
-                                    let mut fetched = match snapshot.fetch(hash).await.unwrap() {
+                                    let mut fetched = match snapshot.fetch(*content_hash).await.unwrap() {
                                         RemoteCall::Success(terminal) => terminal.value,
                                         other => panic!("fetch failed: {other:?}"),
                                     };
@@ -926,7 +988,7 @@ fn concurrent_snapshots_resolves_fetches_and_commits_stay_consistent() {
                                     while let Some(chunk) = fetched.next_chunk().await.unwrap() {
                                         bytes.extend_from_slice(&chunk.bytes);
                                     }
-                                    assert_eq!(distill_wire::artifact::content_hash(&bytes), hash);
+                                    assert_eq!(distill_wire::artifact::content_hash(&bytes), *content_hash);
                                 }
                                 observed.push((stamp, terminal.value));
                             }
@@ -955,27 +1017,19 @@ fn concurrent_snapshots_resolves_fetches_and_commits_stay_consistent() {
             }));
         }
 
-        // Publish while the clients run: even generations restore the built
-        // artifact, odd ones fail it.
+        // Publish while the clients run: odd generations withhold `ASSET`
+        // behind a second bundle file claiming it, even ones remove that
+        // file, and its build at that version answers the generation's own
+        // artifact.
         let mut generations = BTreeMap::new();
         for generation in 1..=COMMITS {
-            let resolution = if generation % 2 == 0 {
-                StoredResolve::Built { content_hash: hash }
+            if generation % 2 == 0 {
+                project.remove(DUPLICATE_FILE);
             } else {
-                StoredResolve::Failed {
-                    error: format!("generation {generation}"),
-                }
-            };
-            let stamp = server
-                .commit(Commit {
-                    assets: vec![AssetMutation::Set {
-                        uuid: ASSET,
-                        resolution,
-                        delta: AssetDeltaState::Changed,
-                    }],
-                    ..Commit::default()
-                })
-                .unwrap();
+                write_duplicate(&mut project);
+            }
+            let stamp = project.publish();
+            assert_eq!(stamp.version, InputVersion(base.0 + generation));
             generations.insert(stamp.version, generation);
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -989,11 +1043,11 @@ fn concurrent_snapshots_resolves_fetches_and_commits_stay_consistent() {
                         assert_eq!(version, base);
                         ResolveResult::Built { content_hash: hash }
                     }
-                    Some(generation) if generation % 2 == 0 => {
-                        ResolveResult::Built { content_hash: hash }
-                    }
-                    Some(generation) => ResolveResult::Failed {
-                        error: format!("generation {generation}"),
+                    Some(generation) if generation % 2 == 0 => ResolveResult::Built {
+                        content_hash: by_version[&version],
+                    },
+                    Some(_) => ResolveResult::Failed {
+                        error: collision_error(),
                     },
                 };
                 assert_eq!(value, expected, "resolve at {version:?}");
@@ -1105,13 +1159,13 @@ impl AuthoringBackend for LedgerBackend {
     }
 }
 
-fn ledger_server(backend: Arc<LedgerBackend>) -> Server {
-    Server::new_with_authoring_backend(
-        StoreInstanceId([9; 16]),
-        vec![TargetDefinition::new("dev", TARGET_HASH)],
-        backend,
-    )
-    .unwrap()
+/// A server of its own over a fresh project's store, writing through
+/// `backend`; the project holds the daemon and its files.
+fn ledger_server(backend: Arc<LedgerBackend>) -> (TestProject, Server) {
+    let project = project();
+    let handle = ServerHandle::open(backend, Arc::clone(project.coordinator().opener()));
+    let server = Server::open(&handle);
+    (project, server)
 }
 
 /// Connect, keeping the raw hub for the authoring calls `RemoteHub` does
@@ -1165,7 +1219,7 @@ fn two_connections_writing_concurrently_are_serialized_and_commit_nothing() {
             hold: Duration::from_millis(2),
             ..LedgerBackend::default()
         });
-        let server = ledger_server(Arc::clone(&backend));
+        let (_project, server) = ledger_server(Arc::clone(&backend));
         let daemon = Daemon::start(server.root());
         let address = daemon.address;
         let start = server.current_stamp().unwrap().version;
@@ -1208,7 +1262,7 @@ fn two_connections_writing_concurrently_are_serialized_and_commit_nothing() {
 #[test]
 fn a_coordinated_commits_backend_row_and_served_projection_land_together() {
     watchdog(Duration::from_secs(60), || {
-        let server = ledger_server(Arc::new(LedgerBackend::default()));
+        let (_project, server) = ledger_server(Arc::new(LedgerBackend::default()));
         let handle = server.handle();
         let start = server.current_stamp().unwrap().version;
         const COMMITS: u64 = 150;
@@ -1271,11 +1325,11 @@ fn a_coordinated_commits_backend_row_and_served_projection_land_together() {
 #[test]
 fn a_connection_blocked_on_the_write_lock_does_not_stall_another() {
     watchdog(Duration::from_secs(60), || {
-        let server = ledger_server(Arc::new(LedgerBackend::default()));
-        let start = server
-            .commit(ledger_commit(InputVersion(1)))
-            .unwrap()
-            .version;
+        let (mut project, server) = ledger_server(Arc::new(LedgerBackend::default()));
+        // `ASSET` is served failed: two bundle files claim it.
+        write_asset(&mut project, 1);
+        write_duplicate(&mut project);
+        let start = project.publish().version;
         let daemon = Daemon::start(server.root());
         let address = daemon.address;
 
@@ -1338,7 +1392,7 @@ fn a_connection_blocked_on_the_write_lock_does_not_stall_another() {
 fn a_configuration_change_reaches_open_writers() {
     watchdog(Duration::from_secs(60), || {
         let backend = Arc::new(LedgerBackend::default());
-        let server = ledger_server(Arc::clone(&backend));
+        let (_project, server) = ledger_server(Arc::clone(&backend));
         let daemon = Daemon::start(server.root());
         let address = daemon.address;
         let handle = server.handle();
