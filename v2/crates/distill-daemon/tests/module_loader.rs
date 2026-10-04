@@ -106,11 +106,13 @@ fn compiled_pipeline_cdylib_opens_registers_unloads_and_closes() {
         module_abi: host_module_abi_identity(),
         source_hashes: BTreeMap::from([(source_identity.crate_name, source_identity.source_hash)]),
         layout_hashes: BTreeMap::new(),
-        // The fixture's processor binds these types.
+        // The fixture's processor and importers bind these types.
         schema_registry: [
             distill_pipeline_fixture::PARENT_TYPE,
             distill_pipeline_fixture::COOKED_TYPE,
             distill_pipeline_fixture::REFLECTION_TYPE,
+            distill_pipeline_fixture::SETTINGS_TYPE,
+            distill_pipeline_fixture::VALUE_TYPE,
         ]
         .into_iter()
         .map(|type_uuid| (type_uuid, distill_core::id::LogicalHash([1; 32])))
@@ -137,7 +139,11 @@ fn compiled_pipeline_cdylib_opens_registers_unloads_and_closes() {
             .iter()
             .map(|registration| registration.id.as_str())
             .collect::<Vec<_>>(),
-        [distill_pipeline_fixture::REFLECT]
+        [
+            distill_pipeline_fixture::REFLECT,
+            distill_pipeline_fixture::BYTE_IMPORTER,
+            distill_pipeline_fixture::CHAIN_IMPORTER,
+        ]
     );
 
     let second = host

@@ -456,16 +456,14 @@ pub fn canonical_artifact(
 /// A project type of the configured project: a struct of one `String`
 /// field `group`, a search tag.
 pub const TAGGED_TYPE: TypeUuid = TypeUuid([0xa4; 16]);
-/// A project type of the configured project no processor cooks: a struct
-/// of one `u8` field `value`.
-pub const VALUE_TYPE: TypeUuid = TypeUuid([0xa5; 16]);
 pub use distill_pipeline_fixture::{
-    COOKED_TYPE, PARENT_TYPE, REFLECT, REFLECTION, REFLECTION_TYPE,
+    COOKED_TYPE, PARENT_TYPE, REFLECT, REFLECTION, REFLECTION_TYPE, SETTINGS_TYPE, VALUE_TYPE,
 };
 
-/// The configured project's schema: [`TAGGED_TYPE`], [`VALUE_TYPE`], and the
-/// pipeline module's [`PARENT_TYPE`], [`COOKED_TYPE`] and [`REFLECTION_TYPE`]
-/// (each of these a struct of one `u8` field `value`), laid out for this host. Its
+/// The configured project's schema: [`TAGGED_TYPE`], and the pipeline
+/// module's [`PARENT_TYPE`], [`COOKED_TYPE`], [`REFLECTION_TYPE`] and
+/// [`VALUE_TYPE`] (each of these a struct of one `u8` field `value`) and
+/// [`SETTINGS_TYPE`] (a struct of no fields), laid out for this host. Its
 /// source hashes are the pipeline module's.
 pub fn project_schema() -> Schema {
     let type_def = |id: usize, kind, krate: &str, name: &str, uuid, fields| TypeDef {
@@ -518,11 +516,13 @@ pub fn project_schema() -> Schema {
             Some(TAGGED_TYPE),
             vec![field("group", 1, true)],
         ),
+        type_def(3, PrimitiveType::Struct, "fixture", "Settings", Some(SETTINGS_TYPE), Vec::new()),
     ];
     let mut layouts = vec![
         layout(1, 1, Vec::new()),
         layout(string, string_align, Vec::new()),
         layout(string, string_align, vec![at_zero(string)]),
+        layout(0, 1, Vec::new()),
     ];
     for (name, uuid) in [
         ("Parent", PARENT_TYPE),

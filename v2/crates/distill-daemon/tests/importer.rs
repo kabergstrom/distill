@@ -7,93 +7,20 @@ use distill_core::bootstrap::{
 };
 use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
 use distill_daemon::coordinator::DaemonCoordinator;
-use distill_daemon::importer::{AuthoringImportContext, AuthoringImporter, AuthoringImporterError};
 use distill_daemon::scanner::AssetRoot;
 use distill_daemon::watcher::WatcherBatch;
 use distill_json::AuthoredValue;
+use distill_pipeline_fixture::{value as byte, value_of as byte_of, BYTE_IMPORTER, CHAIN_IMPORTER};
 use distill_rpc::{
     AuthoringValue, ImportRequest, InputVersion, TargetDefinition,
     TargetDefinitionHash,
 };
-use distill_schema::ngp_schema::{LogicalSchema, PrimitiveKind, SchemaNode};
+use distill_schema::ngp_schema::LogicalSchema;
 use distill_store::StoreConfig;
 
-/// The importers' output type, a project type of the shared test
-/// configuration: a struct of one `u8` field `value`.
+/// The output type of the pipeline fixture's importers, a project type of
+/// the shared test configuration: a struct of one `u8` field `value`.
 const TYPE_UUID: TypeUuid = distill_test_project::VALUE_TYPE;
-/// The importers' settings type: a `u8` the importer registers itself.
-const SETTINGS_TYPE_UUID: TypeUuid = TypeUuid([70; 16]);
-
-fn settings_schema() -> LogicalSchema {
-    LogicalSchema {
-        root: SchemaNode::Primitive(PrimitiveKind::U8),
-    }
-}
-
-/// The importers' output value: a `TYPE_UUID` struct of one `u8`.
-fn byte(value: u128) -> AuthoredValue {
-    AuthoredValue::Object(BTreeMap::from([("value".to_owned(), AuthoredValue::UInt(value))]))
-}
-
-/// The `u8` of an importer output value.
-fn byte_of(value: &AuthoredValue) -> Option<u128> {
-    match value {
-        AuthoredValue::Object(fields) => match fields.get("value") {
-            Some(AuthoredValue::UInt(value)) => Some(*value),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-struct ByteImporter {
-    schema: LogicalSchema,
-}
-
-impl AuthoringImporter for ByteImporter {
-    fn id(&self) -> &str {
-        "byte-importer"
-    }
-
-    fn version(&self) -> u32 {
-        1
-    }
-
-    fn settings_type_uuid(&self) -> TypeUuid {
-        SETTINGS_TYPE_UUID
-    }
-
-    fn settings_schema(&self) -> &LogicalSchema {
-        &self.schema
-    }
-
-    fn default_settings(&self) -> AuthoredValue {
-        AuthoredValue::UInt(0)
-    }
-
-    fn import(
-        &self,
-        context: &mut dyn AuthoringImportContext,
-        _settings: &AuthoredValue,
-    ) -> Result<distill_build::import::ImportOutput, AuthoringImporterError> {
-        let source = context
-            .sources()
-            .first()
-            .ok_or_else(|| AuthoringImporterError::rejected(1, "one source is required"))?
-            .path
-            .clone();
-        let bytes = context.read(&source)?;
-        let value = std::str::from_utf8(&bytes)
-            .map_err(|error| AuthoringImporterError::rejected(2, error.to_string()))?
-            .parse::<u8>()
-            .map_err(|error| AuthoringImporterError::rejected(3, error.to_string()))?;
-        let mut output = distill_build::import::ImportOutput::new();
-        output
-            .entry("asset", TYPE_UUID, byte(value.into()))
-            .map_err(|error| AuthoringImporterError::rejected(4, format!("{error:?}")))?;
-        Ok(output)
-    }
-}
 
 fn ordinary_bundle() -> (Vec<u8>, LogicalSchema, distill_core::id::LogicalHash) {
     let authority = distill_test_project::project_authority();
@@ -147,15 +74,13 @@ fn connect(coordinator: &DaemonCoordinator) -> distill_rpc::Hub {
     }
 }
 
-/// Import `dest` from `sources` with `importer` (its settings the
-/// canonical value `settings`), watched, through the RPC hub as a client
-/// does, at the current version; returns the imported bundle.
+/// Import `dest` from `sources` with `importer`, watched, through the RPC hub
+/// as a client does, at the current version; returns the imported bundle.
 fn import(
     coordinator: &DaemonCoordinator,
     importer: &str,
     sources: &[&str],
     dest: &str,
-    settings: &[u8],
 ) -> BundleUuid {
     let base = coordinator.server().current_stamp().unwrap().version;
     let request = ImportRequest {
@@ -163,7 +88,7 @@ fn import(
         sources: sources.iter().map(|source| (*source).to_owned()).collect(),
         dest: dest.into(),
         settings: AuthoringValue {
-            canonical_value: Arc::from(settings),
+            canonical_value: Arc::from(b"{}".as_slice()),
             blobs: Vec::new(),
         },
         watch: true,
@@ -236,13 +161,10 @@ fn directory_rules_bundle_with_rule(include_rule: bool) -> Vec<u8> {
     let rules = vec![object([
         ("group", object([("PerFile", object([]))])),
         ("id", bytes(if include_rule { [97; 16] } else { [100; 16] })),
-        ("importer", AuthoredValue::Str("byte-importer".into())),
+        ("importer", AuthoredValue::Str(BYTE_IMPORTER.into())),
         ("matches", matches),
         ("output", AuthoredValue::Str("{stem}.bundle".into())),
-        (
-            "settings",
-            object([("UInt", object([("value", AuthoredValue::UInt(5))]))]),
-        ),
+        ("settings", object([("Object", object([("value", object([]))]))])),
     ])];
     let data = object([("listing", query()), ("rules", AuthoredValue::Array(rules))]);
     distill_bundle::write_bundle(&Bundle {
@@ -284,18 +206,12 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
 
     configure(&coordinator, temp.path(), &assets);
 
-    coordinator
-        .authoring_service()
-        .register_importer(Arc::new(ByteImporter {
-            schema: settings_schema(),
-        }))
-        .unwrap();
-    let imported_bundle = import(&coordinator, "byte-importer", &["source.txt"], "imported.bundle", b"3");
+    let imported_bundle = import(&coordinator, BYTE_IMPORTER, &["source.txt"], "imported.bundle");
     let path = assets.join("imported.bundle");
     let first = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
     let first_asset = first.assets["asset"].uuid;
     assert_eq!(first.assets["asset"].data, byte(7));
-    assert_eq!(first.assets["$settings"].data, AuthoredValue::UInt(3));
+    assert_eq!(first.assets["$settings"].data, object([]));
     assert!(first.assets.contains_key("$record"));
     assert!(coordinator.authoring_service().watched_imports_needing_reimport(&mut writer)
         .unwrap()
@@ -321,7 +237,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     assert_eq!(second.uuid, imported_bundle);
     assert_eq!(second.assets["asset"].uuid, first_asset);
     assert_eq!(second.assets["asset"].data, byte(8));
-    assert_eq!(second.assets["$settings"].data, AuthoredValue::UInt(3));
+    assert_eq!(second.assets["$settings"].data, object([]));
     assert_eq!(
         coordinator.open_reader().unwrap().input_version().unwrap(),
         InputVersion(5)
@@ -449,19 +365,13 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
     let mut writer = coordinator.open_writer().unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
     configure(&coordinator, temp.path(), &assets);
-    coordinator
-        .authoring_service()
-        .register_importer(Arc::new(ByteImporter {
-            schema: settings_schema(),
-        }))
-        .unwrap();
 
     let imported = coordinator.reconcile_directory_imports(&mut writer).unwrap();
     assert_eq!(imported.len(), 1);
     let generated_path = assets.join("foo.bundle");
     let generated = distill_bundle::parse_bundle(&std::fs::read(&generated_path).unwrap()).unwrap();
     assert_eq!(generated.assets["asset"].data, byte(9));
-    assert_eq!(generated.assets["$settings"].data, AuthoredValue::UInt(5));
+    assert_eq!(generated.assets["$settings"].data, object([]));
     let meta = coordinator
         .open_reader()
         .unwrap()
@@ -581,12 +491,6 @@ fn removing_a_rules_source_orphans_its_outputs_incrementally() {
     let mut writer = coordinator.open_writer().unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
     configure(&coordinator, temp.path(), &assets);
-    coordinator
-        .authoring_service()
-        .register_importer(Arc::new(ByteImporter {
-            schema: settings_schema(),
-        }))
-        .unwrap();
     assert_eq!(coordinator.reconcile_directory_imports(&mut writer).unwrap().len(), 1);
     let generated =
         distill_bundle::parse_bundle(&std::fs::read(assets.join("foo.bundle")).unwrap()).unwrap();
@@ -647,21 +551,14 @@ fn watched_imports_defer_while_their_importer_is_unregistered() {
     let mut writer = coordinator.open_writer().unwrap();
         coordinator.reconcile_full_scan(&mut writer).unwrap();
         configure(&coordinator, temp.path(), &assets);
-        coordinator
-            .authoring_service()
-            .register_importer(Arc::new(ByteImporter {
-                schema: settings_schema(),
-            }))
-            .unwrap();
-        import(&coordinator, "byte-importer", &["source.txt"], "imported.bundle", b"3")
+        import(&coordinator, BYTE_IMPORTER, &["source.txt"], "imported.bundle")
     };
     let path = assets.join("imported.bundle");
 
-    // Restart with the source edited and no importer registered.
+    // Restart with the source edited, before the configuration (and so the
+    // pipeline, whose importer it is) is published again.
     std::fs::write(assets.join("source.txt"), b"8").unwrap();
     let coordinator = open();
-    // Startup publishes the configuration again.
-    configure(&coordinator, temp.path(), &assets);
     let mut writer = coordinator.open_writer().unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
     assert_eq!(
@@ -684,12 +581,7 @@ fn watched_imports_defer_while_their_importer_is_unregistered() {
         "a deferred import is not a memoized failure"
     );
 
-    coordinator
-        .authoring_service()
-        .register_importer(Arc::new(ByteImporter {
-            schema: settings_schema(),
-        }))
-        .unwrap();
+    configure(&coordinator, temp.path(), &assets);
     assert_eq!(
         coordinator.reconcile_watched_imports(&mut writer).unwrap(),
         vec![imported_bundle]
@@ -719,13 +611,7 @@ fn reverting_a_failed_watched_import_clears_its_failure_incrementally() {
     let mut writer = coordinator.open_writer().unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
     configure(&coordinator, temp.path(), &assets);
-    coordinator
-        .authoring_service()
-        .register_importer(Arc::new(ByteImporter {
-            schema: settings_schema(),
-        }))
-        .unwrap();
-    import(&coordinator, "byte-importer", &["source.txt"], "imported.bundle", b"3");
+    import(&coordinator, BYTE_IMPORTER, &["source.txt"], "imported.bundle");
     // Build the import index as the startup pass does.
     coordinator.reconcile_watched_imports(&mut writer).unwrap();
 
@@ -752,96 +638,10 @@ fn reverting_a_failed_watched_import_clears_its_failure_incrementally() {
     );
 }
 
-/// [`ByteImporter`] that takes `value` × 10 ms to import. While `gate` holds
-/// its channels, the run of `gated` reports that it started and waits to be
-/// released, once.
-struct PacedImporter {
-    schema: LogicalSchema,
-    gated: u8,
-    gate: std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
-}
-
-impl PacedImporter {
-    fn new(schema: LogicalSchema) -> Self {
-        Self {
-            schema,
-            gated: 0,
-            gate: std::sync::Mutex::new(None),
-        }
-    }
-
-    /// Hold the run of `value` until the returned sender releases it; the
-    /// returned receiver reports that it started.
-    fn gated(
-        schema: LogicalSchema,
-        value: u8,
-    ) -> (Self, std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
-        let (started, entered) = std::sync::mpsc::channel();
-        let (release, released) = std::sync::mpsc::channel();
-        (
-            Self {
-                schema,
-                gated: value,
-                gate: std::sync::Mutex::new(Some((started, released))),
-            },
-            entered,
-            release,
-        )
-    }
-}
-
-impl AuthoringImporter for PacedImporter {
-    fn id(&self) -> &str {
-        "byte-importer"
-    }
-
-    fn version(&self) -> u32 {
-        1
-    }
-
-    fn settings_type_uuid(&self) -> TypeUuid {
-        SETTINGS_TYPE_UUID
-    }
-
-    fn settings_schema(&self) -> &LogicalSchema {
-        &self.schema
-    }
-
-    fn default_settings(&self) -> AuthoredValue {
-        AuthoredValue::UInt(0)
-    }
-
-    fn import(
-        &self,
-        context: &mut dyn AuthoringImportContext,
-        settings: &AuthoredValue,
-    ) -> Result<distill_build::import::ImportOutput, AuthoringImporterError> {
-        let source = context.sources()[0].path.clone();
-        let value = std::str::from_utf8(&context.read(&source)?)
-            .ok()
-            .and_then(|text| text.parse::<u8>().ok());
-        if let Some(value) = value {
-            std::thread::sleep(std::time::Duration::from_millis(u64::from(value) * 10));
-            if value == self.gated {
-                let gate = self.gate.lock().unwrap().take();
-                if let Some((started, release)) = gate {
-                    started.send(()).unwrap();
-                    release.recv().unwrap();
-                }
-            }
-        }
-        ByteImporter {
-            schema: self.schema.clone(),
-        }
-        .import(context, settings)
-    }
-}
-
 /// A project with directory rules generating `{stem}.bundle` from each of
 /// `sources` (stem, contents), imported.
 fn imported_sources(
     sources: &[(&str, &str)],
-    importer: impl FnOnce(LogicalSchema) -> PacedImporter,
 ) -> (tempfile::TempDir, std::path::PathBuf, DaemonCoordinator) {
     let temp = tempfile::tempdir().unwrap();
     let assets = temp.path().join("assets");
@@ -863,10 +663,6 @@ fn imported_sources(
     let mut writer = coordinator.open_writer().unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
     configure(&coordinator, temp.path(), &assets);
-    coordinator
-        .authoring_service()
-        .register_importer(Arc::new(importer(settings_schema())))
-        .unwrap();
     assert_eq!(
         coordinator.reconcile_directory_imports(&mut writer).unwrap().len(),
         sources.len()
@@ -973,7 +769,7 @@ fn batch(assets: &std::path::Path, files: &[&str]) -> WatcherBatch {
 fn a_burst_across_bundles_publishes_one_version() {
     let stems = ["a", "b", "c"];
     let (_temp, assets, coordinator) =
-        imported_sources(&[("a", "1"), ("b", "2"), ("c", "3")], PacedImporter::new);
+        imported_sources(&[("a", "1"), ("b", "2"), ("c", "3")]);
     let mut writer = coordinator.open_writer().unwrap();
     let base = writer.input_version().unwrap();
     let old_hashes = generated_hashes(&writer, &stems);
@@ -1040,17 +836,15 @@ fn a_burst_across_bundles_publishes_one_version() {
 /// new base, so both land, once each.
 #[test]
 fn an_rpc_write_during_a_pass_makes_it_stale_and_its_retry_applies_everything_once() {
-    let (_temp, assets, coordinator) =
-        imported_sources(&[("a", "1"), ("b", "2"), ("c", "3")], |schema| {
-            let (importer, entered, release) = PacedImporter::gated(schema, 4);
-            GATE.with(|gate| *gate.borrow_mut() = Some((entered, release)));
-            importer
-        });
-    let (entered, release) = GATE.with(|gate| gate.borrow_mut().take()).unwrap();
+    let (temp, assets, coordinator) = imported_sources(&[("a", "1"), ("b", "2"), ("c", "3")]);
+    // The run of a.src waits at a gate: it reports `started` and waits for
+    // `release`.
+    let gate = temp.path().join("gate");
+    std::fs::create_dir_all(&gate).unwrap();
     let mut writer = coordinator.open_writer().unwrap();
     let base = writer.input_version().unwrap();
 
-    std::fs::write(assets.join("a.src"), b"4").unwrap();
+    std::fs::write(assets.join("a.src"), format!("4 {}", gate.display())).unwrap();
     std::fs::write(assets.join("b.src"), b"5").unwrap();
     std::fs::write(assets.join("c.src"), b"6").unwrap();
     let burst = batch(&assets, &["a.src", "b.src", "c.src"]);
@@ -1059,10 +853,12 @@ fn an_rpc_write_during_a_pass_makes_it_stale_and_its_retry_applies_everything_on
             let mut writer = coordinator.open_writer().unwrap();
             coordinator.reconcile_batch(&mut writer, &burst, false)
         });
-        entered.recv().unwrap();
+        while !gate.join("started").exists() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         // The RPC import commits while the pass's import is running.
-        import(&coordinator, "byte-importer", &["other.txt"], "explicit.bundle", b"3");
-        release.send(()).unwrap();
+        import(&coordinator, BYTE_IMPORTER, &["other.txt"], "explicit.bundle");
+        std::fs::write(gate.join("release"), b"").unwrap();
         pass.join().unwrap()
     });
     assert!(
@@ -1100,19 +896,13 @@ fn an_rpc_write_during_a_pass_makes_it_stale_and_its_retry_applies_everything_on
     assert_changes_exactly(&changed_assets(&reader, version), &assets, &["a", "b", "c"]);
 }
 
-thread_local! {
-    static GATE: std::cell::RefCell<
-        Option<(std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>)>,
-    > = const { std::cell::RefCell::new(None) };
-}
-
 /// One failing import in a multi-bundle pass: the others publish, the
 /// failing bundle keeps its last good contents and records the failure, and
 /// a new output whose importer fails is reported, all in one version.
 #[test]
 fn an_import_failure_in_a_pass_keeps_its_last_good_bundle_while_the_rest_publish() {
     let (_temp, assets, coordinator) =
-        imported_sources(&[("a", "1"), ("b", "2"), ("c", "3")], PacedImporter::new);
+        imported_sources(&[("a", "1"), ("b", "2"), ("c", "3")]);
     let mut writer = coordinator.open_writer().unwrap();
     let base = writer.input_version().unwrap();
 
@@ -1144,72 +934,11 @@ fn an_import_failure_in_a_pass_keeps_its_last_good_bundle_while_the_rest_publish
     assert_changes_exactly(&changed_assets(&reader, version), &assets, &["a", "c"]);
 }
 
-/// An importer whose output is one more than the largest value among its
-/// sources that exist: a text source's number, or a bundle source's
-/// `asset` entry, so its sources may be other imports' outputs.
-struct ChainImporter {
-    schema: LogicalSchema,
-}
-
-impl AuthoringImporter for ChainImporter {
-    fn id(&self) -> &str {
-        "chain-importer"
-    }
-
-    fn version(&self) -> u32 {
-        1
-    }
-
-    fn settings_type_uuid(&self) -> TypeUuid {
-        SETTINGS_TYPE_UUID
-    }
-
-    fn settings_schema(&self) -> &LogicalSchema {
-        &self.schema
-    }
-
-    fn default_settings(&self) -> AuthoredValue {
-        AuthoredValue::UInt(0)
-    }
-
-    fn import(
-        &self,
-        context: &mut dyn AuthoringImportContext,
-        _settings: &AuthoredValue,
-    ) -> Result<distill_build::import::ImportOutput, AuthoringImporterError> {
-        let mut value = 0;
-        for source in context.sources().to_vec() {
-            if !context.probe(&source.path)? {
-                continue;
-            }
-            let bytes = context.read(&source.path)?;
-            let source_value = if source.path.ends_with(".bundle") {
-                let bundle = distill_bundle::parse_bundle(&bytes)
-                    .map_err(|error| AuthoringImporterError::rejected(5, format!("{error:?}")))?;
-                let data = &bundle.assets["asset"].data;
-                byte_of(data)
-                    .ok_or_else(|| AuthoringImporterError::rejected(6, format!("{data:?}")))?
-            } else {
-                std::str::from_utf8(&bytes)
-                    .ok()
-                    .and_then(|text| text.parse::<u128>().ok())
-                    .ok_or_else(|| AuthoringImporterError::rejected(3, "not a number"))?
-            };
-            value = value.max(source_value);
-        }
-        let mut output = distill_build::import::ImportOutput::new();
-        output
-            .entry("asset", TYPE_UUID, byte(value + 1))
-            .map_err(|error| AuthoringImporterError::rejected(4, format!("{error:?}")))?;
-        Ok(output)
-    }
-}
-
-/// Import `dest` from `sources` with [`ChainImporter`], watched, as one
+/// Import `dest` from `sources` with [`CHAIN_IMPORTER`], watched, as one
 /// RPC publication, and pass over the watcher work it leaves.
 fn chain_import(coordinator: &DaemonCoordinator, assets: &std::path::Path, dest: &str, sources: &[&str]) {
     let mut writer = coordinator.open_writer().unwrap();
-    import(coordinator, "chain-importer", sources, dest, b"0");
+    import(coordinator, CHAIN_IMPORTER, sources, dest);
     // The watcher's echo of the output: a pass that indexes its import
     // record and consumes its work.
     let echo = coordinator
@@ -1222,11 +951,7 @@ fn chain_import(coordinator: &DaemonCoordinator, assets: &std::path::Path, dest:
 /// imported, watched, from the bundle of the stem before it: a chain whose
 /// every level reads the output of the one before.
 fn chained_imports(stems: &[&str]) -> (tempfile::TempDir, std::path::PathBuf, DaemonCoordinator) {
-    let (temp, assets, coordinator) = imported_sources(&[("a", "1")], PacedImporter::new);
-    coordinator
-        .authoring_service()
-        .register_importer(Arc::new(ChainImporter { schema: settings_schema() }))
-        .unwrap();
+    let (temp, assets, coordinator) = imported_sources(&[("a", "1")]);
     let mut previous = "a".to_owned();
     for stem in stems {
         chain_import(
@@ -1461,13 +1186,7 @@ fn a_failed_rpc_reimport_commits_only_its_memo() {
     let mut writer = coordinator.open_writer().unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
     configure(&coordinator, temp.path(), &assets);
-    coordinator
-        .authoring_service()
-        .register_importer(Arc::new(ByteImporter {
-            schema: settings_schema(),
-        }))
-        .unwrap();
-    let bundle = import(&coordinator, "byte-importer", &["source.txt"], "imported.bundle", b"3");
+    let bundle = import(&coordinator, BYTE_IMPORTER, &["source.txt"], "imported.bundle");
     std::fs::write(assets.join("source.txt"), b"broken").unwrap();
     coordinator
         .reconcile_incremental(&mut writer, &WatcherBatch {
