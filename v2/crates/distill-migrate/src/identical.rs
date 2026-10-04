@@ -10,6 +10,7 @@
 //! unchanged; this module compares through the frame stacks instead.
 
 use crate::FieldPath;
+use distill_core::frames::resolve_backref;
 use ngp_schema::SchemaNode;
 
 /// Resolve a struct-field-name path against a schema subtree. Navigation
@@ -126,13 +127,12 @@ fn ident(
             if d1 != d2 {
                 return false;
             }
-            let d = *d1 as usize;
-            if d >= old_frames.len() || d >= new_frames.len() {
+            let (Some((&fo, old_above)), Some((&fnew, new_above))) = (
+                resolve_backref(old_frames, *d1),
+                resolve_backref(new_frames, *d2),
+            ) else {
                 return false; // malformed: unresolvable back-reference
-            }
-            let oi = old_frames.len() - 1 - d;
-            let ni = new_frames.len() - 1 - d;
-            let (fo, fnew) = (old_frames[oi], new_frames[ni]);
+            };
             if std::ptr::eq(fo, fnew) {
                 return true;
             }
@@ -141,7 +141,7 @@ fn ident(
                 return true; // coinductive: assume identical on the cycle
             }
             in_progress.push(key);
-            let r = ident(fo, fnew, &old_frames[..oi], &new_frames[..ni], in_progress);
+            let r = ident(fo, fnew, old_above, new_above, in_progress);
             in_progress.pop();
             r
         }

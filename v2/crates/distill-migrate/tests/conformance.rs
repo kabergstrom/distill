@@ -256,3 +256,66 @@ fn unresolvable_backref_is_error() {
     let s = strct(0, &[("r", 0, SchemaNode::BackRef(5))]);
     conforms(&obj(&[("r", obj(&[]))]), &s).unwrap_err();
 }
+
+#[test]
+fn backref_reentry_resolves_under_the_targets_own_ancestors() {
+    // A { b: Option<B> }, B { a: Option<A>, b: Option<B> }. B.b re-enters
+    // B as BackRef(0); inside that B, `a` is BackRef(1) and names A.
+    let s = strct(
+        0,
+        &[(
+            "b",
+            0,
+            opt(strct(
+                0,
+                &[
+                    ("a", 0, opt(SchemaNode::BackRef(1))),
+                    ("b", 0, opt(SchemaNode::BackRef(0))),
+                ],
+            )),
+        )],
+    );
+    let n = || AuthoredValue::Null;
+    let a = |b| obj(&[("b", b)]);
+    let b = |a, b| obj(&[("a", a), ("b", b)]);
+    conforms(&a(b(n(), b(a(n()), n()))), &s).unwrap();
+    // A B where `a` names A is refused.
+    conforms(&a(b(n(), b(b(n(), n()), n()))), &s).unwrap_err();
+}
+
+#[test]
+fn backref_reentry_resolves_under_the_targets_own_ancestors_three_deep() {
+    // A { b: Option<B> }, B { c: Option<C> },
+    // C { a: Option<A>, b: Option<B>, c: Option<C> }.
+    let s = strct(
+        0,
+        &[(
+            "b",
+            0,
+            opt(strct(
+                0,
+                &[(
+                    "c",
+                    0,
+                    opt(strct(
+                        0,
+                        &[
+                            ("a", 0, opt(SchemaNode::BackRef(2))),
+                            ("b", 0, opt(SchemaNode::BackRef(1))),
+                            ("c", 0, opt(SchemaNode::BackRef(0))),
+                        ],
+                    )),
+                )],
+            )),
+        )],
+    );
+    let n = || AuthoredValue::Null;
+    let a = |b| obj(&[("b", b)]);
+    let b = |c| obj(&[("c", c)]);
+    let c = |a, b, c| obj(&[("a", a), ("b", b), ("c", c)]);
+    let inner = b(c(a(b(n())), n(), c(n(), n(), n())));
+    conforms(&a(b(c(n(), n(), c(n(), inner, n())))), &s).unwrap();
+    // Inside the re-entered C, `b` names B: a C there is refused.
+    let wrong = c(n(), n(), n());
+    conforms(&a(b(c(n(), n(), c(n(), wrong, n())))), &s).unwrap_err();
+}

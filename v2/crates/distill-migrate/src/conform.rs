@@ -11,6 +11,7 @@
 //! non-string-key maps must be in canonical order (strictly increasing
 //! encoded bytes — which subsumes the duplicate check).
 
+use distill_core::frames::resolve_backref;
 use distill_json::AuthoredValue;
 use ngp_schema::{PrimitiveKind, SchemaNode};
 use std::fmt;
@@ -211,8 +212,9 @@ fn check(
         // as a plain string; anything else is refused.
         SchemaNode::AssetRef(_) | SchemaNode::WeakRef(_) => check_asset_ref(value, path),
         SchemaNode::BackRef(d) => {
-            let d = *d as usize;
-            if d >= frames.len() {
+            // Re-enter the referenced frame under its own ancestors: inside
+            // it, distance 0 is that frame itself.
+            let Some((target, ancestors)) = resolve_backref(frames, *d) else {
                 return Err(err(
                     path,
                     format!(
@@ -221,11 +223,8 @@ fn check(
                     ),
                     value,
                 ));
-            }
-            let idx = frames.len() - 1 - d;
-            // Re-enter the referenced frame: inside it, distance 0 is that
-            // frame itself, so the open stack is the prefix above it.
-            check(value, frames[idx], &frames[..idx], path)
+            };
+            check(value, *target, ancestors, path)
         }
     }
 }
