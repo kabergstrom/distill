@@ -56,7 +56,7 @@ use crate::epoch::{
 use crate::module_loader::DynamicPipelineModuleLoader;
 use crate::pipeline_map::PipelineProjection;
 use crate::scanner::{
-    AssetRoot, DaemonOwnedDirectoryKind, RootedScanner, ScanDelta, ScanDiagnostic, ScanError,
+    AssetRoot, DaemonOwnedDirectoryKind, RootedScanner, ScanDelta, ScanError,
     ScanSnapshot, ScannedBundle, StoredBaseline,
 };
 use crate::scheduler::{ScheduledPool, Scheduler, SchedulerConfig, WorkClass};
@@ -278,14 +278,6 @@ impl DaemonCoordinator {
 
     pub fn scanner(&self) -> RootedScanner {
         self.scanner.clone()
-    }
-
-    /// Current non-fatal filesystem exclusions in canonical rooted-path
-    /// order. These rows are also reported by `doctor verify`.
-    pub fn scan_diagnostics(&self, store: &StoreReader) -> Result<Vec<ScanDiagnostic>, CoordinatorError> {
-        ScanSnapshot::load_diagnostics(store)
-            .map(|scan| scan.diagnostic_rows().cloned().collect())
-            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
     }
 
     pub fn authoring_service(&self) -> &Arc<AuthoringService> {
@@ -2424,7 +2416,6 @@ fn publish_scan(
         transaction.replace_scan_structure(
             None,
             &candidate.scan.directory_rows(),
-            &candidate.scan.encoded_diagnostic_rows(),
         )?;
         transaction.set_namespace_errors(candidate.namespace_errors.iter().cloned())?;
         transaction.clear_derived_outputs()?;
@@ -2732,7 +2723,6 @@ fn publish_incremental_scan(
         transaction.replace_scan_structure(
             Some(delta.affected_prefixes()),
             &delta.observed().directory_rows(),
-            &delta.observed().encoded_diagnostic_rows(),
         )?;
         let pending = transaction.replace_source_claims(Some(delta.affected_prefixes()), claims)?;
         let commit = publish_claimed(

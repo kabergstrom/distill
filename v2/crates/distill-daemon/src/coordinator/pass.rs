@@ -55,7 +55,7 @@
 
 use std::collections::BTreeSet;
 
-use distill_store::files::{ObservedDiagnostic, ObservedFile};
+use distill_store::files::ObservedFile;
 
 use super::*;
 use crate::importer::{FileOverlay, ImportRun, PassImport, PassOutput, PassPublication, PlannedImport};
@@ -83,12 +83,6 @@ pub struct PassOutcome {
 pub(super) enum ScanStep {
     /// The scan observed nothing new.
     Unchanged,
-    /// Only warning-grade exclusions changed: scanner state, not authored
-    /// input, so no input version.
-    Diagnostics {
-        under: Option<Vec<(String, String)>>,
-        rows: Vec<ObservedDiagnostic>,
-    },
     Incremental(Box<IncrementalStep>),
     Full(Box<FullStep>),
     /// The scan could not observe some subjects: the namespace keeps what it
@@ -930,12 +924,7 @@ impl DaemonCoordinator {
             echo = echo && delta.rename_moves_nothing(store, &rename.root_name, &rename.from_path)?;
         }
         if echo {
-            // Diagnostics are replaced with their affected subtree even when
-            // the authored namespace itself did not change.
-            return Ok(ScanStep::Diagnostics {
-                under: Some(delta.affected_prefixes().to_vec()),
-                rows: delta.observed().encoded_diagnostic_rows(),
-            });
+            return Ok(ScanStep::Unchanged);
         }
         let tags = self.tag_inputs(compiled);
         let claims = bundle_claims(
@@ -965,13 +954,10 @@ impl DaemonCoordinator {
                 if PendingScanRejection::stored(store)?.is_none()
                     && self.scan_initialized.get().is_some() =>
             {
-                if scan.matches_published(store, false)? {
-                    // Warning-grade exclusions are scanner state, not authored
-                    // input: refresh them without minting an input version.
-                    Ok(ScanStep::Diagnostics {
-                        under: None,
-                        rows: scan.encoded_diagnostic_rows(),
-                    })
+                if scan.matches_published(store)? {
+                    // Warning-grade exclusions are scanner state, not
+                    // authored input: nothing to publish.
+                    Ok(ScanStep::Unchanged)
                 } else {
                     self.candidate_step(compiled, scan)
                 }
@@ -1067,12 +1053,6 @@ impl DaemonCoordinator {
     ) -> Result<Option<Commit>, StepFailure> {
         match step {
             ScanStep::Unchanged => Ok(None),
-            ScanStep::Diagnostics { under, rows } => {
-                store
-                    .replace_scan_diagnostics(under.as_deref(), rows)
-                    .map_err(|error| error.to_string())?;
-                Ok(None)
-            }
             ScanStep::Incremental(step) => {
                 let tags = &step.tags;
                 if step.heals {

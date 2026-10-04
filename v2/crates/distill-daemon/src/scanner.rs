@@ -19,8 +19,7 @@ use distill_store::db::StoreReader;
 use distill_store::Current;
 use distill_store::error::StoreError;
 use distill_store::files::{
-    FileKind, FileObservation, FileState, ObservedDiagnostic, ObservedDirectory,
-    ObservedFile,
+    FileKind, FileObservation, FileState, ObservedDirectory, ObservedFile,
 };
 use distill_store::state::{PhysicalPathClaim, PhysicalPathFailureCode, PlatformPathBytes};
 use unicode_normalization::{is_nfc, UnicodeNormalization};
@@ -272,8 +271,8 @@ pub struct ScanSnapshot {
 }
 
 /// A non-fatal filesystem observation that was excluded from the authored
-/// namespace. Diagnostics are keyed by their canonical rooted path so an
-/// incremental rescan replaces only the affected diagnostic rows.
+/// namespace, keyed by its canonical rooted path. It is the scan's own
+/// state: `doctor verify` reports the ones a fresh scan observes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScanDiagnostic {
     DaemonOwnedDirectoryAlias {
@@ -333,11 +332,9 @@ pub struct ScanDelta {
 
 impl ScanSnapshot {
     /// Equality of filesystem authority, excluding parsed-object allocation
-    /// details. Used to suppress watcher echoes of daemon-authored writes.
-    pub fn same_observation(&self, other: &Self) -> bool {
-        self.same_namespace_observation(other) && self.diagnostics == other.diagnostics
-    }
-
+    /// details and diagnostics: the oracle `matches_published` is tested
+    /// against.
+    #[cfg(test)]
     pub(crate) fn same_namespace_observation(&self, other: &Self) -> bool {
         self.files == other.files
             && self.bundles.len() == other.bundles.len()
@@ -601,20 +598,14 @@ impl ScanSnapshot {
         Self::from_rows(
             reader.observed_files()?,
             reader.observed_directories()?,
-            reader.scan_diagnostics()?,
             bundles,
         )
     }
 
-    /// Only the diagnostic rows of the published observation.
-    pub(crate) fn load_diagnostics(reader: &StoreReader) -> Result<Self, StoreError> {
-        Self::from_rows(Vec::new(), Vec::new(), reader.scan_diagnostics()?, Vec::new())
-    }
-
+    #[cfg(test)]
     fn from_rows(
         files: Vec<ObservedFile>,
         directories: Vec<ObservedDirectory>,
-        diagnostics: Vec<ObservedDiagnostic>,
         bundles: Vec<(String, String, [u8; 32])>,
     ) -> Result<Self, StoreError> {
         let mut snapshot = Self::default();
@@ -630,10 +621,6 @@ impl ScanSnapshot {
             let (key, observation) = directory_observation_row(row);
             snapshot.directory_observations.insert(key, observation);
         }
-        for row in diagnostics {
-            let (key, diagnostic) = diagnostic_row(row)?;
-            snapshot.diagnostics.insert(key, diagnostic);
-        }
         for (root_name, path, hash) in bundles {
             let mut bundle = scanned_bundle(&root_name, &path, Vec::new());
             bundle.file_hash = BundleFileHash(hash);
@@ -648,21 +635,15 @@ impl ScanSnapshot {
     }
 
     /// Whether this scan observes what the store's scan tables publish:
-    /// `self.same_observation(&ScanSnapshot::load(reader)?)`, or
-    /// [`Self::same_namespace_observation`] without `diagnostics`. The tables are streamed in key order and compared
+    /// `self.same_namespace_observation(&ScanSnapshot::load(reader)?)`.
+    /// The tables are streamed in key order and compared
     /// row by row; a bundle file is compared by its stored hash, so no
     /// bundle bytes are read or parsed.
     pub(crate) fn matches_published(
         &self,
         reader: &StoreReader,
-        diagnostics: bool,
     ) -> Result<bool, StoreError> {
-        let mut published_diagnostics = BTreeMap::new();
-        for row in reader.scan_diagnostics()? {
-            let (key, diagnostic) = diagnostic_row(row)?;
-            published_diagnostics.insert(key, diagnostic);
-        }
-        let mut same = !diagnostics || published_diagnostics == self.diagnostics;
+        let mut same = true;
 
         let (mut files, mut aliases) = (self.files.iter(), self.symlink_aliases.iter());
         reader.for_each_observed_file(|row| {
@@ -753,16 +734,6 @@ impl ScanSnapshot {
             .collect()
     }
 
-    pub(crate) fn encoded_diagnostic_rows(&self) -> Vec<ObservedDiagnostic> {
-        self.diagnostics
-            .iter()
-            .map(|((root, path), diagnostic)| ObservedDiagnostic {
-                root_name: root.clone(),
-                path: path.clone(),
-                detail: encode_diagnostic(diagnostic),
-            })
-            .collect()
-    }
 }
 
 impl ScanDelta {
@@ -827,95 +798,6 @@ fn decode_raw_path(bytes: &[u8]) -> PlatformPathBytes {
     }
 }
 
-fn put_field(out: &mut Vec<u8>, field: &[u8]) {
-    out.extend_from_slice(&(field.len() as u32).to_le_bytes());
-    out.extend_from_slice(field);
-}
-
-fn take_field<'a>(input: &mut &'a [u8]) -> Option<&'a [u8]> {
-    let (length, rest) = input.split_first_chunk::<4>()?;
-    let length = u32::from_le_bytes(*length) as usize;
-    let field = rest.get(..length)?;
-    *input = &rest[length..];
-    Some(field)
-}
-
-fn encode_diagnostic(diagnostic: &ScanDiagnostic) -> Vec<u8> {
-    let mut out = Vec::new();
-    match diagnostic {
-        ScanDiagnostic::DaemonOwnedDirectoryAlias {
-            root_name,
-            normalized_path,
-            physical_path,
-            owned_path,
-            kind,
-        } => {
-            out.push(0);
-            put_field(&mut out, root_name.as_bytes());
-            put_field(&mut out, normalized_path.as_bytes());
-            put_field(&mut out, &encode_path(physical_path));
-            put_field(&mut out, &encode_path(owned_path));
-            out.push(match kind {
-                DaemonOwnedDirectoryKind::State => 0,
-                DaemonOwnedDirectoryKind::ModuleStaging => 1,
-                // 2 was the in-process pack's package output.
-                DaemonOwnedDirectoryKind::CodegenOutput => 3,
-            });
-        }
-        ScanDiagnostic::DirectoryCycle {
-            root_name,
-            normalized_path,
-            path_chain,
-        } => {
-            out.push(1);
-            put_field(&mut out, root_name.as_bytes());
-            put_field(&mut out, normalized_path.as_bytes());
-            for path in path_chain {
-                put_field(&mut out, &encode_path(path));
-            }
-        }
-    }
-    out
-}
-
-fn decode_diagnostic(bytes: &[u8]) -> Option<ScanDiagnostic> {
-    let (tag, mut input) = bytes.split_first()?;
-    let text = |field: &[u8]| String::from_utf8(field.to_vec()).ok();
-    let root_name = text(take_field(&mut input)?)?;
-    let normalized_path = text(take_field(&mut input)?)?;
-    match tag {
-        0 => {
-            let physical_path = decode_path(take_field(&mut input)?);
-            let owned_path = decode_path(take_field(&mut input)?);
-            let kind = match input {
-                [0] => DaemonOwnedDirectoryKind::State,
-                [1] => DaemonOwnedDirectoryKind::ModuleStaging,
-                [3] => DaemonOwnedDirectoryKind::CodegenOutput,
-                _ => return None,
-            };
-            Some(ScanDiagnostic::DaemonOwnedDirectoryAlias {
-                root_name,
-                normalized_path,
-                physical_path,
-                owned_path,
-                kind,
-            })
-        }
-        1 => {
-            let mut path_chain = Vec::new();
-            while !input.is_empty() {
-                path_chain.push(decode_path(take_field(&mut input)?));
-            }
-            Some(ScanDiagnostic::DirectoryCycle {
-                root_name,
-                normalized_path,
-                path_chain,
-            })
-        }
-        _ => None,
-    }
-}
-
 /// One `files` row as the scan file it records, with its symlink target.
 fn scanned_file_row(row: ObservedFile) -> (ScannedFile, Option<PathBuf>) {
     let alias = row.file.symlink_target.as_deref().map(decode_path);
@@ -943,17 +825,6 @@ fn directory_observation_row(row: ObservedDirectory) -> ((String, String), Direc
             physical_path: decode_path(&row.physical_path),
         },
     )
-}
-
-fn diagnostic_row(row: ObservedDiagnostic) -> Result<((String, String), ScanDiagnostic), StoreError> {
-    let diagnostic =
-        decode_diagnostic(&row.detail).ok_or_else(|| StoreError::InvalidConfiguration {
-            error: format!(
-                "malformed scan diagnostic at {}/{}",
-                row.root_name, row.path
-            ),
-        })?;
-    Ok(((row.root_name, row.path), diagnostic))
 }
 
 pub(crate) fn scanned_bundle(root_name: &str, normalized_path: &str, bytes: Vec<u8>) -> ScannedBundle {
@@ -2682,36 +2553,6 @@ fn file_identity_from_file(_file: &File, metadata: &Metadata) -> std::io::Result
 mod tests {
     use super::*;
 
-    #[test]
-    fn scan_diagnostics_round_trip_through_their_table_encoding() {
-        let diagnostics = [
-            ScanDiagnostic::DaemonOwnedDirectoryAlias {
-                root_name: "main".to_owned(),
-                normalized_path: "gen/out".to_owned(),
-                physical_path: PathBuf::from("/project/gen/out"),
-                owned_path: PathBuf::from("/project/.distill/codegen"),
-                kind: DaemonOwnedDirectoryKind::CodegenOutput,
-            },
-            ScanDiagnostic::DirectoryCycle {
-                root_name: "main".to_owned(),
-                normalized_path: "a/loop".to_owned(),
-                path_chain: vec![PathBuf::from("/project/a"), PathBuf::from("/project/a/loop")],
-            },
-            ScanDiagnostic::DirectoryCycle {
-                root_name: "main".to_owned(),
-                normalized_path: String::new(),
-                path_chain: Vec::new(),
-            },
-        ];
-        for diagnostic in diagnostics {
-            assert_eq!(
-                decode_diagnostic(&encode_diagnostic(&diagnostic)),
-                Some(diagnostic)
-            );
-        }
-        assert_eq!(decode_diagnostic(&[7]), None);
-    }
-
     fn scanned(path: &str, kind: ScannedFileKind, hash: u8) -> ((String, String), ScannedFile) {
         (
             ("main".to_owned(), path.to_owned()),
@@ -2895,9 +2736,8 @@ mod published_compare_tests {
         }
     }
 
-    /// Publish `scan`'s rows as a complete publication writes them, with
-    /// `diagnostics` (or its own) as the diagnostic rows.
-    fn publish(store: &mut Store, scan: &ScanSnapshot, diagnostics: Option<Vec<ObservedDiagnostic>>) {
+    /// Publish `scan`'s rows as a complete publication writes them.
+    fn publish(store: &mut Store, scan: &ScanSnapshot) {
         store
             .input_transaction(|txn| {
                 let version = txn.version();
@@ -2905,35 +2745,20 @@ mod published_compare_tests {
                     let root = txn.intern_root(&key.0)?;
                     txn.upsert_file(root, &key.1, &file, version)?;
                 }
-                txn.replace_scan_structure(
-                    None,
-                    &scan.directory_rows(),
-                    &diagnostics.unwrap_or_else(|| scan.encoded_diagnostic_rows()),
-                )
+                txn.replace_scan_structure(None, &scan.directory_rows())
             })
             .unwrap();
     }
 
-    /// Both comparisons, which must agree; returns the agreed answer.
-    fn compare(scan: &ScanSnapshot, store: &Store, diagnostics: bool) -> Result<bool, String> {
-        let streamed = scan
-            .matches_published(store, diagnostics)
-            .map_err(|error| error.to_string());
+    /// The streamed comparison and the loaded oracle's, which must agree;
+    /// returns the agreed answer.
+    fn compare(scan: &ScanSnapshot, store: &Store) -> Result<bool, String> {
+        let streamed = scan.matches_published(store).map_err(|error| error.to_string());
         let loaded = ScanSnapshot::load(store)
-            .map(|published| {
-                if diagnostics {
-                    scan.same_observation(&published)
-                } else {
-                    scan.same_namespace_observation(&published)
-                }
-            })
+            .map(|published| scan.same_namespace_observation(&published))
             .map_err(|error| error.to_string());
-        assert_eq!(streamed, loaded, "diagnostics: {diagnostics}");
+        assert_eq!(streamed, loaded);
         streamed
-    }
-
-    fn both(scan: &ScanSnapshot, store: &Store) -> [Result<bool, String>; 2] {
-        [compare(scan, store, false), compare(scan, store, true)]
     }
 
     #[test]
@@ -2957,45 +2782,21 @@ mod published_compare_tests {
         for (name, change) in changes {
             let mut world = new_world();
             let published = world.scanner.scan().unwrap();
-            publish(&mut world.store, &published, None);
-            assert_eq!(both(&published, &world.store), [Ok(true), Ok(true)]);
+            publish(&mut world.store, &published);
+            assert_eq!(compare(&published, &world.store), Ok(true));
             change(&world.root);
             let scan = world.scanner.scan().unwrap();
-            assert_eq!(both(&scan, &world.store), [Ok(false), Ok(false)], "{name}");
+            assert_eq!(compare(&scan, &world.store), Ok(false), "{name}");
         }
     }
 
     #[test]
-    fn diagnostics_count_only_when_asked_for() {
-        let mut world = new_world();
-        let scan = world.scanner.scan().unwrap();
-        #[cfg(unix)]
-        assert!(scan.diagnostic_rows().next().is_some());
-        publish(&mut world.store, &scan, Some(Vec::new()));
-        #[cfg(unix)]
-        assert_eq!(both(&scan, &world.store), [Ok(true), Ok(false)]);
-    }
-
-    #[test]
     fn inconsistent_tables_fail_as_loading_them_fails() {
-        // A diagnostic row that does not decode.
-        let mut world = new_world();
-        let scan = world.scanner.scan().unwrap();
-        let malformed = ObservedDiagnostic {
-            root_name: "main".into(),
-            path: "dir".into(),
-            detail: vec![7],
-        };
-        publish(&mut world.store, &scan, Some(vec![malformed]));
-        let [namespace, all] = both(&scan, &world.store);
-        assert!(namespace.unwrap_err().contains("malformed scan diagnostic"));
-        assert!(all.is_err());
-
         // Two traversed directories sharing a canonical path never reach
         // the tables: the unique index rejects the write.
         let mut world = new_world();
         let scan = world.scanner.scan().unwrap();
-        publish(&mut world.store, &scan, None);
+        publish(&mut world.store, &scan);
         let mut directories = scan.directory_rows();
         let mut alias = directories[0].clone();
         alias.path = "elsewhere".into();
@@ -3003,9 +2804,9 @@ mod published_compare_tests {
         assert!(world
             .store
             .input_transaction(|txn| {
-                txn.replace_scan_structure(None, &directories, &scan.encoded_diagnostic_rows())
+                txn.replace_scan_structure(None, &directories)
             })
             .is_err());
-        assert_eq!(both(&scan, &world.store), [Ok(true), Ok(true)]);
+        assert_eq!(compare(&scan, &world.store), Ok(true));
     }
 }

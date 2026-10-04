@@ -118,23 +118,29 @@ fn writers_follow_the_operational_configuration_from_their_next_transaction() {
 /// fails, its own writes roll back and the input keeps the rest.
 #[test]
 fn a_failed_nested_write_rolls_back_only_its_own_writes() {
-    use distill_store::files::ObservedDiagnostic;
+    use distill_store::files::ObservedDirectory;
     use distill_store::StoreError;
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(StoreConfig::new(dir.path().join("state"))).unwrap();
-    let diagnostic = |path: &str| ObservedDiagnostic {
-        root_name: "main".to_owned(),
-        path: path.to_owned(),
-        detail: b"unreadable".to_vec(),
+    let observe = |store: &mut Store, path: &str| {
+        let directory = ObservedDirectory {
+            root_name: "main".to_owned(),
+            path: path.to_owned(),
+            canonical_path: path.as_bytes().to_vec(),
+            physical_path: path.as_bytes().to_vec(),
+        };
+        store
+            .input_transaction(|txn| txn.replace_scan_structure(Some(&[]), &[directory]))
+            .map(drop)
     };
     store.open_input().unwrap();
     store
         .write_transaction(|store| {
-            store.replace_scan_diagnostics(Some(&[]), &[diagnostic("kept")])
+            observe(store, "kept")
         })
         .unwrap();
     let failed = store.write_transaction(|store| {
-        store.replace_scan_diagnostics(Some(&[]), &[diagnostic("dropped")])?;
+        observe(store, "dropped")?;
         Err::<(), _>(StoreError::Rejected {
             detail: "the step failed".to_owned(),
         })
@@ -143,16 +149,14 @@ fn a_failed_nested_write_rolls_back_only_its_own_writes() {
     let failed_with = store.write_transaction_with(
         |error| error.to_string(),
         |store| {
-            store
-                .replace_scan_diagnostics(Some(&[]), &[diagnostic("dropped too")])
-                .map_err(|error| error.to_string())?;
+            observe(store, "dropped too").map_err(|error| error.to_string())?;
             Err::<(), _>("the step failed".to_owned())
         },
     );
     assert!(failed_with.is_err());
     store.finish_input(true).unwrap();
     let paths = store
-        .scan_diagnostics()
+        .observed_directories()
         .unwrap()
         .into_iter()
         .map(|row| row.path)

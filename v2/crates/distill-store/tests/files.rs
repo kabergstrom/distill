@@ -4,7 +4,7 @@
 
 use distill_core::id::ContentHash;
 use distill_store::files::{
-    FileKind, FileObservation, FileState, LogicalPathState, ObservedDiagnostic, ObservedDirectory,
+    FileKind, FileObservation, FileState, LogicalPathState, ObservedDirectory,
 };
 use distill_store::state::InputVersion;
 use distill_store::{Store, StoreConfig};
@@ -274,17 +274,11 @@ fn scan_structure_is_replaced_per_subtree() {
         canonical_path: format!("/project/{path}").into_bytes(),
         physical_path: format!("/project/{path}").into_bytes(),
     };
-    let diagnostic = |path: &str| ObservedDiagnostic {
-        root_name: "main".to_owned(),
-        path: path.to_owned(),
-        detail: path.as_bytes().to_vec(),
-    };
     store
         .input_transaction(|txn| {
             txn.replace_scan_structure(
                 None,
                 &[directory(""), directory("a"), directory("a/b"), directory("ab")],
-                &[diagnostic("a/x"), diagnostic("ab/y")],
             )
         })
         .unwrap();
@@ -293,7 +287,6 @@ fn scan_structure_is_replaced_per_subtree() {
             txn.replace_scan_structure(
                 Some(&[("main".to_owned(), "a".to_owned())]),
                 &[directory("a")],
-                &[],
             )
         })
         .unwrap();
@@ -315,13 +308,8 @@ fn scan_structure_is_replaced_per_subtree() {
         .input_transaction(|txn| txn.replace_scan_structure(
             Some(&[("main".to_owned(), "c".to_owned())]),
             &[alias.clone()],
-            &[],
         ))
         .is_err());
-    store
-        .replace_scan_diagnostics(None, &[diagnostic("c")])
-        .unwrap();
-    assert_eq!(store.scan_diagnostics().unwrap(), [diagnostic("c")]);
 }
 
 #[test]

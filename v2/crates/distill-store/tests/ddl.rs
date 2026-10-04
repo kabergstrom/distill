@@ -62,7 +62,6 @@ fn every_section_13_table_exists() {
     let expected: BTreeSet<String> = [
         "files",
         "directories",
-        "scan_diagnostics",
         "source_claims",
         "import_keys",
         "file_work",

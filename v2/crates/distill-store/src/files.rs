@@ -261,14 +261,6 @@ pub struct ObservedDirectory {
     pub physical_path: Vec<u8>,
 }
 
-/// One non-fatal scan exclusion (§13 `scan_diagnostics`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ObservedDiagnostic {
-    pub root_name: String,
-    pub path: String,
-    pub detail: Vec<u8>,
-}
-
 impl InputTxn<'_> {
     /// Intern a root name to its process-local id, creating it if new.
     pub fn intern_root(&mut self, name: &str) -> Result<RootId, StoreError> {
@@ -319,18 +311,17 @@ impl InputTxn<'_> {
         Ok(n > 0)
     }
 
-    /// Replace the directory and diagnostic rows under `under` (every row
-    /// when `None`) with a new observation of that subtree.
+    /// Replace the directory rows under `under` (every row when `None`)
+    /// with a new observation of that subtree.
     pub fn replace_scan_structure(
         &mut self,
         under: Option<&[(String, String)]>,
         directories: &[ObservedDirectory],
-        diagnostics: &[ObservedDiagnostic],
     ) -> Result<(), StoreError> {
-        if under.is_none() {
-            return self.replace_all_scan_structure(directories, diagnostics);
-        }
-        clear_structure(&self.txn, under, true)?;
+        let Some(prefixes) = under else {
+            return self.replace_all_scan_structure(directories);
+        };
+        clear_directories(&self.txn, prefixes)?;
         for directory in directories {
             let root = interned_root(&self.txn, &mut self.roots, &directory.root_name)?;
             self.txn
@@ -347,16 +338,15 @@ impl InputTxn<'_> {
                     ],
                 )?;
         }
-        insert_diagnostics(&self.txn, &mut self.roots, diagnostics)
+        Ok(())
     }
 
     /// [`InputTxn::replace_scan_structure`] of every root, writing only the
     /// directory rows that change: a full rescan observes every directory,
-    /// and most are as they were. The diagnostics (defects) are replaced.
+    /// and most are as they were.
     fn replace_all_scan_structure(
         &mut self,
         directories: &[ObservedDirectory],
-        diagnostics: &[ObservedDiagnostic],
     ) -> Result<(), StoreError> {
         let mut wanted = std::collections::BTreeMap::new();
         for directory in directories {
@@ -400,8 +390,7 @@ impl InputTxn<'_> {
                 )?
                 .execute(rusqlite::params![root, path, canonical, physical])?;
         }
-        clear_structure(&self.txn, None, false)?;
-        insert_diagnostics(&self.txn, &mut self.roots, diagnostics)
+        Ok(())
     }
 
     /// Queue pending work (§13's `file_work`): written when the
@@ -478,75 +467,25 @@ pub(crate) fn under_sql(prefix: &str) -> &'static str {
     }
 }
 
-fn clear_structure(
+fn clear_directories(
     conn: &rusqlite::Connection,
-    under: Option<&[(String, String)]>,
-    directories: bool,
+    prefixes: &[(String, String)],
 ) -> Result<(), StoreError> {
-    let tables: &[&str] = if directories {
-        &["directories", "scan_diagnostics"]
-    } else {
-        &["scan_diagnostics"]
-    };
-    for table in tables {
-        match under {
-            None => {
-                conn.execute(&format!("DELETE FROM {table}"), [])?;
-            }
-            Some(prefixes) => {
-                for (root, prefix) in prefixes {
-                    conn.execute(
-                        &format!(
-                            "DELETE FROM {table} WHERE rowid IN (
-                               SELECT t.rowid FROM {table} t JOIN roots r USING (root_id)
-                               WHERE {})",
-                            under_sql(prefix)
-                        ),
-                        rusqlite::params![root, prefix],
-                    )?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn insert_diagnostics(
-    conn: &rusqlite::Connection,
-    roots: &mut std::collections::BTreeMap<String, RootId>,
-    diagnostics: &[ObservedDiagnostic],
-) -> Result<(), StoreError> {
-    for diagnostic in diagnostics {
-        let root = interned_root(conn, roots, &diagnostic.root_name)?;
-        conn
-            .prepare_cached(
-                "INSERT INTO scan_diagnostics(root_id, path, detail) VALUES (?1, ?2, ?3)
-             ON CONFLICT(root_id, path) DO UPDATE SET detail = excluded.detail",
-            )?
-            .execute(rusqlite::params![root.0, diagnostic.path, diagnostic.detail])?;
+    for (root, prefix) in prefixes {
+        conn.execute(
+            &format!(
+                "DELETE FROM directories WHERE rowid IN (
+                   SELECT t.rowid FROM directories t JOIN roots r USING (root_id)
+                   WHERE {})",
+                under_sql(prefix)
+            ),
+            rusqlite::params![root, prefix],
+        )?;
     }
     Ok(())
 }
 
 impl Store {
-    /// Replace the diagnostic rows under `under` (every row when `None`)
-    /// without publishing an input version: diagnostics are scanner state,
-    /// not authored input.
-    pub fn replace_scan_diagnostics(
-        &mut self,
-        under: Option<&[(String, String)]>,
-        diagnostics: &[ObservedDiagnostic],
-    ) -> Result<(), StoreError> {
-        self.write_txn(|store| {
-            let transaction = store.read.conn.savepoint()?;
-            clear_structure(&transaction, under, false)?;
-            insert_diagnostics(&transaction, &mut Default::default(), diagnostics)?;
-            transaction.commit()?;
-            Ok(())
-        })
-    }
-
-
     /// Every unacknowledged piece of watcher work, in order: the queue's
     /// rows, then what the open transaction queued.
     pub fn pending_file_work(&self) -> Result<PendingFileWork, StoreError> {
@@ -890,46 +829,6 @@ impl StoreReader {
             )?
             .query_row([canonical], observed_directory_row)
             .optional()?)
-    }
-
-    /// Every scan diagnostic, in (root name, path) order.
-    pub fn scan_diagnostics(&self) -> Result<Vec<ObservedDiagnostic>, StoreError> {
-        self.query_rows(
-            "SELECT r.name, t.path, t.detail
-             FROM scan_diagnostics t JOIN roots r USING (root_id) ORDER BY r.name, t.path",
-            [],
-            |row| {
-                Ok(ObservedDiagnostic {
-                    root_name: row.get(0)?,
-                    path: row.get(1)?,
-                    detail: row.get(2)?,
-                })
-            },
-        )
-    }
-
-    /// The scan diagnostics at or below `prefix` in `root_name`.
-    pub fn scan_diagnostics_under(
-        &self,
-        root_name: &str,
-        prefix: &str,
-    ) -> Result<Vec<ObservedDiagnostic>, StoreError> {
-        self.query_rows(
-            &format!(
-                "SELECT r.name, t.path, t.detail
-                 FROM scan_diagnostics t JOIN roots r USING (root_id)
-                 WHERE {} ORDER BY t.path",
-                under_sql(prefix)
-            ),
-            rusqlite::params![root_name, prefix],
-            |row| {
-                Ok(ObservedDiagnostic {
-                    root_name: row.get(0)?,
-                    path: row.get(1)?,
-                    detail: row.get(2)?,
-                })
-            },
-        )
     }
 
     /// The (path, blake3 hash) of each observed `.bundle` file at or below

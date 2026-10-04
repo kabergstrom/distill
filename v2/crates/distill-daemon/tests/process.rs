@@ -260,9 +260,10 @@ fn disabled_existing_codegen_output_is_still_excluded() {
     let process = DaemonProcess::start(config).unwrap();
     assert!(process
         .coordinator()
-        .scan_diagnostics(&process.coordinator().open_reader().unwrap())
+        .scanner()
+        .scan()
         .unwrap()
-        .iter()
+        .diagnostic_rows()
         .any(|diagnostic| matches!(
             diagnostic,
             ScanDiagnostic::DaemonOwnedDirectoryAlias {

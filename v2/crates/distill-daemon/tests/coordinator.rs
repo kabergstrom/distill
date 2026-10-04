@@ -794,6 +794,12 @@ fn directory_alias_publishes_configuration_error_without_aborting_the_version() 
     ));
 }
 
+/// What a fresh scan of the coordinator's roots diagnoses.
+#[cfg(unix)]
+fn diagnostics(coordinator: &DaemonCoordinator) -> Vec<ScanDiagnostic> {
+    coordinator.scanner().scan().unwrap().diagnostic_rows().cloned().collect()
+}
+
 #[cfg(unix)]
 #[test]
 fn daemon_state_alias_is_diagnosed_and_never_scanned() {
@@ -813,7 +819,7 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
 
     coordinator.reconcile_full_scan(&mut writer).unwrap();
     assert!(matches!(
-        coordinator.scan_diagnostics(&mut writer).unwrap().as_slice(),
+        diagnostics(&coordinator).as_slice(),
         [ScanDiagnostic::DaemonOwnedDirectoryAlias {
             root_name,
             normalized_path,
@@ -841,7 +847,7 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
             renames: Vec::new(),
         })
         .unwrap();
-    assert!(coordinator.scan_diagnostics(&mut writer).unwrap().is_empty());
+    assert!(diagnostics(&coordinator).is_empty());
     assert_eq!(coordinator.server().current_stamp().unwrap().version, version);
     symlink(temp.path().join(".distill"), &alias).unwrap();
     coordinator
@@ -850,7 +856,7 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
             renames: Vec::new(),
         })
         .unwrap();
-    assert_eq!(coordinator.scan_diagnostics(&mut writer).unwrap().len(), 1);
+    assert_eq!(diagnostics(&coordinator).len(), 1);
     assert_eq!(coordinator.server().current_stamp().unwrap().version, version);
 
     let base = coordinator.server().current_stamp().unwrap().version;

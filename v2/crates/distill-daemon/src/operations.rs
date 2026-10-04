@@ -350,7 +350,7 @@ impl OperationRuntime {
         let compiled = self.compiled.at(reader).map_err(|error| error.to_string())?;
         let observed = compiled.scanner().scan().map_err(|error| error.to_string())?;
         let filesystem_mismatch = !observed
-            .matches_published(reader, true)
+            .matches_published(reader)
             .map_err(|error| error.to_string())?;
         let build_defects = match snapshot.verification_build_requests() {
             Ok(requests) => crate::build::doctor_verify_builds(&coordinator, reader, &requests),
