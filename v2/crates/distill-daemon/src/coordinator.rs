@@ -754,10 +754,22 @@ impl DaemonCoordinator {
             .coordinated_replace_target_set(store, base, targets, |store| {
                 // The asset rows of the types whose interface this projection
                 // changes are republished; the others keep theirs.
-                let retyped = match self.compiled.at(store) {
-                    Ok(previous) => projection.retyped(previous.projection()),
-                    Err(CompiledLookupError::NotLoaded { .. }) => projection.retyped(self.boot.projection()),
+                let previous = match self.compiled.at(store) {
+                    Ok(previous) => Some(previous),
+                    Err(CompiledLookupError::NotLoaded { .. }) => None,
                     Err(error) => return Err(error.to_string()),
+                };
+                let retyped = projection.retyped(
+                    previous.as_deref().map_or(self.boot.projection(), Compiled::projection),
+                );
+                // A failure identical to the one the base's loaded state
+                // serves changes no pipeline: no connection is fenced.
+                let pipeline_changed = match (&pipeline, &previous) {
+                    (ConfigurationPipelinePublication::Failed(failure), Some(_)) => {
+                        store.pipeline_failure().map_err(|error| error.to_string())?.as_ref()
+                            != Some(failure)
+                    }
+                    _ => true,
                 };
                 let (version, _) = store
                     .input_transaction(|transaction| {
@@ -841,7 +853,7 @@ impl DaemonCoordinator {
                     &mut commit,
                     true,
                 )?;
-                commit.pipeline_epoch_changed = true;
+                commit.pipeline_epoch_changed = pipeline_changed;
                 #[cfg(test)]
                 compiled_tests::candidate_staged()?;
                 Ok(commit)
@@ -924,32 +936,37 @@ impl DaemonCoordinator {
         failure: PipelineFailure,
         heal_configuration: bool,
     ) -> Result<SnapshotStamp, CoordinatorError> {
-        warn_pipeline_failure(
-            &failure,
-            "pipeline candidate rejected; importers from it are unavailable",
-        );
-        let base = self.server.stamp_of(store)?.version;
+        let base = self.server.stamp_of(store)?;
         let diagnostic = failure.clone();
         let mut staged: Option<StagedCompiled<'_>> = None;
-        let result = self.server.coordinated_commit(store, base, |store| {
-            if store.input_version().map_err(|error| error.to_string())? != base {
-                return Err(format!(
-                    "durable pipeline-failure basis is {:?}, expected {base:?}",
-                    store.input_version().map_err(|error| error.to_string())?
-                ));
-            }
+        let mut changed = false;
+        let result = self.server.coordinated_maybe_commit(store, base.version, |store| {
             // The compiled state this version keeps but for its pipeline: the
             // base's, or, when this process has compiled nothing for the
             // store yet, what it holds since it opened.
-            let previous = match self.compiled.at(store) {
-                Ok(previous) => previous,
-                Err(CompiledLookupError::NotLoaded { .. }) => Arc::new(self.boot.clone()),
+            let (previous, loaded) = match self.compiled.at(store) {
+                Ok(previous) => (previous, true),
+                Err(CompiledLookupError::NotLoaded { .. }) => (Arc::new(self.boot.clone()), false),
                 Err(error) => return Err(error.to_string()),
             };
+            // The failure the base already serves is no change to the
+            // pipeline: nothing is fenced, and without a configuration to
+            // heal nothing is published. A store version this process has
+            // compiled nothing for is published regardless, so the process
+            // holds the state it serves.
+            let unchanged = loaded
+                && store.pipeline_failure().map_err(|error| error.to_string())?.as_ref()
+                    == Some(&diagnostic);
+            if unchanged && !heal_configuration {
+                return Ok(None);
+            }
+            changed = !unchanged;
             let generation = store.configuration_generation().map_err(|error| error.to_string())?;
             let ((configuration, version), _) = store
                 .input_transaction(|transaction| {
-                    transaction.publish_pipeline_failure(&diagnostic)?;
+                    if !unchanged {
+                        transaction.publish_pipeline_failure(&diagnostic)?;
+                    }
                     transaction.mark_compiled()?;
                     let configuration = if heal_configuration {
                         transaction.set_configuration_source_error(None)?;
@@ -964,14 +981,20 @@ impl DaemonCoordinator {
                 self.compiled
                     .stage(previous.with_pipeline_failure(version, diagnostic.clone())),
             );
-            Ok(Commit {
+            Ok(Some(Commit {
                 configuration: configuration.map(configuration_status),
-                pipeline_epoch_changed: true,
+                pipeline_epoch_changed: !unchanged,
                 ..Commit::default()
-            })
+            }))
         });
         match result {
-            Ok(stamp) => {
+            Ok(Some(stamp)) => {
+                if changed {
+                    warn_pipeline_failure(
+                        &failure,
+                        "pipeline candidate rejected; importers from it are unavailable",
+                    );
+                }
                 staged
                     .take()
                     .expect("a committed pipeline failure staged its compiled state")
@@ -979,6 +1002,7 @@ impl DaemonCoordinator {
                 lock_pipeline(&self.pipeline).host.install_failure(failure);
                 Ok(stamp)
             }
+            Ok(None) => Ok(base),
             Err(error) => Err(CoordinatorError::Coordinated(error)),
         }
     }

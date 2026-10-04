@@ -1023,3 +1023,55 @@ fn a_snapshot_whose_compiled_state_was_released_expires_instead_of_reporting_rea
         distill_rpc::MetadataCall::SnapshotExpired
     );
 }
+
+/// A pipeline failure identical to the one the store's version serves is no
+/// change: republishing it publishes no version and fences no connection,
+/// and a configuration change that keeps it publishes without a pipeline
+/// fence. A different failure is a change.
+#[test]
+fn a_repeated_pipeline_failure_neither_publishes_nor_fences() {
+    let mut fixture = Fixture::new();
+    let coordinator = Arc::clone(&fixture.coordinator);
+    let served = |coordinator: &DaemonCoordinator| {
+        let reader = coordinator.open_reader().unwrap();
+        (
+            reader.input_version().unwrap(),
+            reader.pipeline_failure().unwrap(),
+            reader.rpc_fences().unwrap().pipeline_generation,
+        )
+    };
+    let (version, failure, generation) = served(&coordinator);
+    let failure = failure.expect("the missing module's failure serves");
+
+    let stamp = coordinator
+        .publish_pipeline_rejection(&mut fixture.writer, failure.clone())
+        .unwrap();
+    assert_eq!(stamp.version, version);
+    assert_eq!(served(&coordinator), (version, Some(failure.clone()), generation));
+
+    let candidate = fixture.candidate(true, false);
+    let stamp = coordinator
+        .publish_configuration_candidate(&mut fixture.writer, candidate)
+        .unwrap();
+    assert_eq!(stamp.version, InputVersion(version.0 + 1));
+    assert_eq!(
+        served(&coordinator),
+        (stamp.version, Some(failure.clone()), generation)
+    );
+
+    let other = PipelineFailure::new(
+        PipelineFailureCode::CandidateValidation,
+        PipelineFailureOrigin::CandidateOpen,
+        CleanupDisposition::None,
+        "a different failure".to_owned(),
+    )
+    .unwrap();
+    let stamp = coordinator
+        .publish_pipeline_rejection(&mut fixture.writer, other.clone())
+        .unwrap();
+    assert_eq!(stamp.version, InputVersion(version.0 + 2));
+    assert_eq!(
+        served(&coordinator),
+        (stamp.version, Some(other), generation + 1)
+    );
+}

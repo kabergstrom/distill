@@ -1573,11 +1573,13 @@ impl ModuleHost {
                         .checked_add(1)
                         .ok_or_else(|| "pipeline staging path namespace exhausted".to_owned())?;
                 }
+                // The staging directory, not this attempt's copy: the same
+                // failure of the same module reads the same each attempt.
                 Err(error) => {
                     return Err(format!(
-                        "stage {} as {}: {error}",
+                        "stage {} in {}: {error}",
                         source.display(),
-                        path.display()
+                        distill_store::atomic_file::staging_dir(&self.state_dir).display()
                     ))
                 }
             }
