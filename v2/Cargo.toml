@@ -9,6 +9,7 @@ members = [
     "crates/distill-daemon",
     "crates/distill-daemon/tests/fixtures/pipeline-module",
     "crates/distill-daemon/tests/fixtures/game-assets-pipeline",
+    "crates/distill-daemon/tests/fixtures/test-project",
     "crates/distill-json",
     "crates/distill-loader",
     "crates/distill-migrate",

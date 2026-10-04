@@ -14,3 +14,6 @@ distill-schema = { path = "../distill-schema" }
 distill-store = { path = "../distill-store" }
 distill-wire = { path = "../distill-wire" }
 tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
+
+[dev-dependencies]
+distill-test-project = { path = "../distill-daemon/tests/fixtures/test-project" }

@@ -20,5 +20,6 @@ distill-store = { path = "../distill-store" }
 distill-wire = { path = "../distill-wire" }
 
 [dev-dependencies]
+distill-test-project = { path = "../distill-daemon/tests/fixtures/test-project" }
 tempfile = "3"
 tokio = { version = "1", features = ["net", "rt", "time"] }

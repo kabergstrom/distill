@@ -1,0 +1,20 @@
+[package]
+name = "distill-test-project"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# A project on disk served by a real daemon coordinator, shared by the RPC,
+# loader and pack tests: they author bundle files and publish them through
+# the daemon's own scan, never by writing rows.
+[dependencies]
+distill-bundle = { path = "../../../../distill-bundle" }
+distill-core = { path = "../../../../distill-core" }
+distill-daemon = { path = "../../.." }
+distill-json = { path = "../../../../distill-json" }
+distill-rpc = { path = "../../../../distill-rpc" }
+distill-schema = { path = "../../../../distill-schema" }
+distill-store = { path = "../../../../distill-store" }
+distill-wire = { path = "../../../../distill-wire" }
+tempfile = "3"
