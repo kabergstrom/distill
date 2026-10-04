@@ -564,6 +564,12 @@ impl LoaderStats {
     pub fn totals(&self) -> LoaderTotals {
         self.totals
     }
+
+    /// Loader steps and host wakeups ever: an in-flight timeline has spent
+    /// these minus its own `steps` and `wakeups`.
+    pub fn counters(&self) -> (u64, u64) {
+        (self.steps, self.wakeups)
+    }
 }
 
 #[cfg(test)]
