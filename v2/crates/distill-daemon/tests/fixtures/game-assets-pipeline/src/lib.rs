@@ -51,7 +51,9 @@ impl Kind {
     fn terminal_type(self) -> TypeUuid {
         match self {
             Self::Texture => newgameplus_assets::TextureAsset::TYPE_UUID,
-            Self::Mesh => newgameplus_assets::MeshAsset::TYPE_UUID,
+            // A plain blob terminal standing in for a mesh (see
+            // `game_assets_e2e.rs`, `MeshTerminal`).
+            Self::Mesh => newgameplus_assets::FontAsset::TYPE_UUID,
             Self::Shader => newgameplus_assets::CookedPipeline::TYPE_UUID,
         }
     }
@@ -152,25 +154,14 @@ fn cook_mesh(value: &str) -> Result<AuthoredValue, ProcessorError> {
             "OBJ geometry is empty or out of range",
         ));
     }
-    let mut vertices = Vec::with_capacity(positions.len() * 16);
-    for position in positions {
-        for component in position {
-            vertices.extend_from_slice(&component.to_le_bytes());
-        }
-        vertices.extend_from_slice(&0_u32.to_le_bytes());
-    }
     let indices = indices
         .into_iter()
         .flat_map(u16::to_le_bytes)
         .collect::<Vec<_>>();
+    // The triangle's u16 indices as the terminal's blob.
     Ok(AuthoredValue::Object(BTreeMap::from([
-        ("vertices".to_owned(), bytes_array(&vertices)),
-        ("indices".to_owned(), bytes_array(&indices)),
-        (
-            "vertex_channels".to_owned(),
-            AuthoredValue::UInt(u128::from(newgameplus_assets::VERTEX_CHANNEL_POSITION)),
-        ),
-        ("index_stride".to_owned(), AuthoredValue::UInt(2)),
+        ("index".to_owned(), AuthoredValue::UInt(0)),
+        ("data".to_owned(), AuthoredValue::Blob(indices)),
     ])))
 }
 
@@ -187,15 +178,6 @@ fn cook_shader(value: &str) -> Result<AuthoredValue, ProcessorError> {
         "cooked".to_owned(),
         AuthoredValue::Blob(cooked),
     )])))
-}
-
-fn bytes_array(bytes: &[u8]) -> AuthoredValue {
-    AuthoredValue::Array(
-        bytes
-            .iter()
-            .map(|byte| AuthoredValue::UInt(u128::from(*byte)))
-            .collect(),
-    )
 }
 
 struct GameAssetsImporter;

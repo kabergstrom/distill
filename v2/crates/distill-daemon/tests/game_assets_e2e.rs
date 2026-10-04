@@ -33,7 +33,14 @@ const TEXTURE_SOURCE_TYPE: TypeUuid = TypeUuid([0x91; 16]);
 const MESH_SOURCE_TYPE: TypeUuid = TypeUuid([0x92; 16]);
 const SHADER_SOURCE_TYPE: TypeUuid = TypeUuid([0x93; 16]);
 
-use newgameplus_assets::{CookedPipeline, MeshAsset, TextureAsset};
+use newgameplus_assets::{CookedPipeline, TextureAsset};
+
+/// The terminal the fixture cooks its OBJ triangle into: `FontAsset`, a
+/// plain blob-carrying type, holding the triangle's u16 indices as its
+/// `data`. The engine's `MeshAsset` (scene streams, submeshes naming
+/// materials) would need a material asset and a much larger hand-built
+/// schema here; the loader paths this test covers do not depend on it.
+type MeshTerminal = newgameplus_assets::FontAsset;
 
 #[path = "support/pack_definition.rs"]
 mod pack_definition;
@@ -117,7 +124,7 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
     let authority = ProjectSchemaAuthority::from_schema(schema.clone(), [0x51; 32]).unwrap();
     for descriptor in [
         TextureAsset::descriptor(),
-        MeshAsset::descriptor(),
+        MeshTerminal::descriptor(),
         CookedPipeline::descriptor(),
     ] {
         assert_eq!(
@@ -160,7 +167,7 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
         Loader::new(RpcIo::connect(process.rpc_address(), request.clone()).unwrap());
     register_runtime(&mut live_loader, target_hash, 1);
     let texture_handle = live_loader.add_ref::<TextureAsset>(texture).unwrap();
-    let mesh_handle = live_loader.add_ref::<MeshAsset>(mesh).unwrap();
+    let mesh_handle = live_loader.add_ref::<MeshTerminal>(mesh).unwrap();
     let shader_handle = live_loader.add_ref::<CookedPipeline>(shader).unwrap();
     let mut live_storage = Storage::default();
     wait_for_loads(
@@ -253,13 +260,13 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
     // Named assets: the bundle holds two meshes, each loaded by its path and
     // the name its importer gave it; an unknown name resolves to nothing.
     let primary_named = live_loader
-        .add_ref_named::<MeshAsset>("game-assets.bundle", "mesh")
+        .add_ref_named::<MeshTerminal>("game-assets.bundle", "mesh")
         .unwrap();
     let reversed_named = live_loader
-        .add_ref_named::<MeshAsset>("game-assets.bundle", "mesh_reversed")
+        .add_ref_named::<MeshTerminal>("game-assets.bundle", "mesh_reversed")
         .unwrap();
     let unknown_named = live_loader
-        .add_ref_named::<MeshAsset>("game-assets.bundle", "mesh_unknown")
+        .add_ref_named::<MeshTerminal>("game-assets.bundle", "mesh_unknown")
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while live_loader.status(&primary_named) != LoadStatus::Loaded
@@ -281,8 +288,8 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
             .iter()
             .filter(|((candidate, _), _)| *candidate == handle)
             .max_by_key(|((_, adoption), _)| *adoption)
-            .and_then(|(_, value)| value.downcast_ref::<MeshAsset>())
-            .map(|mesh| mesh.indices.clone())
+            .and_then(|(_, value)| value.downcast_ref::<MeshTerminal>())
+            .map(|mesh| mesh.data.as_bytes().to_vec())
             .unwrap_or_else(|| panic!("named mesh {handle:?} has no resident value"))
     };
     assert_eq!(indices_of(primary_named.id()), [0, 0, 1, 0, 2, 0]);
@@ -331,7 +338,7 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
     let mut pack_loader = Loader::new(pack_io);
     register_runtime(&mut pack_loader, target_hash, 2);
     let packed_texture = pack_loader.add_ref::<TextureAsset>(texture).unwrap();
-    let packed_mesh = pack_loader.add_ref::<MeshAsset>(mesh).unwrap();
+    let packed_mesh = pack_loader.add_ref::<MeshTerminal>(mesh).unwrap();
     let packed_shader = pack_loader.add_ref::<CookedPipeline>(shader).unwrap();
     let mut pack_storage = Storage::default();
     wait_for_loads(
@@ -384,15 +391,10 @@ fn assert_loaded_game_assets(
     );
 
     let mesh = value_for(mesh_handle)
-        .downcast_ref::<MeshAsset>()
+        .downcast_ref::<MeshTerminal>()
         .expect("mesh terminal value used the wrong native type");
-    assert_eq!(
-        mesh.vertex_channels,
-        newgameplus_assets::VERTEX_CHANNEL_POSITION
-    );
-    assert_eq!(mesh.index_stride, 2);
-    assert_eq!(mesh.vertices.len(), 3 * 16);
-    assert_eq!(mesh.indices, [0, 0, 1, 0, 2, 0]);
+    assert_eq!(mesh.index, 0);
+    assert_eq!(mesh.data.as_bytes(), [0, 0, 1, 0, 2, 0]);
 
     let shader = value_for(shader_handle)
         .downcast_ref::<CookedPipeline>()
@@ -424,7 +426,7 @@ fn register_runtime<I: distill_loader::LoaderIO>(
             target_hash,
             &[
                 TextureAsset::descriptor(),
-                MeshAsset::descriptor(),
+                MeshTerminal::descriptor(),
                 CookedPipeline::descriptor(),
             ],
         )
@@ -435,7 +437,7 @@ fn wait_for_loads<I: distill_loader::LoaderIO>(
     loader: &mut Loader<I>,
     storage: &mut Storage,
     texture: &distill_loader::Handle<TextureAsset>,
-    mesh: &distill_loader::Handle<MeshAsset>,
+    mesh: &distill_loader::Handle<MeshTerminal>,
     shader: &distill_loader::Handle<CookedPipeline>,
 ) {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -708,14 +710,18 @@ fn fixture_schema(source_identity: (String, String)) -> Schema {
         TypeDef {
             id: SchemaTypeId(10),
             kind: PrimitiveType::Struct,
-            path: type_path("newgameplus_assets", "MeshAsset"),
-            uuid: Some(MeshAsset::TYPE_UUID),
+            path: type_path("newgameplus_assets", "FontAsset"),
+            uuid: Some(MeshTerminal::TYPE_UUID),
             attrs: TypeAttrs::default(),
             fields: vec![
-                field("vertices", 4),
-                field("indices", 4),
-                field("vertex_channels", 3),
-                field("index_stride", 3),
+                field("index", 3),
+                Field {
+                    attrs: FieldAttrs {
+                        blob: true,
+                        ..FieldAttrs::default()
+                    },
+                    ..field("data", 5)
+                },
             ],
             generic_parameters: Vec::new(),
             generic_argument_ids: Vec::new(),
@@ -839,22 +845,16 @@ fn fixture_schema(source_identity: (String, String)) -> Schema {
                     ],
                 ),
                 terminal_layout(
-                    size_of::<MeshAsset>() as u64,
-                    align_of::<MeshAsset>() as u64,
+                    size_of::<MeshTerminal>() as u64,
+                    align_of::<MeshTerminal>() as u64,
                     vec![
-                        layout_field::<MeshAsset, Vec<u8>>(std::mem::offset_of!(
-                            MeshAsset, vertices
+                        layout_field::<MeshTerminal, u32>(std::mem::offset_of!(
+                            MeshTerminal,
+                            index
                         )),
-                        layout_field::<MeshAsset, Vec<u8>>(std::mem::offset_of!(
-                            MeshAsset, indices
-                        )),
-                        layout_field::<MeshAsset, u32>(std::mem::offset_of!(
-                            MeshAsset,
-                            vertex_channels
-                        )),
-                        layout_field::<MeshAsset, u32>(std::mem::offset_of!(
-                            MeshAsset,
-                            index_stride
+                        layout_field::<MeshTerminal, distill_asset::Blob>(std::mem::offset_of!(
+                            MeshTerminal,
+                            data
                         )),
                     ],
                 ),
