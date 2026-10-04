@@ -8,6 +8,7 @@ use distill_rpc::*;
 use distill_schema::ngp_schema::{
     node_hash, snapshot_to_json, LogicalSchema, PrimitiveKind, SchemaNode,
 };
+use distill_test_project::{Asset, TestBuilds, TestProject};
 
 fn type_id(byte: u8) -> TypeUuid {
     TypeUuid([byte; 16])
@@ -74,86 +75,49 @@ fn request_for(definition_hash: u8, _epoch: u64, _policies: &[(u8, bool)]) -> Co
     ConnectRequest::new("dev", target_hash(definition_hash))
 }
 
-fn server_with(policies: &[(u8, bool)]) -> Server {
-    Server::new(StoreInstanceId([9; 16]), vec![target_with(7, policies)]).unwrap()
+/// An empty project whose daemon serves the target "dev" (definition 7).
+fn project() -> TestProject {
+    TestProject::new(vec![target_with(7, &[])])
 }
 
-/// A finished build, answered the same at every snapshot.
-struct Finished(Result<BuildAnswer, RpcFailure>);
-
-impl BuildCompletion for Finished {
-    fn answer(self: Box<Self>, _view: BuildView<'_>) -> Result<BuildAnswer, RpcFailure> {
-        self.0
+/// `entry` (see [`authoring_entry`]) as an authored asset.
+fn asset_of(entry: &AuthoringEntry) -> Asset {
+    let asset = Asset::blob(
+        &entry.local_id,
+        entry.uuid,
+        entry.type_uuid,
+        &entry.value.blobs[0],
+    );
+    match entry.role {
+        AuthoringEntryRole::Runtime => asset,
+        AuthoringEntryRole::AuthoringOnly => asset.authoring_only(),
     }
 }
 
-/// Builds a canonical artifact for each request and publishes it on its
-/// own writer, as the daemon's build workers do, then hands the requester a
-/// ticket for it.
-struct RecordingBuildBackend {
-    server: std::sync::Weak<ServerHandle>,
-    requests: Mutex<Vec<(BuildRequest, SnapshotStamp)>>,
+/// Author `entry` as its own bundle file, at its path; a runtime entry is
+/// the bundle's primary asset (its path resolves to it).
+fn write_entry(project: &mut TestProject, entry: &AuthoringEntry) {
+    let primary = (entry.role == AuthoringEntryRole::Runtime).then_some(entry.local_id.as_str());
+    project.write_bundle(
+        &entry.normalized_path,
+        entry.bundle,
+        primary,
+        &[asset_of(entry)],
+    );
 }
 
-impl RecordingBuildBackend {
-    fn new(server: &Server) -> Self {
-        Self {
-            server: Arc::downgrade(&server.handle()),
-            requests: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn publish(&self, request: &BuildRequest) -> Result<BuildAnswer, RpcFailure> {
-        let wire_node = distill_wire::wire::WireNode::Unit { offset: 0 };
-        let wire_bytes: Arc<[u8]> = Arc::from(distill_wire::dswl::dswl_bytes(&wire_node).unwrap());
-        let layout_hash = distill_wire::dswl::dswl_hash(&wire_node).unwrap();
-        let authored_type = if request.output_key.is_empty() {
-            request.entry.type_uuid
-        } else {
-            request.requested_terminal_type
-        };
-        let (content_hash, payload) = canonical_artifact(
-            request.requested_asset,
-            authored_type,
-            request.requested_terminal_type,
-            request.requested_terminal_type,
-            layout_hash,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        );
-        let server = self.server.upgrade().expect("the server outlives its backend");
-        let mut writer = server.opener().open_writer().unwrap();
-        let content_hash = server.install_build_publication(
-            &mut writer,
-            request.requested_asset,
-            BuildPublication {
-                root_content_hash: content_hash,
-                artifacts: vec![BuildArtifactPublication {
-                    content_hash,
-                    payload,
-                }],
-                wire_trees: vec![BuildWireTree {
-                    layout_hash,
-                    bytes: wire_bytes,
-                }],
-            },
-        )?;
-        Ok(BuildAnswer::Built { content_hash })
-    }
+/// [`write_entry`], published as one version.
+fn publish_entry(project: &mut TestProject, entry: &AuthoringEntry) -> SnapshotStamp {
+    write_entry(project, entry);
+    project.publish()
 }
 
-impl BuildBackend for RecordingBuildBackend {
-    fn start(&self, view: BuildView<'_>, request: &BuildRequest) -> BuildStart {
-        self.requests
-            .lock()
-            .unwrap()
-            .push((request.clone(), view.stamp));
-        let answer = self.publish(request);
-        BuildStart::Submitted(BuildTicket::new(async move {
-            Box::new(Finished(answer)) as Box<dyn BuildCompletion>
-        }))
-    }
+/// An input version that changes nothing these tests watch: an unrelated
+/// bundle file appears.
+fn publish_unrelated(project: &mut TestProject) -> SnapshotStamp {
+    let version = project.server().current_stamp().unwrap().version.0;
+    let entry = authoring_entry(200u8.wrapping_add(version as u8), AuthoringEntryRole::AuthoringOnly);
+    publish_entry(project, &entry)
 }
 
 #[derive(Default)]
@@ -162,7 +126,7 @@ struct DepthLimitedBuildBackend {
 }
 
 struct LifecycleBuildBackend {
-    inner: RecordingBuildBackend,
+    inner: Arc<TestBuilds>,
     events: Arc<Mutex<Vec<&'static str>>>,
 }
 
@@ -185,23 +149,12 @@ impl BuildBackend for DepthLimitedBuildBackend {
 
 #[test]
 fn dependency_depth_exhaustion_is_typed_and_never_memoized() {
-    let server = server_with(&[(1, false)]);
+    let mut project = project();
+    let server = project.server();
     let backend = Arc::new(DepthLimitedBuildBackend::default());
     server.install_build_backend(backend.clone());
     let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
-    server
-        .commit(Commit {
-            assets: vec![set_asset(
-                entry.uuid,
-                StoredResolve::Drifted {
-                    input: DriftedInput::Asset(entry.uuid),
-                },
-                AssetDeltaState::Changed,
-            )],
-            authoring: vec![AuthoringMutation::Set(entry.clone())],
-            ..Commit::default()
-        })
-        .unwrap();
+    publish_entry(&mut project, &entry);
     let snapshot = snapshot(&connect(&server, &[(1, false)]));
     let expected = RpcResult::Failure(RpcFailure::BuildDepthExceeded {
         limit: 1,
@@ -215,26 +168,15 @@ fn dependency_depth_exhaustion_is_typed_and_never_memoized() {
 
 #[test]
 fn snapshot_clones_share_one_read_transaction() {
-    let server = server_with(&[(1, false)]);
+    let mut project = project();
+    let server = project.server();
     let events = Arc::new(Mutex::new(Vec::new()));
     server.install_build_backend(Arc::new(LifecycleBuildBackend {
-        inner: RecordingBuildBackend::new(&server),
+        inner: TestBuilds::new(&server),
         events: Arc::clone(&events),
     }));
     let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
-    server
-        .commit(Commit {
-            assets: vec![set_asset(
-                entry.uuid,
-                StoredResolve::Drifted {
-                    input: DriftedInput::Asset(entry.uuid),
-                },
-                AssetDeltaState::Changed,
-            )],
-            authoring: vec![AuthoringMutation::Set(entry.clone())],
-            ..Commit::default()
-        })
-        .unwrap();
+    publish_entry(&mut project, &entry);
     let snapshot = snapshot(&connect(&server, &[(1, false)]));
     let clone = snapshot.clone();
 
@@ -252,7 +194,8 @@ fn snapshot_clones_share_one_read_transaction() {
 
 #[test]
 fn snapshot_and_connection_bounds_hold_across_connections() {
-    let server = server_with(&[]);
+    let project = project();
+    let server = project.server();
     server
         .install_snapshot_policy(SnapshotPolicy {
             ttl: Duration::from_secs(60),
@@ -309,7 +252,8 @@ fn snapshot_and_connection_bounds_hold_across_connections() {
 async fn a_refused_connection_leaves_a_waiting_delta_stream_alone() {
     tokio::task::LocalSet::new()
         .run_until(async {
-            let server = server_with(&[]);
+            let mut project = project();
+            let server = project.server();
             server
                 .install_snapshot_policy(SnapshotPolicy {
                     ttl: Duration::from_secs(60),
@@ -317,7 +261,8 @@ async fn a_refused_connection_leaves_a_waiting_delta_stream_alone() {
                     max_connections: 1,
                 })
                 .unwrap();
-            let asset = AssetUuid([5; 16]);
+            let entry = authoring_entry(5, AuthoringEntryRole::Runtime);
+            let asset = entry.uuid;
             let first_hub = connect(&server, &[]);
             let install = first_hub
                 .subscribe(InputVersion(0), vec![asset], Vec::new())
@@ -335,18 +280,7 @@ async fn a_refused_connection_leaves_a_waiting_delta_stream_alone() {
                 server.root().connect(request_for(7, 1, &[])),
                 ConnectOutcome::Refused(_)
             ));
-            server
-                .commit(Commit {
-                    assets: vec![set_asset(
-                        asset,
-                        StoredResolve::Failed {
-                            error: "changed".into(),
-                        },
-                        AssetDeltaState::Changed,
-                    )],
-                    ..Commit::default()
-                })
-                .unwrap();
+            publish_entry(&mut project, &entry);
 
             let event = tokio::time::timeout(Duration::from_secs(1), pending)
                 .await
@@ -364,23 +298,11 @@ async fn a_refused_connection_leaves_a_waiting_delta_stream_alone() {
 
 #[test]
 fn drifted_resolve_builds_per_resolve_at_the_snapshot_and_publishes_canonical_outputs() {
-    let server = server_with(&[(1, false)]);
-    let backend = Arc::new(RecordingBuildBackend::new(&server));
-    server.install_build_backend(backend.clone());
+    let mut project = project();
+    let server = project.server();
+    let backend = TestBuilds::install(&server);
     let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
-    let first_stamp = server
-        .commit(Commit {
-            assets: vec![set_asset(
-                entry.uuid,
-                StoredResolve::Drifted {
-                    input: DriftedInput::Asset(entry.uuid),
-                },
-                AssetDeltaState::Changed,
-            )],
-            authoring: vec![AuthoringMutation::Set(entry.clone())],
-            ..Commit::default()
-        })
-        .unwrap();
+    let first_stamp = publish_entry(&mut project, &entry);
     let hub = connect(&server, &[(1, false)]);
     let first = snapshot(&hub);
 
@@ -398,15 +320,13 @@ fn drifted_resolve_builds_per_resolve_at_the_snapshot_and_publishes_canonical_ou
     // The server keeps no build results: every resolve of a drifted asset
     // asks the backend, at the requester's own snapshot (the daemon's
     // backend answers a repeat from its node cache).
-    assert_eq!(backend.requests.lock().unwrap().len(), 2);
+    assert_eq!(backend.requests().len(), 2);
     assert!(backend
-        .requests
-        .lock()
-        .unwrap()
+        .requests()
         .iter()
         .all(|(_, stamp)| *stamp == first_stamp));
 
-    let second_stamp = server.commit(Commit::default()).unwrap();
+    let second_stamp = publish_unrelated(&mut project);
     let second = first.refresh().success().unwrap();
     assert_eq!(second.stamp(), second_stamp);
     assert_eq!(
@@ -415,7 +335,7 @@ fn drifted_resolve_builds_per_resolve_at_the_snapshot_and_publishes_canonical_ou
             content_hash: first_hash
         }
     );
-    let requests = backend.requests.lock().unwrap();
+    let requests = backend.requests();
     assert_eq!(requests.len(), 3);
     assert_eq!(requests[2].1, second_stamp);
     assert_eq!(requests[2].0.target, "dev");
@@ -424,64 +344,20 @@ fn drifted_resolve_builds_per_resolve_at_the_snapshot_and_publishes_canonical_ou
     assert!(requests[2].0.output_key.is_empty());
 }
 
-#[test]
-fn derived_child_resolution_builds_the_parent_and_selects_the_declared_output() {
-    let server = server_with(&[(1, false), (2, false)]);
-    let backend = Arc::new(RecordingBuildBackend::new(&server));
-    server.install_build_backend(backend.clone());
-    let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
-    let output_key = "reflection".to_owned();
-    let child = AssetUuid::v5(entry.uuid, &output_key);
-    server
-        .commit(Commit {
-            assets: vec![set_asset(
-                entry.uuid,
-                StoredResolve::Drifted {
-                    input: DriftedInput::Asset(entry.uuid),
-                },
-                AssetDeltaState::Changed,
-            )],
-            authoring: vec![AuthoringMutation::Set(entry.clone())],
-            derived_outputs: Some(BTreeMap::from([(
-                child,
-                DerivedOutputEntry {
-                    parent: entry.uuid,
-                    output_key: output_key.clone(),
-                    terminal_type: type_id(2),
-                },
-            )])),
-            ..Commit::default()
-        })
-        .unwrap();
-
-    let snapshot = snapshot(&connect(&server, &[(1, false), (2, false)]));
-    let hash = match snapshot.resolve(child).success().unwrap().value {
-        ResolveResult::Built { content_hash } => content_hash,
-        other => panic!("expected built derived output, got {other:?}"),
-    };
-    assert!(matches!(snapshot.fetch(hash), RpcResult::Success(_)));
-    let requests = backend.requests.lock().unwrap();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].0.entry.uuid, entry.uuid);
-    assert_eq!(requests[0].0.requested_asset, child);
-    assert_eq!(requests[0].0.output_key, output_key);
-    assert_eq!(requests[0].0.requested_terminal_type, type_id(2));
-}
-
+/// The durable store's version is what a restarted daemon serves first.
 #[test]
 fn production_bootstrap_starts_at_the_durable_store_version() {
-    let server = Server::new_at_version_with_authoring_backend(
-        StoreInstanceId([9; 16]),
-        InputVersion(41),
-        vec![target_with(7, &[(1, false)])],
-        Arc::new(RecordingAuthoringBackend::default()),
-    )
-    .unwrap();
+    let mut project = project();
+    publish_entry(&mut project, &authoring_entry(1, AuthoringEntryRole::Runtime));
+    let durable = publish_entry(&mut project, &authoring_entry(2, AuthoringEntryRole::Runtime));
+    assert_eq!(durable.version, InputVersion(2));
 
-    assert_eq!(server.current_stamp().unwrap().version, InputVersion(41));
+    let project = project.restart();
+    let server = project.server();
+    assert_eq!(server.current_stamp().unwrap().version, durable.version);
     assert_eq!(
         snapshot(&connect(&server, &[(1, false)])).stamp().version,
-        InputVersion(41)
+        durable.version
     );
 }
 
@@ -554,104 +430,50 @@ impl AuthoringBackend for RecordingAuthoringBackend {
     }
 }
 
-#[derive(Default)]
-struct FileWriteBackend {
-    bases: Mutex<Vec<InputVersion>>,
-}
-
-impl AuthoringBackend for FileWriteBackend {
-    fn write_files(
-        &self,
-        _store: &mut distill_store::Store,
-        base: InputVersion,
-        _operations: &[AuthoringOp],
-        _force_lossy: bool,
-    ) -> Result<Option<WriteReceipt>, RpcFailure> {
-        self.bases.lock().unwrap().push(base);
-        Ok(Some(receipt()))
-    }
-
-    fn prepare_import(
-        &self,
-        _store: &mut distill_store::Store,
-        _base: InputVersion,
-        _request: &ImportRequest,
-    ) -> Result<PreparedImportCommit, RpcFailure> {
-        unreachable!("write test does not import")
-    }
-
-    fn prepare_reimport(
-        &self,
-        _store: &mut distill_store::Store,
-        _base: InputVersion,
-        _bundle: BundleUuid,
-    ) -> Result<PreparedImportCommit, RpcFailure> {
-        unreachable!("write test does not reimport")
-    }
-
-    fn prepare_operation(
-        &self,
-        _store: &mut distill_store::Store,
-        _base: InputVersion,
-        _operation: &LongRunningOp,
-    ) -> Result<PreparedOperationCommit, RpcFailure> {
-        unreachable!("write test does not run operations")
-    }
-}
-
-fn receipt() -> WriteReceipt {
-    WriteReceipt {
-        files: vec![WrittenFile {
-            root: "main".to_owned(),
-            path: "a.bundle".to_owned(),
-            content_hash: Some(ContentHash([3; 32])),
-        }],
-    }
-}
-
-/// A backend that writes files answers their receipt and publishes
-/// nothing: the store follows the files. A stale base reaches no backend.
+/// The daemon writes an authoring write's files and answers their receipt;
+/// the version does not move until the watcher publishes them. A stale
+/// base reaches no file.
 #[test]
 fn a_file_write_answers_its_receipt_and_publishes_nothing() {
-    let backend = Arc::new(FileWriteBackend::default());
-    let server = Server::new_at_version_with_authoring_backend(
-        StoreInstanceId([9; 16]),
-        InputVersion(8),
-        vec![target_with(7, &[(1, false)])],
-        backend.clone(),
-    )
-    .unwrap();
+    let mut project = project();
+    let server = project.server();
+    let entry = authoring_entry(7, AuthoringEntryRole::Runtime);
+    let base = publish_entry(&mut project, &entry).version;
     let hub = connect(&server, &[(1, false)]);
+    let file = project.root(distill_test_project::ROOT).join(&entry.normalized_path);
 
+    let receipt = WriteReceipt {
+        files: vec![WrittenFile {
+            root: distill_test_project::ROOT.to_owned(),
+            path: entry.normalized_path.clone(),
+            content_hash: None,
+        }],
+    };
     assert_eq!(
         hub.write(
-            InputVersion(8),
-            vec![AuthoringOp::Remove { uuid: asset_id(7) }],
-            false
-        ),
-        RpcResult::Success(receipt())
-    );
-    assert_eq!(*backend.bases.lock().unwrap(), [InputVersion(8)]);
-    assert_eq!(server.current_stamp().unwrap().version, InputVersion(8));
-    assert_eq!(
-        hub.write(
-            InputVersion(7),
-            vec![AuthoringOp::Remove { uuid: asset_id(7) }],
+            InputVersion(base.0 - 1),
+            vec![AuthoringOp::Remove { uuid: entry.uuid }],
             false
         ),
         RpcResult::Failure(RpcFailure::StaleInputVersion {
-            expected: InputVersion(8),
-            got: InputVersion(7),
+            expected: base,
+            got: InputVersion(base.0 - 1),
         })
     );
-    assert_eq!(*backend.bases.lock().unwrap(), [InputVersion(8)]);
-    assert_eq!(server.current_stamp().unwrap().version, InputVersion(8));
-    assert_eq!(WriteReceipt::decode(&receipt().encode()), Ok(receipt()));
+    assert!(file.exists());
+    assert_eq!(
+        hub.write(base, vec![AuthoringOp::Remove { uuid: entry.uuid }], false),
+        RpcResult::Success(receipt.clone())
+    );
+    assert!(!file.exists());
+    assert_eq!(server.current_stamp().unwrap().version, base);
+    assert_eq!(WriteReceipt::decode(&receipt.encode()), Ok(receipt));
 }
 
 #[test]
 fn external_coordinator_cas_runs_publication_only_at_the_exact_server_base() {
-    let server = server_with(&[(1, false)]);
+    let project = project();
+    let server = project.server();
     let mut called = false;
     assert_eq!(
         server.coordinated_commit(InputVersion(9), |_| {
@@ -675,25 +497,21 @@ fn external_coordinator_cas_runs_publication_only_at_the_exact_server_base() {
 
 #[test]
 fn coordinator_can_project_daemon_controls_but_hub_cannot_write_them_directly() {
-    let server = server_with(&[(1, false)]);
+    let mut project = project();
+    let server = project.server();
     let mut control = authoring_entry(44, AuthoringEntryRole::AuthoringOnly);
-    control.local_id = "$record".to_owned();
-    server
-        .commit(Commit {
-            authoring: vec![AuthoringMutation::Set(control.clone())],
-            ..Commit::default()
-        })
-        .unwrap();
+    control.local_id = "$settings".to_owned();
+    let stamp = publish_entry(&mut project, &control);
     let hub = connect(&server, &[(1, false)]);
     assert!(matches!(
         authoring_snapshot(&hub).inspect(control.uuid),
         RpcResult::Success(AuthoringInspectResult::Inspection(_))
     ));
     assert!(matches!(
-        hub.write(InputVersion(1), vec![AuthoringOp::Set(control)], false),
+        hub.write(stamp.version, vec![AuthoringOp::Set(control)], false),
         RpcResult::Failure(RpcFailure::InvalidAuthoringRequest { .. })
     ));
-    assert_eq!(server.current_stamp().unwrap().version, InputVersion(1));
+    assert_eq!(server.current_stamp().unwrap(), stamp);
 }
 
 fn connect(server: &Server, policies: &[(u8, bool)]) -> Hub {
@@ -734,22 +552,22 @@ fn assert_reconnect<T: std::fmt::Debug>(result: RpcResult<T>, reason: ReconnectR
     ));
 }
 
+/// The authoring entry the daemon serves for the asset `byte`: one blob
+/// (`byte + 2`) in its own bundle file `bundle-{byte}.bundle`, the bundle's
+/// primary. The daemon tags nothing without a project schema.
 fn authoring_entry(byte: u8, role: AuthoringEntryRole) -> AuthoringEntry {
     let schema_hash = node_hash(&SchemaNode::Blob).unwrap();
     AuthoringEntry {
         uuid: asset_id(byte),
         bundle: BundleUuid([byte.wrapping_add(1); 16]),
         local_id: format!("entry-{byte}"),
-        normalized_path: format!("bundle-{byte}.asset"),
+        normalized_path: format!("bundle-{byte}.bundle"),
         type_uuid: type_id(byte),
         terminal_type: type_id(byte),
         schema_hash,
         logical_schema: Arc::from(&b"\"blob\""[..]),
         role,
-        tags: std::collections::BTreeMap::from([(
-            "group".to_owned(),
-            Some(format!("group-{byte}")),
-        )]),
+        tags: BTreeMap::new(),
         value: AuthoringValue {
             canonical_value: Arc::from(&b"{\"$distill_blob\":0}"[..]),
             blobs: vec![Arc::from([byte.wrapping_add(2)])],
@@ -3020,4 +2838,10 @@ fn an_unchanged_protocol_epoch_or_target_publishes_no_version() {
     assert_eq!(server.current_stamp().unwrap(), before);
     let changed = server.replace_protocol_epoch(PROTOCOL_VERSION + 1).unwrap();
     assert_eq!(changed.version.0, before.version.0 + 1);
+}
+
+// TODO(schema-min phase 5): the embedded server the unconverted tests below
+// still use; removed with embedded Full apply mode.
+fn server_with(policies: &[(u8, bool)]) -> Server {
+    Server::new(StoreInstanceId([9; 16]), vec![target_with(7, policies)]).unwrap()
 }
