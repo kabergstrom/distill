@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use unicode_normalization::UnicodeNormalization;
 
+use distill_core::frames::reenter;
 use distill_json::AuthoredValue;
 use distill_schema::ngp_schema::{verify_snapshot, PrimitiveKind, SchemaNode};
 
@@ -171,10 +172,10 @@ pub fn decode_authoring_payload(
     Ok(value)
 }
 
-pub(crate) fn materialize_blob_tokens(
-    schema: &SchemaNode,
+pub(crate) fn materialize_blob_tokens<'s>(
+    schema: &'s SchemaNode,
     value: &mut AuthoredValue,
-    frames: &mut Vec<SchemaNode>,
+    frames: &mut Vec<&'s SchemaNode>,
     blobs: &[Arc<[u8]>],
 ) {
     match schema {
@@ -188,7 +189,7 @@ pub(crate) fn materialize_blob_tokens(
             *value = AuthoredValue::Blob(blobs[*index as usize].to_vec());
         }
         SchemaNode::Struct { fields, .. } => {
-            frames.push(schema.clone());
+            frames.push(schema);
             materialize_fields(fields, value, frames, blobs);
             frames.pop();
         }
@@ -206,7 +207,7 @@ pub(crate) fn materialize_blob_tokens(
                 .find(|(candidate, _, _)| candidate == &name)
                 .expect("validated enum schema")
                 .2;
-            frames.push(schema.clone());
+            frames.push(schema);
             let payload = object.get_mut(&name).expect("validated enum value");
             // A variant payload opens no frame of its own (§5).
             match variant_schema {
@@ -257,8 +258,9 @@ pub(crate) fn materialize_blob_tokens(
             _ => unreachable!("validated map shape"),
         },
         SchemaNode::BackRef(distance) => {
-            let target = frames[frames.len() - (*distance as usize + 1)].clone();
-            materialize_blob_tokens(&target, value, frames, blobs);
+            let (target, reentry) = reenter(frames, *distance).expect("validated back-reference");
+            materialize_blob_tokens(target, value, frames, blobs);
+            reentry.restore(frames);
         }
         SchemaNode::Primitive(_)
         | SchemaNode::AssetRef(_)
@@ -270,10 +272,10 @@ pub(crate) fn materialize_blob_tokens(
 
 /// A struct body's fields, materialized in whatever frame the caller
 /// opened: a struct's own, or its enum's for a variant payload.
-fn materialize_fields(
-    fields: &[(String, u32, SchemaNode)],
+fn materialize_fields<'s>(
+    fields: &'s [(String, u32, SchemaNode)],
     value: &mut AuthoredValue,
-    frames: &mut Vec<SchemaNode>,
+    frames: &mut Vec<&'s SchemaNode>,
     blobs: &[Arc<[u8]>],
 ) {
     let AuthoredValue::Object(object) = value else {
@@ -289,10 +291,10 @@ fn materialize_fields(
     }
 }
 
-pub(crate) fn walk_schema_value(
-    schema: &SchemaNode,
+pub(crate) fn walk_schema_value<'s>(
+    schema: &'s SchemaNode,
     value: &AuthoredValue,
-    frames: &mut Vec<SchemaNode>,
+    frames: &mut Vec<&'s SchemaNode>,
     used: &mut BTreeSet<u32>,
     blob_count: u32,
 ) -> Result<(), AuthoringValueError> {
@@ -320,7 +322,7 @@ pub(crate) fn walk_schema_value(
             }
         }
         SchemaNode::Struct { fields, .. } => {
-            frames.push(schema.clone());
+            frames.push(schema);
             walk_fields(fields, value, frames, used, blob_count)?;
             frames.pop();
         }
@@ -336,7 +338,7 @@ pub(crate) fn walk_schema_value(
                 .iter()
                 .find(|(candidate, _, _)| candidate == name)
                 .ok_or_else(|| shape("enum value names an unknown variant"))?;
-            frames.push(schema.clone());
+            frames.push(schema);
             // A variant payload opens no frame of its own (§5).
             match variant_schema {
                 SchemaNode::Struct { fields, .. } => {
@@ -393,16 +395,12 @@ pub(crate) fn walk_schema_value(
             _ => return Err(shape("map value does not match its key schema")),
         },
         SchemaNode::BackRef(distance) => {
-            let distance = usize::try_from(*distance).expect("u32 fits usize");
-            let Some(target) = frames
-                .len()
-                .checked_sub(distance + 1)
-                .and_then(|index| frames.get(index))
-                .cloned()
-            else {
+            let Some((target, reentry)) = reenter(frames, *distance) else {
                 return Err(shape("logical schema contains an invalid back-reference"));
             };
-            walk_schema_value(&target, value, frames, used, blob_count)?;
+            let walked = walk_schema_value(target, value, frames, used, blob_count);
+            reentry.restore(frames);
+            walked?;
         }
         SchemaNode::Unit if !matches!(value, AuthoredValue::Null) => {
             return Err(shape("unit value must be null"));
@@ -419,10 +417,10 @@ pub(crate) fn walk_schema_value(
 
 /// A struct body's fields, validated in whatever frame the caller opened:
 /// a struct's own, or its enum's for a variant payload.
-fn walk_fields(
-    fields: &[(String, u32, SchemaNode)],
+fn walk_fields<'s>(
+    fields: &'s [(String, u32, SchemaNode)],
     value: &AuthoredValue,
-    frames: &mut Vec<SchemaNode>,
+    frames: &mut Vec<&'s SchemaNode>,
     used: &mut BTreeSet<u32>,
     blob_count: u32,
 ) -> Result<(), AuthoringValueError> {
@@ -626,4 +624,34 @@ pub(crate) fn path_glob_matches(pattern: &str, path: &str) -> bool {
         previous = current;
     }
     previous[path.len()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn materializing_reenters_a_backref_under_its_own_ancestors() {
+        // A { b: Option<B> }, B { a: Option<A>, b: Option<B> }: inside the B
+        // that B.b re-enters, `a` is BackRef(1) and names A.
+        let option = |inner| SchemaNode::Option(Box::new(inner));
+        let record = |fields: Vec<(&str, SchemaNode)>| SchemaNode::Struct {
+            rev: 0,
+            fields: fields
+                .into_iter()
+                .map(|(name, node)| (name.to_owned(), 0, node))
+                .collect(),
+        };
+        let schema = record(vec![(
+            "b",
+            option(record(vec![
+                ("a", option(SchemaNode::BackRef(1))),
+                ("b", option(SchemaNode::BackRef(0))),
+            ])),
+        )]);
+        let text = r#"{"b":{"a":null,"b":{"a":{"b":null},"b":null}}}"#;
+        let mut value = distill_json::parse(text).unwrap();
+        materialize_blob_tokens(&schema, &mut value, &mut Vec::new(), &[]);
+        assert_eq!(value, distill_json::parse(text).unwrap());
+    }
 }

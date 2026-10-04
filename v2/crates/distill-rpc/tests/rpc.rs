@@ -808,6 +808,89 @@ fn authoring_payload_decoder_reenters_an_enum_from_its_variant_payload() {
         link(1, link(2, end))
     );
 }
+
+fn option_of(inner: SchemaNode) -> SchemaNode {
+    SchemaNode::Option(Box::new(inner))
+}
+
+fn record(fields: Vec<(&str, SchemaNode)>) -> SchemaNode {
+    SchemaNode::Struct {
+        rev: 0,
+        fields: fields
+            .into_iter()
+            .map(|(name, node)| (name.to_owned(), 0, node))
+            .collect(),
+    }
+}
+
+fn decode_plain(root: SchemaNode, canonical: &str) -> Result<AuthoredValue, AuthoringValueError> {
+    let schema = LogicalSchema { root };
+    decode_authoring_payload(
+        node_hash(&schema.root).unwrap(),
+        snapshot_to_json(&schema).unwrap().as_bytes(),
+        &AuthoringValue {
+            canonical_value: Arc::from(canonical.as_bytes()),
+            blobs: Vec::new(),
+        },
+    )
+}
+
+#[test]
+fn authoring_payload_decoder_reenters_a_backref_under_its_own_ancestors() {
+    // A { b: Option<B> }, B { a: Option<A>, b: Option<B> }. B.b re-enters
+    // B as BackRef(0); inside that B, `a` is BackRef(1) and names A.
+    let schema = || {
+        record(vec![(
+            "b",
+            option_of(record(vec![
+                ("a", option_of(SchemaNode::BackRef(1))),
+                ("b", option_of(SchemaNode::BackRef(0))),
+            ])),
+        )])
+    };
+    let text = r#"{"b":{"a":null,"b":{"a":{"b":null},"b":null}}}"#;
+    assert_eq!(
+        decode_plain(schema(), text).unwrap(),
+        distill_json::parse(text).unwrap()
+    );
+    // A B where `a` names A is refused.
+    decode_plain(
+        schema(),
+        r#"{"b":{"a":null,"b":{"a":{"a":null,"b":null},"b":null}}}"#,
+    )
+    .unwrap_err();
+}
+
+#[test]
+fn authoring_payload_decoder_reenters_a_backref_under_its_own_ancestors_three_deep() {
+    // A { b: Option<B> }, B { c: Option<C> },
+    // C { a: Option<A>, b: Option<B>, c: Option<C> }.
+    let schema = || {
+        record(vec![(
+            "b",
+            option_of(record(vec![(
+                "c",
+                option_of(record(vec![
+                    ("a", option_of(SchemaNode::BackRef(2))),
+                    ("b", option_of(SchemaNode::BackRef(1))),
+                    ("c", option_of(SchemaNode::BackRef(0))),
+                ])),
+            )])),
+        )])
+    };
+    let text = r#"{"b":{"c":{"a":null,"b":null,"c":{"a":null,"b":{"c":{"a":{"b":{"c":null}},"b":null,"c":{"a":null,"b":null,"c":null}}},"c":null}}}}"#;
+    assert_eq!(
+        decode_plain(schema(), text).unwrap(),
+        distill_json::parse(text).unwrap()
+    );
+    // Inside the re-entered C, `b` names B: a C there is refused.
+    decode_plain(
+        schema(),
+        r#"{"b":{"c":{"a":null,"b":null,"c":{"a":null,"b":{"a":null,"b":null,"c":null},"c":null}}}}"#,
+    )
+    .unwrap_err();
+}
+
 #[test]
 fn tag_queries_fail_when_other_selectors_could_include_a_poisoned_entry() {
     // Without a project schema the daemon's tag index stays pending: the
