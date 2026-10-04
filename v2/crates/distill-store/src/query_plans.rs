@@ -716,6 +716,17 @@ fn a_derived_child_resolves_by_point_reads() {
     assert!(many <= few + 24, "{few} {many}");
 }
 
+/// A tool epoch reads each key's last row at its base in one pass over the
+/// primary key: no sort, no per-key subquery.
+#[test]
+fn a_tool_epoch_reads_the_published_tools_in_one_pass() {
+    let (_dir, store) = store_with(0);
+    assert_eq!(
+        store.query_plan_details(crate::pipeline::PUBLISHED_TOOLS).unwrap(),
+        ["SCAN tools USING INDEX sqlite_autoindex_tools_1"]
+    );
+}
+
 /// Which rules bundles generated bundles name is found once per edit of a
 /// bundle source: one seek per rules bundle, however many bundles each
 /// generated.

@@ -241,6 +241,17 @@ fn complete_tool_epoch_tombstones_removed_keys_without_hiding_old_snapshots() {
         store.tool("compiler").unwrap().unwrap().input_version,
         version_two
     );
+
+    // The same epoch again writes no row: the compiler's is version two's.
+    let (_, version_three) = store
+        .input_transaction(|txn| txn.publish_tool_epoch(&second))
+        .unwrap();
+    assert!(version_three > version_two);
+    assert_eq!(
+        store.tool("compiler").unwrap().unwrap().input_version,
+        version_two
+    );
+    assert!(store.tool("linker").unwrap().is_none());
 }
 
 #[test]

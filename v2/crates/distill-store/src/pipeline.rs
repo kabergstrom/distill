@@ -474,6 +474,18 @@ impl InputTxn<'_> {
         key: &str,
         registration: ToolRegistrationV2,
     ) -> Result<RegisteredTool, StoreError> {
+        self.stage_tool(key, registration, None)
+    }
+
+    /// Stage `key`'s tool and write its row at this version, unless
+    /// `published` (the hash of the row it would replace) already names
+    /// the same tool.
+    fn stage_tool(
+        &mut self,
+        key: &str,
+        registration: ToolRegistrationV2,
+        published: Option<&[u8]>,
+    ) -> Result<RegisteredTool, StoreError> {
         if key.is_empty() || !is_nfc(key) || key.contains('\0') {
             return Err(StoreError::InvalidToolKey);
         }
@@ -505,6 +517,15 @@ impl InputTxn<'_> {
                 None
             }
         };
+        if published == Some(tool_hash.as_slice()) {
+            return Ok(RegisteredTool {
+                key: key.to_owned(),
+                root,
+                identity,
+                tool_hash,
+                input_version: self.version(),
+            });
+        }
         self.txn
             .prepare_cached(
                 "INSERT INTO tools(tool_key, present, identity_object, tool_hash, input_version)
@@ -531,40 +552,35 @@ impl InputTxn<'_> {
         })
     }
 
-    /// Publish one complete ToolEpoch projection. Keys absent from `tools`
+    /// Publish one complete ToolEpoch projection: a row for each key whose
+    /// tool changed or that `tools` drops. Keys absent from `tools`
     /// receive input-versioned tombstones so a removed registration cannot
     /// fall through to an older live registration at a newer snapshot.
     pub fn publish_tool_epoch(
         &mut self,
         tools: &BTreeMap<String, ToolRegistrationV2>,
     ) -> Result<Vec<RegisteredTool>, StoreError> {
-        let mut previous = BTreeSet::new();
+        let mut previous = BTreeMap::<String, Vec<u8>>::new();
         {
-            let mut statement = self.txn.prepare(
-                "SELECT candidate.tool_key
-                   FROM tools AS candidate
-                  WHERE candidate.input_version = (
-                        SELECT MAX(prior.input_version)
-                          FROM tools AS prior
-                         WHERE prior.tool_key = candidate.tool_key
-                           AND prior.input_version <= ?1)
-                    AND candidate.present = 1",
-            )?;
+            let mut statement = self.txn.prepare_cached(PUBLISHED_TOOLS)?;
             let rows = statement.query_map(
                 [i64::try_from(self.base_stamp().version.0).unwrap_or(i64::MAX)],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?, row.get(2)?)),
             )?;
             for row in rows {
-                previous.insert(row?);
+                let (key, present, hash) = row?;
+                if present {
+                    previous.insert(key, hash);
+                }
             }
         }
 
         let mut staged = Vec::with_capacity(tools.len());
         for (key, registration) in tools {
-            staged.push(self.register_tool(key, registration.clone())?);
+            let published = previous.get(key).map(Vec::as_slice);
+            staged.push(self.stage_tool(key, registration.clone(), published)?);
         }
-        let current = tools.keys().cloned().collect::<BTreeSet<_>>();
-        for removed in previous.difference(&current) {
+        for removed in previous.keys().filter(|key| !tools.contains_key(*key)) {
             self.txn
                 .prepare_cached(
                     "INSERT INTO tools(tool_key, present, identity_object, tool_hash, input_version)
@@ -616,6 +632,12 @@ fn exact_blob32(bytes: Vec<u8>, name: &str) -> Result<[u8; 32], StoreError> {
         .map_err(|_| invalid_state(&format!("{name} is not exactly 32 bytes")))
 }
 
+
+/// Each key's last ToolEpoch row at a version, `(key, present, hash)`:
+/// one pass over the primary key (the row of a group's `MAX` supplies the
+/// bare columns).
+pub(crate) const PUBLISHED_TOOLS: &str = "SELECT tool_key, present, tool_hash, MAX(input_version)
+     FROM tools WHERE input_version <= ?1 GROUP BY tool_key";
 
 /// The last ToolEpoch row of one key at a pinned version (primary key).
 pub(crate) const TOOL_AT: &str = "SELECT present, identity_object, tool_hash, input_version

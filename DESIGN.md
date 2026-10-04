@@ -3217,7 +3217,8 @@ a job runs is a **snapshot input**: registering or replacing a tool
 ambient toolchain and publishes the (tool key → execution identity + DSCT hash)
 mapping as
 input-versioned **ToolEpoch** state (§13) — a registration change
-advances the input version like any other input event. A job resolves
+advances the input version like any other input event. An epoch writes a
+row only for a key whose tool changed or that it drops. A job resolves
 `id` through its pinned snapshot. Package tools launch only the staged package
 the published DSCT names; ambient tools launch their explicit path, and only a
 trusted fingerprint makes that call memoizable. A swap mid-epoch invalidates
