@@ -880,7 +880,6 @@ impl<T> MetadataCall<T> {
     fn retype<U>(self) -> MetadataCall<U> {
         match self {
             Self::Success(_) => unreachable!("only failures are retyped"),
-            Self::ReconnectRequired { reason } => MetadataCall::ReconnectRequired { reason },
             Self::SnapshotExpired => MetadataCall::SnapshotExpired,
             Self::Error(error) => MetadataCall::Error(error),
         }

@@ -49,10 +49,10 @@ use crate::{
     ConfigurationStatus, ConnectError, ConnectOutcome, ConnectRequest, ContentHash, Delta,
     DeltaStream, DriftedInput, Hub, InputVersion, LayoutHash, MetadataAuthoringSnapshot,
     MetadataCall, MetadataConnectOutcome, MetadataDiagnostics, MetadataEntry, MetadataHub,
-    MetadataNamespaceCall, MetadataReconnectReason, MetadataSnapshot, NamespaceError,
-    NamespaceErrorV1, PathResolveFailure, PathResolveResult, ProgressStream, PureMetadataEntry,
-    PureMetadataQuery, ReconnectReason, ResolveResult, Root, RpcBasis, RpcFailure, RpcResult,
-    Snapshot, SnapshotStamp, StoreInstanceId, TagSelector, TargetDefinitionHash, TypeUuid,
+    MetadataNamespaceCall, MetadataSnapshot, NamespaceError, NamespaceErrorV1, PathResolveFailure,
+    PathResolveResult, ProgressStream, PureMetadataEntry, PureMetadataQuery, ReconnectReason,
+    ResolveResult, Root, RpcBasis, RpcFailure, RpcResult, Snapshot, SnapshotStamp, StoreInstanceId,
+    TagSelector, TargetDefinitionHash, TypeUuid,
 };
 
 pub use crate::distill_rpc_capnp as schema;
@@ -2803,9 +2803,6 @@ fn write_metadata_snapshot_result(
             let mut result = result;
             result.set_success(client);
         }
-        MetadataCall::ReconnectRequired { reason } => {
-            write_metadata_reconnect(result.init_reconnect_required(), reason)
-        }
         MetadataCall::SnapshotExpired => result.set_snapshot_expired(()),
         MetadataCall::Error(error) => write_error(
             result.init_error(),
@@ -2827,9 +2824,6 @@ fn write_metadata_authoring_snapshot_result(
             let mut result = result;
             result.set_success(client);
         }
-        MetadataCall::ReconnectRequired { reason } => {
-            write_metadata_reconnect(result.init_reconnect_required(), reason)
-        }
         MetadataCall::SnapshotExpired => result.set_snapshot_expired(()),
         MetadataCall::Error(error) => write_error(
             result.init_error(),
@@ -2850,9 +2844,6 @@ fn write_metadata_authoring_refresh_result(
                 capnp_rpc::new_client(MetadataAuthoringSnapshotService { snapshot });
             let mut result = result;
             result.set_success(client);
-        }
-        MetadataCall::ReconnectRequired { reason } => {
-            write_metadata_reconnect(result.init_reconnect_required(), reason)
         }
         MetadataCall::SnapshotExpired => result.set_snapshot_expired(()),
         MetadataCall::Error(error) => write_error(
@@ -2891,9 +2882,6 @@ fn write_metadata_diagnostics_result(
                 write_namespace_error(errors.reborrow().get(index as u32), error);
             }
         }
-        MetadataCall::ReconnectRequired { reason } => {
-            write_metadata_reconnect(result.init_reconnect_required(), reason)
-        }
         MetadataCall::SnapshotExpired => result.set_snapshot_expired(()),
         MetadataCall::Error(error) => write_error(
             result.init_error(),
@@ -2910,9 +2898,6 @@ fn write_metadata_uint64_result(
 ) {
     match outcome {
         MetadataCall::Success(value) => result.set_success(value),
-        MetadataCall::ReconnectRequired { reason } => {
-            write_metadata_reconnect(result.init_reconnect_required(), reason)
-        }
         MetadataCall::SnapshotExpired => result.set_snapshot_expired(()),
         MetadataCall::Error(error) => write_error(
             result.init_error(),
@@ -2933,9 +2918,6 @@ fn write_metadata_uuid_list_result(
                 list.reborrow().get(index as u32).set_bytes(&uuid.0);
             }
         }
-        MetadataNamespaceCall::ReconnectRequired { reason } => {
-            write_metadata_reconnect(result.init_reconnect_required(), reason)
-        }
         MetadataNamespaceCall::SnapshotExpired => result.set_snapshot_expired(()),
         MetadataNamespaceCall::Error(error) => write_error(
             result.init_error(),
@@ -2952,9 +2934,6 @@ fn write_metadata_entry_result(
     match outcome {
         MetadataNamespaceCall::Success(entry) => {
             write_pure_metadata_entry(result.reborrow().init_success(), &entry);
-        }
-        MetadataNamespaceCall::ReconnectRequired { reason } => {
-            write_metadata_reconnect(result.init_reconnect_required(), reason)
         }
         MetadataNamespaceCall::SnapshotExpired => result.set_snapshot_expired(()),
         MetadataNamespaceCall::Error(error) => write_error(
@@ -2983,9 +2962,6 @@ fn write_metadata_path_result(
                 }
             }
         }
-        MetadataNamespaceCall::ReconnectRequired { reason } => {
-            write_metadata_reconnect(result.init_reconnect_required(), reason)
-        }
         MetadataNamespaceCall::SnapshotExpired => result.set_snapshot_expired(()),
         MetadataNamespaceCall::Error(error) => write_error(
             result.init_error(),
@@ -3011,9 +2987,6 @@ fn write_metadata_authoring_inspect_result(
         }
         MetadataNamespaceCall::Success(AuthoringInspectResult::Drifted { input, current }) => {
             write_drifted(result.init_drifted(), &input, current)
-        }
-        MetadataNamespaceCall::ReconnectRequired { reason } => {
-            write_metadata_reconnect(result.init_reconnect_required(), reason)
         }
         MetadataNamespaceCall::SnapshotExpired => result.set_snapshot_expired(()),
         MetadataNamespaceCall::Error(error) => write_error(
@@ -3502,9 +3475,6 @@ fn write_metadata_fetch_result(
             let mut result = result;
             result.set_success(client);
         }
-        MetadataCall::ReconnectRequired { reason } => {
-            write_metadata_reconnect(result.init_reconnect_required(), reason)
-        }
         MetadataCall::SnapshotExpired => result.set_snapshot_expired(()),
         MetadataCall::Error(error) => write_error(
             result.init_error(),
@@ -3934,17 +3904,6 @@ fn write_rpc_result_error_subscribe(
 
 fn write_reconnect(mut output: schema::reconnect_required::Builder<'_>, reason: ReconnectReason) {
     output.set_reason(wire_reconnect(reason));
-}
-
-fn write_metadata_reconnect(
-    mut output: schema::metadata_reconnect_required::Builder<'_>,
-    reason: MetadataReconnectReason,
-) {
-    output.set_reason(match reason {
-        MetadataReconnectReason::StoreInstanceChanged => {
-            schema::MetadataReconnectReason::StoreInstanceChanged
-        }
-    });
 }
 
 fn wire_reconnect(reason: ReconnectReason) -> schema::ReconnectReason {

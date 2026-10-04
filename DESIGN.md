@@ -9356,6 +9356,10 @@ put production image codecs, mesh optimization, or shader compilers in core.
   (schema-min, protocol 15: the reasons are `StoreInstanceChanged=0` and
   `PipelineEpochChanged=1`, and the metadata hub's is
   `StoreInstanceChanged=0`; the others were never produced.)
+  (schema-min, protocol 16: the metadata calls have no reconnect arm and
+  the metadata hub no reason: its connection never outlives its store, whose
+  state directory is locked to the daemon process, so a recreated store is a
+  new process and a new connection.)
   (Refined in R25: bootstrap connect is also generated-binding-safe through a
   dedicated typed ConnectResult, and authoring reads move to a pinned
   AuthoringSnapshot capability.)

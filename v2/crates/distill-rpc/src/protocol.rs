@@ -22,8 +22,10 @@ pub use distill_store::state::{
 /// published content hash. 15: the reconnect reasons are
 /// `storeInstanceChanged` and `pipelineEpochChanged`, and an asset delta is
 /// `changed` or `deleted` (`targetDefinitionChanged`, `protocolEpochChanged`
-/// and `restored` were never produced).
-pub const PROTOCOL_VERSION: u32 = 15;
+/// and `restored` were never produced). 16: the metadata calls have no
+/// `reconnectRequired` arm (a metadata connection never outlives its
+/// store: the state directory is locked to the daemon process).
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// A watched import whose latest attempt failed. The bundle keeps serving its
 /// last good contents; the failure clears when a later import succeeds.
@@ -174,11 +176,6 @@ pub enum ReconnectReason {
     PipelineEpochChanged,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MetadataReconnectReason {
-    StoreInstanceChanged,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RpcFailure {
     /// The snapshot expired or was released: open a new one.
@@ -243,7 +240,6 @@ pub enum RpcFailure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataCall<T> {
     Success(T),
-    ReconnectRequired { reason: MetadataReconnectReason },
     SnapshotExpired,
     Error(RpcFailure),
 }
@@ -259,7 +255,6 @@ impl<T> MetadataCall<T> {
     pub fn map_success<U>(self, map: impl FnOnce(T) -> U) -> MetadataCall<U> {
         match self {
             Self::Success(value) => MetadataCall::Success(map(value)),
-            Self::ReconnectRequired { reason } => MetadataCall::ReconnectRequired { reason },
             Self::SnapshotExpired => MetadataCall::SnapshotExpired,
             Self::Error(error) => MetadataCall::Error(error),
         }
@@ -270,7 +265,6 @@ impl<T> MetadataCall<T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataNamespaceCall<T> {
     Success(T),
-    ReconnectRequired { reason: MetadataReconnectReason },
     SnapshotExpired,
     Error(RpcFailure),
 }

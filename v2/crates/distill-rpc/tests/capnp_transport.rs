@@ -569,6 +569,39 @@ fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
     assert!(source.contains("inputVersion @1 :UInt64"));
 }
 
+/// A metadata connection never outlives its store (the state directory is
+/// locked to the daemon process), so the metadata calls have no
+/// reconnect arm: success, expiry, error.
+#[test]
+fn schema_metadata_calls_have_no_reconnect_arm() {
+    let source = include_str!("../schema/distill_rpc.capnp").replace("\r\n", "\n");
+    assert!(!source.contains("MetadataReconnect"));
+    for name in [
+        "MetadataSnapshotCall",
+        "MetadataAuthoringSnapshotCall",
+        "MetadataDiagnosticsCall",
+        "MetadataUInt64Call",
+        "MetadataChunkStreamCall",
+        "MetadataUuidListCall",
+        "MetadataEntryMetaCall",
+        "MetadataPathResolveCall",
+        "MetadataAuthoringInspectCall",
+    ] {
+        let marker = format!("struct {name} {{");
+        let body = source
+            .split_once(marker.as_str())
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .1
+            .split_once("\n  }\n}")
+            .unwrap_or_else(|| panic!("unterminated {name}"))
+            .0;
+        assert!(body.contains("success @0"), "{name} success ordinal");
+        assert!(body.contains("snapshotExpired @1"), "{name} expiry ordinal");
+        assert!(body.contains("error @2"), "{name} error ordinal");
+        assert!(!body.contains("reconnectRequired"), "{name} reconnect arm");
+    }
+}
+
 /// The authoring entry the daemon serves for the asset `byte`: one blob
 /// (`byte + 2`) in its own bundle file `bundle-{byte}.bundle`, the bundle's
 /// primary. The daemon tags nothing without a project schema.

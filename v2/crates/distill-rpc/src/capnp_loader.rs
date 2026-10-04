@@ -617,9 +617,6 @@ impl RemoteMetadataHub {
                     client: client?,
                 }))
             }
-            schema::metadata_authoring_snapshot_call::Which::ReconnectRequired(value) => Ok(
-                RemoteCall::ReconnectRequired(decode_metadata_reconnect(value?.get_reason()?)),
-            ),
             schema::metadata_authoring_snapshot_call::Which::SnapshotExpired(()) => {
                 Ok(RemoteCall::SnapshotExpired)
             }
@@ -677,9 +674,6 @@ impl RemoteMetadataAuthoringSnapshot {
                     current,
                 }))
             }
-            schema::metadata_authoring_inspect_call::Which::ReconnectRequired(value) => Ok(
-                RemoteCall::ReconnectRequired(decode_metadata_reconnect(value?.get_reason()?)),
-            ),
             schema::metadata_authoring_inspect_call::Which::SnapshotExpired(()) => {
                 Ok(RemoteCall::SnapshotExpired)
             }
@@ -1009,14 +1003,6 @@ fn decode_reconnect(value: schema::ReconnectReason) -> ReconnectReason {
     match value {
         schema::ReconnectReason::StoreInstanceChanged => ReconnectReason::StoreInstanceChanged,
         schema::ReconnectReason::PipelineEpochChanged => ReconnectReason::PipelineEpochChanged,
-    }
-}
-
-fn decode_metadata_reconnect(value: schema::MetadataReconnectReason) -> ReconnectReason {
-    match value {
-        schema::MetadataReconnectReason::StoreInstanceChanged => {
-            ReconnectReason::StoreInstanceChanged
-        }
     }
 }
 

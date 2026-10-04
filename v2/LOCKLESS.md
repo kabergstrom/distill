@@ -1309,6 +1309,10 @@ Final cleanup (schema 56, protocol 15):
   `AuthoringBackend::read_file`'s default, `register_importer` (the
   importer tests import through the pipeline fixture), and the store,
   daemon, loader and pack `pub` items only tests called.
+- Protocol 16: the metadata calls have no `reconnectRequired` arm. A
+  metadata connection never outlives its store (the state directory is
+  locked to the daemon process), so nothing could produce
+  `StoreInstanceChanged` there.
 - An edit reads nothing twice:
   - the scan's baseline subtree read serves the echo check;
   - a claims replacement returns each pending bundle's claimants;

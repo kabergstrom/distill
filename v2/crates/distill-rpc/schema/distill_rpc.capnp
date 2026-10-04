@@ -85,74 +85,59 @@ struct MetadataConnectSuccess {
   protocolEpoch @2 :UInt32;
 }
 
-enum MetadataReconnectReason {
-  storeInstanceChanged @0;
-}
-
-struct MetadataReconnectRequired {
-  reason @0 :MetadataReconnectReason;
-}
-
 struct MetadataSnapshotCall {
   union {
     success @0 :MetadataSnapshot;
-    reconnectRequired @1 :MetadataReconnectRequired;
-    snapshotExpired @2 :Void;
-    error @3 :RpcError;
+    snapshotExpired @1 :Void;
+    error @2 :RpcError;
   }
 }
 
 struct MetadataAuthoringSnapshotCall {
   union {
     success @0 :MetadataAuthoringSnapshot;
-    reconnectRequired @1 :MetadataReconnectRequired;
-    snapshotExpired @2 :Void;
-    error @3 :RpcError;
+    snapshotExpired @1 :Void;
+    error @2 :RpcError;
   }
 }
 
 struct MetadataDiagnosticsCall {
   union {
     success @0 :MetadataDiagnostics;
-    reconnectRequired @1 :MetadataReconnectRequired;
-    snapshotExpired @2 :Void;
-    error @3 :RpcError;
+    snapshotExpired @1 :Void;
+    error @2 :RpcError;
   }
 }
 
 struct MetadataUInt64Call {
   union {
     success @0 :UInt64;
-    reconnectRequired @1 :MetadataReconnectRequired;
-    snapshotExpired @2 :Void;
-    error @3 :RpcError;
+    snapshotExpired @1 :Void;
+    error @2 :RpcError;
   }
 }
 
 struct MetadataChunkStreamCall {
   union {
     success @0 :ChunkStream;
-    reconnectRequired @1 :MetadataReconnectRequired;
-    snapshotExpired @2 :Void;
-    error @3 :RpcError;
+    snapshotExpired @1 :Void;
+    error @2 :RpcError;
   }
 }
 
 struct MetadataUuidListCall {
   union {
     success @0 :List(Uuid);
-    reconnectRequired @1 :MetadataReconnectRequired;
-    snapshotExpired @2 :Void;
-    error @3 :RpcError;
+    snapshotExpired @1 :Void;
+    error @2 :RpcError;
   }
 }
 
 struct MetadataEntryMetaCall {
   union {
     success @0 :PureMetadataEntry;
-    reconnectRequired @1 :MetadataReconnectRequired;
-    snapshotExpired @2 :Void;
-    error @3 :RpcError;
+    snapshotExpired @1 :Void;
+    error @2 :RpcError;
   }
 }
 
@@ -169,21 +154,19 @@ struct PureMetadataEntry {
 struct MetadataPathResolveCall {
   union {
     success @0 :PathResolveResult;
-    reconnectRequired @1 :MetadataReconnectRequired;
-    snapshotExpired @2 :Void;
-    error @3 :RpcError;
+    snapshotExpired @1 :Void;
+    error @2 :RpcError;
   }
 }
 
 struct MetadataAuthoringInspectCall {
   union {
     success @0 :AuthoringInspection;
-    reconnectRequired @1 :MetadataReconnectRequired;
-    snapshotExpired @2 :Void;
-    error @3 :RpcError;
-    missing @4 :Void;
-    roleIneligible @5 :AuthoringRoleFailure;
-    drifted @6 :DriftedResolve;
+    snapshotExpired @1 :Void;
+    error @2 :RpcError;
+    missing @3 :Void;
+    roleIneligible @4 :AuthoringRoleFailure;
+    drifted @5 :DriftedResolve;
   }
 }
 
