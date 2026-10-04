@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use distill_asset::{AssetType, ErasedValue, ModuleEpochToken};
-use distill_core::id::{AssetUuid, ContentHash, LayoutHash, TypeUuid};
+use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, TypeUuid};
 use distill_loader::{
     AdoptionId, AssetStorage, GameModuleEpoch, HandleId, IoBasis, IoEvent, LoadStatus, Loader,
     LoaderIO, ManifestHash, PendingState, PendingToken, ReqId, RpcIo, RpcIoConfig, RpcIoStats,
@@ -23,9 +23,9 @@ use distill_loader::{
 };
 use distill_rpc::capnp_transport::StagedListener;
 use distill_rpc::{
-    ArtifactPayload, AssetDeltaState, AssetMutation, Commit, ConnectRequest, Server,
-    StoreInstanceId, StoredResolve, TargetDefinition, TargetDefinitionHash,
+    ArtifactPayload, BuildAnswer, ConnectRequest, TargetDefinition, TargetDefinitionHash,
 };
+use distill_test_project::{Asset, TestBuilds, TestProject};
 use distill_wire::artifact::{content_hash, parse_artifact, write_artifact, ArtifactHeader};
 use distill_wire::dswl::{dswl_bytes, dswl_hash};
 use distill_wire::native::CallbackPanic;
@@ -69,11 +69,32 @@ fn watchdog<T: Send + 'static>(limit: Duration, body: impl FnOnce() -> T + Send 
 
 /// A daemon serving `count` built `A` assets (each with one blob of
 /// `blob_len` bytes when nonzero), accepting connections until the process
-/// exits.
+/// exits. Each asset is a bundle file of the daemon's project; its build
+/// backend answers each built to its installed artifact.
 struct Daemon {
-    server: Server,
+    project: TestProject,
     assets: Vec<(AssetUuid, ContentHash)>,
     address: SocketAddr,
+    /// Rewrites so far: each authors a value no rewrite authored before.
+    touches: u32,
+}
+
+/// The bundle file of the asset `seed`.
+fn bundle_path(seed: usize) -> String {
+    format!("assets/a-{seed}.bundle")
+}
+
+/// Author the bundle file of the asset `seed` holding `value`.
+fn write_asset(project: &mut TestProject, seed: usize, value: u32) {
+    let seed16 = u16::try_from(seed).unwrap();
+    let mut bundle = [0x40; 16];
+    bundle[..2].copy_from_slice(&seed16.to_le_bytes());
+    project.write_bundle(
+        &bundle_path(seed),
+        BundleUuid(bundle),
+        Some("a"),
+        &[Asset::blob("a", asset(seed16), A::TYPE_UUID, &value.to_le_bytes())],
+    );
 }
 
 fn serve(count: u16, blob_len: usize) -> Daemon {
@@ -84,7 +105,9 @@ fn serve(count: u16, blob_len: usize) -> Daemon {
 /// blob of that many bytes when nonzero.
 fn serve_sized(blob_lens: &[usize]) -> Daemon {
     let target = TargetDefinition::new("dev", TargetDefinitionHash(TARGET_HASH));
-    let server = Server::new(StoreInstanceId([6; 16]), vec![target]).unwrap();
+    let mut project = TestProject::new(vec![target]);
+    let server = project.server();
+    let builds = TestBuilds::install(&server);
     let wire = WireNode::Struct {
         offset: 0,
         size: 0,
@@ -96,7 +119,6 @@ fn serve_sized(blob_lens: &[usize]) -> Daemon {
         .install_wire_tree(layout_hash, Arc::from(dswl_bytes(&wire).unwrap()))
         .unwrap();
     let mut assets = Vec::new();
-    let mut mutations = Vec::new();
     for (seed, &blob_len) in blob_lens.iter().enumerate() {
         let uuid = asset(u16::try_from(seed).unwrap());
         let blob = vec![0x5a; blob_len];
@@ -136,19 +158,11 @@ fn serve_sized(blob_lens: &[usize]) -> Daemon {
                 },
             )
             .unwrap();
-        mutations.push(AssetMutation::Set {
-            uuid,
-            resolution: StoredResolve::Built { content_hash: hash },
-            delta: AssetDeltaState::Changed,
-        });
+        builds.answer(uuid, Ok(BuildAnswer::Built { content_hash: hash }));
+        write_asset(&mut project, seed, 0);
         assets.push((uuid, hash));
     }
-    server
-        .commit(Commit {
-            assets: mutations,
-            ..Commit::default()
-        })
-        .unwrap();
+    project.publish();
     let (address_tx, address_rx) = std::sync::mpsc::sync_channel(1);
     let root = server.root();
     std::thread::spawn(move || {
@@ -166,25 +180,20 @@ fn serve_sized(blob_lens: &[usize]) -> Daemon {
         });
     });
     Daemon {
-        server,
+        project,
         assets,
         address: address_rx.recv().unwrap(),
+        touches: 0,
     }
 }
 
 impl Daemon {
-    /// Re-mark `uuid` changed, as a reimport commit does.
-    fn touch(&self, uuid: AssetUuid, hash: ContentHash) {
-        self.server
-            .commit(Commit {
-                assets: vec![AssetMutation::Set {
-                    uuid,
-                    resolution: StoredResolve::Built { content_hash: hash },
-                    delta: AssetDeltaState::Changed,
-                }],
-                ..Commit::default()
-            })
-            .unwrap();
+    /// Change the asset `seed`, as a reimport does: its bundle file is
+    /// rewritten and published. It still builds to the same artifact.
+    fn touch(&mut self, seed: usize) {
+        self.touches += 1;
+        write_asset(&mut self.project, seed, self.touches);
+        self.project.publish();
     }
 }
 
@@ -944,19 +953,18 @@ impl Game {
         }
     }
 
-    /// `frames` frames with a reimport commit every `period` frames.
+    /// `frames` frames with a reimport every `period` frames.
     fn churn(&mut self, frames: usize, period: usize) {
         for frame in 0..frames {
             if frame % period == 0 {
-                let (uuid, hash) = self.daemon.assets[frame % self.daemon.assets.len()];
-                self.daemon.touch(uuid, hash);
+                self.daemon.touch(frame % self.daemon.assets.len());
             }
             self.frame();
         }
     }
 }
 
-// H1 through the orchestrator, then H5: commit churn (a mass reimport)
+// H1 through the orchestrator, then H5: publication churn (a mass reimport)
 // never stalls a frame, and once it stops everything loads.
 #[test]
 fn loader_frames_stay_short_under_commit_churn_and_everything_loads_after() {
