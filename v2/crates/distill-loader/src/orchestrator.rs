@@ -546,6 +546,34 @@ impl<I: LoaderIO> Loader<I> {
                 });
             }
         }
+        // A load dependency of a held asset already has an internal slot
+        // (and its storage value): hand that slot out instead of loading the
+        // asset a second time. The internal lease stays, as for any other
+        // dependency slot.
+        let internal = self
+            .slots
+            .iter()
+            .find(|(_, slot)| {
+                slot.expected_type.is_none()
+                    && slot.internal_lease.is_some()
+                    && matches!(slot.binding, Binding::Direct(bound) if bound == uuid)
+                    && slot
+                        .current
+                        .as_ref()
+                        .is_none_or(|current| current.type_uuid == T::TYPE_UUID)
+            })
+            .map(|(id, _)| *id);
+        if let Some(id) = internal {
+            let slot = self.slots.get_mut(&id).expect("found above");
+            slot.expected_type = Some(T::TYPE_UUID);
+            let lease = slot.internal_lease.clone().expect("checked above");
+            self.direct_slots.insert((uuid, T::TYPE_UUID), id);
+            return Ok(Handle {
+                id,
+                lease,
+                marker: PhantomData,
+            });
+        }
         let (id, lease) = self.new_slot(Some(T::TYPE_UUID), Binding::Direct(uuid))?;
         self.direct_slots.insert((uuid, T::TYPE_UUID), id);
         self.manifest.entry(uuid).or_insert(ManifestEntry {

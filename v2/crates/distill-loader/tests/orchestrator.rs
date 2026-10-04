@@ -1214,6 +1214,41 @@ fn pending_member_defers_the_whole_dependency_component() {
     assert_eq!(loader.status(&b), LoadStatus::Loaded);
 }
 
+/// A request for an asset that is already loaded as a dependency of a held
+/// one takes the dependency's slot: no second storage value.
+#[test]
+fn add_ref_of_a_loaded_dependency_reuses_its_slot() {
+    let token = ModuleEpochToken::new(2);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 2, &token);
+    let a_uuid = uuid(2);
+    let b_uuid = uuid(3);
+    let a = loader.add_ref::<A>(a_uuid).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+    let (a_hash, a_artifact) = artifact_with_edges::<A>(a_uuid, &[(b_uuid, B::TYPE_UUID)]);
+    resolve(&mut loader, a_uuid, a_hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, a_hash, a_artifact);
+    loader.process(&mut storage).unwrap();
+    loader.process(&mut storage).unwrap();
+    let (b_hash, b_artifact) = artifact::<B>(b_uuid, &[]);
+    resolve(&mut loader, b_uuid, b_hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, b_hash, b_artifact);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.status(&a), LoadStatus::Loaded);
+    assert_eq!(storage.commits.len(), 2);
+    let dependency = storage.commits.iter().find(|(id, _)| *id != a.id()).unwrap().0;
+
+    let b = loader.add_ref::<B>(b_uuid).unwrap();
+    assert_eq!(b.id(), dependency);
+    assert_eq!(loader.status(&b), LoadStatus::Loaded);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(storage.updates.len(), 2, "no second load of the dependency");
+    assert_eq!(loader.add_ref::<B>(b_uuid).unwrap().id(), dependency);
+}
+
 #[test]
 fn failed_pending_storage_preserves_last_good_and_freezes_the_component() {
     let token = ModuleEpochToken::new(48);
