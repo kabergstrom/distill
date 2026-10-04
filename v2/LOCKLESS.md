@@ -1236,6 +1236,66 @@ should reach zero by the end of phase 6.
   - Txn M5: generated files carry a self-certifying mark, so a
     publication cut short before its rows no longer wedges codegen.
 
+### 6.2 schema-min
+
+The store went from 42 tables to 25 (schema 55; DESIGN §13 lists them).
+Four rules decided what stays:
+
+1. **One source of truth.** A table holds a fact nothing else answers.
+   Hashes are kept, and so is what only the daemon knows. What derives
+   from a bundle is written with the bundle's rows and goes with them.
+   What the daemon compiles (pipeline registrations, schema authority)
+   comes from the `CompiledRegistry`.
+2. **A read costs what its answer costs.** Reads are indexed and run on
+   the caller's transaction. No mutable DB state is cached. Each
+   `store_meta` counter is read once per transaction.
+3. **No repair, maintenance or orphan passes.** Each invariant is enforced
+   by the write that could break it.
+4. **Every statement has a plan.** Each new or changed statement has an
+   exact EXPLAIN QUERY PLAN case in `query_plans.rs`. Per-edit,
+   per-request and per-build paths also have page-count scale guards.
+
+What went:
+- Bundle bytes, authored values and schema snapshots. Readers read the
+  file and verify its observed hash.
+- Pipeline registrations, the schema registry and the target set.
+  `store_meta` keeps only the module hash. A runtime failure lives on the
+  loaded epoch.
+- Configuration state and served restart keys. These are `errors` rows
+  and `pending_restart`.
+- `result_candidates`, replaced by `results` and `result_outputs`.
+  Segments now hold only raw extents.
+- `asset_tag_index`, replaced by two columns of `assets`.
+- `path_index`, replaced by `bundles.primary_asset`.
+- The import index tables, now one `import_keys` table.
+- `claim_collisions` and `claim_pending`. Collisions are namespace
+  `errors` rows; pending claims are a return value.
+- `scan_diagnostics`.
+- `directories`, now `files.canonical_path`.
+- `asset_resolutions`. An asset resolves by point reads; a deleted asset
+  is a missing one.
+- `derived_outputs`. A derived child is its one `source_claims` claim
+  while neither it nor its parent is withheld.
+
+Write paths:
+- A tool epoch writes only the rows it changes.
+- A rewritten bundle deletes only its vanished assets and clears its path
+  references once.
+- A nested write is part of the open transaction, and its failure fails
+  that transaction. The one savepoint left is the build flush's
+  `isolated_write_transaction`, where a failure poisons one asset and the
+  input carries on.
+- `change_log` records only real changes. The first publication on an
+  empty store logs no deltas: the daemon binds its listener after its
+  startup publication, so no client holds version 0. A rescan logs the
+  assets of changed bundles and the paths whose candidates changed. There
+  is no reset marker.
+
+Scale probe (20k assets, release; statements cold / edit / warm, then
+cold and warm seconds):
+- before: 821,071 / 123 / 58; 6.6–7.4 s and 3.1 s;
+- after: 500,235 / 66 / 30; 5.1 s and 2.8 s.
+
 ## 7. Test baseline
 
 Recorded at the start of phase 0; see `git log` for updates.
