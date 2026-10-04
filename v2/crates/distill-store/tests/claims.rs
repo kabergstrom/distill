@@ -1,6 +1,6 @@
-//! Scan claims: per-source rows, collisions kept for the touched subjects
-//! (as namespace error rows), the pending subjects a replacement returns,
-//! and rollback with the owning input transaction.
+//! Scan claims: per-source rows, collisions read from them, the pending
+//! subjects a replacement returns, and rollback with the owning input
+//! transaction.
 
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, TypeUuid};
 use distill_store::claims::{DerivedOutputClaim, SourceClaim, SourceClaims};
@@ -176,11 +176,15 @@ fn claims_roll_back_with_their_transaction() {
     assert!(store.namespace_errors().unwrap().is_empty());
 }
 
-/// The claims' namespace errors publish as the scan's family: a malformed
-/// source's error joins the collision rows the claims keep, a stale row
-/// goes, and the family holds exactly what the publication returns.
+/// The claims' namespace errors are read from the claims, never stored: a
+/// malformed source's error and each collision. What a collision withholds
+/// is read the same way: one asset by point searches, every one at once by
+/// a GROUP BY. An asset's own collision comes before its bundle's.
 #[test]
-fn the_claims_namespace_errors_publish_as_the_scan_family() {
+fn namespace_errors_and_withholding_are_read_from_the_claims() {
+    use std::collections::BTreeSet;
+
+    use distill_store::claims::{asset_collision_message, bundle_collision_message};
     use distill_store::state::{NamespaceError, SkeletonFailureCode};
     let (_d, mut store) = store();
     let malformed = NamespaceError::new(
@@ -200,29 +204,48 @@ fn the_claims_namespace_errors_publish_as_the_scan_family() {
         path: "broken.bundle".to_owned(),
         claims: vec![SourceClaim::Malformed(malformed.clone())],
     };
-    let (published, _) = store
+    store
         .input_transaction(|txn| {
             txn.replace_source_claims(
                 Some(&under("")),
                 &[source("a.bundle", 1, 10), source("b.bundle", 1, 20), broken],
-            )?;
-            txn.publish_claims_namespace_errors()
+            )
         })
         .unwrap();
-    assert_eq!(published.len(), 2);
-    assert!(published.contains(&malformed));
-    assert_eq!(store.namespace_errors().unwrap(), published);
+    let errors = store.namespace_errors().unwrap();
+    assert_eq!(errors.len(), 2);
+    assert!(errors.contains(&malformed));
+    let bundle_message = bundle_collision_message(BundleUuid([1; 16]));
+    assert_eq!(store.withholding(AssetUuid([10; 16])).unwrap(), Some(bundle_message.clone()));
+    assert_eq!(
+        store.withheld_assets().unwrap(),
+        BTreeSet::from([AssetUuid([10; 16]), AssetUuid([20; 16])])
+    );
 
-    let (published, _) = store
+    // A third source authors asset 20 again: the replacement reports it
+    // colliding, and its own collision withholds it.
+    let (pending, _) = store
+        .input_transaction(|txn| {
+            txn.replace_source_claims(Some(&under("c.bundle")), &[source("c.bundle", 3, 20)])
+        })
+        .unwrap();
+    assert_eq!(pending.assets.get(&AssetUuid([20; 16])), Some(&true));
+    assert_eq!(
+        store.withholding(AssetUuid([20; 16])).unwrap(),
+        Some(asset_collision_message(AssetUuid([20; 16])))
+    );
+    assert_eq!(store.namespace_errors().unwrap().len(), 3);
+
+    // Every claimant but one leaves: nothing collides or is withheld.
+    let (pending, _) = store
         .input_transaction(|txn| {
             txn.replace_source_claims(Some(&under("broken.bundle")), &[])?;
-            txn.publish_claims_namespace_errors()
+            txn.replace_source_claims(Some(&under("b.bundle")), &[])
         })
         .unwrap();
-    let [collision] = <[_; 1]>::try_from(published).unwrap();
-    assert!(matches!(
-        collision.detail,
-        NamespaceErrorV1::DuplicateBundleUuid { .. }
-    ));
-    assert_eq!(store.namespace_errors().unwrap(), [collision]);
+    assert_eq!(pending.assets.get(&AssetUuid([20; 16])), Some(&false));
+    assert!(store.namespace_errors().unwrap().is_empty());
+    assert!(store.withheld_assets().unwrap().is_empty());
+    assert_eq!(store.withholding(AssetUuid([10; 16])).unwrap(), None);
+    assert_eq!(store.withholding(AssetUuid([20; 16])).unwrap(), None);
 }

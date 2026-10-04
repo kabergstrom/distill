@@ -4,22 +4,18 @@
 //! namespace error. Rows are keyed by the claiming (root, path), so a scan
 //! replaces exactly the claims of the subtree it observed.
 //!
-//! Two things follow from the claims in the same transaction: every bundle
-//! or asset subject with more than one distinct claimant has its namespace
-//! error row (`errors`, the scan's family, scoped to the subject), and a
-//! subtree replacement returns the bundle, derived-output and path subjects
+//! Two things follow from the claims. A bundle or asset subject with more
+//! than one distinct claimant collides: its namespace error is read from
+//! the claims, never stored. And a subtree replacement returns the subjects
 //! it changed, for the publication that follows it in that transaction.
 
 use std::collections::{BTreeMap, BTreeSet};
-
-use rusqlite::OptionalExtension;
 
 use distill_core::canonical::CanonicalEncoder;
 use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
 
 use crate::db::{InputTxn, StoreReader};
 use crate::error::StoreError;
-use crate::errors::{write_namespace_error, NAMESPACE};
 use crate::state::{
     encode_asset_claimant, encode_bundle_source, AssetClaimant, NamespaceError,
     NamespaceErrorDecodeError, NamespaceErrorDecoder, NamespaceErrorV1, ReadableBundleSource,
@@ -83,6 +79,9 @@ pub struct PendingClaims {
     /// order: the claims the replacement read refreshing its collision.
     pub bundles: BTreeMap<BundleUuid, Vec<ReadableBundleSource>>,
     pub paths: BTreeSet<String>,
+    /// Each asset UUID the replacement touched, and whether more than one
+    /// claimant claims it now.
+    pub assets: BTreeMap<AssetUuid, bool>,
 }
 
 fn claim_row(claim: &SourceClaim) -> Result<(i64, Vec<u8>, Vec<u8>, Vec<u8>), StoreError> {
@@ -151,13 +150,23 @@ fn group_kinds(group: i64) -> &'static str {
     }
 }
 
-/// The `errors.scope_kind` of a collision group's rows: bundle, asset.
-fn group_scope(group: i64) -> i64 {
-    if group == BUNDLE_GROUP {
-        2
-    } else {
-        3
-    }
+/// Every colliding subject and its group (0 bundle, 1 asset): each bundle
+/// UUID, and each asset UUID, with more than one distinct claimant. A
+/// GROUP BY over the bundle and asset claims, so it costs the claims: it
+/// serves full publication and diagnostics, never an edit.
+pub(crate) const COLLIDING: &str =
+    "SELECT CASE kind WHEN 0 THEN 0 ELSE 1 END AS g, subject FROM source_claims
+     WHERE kind IN (0, 1, 2)
+     GROUP BY g, subject HAVING COUNT(DISTINCT claimant) > 1";
+
+/// The message of a bundle UUID's collision.
+pub fn bundle_collision_message(bundle: BundleUuid) -> String {
+    format!("duplicate bundle UUID {bundle}")
+}
+
+/// The message of an asset UUID's collision.
+pub fn asset_collision_message(asset: AssetUuid) -> String {
+    format!("duplicate asset UUID {asset}")
 }
 
 /// The distinct claimants of `subject` in `group`, in order.
@@ -175,6 +184,17 @@ fn group_claimants(
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
+/// Whether more than one distinct claimant claims asset UUID `subject`.
+fn asset_collides(conn: &rusqlite::Connection, subject: &[u8]) -> Result<bool, StoreError> {
+    Ok(conn
+        .prepare_cached(ASSET_COLLIDES)?
+        .query_row([subject], |row| row.get(0))?)
+}
+
+/// Whether asset UUID `?1` has more than one distinct claimant.
+pub(crate) const ASSET_COLLIDES: &str =
+    "SELECT COUNT(DISTINCT claimant) > 1 FROM source_claims WHERE kind IN (1, 2) AND subject = ?1";
+
 /// The namespace error of `subject` claimed by every one of `claimants`.
 fn collision_error(
     group: i64,
@@ -190,7 +210,7 @@ fn collision_error(
         sources.sort();
         NamespaceError::new(
             NamespaceErrorV1::DuplicateBundleUuid { bundle, sources },
-            format!("duplicate bundle UUID {bundle}"),
+            bundle_collision_message(bundle),
         )
     } else {
         let asset = AssetUuid(uuid16(subject)?);
@@ -201,62 +221,10 @@ fn collision_error(
         claimants.sort();
         NamespaceError::new(
             NamespaceErrorV1::DuplicateAssetUuid { asset, claimants },
-            format!("duplicate asset UUID {asset}"),
+            asset_collision_message(asset),
         )
     };
     error.map_err(invalid_namespace_error)
-}
-
-/// Write `error`, a collision's, as a row of the scan's family.
-fn write_collision(conn: &rusqlite::Connection, error: &NamespaceError) -> Result<(), StoreError> {
-    let record = error
-        .persisted_bytes()
-        .map_err(StoreError::InvalidNamespaceError)?;
-    write_namespace_error(conn, NAMESPACE, error, &record)
-}
-
-fn delete_collision(conn: &rusqlite::Connection, identity: &[u8]) -> Result<(), StoreError> {
-    conn.prepare_cached("DELETE FROM errors WHERE family = ?1 AND identity = ?2")?
-        .execute(rusqlite::params![NAMESPACE, identity])?;
-    Ok(())
-}
-
-/// Bring `subject`'s collision row in `group` up to date with its claims.
-/// Returns whether it collided before, whether it does now, and its
-/// distinct claimants.
-fn refresh_collision(
-    conn: &rusqlite::Connection,
-    group: i64,
-    subject: &[u8],
-) -> Result<(bool, bool, Vec<Vec<u8>>), StoreError> {
-    let recorded: Option<Vec<u8>> = conn
-        .prepare_cached(
-            "SELECT identity FROM errors WHERE scope_kind = ?1 AND scope_id = ?2 AND family = ?3",
-        )?
-        .query_row(
-            rusqlite::params![group_scope(group), subject, NAMESPACE],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let claimants = group_claimants(conn, group, subject)?;
-    let current = if claimants.len() > 1 {
-        Some(collision_error(group, subject, &claimants)?)
-    } else {
-        None
-    };
-    let unchanged = matches!(
-        (&recorded, &current),
-        (Some(identity), Some(error)) if identity.as_slice() == error.identity.as_slice()
-    );
-    if !unchanged {
-        if let Some(identity) = &recorded {
-            delete_collision(conn, identity)?;
-        }
-        if let Some(error) = &current {
-            write_collision(conn, error)?;
-        }
-    }
-    Ok((recorded.is_some(), current.is_some(), claimants))
 }
 
 /// An asset UUID started or stopped colliding: what publishes it (its
@@ -299,10 +267,8 @@ fn path_subject(subject: Vec<u8>) -> Result<String, StoreError> {
 
 impl InputTxn<'_> {
     /// Replace the claims of every source under `under` (every source when
-    /// `None`) with `sources`. A subtree replacement refreshes the
-    /// collisions of the subjects it touched and returns them pending; a
-    /// full replacement recomputes every collision and returns nothing
-    /// pending.
+    /// `None`) with `sources`. A subtree replacement returns the subjects it
+    /// touched pending; a full replacement returns nothing pending.
     pub fn replace_source_claims(
         &mut self,
         under: Option<&[(String, String)]>,
@@ -326,6 +292,32 @@ impl InputTxn<'_> {
             for row in rows {
                 touched.insert(row?);
             }
+        }
+        let rows = sources
+            .iter()
+            .map(|source| {
+                let rows = source
+                    .claims
+                    .iter()
+                    .map(claim_row)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((source, rows))
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        for (_, rows) in &rows {
+            for (kind, subject, _, _) in rows {
+                touched.insert((*kind, subject.clone()));
+            }
+        }
+        // Whether each touched asset UUID collided before: one that starts
+        // or stops colliding changes what publishes it.
+        let mut collided = BTreeMap::new();
+        for (kind, subject) in &touched {
+            if collision_group(*kind) == Some(ASSET_GROUP) && !collided.contains_key(subject) {
+                collided.insert(subject.clone(), asset_collides(conn, subject)?);
+            }
+        }
+        for (root, prefix) in prefixes {
             conn.execute(
                 &format!(
                     "DELETE FROM source_claims WHERE rowid IN (
@@ -336,35 +328,40 @@ impl InputTxn<'_> {
                 rusqlite::params![root, prefix],
             )?;
         }
-        for source in sources {
+        for (source, rows) in &rows {
             let root = self.intern_root(&source.root_name)?;
-            for claim in &source.claims {
-                let (kind, subject, claimant, detail) = claim_row(claim)?;
+            for (kind, subject, claimant, detail) in rows {
                 self.txn
                     .prepare_cached(
                         "INSERT OR REPLACE INTO source_claims(root_id, path, kind, subject, claimant, detail)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     )?
                     .execute(rusqlite::params![root.0, source.path, kind, subject, claimant, detail])?;
-                touched.insert((kind, subject));
             }
         }
         let conn = &*self.txn;
-        let mut refreshed = BTreeSet::new();
         let mut pending = PendingClaims::default();
         let mut bundles = BTreeSet::new();
         let mut bundle_claimants = BTreeMap::new();
         for (kind, subject) in &touched {
-            if let Some(group) = collision_group(*kind) {
-                if refreshed.insert((group, subject.clone())) {
-                    let (collided, collides, claimants) = refresh_collision(conn, group, subject)?;
-                    if group == ASSET_GROUP && collided != collides {
-                        asset_dependents_pending(conn, subject, &mut bundles, &mut pending.paths)?;
-                    }
-                    if group == BUNDLE_GROUP {
-                        bundle_claimants.insert(BundleUuid(uuid16(subject)?), claimants);
+            match collision_group(*kind) {
+                Some(BUNDLE_GROUP) => {
+                    bundle_claimants.insert(
+                        BundleUuid(uuid16(subject)?),
+                        group_claimants(conn, BUNDLE_GROUP, subject)?,
+                    );
+                }
+                Some(_) => {
+                    let asset = AssetUuid(uuid16(subject)?);
+                    if !pending.assets.contains_key(&asset) {
+                        let collides = asset_collides(conn, subject)?;
+                        if collides != collided[subject] {
+                            asset_dependents_pending(conn, subject, &mut bundles, &mut pending.paths)?;
+                        }
+                        pending.assets.insert(asset, collides);
                     }
                 }
+                None => {}
             }
             match *kind {
                 BUNDLE => {
@@ -394,8 +391,7 @@ impl InputTxn<'_> {
 
     /// Replace every source's claims with `sources`, writing only the rows
     /// that change: a full rescan republishes every source, and most keep
-    /// their claims. When any changed, every collision is recomputed.
-    /// Nothing is left pending.
+    /// their claims. Nothing is left pending.
     fn replace_all_source_claims(&mut self, sources: &[SourceClaims]) -> Result<(), StoreError> {
         type Key = (i64, String, i64, Vec<u8>, Vec<u8>);
         let mut wanted = std::collections::BTreeMap::<Key, Vec<u8>>::new();
@@ -448,37 +444,6 @@ impl InputTxn<'_> {
             )?
             .execute(rusqlite::params![root, path, kind, subject, claimant, detail])?;
         }
-        if stale.is_empty() && wanted.is_empty() {
-            return Ok(());
-        }
-        // Every collision, against the rows recording them.
-        let colliding = {
-            let mut select = conn.prepare_cached(
-                "SELECT CASE kind WHEN 0 THEN 0 ELSE 1 END AS g, subject FROM source_claims
-                 WHERE kind IN (0, 1, 2)
-                 GROUP BY g, subject HAVING COUNT(DISTINCT claimant) > 1",
-            )?;
-            let rows = select.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        let mut recorded = {
-            let mut select = conn.prepare_cached(
-                "SELECT identity FROM errors WHERE family = ?1 AND scope_kind IN (2, 3)",
-            )?;
-            let rows = select.query_map([NAMESPACE], |row| row.get::<_, Vec<u8>>(0))?;
-            rows.collect::<Result<BTreeSet<_>, _>>()?
-        };
-        for (group, subject) in colliding {
-            let error = collision_error(group, &subject, &group_claimants(conn, group, &subject)?)?;
-            if !recorded.remove(error.identity.as_slice()) {
-                write_collision(conn, &error)?;
-            }
-        }
-        for identity in recorded {
-            delete_collision(conn, &identity)?;
-        }
         Ok(())
     }
 }
@@ -507,57 +472,48 @@ fn decode_asset_claimant(bytes: &[u8]) -> Result<AssetClaimant, StoreError> {
     Ok(claimant)
 }
 
-impl InputTxn<'_> {
-    /// Publish the namespace errors of the claims as the scan's family, and
-    /// return them in canonical order: every malformed skeleton and every
-    /// bundle or asset UUID with more than one claimant. Each collision's
-    /// row is the claims' own (see `refresh_collision`), so one read of the
-    /// family serves both as those errors and as the rows the write
-    /// compares with.
-    pub fn publish_claims_namespace_errors(&mut self) -> Result<Vec<NamespaceError>, StoreError> {
-        let decode = |bytes: &[u8]| {
-            NamespaceError::from_persisted_bytes(bytes).map_err(invalid_namespace_error)
-        };
-        let mut errors = self
-            .txn
-            .prepare_cached("SELECT claimant FROM source_claims WHERE kind = 5")?
-            .query_map([], |row| row.get::<_, Vec<u8>>(0))?
-            .map(|bytes| decode(&bytes?))
-            .collect::<Result<Vec<_>, _>>()?;
-        let collision = [group_scope(BUNDLE_GROUP), group_scope(ASSET_GROUP)];
-        let mut held = BTreeMap::new();
-        let mut rows = self
-            .txn
-            .prepare_cached("SELECT identity, record, scope_kind FROM errors WHERE family = ?1")?;
-        let mut rows = rows.query([NAMESPACE])?;
-        while let Some(row) = rows.next()? {
-            let (identity, record) = (row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?);
-            if collision.contains(&row.get::<_, i64>(2)?) {
-                errors.push(decode(&record)?);
-            }
-            held.insert(identity, record);
-        }
-        drop(rows);
-        self.write_namespace_family(NAMESPACE, errors, held)
-    }
-}
-
 impl StoreReader {
+    /// Every namespace error of the claims, in canonical order: each
+    /// malformed skeleton (its claim holds the error) and each bundle or
+    /// asset UUID with more than one claimant. Costs the claims (see
+    /// [`COLLIDING`]).
+    pub fn namespace_errors(&self) -> Result<Vec<NamespaceError>, StoreError> {
+        let mut errors = self
+            .query_rows(
+                "SELECT claimant FROM source_claims WHERE kind = 5",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?
+            .iter()
+            .map(|bytes| {
+                NamespaceError::from_persisted_bytes(bytes).map_err(invalid_namespace_error)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let colliding = self.query_rows(COLLIDING, [], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        for (group, subject) in colliding {
+            let claimants = group_claimants(&self.conn, group, &subject)?;
+            errors.push(collision_error(group, &subject, &claimants)?);
+        }
+        NamespaceError::canonical_set(errors).map_err(invalid_namespace_error)
+    }
+
     /// The (root, path) of every source whose claims do not publish as they
     /// stand: a malformed source (no complete skeleton) and every source
-    /// claiming a colliding bundle or asset. Searches of
-    /// `source_claims_by_subject`, so it costs the defects, not the
-    /// namespace.
+    /// claiming a colliding bundle or asset. Costs the claims (see
+    /// [`COLLIDING`]): only a reconfiguration that reclaims sources asks.
     pub fn unpublished_claim_sources(&self) -> Result<BTreeSet<(String, String)>, StoreError> {
         Ok(self
             .query_rows(
-                "SELECT r.name, t.path FROM source_claims t JOIN roots r USING (root_id)
-                 WHERE t.kind = 5
-                 UNION SELECT r.name, t.path FROM errors c
-                 CROSS JOIN source_claims t ON t.kind IN (0, 1, 2) AND t.subject = c.scope_id
-                 JOIN roots r ON r.root_id = t.root_id
-                 WHERE c.family = ?1 AND c.scope_kind IN (2, 3)",
-                [NAMESPACE],
+                &format!(
+                    "SELECT r.name, t.path FROM source_claims t JOIN roots r USING (root_id)
+                     WHERE t.kind = 5
+                     UNION SELECT r.name, t.path FROM ({COLLIDING}) c
+                     CROSS JOIN source_claims t ON t.kind IN (0, 1, 2) AND t.subject = c.subject
+                     JOIN roots r ON r.root_id = t.root_id"
+                ),
+                [],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )?
             .into_iter()

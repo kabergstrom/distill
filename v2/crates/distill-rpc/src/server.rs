@@ -187,6 +187,9 @@ pub struct ServerHandle {
     /// The restart-only values the configuration file asks for that this
     /// process does not use ([`Self::set_restart_required`]).
     restart: Mutex<RestartRequired>,
+    /// What the daemon cannot accept now, which no snapshot carries
+    /// ([`Self::set_scan_rejection`], [`Self::set_configuration_source_error`]).
+    rejections: Mutex<Rejections>,
 }
 
 /// Process state, in no store row: the process compares the values it
@@ -197,6 +200,27 @@ pub struct ServerHandle {
 struct RestartRequired {
     serial: u64,
     values: Vec<(&'static str, String)>,
+}
+
+/// Process state, in no store row: the configuration source's error and
+/// the pending scan rejection. Neither changes a published row, so every
+/// snapshot reads them as they are now; a restart finds them again (its
+/// configuration parse and first scan run anyway).
+#[derive(Default)]
+struct Rejections {
+    configuration_source: Option<ConfigurationError>,
+    scan: Option<PendingScanRejection>,
+}
+
+/// A scan that could not observe some subjects (LOCKLESS.md §4): its
+/// namespace errors, the configuration error it found (a directory alias)
+/// and the physical subjects whose revalidation heals it. The published
+/// namespace stays at the last scan that observed everything.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PendingScanRejection {
+    pub errors: Vec<NamespaceError>,
+    pub configuration: Option<ConfigurationError>,
+    pub subjects: Vec<std::path::PathBuf>,
 }
 
 impl fmt::Debug for ServerHandle {
@@ -227,6 +251,7 @@ impl ServerHandle {
             next_connection_id: AtomicU64::new(1),
             opener,
             restart: Mutex::default(),
+            rejections: Mutex::default(),
         })
     }
 
@@ -649,7 +674,9 @@ impl ReportSnapshot<'_> {
     /// capabilities but not configuration or pipeline errors.
     pub fn verification_build_requests(&self) -> Result<Vec<BuildRequest>, RpcFailure> {
         let txn = &self.txn;
-        if let ConfigurationStatus::Failed(error) = txn.configuration().map_err(store_failure)? {
+        if let ConfigurationStatus::Failed(error) =
+            self.server.inner.configuration().map_err(store_failure)?
+        {
             return Err(RpcFailure::InvalidQuery {
                 detail: format!("cannot verify failed configuration: {error:?}"),
             });
@@ -691,7 +718,7 @@ impl ReportSnapshot<'_> {
 impl ServerHandle {
     /// Fence every connection after the served pipeline epoch failed at
     /// runtime: a reconnect meets the failure, which the epoch holds in
-    /// memory (see [`AuthoringBackend::pipeline_runtime_failure`]). Called
+    /// memory (see [`AuthoringBackend::pipeline_failure`]). Called
     /// inside an open input, the fence joins that input's version and
     /// readers learn of it when the input commits.
     pub fn coordinated_pipeline_fence(&self, store: &mut Store) -> Result<(), String> {
@@ -855,6 +882,61 @@ impl ServerHandle {
                 .collect(),
         )
     }
+
+    /// Replace the pending scan rejection; `None` heals it.
+    pub fn set_scan_rejection(&self, rejection: Option<PendingScanRejection>) {
+        self.rejections.lock().expect("rejections lock").scan = rejection;
+    }
+
+    /// The pending scan rejection, if a scan left one.
+    pub fn scan_rejection(&self) -> Option<PendingScanRejection> {
+        self.rejections.lock().expect("rejections lock").scan.clone()
+    }
+
+    /// Replace the configuration source's error; `None` heals it.
+    pub fn set_configuration_source_error(&self, error: Option<ConfigurationError>) {
+        self.rejections
+            .lock()
+            .expect("rejections lock")
+            .configuration_source = error;
+    }
+
+    /// The configuration source's error, if its last observation was
+    /// rejected.
+    pub fn configuration_source_error(&self) -> Option<ConfigurationError> {
+        self.rejections
+            .lock()
+            .expect("rejections lock")
+            .configuration_source
+            .clone()
+    }
+
+    /// The configuration error the daemon serves: the canonical one of the
+    /// source's error and the pending scan rejection's.
+    pub fn configuration_error(&self) -> Result<Option<ConfigurationError>, StoreError> {
+        let rejections = self.rejections.lock().expect("rejections lock");
+        let scan = rejections
+            .scan
+            .as_ref()
+            .and_then(|scan| scan.configuration.as_ref());
+        ConfigurationError::select_canonical(
+            rejections.configuration_source.iter().chain(scan).cloned(),
+        )
+        .map_err(|error| StoreError::InvalidConfiguration {
+            error: error.to_string(),
+        })
+    }
+
+    /// Every namespace error `snapshot` serves, in canonical order: its
+    /// claims' and the pending scan rejection's.
+    pub fn namespace_errors(
+        &self,
+        snapshot: &StoreReader,
+    ) -> Result<Vec<NamespaceError>, StoreError> {
+        let mut errors = snapshot.namespace_errors()?;
+        errors.extend(self.scan_rejection().into_iter().flat_map(|scan| scan.errors));
+        NamespaceError::canonical_set(errors).map_err(StoreError::InvalidNamespaceError)
+    }
 }
 
 impl Server {
@@ -970,18 +1052,15 @@ pub(crate) fn entry_role(authoring_only: bool) -> AuthoringEntryRole {
     }
 }
 
-/// The pipeline `snapshot` serves: its version's candidate failure, else
-/// the runtime failure `backend` holds for the epoch it serves. A backend
-/// that cannot see that epoch fails the read (retryably), never Ready.
+/// The pipeline `snapshot` serves: the failure `backend` holds for the
+/// compiled state of its version. A backend that cannot see that state
+/// fails the read (retryably), never Ready.
 fn pipeline_at(
     backend: &dyn AuthoringBackend,
     snapshot: &StoreReader,
 ) -> Result<PipelineDiagnostic, RpcFailure> {
-    if let Some(failure) = snapshot.pipeline_failure().map_err(store_failure)? {
-        return Ok(PipelineDiagnostic::Failed(failure));
-    }
     Ok(backend
-        .pipeline_runtime_failure(snapshot)?
+        .pipeline_failure(snapshot)?
         .map_or(PipelineDiagnostic::Ready, PipelineDiagnostic::Failed))
 }
 
@@ -1027,10 +1106,6 @@ impl SnapshotTxn {
             .expect("a live snapshot transaction owns its snapshot")
     }
 
-    /// The configuration status this snapshot pins.
-    pub(crate) fn configuration(&self) -> Result<ConfigurationStatus, StoreError> {
-        Ok(configuration_status(self.snapshot().configuration_error()?))
-    }
 }
 
 /// A front end's connection with no read transaction open, kept for its
@@ -1316,8 +1391,14 @@ impl Inner {
         Ok(txn)
     }
 
-    /// A snapshot's pipeline: its version's candidate failure, else the
-    /// runtime failure of the epoch it serves, which the backend holds.
+    /// The configuration status the daemon serves now (see
+    /// [`ServerHandle::configuration_error`]): no snapshot pins it.
+    pub(crate) fn configuration(&self) -> Result<ConfigurationStatus, StoreError> {
+        Ok(configuration_status(self.handle.configuration_error()?))
+    }
+
+    /// A snapshot's pipeline: the failure of the compiled state it serves,
+    /// which the backend holds.
     pub(crate) fn effective_pipeline(
         &self,
         txn: &SnapshotTxn,
@@ -1566,7 +1647,7 @@ impl Root {
             Ok((
                 reader.rpc_pipeline_generation()?,
                 reader.rpc_target(&target_name)?,
-                reader.configuration_error()?,
+                handle.configuration_error()?,
                 pipeline_at(&*handle.authoring_backend(), reader),
                 reader.change_log_head()?,
             ))

@@ -37,7 +37,7 @@ use crate::watcher::{
 use distill_store::cas::SegmentSweeper;
 use distill_store::config::RestartOnlyChange;
 use distill_store::state::{ConfigurationSourceFailureCode, ConfigurationSourcePath, DscpV1};
-use distill_store::{Store, StoreReader, StoreWriter};
+use distill_store::{Store, StoreWriter};
 
 /// A failed pass, or a failed codegen run, is retried this much later.
 const RETRY_DELAY: Duration = Duration::from_millis(40);
@@ -845,7 +845,7 @@ impl ConfigWatch {
             .replace_paths(self.control_paths())
             .map_err(CoordinatorError::InvalidManifest)?;
         if !invalidation.configuration {
-            if self.source_rejected && rejected(store)? {
+            if self.source_rejected && rejected(coordinator) {
                 self.refresh_cached_artifacts(invalidation);
                 return Ok(false);
             }
@@ -874,7 +874,7 @@ impl ConfigWatch {
                     %message,
                     "configuration rejected; the active one (and its rebuild jobs) stays"
                 );
-                coordinator.publish_configuration_rejection(store, reason, message)?;
+                coordinator.reject_configuration(reason, message)?;
                 self.source_rejected = true;
                 self.observed = Some(observation.state);
                 Ok(false)
@@ -912,7 +912,7 @@ impl ConfigWatch {
         candidate: DaemonConfig,
         invalidation: ControlInvalidation,
     ) -> Result<bool, CoordinatorError> {
-        let rejected = rejected(store)?;
+        let rejected = rejected(coordinator);
         if invalidation.configuration {
             self.adopt_watch_and_rebuild(&candidate);
             watcher
@@ -1035,11 +1035,7 @@ impl ConfigWatch {
                             }))
                             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?
                             .expect("execution staging returned at least one defect");
-                        coordinator.publish_configuration_rejection(
-                            store,
-                            *selected.detail,
-                            selected.message,
-                        )?;
+                        coordinator.reject_configuration(*selected.detail, selected.message)?;
                         self.staged = candidate;
                         self.observed = Some(config_state);
                         self.observed_schema = Some(schema.state.clone());
@@ -1068,7 +1064,7 @@ impl ConfigWatch {
                 }
             }
             Ok(_) if rejected => {
-                coordinator.heal_configuration_rejection(store)?;
+                coordinator.heal_configuration_rejection();
             }
             Ok(_) => {}
         }
@@ -1098,13 +1094,13 @@ impl ConfigWatch {
     }
 }
 
-/// Whether the store holds a configuration source error: the last observed
-/// configuration, or its staging, was rejected.
-fn rejected(store: &StoreReader) -> Result<bool, CoordinatorError> {
-    store
+/// Whether the daemon serves a configuration source error: the last
+/// observed configuration, or its staging, was rejected.
+fn rejected(coordinator: &DaemonCoordinator) -> bool {
+    coordinator
+        .server_handle()
         .configuration_source_error()
-        .map(|error| error.is_some())
-        .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
+        .is_some()
 }
 
 fn control_invalidation_for(

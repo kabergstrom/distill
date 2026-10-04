@@ -16,7 +16,6 @@ pub mod config;
 pub mod current;
 pub mod db;
 pub mod error;
-pub mod errors;
 pub mod files;
 pub mod imports;
 pub mod opener;

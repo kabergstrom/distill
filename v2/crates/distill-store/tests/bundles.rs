@@ -7,6 +7,7 @@ use distill_store::bundles::{
     AssetFilter, AssetRecord, BundleMeta, DirectoryOrigin, DirectoryRuleId, NamespaceSkeleton,
     SkeletonEntry, TagIndexUpdate,
 };
+use distill_store::claims::{SourceClaim, SourceClaims};
 use distill_store::files::RootId;
 use distill_store::state::{
     NamespaceError, NamespaceErrorV1, ReadableBundleSource, SkeletonFailureCode,
@@ -536,28 +537,45 @@ fn fixing_the_file_heals_on_the_next_version() {
 
 // ---- per-entity namespace errors (LOCKLESS.md §4) ----
 
+/// Claim each of `errors` as its source's malformed skeleton, in place of
+/// every other claim.
+fn claim_malformed(store: &mut Store, errors: &[NamespaceError]) {
+    let sources = errors
+        .iter()
+        .map(|error| {
+            let NamespaceErrorV1::IncompleteSkeleton { source, .. } = &error.detail else {
+                unreachable!("a malformed skeleton's error");
+            };
+            SourceClaims {
+                root_name: source.root_name.clone(),
+                path: source.normalized_path.clone(),
+                claims: vec![SourceClaim::Malformed(error.clone())],
+            }
+        })
+        .collect::<Vec<_>>();
+    store
+        .input_transaction(|txn| txn.replace_source_claims(None, &sources))
+        .unwrap();
+}
+
 #[test]
 fn a_namespace_error_leaves_the_rest_of_the_namespace_readable() {
     let (_d, mut store) = store();
     seed(&mut store);
     let error = namespace_error("broken.bundle has no complete skeleton");
-    store
-        .input_transaction(|txn| txn.set_namespace_errors([error.clone()]))
-        .unwrap();
+    claim_malformed(&mut store, &[error.clone()]);
 
     assert_eq!(store.namespace_errors().unwrap(), vec![error.clone()]);
     assert!(store.entry(AssetUuid([10u8; 16])).unwrap().is_some());
     assert!(!store.path_assets("tex/1.bundle").unwrap().is_empty());
 
     // The next version heals.
-    store
-        .input_transaction(|txn| txn.set_namespace_errors([]))
-        .unwrap();
+    claim_malformed(&mut store, &[]);
     assert!(store.namespace_errors().unwrap().is_empty());
 }
 
 #[test]
-fn namespace_errors_persist_the_full_set_in_canonical_order() {
+fn namespace_errors_read_in_canonical_order() {
     let (_d, mut store) = store();
     let make = |path: &str, byte: u8| {
         NamespaceError::new(
@@ -575,12 +593,7 @@ fn namespace_errors_persist_the_full_set_in_canonical_order() {
     };
     let first = make("a.bundle", 1);
     let later = make("z.bundle", 2);
-    let (diagnostics, _) = store
-        .input_transaction(|txn| {
-            txn.set_namespace_errors([later.clone(), first.clone(), later.clone()])
-        })
-        .unwrap();
-    assert_eq!(diagnostics, vec![first.clone(), later.clone()]);
+    claim_malformed(&mut store, &[later.clone(), first.clone()]);
     assert_eq!(store.namespace_errors().unwrap(), vec![first, later]);
 }
 

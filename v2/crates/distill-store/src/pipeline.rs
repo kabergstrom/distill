@@ -17,7 +17,7 @@ use unicode_normalization::is_nfc;
 
 use crate::db::{InputTxn, StoreReader};
 use crate::error::StoreError;
-use crate::state::{InputVersion, PipelineEpoch, PipelineFailure};
+use crate::state::{InputVersion, PipelineEpoch};
 
 /// One package member supplied at the registration boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -438,29 +438,6 @@ impl std::ops::Deref for ValidatedPipelineEpoch {
 }
 
 impl InputTxn<'_> {
-    /// Publish a staged pipeline candidate (§3, §13) as the Ready epoch:
-    /// the version carries no pipeline failure.
-    pub fn publish_pipeline_epoch(
-        &mut self,
-        epoch: &ValidatedPipelineEpoch,
-    ) -> Result<(), StoreError> {
-        validate_target_set(&epoch.target_set)?;
-        validate_bootstrap_schema_registry(&epoch.schema_registry)?;
-        self.set_pipeline_failure(None)
-    }
-
-    /// A rejected candidate still publishes (§13): the version carries a
-    /// pipeline failure naming the error.
-    pub fn publish_pipeline_failure(
-        &mut self,
-        failure: &PipelineFailure,
-    ) -> Result<(), StoreError> {
-        failure
-            .validate()
-            .map_err(StoreError::InvalidPipelineFailure)?;
-        self.set_pipeline_failure(Some(failure))
-    }
-
     /// Publish a package snapshot or explicit ambient toolchain identity.
     pub fn register_tool(
         &mut self,

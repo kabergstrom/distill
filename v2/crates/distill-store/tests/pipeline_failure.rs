@@ -3,14 +3,6 @@ use distill_store::state::{
     CleanupDisposition, PipelineFailure, PipelineFailureCode, PipelineFailureDecodeError,
     PipelineFailureOrigin,
 };
-use distill_store::{Store, StoreConfig, StoreError};
-
-fn store() -> (tempfile::TempDir, Store) {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(StoreConfig::new(dir.path().join(".distill"))).unwrap();
-    (dir, store)
-}
-
 #[test]
 fn dspp_v1_discriminants_are_pinned() {
     assert_eq!(PipelineFailureCode::CandidateOpen as u16, 1);
@@ -164,30 +156,3 @@ fn wire_decoder_rejects_unknown_tags_and_identity_mismatch() {
     );
 }
 
-#[test]
-fn typed_pipeline_failure_roundtrips_through_store_and_invalid_identity_rolls_back() {
-    let (_dir, mut store) = store();
-    let failure = PipelineFailure::new(
-        PipelineFailureCode::PublishedCallbackRejected,
-        PipelineFailureOrigin::PublishedRuntime,
-        CleanupDisposition::PublishedEpochLeaked,
-        "callback rejected the request",
-    )
-    .unwrap();
-    store
-        .input_transaction(|txn| txn.publish_pipeline_failure(&failure))
-        .unwrap();
-    assert_eq!(store.pipeline_failure().unwrap(), Some(failure.clone()));
-
-    let mut invalid = failure;
-    invalid.identity[0] ^= 1;
-    let before = store.input_version().unwrap();
-    let error = store
-        .input_transaction(|txn| txn.publish_pipeline_failure(&invalid))
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        StoreError::InvalidPipelineFailure(PipelineFailureDecodeError::IdentityMismatch)
-    ));
-    assert_eq!(store.input_version().unwrap(), before);
-}

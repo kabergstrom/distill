@@ -748,15 +748,16 @@ fn derived_resolution_pages(count: u32) -> u64 {
     })
 }
 
-/// A derived child resolves by point reads of its claims and the errors
+/// A derived child resolves by point reads of its claims and the collisions
 /// that would withhold it and its parent, however many sources claim.
 #[test]
 fn a_derived_child_resolves_by_point_reads() {
     let few = derived_resolution_pages(1_000);
     let many = derived_resolution_pages(20_000);
-    // Thirteen index searches, each at most an index level or two deeper
-    // (51 and 69 pages when measured); a scan would fetch thousands.
-    assert!(many <= few + 24, "{few} {many}");
+    // Index searches into `source_claims`, each at most an index level or
+    // two deeper (74 and 104 pages when measured); a scan would fetch
+    // thousands.
+    assert!(many <= few + 36, "{few} {many}");
 }
 
 /// A transaction reads each `store_meta` counter once, sees its own
@@ -1750,7 +1751,8 @@ fn a_changed_tag_epoch_marks_only_its_types_rows() {
 /// A configuration change finds the sources it claims again by searches:
 /// the bundles of a type (or only its poisoned ones) through
 /// `assets_by_type`, and the malformed and colliding sources through
-/// `source_claims_by_subject`.
+/// `source_claims_by_subject`: the colliding ones by a walk of its bundle
+/// and asset claims, the index alone (it covers the claimant).
 #[test]
 fn reconfigured_sources_are_index_searches() {
     let _tracing = TRACING
@@ -1791,8 +1793,12 @@ fn reconfigured_sources_are_index_searches() {
                 "SEARCH t USING INDEX source_claims_by_subject (kind=?)",
                 "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)",
                 "UNION USING TEMP B-TREE",
-                // The collisions: the defects, never the namespace's claims.
-                "SEARCH c USING INDEX sqlite_autoindex_errors_1 (family=?)",
+                // The collisions: a walk of the bundle and asset claims.
+                "CO-ROUTINE c",
+                "SEARCH source_claims USING COVERING INDEX source_claims_by_subject (kind=?)",
+                "USE TEMP B-TREE FOR GROUP BY",
+                "USE TEMP B-TREE FOR count(DISTINCT)",
+                "SCAN c",
                 "SEARCH t USING INDEX source_claims_by_subject (kind=? AND subject=?)",
                 "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)",
             ],
@@ -1974,29 +1980,17 @@ fn pass_bookkeeping_statements_search_their_indexes() {
             .replace_import_index(&sources[..1], &rows[..1])
             .unwrap();
         store.directory_rule_sources_listing(["", "d04/"]).unwrap();
-        store
-            .input_transaction(|txn| txn.publish_claims_namespace_errors().map(drop))
-            .unwrap();
-        store.pipeline_failure().unwrap();
-        // A rejected pipeline candidate: no module, one failure row.
-        let failure = crate::state::PipelineFailure::new(
-            crate::state::PipelineFailureCode::CandidateRegistration,
-            crate::state::PipelineFailureOrigin::CandidateOpen,
-            crate::state::CleanupDisposition::CleanedAndClosed,
-            "rejected",
-        )
-        .unwrap();
-        store
-            .input_transaction(|txn| txn.publish_pipeline_failure(&failure))
-            .unwrap();
-        store.configuration_error().unwrap();
+        // The collision's diagnostics and what it withholds.
+        store.namespace_errors().unwrap();
+        assert!(store.withholding(asset_uuid(42, 1)).unwrap().is_some());
         store
             .input_transaction(|txn| {
                 txn.intern_root("main")?;
-                txn.replace_source_claims(Some(&under), &[])?;
-                txn.set_namespace_errors(Vec::new()).map(drop)
+                txn.replace_source_claims(Some(&under), &[]).map(drop)
             })
             .unwrap();
+        // Resolved: nothing withholds the asset.
+        assert!(store.withholding(asset_uuid(42, 1)).unwrap().is_none());
         // A full replacement that drops one source's claims.
         let mut kept = populate_scan_structure_claims(200);
         kept.pop();
@@ -2023,12 +2017,9 @@ fn pass_bookkeeping_statements_search_their_indexes() {
     };
     let by_root = "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)";
     let by_subject =
-        ["SEARCH source_claims USING INDEX source_claims_by_subject (kind=? AND subject=?)"];
-    let distinct = [
-        "SEARCH source_claims USING INDEX source_claims_by_subject (kind=? AND subject=?)",
-        "USE TEMP B-TREE FOR DISTINCT",
-    ];
-    let cases: [(&str, &[&str]); 20] = [
+        ["SEARCH source_claims USING COVERING INDEX source_claims_by_subject (kind=? AND subject=?)"];
+    let distinct = ["SEARCH source_claims USING COVERING INDEX source_claims_by_subject (kind=? AND subject=?)"];
+    let cases: [(&str, &[&str]); 16] = [
         // A full replacement streams the claims (a whole-namespace pass)
         // and deletes the stale ones by key.
         ("SELECT root_id, path, kind, subject, claimant, detail FROM source_claims", &["SCAN source_claims"]),
@@ -2039,11 +2030,20 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         ("SELECT DISTINCT claimant FROM source_claims WHERE kind = 3", &distinct),
         // A subject's claimants, whatever index orders claimants.
         ("SELECT DISTINCT claimant FROM source_claims WHERE kind IN (0)", &distinct),
-        ("SELECT DISTINCT claimant FROM source_claims WHERE kind IN (1, 2)", &distinct),
-        // The row recording a subject's collision, and its replacement.
         (
-            "SELECT identity FROM errors WHERE scope_kind",
-            &["SEARCH errors USING INDEX errors_by_scope (scope_kind=? AND scope_id=?)"],
+            "SELECT DISTINCT claimant FROM source_claims WHERE kind IN (1, 2)",
+            &[
+                "SEARCH source_claims USING COVERING INDEX source_claims_by_subject (kind=? AND subject=?)",
+                "USE TEMP B-TREE FOR DISTINCT",
+            ],
+        ),
+        // Whether an asset subject collides, before and after a replacement.
+        (
+            "SELECT COUNT(DISTINCT claimant) > 1 FROM source_claims WHERE kind IN (1, 2)",
+            &[
+                "USE TEMP B-TREE FOR count(DISTINCT)",
+                "SEARCH source_claims USING COVERING INDEX source_claims_by_subject (kind=? AND subject=?)",
+            ],
         ),
         // The pending work: a pass's whole queue.
         ("SELECT w.seq", &["SCAN w", by_root]),
@@ -2078,31 +2078,20 @@ fn pass_bookkeeping_statements_search_their_indexes() {
             ],
         ),
         ("SELECT claimant FROM source_claims WHERE kind = 1", &by_subject),
-        ("SELECT claimant FROM source_claims WHERE kind = 5", &["SEARCH source_claims USING INDEX source_claims_by_subject (kind=?)"]),
+        ("SELECT claimant FROM source_claims WHERE kind = 5", &["SEARCH source_claims USING COVERING INDEX source_claims_by_subject (kind=?)"]),
         (
-            "SELECT subject FROM source_claims WHERE kind",
-            &["SEARCH source_claims USING INDEX source_claims_by_claimant (claimant=? AND kind=?)"],
+            "SELECT subject FROM source_claims WHERE kind = ",
+            &["SEARCH source_claims USING COVERING INDEX source_claims_by_claimant (claimant=? AND kind=?)"],
         ),
-        // A full replacement's held collisions, and a resolved one's row.
+        // The namespace's collisions: a walk of the claim index's
+        // bundle and asset ranges (the listing is the whole namespace's).
         (
-            "SELECT identity FROM errors WHERE family = 1 AND scope_kind IN (2, 3)",
-            &["SEARCH errors USING INDEX sqlite_autoindex_errors_1 (family=?)"],
-        ),
-        (
-            "DELETE FROM errors WHERE family = 1 AND identity",
-            &["SEARCH errors USING INDEX sqlite_autoindex_errors_1 (family=? AND identity=?)"],
-        ),
-        (
-            "SELECT identity, record, scope_kind FROM errors WHERE family = 1",
-            &["SEARCH errors USING INDEX sqlite_autoindex_errors_1 (family=?)"],
-        ),
-        (
-            "SELECT identity, record FROM errors",
-            &["SEARCH errors USING INDEX sqlite_autoindex_errors_1 (family=?)"],
-        ),
-        (
-            "SELECT code, identity, record, message FROM errors",
-            &["SEARCH errors USING INDEX sqlite_autoindex_errors_1 (family=?)"],
+            "SELECT CASE kind WHEN 0 THEN 0 ELSE 1 END AS g",
+            &[
+                "SEARCH source_claims USING COVERING INDEX source_claims_by_subject (kind=?)",
+                "USE TEMP B-TREE FOR GROUP BY",
+                "USE TEMP B-TREE FOR count(DISTINCT)",
+            ],
         ),
     ];
     for (prefix, expected) in cases {
@@ -2115,19 +2104,6 @@ fn pass_bookkeeping_statements_search_their_indexes() {
     assert_eq!(
         plan("SELECT value FROM store_meta")[0],
         ["SEARCH store_meta USING INDEX sqlite_autoindex_store_meta_1 (key=?)"]
-    );
-    let exact = |sql: &str| {
-        let normal = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
-        plans
-            .iter()
-            .find(|(traced, _)| normal(traced) == normal(sql))
-            .unwrap_or_else(|| panic!("{sql} was not run: {plans:#?}"))
-            .1
-            .clone()
-    };
-    assert_eq!(
-        exact("DELETE FROM errors WHERE family = 5"),
-        ["SEARCH errors USING INDEX sqlite_autoindex_errors_1 (family=?)"]
     );
 }
 
@@ -2590,16 +2566,21 @@ fn cas_and_served_point_statements_search_their_keys() {
                 "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)",
             ],
         ),
+        // What withholds an asset: its own collision, then its bundle's.
         (
-            "SELECT message FROM errors WHERE scope_kind = ? AND scope_id = ? AND family = ?",
-            &["SEARCH errors USING INDEX errors_by_scope (scope_kind=? AND scope_id=?)"],
+            "SELECT COUNT(DISTINCT claimant) > ? FROM source_claims WHERE kind IN (?, ?) AND subject = ?",
+            &[
+                "USE TEMP B-TREE FOR count(DISTINCT)",
+                "SEARCH source_claims USING COVERING INDEX source_claims_by_subject (kind=? AND subject=?)",
+            ],
         ),
         (
-            "SELECT e.message FROM source_claims a CROSS JOIN source_claims b ON b.root_id = a.root_id AND b.path = a.path AND b.kind = ? CROSS JOIN errors e ON e.scope_kind = ? AND e.scope_id = b.subject AND e.family = ? WHERE a.kind = ? AND a.subject = ? LIMIT ?",
+            "SELECT b.subject FROM source_claims a CROSS JOIN source_claims b ON b.root_id = a.root_id AND b.path = a.path AND b.kind = ? WHERE a.kind = ? AND a.subject = ? AND (SELECT COUNT(DISTINCT c.claimant) FROM source_claims c WHERE c.kind = ? AND c.subject = b.subject) > ? LIMIT ?",
             &[
                 "SEARCH a USING INDEX source_claims_by_subject (kind=? AND subject=?)",
                 "SEARCH b USING COVERING INDEX sqlite_autoindex_source_claims_1 (root_id=? AND path=? AND kind=?)",
-                "SEARCH e USING INDEX errors_by_scope (scope_kind=? AND scope_id=?)",
+                "CORRELATED SCALAR SUBQUERY 1",
+                "SEARCH c USING COVERING INDEX source_claims_by_subject (kind=? AND subject=?)",
             ],
         ),
         (
@@ -2610,7 +2591,7 @@ fn cas_and_served_point_statements_search_their_keys() {
             "SELECT name, definition_hash FROM rpc_targets WHERE name = ?",
             &["SEARCH rpc_targets USING INDEX sqlite_autoindex_rpc_targets_1 (name=?)"],
         ),
-        // A derived child: its claims (then its and its parent's errors).
+        // A derived child: its claims (then its and its parent's collisions).
         (
             "SELECT DISTINCT claimant, detail FROM source_claims WHERE kind = ? AND subject = ?",
             &[
@@ -2801,9 +2782,9 @@ fn rules_at(store: &StoreReader, path: &str) -> Vec<crate::imports::DirectoryRul
         .collect()
 }
 
-/// The assets the old namespace's errors withhold are found from the
-/// collision rows: a range of the asset collisions, and per bundle
-/// collision its claims and their sources' authored claims, by key.
+/// The assets the old namespace's collisions withhold are found from the
+/// claims: the grouped asset claims, and per colliding bundle subject its
+/// claims and their sources' authored claims, by key.
 #[test]
 fn the_withheld_assets_are_searched_from_the_collisions() {
     let (_dir, store) = store_with(0);
@@ -2814,9 +2795,13 @@ fn the_withheld_assets_are_searched_from_the_collisions() {
         [
             "COMPOUND QUERY",
             "LEFT-MOST SUBQUERY",
-            "SEARCH errors USING INDEX errors_by_scope (scope_kind=?)",
+            "SEARCH source_claims USING COVERING INDEX source_claims_by_subject (kind=?)",
+            "USE TEMP B-TREE FOR GROUP BY",
+            "USE TEMP B-TREE FOR count(DISTINCT)",
             "UNION USING TEMP B-TREE",
-            "SEARCH e USING INDEX errors_by_scope (scope_kind=?)",
+            "CO-ROUTINE c",
+            "SEARCH source_claims USING COVERING INDEX source_claims_by_subject (kind=?)",
+            "SCAN c",
             "SEARCH b USING INDEX source_claims_by_subject (kind=? AND subject=?)",
             "SEARCH a USING COVERING INDEX sqlite_autoindex_source_claims_1 \
              (root_id=? AND path=? AND kind=?)",

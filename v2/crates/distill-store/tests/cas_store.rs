@@ -504,7 +504,16 @@ fn resolve_child_ignores_namespace_errors_elsewhere() {
     let (_d, mut store) = store();
     let child = declare_child(&mut store, PARENT, "normals");
     store
-        .input_transaction(|txn| txn.set_namespace_errors([namespace_error("collision")]))
+        .input_transaction(|txn| {
+            txn.replace_source_claims(
+                Some(&under("broken.bundle")),
+                &[SourceClaims {
+                    root_name: "main".into(),
+                    path: "broken.bundle".into(),
+                    claims: vec![SourceClaim::Malformed(namespace_error("collision"))],
+                }],
+            )
+        })
         .unwrap();
     assert_eq!(
         store.resolve_child(child).unwrap(),

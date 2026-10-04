@@ -187,9 +187,7 @@ fn process_serves_rpc_and_consumes_watcher_changes_until_drop() {
     assert!(matches!(
         process
             .coordinator()
-            .open_reader()
-            .unwrap()
-            .pipeline_failure()
+            .pipeline_failure(&process.coordinator().open_reader().unwrap())
             .unwrap(),
         Some(_)
     ));
@@ -211,9 +209,7 @@ fn process_serves_rpc_and_consumes_watcher_changes_until_drop() {
     assert!(matches!(
         process
             .coordinator()
-            .open_reader()
-            .unwrap()
-            .pipeline_failure()
+            .pipeline_failure(&process.coordinator().open_reader().unwrap())
             .unwrap(),
         Some(_)
     ));
@@ -506,7 +502,7 @@ fn valid_configuration_with_malformed_schema_fails_only_the_pipeline() {
                 process.coordinator().configuration_status().unwrap(),
                 ConfigurationStatus::Ready
             ) && matches!(
-                store.pipeline_failure().unwrap(),
+                process.coordinator().pipeline_failure(&store).unwrap(),
                 Some(error) if error.message.contains("schema authority")
             )
         },
@@ -949,9 +945,7 @@ fn malformed_schema_is_a_stable_pipeline_failure_and_a_valid_edit_retries() {
             matches!(
                 process
                     .coordinator()
-                    .open_reader()
-                    .unwrap()
-                    .pipeline_failure()
+                    .pipeline_failure(&process.coordinator().open_reader().unwrap())
                     .unwrap(),
                 Some(error) if error.message.contains("schema authority")
             )
@@ -1430,7 +1424,7 @@ fn dylib_hash(variant: &GateVariant) -> [u8; 32] {
 
 fn ready_dylib_hash(process: &DaemonProcess) -> Option<[u8; 32]> {
     let store = process.coordinator().open_reader().unwrap();
-    match store.pipeline_failure().unwrap() {
+    match process.coordinator().pipeline_failure(&store).unwrap() {
         None => process.coordinator().ready_dylib_hash(),
         Some(_) => None,
     }

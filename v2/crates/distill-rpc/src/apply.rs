@@ -47,7 +47,7 @@ impl From<ApplyError> for StoreError {
     }
 }
 
-/// The RPC view of the configuration error the store selects, if any.
+/// The RPC view of the configuration error the daemon serves, if any.
 pub(crate) fn configuration_status(error: Option<ConfigurationError>) -> ConfigurationStatus {
     error.map_or(ConfigurationStatus::Ready, ConfigurationStatus::Failed)
 }
@@ -58,11 +58,6 @@ pub(crate) fn configuration_status(error: Option<ConfigurationError>) -> Configu
 /// it.
 pub fn apply_commit<W: ServedWrite>(txn: &mut W, commit: &Commit) -> Result<(), ApplyError> {
     validate_commit(commit)?;
-    for error in commit.namespace_errors.iter().flatten() {
-        error
-            .validate()
-            .map_err(|error| AdminError::InvalidNamespaceError { error })?;
-    }
     let version = txn.change_version();
     // The fence row comes first: a front end fences its connections on it
     // before it reaches this version's deltas.

@@ -600,7 +600,8 @@ fn record_refined(sql: &str) {
 
 /// A schema edit to one type republishes that type's rows; a candidate
 /// changing nothing republishes nothing. Neither reads the bundles of the
-/// other type.
+/// other type; the edit walks the claim index once for the colliding
+/// sources (see `StoreReader::unpublished_claim_sources`).
 #[test]
 fn a_schema_edit_reads_independent_of_other_types() {
     // Both namespaces are large enough that their indexes are as deep: the
@@ -611,8 +612,10 @@ fn a_schema_edit_reads_independent_of_other_types() {
         "schema edit: {small_edit} pages beside 1000 bundles, {large_edit} beside 8000; \
          unchanged candidate: {small_unchanged} and {large_unchanged}"
     );
+    // The collision walk reads the covering index of the bundle and asset
+    // claims: 178 and 590 pages when measured, about a page per 17 bundles.
     assert!(
-        large_edit <= small_edit + 16,
+        large_edit <= small_edit + 16 + 7000 / 14,
         "{small_edit} beside 1000, {large_edit} beside 8000"
     );
     assert!(
@@ -655,21 +658,9 @@ fn bytes_projection(terminal: Option<TypeUuid>, dylib: u8) -> PipelineProjection
     .unwrap()
 }
 
-/// A pipeline epoch over `authority`'s types.
-fn pipeline_publication(authority: &ProjectSchemaAuthority) -> ConfigurationPipelinePublication {
-    use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
+/// A pipeline epoch without tools.
+fn pipeline_publication() -> ConfigurationPipelinePublication {
     ConfigurationPipelinePublication::Epoch {
-        epoch: ValidatedPipelineEpoch::validate(distill_store::state::PipelineEpoch {
-            target_set: CanonicalTargetSet::canonical(vec![TargetSetRow {
-                name: "dev".into(),
-                target_definition_hash: distill_build::keys::target_definition_hash(&build_target(
-                    false,
-                )),
-            }])
-            .unwrap(),
-            schema_registry: authority.logical_registry().unwrap(),
-        })
-        .unwrap(),
         tools: BTreeMap::new(),
     }
 }
@@ -724,7 +715,6 @@ fn published_tables(store: &Store) -> BTreeMap<&'static str, Vec<String>> {
         "assets",
         "asset_tags",
         "tag_epochs",
-        "errors",
     ]
     .into_iter()
     .map(|table| (table, store.table_rows(table).unwrap()))
@@ -837,7 +827,7 @@ pub(super) fn source_reclaimed() {
 fn a_reconfiguration_publishes_what_a_complete_publication_does() {
     let configuration = |authority: Arc<ProjectSchemaAuthority>, terminal, dylib| Configuration {
         projection: bytes_projection(terminal, dylib),
-        pipeline: pipeline_publication(&authority),
+        pipeline: pipeline_publication(),
         authority,
     };
     const TERMINAL: TypeUuid = TypeUuid([0x63; 16]);
@@ -1017,7 +1007,7 @@ fn a_complete_publication_revalidates_a_poisoned_skeleton_after_a_schema_edit() 
                 [LABEL_TYPE],
             )
             .unwrap(),
-            pipeline: pipeline_publication(&authority),
+            pipeline: pipeline_publication(),
             authority,
         }
     };
@@ -1126,14 +1116,14 @@ fn assert_republication_matches_a_fresh_one(
             [LABEL_TYPE],
         )
         .unwrap(),
-        pipeline: pipeline_publication(&labeled_authority(false)),
+        pipeline: pipeline_publication(),
         authority: labeled_authority(false),
     };
     publish_completely(store, scanner, &configuration, &BTreeSet::new());
     let mut fresh = Store::open(StoreConfig::new(temp.path().join("fresh"))).unwrap();
     publish_completely(&mut fresh, scanner, &configuration, &BTreeSet::new());
     let (republished, fresh) = (published_tables(store), published_tables(&fresh));
-    for table in ["bundles", "bundle_path_refs", "asset_tags", "errors"] {
+    for table in ["bundles", "bundle_path_refs", "asset_tags", "source_claims"] {
         assert_eq!(republished[table], fresh[table], "{table}");
     }
     // An asset row less its tag state (tag_poison, tag_module), which
@@ -1163,7 +1153,7 @@ fn labeled_store(temp: &tempfile::TempDir, files: &[(&str, Vec<u8>)]) -> (Store,
             [LABEL_TYPE],
         )
         .unwrap(),
-        pipeline: pipeline_publication(&labeled_authority(false)),
+        pipeline: pipeline_publication(),
         authority: labeled_authority(false),
     };
     publish_completely(&mut store, &scanner, &configuration, &BTreeSet::new());
@@ -1285,7 +1275,7 @@ fn a_repeated_pipeline_failure_neither_publishes_nor_fences() {
         let reader = coordinator.open_reader().unwrap();
         (
             reader.input_version().unwrap(),
-            reader.pipeline_failure().unwrap(),
+            coordinator.pipeline_failure(&reader).unwrap(),
             reader.rpc_pipeline_generation().unwrap(),
         )
     };

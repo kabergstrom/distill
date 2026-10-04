@@ -1,10 +1,10 @@
 //! §18 configuration state: scheduler bounds/live resize, restart-only
-//! changes, and configuration errors.
+//! changes.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use distill_store::config::{ConfigValidationError, RestartOnlyChange};
-use distill_store::state::{ConfigurationError, DscpV1};
+
 use distill_store::{Store, StoreConfig};
 
 fn open() -> (tempfile::TempDir, Store) {
@@ -84,21 +84,4 @@ fn invalid_restart_value_is_rejected() {
     let err = RestartOnlyChange::key_values(&[RestartOnlyChange::Address(non_loopback)])
         .unwrap_err();
     assert!(matches!(err, ConfigValidationError::NonLoopbackAddress(a) if a == non_loopback));
-}
-
-#[test]
-fn invalid_configuration_candidate_publishes_typed_snapshot_error() {
-    let (_dir, mut store) = open();
-    store
-        .input_transaction(|txn| {
-            txn.set_configuration_source_error(Some(&ConfigurationError::from_reason(
-                &DscpV1::NonLoopbackAddress {
-                    address: "10.0.0.5:9999".to_owned(),
-                },
-                "non-loopback daemon address",
-            )))
-        })
-        .unwrap();
-    let err = store.configuration_error().unwrap().unwrap();
-    assert!(err.message.contains("non-loopback"));
 }

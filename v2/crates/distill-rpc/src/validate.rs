@@ -13,11 +13,6 @@ use distill_schema::ngp_schema::{verify_snapshot, PrimitiveKind, SchemaNode};
 use crate::*;
 
 pub(crate) fn validate_commit(commit: &Commit) -> Result<(), AdminError> {
-    if let Some(ConfigurationStatus::Failed(error)) = &commit.configuration {
-        error
-            .validate()
-            .map_err(|error| AdminError::InvalidConfigurationError { error })?;
-    }
     let mut tag_assets = BTreeSet::new();
     for mutation in &commit.tag_projection_mutations {
         let (asset, tags) = match mutation {

@@ -1,18 +1,11 @@
-//! DSCP v1 configuration-error grammar and persistence pinning.
+//! DSCP v1 configuration-error grammar pinning.
 
 use distill_store::state::{
     ConfigurationError, ConfigurationErrorCode, ConfigurationPathKey,
     ConfigurationSourceFailureCode, ConfigurationSourcePath,
     DirectoryAliasSide, DscpV1, OwnedPathKind, OwnedPathSide,
 };
-use distill_store::{Store, StoreConfig, StoreError};
 use ngp_schema::identity::LayoutIdentity;
-
-fn open() -> (tempfile::TempDir, Store) {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(StoreConfig::new(dir.path().join(".distill"))).unwrap();
-    (dir, store)
-}
 
 fn identity(target: &str, marker: u8) -> LayoutIdentity {
     LayoutIdentity {
@@ -318,8 +311,7 @@ fn layout_identity_fields_are_part_of_the_typed_reason() {
 }
 
 #[test]
-fn typed_configuration_error_roundtrips_and_message_is_not_hashed() {
-    let (_dir, mut store) = open();
+fn typed_configuration_error_carries_its_reason_and_message_is_not_hashed() {
     let facts = DscpV1::NonLoopbackAddress {
         address: "10.0.0.5:9999".to_owned(),
     };
@@ -328,18 +320,7 @@ fn typed_configuration_error_roundtrips_and_message_is_not_hashed() {
         ConfigurationError::from_reason(&facts, "first diagnostic").reason_hash,
         ConfigurationError::from_reason(&facts, "completely different prose").reason_hash,
     );
-    store
-        .input_transaction(|txn| {
-            txn.set_configuration_source_error(Some(&ConfigurationError::from_reason(
-                &facts,
-                "daemon address is not loopback",
-            )))
-        })
-        .unwrap();
-
-    let Some(error) = store.configuration_error().unwrap() else {
-        panic!("typed error must be persisted");
-    };
+    let error = ConfigurationError::from_reason(&facts, "daemon address is not loopback");
     assert_eq!(error.code, ConfigurationErrorCode::NonLoopbackAddress);
     assert_eq!(error.reason_hash, expected_hash);
     assert_eq!(error.detail.as_ref(), &facts);
@@ -354,129 +335,3 @@ fn typed_configuration_error_roundtrips_and_message_is_not_hashed() {
     );
 }
 
-/// The configuration status is the source's error until the source heals it.
-#[test]
-fn only_its_source_heals_a_configuration_error() {
-    let (_dir, mut store) = open();
-    store
-        .input_transaction(|txn| {
-            txn.set_configuration_source_error(Some(&ConfigurationError::from_reason(
-                &DscpV1::InvalidParallelism { value: 0 },
-                "parallelism must be positive",
-            )))
-        })
-        .unwrap();
-    assert!(store.configuration_error().unwrap().is_some());
-    store
-        .input_transaction(|txn| txn.set_configuration_source_error(None))
-        .unwrap();
-    assert!(store.configuration_error().unwrap().is_none());
-}
-
-#[test]
-fn unknown_persisted_code_is_rejected_instead_of_becoming_an_other_variant() {
-    let (dir, store) = open();
-    let state_path = dir.path().join(".distill");
-    drop(store);
-    let conn = rusqlite::Connection::open(state_path.join("meta.sqlite")).unwrap();
-    conn.pragma_update(None, "ignore_check_constraints", true)
-        .unwrap();
-    conn.execute(
-        "INSERT INTO errors(family, scope_kind, scope_id, identity, code, record, message)
-         VALUES (4, 6, X'', ?1, 65535, X'', 'future')",
-        [[7u8; 32].as_slice()],
-    )
-    .unwrap();
-    drop(conn);
-
-    let reopened = Store::open(StoreConfig::new(state_path)).unwrap();
-    assert!(matches!(
-        reopened.configuration_error(),
-        Err(StoreError::InvalidConfiguration { .. })
-    ));
-}
-
-#[test]
-fn noncanonical_persisted_error_shape_is_rejected() {
-    let (dir, store) = open();
-    let state_path = dir.path().join(".distill");
-    drop(store);
-    let conn = rusqlite::Connection::open(state_path.join("meta.sqlite")).unwrap();
-    conn.pragma_update(None, "ignore_check_constraints", true)
-        .unwrap();
-    conn.execute(
-        "INSERT INTO errors(family, scope_kind, scope_id, identity, code, record, message)
-         VALUES (4, 6, X'', ?2, 2, ?1, 'truncated hash')",
-        rusqlite::params![
-            DscpV1::NonLoopbackAddress {
-                address: "127.0.0.1:1".to_owned(),
-            }
-            .canonical_detail_bytes(),
-            [7u8; 31].as_slice(),
-        ],
-    )
-    .unwrap();
-    drop(conn);
-
-    let reopened = Store::open(StoreConfig::new(state_path)).unwrap();
-    assert!(matches!(
-        reopened.configuration_error(),
-        Err(StoreError::InvalidConfiguration { .. })
-    ));
-}
-
-#[test]
-fn persisted_configuration_error_recomputes_detail_authority() {
-    let cases = ["trailing-detail", "wrong-code", "wrong-digest"];
-    for case in cases {
-        let (dir, mut store) = open();
-        let state_path = dir.path().join(".distill");
-        store
-            .input_transaction(|txn| {
-                txn.set_configuration_source_error(Some(&ConfigurationError::from_reason(
-                    &DscpV1::NonLoopbackAddress {
-                        address: "10.0.0.5:9999".to_owned(),
-                    },
-                    "invalid address",
-                )))
-            })
-            .unwrap();
-        drop(store);
-
-        let conn = rusqlite::Connection::open(state_path.join("meta.sqlite")).unwrap();
-        conn.pragma_update(None, "ignore_check_constraints", true)
-            .unwrap();
-        match case {
-            "trailing-detail" => {
-                let mut detail: Vec<u8> = conn
-                    .query_row("SELECT record FROM errors WHERE family = 4", [], |row| {
-                        row.get(0)
-                    })
-                    .unwrap();
-                detail.push(0);
-                conn.execute("UPDATE errors SET record = ?1 WHERE family = 4", [detail])
-                    .unwrap();
-            }
-            "wrong-code" => {
-                conn.execute("UPDATE errors SET code = 7 WHERE family = 4", [])
-                    .unwrap();
-            }
-            "wrong-digest" => {
-                conn.execute(
-                    "UPDATE errors SET identity = ?1 WHERE family = 4",
-                    [[0xabu8; 32].as_slice()],
-                )
-                .unwrap();
-            }
-            _ => unreachable!(),
-        }
-        drop(conn);
-
-        let reopened = Store::open(StoreConfig::new(&state_path)).unwrap();
-        let state = reopened.configuration_error();
-        assert!(
-            matches!(state, Err(StoreError::InvalidConfiguration { .. })),
-            "{case}: {state:?}"
-        );
-    }
-}

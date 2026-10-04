@@ -665,7 +665,7 @@ fn authoring_gate(
         Ok(txn) => txn,
         Err(error) => return Some(AuthoringGate::Failure(store_failure(error))),
     };
-    match txn.configuration() {
+    match server.inner.configuration() {
         Ok(ConfigurationStatus::Failed(error)) => {
             return Some(AuthoringGate::ConfigurationFailed(error));
         }
@@ -873,9 +873,9 @@ impl MetadataHub {
         let txn = metadata_try!(self.server.inner.current_snapshot());
         MetadataCall::Success(MetadataDiagnostics {
             stamp: txn.stamp,
-            configuration: metadata_try!(txn.configuration()),
+            configuration: metadata_try!(self.server.inner.configuration()),
             pipeline: metadata_rpc_try!(self.server.inner.effective_pipeline(&txn)),
-            namespace_errors: metadata_try!(txn.snapshot().namespace_errors()),
+            namespace_errors: metadata_try!(self.server.inner.handle.namespace_errors(txn.snapshot())),
         })
     }
 
@@ -985,9 +985,9 @@ impl MetadataSnapshot {
         };
         MetadataCall::Success(MetadataDiagnostics {
             stamp: self.basis.snapshot,
-            configuration: metadata_try!(txn.configuration()),
+            configuration: metadata_try!(self.server.inner.configuration()),
             pipeline: metadata_rpc_try!(self.server.inner.effective_pipeline(&txn)),
-            namespace_errors: metadata_try!(txn.snapshot().namespace_errors()),
+            namespace_errors: metadata_try!(self.server.inner.handle.namespace_errors(txn.snapshot())),
         })
     }
 
@@ -1734,7 +1734,7 @@ impl Snapshot {
 
     pub fn configuration(&self) -> RpcResult<ConfigurationStatus> {
         match self.preflight() {
-            Ok(txn) => RpcResult::Success(rpc_try!(txn.configuration())),
+            Ok(_) => RpcResult::Success(rpc_try!(self.server.inner.configuration())),
             Err(result) => result,
         }
     }
@@ -1873,7 +1873,7 @@ impl Snapshot {
         if let Some(error) = pipeline_failure(self.server.inner.effective_pipeline(&txn)) {
             return done(RpcResult::Failure(error));
         }
-        if let ConfigurationStatus::Failed(error) = txn.configuration()? {
+        if let ConfigurationStatus::Failed(error) = self.server.inner.configuration()? {
             return done(RpcResult::ConfigurationFailed(error));
         }
         let snapshot = txn.snapshot();

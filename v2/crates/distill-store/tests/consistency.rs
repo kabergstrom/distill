@@ -1,39 +1,22 @@
 //! §13's consistency contract, cross-cutting: the two sequencing
 //! domains stay independent, multi-table input transactions are
 //! all-or-nothing, WAL readers only ever observe complete input
-//! versions, and the error classifications compose.
+//! versions, and a namespace error gates only its entity.
 
-use distill_core::bootstrap::bootstrap_control_logical_registry_v1;
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
-use distill_core::target_set::CanonicalTargetSet;
 use distill_core::tool::ToolCwdPolicy;
 use distill_store::bundles::{AssetRecord, BundleMeta};
 use distill_store::cas::record::KeyKind;
 use distill_store::cas::{BuildCommit, CommitOutcome, OutputSpec};
-use distill_store::pipeline::ValidatedPipelineEpoch;
+use distill_store::claims::{SourceClaim, SourceClaims};
 use distill_store::pipeline::{ResolvedToolPackageFile, ResolvedToolSourceV2, ToolRegistrationV2};
 use distill_store::state::{
-    CleanupDisposition, NamespaceError, NamespaceErrorV1, PipelineEpoch, PipelineFailure,
-    PipelineFailureCode, PipelineFailureOrigin, ReadableBundleSource, SkeletonFailureCode,
+    NamespaceError, NamespaceErrorV1, ReadableBundleSource, SkeletonFailureCode,
 };
 use distill_store::{Store, StoreConfig, StoreError};
 
 fn cfg(dir: &tempfile::TempDir) -> StoreConfig {
     StoreConfig::new(dir.path().join(".distill"))
-}
-
-fn validated_epoch(
-    custom: Option<(TypeUuid, LogicalHash)>,
-) -> ValidatedPipelineEpoch {
-    let mut schema_registry = bootstrap_control_logical_registry_v1().unwrap();
-    if let Some((type_uuid, logical_hash)) = custom {
-        schema_registry.insert(type_uuid, logical_hash);
-    }
-    let epoch = PipelineEpoch {
-        target_set: CanonicalTargetSet::canonical(vec![]).unwrap(),
-        schema_registry,
-    };
-    ValidatedPipelineEpoch::validate(epoch).unwrap()
 }
 
 fn namespace_error(message: &str) -> NamespaceError {
@@ -46,16 +29,6 @@ fn namespace_error(message: &str) -> NamespaceError {
             },
             failure: SkeletonFailureCode::IncompleteAssetIdentity,
         },
-        message,
-    )
-    .unwrap()
-}
-
-fn pipeline_failure(message: &str) -> PipelineFailure {
-    PipelineFailure::new(
-        PipelineFailureCode::CandidateRegistration,
-        PipelineFailureOrigin::CandidateOpen,
-        CleanupDisposition::CleanedAndClosed,
         message,
     )
     .unwrap()
@@ -164,9 +137,6 @@ fn multi_table_input_transactions_are_all_or_nothing() {
                     cwd_policy: ToolCwdPolicy::EmptyScratch,
                 },
             )?;
-            txn.publish_pipeline_epoch(&validated_epoch(
-                Some((TypeUuid([3u8; 16]), LogicalHash([5u8; 32]))),
-            ))?;
             Err(StoreError::InvalidConfiguration {
                 error: "abort everything".into(),
             })
@@ -249,70 +219,29 @@ fn wal_readers_only_observe_complete_input_versions() {
 }
 
 #[test]
-fn pure_metadata_reads_survive_a_pipeline_failure() {
-    // §13: the pipeline failure gates pipeline-dependent operations;
-    // path-index and CAS reads remain valid.
-    let dir = tempfile::tempdir().unwrap();
-    let mut store = Store::open(cfg(&dir)).unwrap();
-    commit(&mut store, 1);
-    let hash = *blake3::hash(&[1u8; 64]).as_bytes();
-    store
-        .input_transaction(|txn| {
-            let root = txn.intern_root("main")?;
-            txn.upsert_bundle(&BundleMeta {
-                bundle: BundleUuid([1u8; 16]),
-                root,
-                path: "a.bundle".to_owned(),
-                format_version: 1,
-                content_hash: ContentHash([1u8; 32]),
-                origin: None,
-                import_watched: false,
-            })?;
-            txn.upsert_asset(&AssetRecord {
-                asset: AssetUuid([2u8; 16]),
-                bundle: BundleUuid([1u8; 16]),
-                local_id: "main".to_owned(),
-                type_uuid: TypeUuid([3u8; 16]),
-                logical_hash: LogicalHash([4u8; 32]),
-                authoring_only: false,
-                tags: std::collections::BTreeMap::new(),
-                terminal_type: None,
-            })?;
-            txn.set_primary_asset(BundleUuid([1u8; 16]), AssetUuid([2u8; 16]))?;
-            txn.publish_pipeline_failure(&pipeline_failure(
-                "candidate rejected: duplicate type uuid",
-            ))
-        })
-        .unwrap();
-
-    assert!(store.pipeline_failure().unwrap().is_some());
-
-    // CAS reads and path resolution still answer.
-    assert_eq!(store.cas_read(&hash).unwrap(), vec![1u8; 64]);
-    assert_eq!(
-        store.path_assets("a.bundle").unwrap(),
-        std::collections::BTreeSet::from([AssetUuid([2u8; 16])])
-    );
-    let _ = store.input_version().unwrap();
-}
-
-#[test]
-fn namespace_errors_do_not_gate_the_namespace_or_the_pipeline() {
+fn a_namespace_error_does_not_gate_the_namespace() {
     // A namespace error (LOCKLESS.md §4) is about one entity: the rest of
-    // the namespace and the pipeline stay readable.
+    // the namespace stays readable.
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
     store
         .input_transaction(|txn| {
-            txn.publish_pipeline_epoch(&validated_epoch(None))?;
-            txn.set_namespace_errors([namespace_error("identity collision")])?;
+            txn.replace_source_claims(
+                None,
+                &[SourceClaims {
+                    root_name: "main".into(),
+                    path: "broken.bundle".into(),
+                    claims: vec![SourceClaim::Malformed(namespace_error("unreadable"))],
+                }],
+            )?;
             Ok(())
         })
         .unwrap();
 
-    // Pipeline healthy…
-    assert_eq!(store.pipeline_failure().unwrap(), None);
-    // …and so is the namespace.
+    assert_eq!(
+        store.namespace_errors().unwrap(),
+        vec![namespace_error("unreadable")]
+    );
     assert!(store.path_assets("x").unwrap().is_empty());
     assert!(store.entry(AssetUuid([1u8; 16])).unwrap().is_none());
     // CAS reads are pure metadata.

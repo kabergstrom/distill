@@ -31,7 +31,7 @@ pub use capability::{
 pub use protocol::*;
 pub use server::{
     bundle_authoring_entry, target_map, CoordinatedCommitError, ReportSnapshot, Root, Server,
-    ServerHandle, SnapshotPolicy, DEFAULT_SNAPSHOT_TTL, MAX_SUBSCRIBED_ASSETS,
+    PendingScanRejection, ServerHandle, SnapshotPolicy, DEFAULT_SNAPSHOT_TTL, MAX_SUBSCRIBED_ASSETS,
     MAX_SUBSCRIBED_PATHS,
 };
 pub use target::{TargetDefinition, TargetSetError};

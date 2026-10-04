@@ -144,6 +144,12 @@ impl Compiled {
         self.pipeline.epoch()
     }
 
+    /// The pipeline failure this state publishes (see
+    /// [`PipelineSnapshot::published_failure`]).
+    pub(crate) fn pipeline_failure(&self) -> Option<PipelineFailure> {
+        self.pipeline.published_failure()
+    }
+
     pub fn scanner(&self) -> &RootedScanner {
         &self.scanner
     }

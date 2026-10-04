@@ -20,7 +20,7 @@ use distill_rpc::{
     Commit, ImportJob, ImportRequest, InputVersion, LongRunningOp, PreparedImportCommit,
     PreparedOperationCommit, RpcFailure, WriteReceipt, WrittenFile,
 };
-use distill_store::state::{PipelineFailure, PipelineFailureOrigin};
+use distill_store::state::PipelineFailure;
 use distill_store::{Store, StoreOpener, StoreReader};
 
 use crate::compiled::{Compiled, CompiledRegistry};
@@ -472,18 +472,13 @@ impl AuthoringBackend for AuthoringService {
             .map_err(|error| error.to_string())
     }
 
-    fn pipeline_runtime_failure(
+    fn pipeline_failure(
         &self,
         snapshot: &StoreReader,
     ) -> Result<Option<PipelineFailure>, RpcFailure> {
-        // A candidate failure is the version's errors row; only the epoch
-        // the snapshot serves can fail at runtime. A snapshot whose compiled
-        // state is not loaded sees no epoch to report on.
-        Ok(self
-            .compiled(snapshot)?
-            .pipeline_epoch()
-            .err()
-            .filter(|failure| failure.origin == PipelineFailureOrigin::PublishedRuntime))
+        // The version's compiled state holds its candidate's failure, and
+        // its epoch the runtime failure it latched.
+        Ok(self.compiled(snapshot)?.pipeline_failure())
     }
 
     fn write_files(

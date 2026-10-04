@@ -4927,7 +4927,7 @@ All daemon state is disposable (§2) and lives under `.distill/` (gitignored).
 
 ### SQLite (metadata layer)
 
-The store holds 25 tables. Each holds one fact no other row or source can
+The store holds 22 tables. Each holds one fact no other row or source can
 answer: what derives from a bundle (its rows, claims, path references,
 import keys) is written with that bundle's rows and goes with them, and
 what the daemon compiles (pipeline registrations, the schema authority)
@@ -4936,12 +4936,10 @@ that published it, never copied into a table.
 
 | Table | Contents |
 |-------|----------|
-| `store_meta` | the store's scalars, one row each: the input, compiled and configuration-generation counters (a transaction reads each once), the pipeline module hash, the served fences (protocol epoch, pipeline generation), the oldest resumable change-log cursor and the served diagnostic blobs |
+| `store_meta` | the store's scalars, one row each: the input and compiled counters (a transaction reads each once), the pipeline module hash, the served fences (protocol epoch, pipeline generation), the oldest resumable change-log cursor and the served diagnostic blobs |
 | `roots` | root name → the small integer id every physical key carries |
 | `files` | **(root id, normalized root-relative path)** → mtime, size, kind, content hash — last-known tree state — and, for a traversed directory, its canonical path, unique across roots (`files_by_canonical`; a root's own directory is its configuration's): two observed directories with one canonical path are an inconsistent table, not an alias to choose between. Physical tracking is per root: multiple roots form one *logical* namespace (§18), and a single-path key could hold only one of two same-path observations, silently choosing a root. The logical path index derives as a multimap with three states — `Missing`, `Unique(root)`, `Ambiguous(roots)` — and ambiguity is representable, not pre-collapsed |
-| `source_claims` | what each scanned source claims, keyed by the claimant: bundle and asset uuids, primary paths, malformed skeletons, and its derived outputs (kind 2: child uuid → parent uuid, output key and the child's terminal type, from the source's assets × the pinned pipeline map, §9). A derived child is its one claim while neither it nor its parent is withheld by a namespace error — read by point lookups, the only authority for child resolution. Two claims on one subject are a collision row in `errors` |
-| `errors` | one row per current defect, keyed by the producer that owns it (scan namespace, pending rejection, configuration, pipeline candidate) and the entity it names (file, bundle, asset, target, pipeline, configuration, daemon). An asset resolves by point reads: its `assets` row, its bundle's poison, else its collision rows here; a deleted asset is a missing one, and subscribers learn of the deletion from `change_log` |
-| `scan_rejection_subjects` | the physical subjects (platform path encoding) whose revalidation heals the pending scan rejection: raw event paths are matched physically, which the logical subjects of its `errors` rows cannot answer |
+| `source_claims` | what each scanned source claims, keyed by the claimant: bundle and asset uuids, primary paths, malformed skeletons, and its derived outputs (kind 2: child uuid → parent uuid, output key and the child's terminal type, from the source's assets × the pinned pipeline map, §9). A derived child is its one claim while neither it nor its parent is withheld by a collision — read by point lookups, the only authority for child resolution. A subject with more than one distinct claimant collides: an asset resolves by point reads of its `assets` row, its bundle's poison, else its and its bundle's claimants here (`source_claims_by_subject` covers the claimant); the full collision listing (diagnostics, full publication, a reconfiguration's colliding sources) walks that index's bundle and asset claims. A malformed skeleton (kind 5) is its namespace error. A deleted asset is a missing one, and subscribers learn of the deletion from `change_log` |
 | `file_work` | the watcher work no pass has consumed, in one order: changed paths (root id, path, exists/deleted, observation) and renames. A transaction queues its work in memory and writes, at its commit, only what no pass consumed in it; a pass acknowledges exactly the rows it captured, by sequence range |
 | `import_keys` | the import index, one row per (bundle, asset, kind, key) indexed by (kind, key): what each watched import's basis reads (a path, a listing, an importer capability) under its `$record` entry, and each directory-import rules asset by the directory of its listing's literal prefix, so a changed path finds the rules that may list it by its ancestor directories. A row's source is its bundle's row, and its rows go with that row (a foreign key); the basis itself is read when needed, from the failure memo or the `$record`. Derived from the committed bundles and kept by source: every bundle publication queues its paths in `file_work`, and an import pass reindexes the dirty bundle sources, parsing each once, before it acknowledges that work, so the index is current but for pending work. It is never rebuilt whole; a store starts with no bundles and an empty index |
 | `bundles` | bundle uuid → **(root id, normalized path)**, format version, content hash, primary asset (the runtime entry its path resolves to; a path's candidates are the primaries of its bundles in every root, a search of `bundles_by_path`) — the physical key, matching `files`: UUID-based access must reach the owning file without a logical-index round trip that could turn ambiguous under a same-path file in a second root; path-query ambiguity is derived separately. Directory-import ownership derives at scan from generated bundles' `DirectoryOrigin` records (§8), whose `rule` is the authored stable `ImportRuleId`, never a vector index; deleting that id re-derives the orphan state, never reassigns ownership |
@@ -5545,8 +5543,13 @@ One writer, many snapshot readers:
   host and the watcher's roots change only after the commit. Superseded
   entries live while held, and a bounded number stay for a while for older
   snapshots. State with no compiled form (the pending scan rejection with
-  the subjects that heal it, the configuration source's error) is SQLite
-  rows that only the scan and configuration publications write.
+  the subjects that heal it, the configuration source's error, the
+  restart-required keys) is process memory on the RPC hub, set by the
+  pass or the configuration watch that found it; a restart recomputes it
+  (the startup scan, the configuration parse). It mints no version, and
+  RPC reads it current, not as of a snapshot: clients poll it through
+  `diagnostics`, `configuration` and the gates, except the restart keys,
+  which every stream is told as they change.
 - **Build pool** — pure work (imports, processing, artifact encoding) runs on
   a work-stealing pool sized by `parallelism`. Jobs read a pinned snapshot,
   never the live store, and return results to the coordinator for commit.

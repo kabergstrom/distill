@@ -821,12 +821,12 @@ pub trait AuthoringBackend: Send + Sync + 'static {
         path: &str,
     ) -> Result<Vec<u8>, String>;
 
-    /// The runtime failure of the pipeline epoch `snapshot` serves, if its
-    /// module has failed since it was published. It lives on the loaded
-    /// epoch, never in the store. An error: the backend cannot see the
-    /// epoch `snapshot` serves (a retryable failure, such as
+    /// The pipeline failure of the compiled state `snapshot` serves: its
+    /// candidate's, or the runtime failure its epoch latched since it was
+    /// published. It lives in this process, never in the store. An error:
+    /// the backend cannot see the compiled state `snapshot` serves (a retryable failure, such as
     /// [`RpcFailure::SnapshotExpired`]), so it claims nothing about it.
-    fn pipeline_runtime_failure(
+    fn pipeline_failure(
         &self,
         _snapshot: &distill_store::StoreReader,
     ) -> Result<Option<PipelineFailure>, RpcFailure> {
@@ -1451,14 +1451,11 @@ pub struct Commit {
     pub tag_poisons: Option<BTreeMap<AssetUuid, BundleUuid>>,
     pub tag_poison_mutations: Vec<TagPoisonMutation>,
     pub tag_projection_mutations: Vec<TagProjectionMutation>,
-    pub configuration: Option<ConfigurationStatus>,
     /// The publication installs, retires, or fails a module epoch even when
     /// the externally visible diagnostic remains `Ready`. Existing target
     /// Hubs must reconnect instead of retaining capabilities across that
     /// boundary.
     pub pipeline_epoch_changed: bool,
-    /// `Some` replaces the namespace errors (LOCKLESS.md §4).
-    pub namespace_errors: Option<Vec<NamespaceError>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1476,12 +1473,6 @@ pub enum AdminError {
     InvalidAuthoringIdentity {
         uuid: AssetUuid,
         detail: String,
-    },
-    InvalidNamespaceError {
-        error: distill_store::state::NamespaceErrorDecodeError,
-    },
-    InvalidConfigurationError {
-        error: distill_store::state::DscpError,
     },
     DuplicatePathMutation {
         path: String,

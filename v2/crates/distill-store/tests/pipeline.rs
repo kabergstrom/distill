@@ -1,5 +1,5 @@
-//! §13 pipeline-side metadata: the version's candidate failure and the
-//! `tools` ToolEpoch table.
+//! §13 pipeline-side metadata: epoch validation and the `tools` ToolEpoch
+//! table.
 
 use std::collections::BTreeMap;
 
@@ -10,9 +10,7 @@ use distill_core::tool::ToolCwdPolicy;
 use distill_store::pipeline::{
     ResolvedToolPackageFile, ResolvedToolSourceV2, ToolRegistrationV2, ValidatedPipelineEpoch,
 };
-use distill_store::state::{
-    CleanupDisposition, PipelineEpoch, PipelineFailure, PipelineFailureCode, PipelineFailureOrigin,
-};
+use distill_store::state::PipelineEpoch;
 use distill_store::{Store, StoreConfig, StoreError};
 
 fn store() -> (tempfile::TempDir, Store) {
@@ -54,10 +52,6 @@ fn raw_epoch(n: u8) -> PipelineEpoch {
     }
 }
 
-fn epoch(n: u8) -> ValidatedPipelineEpoch {
-    ValidatedPipelineEpoch::validate(raw_epoch(n)).unwrap()
-}
-
 #[test]
 fn ready_requires_exact_bootstrap_logical_projection() {
     let type_uuid = distill_core::bootstrap::BOOTSTRAP_CONTROL_TYPE_UUIDS[0];
@@ -77,59 +71,6 @@ fn ready_requires_exact_bootstrap_logical_projection() {
         ValidatedPipelineEpoch::validate(changed),
         Err(StoreError::InvalidBootstrapRegistry { .. })
     ));
-}
-
-fn candidate_failure(message: &str) -> PipelineFailure {
-    PipelineFailure::new(
-        PipelineFailureCode::CandidateRegistration,
-        PipelineFailureOrigin::CandidateOpen,
-        CleanupDisposition::CleanedAndClosed,
-        message,
-    )
-    .unwrap()
-}
-
-// ---- the candidate failure ----
-
-#[test]
-fn publishing_an_epoch_carries_no_failure() {
-    let (_d, mut store) = store();
-    assert_eq!(store.pipeline_failure().unwrap(), None);
-    store
-        .input_transaction(|txn| txn.publish_pipeline_epoch(&epoch(3)))
-        .unwrap();
-    assert_eq!(store.pipeline_failure().unwrap(), None);
-}
-
-#[test]
-fn a_rejected_candidate_still_publishes_as_a_failure() {
-    // §13: failure publishes the version carrying a pipeline failure —
-    // the prior epoch is never silently retained as the new version's
-    // code, and the version is never dropped.
-    let (_d, mut store) = store();
-    store
-        .input_transaction(|txn| txn.publish_pipeline_epoch(&epoch(3)))
-        .unwrap();
-    let failure = candidate_failure("dup processor id `tex`");
-    store
-        .input_transaction(|txn| txn.publish_pipeline_failure(&failure))
-        .unwrap();
-    assert_eq!(store.pipeline_failure().unwrap(), Some(failure));
-}
-
-#[test]
-fn the_next_successful_swap_publishes_over_the_failure() {
-    let (_d, mut store) = store();
-    store
-        .input_transaction(|txn| txn.publish_pipeline_epoch(&epoch(3)))
-        .unwrap();
-    store
-        .input_transaction(|txn| txn.publish_pipeline_failure(&candidate_failure("bad candidate")))
-        .unwrap();
-    store
-        .input_transaction(|txn| txn.publish_pipeline_epoch(&epoch(7)))
-        .unwrap();
-    assert_eq!(store.pipeline_failure().unwrap(), None, "healed");
 }
 
 #[test]

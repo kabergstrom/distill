@@ -641,13 +641,14 @@ fn reject_pipeline(project: &TestProject, failure: PipelineFailure) -> SnapshotS
         .unwrap()
 }
 
-/// The daemon publishes a rejected configuration source.
+/// The daemon rejects its configuration source: no version is published,
+/// the current one is served under the failure (its stamp is returned).
 fn reject_configuration(project: &TestProject, reason: DscpV1, message: &str) -> SnapshotStamp {
-    let mut writer = project.coordinator().open_writer().unwrap();
     project
         .coordinator()
-        .publish_configuration_rejection(&mut writer, reason, message)
-        .unwrap()
+        .reject_configuration(reason, message)
+        .unwrap();
+    project.server().current_stamp().unwrap()
 }
 
 /// A second RPC server over `project`'s store, with `backend` as its
@@ -1987,7 +1988,7 @@ impl AuthoringBackend for RuntimeFailedBackend {
         unreachable!("never writes")
     }
 
-    fn pipeline_runtime_failure(
+    fn pipeline_failure(
         &self,
         _snapshot: &distill_store::StoreReader,
     ) -> Result<Option<PipelineFailure>, RpcFailure> {
@@ -2020,29 +2021,6 @@ impl AuthoringBackend for RuntimeFailedBackend {
     ) -> Result<PreparedOperationCommit, RpcFailure> {
         unreachable!("no operations")
     }
-}
-
-#[test]
-fn commit_rejects_an_unauthenticated_dscp() {
-    let project = project();
-    let server = project.server();
-    let before = server.current_stamp().unwrap();
-    let mut error = ConfigurationError::from_reason(
-        &DscpV1::MalformedConfiguration { file_hash: [1; 32] },
-        "bad configuration",
-    );
-    error.reason_hash = [2; 32];
-    assert!(matches!(
-        offer(
-            &server,
-            Commit {
-                configuration: Some(ConfigurationStatus::Failed(error)),
-                ..Commit::default()
-            }
-        ),
-        Err(AdminError::InvalidConfigurationError { .. })
-    ));
-    assert_eq!(server.current_stamp().unwrap(), before);
 }
 
 #[test]

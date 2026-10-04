@@ -319,11 +319,12 @@ fn claims_survive_a_restart_whose_first_scan_is_rejected() {
     let mut writer = coordinator.open_writer().unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
     let reader = coordinator.open_reader().unwrap();
+    let hub = coordinator.server_handle();
     assert!(
-        reader.scan_rejection().unwrap().is_some(),
+        hub.scan_rejection().is_some(),
         "the first scan is rejected"
     );
-    let errors = reader.namespace_errors().unwrap();
+    let errors = hub.namespace_errors(&reader).unwrap();
     assert!(
         errors.iter().any(|error| matches!(
             error.detail,
@@ -351,11 +352,11 @@ fn claims_survive_a_restart_whose_first_scan_is_rejected() {
         )
         .unwrap();
     let store = coordinator.open_reader().unwrap();
-    assert_eq!(store.scan_rejection().unwrap(), None);
+    assert_eq!(hub.scan_rejection(), None);
     assert!(
-        store.namespace_errors().unwrap().is_empty(),
+        hub.namespace_errors(&store).unwrap().is_empty(),
         "{:?}",
-        store.namespace_errors()
+        hub.namespace_errors(&store)
     );
     assert!(store.entry(AssetUuid([32; 16])).unwrap().is_some());
     assert!(store.entry(AssetUuid([34; 16])).unwrap().is_none());
@@ -614,7 +615,7 @@ fn a_direct_write_changes_the_file_and_commits_nothing() {
 
 #[cfg(unix)]
 #[test]
-fn unreadable_scan_state_publishes_a_typed_version_and_heals() {
+fn unreadable_scan_state_is_diagnosed_without_a_version_and_heals() {
     use std::os::unix::fs::symlink;
 
     let temp = tempfile::tempdir().unwrap();
@@ -625,16 +626,18 @@ fn unreadable_scan_state_publishes_a_typed_version_and_heals() {
     let link = temp.path().join("assets/escape");
     symlink(&outside, &link).unwrap();
 
+    // The rejected scan publishes nothing; its error is the process's.
     assert_eq!(
         coordinator
             .reconcile_full_scan(&mut writer)
             .unwrap()
             .version,
-        InputVersion(1)
+        InputVersion(0)
     );
+    let hub = coordinator.server_handle();
     let store = coordinator.open_reader().unwrap();
     assert!(matches!(
-        store.namespace_errors().unwrap()[0].detail,
+        hub.namespace_errors(&store).unwrap()[0].detail,
         NamespaceErrorV1::UnreadableScanSubtree { .. }
     ));
 
@@ -644,9 +647,9 @@ fn unreadable_scan_state_publishes_a_typed_version_and_heals() {
             .reconcile_full_scan(&mut writer)
             .unwrap()
             .version,
-        InputVersion(2)
+        InputVersion(1)
     );
-    assert!(store.namespace_errors().unwrap().is_empty());
+    assert!(hub.namespace_errors(&store).unwrap().is_empty());
 }
 
 #[cfg(unix)]
@@ -668,6 +671,7 @@ fn incremental_scan_error_heals_when_observation_returns_to_last_good() {
     std::fs::write(&outside, b"outside").unwrap();
     let link = temp.path().join("assets/escape");
     symlink(&outside, &link).unwrap();
+    // The rejection publishes no version; the process diagnoses it.
     assert_eq!(
         coordinator
             .reconcile_incremental(
@@ -679,9 +683,12 @@ fn incremental_scan_error_heals_when_observation_returns_to_last_good() {
             )
             .unwrap()
             .version,
-        InputVersion(2)
+        InputVersion(1)
     );
+    let hub = coordinator.server_handle();
+    assert!(hub.scan_rejection().is_some());
 
+    // The healing batch publishes what it observed.
     std::fs::remove_file(&link).unwrap();
     assert_eq!(
         coordinator
@@ -694,14 +701,9 @@ fn incremental_scan_error_heals_when_observation_returns_to_last_good() {
             )
             .unwrap()
             .version,
-        InputVersion(3)
+        InputVersion(2)
     );
-    assert!(coordinator
-        .open_reader()
-        .unwrap()
-        .namespace_errors()
-        .unwrap()
-        .is_empty());
+    assert_eq!(hub.scan_rejection(), None);
 }
 
 #[cfg(unix)]
@@ -744,12 +746,10 @@ fn unrelated_incremental_observation_does_not_heal_pending_scan_error() {
             },
         )
         .unwrap();
-    assert!(!coordinator
-        .open_reader()
-        .unwrap()
-        .namespace_errors()
-        .unwrap()
-        .is_empty());
+    let hub = coordinator.server_handle();
+    let store = coordinator.open_reader().unwrap();
+    assert!(!hub.namespace_errors(&store).unwrap().is_empty());
+    drop(store);
 
     std::fs::remove_file(&link).unwrap();
     coordinator
@@ -761,12 +761,8 @@ fn unrelated_incremental_observation_does_not_heal_pending_scan_error() {
             },
         )
         .unwrap();
-    assert!(coordinator
-        .open_reader()
-        .unwrap()
-        .namespace_errors()
-        .unwrap()
-        .is_empty());
+    let store = coordinator.open_reader().unwrap();
+    assert!(hub.namespace_errors(&store).unwrap().is_empty());
 }
 
 #[cfg(unix)]
@@ -814,7 +810,7 @@ fn configuration_scan_rejection_preserves_existing_namespace_errors() {
 
 #[cfg(unix)]
 #[test]
-fn directory_alias_publishes_configuration_error_without_aborting_the_version() {
+fn directory_alias_is_a_configuration_error_without_a_version() {
     use std::os::unix::fs::symlink;
 
     let temp = tempfile::tempdir().unwrap();
@@ -829,7 +825,7 @@ fn directory_alias_publishes_configuration_error_without_aborting_the_version() 
             .reconcile_full_scan(&mut writer)
             .unwrap()
             .version,
-        InputVersion(1)
+        InputVersion(0)
     );
     assert!(matches!(
         coordinator.configuration_status().unwrap(),
@@ -1157,12 +1153,12 @@ fn the_echo_of_an_atomic_write_through_an_unobserved_temporary_file_publishes_no
     assert_eq!(echo.version, published.version);
 }
 
-/// A pending scan rejection is durable state: an RPC authoring write keeps
-/// its errors, a restart keeps it with its subjects, and only the scan that
-/// revalidates those subjects heals it.
+/// A pending scan rejection is process state: an RPC authoring write keeps
+/// its errors, only the scan that revalidates its subjects heals it, and a
+/// restarted process knows it again once its first scan finds it.
 #[cfg(unix)]
 #[test]
-fn a_pending_scan_rejection_survives_an_authoring_write_and_a_restart() {
+fn a_pending_scan_rejection_survives_an_authoring_write_and_a_rescan() {
     use std::os::unix::fs::symlink;
 
     let temp = tempfile::tempdir().unwrap();
@@ -1188,11 +1184,9 @@ fn a_pending_scan_rejection_survives_an_authoring_write_and_a_restart() {
                 },
             )
             .unwrap();
-        let pending = coordinator
-            .open_reader()
-            .unwrap()
+        let hub = coordinator.server_handle();
+        let pending = hub
             .scan_rejection()
-            .unwrap()
             .expect("the unreadable subtree leaves a pending rejection");
         assert!(matches!(
             pending.errors[..],
@@ -1225,21 +1219,23 @@ fn a_pending_scan_rejection_survives_an_authoring_write_and_a_restart() {
             write_and_publish(&coordinator, &mut writer, base, &[operation], false).unwrap();
         assert_eq!(version, InputVersion(base.0 + 1));
         let store = coordinator.open_reader().unwrap();
-        assert_eq!(store.scan_rejection().unwrap().as_ref(), Some(&pending));
-        assert_eq!(store.namespace_errors().unwrap(), pending.errors);
+        assert_eq!(hub.scan_rejection().as_ref(), Some(&pending));
+        assert_eq!(hub.namespace_errors(&store).unwrap(), pending.errors);
         pending
     };
 
-    // A restart keeps it, subjects included.
+    // A restart starts without it; its first scan finds it again.
     let coordinator = coordinator(&temp);
+    let hub = coordinator.server_handle();
+    assert_eq!(hub.scan_rejection(), None);
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
     let store = coordinator.open_reader().unwrap();
-    assert_eq!(store.scan_rejection().unwrap().as_ref(), Some(&pending));
-    assert_eq!(store.namespace_errors().unwrap(), pending.errors);
+    assert_eq!(hub.namespace_errors(&store).unwrap(), pending.errors);
     drop(store);
 
-    // An unrelated observation does not heal it; revalidating the stored
-    // subject does.
-    let mut writer = coordinator.open_writer().unwrap();
+    // An unrelated observation does not heal it; revalidating its subject
+    // does.
     std::fs::remove_file(&link).unwrap();
     let unrelated = temp.path().join("assets/unrelated.txt");
     std::fs::write(&unrelated, b"new observation").unwrap();
@@ -1253,13 +1249,8 @@ fn a_pending_scan_rejection_survives_an_authoring_write_and_a_restart() {
         )
         .unwrap();
     assert_eq!(
-        coordinator
-            .open_reader()
-            .unwrap()
-            .scan_rejection()
-            .unwrap()
-            .as_ref(),
-        Some(&pending)
+        hub.scan_rejection().map(|rejection| rejection.errors),
+        Some(pending.errors)
     );
     coordinator
         .reconcile_incremental(
@@ -1271,8 +1262,8 @@ fn a_pending_scan_rejection_survives_an_authoring_write_and_a_restart() {
         )
         .unwrap();
     let store = coordinator.open_reader().unwrap();
-    assert_eq!(store.scan_rejection().unwrap(), None);
-    assert!(store.namespace_errors().unwrap().is_empty());
+    assert_eq!(hub.scan_rejection(), None);
+    assert!(hub.namespace_errors(&store).unwrap().is_empty());
 }
 
 /// What one single-bundle edit's incremental publication reads, in pages
@@ -1325,17 +1316,13 @@ fn a_single_bundle_edit_reads_independent_of_namespace_size() {
     );
 }
 
-/// Pages a configuration source rejection and its heal read and write beside
-/// `filler` files, and the configuration error the rejection stored.
-fn configuration_error_pages(filler: usize) -> u64 {
+/// A configuration source error and its heal are process state: they
+/// publish no version and read no page of the store.
+#[test]
+fn a_configuration_error_publishes_nothing() {
     let temp = tempfile::tempdir().unwrap();
     let assets = temp.path().join("assets");
     std::fs::create_dir_all(&assets).unwrap();
-    for index in 0..filler {
-        let directory = assets.join(format!("filler/d{}", index % 40));
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(directory.join(format!("f{index}.txt")), index.to_string()).unwrap();
-    }
     let (bytes, _, _) = ordinary_bundle();
     std::fs::write(assets.join("first.bundle"), bytes).unwrap();
     let coordinator = coordinator(&temp);
@@ -1343,42 +1330,25 @@ fn configuration_error_pages(filler: usize) -> u64 {
     coordinator.reconcile_full_scan(&mut writer).unwrap();
     let ready = coordinator.configuration_status().unwrap();
 
-    let before = writer.pages_fetched().unwrap();
     let base = writer.input_version().unwrap();
-    let rejected = coordinator
-        .publish_configuration_rejection(
-            &mut writer,
+    let before = writer.pages_fetched().unwrap();
+    coordinator
+        .reject_configuration(
             DscpV1::MalformedConfiguration { file_hash: [5; 32] },
             "malformed",
         )
         .unwrap();
-    assert_eq!(rejected.version.0, base.0 + 1);
     assert!(matches!(
         coordinator.configuration_status().unwrap(),
         ConfigurationStatus::Failed(_)
     ));
-    let healed = coordinator
-        .heal_configuration_rejection(&mut writer)
-        .unwrap();
-    assert_eq!(healed.version.0, base.0 + 2);
+    coordinator.heal_configuration_rejection();
     assert_eq!(
         format!("{:?}", coordinator.configuration_status().unwrap()),
         format!("{ready:?}")
     );
-    writer.pages_fetched().unwrap() - before
-}
-
-/// A configuration source error and its heal write the error row and the
-/// configuration status; they never republish the namespace.
-#[test]
-fn a_configuration_error_reads_independent_of_namespace_size() {
-    let small = configuration_error_pages(100);
-    let large = configuration_error_pages(6000);
-    println!("configuration error and heal: {small} pages beside 100 files, {large} beside 6000");
-    assert!(
-        large <= small + 16,
-        "{small} pages beside 100 files, {large} beside 6000"
-    );
+    assert_eq!(writer.pages_fetched().unwrap(), before);
+    assert_eq!(writer.input_version().unwrap(), base);
 }
 
 static EDIT_STATEMENTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());

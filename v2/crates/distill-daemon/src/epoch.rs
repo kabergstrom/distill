@@ -1269,6 +1269,8 @@ impl Drop for EpochInner {
 
 #[derive(Clone)]
 enum PublishedState {
+    /// Nothing is published yet: no epoch serves, and no failure does.
+    Unpublished,
     Ready(PipelineEpoch),
     Failed(PipelineFailure),
 }
@@ -1295,11 +1297,14 @@ impl PipelineSnapshot {
 
     /// What serves before any epoch is published.
     pub(crate) fn unpublished() -> Self {
-        Self::failed(unpublished_failure())
+        Self {
+            state: PublishedState::Unpublished,
+        }
     }
 
     pub fn epoch(&self) -> Result<&PipelineEpoch, PipelineFailure> {
         match &self.state {
+            PublishedState::Unpublished => Err(unpublished_failure()),
             PublishedState::Failed(error) => Err(error.clone()),
             PublishedState::Ready(epoch) => {
                 epoch.0.observe_token_poison();
@@ -1314,6 +1319,15 @@ impl PipelineSnapshot {
                     Ok(epoch)
                 }
             }
+        }
+    }
+
+    /// The failure this snapshot publishes: its epoch's, or none while
+    /// nothing is published (when no epoch serves either).
+    pub(crate) fn published_failure(&self) -> Option<PipelineFailure> {
+        match self.state {
+            PublishedState::Unpublished => None,
+            _ => self.epoch().err(),
         }
     }
 }
@@ -1366,7 +1380,7 @@ impl ModuleHost {
         let state = self
             .published
             .clone()
-            .unwrap_or_else(|| PublishedState::Failed(unpublished_failure()));
+            .unwrap_or(PublishedState::Unpublished);
         PipelineSnapshot { state }
     }
 

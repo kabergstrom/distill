@@ -61,26 +61,25 @@ pub enum AssetResolution {
 /// A published asset's row and its bundle's poison.
 pub(crate) const ASSET_POISON: &str = "SELECT b.poison FROM assets a
      JOIN bundles b ON b.bundle_uuid = a.bundle_uuid WHERE a.asset_uuid = ?1";
-/// The collision withholding asset `?1`: its own UUID's (scope 3).
-pub(crate) const ASSET_COLLISION: &str =
-    "SELECT message FROM errors WHERE scope_kind = 3 AND scope_id = ?1 AND family = ?2";
-/// The collision withholding asset `?1`'s bundle: the bundle UUID (scope 2)
-/// a source authoring the asset claims. The joins are ordered (`CROSS
-/// JOIN`) so errors are searched by their full scope, not scanned per kind.
-pub(crate) const ASSET_BUNDLE_COLLISION: &str = "SELECT e.message FROM source_claims a
+/// The colliding bundle UUID withholding asset `?1`: one a source
+/// authoring the asset claims (kind 0) that more than one source claims.
+/// The joins are ordered (`CROSS JOIN`) so each claim is a search of
+/// `source_claims_by_subject`.
+pub(crate) const ASSET_BUNDLE_COLLISION: &str = "SELECT b.subject FROM source_claims a
      CROSS JOIN source_claims b ON b.root_id = a.root_id AND b.path = a.path AND b.kind = 0
-     CROSS JOIN errors e ON e.scope_kind = 2 AND e.scope_id = b.subject AND e.family = ?2
-     WHERE a.kind = 1 AND a.subject = ?1 LIMIT 1";
-/// Every asset a namespace error withholds (see
-/// [`ASSET_COLLISION`], [`ASSET_BUNDLE_COLLISION`]): each colliding asset
-/// UUID, and each asset a source claiming a colliding bundle UUID authors.
-/// Searches from the collision rows, so it costs the defects.
-pub(crate) const WITHHELD_ASSETS: &str = "SELECT scope_id FROM errors
-     WHERE scope_kind = 3 AND family = ?1
-     UNION SELECT a.subject FROM errors e
-     CROSS JOIN source_claims b ON b.kind = 0 AND b.subject = e.scope_id
-     CROSS JOIN source_claims a ON a.root_id = b.root_id AND a.path = b.path AND a.kind = 1
-     WHERE e.scope_kind = 2 AND e.family = ?1";
+     WHERE a.kind = 1 AND a.subject = ?1
+     AND (SELECT COUNT(DISTINCT c.claimant) FROM source_claims c
+          WHERE c.kind = 0 AND c.subject = b.subject) > 1
+     LIMIT 1";
+/// Every asset a collision withholds (see [`StoreReader::withholding`]):
+/// each colliding asset UUID, and each asset a source claiming a colliding
+/// bundle UUID authors. Costs the claims, so only full publication asks.
+pub(crate) const WITHHELD_ASSETS: &str = "SELECT subject FROM source_claims
+     WHERE kind IN (1, 2) GROUP BY subject HAVING COUNT(DISTINCT claimant) > 1
+     UNION SELECT a.subject FROM (SELECT subject FROM source_claims WHERE kind = 0
+          GROUP BY subject HAVING COUNT(DISTINCT claimant) > 1) c
+     CROSS JOIN source_claims b ON b.kind = 0 AND b.subject = c.subject
+     CROSS JOIN source_claims a ON a.root_id = b.root_id AND a.path = b.path AND a.kind = 1";
 
 /// One `change_log` payload. Reason and state codes belong to the RPC layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,30 +342,29 @@ impl StoreReader {
         Ok(self.withholding(asset)?.map(AssetResolution::Failed))
     }
 
-    /// The namespace error withholding `asset`: its own UUID's collision,
-    /// else its bundle UUID's.
-    pub(crate) fn withholding(&self, asset: AssetUuid) -> Result<Option<String>, StoreError> {
-        for sql in [ASSET_COLLISION, ASSET_BUNDLE_COLLISION] {
-            if let Some(message) = self
-                .conn
-                .prepare_cached(sql)?
-                .query_row(
-                    rusqlite::params![asset.0.as_slice(), crate::errors::NAMESPACE],
-                    |row| row.get(0),
-                )
-                .optional()?
-            {
-                return Ok(Some(message));
-            }
+    /// The message of the collision withholding `asset`: its own UUID's,
+    /// else its bundle UUID's. Point searches of the claims.
+    pub fn withholding(&self, asset: AssetUuid) -> Result<Option<String>, StoreError> {
+        let id = asset.0.as_slice();
+        if self
+            .conn
+            .prepare_cached(crate::claims::ASSET_COLLIDES)?
+            .query_row([id], |row| row.get::<_, bool>(0))?
+        {
+            return Ok(Some(crate::claims::asset_collision_message(asset)));
         }
-        Ok(None)
+        Ok(self
+            .conn
+            .prepare_cached(ASSET_BUNDLE_COLLISION)?
+            .query_row([id], |row| row.get::<_, Vec<u8>>(0))
+            .optional()?
+            .map(|bundle| crate::claims::bundle_collision_message(BundleUuid(blob16(bundle)))))
     }
 
-    /// Every asset a namespace error withholds (see [`Self::withholding`]).
+    /// Every asset a collision withholds (see [`Self::withholding`]).
     pub fn withheld_assets(&self) -> Result<BTreeSet<AssetUuid>, StoreError> {
         let mut statement = self.conn.prepare_cached(WITHHELD_ASSETS)?;
-        let rows =
-            statement.query_map([crate::errors::NAMESPACE], |row| row.get::<_, Vec<u8>>(0))?;
+        let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
         rows.map(|row| Ok(AssetUuid(blob16(row?)))).collect()
     }
 

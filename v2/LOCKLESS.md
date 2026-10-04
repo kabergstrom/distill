@@ -108,7 +108,7 @@ read transaction:
 | `views[*].authoring` | `bundles` / `assets` / `asset_tags` / `schemas`. New `assets` columns hold the encoded authored value (canonical JSON + blobs) and `terminal_type`, so a snapshot never reads a file. |
 | `views[*].paths` | `bundles.primary_asset` by path (schema 49; was `path_index`); several roots at one path is the ambiguity. |
 | `views[*].derived_outputs` | A child's one `source_claims` derived claim (kind 2, terminal type in its detail) while neither it nor its parent is withheld (schema-min: no `derived_outputs` table). |
-| `tag_poisons`, `version_poison`, `configuration`, `pipeline` | `assets.tag_poison`, the persisted version poison, `configuration_state`, `pipeline_state` (then §4's `errors`) |
+| `tag_poisons`, `version_poison`, `configuration`, `pipeline` | `assets.tag_poison`; namespace errors are queries over `source_claims` (schema 59); the configuration error is process state on the RPC hub; a pipeline failure is the snapshot's compiled entry's (no `errors` table since schema 59) |
 | `lineage_repair` | new persisted repair-state columns next to `configuration_state` |
 | `history`, `oldest_available_cursor` | `change_log(seq, version, kind, subject)` trimmed to 4096 rows; the oldest cursor in `store_meta` |
 | `build_results` (cleared on every commit) | `resolutions(version, target, asset, outcome)`, written by the authority after a build, pruned on publication |
@@ -136,12 +136,12 @@ tables, so the ~50 rpc test call sites keep working.
 | `ImportWatchIndex` | memory, lazily built from bundle files | `import_keys(bundle_uuid, asset_uuid, kind, key)` indexed by (kind, key) (schema 50; was `import_records` + `import_reads` + `directory_rule_sources`). Dirty files join against it. |
 | `PipelineProjection`, `RegisteredImporters` | memory | part of the immutable `PipelineRuntime`. The projection's durable consequence goes in a `type_projection` table. |
 | `schema_authority`, `build_targets`, `lineage_destination`, roots, quarantine | `RwLock`s filled from config | immutable `Arc<ActiveConfig>` owned by the authority and passed with jobs. Its hash and generation live in `configuration_state`. Done for the schema authority, build targets, roots, scanner, projection, pipeline importers and pipeline snapshot: one `Compiled` entry per `store_meta.compiled_version` (§6.1). |
-| `configuration_poison`, `scan_rejection` | memory only (and `PendingScanRejection.subjects` is lost on restart) | `errors`. Done: `errors` families 2–4 and `scan_rejection_subjects` (§6.1). |
-| `scan_initialized` / `scan_healthy` | atomics | authority-local. Done: `scan_initialized` is set only after a commit; healthy is "no stored rejection". |
+| `configuration_poison`, `scan_rejection` | memory only (and `PendingScanRejection.subjects` is lost on restart) | process state on the RPC hub (§6.1; schema 59, was `errors` families 2–4 and `scan_rejection_subjects`): a restart recomputes it from the startup scan and configuration parse. |
+| `scan_initialized` / `scan_healthy` | atomics | authority-local. Done: `scan_initialized` is set only after a commit; healthy is "no pending rejection". |
 | `Store.input_version` / `memo_seq` | cached copies | read from `store_meta` in the transaction |
 | `Store.cas: CasInner` | memory | owned by the authority (the writer). Readers resolve segment names from `cas_segments`, not from `CasInner`. |
 | `Store.last_recovery` | memory | returned from `open` and logged |
-| `last_background_error` | memory | `errors` (scope = daemon) |
+| `last_background_error` | memory | memory: process state, as the configuration error is |
 
 ### 2.4 Commit-then-fallible sites to eliminate
 
@@ -507,10 +507,13 @@ should reach zero by the end of phase 6.
   - **Claims in tables** (`claims.rs`, schema 30).
     - `source_claims` holds one row per claim per source. Claim kinds are
       bundle, authored, derived, primary path, lineage and malformed.
-    - A collided subject is its namespace error row (`errors`, found by
-      `errors_by_scope`), written by `InputTxn::replace_source_claims`
-      for the touched subjects only. The subjects pending publication are
-      its return value, not a table.
+    - A collided subject is one with more than one distinct claimant
+      (schema 59; was an `errors` row): `InputTxn::replace_source_claims`
+      reads the touched subjects' claimants before and after, and the
+      subjects pending publication are its return value, not a table.
+      Resolution and withholding are point searches of
+      `source_claims_by_subject`, which covers the claimant; the full
+      listing walks its bundle and asset claims.
     - An incremental scan writes its files, structure and claims, then
       plans against `transaction.reader()`, all in one input transaction.
     - `ScanProjectionIndex` and its checkpoint/restore logic are deleted.
@@ -605,8 +608,8 @@ should reach zero by the end of phase 6.
 
 - **Phase 7:** done (commits `2505ff3`, `2f915c3`).
   - Namespace errors are per-entity. The `errors` table (store `errors.rs`)
-    holds every current scan error, each scoped to its file, bundle or
-    asset. `store_meta.version_poison` and the gates that made every
+    held every current scan error, each scoped to its file, bundle or
+    asset (schema 59 dropped it: see §6.1). `store_meta.version_poison` and the gates that made every
     namespace read fail are gone: `entry`, `resolve_path`, tag queries,
     `resolve_child`, and the RPC `versionPoisoned` result arms (wire
     protocol 5).
@@ -951,7 +954,8 @@ should reach zero by the end of phase 6.
     answers as `SnapshotExpired`), never another version's state. A process
     opening a store marked by an earlier process registers no entry for
     that key; its loop first publishes "no pipeline epoch has been
-    published" so the store says what it holds.
+    published" so the store says what it holds. The boot entry, before
+    anything is published, serves no failure (and no importers).
   - A publication stages its entry under the version it will publish
     (invisible: no reader sees that key before the commit), confirms it
     after the commit, and drops it on failure, so a failed publication
@@ -959,13 +963,17 @@ should reach zero by the end of phase 6.
     `scan_initialized` change only after the commit. Superseded entries
     live while held; the newest 4 stay for 120 s.
   - The pending scan rejection (its namespace errors, its configuration
-    error, its subjects) and the configuration source's error are rows
-    (`errors` families 2–4, `scan_rejection_subjects`); healthy is "no
-    stored rejection", and the configuration status is selected from them
-    inside each publishing input. Only scan and configuration publications
-    write them, so an RPC write keeps them (`publish_incremental_paths` no
-    longer replaces the rejection's namespace errors) and a restart keeps
-    them with their subjects.
+    error, its subjects) and the configuration source's error are process
+    state on the RPC hub (schema 59; they were `errors` families 2–4 and
+    `scan_rejection_subjects`). The pass or the configuration watch sets
+    them after its input commits, and they mint no version; healthy is
+    "no pending rejection", and the configuration status is selected from
+    them when read. Only scan and configuration passes set them, so an RPC
+    write keeps them; a restart recomputes them (the startup scan, the
+    configuration parse). RPC reads them current, not as of a snapshot,
+    and clients poll them (`diagnostics`, `configuration`, the gates); no
+    stream is told. A pipeline candidate's failure is its compiled entry's
+    and still publishes a version, which fences.
   - The import index has no built flag (schema 38): it is kept by the
     dirty work every bundle publication queues, never rebuilt whole.
   - A configuration publication (`coordinated_replace_target_set`) writes
@@ -1152,8 +1160,8 @@ should reach zero by the end of phase 6.
   directory of the listing's literal prefix
   (`directory_rule_sources_by_listing`), and every rule is read only
   when a changed source holds rules or the capabilities changed.
-  Namespace errors, source claims and the full rescan's scan structure
-  are written as differences. `source_claims_by_claimant` is led by
+  Source claims and the full rescan's scan structure are written as
+  differences. `source_claims_by_claimant` is led by
   `claimant` (a `DISTINCT` drove the planner onto a `kind`-led index and
   a scan that grew with the project), and `dirty_files_by_path` answers
   an acknowledgement's `(root_id, path)` delete. The `deps` table,
@@ -1262,15 +1270,19 @@ What went:
   Nothing about the module stays in `store_meta`: its hash is the loaded
   epoch's, which nothing read from the store. A runtime failure lives on the
   loaded epoch.
-- Configuration state, now an `errors` row, and the served restart
-  keys, now process state: the started-with values against the file.
+- Configuration state and the served restart keys, now process state:
+  the configuration source's error and the pending scan rejection on the
+  RPC hub (schema 59; the `errors` table and `scan_rejection_subjects`
+  are gone), the restart keys as the started-with values against the
+  file. A pipeline failure is the compiled entry's.
 - `result_candidates`, replaced by `results` and `result_outputs`.
   Segments now hold only raw extents.
 - `asset_tag_index`, replaced by two columns of `assets`.
 - `path_index`, replaced by `bundles.primary_asset`.
 - The import index tables, now one `import_keys` table.
-- `claim_collisions` and `claim_pending`. Collisions are namespace
-  `errors` rows; pending claims are a return value.
+- `claim_collisions` and `claim_pending`. Collisions are subjects of
+  `source_claims` with more than one distinct claimant; pending claims
+  are a return value.
 - `scan_diagnostics`.
 - `directories`, now `files.canonical_path`.
 - `asset_resolutions`. An asset resolves by point reads; a deleted asset

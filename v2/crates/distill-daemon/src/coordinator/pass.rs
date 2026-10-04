@@ -88,7 +88,7 @@ pub(super) enum ScanStep {
     Incremental(Box<IncrementalStep>),
     Full(Box<FullStep>),
     /// The scan could not observe some subjects: the namespace keeps what it
-    /// published and only its errors change.
+    /// published, and the rejection becomes the pending one.
     Rejection(Box<RejectionStep>),
 }
 
@@ -172,10 +172,9 @@ pub(super) struct FullStep {
 }
 
 pub(super) struct RejectionStep {
-    observed: PendingScanRejection,
-    /// The scan observed every root: its rejection replaces the pending
-    /// one instead of joining it.
-    replaces_pending: bool,
+    /// The pending rejection once the step commits: the scan's own, joined
+    /// with the one pending before unless the scan observed every root.
+    pending: PendingScanRejection,
 }
 
 /// What a scan publication pins for its projection and tag index: the
@@ -884,7 +883,7 @@ impl DaemonCoordinator {
         batch: &WatcherBatch,
     ) -> Result<ScanStep, CoordinatorError> {
         let scanner = compiled.scanner();
-        let pending = PendingScanRejection::stored(store)?;
+        let pending = self.server.scan_rejection();
         let healthy = pending.is_none();
         let pending_subjects = pending.map(|pending| pending.subjects).unwrap_or_default();
         let event_keys = batch
@@ -987,7 +986,7 @@ impl DaemonCoordinator {
     ) -> Result<ScanStep, CoordinatorError> {
         match compiled.scanner().scan() {
             Ok(scan)
-                if PendingScanRejection::stored(store)?.is_none()
+                if self.server.scan_rejection().is_none()
                     && self.scan_initialized.get().is_some() =>
             {
                 if scan.matches_published(store)? {
@@ -1035,16 +1034,30 @@ impl DaemonCoordinator {
         replaces_pending: bool,
     ) -> Result<ScanStep, CoordinatorError> {
         let scanner = compiled.scanner();
-        let rejection = classify_scan_rejection(scanner, error)?;
+        let mut rejection = classify_scan_rejection(scanner, error)?;
         let mut subjects = scanner.rejection_subjects(error);
+        if let Some(previous) = self
+            .server
+            .scan_rejection()
+            .filter(|_| !replaces_pending)
+        {
+            rejection = select_scan_rejection([
+                ScanRejection {
+                    version: previous.errors,
+                    configuration: previous.configuration,
+                },
+                rejection,
+            ])?;
+            subjects.extend(previous.subjects);
+        }
         subjects.sort_unstable();
         subjects.dedup();
         Ok(ScanStep::Rejection(Box::new(RejectionStep {
-            observed: PendingScanRejection {
-                rejection,
+            pending: PendingScanRejection {
+                errors: rejection.version,
+                configuration: rejection.configuration,
                 subjects,
             },
-            replaces_pending,
         })))
     }
 
@@ -1096,12 +1109,6 @@ impl DaemonCoordinator {
             ScanStep::Unchanged => Ok((None, BTreeSet::new())),
             ScanStep::Incremental(step) => {
                 let tags = &step.tags;
-                if step.heals {
-                    // The batch revalidated every rejected subject.
-                    store
-                        .input_transaction(|transaction| transaction.set_scan_rejection(None))
-                        .map_err(|error| error.to_string())?;
-                }
                 let authority = tags.authority();
                 let inputs = PlanInputs {
                     authority: authority.as_deref(),
@@ -1121,9 +1128,6 @@ impl DaemonCoordinator {
             }
             ScanStep::Full(step) => {
                 let tags = &step.tags;
-                store
-                    .input_transaction(|transaction| transaction.set_scan_rejection(None))
-                    .map_err(|error| error.to_string())?;
                 let (commit, written) = publish_scan(
                     store,
                     store.input_version().map_err(|error| error.to_string())?,
@@ -1137,57 +1141,25 @@ impl DaemonCoordinator {
                 .map_err(|error| error.to_string())?;
                 Ok((Some(commit), written))
             }
-            ScanStep::Rejection(step) => {
-                let failed = |error: CoordinatorError| error.to_string();
-                // The rejection joins the one the store holds, unless this
-                // scan observed every root.
-                let pending = if step.replaces_pending {
-                    step.observed.clone()
-                } else {
-                    let previous =
-                        PendingScanRejection::stored(store).map_err(|error| error.to_string())?;
-                    let rejection = select_scan_rejection(
-                        previous
-                            .as_ref()
-                            .map(|previous| previous.rejection.clone())
-                            .into_iter()
-                            .chain([step.observed.rejection.clone()]),
-                    )
-                    .map_err(failed)?;
-                    let mut subjects = step.observed.subjects.clone();
-                    subjects.extend(previous.into_iter().flat_map(|previous| previous.subjects));
-                    subjects.sort_unstable();
-                    subjects.dedup();
-                    PendingScanRejection {
-                        rejection,
-                        subjects,
-                    }
-                };
-                let (configuration, _) = store
-                    .input_transaction(|transaction| {
-                        transaction.publish_claims_namespace_errors()?;
-                        transaction.set_scan_rejection(Some(&pending.record()))?;
-                        transaction.publish_configuration_status()
-                    })
-                    .map_err(|error| error.to_string())?;
-                let namespace_errors = store
-                    .namespace_errors()
-                    .map_err(|error| error.to_string())?;
-                let commit = Commit {
-                    configuration: Some(configuration_status(configuration)),
-                    namespace_errors: Some(namespace_errors),
-                    ..Commit::default()
-                };
-                Ok((Some(commit), BTreeSet::new()))
-            }
+            // The rejection changes no published row: it is pending once the
+            // pass commits (see `finish_scan_step`).
+            ScanStep::Rejection(_) => Ok((None, BTreeSet::new())),
         }
     }
 
     /// What a committed `step` leaves behind in this process: a full scan
-    /// is this process's own observation.
+    /// is this process's own observation, and it heals the pending scan
+    /// rejection, as an incremental one that revalidated its subjects does;
+    /// a rejection becomes the pending one.
     fn finish_scan_step(&self, step: &ScanStep) {
-        if let ScanStep::Full(_) = step {
-            let _ = self.scan_initialized.set(());
+        match step {
+            ScanStep::Full(_) => {
+                let _ = self.scan_initialized.set(());
+                self.server.set_scan_rejection(None);
+            }
+            ScanStep::Incremental(step) if step.heals => self.server.set_scan_rejection(None),
+            ScanStep::Rejection(step) => self.server.set_scan_rejection(Some(step.pending.clone())),
+            _ => {}
         }
     }
 }
@@ -1291,13 +1263,7 @@ fn absorb_into(commit: &mut Commit, later: Commit) {
             | distill_rpc::TagProjectionMutation::Remove { asset } => *asset,
         },
     );
-    if later.configuration.is_some() {
-        commit.configuration = later.configuration;
-    }
     commit.pipeline_epoch_changed |= later.pipeline_epoch_changed;
-    if later.namespace_errors.is_some() {
-        commit.namespace_errors = later.namespace_errors;
-    }
 }
 
 #[cfg(test)]
@@ -1317,7 +1283,6 @@ mod tests {
             &mut commit,
             Commit {
                 paths: vec![path("a"), path("b")],
-                namespace_errors: Some(Vec::new()),
                 pipeline_epoch_changed: true,
                 ..Commit::default()
             },
@@ -1332,7 +1297,6 @@ mod tests {
                     },
                     path("c"),
                 ],
-                configuration: Some(ConfigurationStatus::Ready),
                 ..Commit::default()
             },
         );
@@ -1348,8 +1312,6 @@ mod tests {
                 path("c"),
             ]
         );
-        assert_eq!(commit.namespace_errors, Some(Vec::new()));
-        assert_eq!(commit.configuration, Some(ConfigurationStatus::Ready));
         assert!(commit.pipeline_epoch_changed);
     }
 }

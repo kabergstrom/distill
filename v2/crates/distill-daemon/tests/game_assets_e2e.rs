@@ -137,7 +137,7 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
     let config = write_config(&temp, &module, authority.identity());
     let process = DaemonProcess::start(config.clone()).unwrap();
     let reader = process.coordinator().open_reader().unwrap();
-    let failure = reader.pipeline_failure().unwrap();
+    let failure = process.coordinator().pipeline_failure(&reader).unwrap();
     assert!(
         failure.is_none() && process.coordinator().ready_dylib_hash().is_some(),
         "fixture pipeline did not become ready: {failure:?}"

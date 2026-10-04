@@ -77,8 +77,6 @@ fn every_section_13_table_exists() {
         "tools",
         "roots",
         "store_meta",
-        "errors",
-        "scan_rejection_subjects",
         "codegen_outputs",
         "watched_import_failures",
         "change_log",

@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 58;
+pub const SCHEMA_VERSION: u32 = 59;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -68,8 +68,10 @@ CREATE UNIQUE INDEX files_by_canonical ON files(canonical_path)
     WHERE canonical_path IS NOT NULL;
 -- What each scanned bundle claims (bundle and asset UUIDs, derived
 -- outputs, primary paths, malformed skeletons), keyed
--- by the claiming source. See `claims`. A derived output is its one
--- claim (kind 2) while neither it nor its parent is withheld.
+-- by the claiming source. See `claims`. A subject with more than one
+-- distinct claimant collides, and is withheld with what it names; a
+-- derived output is its one claim (kind 2) while neither it nor its
+-- parent is withheld.
 CREATE TABLE source_claims (
     root_id  INTEGER NOT NULL,
     path     TEXT NOT NULL,
@@ -79,37 +81,17 @@ CREATE TABLE source_claims (
     detail   BLOB NOT NULL,
     PRIMARY KEY (root_id, path, kind, subject, claimant)
 );
-CREATE INDEX source_claims_by_subject ON source_claims(kind, subject);
+-- Schema 59: covering the claimant, so a subject's distinct claimants
+-- (whether it collides) and the walk listing the collisions read the
+-- index alone.
+CREATE INDEX source_claims_by_subject ON source_claims(kind, subject, claimant);
 -- Schema 39: the claims an asset makes (a primary path's claimant), for
 -- the sources an asset change makes pending. Led by the claimant: led by
 -- `kind`, it would serve a `DISTINCT claimant` of one kind in order, and
 -- the planner would walk the kind's every claim instead of searching
--- `source_claims_by_subject`.
-CREATE INDEX source_claims_by_claimant ON source_claims(claimant, kind);
--- Per-entity errors (see `errors`): one row per current defect. `family`
--- is the producer that owns the row (1 scan namespace, 2 the pending scan
--- rejection's namespace errors, 3 its configuration error, 4 the
--- configuration source's error, 5 the pipeline candidate's failure);
--- `scope_kind` 1 file, 2 bundle, 3 asset, 4 target, 5 pipeline,
--- 6 configuration, 7 daemon.
-CREATE TABLE errors (
-    family     INTEGER NOT NULL,
-    scope_kind INTEGER NOT NULL CHECK (scope_kind BETWEEN 1 AND 7),
-    scope_id   BLOB NOT NULL,
-    identity   BLOB NOT NULL CHECK (length(identity) = 32),
-    code       INTEGER NOT NULL,
-    record     BLOB NOT NULL,
-    message    TEXT NOT NULL,
-    PRIMARY KEY (family, identity)
-);
--- An entity's errors: a claim subject's collision row (scope 2 bundle,
--- 3 asset) is found by its subject.
-CREATE INDEX errors_by_scope ON errors(scope_kind, scope_id);
--- The physical subjects (platform path encoding) whose revalidation heals
--- the pending scan rejection.
-CREATE TABLE scan_rejection_subjects (
-    path BLOB NOT NULL PRIMARY KEY
-);
+-- `source_claims_by_subject`. Covering the subject, as that index covers
+-- the claimant: otherwise the planner walks the kind there instead.
+CREATE INDEX source_claims_by_claimant ON source_claims(claimant, kind, subject);
 -- The watcher work no pass has consumed yet, in order. kind 0: `path` was
 -- deleted, 1: `path` exists as observed at input version `observation`,
 -- 2: `path` was renamed to `to_path`. A pass acknowledges the rows it

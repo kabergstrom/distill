@@ -78,19 +78,18 @@ fn configuration_error(file_hash: [u8; 32]) -> ConfigurationError {
     )
 }
 
-/// The daemon publishes a rejected configuration source (a malformed
-/// configuration file hashing to `file_hash`) as an input version, on a
-/// writer of its own.
+/// The daemon rejects its configuration source (a malformed configuration
+/// file hashing to `file_hash`): no version is published, the current one
+/// is served under the failure (its stamp is returned).
 fn reject_configuration(project: &TestProject, file_hash: [u8; 32]) -> SnapshotStamp {
-    let mut writer = project.coordinator().open_writer().unwrap();
     project
         .coordinator()
-        .publish_configuration_rejection(
-            &mut writer,
+        .reject_configuration(
             DscpV1::MalformedConfiguration { file_hash },
             "invalid staged configuration",
         )
-        .unwrap()
+        .unwrap();
+    project.server().current_stamp().unwrap()
 }
 
 fn canonical_artifact(
