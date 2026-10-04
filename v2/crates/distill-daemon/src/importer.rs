@@ -163,16 +163,19 @@ impl AuthoringService {
         &self,
         store: &mut Store,
         dirty: &[distill_store::files::DirtyEntry],
+        written: &BTreeSet<(String, String)>,
         fresh: impl Fn(&str, &str) -> Option<Arc<ScannedBundle>>,
     ) -> Result<IndexRefresh, RpcFailure> {
-        self.refresh_dirty_import_index(store, dirty, fresh)
+        self.refresh_dirty_import_index(store, dirty, written, fresh)
     }
 
-    /// Reindex the bundle sources `dirty` names, parsing each once.
+    /// Reindex the bundle sources `dirty` names, parsing each once. The
+    /// input just wrote the bundle row of each source `written` names.
     fn refresh_dirty_import_index(
         &self,
         store: &mut Store,
         dirty: &[distill_store::files::DirtyEntry],
+        written: &BTreeSet<(String, String)>,
         fresh: impl Fn(&str, &str) -> Option<Arc<ScannedBundle>>,
     ) -> Result<IndexRefresh, RpcFailure> {
         store.write_transaction_with(invalid, |store| {
@@ -205,6 +208,11 @@ impl AuthoringService {
                 let Ok(bundle) = source.parsed.clone() else {
                     continue;
                 };
+                // A row the input just wrote from this source is its own.
+                if written.contains(&(root.clone(), path.clone())) {
+                    rows.push(self.index_import_bundle(store, path.clone(), root.clone(), bundle)?);
+                    continue;
+                }
                 let Some(meta) = store.bundle(bundle.uuid).map_err(invalid)? else {
                     continue;
                 };
@@ -214,7 +222,7 @@ impl AuthoringService {
                 } else {
                     self.published_bundle(store, &meta)?
                 };
-                rows.push(self.index_import_bundle(store, &meta, root_name, bundle)?);
+                rows.push(self.index_import_bundle(store, meta.path, root_name, bundle)?);
             }
             if keys.is_empty() {
                 return Ok(IndexRefresh {
@@ -263,10 +271,11 @@ impl AuthoringService {
     fn index_import_bundle(
         &self,
         store: &StoreReader,
-        meta: &BundleMeta,
+        path: String,
         root_name: String,
         bundle: Bundle,
     ) -> Result<ImportIndexSource, RpcFailure> {
+        let uuid = bundle.uuid;
         let mut directory_rules = Vec::new();
         for entry in bundle
             .assets
@@ -280,7 +289,7 @@ impl AuthoringService {
         let mut watched = None;
         if let (Ok(prior), Some(record)) = (decode_prior_import(bundle), record) {
             if prior.model.record.watch {
-                let basis = match store.watched_import_failure(meta.bundle).map_err(invalid)? {
+                let basis = match store.watched_import_failure(uuid).map_err(invalid)? {
                     Some(failure) if failure.terminal == WatchedImportTerminal::DirectoryOrphan => {
                         Vec::new()
                     }
@@ -297,8 +306,8 @@ impl AuthoringService {
         }
         Ok(ImportIndexSource {
             root_name,
-            path: meta.path.clone(),
-            bundle: meta.bundle,
+            path,
+            bundle: uuid,
             watched,
             directory_rules,
         })
@@ -371,7 +380,7 @@ impl AuthoringService {
         store: &mut Store,
     ) -> Result<Vec<BundleUuid>, RpcFailure> {
         let pending = store.pending_file_work().map_err(invalid)?;
-        self.refresh_import_index(store, &pending.dirty, |_, _| None)?;
+        self.refresh_import_index(store, &pending.dirty, &BTreeSet::new(), |_, _| None)?;
         self.watched_imports_due(store, None, None)
     }
 
@@ -1635,7 +1644,7 @@ impl AuthoringService {
     /// clears.
     fn reindex_watched_bundle(&self, store: &mut Store, meta: &BundleMeta) -> Result<(), RpcFailure> {
         let (root_name, bundle) = self.published_bundle(store, meta)?;
-        let row = self.index_import_bundle(store, meta, root_name, bundle)?;
+        let row = self.index_import_bundle(store, meta.path.clone(), root_name, bundle)?;
         let source = [(row.root_name.clone(), row.path.clone())];
         store.replace_import_index(&source, &[row]).map_err(invalid)?;
         Ok(())

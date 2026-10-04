@@ -63,7 +63,7 @@ fn a_shared_bundle_uuid_collides_until_one_claimant_leaves() {
             txn.replace_source_claims(None, &[source("a.bundle", 1, 10), source("b.bundle", 1, 20)])
         })
         .unwrap();
-    let [error] = <[_; 1]>::try_from(store.claims_namespace_errors().unwrap()).unwrap();
+    let [error] = <[_; 1]>::try_from(store.namespace_errors().unwrap()).unwrap();
     let NamespaceErrorV1::DuplicateBundleUuid { bundle, sources } = &error.detail else {
         panic!("expected a bundle collision, got {error:?}");
     };
@@ -71,18 +71,15 @@ fn a_shared_bundle_uuid_collides_until_one_claimant_leaves() {
     assert_eq!(sources.len(), 2);
     // A full replacement leaves nothing pending.
     assert_eq!(pending, Default::default());
-    // The collision is the scan's namespace error.
-    assert_eq!(store.namespace_errors().unwrap(), [error]);
 
     let (pending, _) = store
         .input_transaction(|txn| {
             txn.replace_source_claims(Some(&under("b.bundle")), &[source("b.bundle", 2, 20)])
         })
         .unwrap();
-    assert!(store.claims_namespace_errors().unwrap().is_empty());
     assert!(store.namespace_errors().unwrap().is_empty());
     assert_eq!(
-        pending.bundles.into_iter().collect::<Vec<_>>(),
+        pending.bundles.keys().copied().collect::<Vec<_>>(),
         [BundleUuid([1; 16]), BundleUuid([2; 16])]
     );
     assert_eq!(
@@ -90,7 +87,7 @@ fn a_shared_bundle_uuid_collides_until_one_claimant_leaves() {
         ["b.bundle"]
     );
     assert_eq!(
-        store.bundle_claim_sources(BundleUuid([2; 16])).unwrap()[0].normalized_path,
+        pending.bundles[&BundleUuid([2; 16])][0].normalized_path,
         "b.bundle"
     );
     assert_eq!(
@@ -116,7 +113,7 @@ fn an_asset_uuid_authored_twice_collides() {
             txn.replace_source_claims(Some(&under("b.bundle")), &[source("b.bundle", 2, 10)])
         })
         .unwrap();
-    let [error] = <[_; 1]>::try_from(store.claims_namespace_errors().unwrap()).unwrap();
+    let [error] = <[_; 1]>::try_from(store.namespace_errors().unwrap()).unwrap();
     assert!(
         matches!(
             &error.detail,
@@ -135,13 +132,13 @@ fn an_asset_uuid_authored_twice_collides() {
     let (pending, _) = store
         .input_transaction(|txn| txn.replace_source_claims(Some(&under("b.bundle")), &[]))
         .unwrap();
-    assert!(store.claims_namespace_errors().unwrap().is_empty());
-    assert!(pending.bundles.contains(&BundleUuid([1; 16])));
+    assert!(store.namespace_errors().unwrap().is_empty());
+    assert!(pending.bundles.contains_key(&BundleUuid([1; 16])));
     assert_eq!(
         store.resolve_child(AssetUuid([110; 16])).unwrap(),
         Some((AssetUuid([10; 16]), "thumb".to_owned()))
     );
-    assert!(store.bundle_claim_sources(BundleUuid([2; 16])).unwrap().is_empty());
+    assert!(pending.bundles[&BundleUuid([2; 16])].is_empty());
 }
 
 #[test]
@@ -151,12 +148,66 @@ fn claims_roll_back_with_their_transaction() {
         let pending =
             txn.replace_source_claims(Some(&under("")), &[source("a.bundle", 1, 10), source("b.bundle", 1, 20)])?;
         assert_eq!(pending.bundles.len(), 1);
+        // Both sources claim the bundle.
+        assert_eq!(pending.bundles[&BundleUuid([1; 16])].len(), 2);
         assert_eq!(txn.reader().namespace_errors()?.len(), 1);
         Err(StoreError::Rejected {
             detail: "roll back".to_owned(),
         })
     });
     assert!(failed.is_err());
-    assert!(store.bundle_claim_sources(BundleUuid([1; 16])).unwrap().is_empty());
+    // No claim was left to replace.
+    let (pending, _) = store
+        .input_transaction(|txn| txn.replace_source_claims(Some(&under("")), &[]))
+        .unwrap();
+    assert!(pending.bundles.is_empty());
     assert!(store.namespace_errors().unwrap().is_empty());
+}
+
+/// The claims' namespace errors publish as the scan's family: a malformed
+/// source's error joins the collision rows the claims keep, a stale row
+/// goes, and the family holds exactly what the publication returns.
+#[test]
+fn the_claims_namespace_errors_publish_as_the_scan_family() {
+    use distill_store::state::{NamespaceError, SkeletonFailureCode};
+    let (_d, mut store) = store();
+    let malformed = NamespaceError::new(
+        NamespaceErrorV1::IncompleteSkeleton {
+            source: ReadableBundleSource {
+                root_name: "main".to_owned(),
+                normalized_path: "broken.bundle".to_owned(),
+                file_hash: BundleFileHash([9; 32]),
+            },
+            failure: SkeletonFailureCode::IncompleteAssetIdentity,
+        },
+        "incomplete skeleton",
+    )
+    .unwrap();
+    let broken = SourceClaims {
+        root_name: "main".to_owned(),
+        path: "broken.bundle".to_owned(),
+        claims: vec![SourceClaim::Malformed(malformed.clone())],
+    };
+    let (published, _) = store
+        .input_transaction(|txn| {
+            txn.replace_source_claims(
+                Some(&under("")),
+                &[source("a.bundle", 1, 10), source("b.bundle", 1, 20), broken],
+            )?;
+            txn.publish_claims_namespace_errors()
+        })
+        .unwrap();
+    assert_eq!(published.len(), 2);
+    assert!(published.contains(&malformed));
+    assert_eq!(store.namespace_errors().unwrap(), published);
+
+    let (published, _) = store
+        .input_transaction(|txn| {
+            txn.replace_source_claims(Some(&under("broken.bundle")), &[])?;
+            txn.publish_claims_namespace_errors()
+        })
+        .unwrap();
+    let [collision] = <[_; 1]>::try_from(published).unwrap();
+    assert!(matches!(collision.detail, NamespaceErrorV1::DuplicateBundleUuid { .. }));
+    assert_eq!(store.namespace_errors().unwrap(), [collision]);
 }

@@ -119,8 +119,8 @@ fn pending_file_work_acknowledges_only_the_observed_sequence_prefix() {
     let (root, _) = store
         .input_transaction(|transaction| {
             let root = transaction.intern_root("main")?;
-            transaction.push_dirty(root, "old.bundle", false, InputVersion(1))?;
-            transaction.push_rename(root, "old.bundle", "new.bundle")?;
+            transaction.push_dirty(root, "main", "old.bundle", false, InputVersion(1))?;
+            transaction.push_rename(root, "main", "old.bundle", "new.bundle")?;
             Ok(root)
         })
         .unwrap();
@@ -130,8 +130,8 @@ fn pending_file_work_acknowledges_only_the_observed_sequence_prefix() {
 
     store
         .input_transaction(|transaction| {
-            transaction.push_dirty(root, "later.bundle", true, InputVersion(2))?;
-            transaction.push_rename(root, "later.bundle", "last.bundle")
+            transaction.push_dirty(root, "main", "later.bundle", true, InputVersion(2))?;
+            transaction.push_rename(root, "main", "later.bundle", "last.bundle")
         })
         .unwrap();
     let version = store.input_version().unwrap();
@@ -157,7 +157,7 @@ fn stale_observation_cannot_acknowledge_newer_work_for_the_same_path() {
         .input_transaction(|transaction| {
             let root = transaction.intern_root("main")?;
             transaction.upsert_file(root, "source.txt", &file_state(1).into(), InputVersion(1))?;
-            transaction.push_dirty(root, "source.txt", true, InputVersion(1))?;
+            transaction.push_dirty(root, "main", "source.txt", true, InputVersion(1))?;
             Ok(root)
         })
         .unwrap();
@@ -165,7 +165,7 @@ fn stale_observation_cannot_acknowledge_newer_work_for_the_same_path() {
     store
         .input_transaction(|transaction| {
             transaction.upsert_file(root, "source.txt", &file_state(2).into(), InputVersion(2))?;
-            transaction.push_dirty(root, "source.txt", true, InputVersion(2))
+            transaction.push_dirty(root, "main", "source.txt", true, InputVersion(2))
         })
         .unwrap();
 
@@ -192,7 +192,7 @@ fn a_transaction_view_reads_its_own_uncommitted_scan_rows() {
         let root = txn.intern_root("main")?;
         txn.upsert_file(root, "tex/rock.bundle", &observation, InputVersion(1))?;
         let view = txn.reader();
-        let row = view.observed_file("main", "tex/rock.bundle")?.unwrap();
+        let [row] = <[_; 1]>::try_from(view.observed_files_under("main", "tex/rock.bundle")?).unwrap();
         assert_eq!(row.file, observation);
         assert_eq!(
             view.symlinks_targeting(b"/project/tex")?
@@ -206,7 +206,7 @@ fn a_transaction_view_reads_its_own_uncommitted_scan_rows() {
         })
     });
     assert!(failed.is_err());
-    assert_eq!(store.observed_file("main", "tex/rock.bundle").unwrap(), None);
+    assert!(store.observed_files_under("main", "tex/rock.bundle").unwrap().is_empty());
 }
 
 #[test]
@@ -242,9 +242,9 @@ fn acknowledgement_clears_settled_paths_and_keeps_paths_with_newer_work() {
         .input_transaction(|transaction| {
             let root = transaction.intern_root("main")?;
             transaction.upsert_file(root, "settled.txt", &file_state(1).into(), InputVersion(1))?;
-            transaction.push_dirty(root, "settled.txt", true, InputVersion(1))?;
+            transaction.push_dirty(root, "main", "settled.txt", true, InputVersion(1))?;
             transaction.upsert_file(root, "moving.txt", &file_state(1).into(), InputVersion(1))?;
-            transaction.push_dirty(root, "moving.txt", true, InputVersion(1))?;
+            transaction.push_dirty(root, "main", "moving.txt", true, InputVersion(1))?;
             Ok(root)
         })
         .unwrap();
@@ -252,7 +252,7 @@ fn acknowledgement_clears_settled_paths_and_keeps_paths_with_newer_work() {
     store
         .input_transaction(|transaction| {
             transaction.upsert_file(root, "moving.txt", &file_state(2).into(), InputVersion(2))?;
-            transaction.push_dirty(root, "moving.txt", true, InputVersion(2))
+            transaction.push_dirty(root, "main", "moving.txt", true, InputVersion(2))
         })
         .unwrap();
 
@@ -277,7 +277,7 @@ fn work_queued_and_acknowledged_in_one_transaction_is_never_written() {
         .input_transaction(|transaction| {
             let root = transaction.intern_root("main")?;
             let version = transaction.version();
-            transaction.push_dirty(root, "a.bundle", true, version)
+            transaction.push_dirty(root, "main", "a.bundle", true, version)
         })
         .unwrap();
     let work = store.pending_file_work().unwrap();
@@ -289,7 +289,7 @@ fn work_queued_and_acknowledged_in_one_transaction_is_never_written() {
         .input_transaction(|transaction| {
             let root = transaction.intern_root("main")?;
             let version = transaction.version();
-            transaction.push_dirty(root, "b.bundle", true, version)?;
+            transaction.push_dirty(root, "main", "b.bundle", true, version)?;
             Err::<(), _>(distill_store::StoreError::Rejected {
                 detail: "rolled back".to_owned(),
             })
@@ -304,7 +304,7 @@ fn work_queued_and_acknowledged_in_one_transaction_is_never_written() {
         .input_transaction(|transaction| {
             let root = transaction.intern_root("main")?;
             let version = transaction.version();
-            transaction.push_dirty(root, "c.bundle", true, version)
+            transaction.push_dirty(root, "main", "c.bundle", true, version)
         })
         .unwrap();
     let committed = store.committed_file_work().unwrap();

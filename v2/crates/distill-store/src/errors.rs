@@ -173,15 +173,25 @@ impl InputTxn<'_> {
         family: i64,
         errors: impl IntoIterator<Item = NamespaceError>,
     ) -> Result<Vec<NamespaceError>, StoreError> {
-        let errors =
-            NamespaceError::canonical_set(errors).map_err(StoreError::InvalidNamespaceError)?;
-        // Only the rows that change are written: a family holds the
-        // namespace's defects, and most publications change none.
-        let mut held = self
+        let held = self
             .txn
             .prepare_cached("SELECT identity, record FROM errors WHERE family = ?1")?
             .query_map([family], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)))?
             .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+        self.write_namespace_family(family, errors, held)
+    }
+
+    /// Make `family`, whose rows are `held` (identity to record), hold
+    /// exactly `errors`. Only the rows that change are written: a family
+    /// holds the namespace's defects, and most publications change none.
+    pub(crate) fn write_namespace_family(
+        &mut self,
+        family: i64,
+        errors: impl IntoIterator<Item = NamespaceError>,
+        mut held: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+    ) -> Result<Vec<NamespaceError>, StoreError> {
+        let errors =
+            NamespaceError::canonical_set(errors).map_err(StoreError::InvalidNamespaceError)?;
         for error in &errors {
             let record = error
                 .persisted_bytes()

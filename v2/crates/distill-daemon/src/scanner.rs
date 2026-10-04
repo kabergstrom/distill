@@ -330,6 +330,30 @@ impl std::fmt::Display for ScanDiagnostic {
 pub struct ScanDelta {
     affected: Vec<(String, String)>,
     observed: ScanSnapshot,
+    /// What the baseline published under each affected prefix an event
+    /// named, as the scan read it for the event's previous spelling.
+    published: BTreeMap<(String, String), PublishedFiles>,
+}
+
+/// The files a baseline publishes at or below one rooted path, in path
+/// order (the path's own row first), with each symlink alias's target.
+#[derive(Debug, Clone, Default)]
+pub struct PublishedFiles {
+    files: Vec<ScannedFile>,
+    aliases: Vec<((String, String), PathBuf)>,
+}
+
+impl PublishedFiles {
+    fn read(reader: &StoreReader, root: &str, prefix: &str) -> Result<Self, StoreError> {
+        let mut published = Self::default();
+        for row in reader.observed_files_under(root, prefix)? {
+            let key = (row.root_name.clone(), row.path.clone());
+            let (file, alias) = scanned_file_row(row);
+            published.aliases.extend(alias.map(|target| (key, target)));
+            published.files.push(file);
+        }
+        Ok(published)
+    }
 }
 
 impl ScanSnapshot {
@@ -456,21 +480,20 @@ impl ScanDelta {
     /// Whether the store publishes, under every affected prefix, the
     /// namespace this delta observed there: its files, symlink targets and
     /// directories, and its bundle files' hashes (never their bytes).
-    /// Diagnostics are scanner state and do not count.
+    /// Diagnostics are scanner state and do not count. `published` is the
+    /// store the delta's baseline read: a prefix an event named compares
+    /// with the files that read returned.
     pub(crate) fn matches_published(&self, published: &StoreReader) -> Result<bool, StoreError> {
         for affected in &self.affected {
             let (root, prefix) = affected;
-            let mut aliases = Vec::new();
-            let files = published
-                .observed_files_under(root, prefix)?
-                .into_iter()
-                .map(|row| {
-                    let key = (row.root_name.clone(), row.path.clone());
-                    let (file, alias) = scanned_file_row(row);
-                    aliases.extend(alias.map(|target| (key, target)));
-                    file
-                })
-                .collect::<Vec<_>>();
+            let read;
+            let PublishedFiles { files, aliases } = match self.published.get(affected) {
+                Some(files) => files,
+                None => {
+                    read = PublishedFiles::read(published, root, prefix)?;
+                    &read
+                }
+            };
             let bundles = published.bundle_file_hashes_under(root, prefix)?;
             let same = files.iter().eq(matching_values(&self.observed.files, affected))
                 && aliases
@@ -493,8 +516,8 @@ impl ScanDelta {
 /// either an in-memory [`ScanSnapshot`] or the store's scan tables
 /// ([`StoredBaseline`]).
 pub trait ScanBaseline {
-    /// The on-disk spelling recorded for one rooted path.
-    fn raw_relative_path(&self, root: &str, path: &str) -> Option<PlatformPathBytes>;
+    /// The files published at or below one rooted path, its own first.
+    fn files_under(&self, root: &str, path: &str) -> PublishedFiles;
     /// The symlinked files whose canonical target lies at or below `canonical`.
     fn aliases_affected_by(&self, canonical: &Path) -> Vec<(String, String)>;
     /// The first traversed directory whose canonical path is `canonical`,
@@ -503,10 +526,14 @@ pub trait ScanBaseline {
 }
 
 impl ScanBaseline for ScanSnapshot {
-    fn raw_relative_path(&self, root: &str, path: &str) -> Option<PlatformPathBytes> {
-        self.files
-            .get(&(root.to_owned(), path.to_owned()))
-            .map(|file| file.raw_relative_path.clone())
+    fn files_under(&self, root: &str, path: &str) -> PublishedFiles {
+        let prefix = (root.to_owned(), path.to_owned());
+        PublishedFiles {
+            files: matching_values(&self.files, &prefix).cloned().collect(),
+            aliases: subtree_entries(&self.symlink_aliases, &prefix)
+                .map(|(key, target)| (key.clone(), target.clone()))
+                .collect(),
+        }
     }
 
     fn aliases_affected_by(&self, canonical: &Path) -> Vec<(String, String)> {
@@ -550,9 +577,8 @@ impl<'a> StoredBaseline<'a> {
 }
 
 impl ScanBaseline for StoredBaseline<'_> {
-    fn raw_relative_path(&self, root: &str, path: &str) -> Option<PlatformPathBytes> {
-        self.keep(self.reader.observed_file(root, path))
-            .map(|row| decode_raw_path(&row.file.raw_path))
+    fn files_under(&self, root: &str, path: &str) -> PublishedFiles {
+        self.keep(PublishedFiles::read(self.reader, root, path))
     }
 
     fn aliases_affected_by(&self, canonical: &Path) -> Vec<(String, String)> {
@@ -1147,6 +1173,7 @@ impl RootedScanner {
         // identity.  Reopening from the latter is incorrect on filesystems
         // where NFC-equivalent names are distinct.
         let mut affected = BTreeMap::<(String, String), BTreeSet<PathBuf>>::new();
+        let mut published = BTreeMap::new();
         for event_path in event_paths {
             if let Some((root, path)) = event_key(&roots, event_path)? {
                 let mut canonical_event = roots[&root].canonical_path.clone();
@@ -1157,13 +1184,15 @@ impl RootedScanner {
                     affected.entry(alias).or_default();
                 }
                 let key = (root, path);
+                let files = baseline.files_under(&key.0, &key.1);
                 let physical = affected.entry(key.clone()).or_default();
                 physical.insert(event_path.clone());
-                if let Some(previous) = baseline.raw_relative_path(&key.0, &key.1) {
-                    if let Some(relative) = platform_path(&previous) {
+                if let Some(previous) = files.files.first().filter(|file| file.normalized_path == key.1) {
+                    if let Some(relative) = platform_path(&previous.raw_relative_path) {
                         physical.insert(roots[&key.0].canonical_path.join(relative));
                     }
                 }
+                published.insert(key, files);
             }
         }
         if affected.is_empty() {
@@ -1171,6 +1200,7 @@ impl RootedScanner {
         }
         let physical = affected.clone();
         let affected = collapse_affected(affected.into_keys().collect());
+        published.retain(|key, _| affected.contains(key));
         let mut observed = ScanSnapshot::default();
         let mut errors = Vec::new();
         for (root, path) in &affected {
@@ -1196,7 +1226,11 @@ impl RootedScanner {
         }
         rebuild_reverse_indexes(&mut observed)?;
         validate_incremental_directory_aliases(baseline, &affected, &observed)?;
-        Ok(Some(ScanDelta { affected, observed }))
+        Ok(Some(ScanDelta {
+            affected,
+            observed,
+            published,
+        }))
     }
 
     /// Convenience path for callers that require a standalone snapshot. Live
@@ -2565,6 +2599,7 @@ mod tests {
             let delta = ScanDelta {
                 affected: vec![("main".to_owned(), String::new())],
                 observed: snapshot(observed),
+                published: BTreeMap::new(),
             };
             crate::coordinator::incremental_overlay(&store.reader().unwrap(), &delta)
                 .unwrap()
@@ -2618,6 +2653,7 @@ mod tests {
                 scanned("dir", ScannedFileKind::Directory, 0),
                 scanned("dir/child", ScannedFileKind::File, 5),
             ]),
+            published: BTreeMap::new(),
         };
         assert!(!changed.matches_published(&store).unwrap());
         let unchanged = ScanDelta {
@@ -2626,6 +2662,7 @@ mod tests {
                 scanned("dir", ScannedFileKind::Directory, 0),
                 scanned("dir/child", ScannedFileKind::File, 4),
             ]),
+            published: BTreeMap::new(),
         };
         assert!(unchanged.matches_published(&store).unwrap());
         assert!(!unchanged.rename_moves_nothing(&store, "main", "dir/child").unwrap());
@@ -2636,6 +2673,7 @@ mod tests {
         applied.apply_delta(ScanDelta {
             affected: vec![affected],
             observed: snapshot([scanned("dir", ScannedFileKind::Directory, 0)]),
+            published: BTreeMap::new(),
         });
         assert_eq!(
             applied.files.keys().map(|key| key.1.as_str()).collect::<Vec<_>>(),

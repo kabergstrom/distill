@@ -1728,7 +1728,7 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         .input_transaction(|txn| {
             let root = txn.intern_root("main")?;
             let version = txn.version();
-            txn.push_dirty(root, "gone.png", false, version)
+            txn.push_dirty(root, "main", "gone.png", false, version)
         })
         .unwrap();
     // Two sources claim one asset: a collision the edit below resolves.
@@ -1763,13 +1763,14 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         })
         .unwrap();
     let plans = configuration_plans(&mut store, |store| {
-        store.bundle_claim_sources(bundle_uuid(42)).unwrap();
         store.path_claims(&bundle_path(4)).unwrap();
         let work = store.pending_file_work().unwrap();
         store.acknowledge_file_work(&work).unwrap();
         store.replace_import_index(&sources[..1], &rows[..1]).unwrap();
         store.directory_rule_sources_listing(["", "d04/"]).unwrap();
-        store.claims_namespace_errors().unwrap();
+        store
+            .input_transaction(|txn| txn.publish_claims_namespace_errors().map(drop))
+            .unwrap();
         store.pipeline_failure().unwrap();
         store.pipeline_module_hash().unwrap();
         // A rejected pipeline candidate: no module, one failure row.
@@ -1832,7 +1833,6 @@ fn pass_bookkeeping_statements_search_their_indexes() {
             "SELECT identity FROM errors WHERE scope_kind",
             &["SEARCH errors USING INDEX errors_by_scope (scope_kind=? AND scope_id=?)"],
         ),
-        ("SELECT DISTINCT claimant FROM source_claims WHERE kind = 0", &distinct),
         // The pending work: a pass's whole queue.
         ("SELECT w.seq", &["SCAN w", by_root]),
         // Acknowledging it: the captured range, and what was queued since.
@@ -1866,6 +1866,7 @@ fn pass_bookkeeping_statements_search_their_indexes() {
             ],
         ),
         ("SELECT claimant FROM source_claims WHERE kind = 1", &by_subject),
+        ("SELECT claimant FROM source_claims WHERE kind = 5", &["SEARCH source_claims USING INDEX source_claims_by_subject (kind=?)"]),
         (
             "SELECT subject FROM source_claims WHERE kind",
             &["SEARCH source_claims USING INDEX source_claims_by_claimant (claimant=? AND kind=?)"],
@@ -1880,7 +1881,7 @@ fn pass_bookkeeping_statements_search_their_indexes() {
             &["SEARCH errors USING INDEX sqlite_autoindex_errors_1 (family=? AND identity=?)"],
         ),
         (
-            "SELECT record FROM errors WHERE family = 1 AND scope_kind IN (2, 3)",
+            "SELECT identity, record, scope_kind FROM errors WHERE family = 1",
             &["SEARCH errors USING INDEX sqlite_autoindex_errors_1 (family=?)"],
         ),
         (

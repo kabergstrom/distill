@@ -782,7 +782,8 @@ impl DaemonCoordinator {
                         &retyped,
                         Some(&schema_authority),
                         claims,
-                    ),
+                    )
+                    .map(|(commit, _)| commit),
                     _ => publish_reconfiguration(
                         store,
                         &scanner,
@@ -1816,15 +1817,13 @@ fn incremental_plan(
     reader: &StoreReader,
     inputs: &PlanInputs<'_>,
     pending: PendingClaims,
+    namespace_errors: Vec<NamespaceError>,
 ) -> Result<IncrementalScanPlan, CoordinatorError> {
-    let namespace_errors = NamespaceError::canonical_set(reader.claims_namespace_errors()?)
-        .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-    // Every source of each pending bundle: a colliding bundle withholds the
-    // assets of all of them.
+    // Every source of each pending bundle, as the claims replacement read
+    // them: a colliding bundle withholds the assets of all of them.
     let mut claimed = BTreeMap::new();
-    for bundle in pending.bundles {
-        let sources = reader
-            .bundle_claim_sources(bundle)?
+    for (bundle, sources) in pending.bundles {
+        let sources = sources
             .iter()
             .map(|source| {
                 claimed_source(
@@ -2240,6 +2239,8 @@ impl AssetGroupChanges {
     }
 }
 
+/// Publish a complete scan. Returns its commit and the sources whose bundle
+/// rows it wrote: each such row is at its source.
 #[allow(clippy::too_many_arguments)] // The scan transaction receives each publication input explicitly.
 fn publish_scan(
     store: &mut Store,
@@ -2251,7 +2252,7 @@ fn publish_scan(
     retyped: &BTreeSet<TypeUuid>,
     authority: Option<&ProjectSchemaAuthority>,
     claims: &[SourceClaims],
-) -> Result<Commit, StoreError> {
+) -> Result<(Commit, BTreeSet<ScanKey>), StoreError> {
     let derived_errors = derived_collisions(&candidate, projection)?;
     candidate.namespace_errors = NamespaceError::canonical_set(
         std::mem::take(&mut candidate.namespace_errors)
@@ -2383,6 +2384,7 @@ fn publish_scan(
         &rpc_publishable_bundles,
     )?;
     let mut configuration = None;
+    let mut written = BTreeSet::new();
     store.input_transaction(|transaction| {
         // Rows are labelled with the version the input publishes, which a
         // pass's earlier step may already have advanced to.
@@ -2393,7 +2395,7 @@ fn publish_scan(
         for (root_name, path) in &removed_files {
             let root = transaction.intern_root(root_name)?;
             transaction.remove_file(root, path)?;
-            transaction.push_dirty(root, path, false, observation)?;
+            transaction.push_dirty(root, root_name, path, false, observation)?;
         }
         let mut root_ids = BTreeMap::new();
         for (key, file) in candidate.scan.file_observations() {
@@ -2405,7 +2407,7 @@ fn publish_scan(
             };
             transaction.upsert_file(root, &key.1, &file, observation)?;
             if dirty {
-                transaction.push_dirty(root, &key.1, true, observation)?;
+                transaction.push_dirty(root, &key.0, &key.1, true, observation)?;
             }
         }
         transaction.set_namespace_errors(candidate.namespace_errors.iter().cloned())?;
@@ -2499,6 +2501,7 @@ fn publish_scan(
                 // them to clear.
                 transaction.insert_bundle(&meta, &assets, primary)?;
             }
+            written.insert((source.root_name.clone(), source.normalized_path.clone()));
             transaction.set_bundle_path_refs(
                 bundle.uuid,
                 crate::operations::bundle_path_references(bundle)
@@ -2529,12 +2532,12 @@ fn publish_scan(
             let root = *root_ids
                 .entry(rename.root_name.clone())
                 .or_insert(transaction.intern_root(&rename.root_name)?);
-            transaction.push_rename(root, &rename.from_path, &rename.to_path)?;
+            transaction.push_rename(root, &rename.root_name, &rename.from_path, &rename.to_path)?;
         }
         Ok(())
     })?;
     commit.configuration = Some(configuration_status(configuration));
-    Ok(commit)
+    Ok((commit, written))
 }
 
 /// The (root, path) of each poisoned bundle holding an asset of a type whose
@@ -2640,6 +2643,7 @@ fn publish_reconfiguration(
             true,
             &mut BTreeMap::new(),
         )
+        .map(|(commit, _)| commit)
     })?;
     Ok(commit)
 }
@@ -2685,7 +2689,8 @@ fn append_path_mutations(
 
 /// Publish one incremental scan in one input transaction: its file rows and
 /// claims are written first, and the plan is read back from them, so a
-/// failed publication rolls both back.
+/// failed publication rolls both back. Returns its commit and the sources
+/// whose bundle rows it wrote.
 #[allow(clippy::too_many_arguments)] // The transaction receives each independently pinned publication authority.
 fn publish_incremental_scan(
     store: &mut Store,
@@ -2695,7 +2700,7 @@ fn publish_incremental_scan(
     inputs: &PlanInputs<'_>,
     renames: &[LogicalRename],
     projection: &PipelineProjection,
-) -> Result<Commit, StoreError> {
+) -> Result<(Commit, BTreeSet<ScanKey>), StoreError> {
     if store.input_version()? != base {
         return Err(StoreError::InvalidConfiguration {
             error: format!(
@@ -2704,7 +2709,7 @@ fn publish_incremental_scan(
             ),
         });
     }
-    let (commit, _) = store.input_transaction(|transaction| {
+    let (published, _) = store.input_transaction(|transaction| {
         // Rows are labelled with the version the input publishes: inside a
         // pass, an earlier step has already advanced it past `base`.
         let observation = transaction.version();
@@ -2718,7 +2723,7 @@ fn publish_incremental_scan(
                 .or_insert(transaction.intern_root(&mutation.root_name)?);
             if mutation.file.is_none() {
                 transaction.remove_file(root, &mutation.path)?;
-                transaction.push_dirty(root, &mutation.path, false, observation)?;
+                transaction.push_dirty(root, &mutation.root_name, &mutation.path, false, observation)?;
             }
         }
         for mutation in &file_mutations {
@@ -2726,11 +2731,11 @@ fn publish_incremental_scan(
             let root = root_ids[&mutation.root_name];
             transaction.upsert_file(root, &mutation.path, file, observation)?;
             if mutation.dirty {
-                transaction.push_dirty(root, &mutation.path, true, observation)?;
+                transaction.push_dirty(root, &mutation.root_name, &mutation.path, true, observation)?;
             }
         }
         let pending = transaction.replace_source_claims(Some(delta.affected_prefixes()), claims)?;
-        let commit = publish_claimed(
+        let published = publish_claimed(
             transaction,
             pending,
             inputs,
@@ -2743,11 +2748,11 @@ fn publish_incremental_scan(
             let root = *root_ids
                 .entry(rename.root_name.clone())
                 .or_insert(transaction.intern_root(&rename.root_name)?);
-            transaction.push_rename(root, &rename.from_path, &rename.to_path)?;
+            transaction.push_rename(root, &rename.root_name, &rename.from_path, &rename.to_path)?;
         }
-        Ok(commit)
+        Ok(published)
     })?;
-    Ok(commit)
+    Ok(published)
 }
 
 /// Publish the plan of the claims an input just replaced, inside that
@@ -2755,7 +2760,8 @@ fn publish_incremental_scan(
 /// advanced when `advance_configuration`), the bundles whose rows change
 /// (and every bundle of `forced`, whose rows change without its summary or
 /// assets: a retype, a new skeleton), and the derived outputs, of the
-/// subjects `pending` names.
+/// subjects `pending` names. Returns the commit and the sources whose
+/// bundle rows it wrote.
 #[allow(clippy::too_many_arguments)] // Each input is independently pinned by the caller.
 fn publish_claimed(
     transaction: &mut distill_store::InputTxn<'_>,
@@ -2765,15 +2771,23 @@ fn publish_claimed(
     forced: &BTreeSet<BundleUuid>,
     advance_configuration: bool,
     root_ids: &mut BTreeMap<String, distill_store::files::RootId>,
-) -> Result<Commit, StoreError> {
+) -> Result<(Commit, BTreeSet<ScanKey>), StoreError> {
+    // The claims' namespace errors, which the plan withholds by.
+    let namespace_errors = transaction.publish_claims_namespace_errors()?;
     let IncrementalPublication {
         plan,
         mut commit,
         changed_bundles,
         held,
         configuration_generation,
-    } = prepare_incremental_publication(&transaction.reader(), inputs, pending, projection, forced)?;
-    transaction.set_namespace_errors(plan.namespace_errors.iter().cloned())?;
+    } = prepare_incremental_publication(
+        &transaction.reader(),
+        inputs,
+        pending,
+        namespace_errors,
+        projection,
+        forced,
+    )?;
     let generation = if advance_configuration {
         configuration_generation
             .checked_add(1)
@@ -2785,6 +2799,7 @@ fn publish_claimed(
     };
     let configuration = transaction.publish_configuration_status(generation)?;
     commit.configuration = Some(configuration_status(configuration));
+    let mut written = BTreeSet::new();
     for bundle_uuid in &changed_bundles {
         // A bundle this input rewrites keeps its row.
         let Some(source) = &plan.bundles[bundle_uuid] else {
@@ -2851,8 +2866,9 @@ fn publish_claimed(
         if let Some(primary) = &bundle.primary {
             transaction.set_primary_asset(bundle.uuid, bundle.assets[primary].uuid)?;
         }
+        written.insert((source.root_name.clone(), source.normalized_path.clone()));
     }
-    Ok(commit)
+    Ok((commit, written))
 }
 
 struct IncrementalPublication {
@@ -2870,10 +2886,11 @@ fn prepare_incremental_publication(
     store: &StoreReader,
     inputs: &PlanInputs<'_>,
     pending: PendingClaims,
+    namespace_errors: Vec<NamespaceError>,
     projection: &PipelineProjection,
     forced: &BTreeSet<BundleUuid>,
 ) -> Result<IncrementalPublication, StoreError> {
-    let plan = incremental_plan(store, inputs, pending).map_err(|error| match error {
+    let plan = incremental_plan(store, inputs, pending, namespace_errors).map_err(|error| match error {
         CoordinatorError::Drifted { root, path } => StoreError::Drifted { root, path },
         error => StoreError::InvalidConfiguration {
             error: error.to_string(),
@@ -3145,7 +3162,7 @@ pub(crate) fn publish_incremental_paths(
         fresh: fresh_bundles(&delta),
         scanner,
     };
-    let mut commit = publish_incremental_scan(
+    let (mut commit, _) = publish_incremental_scan(
         store,
         base,
         &delta,

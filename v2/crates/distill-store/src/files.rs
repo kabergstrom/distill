@@ -122,12 +122,14 @@ impl PendingFileWork {
 enum QueuedEntry {
     Dirty {
         root: RootId,
+        root_name: String,
         path: String,
         exists: bool,
         observation: InputVersion,
     },
     Rename {
         root: RootId,
+        root_name: String,
         from: String,
         to: String,
     },
@@ -193,6 +195,7 @@ impl QueuedWork {
                     path,
                     exists,
                     observation,
+                    ..
                 } => insert.execute(rusqlite::params![
                     *exists as i64,
                     root.0,
@@ -200,7 +203,7 @@ impl QueuedWork {
                     None::<String>,
                     observation.0 as i64
                 ])?,
-                QueuedEntry::Rename { root, from, to } => insert.execute(rusqlite::params![
+                QueuedEntry::Rename { root, from, to, .. } => insert.execute(rusqlite::params![
                     WORK_RENAME,
                     root.0,
                     from,
@@ -307,12 +310,14 @@ impl InputTxn<'_> {
     pub fn push_dirty(
         &mut self,
         root: RootId,
+        root_name: &str,
         path: &str,
         exists: bool,
         observation: InputVersion,
     ) -> Result<(), StoreError> {
         self.queued_work.entries.push(QueuedEntry::Dirty {
             root,
+            root_name: root_name.to_owned(),
             path: path.to_owned(),
             exists,
             observation,
@@ -321,9 +326,16 @@ impl InputTxn<'_> {
     }
 
     /// Queue a rename, in order with the rest of the work.
-    pub fn push_rename(&mut self, root: RootId, from: &str, to: &str) -> Result<(), StoreError> {
+    pub fn push_rename(
+        &mut self,
+        root: RootId,
+        root_name: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<(), StoreError> {
         self.queued_work.entries.push(QueuedEntry::Rename {
             root,
+            root_name: root_name.to_owned(),
             from: from.to_owned(),
             to: to.to_owned(),
         });
@@ -382,34 +394,29 @@ impl Store {
     pub fn pending_file_work(&self) -> Result<PendingFileWork, StoreError> {
         let mut work = self.read.committed_file_work()?;
         let queued = &self.queued_work;
-        let mut names = std::collections::BTreeMap::new();
-        let mut name = |root: RootId| -> Result<String, StoreError> {
-            if let Some(name) = names.get(&root) {
-                return Ok(String::clone(name));
-            }
-            let found = self.read.root_name(root)?.ok_or_else(|| StoreError::Rejected {
-                detail: format!("queued work names unknown root {}", root.0),
-            })?;
-            names.insert(root, found.clone());
-            Ok(found)
-        };
         for entry in &queued.entries[queued.consumed..] {
             match entry {
                 QueuedEntry::Dirty {
                     root,
+                    root_name,
                     path,
                     exists,
                     observation,
                 } => work.dirty.push(DirtyEntry {
                     root: *root,
-                    root_name: name(*root)?,
+                    root_name: root_name.clone(),
                     path: path.clone(),
                     exists: *exists,
                     observation: *observation,
                 }),
-                QueuedEntry::Rename { root, from, to } => work.renames.push(RenameEvent {
+                QueuedEntry::Rename {
+                    root,
+                    root_name,
+                    from,
+                    to,
+                } => work.renames.push(RenameEvent {
                     root: *root,
-                    root_name: name(*root)?,
+                    root_name: root_name.clone(),
                     from_path: from.clone(),
                     to_path: to.clone(),
                 }),
@@ -615,19 +622,6 @@ impl StoreReader {
             [path],
             observed_file_row,
         )
-    }
-
-    /// One scanned row.
-    pub fn observed_file(
-        &self,
-        root_name: &str,
-        path: &str,
-    ) -> Result<Option<ObservedFile>, StoreError> {
-        Ok(self
-            .conn
-            .prepare_cached(&format!("{OBSERVED_FILE} WHERE r.name = ?1 AND t.path = ?2"))?
-            .query_row(rusqlite::params![root_name, path], observed_file_row)
-            .optional()?)
     }
 
     /// Symlinked file rows whose canonical target starts with the bytes of

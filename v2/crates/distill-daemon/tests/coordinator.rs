@@ -293,7 +293,7 @@ fn claims_survive_a_restart_whose_first_scan_is_rejected() {
 
     let coordinator = coordinator(&temp);
     let reader = coordinator.open_reader().unwrap();
-    let [stored] = <[_; 1]>::try_from(reader.claims_namespace_errors().unwrap()).unwrap();
+    let [stored] = <[_; 1]>::try_from(reader.namespace_errors().unwrap()).unwrap();
     assert!(matches!(
         stored.detail,
         NamespaceErrorV1::DuplicateAssetUuid { asset, .. } if asset == AssetUuid([40; 16])

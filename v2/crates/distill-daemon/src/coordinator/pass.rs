@@ -370,7 +370,7 @@ impl DaemonCoordinator {
                 self.sync_runtime_pipeline_failure(store)
                     .map_err(|error| error.to_string())?;
             }
-            let mut commit = self
+            let (mut commit, written) = self
                 .apply_scan_step(store, &step)
                 .map_err(|failure| failure.noted(&drift))?;
             if scope.imports() {
@@ -378,7 +378,7 @@ impl DaemonCoordinator {
                     Some(work) => work.clone(),
                     None => store.pending_file_work().map_err(|error| error.to_string())?,
                 };
-                let imports = self.discover(store, &step, &work, scope, None)?;
+                let imports = self.discover(store, &step, &work, &written, scope, None)?;
                 if !imports.is_empty() {
                     let mut plans = Vec::with_capacity(imports.len());
                     for import in imports {
@@ -445,7 +445,7 @@ impl DaemonCoordinator {
                 self.sync_runtime_pipeline_failure(store)
                     .map_err(|error| error.to_string())?;
             }
-            let mut commit = self
+            let (mut commit, written) = self
                 .apply_scan_step(store, &step)
                 .map_err(|failure| failure.noted(&drift))?;
             self.refine_scan_tags(store, &step, &mut commit)?;
@@ -461,7 +461,9 @@ impl DaemonCoordinator {
             let mut waiting = Vec::new();
             for level in 0..levels.len() {
                 let mut outputs = Vec::new();
-                for import in self.discover(store, &step, &level_work, level_scope, None)? {
+                // Only the step wrote bundle rows before level 0's imports.
+                let written = if level == 0 { written.clone() } else { BTreeSet::new() };
+                for import in self.discover(store, &step, &level_work, &written, level_scope, None)? {
                     let Some(index) = levels[level]
                         .iter()
                         .position(|(planned, _)| *planned == import)
@@ -668,7 +670,7 @@ impl DaemonCoordinator {
                     let work = published_paths_work(store, std::slice::from_ref(key))
                         .map_err(publication)?;
                     for import in self
-                        .discover(store, step, &work, scope.chained(), Some(&overlay))
+                        .discover(store, step, &work, &BTreeSet::new(), scope.chained(), Some(&overlay))
                         .map_err(publication)?
                     {
                         let Some(destination) = self
@@ -782,11 +784,13 @@ impl DaemonCoordinator {
     /// reimports. A directory output the rules regenerate is not also
     /// reimported from its stale record. `outputs` holds the import outputs
     /// the pass will publish before these run, which they read instead.
+    /// `written` names the sources whose bundle rows the input just wrote.
     fn discover(
         &self,
         store: &mut Store,
         step: &ScanStep,
         work: &PendingFileWork,
+        written: &BTreeSet<ScanKey>,
         scope: ImportScope<'_>,
         outputs: Option<&FileOverlay>,
     ) -> Result<Vec<PassImport>, String> {
@@ -795,7 +799,7 @@ impl DaemonCoordinator {
         // `work` names, parsed once each.
         let refreshed = self
             .authoring
-            .refresh_import_index(store, &work.dirty, |root, path| step.fresh_bundle(root, path))
+            .refresh_import_index(store, &work.dirty, written, |root, path| step.fresh_bundle(root, path))
             .map_err(failure)?;
         // `None` revalidates every import.
         let affected = scope.affected.map(|affected| {
@@ -1045,14 +1049,14 @@ impl DaemonCoordinator {
     }
 
     /// Apply `step` inside the input open on `store`. Returns its RPC
-    /// delta, if it publishes.
+    /// delta, if it publishes, and the sources whose bundle rows it wrote.
     fn apply_scan_step(
         &self,
         store: &mut Store,
         step: &ScanStep,
-    ) -> Result<Option<Commit>, StepFailure> {
+    ) -> Result<(Option<Commit>, BTreeSet<ScanKey>), StepFailure> {
         match step {
-            ScanStep::Unchanged => Ok(None),
+            ScanStep::Unchanged => Ok((None, BTreeSet::new())),
             ScanStep::Incremental(step) => {
                 let tags = &step.tags;
                 if step.heals {
@@ -1067,7 +1071,7 @@ impl DaemonCoordinator {
                     fresh: fresh_bundles(&step.delta),
                     scanner: tags.compiled.scanner(),
                 };
-                let commit = publish_incremental_scan(
+                let (commit, written) = publish_incremental_scan(
                     store,
                     store.input_version().map_err(|error| error.to_string())?,
                     &step.delta,
@@ -1077,14 +1081,14 @@ impl DaemonCoordinator {
                     tags.compiled.projection(),
                 )
                 ?;
-                Ok(Some(commit))
+                Ok((Some(commit), written))
             }
             ScanStep::Full(step) => {
                 let tags = &step.tags;
                 store
                     .input_transaction(|transaction| transaction.set_scan_rejection(None))
                     .map_err(|error| error.to_string())?;
-                let commit = publish_scan(
+                let (commit, written) = publish_scan(
                     store,
                     store.input_version().map_err(|error| error.to_string())?,
                     step.candidate.clone(),
@@ -1096,7 +1100,7 @@ impl DaemonCoordinator {
                     &step.claims,
                 )
                 .map_err(|error| error.to_string())?;
-                Ok(Some(commit))
+                Ok((Some(commit), written))
             }
             ScanStep::Rejection(step) => {
                 let failed = |error: CoordinatorError| error.to_string();
@@ -1124,13 +1128,10 @@ impl DaemonCoordinator {
                         subjects,
                     }
                 };
-                let claims_errors = store
-                    .claims_namespace_errors()
-                    .map_err(|error| error.to_string())?;
                 let generation = store.configuration_generation().map_err(|error| error.to_string())?;
                 let (configuration, _) = store
                     .input_transaction(|transaction| {
-                        transaction.set_namespace_errors(claims_errors)?;
+                        transaction.publish_claims_namespace_errors()?;
                         transaction.set_scan_rejection(Some(&pending.record()))?;
                         transaction.publish_configuration_status(generation)
                     })
@@ -1138,11 +1139,12 @@ impl DaemonCoordinator {
                 let namespace_errors = store
                     .namespace_errors()
                     .map_err(|error| error.to_string())?;
-                Ok(Some(Commit {
+                let commit = Commit {
                     configuration: Some(configuration_status(configuration)),
                     namespace_errors: Some(namespace_errors),
                     ..Commit::default()
-                }))
+                };
+                Ok((Some(commit), BTreeSet::new()))
             }
         }
     }
