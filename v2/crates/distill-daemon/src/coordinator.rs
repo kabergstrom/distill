@@ -2449,8 +2449,18 @@ fn publish_scan(
             None => {}
         }
 
+        // A changed bundle this input rewrites keeps its row; one it does
+        // not, or one gone from the candidate, is removed.
+        let rewritten = published
+            .iter()
+            .filter_map(|source| source.parsed.as_ref().ok().map(|bundle| bundle.uuid))
+            .chain(candidate.bundle_poisons.values().map(|poison| poison.bundle))
+            .filter(|bundle| publishable_changed_bundles.contains(bundle))
+            .collect::<BTreeSet<_>>();
         for bundle in old_bundle_summaries.keys() {
-            if !current_bundle_summaries.contains_key(bundle)
+            if rewritten.contains(bundle) {
+                transaction.clear_bundle(*bundle)?;
+            } else if !current_bundle_summaries.contains_key(bundle)
                 || publishable_changed_bundles.contains(bundle)
             {
                 transaction.remove_bundle(*bundle)?;
@@ -2777,10 +2787,12 @@ fn publish_claimed(
     let configuration = transaction.publish_configuration_status(generation)?;
     commit.configuration = Some(configuration_status(configuration));
     for bundle_uuid in &changed_bundles {
-        transaction.remove_bundle(*bundle_uuid)?;
+        // A bundle this input rewrites keeps its row.
         let Some(source) = &plan.bundles[bundle_uuid] else {
+            transaction.remove_bundle(*bundle_uuid)?;
             continue;
         };
+        transaction.clear_bundle(*bundle_uuid)?;
         if let Some(poison) = plan.bundle_poisons.get(bundle_uuid) {
             let root = *root_ids
                 .entry(poison.root_name.clone())

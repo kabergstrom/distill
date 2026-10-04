@@ -208,6 +208,14 @@ impl InputTxn<'_> {
         Ok(())
     }
 
+    /// Drop what a bundle owns (assets, tags, path references) and keep its
+    /// row, for the [`InputTxn::upsert_bundle`] or
+    /// [`InputTxn::poison_bundle`] that rewrites it in this input.
+    pub fn clear_bundle(&mut self, bundle: BundleUuid) -> Result<(), StoreError> {
+        self.remove_owned_asset_rows(bundle)?;
+        self.clear_path_refs(bundle)
+    }
+
     /// Remove a bundle and everything it owns (assets, tags).
     pub fn remove_bundle(&mut self, bundle: BundleUuid) -> Result<bool, StoreError> {
         self.remove_owned_asset_rows(bundle)?;
@@ -381,6 +389,8 @@ impl InputTxn<'_> {
                root_id = excluded.root_id, path = excluded.path,
                format_version = excluded.format_version,
                content_hash = excluded.content_hash, poison = excluded.poison,
+               origin_rules_bundle = NULL, origin_rule = NULL,
+               origin_group_root = NULL, origin_group_path = NULL,
                import_watched = 0, primary_asset = NULL",
             )?
             .execute(
