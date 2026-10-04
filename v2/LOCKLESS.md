@@ -1309,6 +1309,10 @@ Final cleanup (schema 56, protocol 15):
   `AuthoringBackend::read_file`'s default, `register_importer` (the
   importer tests import through the pipeline fixture), and the store,
   daemon, loader and pack `pub` items only tests called.
+  Test instruments and setup writers that stay (whole-table store reads,
+  row writers, CAS evictions, the coordinator's single-step reconcile
+  drivers, `ModuleHost::publish_candidate`, `install_snapshot_policy`,
+  `serve_one`) compile only under `cfg(test)` or a `test-hooks` feature.
 - Protocol 16: the metadata calls have no `reconnectRequired` arm. A
   metadata connection never outlives its store (the state directory is
   locked to the daemon process), so nothing could produce
