@@ -84,9 +84,6 @@ pub enum StoreError {
     InvalidPipelineState { detail: String },
     /// A configuration transition was structurally invalid.
     InvalidConfiguration { error: String },
-    /// A codegen filesystem publication was prepared from a different set of
-    /// daemon-owned pre-images than the store currently records.
-    CodegenStateDrift,
     /// Another process holds the state directory.
     StateLocked { path: PathBuf },
     /// A CAS frame failed validation at the stated segment offset:
@@ -198,9 +195,6 @@ impl fmt::Display for StoreError {
             }
             StoreError::InvalidConfiguration { error } => {
                 write!(f, "invalid configuration transition: {error}")
-            }
-            StoreError::CodegenStateDrift => {
-                write!(f, "codegen output pre-image state changed before publication")
             }
             StoreError::StateLocked { path } => {
                 write!(f, "state directory is in use by another process ({})", path.display())

@@ -11,7 +11,6 @@ pub mod atomic_file;
 pub mod bundles;
 pub mod cas;
 pub mod claims;
-pub mod codegen;
 pub mod config;
 pub mod current;
 pub mod db;

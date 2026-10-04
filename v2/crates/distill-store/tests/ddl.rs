@@ -57,8 +57,7 @@ fn every_section_13_table_exists() {
     // results / result_outputs / derived_outputs /
     // cas_extents / cas_segments (the three roles of §13's `artifacts`
     // row), cas_refs (what keeps each extent indexed), bundle_path_refs
-    // (the reference fields a rename rewrites), and
-    // codegen_outputs (§20's daemon-owned expected-preimage authority).
+    // (the reference fields a rename rewrites).
     let expected: BTreeSet<String> = [
         "files",
         "source_claims",
@@ -77,7 +76,6 @@ fn every_section_13_table_exists() {
         "tools",
         "roots",
         "store_meta",
-        "codegen_outputs",
         "watched_import_failures",
         "change_log",
         "rpc_targets",
@@ -87,16 +85,6 @@ fn every_section_13_table_exists() {
     .map(str::to_owned)
     .collect();
     assert_eq!(got, expected);
-}
-
-#[test]
-fn codegen_outputs_are_exact_preimage_authority() {
-    let dir = tempfile::tempdir().unwrap();
-    let conn = open_conn(&dir);
-    assert_eq!(
-        columns(&conn, "codegen_outputs"),
-        ["relative_path", "content_hash"]
-    );
 }
 
 #[test]
