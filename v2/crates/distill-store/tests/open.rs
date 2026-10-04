@@ -32,9 +32,9 @@ fn a_refused_open_leaves_the_live_stores_tool_stage_files() {
     let dir = tempfile::tempdir().unwrap();
     let config = cfg(&dir);
     let _live = Store::open(config.clone()).unwrap();
-    let objects = config.state_path.join("tools/objects");
-    std::fs::create_dir_all(&objects).unwrap();
-    let staged = objects.join(".stage-in-flight");
+    let staging = distill_store::atomic_file::staging_dir(&config.state_path.join("tools"));
+    std::fs::create_dir_all(&staging).unwrap();
+    let staged = staging.join("1-1-in-flight");
     std::fs::write(&staged, b"tool bytes").unwrap();
     assert!(matches!(
         Store::open(config.clone()),
@@ -52,24 +52,22 @@ fn instance_id_persists_across_reopen() {
 }
 
 #[test]
-fn reopen_empties_the_tool_object_staging_directory() {
+fn reopen_empties_the_tool_staging_directory() {
     let dir = tempfile::tempdir().unwrap();
     let config = cfg(&dir);
     drop(Store::open(config.clone()).unwrap());
 
-    let objects = config.state_path.join("tools/objects");
-    let staging = distill_store::atomic_file::staging_dir(&objects);
-    std::fs::create_dir_all(&staging).unwrap();
-    let orphan = staging.join("1-1-abandoned");
-    let immutable = objects.join("tool-object");
-    std::fs::write(&orphan, b"partial").unwrap();
-    std::fs::write(&immutable, b"complete").unwrap();
+    let tools = config.state_path.join("tools");
+    let staging = distill_store::atomic_file::staging_dir(&tools);
+    let abandoned = staging.join("1-1-abandoned");
+    std::fs::create_dir_all(abandoned.join("bin")).unwrap();
+    std::fs::write(abandoned.join("bin/tool"), b"partial").unwrap();
 
     drop(Store::open(config).unwrap());
 
-    // Neither is a registered package's: the stage file and the object go.
-    assert!(!orphan.exists());
-    assert!(!immutable.exists());
+    // A staged package tree never committed: opening the tree empties it.
+    assert!(!abandoned.exists());
+    assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
 }
 
 #[test]

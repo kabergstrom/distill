@@ -133,119 +133,84 @@ impl ToolRegistrationV2 {
     }
 }
 
-fn create_dir_all(path: &std::path::Path) -> Result<(), StoreError> {
-    std::fs::create_dir_all(path).map_err(|source| StoreError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
 fn hex_hash(hash: &[u8; 32]) -> String {
     hash.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Empty the tool object store's staging directory: the temps an earlier
-/// process left there never committed. Called under the state lock.
+/// Empty the tool store's staging directory: the package trees an earlier
+/// process staged for inputs that never committed. Called under the state
+/// lock, before anything registers.
 pub(crate) fn open_tool_staging(state_path: &std::path::Path) -> Result<(), StoreError> {
-    let objects = state_path.join("tools/objects");
-    atomic_file::open_staging(&objects).map_err(|source| StoreError::Io {
-        path: objects,
+    let tools = state_path.join("tools");
+    atomic_file::open_staging(&tools).map_err(|source| StoreError::Io {
+        path: tools,
         source,
     })
 }
 
-/// Every registered tool: its hash and identity, one row per
-/// registration (the `tools` namespace, read whole by the collector).
-pub(crate) const REGISTERED_TOOLS: &str =
-    "SELECT tool_hash, identity_object FROM tools WHERE present = 1";
-
-/// The object file a package member is hard-linked from.
-fn tool_object_name(metadata: &ToolPackageFile) -> String {
-    let mode = if metadata.executable { "x" } else { "n" };
-    format!("{}-{mode}", hex_hash(&metadata.bytes_hash))
+fn atomic_error(error: atomic_file::AtomicWriteError) -> StoreError {
+    match error {
+        atomic_file::AtomicWriteError::Io { path, source } => StoreError::Io { path, source },
+        atomic_file::AtomicWriteError::Conflict { path } => StoreError::Io {
+            path,
+            source: std::io::Error::other("conflict"),
+        },
+    }
 }
 
-/// Delete the tool packages and objects no `tools` row names: what a
-/// registration staged in an input that rolled back. Runs at open with
-/// the state lock held, so no registration is in flight; it streams the
-/// registered tools once, which is the namespace it collects.
-pub(crate) fn collect_unregistered_tool_files(
-    conn: &rusqlite::Connection,
-    state_path: &std::path::Path,
-) -> Result<(), StoreError> {
-    let tools = state_path.join("tools");
-    let mut packages = std::collections::HashSet::new();
-    let mut objects = std::collections::HashSet::new();
-    let mut statement = conn.prepare(REGISTERED_TOOLS)?;
-    let mut rows = statement.query([])?;
-    while let Some(row) = rows.next()? {
-        let hash: Vec<u8> = row.get(0)?;
-        if !packages.insert(hex_hash(&exact_blob32(hash, "tool_hash")?)) {
-            continue;
-        }
-        let identity = ToolExecutionIdentityV2::decode_record(&row.get::<_, Vec<u8>>(1)?)
-            .map_err(StoreError::InvalidToolIdentity)?;
-        if let ToolSourceIdentityV2::Package { files, .. } = &identity.source {
-            objects.extend(files.iter().map(tool_object_name));
-        }
-    }
-    let io = |path: &std::path::Path| {
-        let path = path.to_path_buf();
-        move |source| StoreError::Io { path, source }
-    };
-    for (dir, keep, is_package) in [
-        (tools.join("packages"), &packages, true),
-        (tools.join("objects"), &objects, false),
-    ] {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(io(&dir)(error)),
-        };
-        let mut removed = false;
-        for entry in entries {
-            let entry = entry.map_err(io(&dir))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if keep.contains(&name) || name == atomic_file::STAGING_DIR {
-                continue;
-            }
-            let path = entry.path();
-            if is_package {
-                std::fs::remove_dir_all(&path).map_err(io(&path))?;
-            } else {
-                std::fs::remove_file(&path).map_err(io(&path))?;
-            }
-            removed = true;
-        }
-        if removed {
-            crate::cas::store::fsync_dir(&dir)?;
-        }
-    }
-    Ok(())
+/// A package tree a registration staged in the tool store's staging
+/// directory. It is uncommitted until its input commits: the input
+/// publishes it under `packages/<tool hash>` by one rename right before
+/// its `COMMIT` ([`StagedPackage::publish`]), and an input that rolls back
+/// drops it, which deletes the tree. A rolled-back registration therefore
+/// leaves no file outside the staging directory, and nothing collects
+/// packages.
+#[derive(Debug)]
+pub(crate) struct StagedPackage {
+    key: String,
+    files: Vec<ToolPackageFile>,
+    dir: atomic_file::StagedDir,
 }
 
-
-fn stage_immutable_file(
-    key: &str,
-    objects: &std::path::Path,
-    path: &std::path::Path,
-    bytes: &[u8],
-    metadata: &ToolPackageFile,
-) -> Result<(), StoreError> {
-    if !path.exists() {
-        atomic_file::stage_with(objects, path, bytes, |file| {
-            set_staged_permissions(file, metadata.executable)
+impl StagedPackage {
+    fn stage(
+        key: &str,
+        tools: &std::path::Path,
+        root: &std::path::Path,
+        files: &[ToolPackageFile],
+        sources: &[ResolvedToolPackageFile],
+    ) -> Result<Self, StoreError> {
+        let dir = atomic_file::stage_dir(tools, root).map_err(atomic_error)?;
+        for (metadata, source) in files.iter().zip(sources) {
+            dir.write_member(std::path::Path::new(&metadata.path), &source.bytes, |file| {
+                set_staged_permissions(file, metadata.executable)
+            })
+            .map_err(atomic_error)?;
+        }
+        verify_package_root(key, dir.path(), files)?;
+        Ok(Self {
+            key: key.to_owned(),
+            files: files.to_vec(),
+            dir,
         })
-        .and_then(atomic_file::Staged::commit_new)
-        .map_err(|error| match error {
-            atomic_file::AtomicWriteError::Io { path, source } => StoreError::Io { path, source },
-            conflict => StoreError::Io {
-                path: path.to_path_buf(),
-                source: std::io::Error::other(conflict.to_string()),
-            },
-        })?;
     }
-    verify_package_file(key, path, metadata)
+
+    pub(crate) fn target(&self) -> &std::path::Path {
+        self.dir.target()
+    }
+
+    /// Publish the tree under its content-addressed root. Returns the root
+    /// when this call created it (the caller removes it again if its
+    /// commit fails); an existing root is verified instead.
+    pub(crate) fn publish(self) -> Result<Option<PathBuf>, StoreError> {
+        let root = self.dir.target().to_path_buf();
+        if self.dir.publish_new().map_err(atomic_error)? {
+            Ok(Some(root))
+        } else {
+            verify_package_root(&self.key, &root, &self.files)?;
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -570,33 +535,19 @@ impl InputTxn<'_> {
         let root = match &identity.source {
             ToolSourceIdentityV2::Package { files, .. } => {
                 let tools_dir = self.state_path.join("tools");
-                let objects_dir = tools_dir.join("objects");
                 let root = tools_dir.join("packages").join(hex_hash(&tool_hash));
-                create_dir_all(&objects_dir)?;
-                create_dir_all(&root)?;
-                for (metadata, source) in files.iter().zip(&sources) {
-                    let object = objects_dir.join(tool_object_name(metadata));
-                    stage_immutable_file(key, &objects_dir, &object, &source.bytes, metadata)?;
-                    let member = root.join(&metadata.path);
-                    if let Some(parent) = member.parent() {
-                        create_dir_all(parent)?;
-                    }
-                    match std::fs::hard_link(&object, &member) {
-                        Ok(()) => {
-                            if let Some(parent) = member.parent() {
-                                crate::cas::store::fsync_dir(parent)?;
-                            }
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                        Err(source) => {
-                            return Err(StoreError::Io {
-                                path: member,
-                                source,
-                            })
-                        }
-                    }
+                // A package is content-addressed: one already published, or
+                // already staged by this input, is the same tree.
+                if root.exists() {
+                    verify_package_root(key, &root, files)?;
+                } else if !self
+                    .staged_packages
+                    .iter()
+                    .any(|staged| staged.target() == root)
+                {
+                    let staged = StagedPackage::stage(key, &tools_dir, &root, files, &sources)?;
+                    self.staged_packages.push(staged);
                 }
-                verify_package_root(key, &root, files)?;
                 Some(root)
             }
             ToolSourceIdentityV2::Ambient { launcher, .. } => {

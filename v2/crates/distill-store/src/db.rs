@@ -570,6 +570,9 @@ pub struct Store {
     /// Held for as long as any writer of this process is open: one process
     /// per state directory.
     pub(crate) _state_lock: Arc<std::fs::File>,
+    /// Tool package trees the open input staged, published right before it
+    /// commits ([`crate::pipeline::StagedPackage`]); a rollback drops them.
+    staged_packages: Vec<crate::pipeline::StagedPackage>,
     /// Runs in `commit_build` between the append and the index transaction.
     #[cfg(test)]
     pub(crate) before_commit: Option<Box<dyn FnMut() + Send>>,
@@ -654,11 +657,11 @@ impl Store {
             input: InputState::Closed,
             config_source: None,
             _state_lock: state_lock,
+            staged_packages: Vec::new(),
             #[cfg(test)]
             before_commit: None,
         };
         let recovery = store.recover_cas()?;
-        crate::pipeline::collect_unregistered_tool_files(&store.conn, &store.config.state_path)?;
         tracing::info!(
             path = %store.config.state_path.display(),
             input_version = store.input_version()?.0,
@@ -700,6 +703,7 @@ impl Store {
             input: InputState::Closed,
             config_source: None,
             _state_lock: state_lock,
+            staged_packages: Vec::new(),
             #[cfg(test)]
             before_commit: None,
         })
@@ -802,13 +806,15 @@ impl Store {
         let config = Arc::clone(&self.config);
         let state_path = config.state_path.clone();
         let open = self.input;
+        let staged = self.staged_packages.len();
         let txn = self.read.conn.savepoint()?;
         let base = match open {
             InputState::Begun { base } => base,
             _ => InputVersion(meta_get_u64(&txn, "input_version")?.unwrap_or(0)),
         };
         let version = InputVersion(base.0 + 1);
-        let mut input_txn = InputTxn {
+        let out = {
+            let mut input_txn = InputTxn {
             txn,
             base_stamp: SnapshotStamp {
                 instance,
@@ -818,13 +824,21 @@ impl Store {
             state_path,
             config,
             roots: std::collections::BTreeMap::new(),
+                staged_packages: &mut self.staged_packages,
+            };
+            f(&mut input_txn).and_then(|out| {
+                if keep {
+                    meta_set_u64(&input_txn.txn, "input_version", version.0)?;
+                    input_txn.txn.commit()?;
+                }
+                Ok(out)
+            })
         };
-        let out = f(&mut input_txn)?;
-        if keep {
-            meta_set_u64(&input_txn.txn, "input_version", version.0)?;
-            input_txn.txn.commit()?;
+        if out.is_err() || !keep {
+            // The savepoint rolled back: so do the packages it staged.
+            self.staged_packages.truncate(staged);
         }
-        Ok((out, version))
+        Ok((out?, version))
     }
 
     /// Arm one input: the next input transaction begins it, and the writes
@@ -878,15 +892,36 @@ impl Store {
             assert_eq!(state, InputState::Armed, "an input is armed");
             return Ok(self.input_version()?);
         };
+        let staged = std::mem::take(&mut self.staged_packages);
         if keep {
-            match self.read.conn.execute_batch("COMMIT") {
+            // The input's tool packages are published right before its
+            // commit, and removed again if the commit fails: a `tools` row
+            // never names a missing package, and a rolled-back input leaves
+            // none behind (a crash between the two leaves one, under its
+            // content address, for the next registration of it to reuse).
+            let mut created = Vec::new();
+            let published = staged.into_iter().try_for_each(|package| {
+                created.extend(package.publish()?);
+                Ok::<_, StoreError>(())
+            });
+            let committed = published.and_then(|()| {
+                self.read
+                    .conn
+                    .execute_batch("COMMIT")
+                    .map_err(StoreError::from)
+            });
+            match committed {
                 Ok(()) => return Ok(self.input_version()?),
                 Err(error) => {
+                    for root in created {
+                        let _ = std::fs::remove_dir_all(root);
+                    }
                     let _ = self.read.conn.execute_batch("ROLLBACK");
-                    return Err(error.into());
+                    return Err(error);
                 }
             }
         }
+        drop(staged);
         self.read.conn.execute_batch("ROLLBACK")?;
         Ok(base)
     }
@@ -1206,6 +1241,8 @@ pub struct InputTxn<'a> {
     /// memo of this transaction only (it rolls back with it), so a
     /// publication's rows name their root without a lookup each.
     pub(crate) roots: std::collections::BTreeMap<String, crate::files::RootId>,
+    /// The tool package trees this input staged so far.
+    pub(crate) staged_packages: &'a mut Vec<crate::pipeline::StagedPackage>,
 }
 
 impl InputTxn<'_> {

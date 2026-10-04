@@ -277,6 +277,108 @@ pub fn stage_with(
     Ok(staged)
 }
 
+/// A directory tree built in a staging directory, published whole under a
+/// content-addressed name by one rename. Dropping it unpublished deletes
+/// the tree.
+#[derive(Debug)]
+pub struct StagedDir {
+    temp: PathBuf,
+    target: PathBuf,
+    published: bool,
+}
+
+/// Create an empty directory in `owner`'s staging directory, to become
+/// `target` when published.
+pub fn stage_dir(owner: &Path, target: &Path) -> Result<StagedDir, AtomicWriteError> {
+    let staging = staging_dir(owner);
+    create_dirs(&staging).map_err(io_at(&staging))?;
+    let name = target
+        .file_name()
+        .and_then(OsStr::to_str)
+        .map(|name| truncated(name, 64))
+        .unwrap_or("dir");
+    let temp = staging.join(format!(
+        "{}-{}-{name}",
+        std::process::id(),
+        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&temp).map_err(io_at(&temp))?;
+    Ok(StagedDir {
+        temp,
+        target: target.to_path_buf(),
+        published: false,
+    })
+}
+
+impl StagedDir {
+    /// Where the tree is built.
+    pub fn path(&self) -> &Path {
+        &self.temp
+    }
+
+    pub fn target(&self) -> &Path {
+        &self.target
+    }
+
+    /// Write one member file of the tree, synced, with `prepare` run on it
+    /// first (to set its permissions, say); its parent directories are
+    /// created.
+    pub fn write_member(
+        &self,
+        relative: &Path,
+        bytes: &[u8],
+        prepare: impl FnOnce(&File) -> io::Result<()>,
+    ) -> Result<(), AtomicWriteError> {
+        let path = self.temp.join(relative);
+        let parent = parent(&path)?;
+        create_dirs(parent).map_err(io_at(parent))?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(io_at(&path))?;
+        file.write_all(bytes)
+            .and_then(|()| prepare(&file))
+            .and_then(|()| file.sync_all())
+            .map_err(io_at(&path))?;
+        sync_dir(parent).map_err(io_at(parent))
+    }
+
+    /// Publish the tree under its content-addressed target, never replacing
+    /// what is there: one rename. Returns whether this call created it; an
+    /// existing target is the caller's to verify, and this tree is deleted.
+    pub fn publish_new(mut self) -> Result<bool, AtomicWriteError> {
+        let target = self.target.clone();
+        let parent = parent(&target)?;
+        create_dirs(parent).map_err(io_at(parent))?;
+        if fs::symlink_metadata(&target).is_ok() {
+            return Ok(false);
+        }
+        match fs::rename(&self.temp, &target) {
+            Ok(()) => {
+                self.published = true;
+                sync_after_rename(parent);
+                Ok(true)
+            }
+            // Another writer published the same tree first: a rename onto
+            // a non-empty directory fails.
+            Err(_) if fs::symlink_metadata(&target).is_ok() => Ok(false),
+            Err(source) => Err(AtomicWriteError::Io {
+                path: target,
+                source,
+            }),
+        }
+    }
+}
+
+impl Drop for StagedDir {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = fs::remove_dir_all(&self.temp);
+        }
+    }
+}
+
 /// Replace `target` with `bytes` if it still holds `expected`.
 pub fn write(
     owner: &Path,

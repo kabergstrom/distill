@@ -484,10 +484,10 @@ fn ambient_registration_is_not_staged_and_trust_controls_cacheability() {
 
 
 #[test]
-fn a_rolled_back_registrations_package_is_collected_at_open() {
-    // A package is staged on disk inside the publishing input; an input
-    // that rolls back leaves files no `tools` row names. The next open
-    // collects them and keeps every registered package.
+fn a_rolled_back_registration_leaves_no_package() {
+    // A registration stages its package tree in the tool store's staging
+    // directory; only its input's commit publishes it. An input that rolls
+    // back leaves no package, and nothing is collected at open.
     let dir = tempfile::tempdir().unwrap();
     let config = StoreConfig::new(dir.path().join(".distill"));
     let mut store = Store::open(config.clone()).unwrap();
@@ -496,24 +496,60 @@ fn a_rolled_back_registrations_package_is_collected_at_open() {
         .unwrap();
     let mut rolled_back = None;
     let out: Result<((), _), StoreError> = store.input_transaction(|txn| {
-        rolled_back = Some(txn.register_tool("dropped", tool_package(b"dropped tool", b"shared"))?);
+        let registered = txn.register_tool("dropped", tool_package(b"dropped tool", b"shared"))?;
+        // Uncommitted: the tree is staged, not published.
+        assert!(!registered.root.as_ref().unwrap().exists());
+        rolled_back = Some(registered);
         Err(StoreError::Rejected { detail: "the publication failed".into() })
     });
     assert!(out.is_err());
     let dropped_root = rolled_back.unwrap().root.unwrap();
-    assert!(dropped_root.join("bin/tool").is_file());
+    assert!(!dropped_root.exists(), "a rolled-back registration published its package");
+    let tools = config.state_path.join("tools");
+    let staging = distill_store::atomic_file::staging_dir(&tools);
+    let names = |dir: &std::path::Path| -> Vec<String> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert!(names(&staging).is_empty(), "a rolled-back stage outlived its input");
+    let root = kept.root.unwrap();
+    assert_eq!(names(&tools.join("packages")), [root.file_name().unwrap().to_string_lossy().into_owned()]);
+    assert_eq!(std::fs::read(root.join("bin/tool")).unwrap(), b"kept tool");
+    assert_eq!(std::fs::read(root.join("share/config")).unwrap(), b"shared");
     drop(store);
 
     let store = Store::open(config.clone()).unwrap();
-    assert!(!dropped_root.exists(), "a rolled-back package outlived its registration");
-    let objects: Vec<String> = std::fs::read_dir(config.state_path.join("tools/objects"))
+    assert!(store.tool("kept").unwrap().unwrap().revalidate().is_ok());
+    assert!(store.tool("dropped").unwrap().is_none());
+}
+
+/// A savepoint that rolls back inside an input that commits drops the
+/// packages it staged and keeps the input's own.
+#[test]
+fn a_rolled_back_savepoint_drops_only_its_packages() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = StoreConfig::new(dir.path().join(".distill"));
+    let mut store = Store::open(config.clone()).unwrap();
+    store.open_input().unwrap();
+    let (outer, _) = store
+        .input_transaction(|txn| txn.register_tool("outer", tool_package(b"outer tool", b"a")))
+        .unwrap();
+    let inner: Result<((), _), StoreError> = store.input_transaction(|txn| {
+        txn.register_tool("inner", tool_package(b"inner tool", b"b"))?;
+        Err(StoreError::Rejected { detail: "nested failure".into() })
+    });
+    assert!(inner.is_err());
+    store.finish_input(true).unwrap();
+    let packages = std::fs::read_dir(config.state_path.join("tools/packages"))
         .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|name| name != distill_store::atomic_file::STAGING_DIR)
-        .collect();
-    assert_eq!(objects.len(), 2, "the kept package's two objects: {objects:?}");
-    let root = kept.root.unwrap();
-    assert_eq!(std::fs::read(root.join("bin/tool")).unwrap(), b"kept tool");
-    assert_eq!(std::fs::read(root.join("share/config")).unwrap(), b"shared");
-    assert!(store.tool("kept").unwrap().is_some());
+        .count();
+    assert_eq!(packages, 1);
+    assert!(outer.root.unwrap().join("bin/tool").is_file());
+    assert!(store.tool("outer").unwrap().unwrap().revalidate().is_ok());
+    assert!(store.tool("inner").unwrap().is_none());
 }
