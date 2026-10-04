@@ -1413,3 +1413,50 @@ fn restart_required_clears_once_a_restart_adopts_the_staged_values() {
     assert!(writer.pending_restart().unwrap().is_none(), "the restart adopted the values");
     assert_eq!(restart_events(&coordinator), Vec::<Vec<String>>::new());
 }
+
+/// The change log holds only real changes: the first publication on an
+/// empty store logs nothing (no client holds the version before it), and a
+/// full rescan logs only the assets and paths that changed.
+#[test]
+fn a_full_rescan_logs_only_what_changed() {
+    use distill_store::served::Change;
+    let temp = tempfile::tempdir().unwrap();
+    let coordinator = coordinator(&temp);
+    let mut writer = coordinator.open_writer().unwrap();
+    let assets = temp.path().join("assets");
+    let (edited, _, edited_asset) = ordinary_bundle_with(73, 72, 7);
+    let (kept, _, kept_asset) = ordinary_bundle_with(83, 82, 7);
+    std::fs::write(assets.join("edited.bundle"), edited).unwrap();
+    std::fs::write(assets.join("kept.bundle"), kept).unwrap();
+    let log = |version: InputVersion| {
+        coordinator
+            .open_reader()
+            .unwrap()
+            .change_log_after(0)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.version == version)
+            .map(|entry| entry.change)
+            .collect::<Vec<_>>()
+    };
+
+    let first = coordinator.reconcile_full_scan(&mut writer).unwrap().version;
+    assert_eq!(first, InputVersion(1));
+    assert_eq!(log(first), []);
+
+    let (edited, _, _) = ordinary_bundle_with(73, 72, 8);
+    std::fs::write(assets.join("edited.bundle"), edited).unwrap();
+    let edit = coordinator.reconcile_full_scan(&mut writer).unwrap().version;
+    assert_eq!(edit, InputVersion(2));
+    assert_eq!(log(edit), [Change::Asset { asset: edited_asset, state: 0 }]);
+
+    std::fs::remove_file(assets.join("kept.bundle")).unwrap();
+    let removal = coordinator.reconcile_full_scan(&mut writer).unwrap().version;
+    assert_eq!(
+        log(removal),
+        [
+            Change::Asset { asset: kept_asset, state: 1 },
+            Change::Path { path: "kept.bundle".to_owned() },
+        ]
+    );
+}

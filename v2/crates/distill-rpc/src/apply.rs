@@ -76,6 +76,12 @@ pub fn apply_commit<W: ServedWrite>(txn: &mut W, commit: &Commit) -> Result<(), 
     if commit.pipeline_epoch_changed {
         publish_pipeline_fence(txn)?;
     }
+    // The first publication on an empty store logs no deltas: no client can
+    // hold the version before it (the daemon binds its listener only after
+    // its startup publication), so every client reads current state.
+    if version.0 <= 1 {
+        return Ok(());
+    }
     let mut asset_deltas = commit
         .assets
         .iter()

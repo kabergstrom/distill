@@ -1159,9 +1159,9 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
             );
             match event.which().unwrap() {
                 schema::stream_event::Which::InitialDelta(initial) => {
-                    let initial = initial.unwrap();
-                    assert_eq!(initial.len(), 1);
-                    assert_eq!(initial.get(0).get_assets().unwrap().len(), 1);
+                    // The first publication logs nothing: a client reads
+                    // its state.
+                    assert_eq!(initial.unwrap().len(), 0);
                 }
                 _ => panic!("expected cursor-bound initial delta"),
             }

@@ -1305,6 +1305,9 @@ fn a_coordinated_commits_backend_row_and_served_projection_land_together() {
             assert_eq!(next_ledger, None, "no later backend row at {version:?}");
             if version != start {
                 assert!(ledger.is_some(), "backend row at {version:?}");
+            }
+            // The first publication logs nothing.
+            if version != start && version.0 > 1 {
                 assert_eq!(
                     served,
                     Some((version, distill_store::served::Change::Asset { asset: ASSET, state: 0 })),

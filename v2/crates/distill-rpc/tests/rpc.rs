@@ -263,6 +263,8 @@ async fn a_refused_connection_leaves_a_waiting_delta_stream_alone() {
                 .unwrap();
             let entry = authoring_entry(5, AuthoringEntryRole::Runtime);
             let asset = entry.uuid;
+            // The daemon serves only after its first publication.
+            publish_unrelated(&mut project);
             let first_hub = connect(&server, &[]);
             let install = first_hub
                 .subscribe(InputVersion(0), vec![asset], Vec::new())
@@ -1680,6 +1682,8 @@ fn commit_rejects_an_unauthenticated_dscp() {
 fn initial_subscription_delta_is_cursor_bound_ordered_and_filters_assets_and_paths() {
     let mut project = project();
     let server = project.server();
+    // The first publication logs nothing: no client holds the version before.
+    publish_unrelated(&mut project);
     let hub = connect(&server, &[(1, false)]);
     let watched = asset_id(1);
     let ignored = asset_id(2);
@@ -1704,9 +1708,9 @@ fn initial_subscription_delta_is_cursor_bound_ordered_and_filters_assets_and_pat
         )
         .success()
         .unwrap();
-    assert_eq!(install.installed, InputVersion(2));
+    assert_eq!(install.installed, InputVersion(3));
     let first = install.deltas.next().unwrap();
-    assert_eq!(first.basis().snapshot.version, InputVersion(2));
+    assert_eq!(first.basis().snapshot.version, InputVersion(3));
     match first {
         StreamEvent::InitialDelta {
             since,
@@ -1715,12 +1719,12 @@ fn initial_subscription_delta_is_cursor_bound_ordered_and_filters_assets_and_pat
             ..
         } => {
             assert_eq!(since, InputVersion(0));
-            assert_eq!(installed, InputVersion(2));
+            assert_eq!(installed, InputVersion(3));
             assert_eq!(deltas.len(), 2);
-            assert_eq!(deltas[0].basis.snapshot.version, InputVersion(1));
+            assert_eq!(deltas[0].basis.snapshot.version, InputVersion(2));
             assert_eq!(deltas[0].assets, vec![(watched, AssetDeltaState::Changed)]);
             assert_eq!(deltas[0].paths, vec!["watched.bundle"]);
-            assert_eq!(deltas[1].basis.snapshot.version, InputVersion(2));
+            assert_eq!(deltas[1].basis.snapshot.version, InputVersion(3));
             assert_eq!(deltas[1].assets, vec![(watched, AssetDeltaState::Deleted)]);
             assert_eq!(deltas[1].paths, vec!["watched.bundle"]);
         }
@@ -1733,6 +1737,8 @@ fn initial_subscription_delta_is_cursor_bound_ordered_and_filters_assets_and_pat
 fn live_delta_types_changed_deleted_and_restored_and_every_event_has_a_basis() {
     let mut project = project();
     let server = project.server();
+    // The daemon serves only after its first publication, which logs nothing.
+    publish_unrelated(&mut project);
     let hub = connect(&server, &[(1, false)]);
     let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
     let uuid = entry.uuid;
@@ -1897,8 +1903,10 @@ fn slow_subscription_queue_is_bounded_by_a_resync_marker() {
         Some(StreamEvent::InitialDelta { .. })
     ));
 
-    // The watched asset changes in each of 1025 versions.
-    for version in 1..=1025_u16 {
+    // The watched asset changes in each of 1025 versions after the first,
+    // which logs nothing.
+    publish_unrelated(&mut project);
+    for version in 2..=1026_u16 {
         project.write_bundle(
             "watched.bundle",
             BundleUuid([1; 16]),
@@ -1911,7 +1919,7 @@ fn slow_subscription_queue_is_bounded_by_a_resync_marker() {
     assert!(matches!(
         install.deltas.next(),
         Some(StreamEvent::ResyncRequired {
-            oldest_available: InputVersion(1025),
+            oldest_available: InputVersion(1026),
             ..
         })
     ));
@@ -2806,9 +2814,11 @@ fn a_failed_served_write_returns_the_store_error() {
         server.replace_target(TargetDefinition::new("absent", TargetDefinitionHash([1; 32]))),
         Err(distill_rpc::AdminWriteError::Invalid(AdminError::UnknownTarget { .. }))
     ));
+    // The first publication logs nothing: the second has history to drop.
+    publish_unrelated(&mut project);
     publish_unrelated(&mut project);
     assert!(server.discard_history_before(InputVersion(2)).is_err());
-    assert_eq!(server.current_stamp().unwrap().version.0, before.version.0 + 1);
+    assert_eq!(server.current_stamp().unwrap().version.0, before.version.0 + 2);
 }
 
 /// Publishing a protocol epoch or target definition that is already in
