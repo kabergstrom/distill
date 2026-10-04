@@ -354,6 +354,133 @@ fn recursive_option_counts_its_two_wire_only_frames() {
     assert_eq!(&encoded.variable[..4], &0u32.to_le_bytes());
 }
 
+fn option_of(inner: SchemaNode) -> SchemaNode {
+    SchemaNode::Option(Box::new(inner))
+}
+
+fn record(fields: Vec<(&str, SchemaNode)>) -> SchemaNode {
+    SchemaNode::Struct {
+        rev: 0,
+        fields: fields
+            .into_iter()
+            .map(|(name, node)| (name.to_owned(), 0, node))
+            .collect(),
+    }
+}
+
+/// `Option<Box<T>>` on the wire: a canonical enum whose `Some` record
+/// boxes `pointee` — three wire frames above the pointee (§12).
+fn option_box_wire(offset: u32, pointee: WireNode) -> WireNode {
+    wenum(
+        offset,
+        16,
+        8,
+        WireEnumForm::Canonical,
+        vec![
+            wvariant("None", 0, wstruct(8, 0, 1, vec![])),
+            wvariant(
+                "Some",
+                0,
+                wstruct(
+                    8,
+                    8,
+                    8,
+                    vec![wfield(
+                        "0",
+                        0,
+                        wslot(0, 8, 8, SlotKind::Box, vec![pointee]),
+                    )],
+                ),
+            ),
+        ],
+    )
+}
+
+fn wire_backref(distance: u32) -> WireNode {
+    WireNode::BackRef {
+        distance,
+        offset: 0,
+    }
+}
+
+fn parse(text: &str) -> AuthoredValue {
+    distill_json::parse(text).unwrap()
+}
+
+#[test]
+fn backref_reentry_resolves_under_the_targets_own_ancestors() {
+    // A { b: Option<Box<B>> }, B { a: Option<Box<A>>, b: Option<Box<B>> }.
+    // B.b re-enters B; inside it, `a` names A on both trees — logical
+    // BackRef(1), wire BackRef(5) — not the B the re-entry came from.
+    let schema = record(vec![(
+        "b",
+        option_of(record(vec![
+            ("a", option_of(SchemaNode::BackRef(1))),
+            ("b", option_of(SchemaNode::BackRef(0))),
+        ])),
+    )]);
+    let b_wire = wstruct(
+        0,
+        32,
+        8,
+        vec![
+            wfield("a", 0, option_box_wire(0, wire_backref(5))),
+            wfield("b", 1, option_box_wire(16, wire_backref(2))),
+        ],
+    );
+    let wire = wstruct(0, 16, 8, vec![wfield("b", 0, option_box_wire(0, b_wire))]);
+    let value = parse(r#"{"b":{"a":null,"b":{"a":{"b":null},"b":null}}}"#);
+    let encoded = encode_authored_value(&schema, &wire, &value, &mut no_references).unwrap();
+    // Variable section: outer B (32), inner B (32), inner A (16).
+    assert_eq!(encoded.variable.len(), 80);
+    assert_eq!(&encoded.variable[32..36], &1u32.to_le_bytes(), "inner B.a is Some");
+    assert_eq!(&encoded.variable[40..44], &64u32.to_le_bytes(), "boxing the A at 64");
+    assert_eq!(&encoded.variable[44..48], &16u32.to_le_bytes(), "of 16 bytes");
+
+    // A B where `a` names A is refused.
+    let wrong = parse(r#"{"b":{"a":null,"b":{"a":{"a":null,"b":null},"b":null}}}"#);
+    encode_authored_value(&schema, &wire, &wrong, &mut no_references).unwrap_err();
+}
+
+#[test]
+fn backref_reentry_resolves_under_the_targets_own_ancestors_three_deep() {
+    // A { b: Option<Box<B>> }, B { c: Option<Box<C>> },
+    // C { a: Option<Box<A>>, b: Option<Box<B>>, c: Option<Box<C>> }.
+    let schema = record(vec![(
+        "b",
+        option_of(record(vec![(
+            "c",
+            option_of(record(vec![
+                ("a", option_of(SchemaNode::BackRef(2))),
+                ("b", option_of(SchemaNode::BackRef(1))),
+                ("c", option_of(SchemaNode::BackRef(0))),
+            ])),
+        )])),
+    )]);
+    let c_wire = wstruct(
+        0,
+        48,
+        8,
+        vec![
+            wfield("a", 0, option_box_wire(0, wire_backref(8))),
+            wfield("b", 1, option_box_wire(16, wire_backref(5))),
+            wfield("c", 2, option_box_wire(32, wire_backref(2))),
+        ],
+    );
+    let b_wire = wstruct(0, 16, 8, vec![wfield("c", 0, option_box_wire(0, c_wire))]);
+    let wire = wstruct(0, 16, 8, vec![wfield("b", 0, option_box_wire(0, b_wire))]);
+    let value = parse(
+        r#"{"b":{"c":{"a":null,"b":null,"c":{"a":null,"b":{"c":{"a":{"b":{"c":null}},"b":null,"c":{"a":null,"b":null,"c":null}}},"c":null}}}}"#,
+    );
+    encode_authored_value(&schema, &wire, &value, &mut no_references).unwrap();
+
+    // Inside the re-entered C, `b` names B: a C there is refused.
+    let wrong = parse(
+        r#"{"b":{"c":{"a":null,"b":null,"c":{"a":null,"b":{"a":null,"b":null,"c":null},"c":null}}}}"#,
+    );
+    encode_authored_value(&schema, &wire, &wrong, &mut no_references).unwrap_err();
+}
+
 #[test]
 fn blobs_sort_by_structural_path_and_patch_slots_after_sorting() {
     let schema = SchemaNode::Struct {

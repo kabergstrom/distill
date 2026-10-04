@@ -1,6 +1,7 @@
 //! Schema-directed `AuthoredValue` to canonical wire sections (§12).
 
 use distill_bundle::{encode_path, PathComponent};
+use distill_core::frames::{reenter, resolve_backref};
 use distill_core::id::{AssetUuid, TypeUuid};
 use distill_json::AuthoredValue;
 use ngp_schema::node::{PrimitiveKind, SchemaNode};
@@ -316,23 +317,21 @@ impl<'a, R: AuthoredReferenceResolver + ?Sized> Encoder<'a, R> {
         if let (SchemaNode::BackRef(schema_distance), WireNode::BackRef { distance, offset }) =
             (schema, wire)
         {
-            let logical_index = self
-                .logical_frames
-                .len()
-                .checked_sub(1 + *schema_distance as usize)
-                .ok_or_else(|| EncodeError::BackRefMismatch {
+            // Both trees re-enter their target under its own ancestors.
+            let Some((target_schema, logical)) =
+                reenter(&mut self.logical_frames, *schema_distance)
+            else {
+                return Err(EncodeError::BackRefMismatch {
                     path: self.path_string(),
-                })?;
-            let wire_index = self
-                .wire_frames
-                .len()
-                .checked_sub(1 + *distance as usize)
-                .ok_or_else(|| EncodeError::BackRefMismatch {
+                });
+            };
+            let Some((target_wire, physical)) = reenter(&mut self.wire_frames, *distance) else {
+                logical.restore(&mut self.logical_frames);
+                return Err(EncodeError::BackRefMismatch {
                     path: self.path_string(),
-                })?;
-            let target_schema = self.logical_frames[logical_index];
-            let target_wire = self.wire_frames[wire_index];
-            return self.node(
+                });
+            };
+            let encoded = self.node(
                 target_schema,
                 target_wire,
                 value,
@@ -340,6 +339,9 @@ impl<'a, R: AuthoredReferenceResolver + ?Sized> Encoder<'a, R> {
                 Some(placement.unwrap_or(*offset)),
                 FrameMode::Both,
             );
+            physical.restore(&mut self.wire_frames);
+            logical.restore(&mut self.logical_frames);
+            return encoded;
         }
         if matches!(schema, SchemaNode::BackRef(_)) || matches!(wire, WireNode::BackRef { .. }) {
             return Err(EncodeError::BackRefMismatch {
@@ -1015,16 +1017,11 @@ impl<'a, R: AuthoredReferenceResolver + ?Sized> Encoder<'a, R> {
     fn geometry(&self, node: &WireNode) -> Result<(u32, u32), EncodeError> {
         match node {
             WireNode::BackRef { distance, .. } => {
-                let index = self
-                    .wire_frames
-                    .len()
-                    .checked_sub(1 + *distance as usize)
+                resolve_backref(&self.wire_frames, *distance)
+                    .and_then(|(target, _)| geometry(target))
                     .ok_or_else(|| EncodeError::BackRefMismatch {
                         path: self.path_string(),
-                    })?;
-                geometry(self.wire_frames[index]).ok_or_else(|| EncodeError::BackRefMismatch {
-                    path: self.path_string(),
-                })
+                    })
             }
             node => geometry(node).ok_or_else(|| EncodeError::InvalidWireShape {
                 path: self.path_string(),
