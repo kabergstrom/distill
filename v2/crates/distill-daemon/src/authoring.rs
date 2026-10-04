@@ -541,8 +541,8 @@ impl AuthoringBackend for AuthoringService {
         base: InputVersion,
         operations: &[AuthoringOp],
         force_lossy: bool,
-    ) -> Result<Option<WriteReceipt>, RpcFailure> {
-        self.write_direct(store, base, operations, force_lossy).map(Some)
+    ) -> Result<WriteReceipt, RpcFailure> {
+        self.write_direct(store, base, operations, force_lossy)
     }
 
     fn prepare_import(

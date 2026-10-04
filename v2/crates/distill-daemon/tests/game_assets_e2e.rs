@@ -147,7 +147,7 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
     let [texture, mesh, shader] = import_assets(&process, &config, &assets);
 
     let coordinator = process.coordinator();
-    let reader = coordinator.opener().open_reader().unwrap();
+    let reader = coordinator.open_reader().unwrap();
     let target = coordinator
         .compiled_at(&reader)
         .unwrap()

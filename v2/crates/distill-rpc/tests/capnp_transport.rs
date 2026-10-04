@@ -15,11 +15,7 @@ use distill_test_project::{
 use tokio::task::LocalSet;
 
 fn target() -> TargetDefinition {
-    target_with_definition(7)
-}
-
-fn target_with_definition(definition: u8) -> TargetDefinition {
-    TargetDefinition::new("dev", TargetDefinitionHash([definition; 32]))
+    TargetDefinition::new("dev", TargetDefinitionHash([7; 32]))
 }
 
 fn request() -> ConnectRequest {
@@ -140,12 +136,16 @@ async fn remote_loader_client_preserves_typed_calls() {
             let wire = distill_wire::wire::WireNode::Unit { offset: 0 };
             let layout_hash = distill_wire::dswl::dswl_hash(&wire).unwrap();
             let wire_bytes: Arc<[u8]> = Arc::from(distill_wire::dswl::dswl_bytes(&wire).unwrap());
-            server
-                .install_wire_tree(layout_hash, Arc::clone(&wire_bytes))
-                .unwrap();
+            assert_eq!(
+                distill_test_project::put_wire_tree(&server.handle(), &wire_bytes),
+                layout_hash
+            );
             let (content_hash, artifact) =
                 canonical_artifact(asset, TypeUuid([1; 16]), layout_hash, &[7, 8, 9]);
-            server.install_artifact(content_hash, artifact).unwrap();
+            assert_eq!(
+                distill_test_project::put_artifact(&server.handle(), &artifact),
+                content_hash
+            );
             // The bundle file at `path`: its primary asset is `asset`,
             // drifted until something builds it.
             project.write_bundle(
@@ -353,12 +353,12 @@ impl AuthoringBackend for RecordingAuthoringBackend {
         base: InputVersion,
         operations: &[AuthoringOp],
         _force_lossy: bool,
-    ) -> Result<Option<WriteReceipt>, RpcFailure> {
+    ) -> Result<WriteReceipt, RpcFailure> {
         self.writes
             .lock()
             .unwrap()
             .push((base, operations.to_vec()));
-        Ok(Some(receipt_of(operations)))
+        Ok(receipt_of(operations))
     }
 
     fn prepare_import(
@@ -853,7 +853,7 @@ async fn authoring_snapshot_round_trips_over_real_tcp_with_exact_stamp_and_role_
                     if version == failed_stamp.version.0
             ));
 
-            server.replace_target(target_with_definition(8)).unwrap();
+            project.reconfigure(true);
             let fenced = failed.version_request().send().promise.await.unwrap();
             assert!(matches!(
                 fenced.get().unwrap().get_result().unwrap().which().unwrap(),
@@ -1047,7 +1047,7 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
             let (hash, payload) =
                 canonical_artifact(uuid, TypeUuid([1; 16]), LayoutHash([4; 32]), &[10, 11, 12]);
             let expected_structural = payload.structural.clone();
-            server.install_artifact(hash, payload).unwrap();
+            assert_eq!(distill_test_project::put_artifact(&server.handle(), &payload), hash);
             builds.answer(uuid, Ok(BuildAnswer::Built { content_hash: hash }));
             let asset_bundle = |value: u8| {
                 (
@@ -1222,7 +1222,7 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
 
             // The stream notification is advisory; stale capabilities are
             // independently fenced by the generated server adapter.
-            server.replace_target(target_with_definition(8)).unwrap();
+            fence_pipeline(&project);
             let mut fenced_resolve = failed_snapshot.resolve_request();
             fenced_resolve.get().set_uuid(&uuid.0);
             let fenced_response = fenced_resolve.send().promise.await.unwrap();
@@ -1231,7 +1231,7 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
                 schema::resolve_call::Which::ReconnectRequired(reconnect) => {
                     assert_eq!(
                         reconnect.unwrap().get_reason().unwrap(),
-                        schema::ReconnectReason::TargetDefinitionChanged
+                        schema::ReconnectReason::PipelineEpochChanged
                     );
                 }
                 _ => panic!("stale capability must be generation-fenced"),
@@ -1534,14 +1534,14 @@ async fn hub_authoring_operation_and_wire_tree_methods_are_live_and_generation_f
             let backend = Arc::new(RecordingAuthoringBackend::default());
             let handle = ServerHandle::open(
                 backend.clone(),
-                Arc::clone(project.coordinator().opener()),
+                Arc::clone(project.coordinator().server_handle().opener()),
             );
             let server = Server::open(&handle);
             let entry = authoring_entry(31, AuthoringEntryRole::Runtime);
             let wire_node = distill_wire::wire::WireNode::Unit { offset: 0 };
             let tree: Arc<[u8]> = Arc::from(distill_wire::dswl::dswl_bytes(&wire_node).unwrap());
             let layout_hash = distill_wire::dswl::dswl_hash(&wire_node).unwrap();
-            server.install_wire_tree(layout_hash, tree.clone()).unwrap();
+            assert_eq!(distill_test_project::put_wire_tree(&server.handle(), &tree), layout_hash);
             let listener = Rc::new(
                 StagedListener::bind(server.root(), "127.0.0.1:0")
                     .await
@@ -1738,7 +1738,7 @@ async fn hub_authoring_operation_and_wire_tree_methods_are_live_and_generation_f
                 _ => panic!("expected wire tree bytes"),
             }
 
-            server.replace_target(target_with_definition(8)).unwrap();
+            fence_pipeline(&project);
             let mut stale = hub.reimport_request();
             stale.get().set_base(u64::MAX);
             stale.get().reborrow().init_bundle().set_bytes(&[1]);
@@ -1746,7 +1746,7 @@ async fn hub_authoring_operation_and_wire_tree_methods_are_live_and_generation_f
             match stale.get().unwrap().get_result().unwrap().which().unwrap() {
                 schema::uuid_call::Which::ReconnectRequired(reconnect) => assert_eq!(
                     reconnect.unwrap().get_reason().unwrap(),
-                    schema::ReconnectReason::TargetDefinitionChanged
+                    schema::ReconnectReason::PipelineEpochChanged
                 ),
                 _ => panic!("generation fence must precede malformed payload decoding"),
             }
@@ -2159,4 +2159,21 @@ async fn remote_snapshot_serves_the_pack_surface() {
             server_task.abort();
         })
         .await;
+}
+
+/// Fence every connection: the daemon publishes a rejected pipeline
+/// candidate, which changes the pipeline generation.
+fn fence_pipeline(project: &TestProject) {
+    let failure = PipelineFailure::new(
+        PipelineFailureCode::CandidateRegistration,
+        PipelineFailureOrigin::CandidateOpen,
+        CleanupDisposition::CleanedAndClosed,
+        "duplicate processor id",
+    )
+    .unwrap();
+    let mut writer = project.coordinator().open_writer().unwrap();
+    project
+        .coordinator()
+        .publish_pipeline_rejection(&mut writer, failure)
+        .unwrap();
 }

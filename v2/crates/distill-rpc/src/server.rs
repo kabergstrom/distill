@@ -39,12 +39,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::{watch, Notify};
 use unicode_normalization::UnicodeNormalization;
 
-use distill_store::served::{Change, ChangeEntry, ServedWrite};
+use distill_store::served::{Change, ChangeEntry};
 use distill_store::{Store, StoreConfig, StoreError, StoreOpener, StoreReader, StoreWriter};
 
 use crate::apply::{
-    apply_commit, configuration_status, publish_pipeline_fence, publish_protocol_epoch,
-    publish_restart_required, publish_target, publish_target_set, ApplyError,
+    apply_commit, configuration_status, publish_pipeline_fence, publish_restart_required,
+    publish_target_set, ApplyError,
 };
 use crate::persist::{delta_state, reconnect_reason};
 use crate::*;
@@ -160,19 +160,6 @@ enum PublishError {
     },
     Invalid(AdminError),
     Store(StoreError),
-}
-
-/// An admin write that failed: refused as invalid, or the store failed it.
-#[derive(Debug)]
-pub enum AdminWriteError {
-    Invalid(AdminError),
-    Store(StoreError),
-}
-
-impl From<StoreError> for AdminWriteError {
-    fn from(error: StoreError) -> Self {
-        Self::Store(error)
-    }
 }
 
 /// The shared identity of one served store. Every connection opens a front
@@ -410,66 +397,6 @@ impl ServerHandle {
         result
     }
 
-    /// Change served state in one transaction, optionally as a new (empty)
-    /// input version. `job` says whether it changed anything: a version
-    /// that would change nothing rolls back and is not published.
-    fn write_served(
-        &self,
-        store: &mut Store,
-        new_version: bool,
-        job: impl FnOnce(&mut dyn ServedWriteObj) -> Result<bool, StoreError>,
-    ) -> Result<bool, StoreError> {
-        let mut unchanged = false;
-        let result = if new_version {
-            store
-                .input_transaction(|txn| {
-                    if job(txn)? {
-                        return Ok(true);
-                    }
-                    unchanged = true;
-                    Err(StoreError::Rejected {
-                        detail: "the served state is unchanged".to_owned(),
-                    })
-                })
-                .map(|(changed, _)| changed)
-        } else {
-            store.served_transaction(|txn| job(txn))
-        };
-        let changed = match result {
-            Ok(changed) => changed,
-            Err(_) if unchanged => false,
-            Err(error) => return Err(error),
-        };
-        // Inside an open input, readers are told once it commits.
-        if changed && !store.input_open() {
-            self.notify_published();
-        }
-        Ok(changed)
-    }
-}
-
-/// [`ServedWrite`] made object safe by delegation.
-trait ServedWriteObj {
-    fn target(&mut self, name: &str, hash: TargetDefinitionHash) -> Result<bool, StoreError>;
-    fn protocol_epoch(&mut self, epoch: u32) -> Result<bool, StoreError>;
-    fn discard_before(&mut self, oldest: InputVersion) -> Result<bool, StoreError>;
-}
-
-impl<W: ServedWrite> ServedWriteObj for W {
-    /// Whether the known target `name` now has `hash`.
-    fn target(&mut self, name: &str, hash: TargetDefinitionHash) -> Result<bool, StoreError> {
-        Ok(publish_target(self, name, hash)? == Some(true))
-    }
-
-    fn protocol_epoch(&mut self, epoch: u32) -> Result<bool, StoreError> {
-        publish_protocol_epoch(self, epoch)
-    }
-
-    fn discard_before(&mut self, oldest: InputVersion) -> Result<bool, StoreError> {
-        let current = self.change_version();
-        self.discard_change_log_before(InputVersion(oldest.0.min(current.0)))?;
-        Ok(true)
-    }
 }
 
 struct UnavailableBuildBackend;
@@ -487,6 +414,18 @@ impl BuildBackend for UnavailableBuildBackend {
 
 #[cfg(test)]
 impl AuthoringBackend for UnavailableAuthoringBackend {
+    fn write_files(
+        &self,
+        _store: &mut Store,
+        _base: InputVersion,
+        _operations: &[AuthoringOp],
+        _force_lossy: bool,
+    ) -> Result<WriteReceipt, RpcFailure> {
+        Err(RpcFailure::AuthoringBackendUnavailable {
+            operation: "write".to_owned(),
+        })
+    }
+
     fn prepare_import(
         &self,
         _store: &mut Store,
@@ -749,193 +688,6 @@ impl ServerHandle {
         })
     }
 
-    /// Advance the protocol epoch and fence every existing connection.
-    pub fn replace_protocol_epoch(
-        &self,
-        store: &mut Store,
-        protocol_epoch: u32,
-    ) -> Result<SnapshotStamp, StoreError> {
-        self.write_served(store, true, move |txn| txn.protocol_epoch(protocol_epoch))?;
-        self.stamp_of(store)
-    }
-
-    /// Validate and publish one artifact with its typed direct load edges.
-    pub fn install_artifact(
-        &self,
-        store: &mut Store,
-        hash: ContentHash,
-        payload: ArtifactPayload,
-    ) -> Result<(), AdminError> {
-        let blob_parts = payload
-            .blobs
-            .iter()
-            .map(AsRef::as_ref)
-            .collect::<Vec<&[u8]>>();
-        let parsed = distill_wire::artifact::parse_artifact_parts(&payload.structural, &blob_parts)
-            .map_err(|error| AdminError::InvalidArtifact {
-                detail: format!("invalid canonical DSTL artifact: {error}"),
-            })?;
-        if parsed.content_hash != hash {
-            return Err(AdminError::InvalidArtifact {
-                detail: format!(
-                    "artifact ContentHash mismatch: expected {hash:?}, observed {:?}",
-                    parsed.content_hash
-                ),
-            });
-        }
-        if payload.load_edges.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return Err(AdminError::InvalidArtifact {
-                detail: "direct typed load edges must be strictly sorted and unique".to_owned(),
-            });
-        }
-        let edge_assets = payload
-            .load_edges
-            .iter()
-            .map(|edge| edge.asset)
-            .collect::<Vec<_>>();
-        if edge_assets != parsed.load_deps {
-            return Err(AdminError::InvalidArtifact {
-                detail: "direct typed load edges do not match authenticated DSTL load_deps"
-                    .to_owned(),
-            });
-        }
-        let edges = payload
-            .load_edges
-            .iter()
-            .map(|edge| (edge.asset, edge.expected_terminal))
-            .collect::<Vec<_>>();
-        // An artifact's load edges are its latest install's: a repeated
-        // install with the same edges changes nothing, a different one
-        // replaces them in the install's transaction.
-        if store.cas_contains(&hash.0).unwrap_or(false) {
-            let existing =
-                store
-                    .artifact_load_edges(hash)
-                    .map_err(|error| AdminError::InvalidArtifact {
-                        detail: format!("cannot read recorded load edges: {error}"),
-                    })?;
-            if existing == edges && !edges.is_empty() {
-                return Ok(());
-            }
-        }
-        let bytes = distill_wire::artifact::assemble_artifact(&payload.structural, &blob_parts);
-        match store.put_artifact(&bytes, &edges) {
-            Ok(stored) if stored == hash => Ok(()),
-            Ok(stored) => Err(AdminError::InvalidArtifact {
-                detail: format!("stored artifact hash {stored:?} differs from {hash:?}"),
-            }),
-            Err(error) => Err(AdminError::InvalidArtifact {
-                detail: format!("the store rejected the artifact: {error}"),
-            }),
-        }
-    }
-
-    /// Validate and publish one canonical DSWL body.
-    pub fn install_wire_tree(
-        &self,
-        store: &mut Store,
-        hash: LayoutHash,
-        bytes: Arc<[u8]>,
-    ) -> Result<(), AdminError> {
-        let root = distill_wire::dswl::decode_dswl(&bytes).map_err(|error| {
-            AdminError::InvalidWireTree {
-                detail: format!("invalid canonical DSWL body: {error:?}"),
-            }
-        })?;
-        let observed =
-            distill_wire::dswl::dswl_hash(&root).map_err(|error| AdminError::InvalidWireTree {
-                detail: format!("cannot authenticate DSWL body: {error:?}"),
-            })?;
-        if observed != hash {
-            return Err(AdminError::WireTreeHashMismatch {
-                expected: hash,
-                observed,
-            });
-        }
-        if store.wire_tree_read(hash).is_ok() {
-            return Ok(());
-        }
-        let stored = store
-            .put_wire_tree(&bytes)
-            .map_err(|error| AdminError::InvalidWireTree {
-                detail: format!("the store rejected the wire tree: {error}"),
-            })?;
-        if stored != hash {
-            return Err(AdminError::WireTreeHashMismatch {
-                expected: hash,
-                observed: stored,
-            });
-        }
-        Ok(())
-    }
-
-    /// Publish a build's artifacts and wire trees on `store`, validated as
-    /// an admin install is; return its root hash. For build backends that
-    /// publish outside the daemon's build path (tests).
-    pub fn install_build_publication(
-        &self,
-        store: &mut Store,
-        asset: AssetUuid,
-        publication: BuildPublication,
-    ) -> Result<ContentHash, RpcFailure> {
-        let root_hash = publication.root_content_hash;
-        let roots = publication
-            .artifacts
-            .iter()
-            .filter(|artifact| artifact.content_hash == root_hash)
-            .collect::<Vec<_>>();
-        if roots.len() != 1 {
-            return Err(RpcFailure::InvalidQuery {
-                detail: "lazy-build publication must contain its root artifact exactly once"
-                    .to_owned(),
-            });
-        }
-        let root = roots[0];
-        let root_blobs = root
-            .payload
-            .blobs
-            .iter()
-            .map(AsRef::as_ref)
-            .collect::<Vec<&[u8]>>();
-        let parsed =
-            distill_wire::artifact::parse_artifact_parts(&root.payload.structural, &root_blobs)
-                .map_err(|error| RpcFailure::InvalidQuery {
-                    detail: format!("lazy-build root is not canonical DSTL: {error}"),
-                })?;
-        if parsed.asset_uuid != asset {
-            return Err(RpcFailure::InvalidQuery {
-                detail: "lazy-build root asset does not match the requested asset".to_owned(),
-            });
-        }
-        drop(parsed);
-
-        let mut wire_hashes = BTreeSet::new();
-        for tree in publication.wire_trees {
-            if !wire_hashes.insert(tree.layout_hash) {
-                return Err(RpcFailure::InvalidQuery {
-                    detail: "lazy-build publication contains a duplicate wire tree".to_owned(),
-                });
-            }
-            self.install_wire_tree(store, tree.layout_hash, tree.bytes)
-                .map_err(|error| RpcFailure::InvalidQuery {
-                    detail: format!("lazy-build wire-tree publication rejected: {error:?}"),
-                })?;
-        }
-        let mut artifact_hashes = BTreeSet::new();
-        for artifact in publication.artifacts {
-            if !artifact_hashes.insert(artifact.content_hash) {
-                return Err(RpcFailure::InvalidQuery {
-                    detail: "lazy-build publication contains a duplicate artifact".to_owned(),
-                });
-            }
-            self.install_artifact(store, artifact.content_hash, artifact.payload)
-                .map_err(|error| RpcFailure::InvalidQuery {
-                    detail: format!("lazy-build artifact publication rejected: {error:?}"),
-                })?;
-        }
-        Ok(root_hash)
-    }
-
     /// Publish one coordinator step against `base` on `store`. `publish`
     /// runs the daemon's durable step (if any) on that same writer, inside
     /// the input, and returns the RPC delta, which is then applied as the
@@ -1038,33 +790,6 @@ impl ServerHandle {
             .map(|stamp| stamp.expect("a coordinated commit always publishes"))
     }
 
-    /// Discard cursor history strictly before `oldest_available`.
-    pub fn discard_history_before(
-        &self,
-        store: &mut Store,
-        oldest_available: InputVersion,
-    ) -> Result<(), StoreError> {
-        self.write_served(store, false, move |txn| txn.discard_before(oldest_available))
-            .map(|_| ())
-    }
-
-    /// Replace a staged target definition and fence every bound Hub.
-    pub fn replace_target(
-        &self,
-        store: &mut Store,
-        replacement: TargetDefinition,
-    ) -> Result<SnapshotStamp, AdminWriteError> {
-        let name = replacement.name().to_owned();
-        let hash = replacement.definition_hash();
-        if store.rpc_target(&name)?.is_none() {
-            return Err(AdminWriteError::Invalid(AdminError::UnknownTarget { target: name }));
-        }
-        // Rechecked inside the transaction: an unchanged definition
-        // publishes no version.
-        self.write_served(store, true, move |txn| txn.target(&name, hash))?;
-        Ok(self.stamp_of(store)?)
-    }
-
     /// Stage a restart-only edit (`stage` replaces the store's pending
     /// restart) and announce its RestartRequired keys, in one transaction.
     /// This does not advance the input version or mutate active
@@ -1099,88 +824,18 @@ impl ServerHandle {
     }
 }
 
-/// Admin calls on a front end's own writer.
 impl Server {
-    /// Run `job` on this front end's writer, opening it on first use.
-    pub fn with_writer<T>(&self, job: impl FnOnce(&mut Store) -> T) -> T {
-        self.inner.with_writer(job)
-    }
-
-    pub fn coordinated_pipeline_fence(&self) -> Result<(), String> {
-        self.with_writer(|store| self.inner.handle.coordinated_pipeline_fence(store))
-    }
-
-    pub fn replace_protocol_epoch(&self, protocol_epoch: u32) -> Result<SnapshotStamp, StoreError> {
-        self.with_writer(|store| self.inner.handle.replace_protocol_epoch(store, protocol_epoch))
-    }
-
-    pub fn install_artifact(
-        &self,
-        hash: ContentHash,
-        payload: ArtifactPayload,
-    ) -> Result<(), AdminError> {
-        self.with_writer(|store| self.inner.handle.install_artifact(store, hash, payload))
-    }
-
-    pub fn install_wire_tree(&self, hash: LayoutHash, bytes: Arc<[u8]>) -> Result<(), AdminError> {
-        self.with_writer(|store| self.inner.handle.install_wire_tree(store, hash, bytes))
-    }
-
-    pub fn coordinated_commit(
-        &self,
-        base: InputVersion,
-        publish: impl FnOnce(&mut Store) -> Result<Commit, String>,
-    ) -> Result<SnapshotStamp, CoordinatedCommitError> {
-        self.with_writer(|store| self.inner.handle.coordinated_commit(store, base, publish))
-    }
-
-    pub fn coordinated_maybe_commit(
+    /// [`ServerHandle::coordinated_maybe_commit`] on this front end's own
+    /// writer.
+    pub(crate) fn coordinated_maybe_commit(
         &self,
         base: InputVersion,
         publish: impl FnOnce(&mut Store) -> Result<Option<Commit>, String>,
     ) -> Result<Option<SnapshotStamp>, CoordinatedCommitError> {
-        self.with_writer(|store| {
+        self.inner.with_writer(|store| {
             self.inner
                 .handle
                 .coordinated_maybe_commit(store, base, publish)
-        })
-    }
-
-    pub fn coordinated_replace_target_set(
-        &self,
-        base: InputVersion,
-        replacements: Vec<TargetDefinition>,
-        publish: impl FnOnce(&mut Store) -> Result<Commit, String>,
-    ) -> Result<SnapshotStamp, CoordinatedCommitError> {
-        self.with_writer(|store| {
-            self.inner
-                .handle
-                .coordinated_replace_target_set(store, base, replacements, publish)
-        })
-    }
-
-    pub fn discard_history_before(&self, oldest_available: InputVersion) -> Result<(), StoreError> {
-        self.with_writer(|store| self.inner.handle.discard_history_before(store, oldest_available))
-    }
-
-    pub fn replace_target(
-        &self,
-        replacement: TargetDefinition,
-    ) -> Result<SnapshotStamp, AdminWriteError> {
-        self.with_writer(|store| self.inner.handle.replace_target(store, replacement))
-    }
-
-    pub fn restart_required(
-        &self,
-        changes: Vec<distill_store::config::RestartOnlyChange>,
-    ) -> Result<SnapshotStamp, String> {
-        self.with_writer(|store| {
-            self.inner.handle.restart_required(store, |store| {
-                store
-                    .stage_pending_restart(&changes)
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())
-            })
         })
     }
 }
@@ -1423,7 +1078,6 @@ pub(crate) struct ConnectionState {
     pub(crate) id: u64,
     pub(crate) target: String,
     target_generation: u64,
-    protocol_epoch: u32,
     pipeline_generation: u64,
     /// The change-log cursor: rows up to here are delivered or predate the
     /// connection.
@@ -1631,16 +1285,6 @@ impl Inner {
         pipeline_at(&*self.handle.authoring_backend(), txn.snapshot())
     }
 
-    pub(crate) fn protocol_epoch(&self) -> u32 {
-        match self.reader.rpc_fences() {
-            Ok(fences) => fences.protocol_epoch.unwrap_or(PROTOCOL_VERSION),
-            Err(error) => {
-                tracing::error!(%error, "cannot read the RPC protocol epoch");
-                PROTOCOL_VERSION
-            }
-        }
-    }
-
     /// Hold one snapshot of the current version under the snapshot bound:
     /// past it this front end releases its own oldest snapshots, and is
     /// refused when it has none left to release.
@@ -1700,15 +1344,14 @@ impl Inner {
         &self,
         target: String,
         target_generation: u64,
-        fences: &distill_store::served::RpcFences,
+        pipeline_generation: u64,
         head: i64,
     ) -> Rc<RefCell<ConnectionState>> {
         Rc::new(RefCell::new(ConnectionState {
             id: self.handle.connection_id(),
             target,
             target_generation,
-            protocol_epoch: fences.protocol_epoch.unwrap_or(PROTOCOL_VERSION),
-            pipeline_generation: fences.pipeline_generation,
+            pipeline_generation,
             seen_seq: head,
             fenced: false,
             subscribed_assets: BTreeSet::new(),
@@ -1722,17 +1365,14 @@ impl Inner {
     /// Why `connection` must reconnect, if it must.
     pub(crate) fn generation_fence(&self, connection: &ConnectionState) -> Option<ReconnectReason> {
         // One statement: the fences and the target generation of one instant.
-        let (fences, target_generation) = match self.reader.rpc_fence(&connection.target) {
+        let (pipeline_generation, target_generation) = match self.reader.rpc_fence(&connection.target) {
             Ok(fence) => fence,
             Err(error) => {
                 tracing::error!(%error, "cannot read RPC fences");
                 return Some(ReconnectReason::StoreInstanceChanged);
             }
         };
-        if fences.protocol_epoch.unwrap_or(PROTOCOL_VERSION) != connection.protocol_epoch {
-            return Some(ReconnectReason::ProtocolEpochChanged);
-        }
-        if fences.pipeline_generation != connection.pipeline_generation {
+        if pipeline_generation != connection.pipeline_generation {
             return Some(ReconnectReason::PipelineEpochChanged);
         }
         (target_generation != Some(connection.target_generation))
@@ -1840,16 +1480,16 @@ impl Root {
     /// metadata hub is a connection of its own.
     pub fn metadata(&self, protocol: u32) -> MetadataConnectOutcome {
         let handle = &self.handle;
-        let (reader, expected) = match handshake(&handle.config, |reader| reader.rpc_fences()) {
-            Ok((reader, fences)) => (reader, fences.protocol_epoch.unwrap_or(PROTOCOL_VERSION)),
-            Err(error) => return MetadataConnectOutcome::Refused(store_failure(error)),
-        };
-        if protocol != expected {
+        if protocol != PROTOCOL_VERSION {
             return MetadataConnectOutcome::ProtocolMismatch {
-                expected,
+                expected: PROTOCOL_VERSION,
                 observed: protocol,
             };
         }
+        let reader = match StoreReader::open(handle.config.clone()) {
+            Ok(reader) => reader,
+            Err(error) => return MetadataConnectOutcome::Refused(store_failure(error)),
+        };
         let Some(admission) = handle.admit_connection() else {
             return MetadataConnectOutcome::Refused(connection_limit(handle));
         };
@@ -1857,12 +1497,11 @@ impl Root {
             hub: MetadataHub {
                 binding: Rc::new(MetadataBinding {
                     id: handle.connection_id(),
-                    protocol_epoch: expected,
                 }),
                 server: Server::connection(handle, reader, admission),
             },
             instance: handle.instance,
-            protocol_epoch: expected,
+            protocol_epoch: PROTOCOL_VERSION,
         })
     }
 
@@ -1872,21 +1511,20 @@ impl Root {
         let target_name = request.target.nfc().collect::<String>();
         let read = handshake(&handle.config, |reader| {
             Ok((
-                reader.rpc_fences()?,
+                reader.rpc_pipeline_generation()?,
                 reader.rpc_target(&target_name)?,
                 reader.configuration_state()?,
                 pipeline_at(&*handle.authoring_backend(), reader),
                 reader.change_log_head()?,
             ))
         });
-        let (reader, (fences, target, configuration, pipeline, head)) = match read {
+        let (reader, (pipeline_generation, target, configuration, pipeline, head)) = match read {
             Ok(read) => read,
             Err(error) => return ConnectOutcome::Refused(store_failure(error)),
         };
-        let protocol = fences.protocol_epoch.unwrap_or(PROTOCOL_VERSION);
-        if request.protocol != protocol {
+        if request.protocol != PROTOCOL_VERSION {
             return ConnectOutcome::Rejected(ConnectError::ProtocolMismatch {
-                expected: protocol,
+                expected: PROTOCOL_VERSION,
                 got: request.protocol,
             });
         }
@@ -1919,7 +1557,7 @@ impl Root {
         let server = Server::connection(handle, reader, admission);
         let connection = server
             .inner
-            .open_connection(target_name, target.generation, &fences, head);
+            .open_connection(target_name, target.generation, pipeline_generation, head);
         ConnectOutcome::Connected(Connected {
             hub: Hub { connection, server },
             instance: handle.instance,
@@ -1938,17 +1576,6 @@ fn connection_limit(handle: &ServerHandle) -> RpcFailure {
 #[derive(Clone)]
 pub(crate) struct MetadataBinding {
     pub(crate) id: u64,
-    pub(crate) protocol_epoch: u32,
-}
-
-impl Inner {
-    pub(crate) fn metadata_fence(
-        &self,
-        binding: &MetadataBinding,
-    ) -> Option<MetadataReconnectReason> {
-        (self.protocol_epoch() != binding.protocol_epoch)
-            .then_some(MetadataReconnectReason::ProtocolEpochChanged)
-    }
 }
 
 #[cfg(test)]
@@ -1963,9 +1590,9 @@ mod bound_tests {
         pub(super) static HANDSHAKE_READERS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
 
-    /// A handshake reads on one connection, which its front end then
-    /// keeps: a target or metadata connection opens one reader, and its
-    /// first snapshot opens none.
+    /// A target handshake reads on one connection, which its front end
+    /// then keeps; a metadata handshake reads nothing and opens the one
+    /// reader its front end keeps. A first snapshot opens none.
     #[test]
     fn a_connection_reads_its_handshake_on_the_reader_it_keeps() {
         let server = test_server();
@@ -1978,7 +1605,7 @@ mod bound_tests {
         let MetadataConnectOutcome::Connected(metadata) = server.root().metadata(PROTOCOL_VERSION) else {
             panic!("the metadata connection is admitted");
         };
-        assert_eq!(HANDSHAKE_READERS.with(|opens| opens.get()), 2);
+        assert_eq!(HANDSHAKE_READERS.with(|opens| opens.get()), 1);
         assert_eq!(
             connected.hub.server.inner.reader.input_version().unwrap(),
             metadata.hub.server.inner.reader.input_version().unwrap()
@@ -1998,7 +1625,7 @@ mod bound_tests {
             other => panic!("expected snapshot, got {other:?}"),
         };
         let publish = || {
-            server.with_writer(|store| store.input_transaction(|_| Ok(())).unwrap());
+            server.inner.with_writer(|store| store.input_transaction(|_| Ok(())).unwrap());
         };
         READER_OPENS.with(|opens| opens.set(0));
         for _ in 0..50 {

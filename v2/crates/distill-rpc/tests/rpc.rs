@@ -399,6 +399,16 @@ struct RecordingAuthoringBackend {
 }
 
 impl AuthoringBackend for RecordingAuthoringBackend {
+    fn write_files(
+        &self,
+        _: &mut distill_store::Store,
+        _: InputVersion,
+        _: &[AuthoringOp],
+        _: bool,
+    ) -> Result<WriteReceipt, RpcFailure> {
+        unreachable!("never writes")
+    }
+
     fn prepare_import(
         &self,
         _store: &mut distill_store::Store,
@@ -503,10 +513,11 @@ fn a_file_write_answers_its_receipt_and_publishes_nothing() {
 #[test]
 fn external_coordinator_cas_runs_publication_only_at_the_exact_server_base() {
     let project = project();
-    let server = project.server();
+    let handle = project.coordinator().server_handle();
+    let mut writer = handle.opener().open_writer().unwrap();
     let mut called = false;
     assert_eq!(
-        server.coordinated_commit(InputVersion(9), |_| {
+        handle.coordinated_commit(&mut writer, InputVersion(9), |_| {
             called = true;
             Ok(Commit::default())
         }),
@@ -517,8 +528,8 @@ fn external_coordinator_cas_runs_publication_only_at_the_exact_server_base() {
     );
     assert!(!called);
     assert_eq!(
-        server
-            .coordinated_commit(InputVersion(0), |_| Ok(Commit::default()))
+        handle
+            .coordinated_commit(&mut writer, InputVersion(0), |_| Ok(Commit::default()))
             .unwrap()
             .version,
         InputVersion(1)
@@ -578,7 +589,10 @@ fn snapshot(hub: &Hub) -> Snapshot {
 /// validation makes of it. A rejected commit publishes nothing.
 fn offer(server: &Server, commit: Commit) -> Result<SnapshotStamp, AdminError> {
     let before = server.current_stamp().unwrap();
-    match server.coordinated_commit(before.version, |_| Ok(commit)) {
+    let offered = coordinated(server, |handle, store| {
+        handle.coordinated_commit(store, before.version, |_| Ok(commit))
+    });
+    match offered {
         Ok(stamp) => Ok(stamp),
         Err(CoordinatedCommitError::Invalid(error)) => {
             assert_eq!(server.current_stamp().unwrap(), before);
@@ -609,7 +623,10 @@ fn reject_configuration(project: &TestProject, reason: DscpV1, message: &str) ->
 /// A second RPC server over `project`'s store, with `backend` as its
 /// authoring backend.
 fn server_over(project: &TestProject, backend: Arc<dyn AuthoringBackend>) -> Server {
-    let handle = ServerHandle::open(backend, Arc::clone(project.coordinator().opener()));
+    let handle = ServerHandle::open(
+        backend,
+        Arc::clone(project.coordinator().server_handle().opener()),
+    );
     Server::open(&handle)
 }
 
@@ -657,7 +674,7 @@ fn assert_reconnect<T: std::fmt::Debug>(result: RpcResult<T>, reason: ReconnectR
     assert!(matches!(
         result,
         RpcResult::ReconnectRequired { reason: actual } if actual == reason
-    ));
+    ), "{result:?}");
 }
 
 /// The authoring entry the daemon serves for the asset `byte`: one blob
@@ -1019,7 +1036,7 @@ fn unbound_metadata_bootstrap_survives_a_configuration_error_and_has_no_runtime_
         vec![1, 2, 3],
         Vec::new(),
     );
-    server.install_artifact(hash, payload).unwrap();
+    assert_eq!(distill_test_project::put_artifact(&server.handle(), &payload), hash);
     let reason = DscpV1::MalformedConfiguration { file_hash: [4; 32] };
     let error = ConfigurationError::from_reason(&reason, "invalid staged configuration");
     publish_entry(&mut project, &entry);
@@ -1225,9 +1242,9 @@ fn authoring_snapshot_refreshes_to_a_successor_stamp_without_tearing() {
 
 #[test]
 fn every_authoring_snapshot_method_is_expiry_and_generation_fenced() {
-    let project = project();
+    let mut project = TestProject::configured(false);
     let server = project.server();
-    let hub = connect(&server, &[(1, false)]);
+    let hub = connect_to(&server, project.target());
     let expired = authoring_snapshot(&hub);
     expired.expire();
     assert_eq!(
@@ -1248,10 +1265,10 @@ fn every_authoring_snapshot_method_is_expiry_and_generation_fenced() {
     ));
 
     let stale = authoring_snapshot(&hub);
-    server
-        .replace_target(target_with(8, &[(1, false)]))
-        .unwrap();
-    let reason = ReconnectReason::TargetDefinitionChanged;
+    // A configuration that redefines the target is a new pipeline
+    // epoch too, which the fence names first.
+    project.reconfigure(true);
+    let reason = ReconnectReason::PipelineEpochChanged;
     assert_reconnect(hub.authoring_snapshot(), reason);
     assert_reconnect(stale.version(), reason);
     assert_reconnect(stale.query(AssetQuery::default()), reason);
@@ -1387,7 +1404,7 @@ fn resolve_path_and_fetch_terminal_outcomes_all_carry_the_snapshot_basis() {
         vec![Arc::from(vec![8_u8; 3])],
     );
     let structural_len = payload.structural.len();
-    server.install_artifact(hash, payload).unwrap();
+    assert_eq!(distill_test_project::put_artifact(&server.handle(), &payload), hash);
     builds.answer(built, Ok(BuildAnswer::Built { content_hash: hash }));
     builds.answer(
         drifted,
@@ -1507,7 +1524,7 @@ fn snapshots_pin_old_metadata_and_refresh_repins_latest() {
         Vec::new(),
     );
     for (hash, payload) in [(first, first_payload), (second, second_payload)] {
-        server.install_artifact(hash, payload).unwrap();
+        assert_eq!(distill_test_project::put_artifact(&server.handle(), &payload), hash);
     }
     let first_stamp = publish_entry(&mut project, &entry);
     builds.answer(first_stamp, first);
@@ -1559,7 +1576,7 @@ fn configuration_error_is_snapshot_pinned_and_typed_without_blocking_safe_reads(
         vec![1, 2, 3],
         Vec::new(),
     );
-    server.install_artifact(hash, payload).unwrap();
+    assert_eq!(distill_test_project::put_artifact(&server.handle(), &payload), hash);
     let reason = DscpV1::NonLoopbackAddress {
         address: "198.51.100.7:7331".to_owned(),
     };
@@ -1597,39 +1614,19 @@ fn configuration_error_is_snapshot_pinned_and_typed_without_blocking_safe_reads(
 
 #[test]
 fn connect_returns_typed_pipeline_unavailable_without_minting_a_hub() {
-    let project = project();
+    let mut project = TestProject::configured(false);
     let server = project.server();
     let failure = test_pipeline_failure();
-    let rejected = reject_pipeline(&project, failure.clone());
-
+    reject_pipeline(&project, failure.clone());
+    let request = ConnectRequest::new(project.target().name(), project.target().definition_hash());
     assert_eq!(
-        server.root().connect(request_for(7, 2, &[(1, false)])),
+        server.root().connect(request.clone()),
         ConnectOutcome::PipelineUnavailable(PipelineUnavailableDiagnostic::PipelineFailure(failure))
     );
 
-    // No daemon path returns a project without a pipeline module to Ready:
-    // the coordinator's step, publishing an epoch, is taken by hand.
-    let epoch = distill_store::pipeline::ValidatedPipelineEpoch::validate(
-        distill_store::state::PipelineEpoch {
-            dylib_hash: [1; 32],
-            target_set: distill_core::target_set::CanonicalTargetSet::canonical(vec![]).unwrap(),
-            schema_registry: distill_core::bootstrap::bootstrap_control_logical_registry_v1()
-                .unwrap(),
-        },
-    )
-    .unwrap();
-    server
-        .coordinated_commit(rejected.version, |store| {
-            store
-                .input_transaction(|txn| txn.publish_pipeline_epoch(&epoch))
-                .map_err(|error| error.to_string())?;
-            Ok(Commit {
-                pipeline_epoch_changed: true,
-                ..Commit::default()
-            })
-        })
-        .unwrap();
-    let connected = match server.root().connect(request_for(7, 3, &[(1, false)])) {
+    // The daemon loads the configuration's pipeline module again: Ready.
+    project.reconfigure(false);
+    let connected = match server.root().connect(request) {
         ConnectOutcome::Connected(connected) => connected,
         other => panic!("expected recovered connection, got {other:?}"),
     };
@@ -1657,7 +1654,10 @@ fn published_runtime_failure_fences_shared_epoch_without_minting_a_version() {
         &project,
         Arc::new(RuntimeFailedBackend(failure.clone())),
     );
-    server.coordinated_pipeline_fence().unwrap();
+    coordinated(&server, |handle, store| {
+        handle.coordinated_pipeline_fence(store)
+    })
+    .unwrap();
 
     assert_eq!(server.current_stamp().unwrap(), stamp);
     let reason = ReconnectReason::PipelineEpochChanged;
@@ -1704,6 +1704,16 @@ fn published_runtime_failure_fences_shared_epoch_without_minting_a_version() {
 struct RuntimeFailedBackend(PipelineFailure);
 
 impl AuthoringBackend for RuntimeFailedBackend {
+    fn write_files(
+        &self,
+        _: &mut distill_store::Store,
+        _: InputVersion,
+        _: &[AuthoringOp],
+        _: bool,
+    ) -> Result<WriteReceipt, RpcFailure> {
+        unreachable!("never writes")
+    }
+
     fn pipeline_runtime_failure(
         &self,
         _snapshot: &distill_store::StoreReader,
@@ -1947,7 +1957,16 @@ fn old_history_returns_resync_marker_and_future_cursor_is_typed_failure() {
     publish_entry(&mut project, &entry);
     project.remove(&entry.normalized_path);
     assert_eq!(project.publish().version, InputVersion(2));
-    server.discard_history_before(InputVersion(1)).unwrap();
+    // History keeps the last RETAINED_HISTORY_VERSIONS versions: an
+    // unrelated file coming and going pushes version 1's history out.
+    let churn = authoring_entry(2, AuthoringEntryRole::AuthoringOnly);
+    while server.current_stamp().unwrap().version.0 < RETAINED_HISTORY_VERSIONS + 1 {
+        publish_entry(&mut project, &churn);
+        project.remove(&churn.normalized_path);
+        project.publish();
+    }
+    let current = InputVersion(RETAINED_HISTORY_VERSIONS + 2);
+    assert_eq!(server.current_stamp().unwrap().version, current);
 
     let install = hub
         .subscribe(InputVersion(0), vec![asset_id(1)], vec![])
@@ -1956,16 +1975,16 @@ fn old_history_returns_resync_marker_and_future_cursor_is_typed_failure() {
     assert!(matches!(
         install.deltas.next(),
         Some(StreamEvent::ResyncRequired {
-            oldest_available: InputVersion(1),
+            oldest_available: InputVersion(2),
             ..
         })
     ));
     assert!(matches!(
-        hub.subscribe(InputVersion(99), vec![], vec![]),
+        hub.subscribe(InputVersion(current.0 + 1), vec![], vec![]),
         RpcResult::Failure(RpcFailure::InvalidCursor {
-            since: InputVersion(99),
-            current: InputVersion(2),
-        })
+            since,
+            current: observed,
+        }) if since.0 == current.0 + 1 && observed == current
     ));
 }
 
@@ -2018,14 +2037,12 @@ fn restart_required_names_sorted_unique_keys_without_advancing_version() {
         .unwrap();
     install.deltas.next().unwrap();
     let before = server.current_stamp().unwrap();
-    let after = server
-        .restart_required(vec![
+    stage_restart(&project, &[
             RestartOnlyChange::StatePath("state".into()),
             RestartOnlyChange::Address(([127, 0, 0, 1], 9000).into()),
             RestartOnlyChange::Address(([127, 0, 0, 1], 9001).into()),
-        ])
-        .unwrap();
-    assert_eq!(before, after);
+        ]);
+    assert_eq!(server.current_stamp().unwrap(), before);
     match install.deltas.next().unwrap() {
         StreamEvent::Asset { basis, event } => {
             assert_eq!(basis.snapshot, before);
@@ -2045,9 +2062,7 @@ fn pending_restart_state_is_queued_after_the_cursor_bound_first_message() {
     let project = project();
     let server = project.server();
     let hub = connect(&server, &[(1, false)]);
-    server
-        .restart_required(vec![RestartOnlyChange::Address(([127, 0, 0, 1], 9000).into())])
-        .unwrap();
+    stage_restart(&project, &[RestartOnlyChange::Address(([127, 0, 0, 1], 9000).into())]);
     let install = hub
         .subscribe(InputVersion(0), vec![], vec![])
         .success()
@@ -2070,12 +2085,8 @@ fn restart_required_replaces_the_prior_pending_key_set() {
     let project = project();
     let server = project.server();
     let hub = connect(&server, &[(1, false)]);
-    server
-        .restart_required(vec![RestartOnlyChange::Address(([127, 0, 0, 1], 9000).into())])
-        .unwrap();
-    server
-        .restart_required(vec![RestartOnlyChange::AutoCodegen(true)])
-        .unwrap();
+    stage_restart(&project, &[RestartOnlyChange::Address(([127, 0, 0, 1], 9000).into())]);
+    stage_restart(&project, &[RestartOnlyChange::AutoCodegen(true)]);
     let install = hub
         .subscribe(InputVersion(0), vec![], vec![])
         .success()
@@ -2114,28 +2125,28 @@ fn delta_stream_capability_keeps_the_connection_alive_after_hub_drop() {
 }
 
 #[test]
-fn target_definition_change_fences_every_target_bound_method_and_prompts_stream() {
-    let project = project();
+fn a_configuration_change_fences_every_target_bound_method_and_prompts_stream() {
+    let mut project = TestProject::configured(false);
     let server = project.server();
-    let hub = connect(&server, &[(1, false)]);
+    let hub = connect_to(&server, project.target());
     let snap = snapshot(&hub);
     let install = hub
         .subscribe(InputVersion(0), vec![], vec![])
         .success()
         .unwrap();
     install.deltas.next().unwrap();
-    server
-        .replace_target(target_with(8, &[(1, false)]))
-        .unwrap();
+    // A configuration that redefines the target is a new pipeline
+    // epoch too, which the fence names first.
+    project.reconfigure(true);
 
     match install.deltas.next().unwrap() {
         StreamEvent::Asset {
             event: AssetEvent::ReconnectRequired { reason },
             ..
-        } => assert_eq!(reason, ReconnectReason::TargetDefinitionChanged),
+        } => assert_eq!(reason, ReconnectReason::PipelineEpochChanged),
         other => panic!("expected reconnect event, got {other:?}"),
     }
-    let reason = ReconnectReason::TargetDefinitionChanged;
+    let reason = ReconnectReason::PipelineEpochChanged;
     assert_reconnect(hub.snapshot(), reason);
     assert_reconnect(snap.refresh(), reason);
     assert_reconnect(snap.resolve(asset_id(1)), reason);
@@ -2305,7 +2316,7 @@ fn hub_authoring_and_wire_tree_surface_is_versioned_typed_and_generation_first()
     let wire_node = distill_wire::wire::WireNode::Unit { offset: 0 };
     let tree: Arc<[u8]> = Arc::from(distill_wire::dswl::dswl_bytes(&wire_node).unwrap());
     let hash = distill_wire::dswl::dswl_hash(&wire_node).unwrap();
-    server.install_wire_tree(hash, tree.clone()).unwrap();
+    assert_eq!(distill_test_project::put_wire_tree(&server.handle(), &tree), hash);
     let (wire_artifact_hash, wire_artifact) = canonical_artifact(
         asset_id(1),
         type_id(1),
@@ -2316,17 +2327,16 @@ fn hub_authoring_and_wire_tree_surface_is_versioned_typed_and_generation_first()
         vec![1],
         Vec::new(),
     );
-    server
-        .install_artifact(wire_artifact_hash, wire_artifact)
-        .unwrap();
+    assert_eq!(
+        distill_test_project::put_artifact(&server.handle(), &wire_artifact),
+        wire_artifact_hash
+    );
     assert_eq!(hub.wire_tree(hash), RpcResult::Success(tree));
 
     let snapshot = snapshot(&hub);
     let authoring = authoring_snapshot(&hub);
-    server
-        .replace_target(target_with(8, &[(2, false)]))
-        .unwrap();
-    let reconnect = ReconnectReason::TargetDefinitionChanged;
+    reject_pipeline(&project, test_pipeline_failure());
+    let reconnect = ReconnectReason::PipelineEpochChanged;
     assert_reconnect(hub.write(InputVersion(99), vec![], false), reconnect);
     assert_reconnect(
         snapshot.query(AssetQuery {
@@ -2375,32 +2385,14 @@ fn long_running_operation_payloads_are_canonical_and_closed() {
 }
 
 #[test]
-fn missing_authoring_backend_is_typed_and_never_advances_the_input_version() {
-    // A server whose authoring backend has no filesystem authority cannot
-    // write: it says so, and publishes nothing.
+fn an_unregistered_importer_is_typed_and_never_advances_the_input_version() {
+    // The daemon has no importer the project does not provide: it says so,
+    // and publishes nothing.
     let mut project = project();
     let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
     let base = publish_entry(&mut project, &entry);
-    let server = server_over(&project, Arc::new(RecordingAuthoringBackend::default()));
-    let hub = connect(&server, &[(1, false)]);
-    assert_eq!(
-        hub.write(
-            base.version,
-            vec![AuthoringOp::Remove { uuid: entry.uuid }],
-            false
-        ),
-        RpcResult::Failure(RpcFailure::AuthoringBackendUnavailable {
-            operation: "write".to_owned(),
-        })
-    );
-    assert!(project
-        .root(distill_test_project::ROOT)
-        .join(&entry.normalized_path)
-        .exists());
-    assert_eq!(server.current_stamp().unwrap(), base);
-
-    // The daemon has no importer the project does not provide.
-    let daemon = connect(&project.server(), &[(1, false)]);
+    let server = project.server();
+    let daemon = connect(&server, &[(1, false)]);
     let request = ImportRequest {
         importer: "image-importer".to_owned(),
         sources: vec!["source/image.png".to_owned()],
@@ -2423,20 +2415,20 @@ fn missing_authoring_backend_is_typed_and_never_advances_the_input_version() {
 
 #[test]
 fn fence_is_the_guarantee_even_if_reconnect_event_is_not_consumed() {
-    let project = project();
+    let mut project = TestProject::configured(false);
     let server = project.server();
-    let hub = connect(&server, &[(1, false)]);
+    let hub = connect_to(&server, project.target());
     let snap = snapshot(&hub);
     let _unpolled = hub
         .subscribe(InputVersion(0), vec![], vec![])
         .success()
         .unwrap();
-    server
-        .replace_target(target_with(8, &[(1, false)]))
-        .unwrap();
+    // A configuration that redefines the target is a new pipeline
+    // epoch too, which the fence names first.
+    project.reconfigure(true);
     assert_reconnect(
         snap.resolve(asset_id(1)),
-        ReconnectReason::TargetDefinitionChanged,
+        ReconnectReason::PipelineEpochChanged,
     );
 }
 
@@ -2564,7 +2556,7 @@ fn wire_tree_coverage_keeps_pinned_compatible_artifact_references() {
     let node = distill_wire::wire::WireNode::Unit { offset: 0 };
     let tree: Arc<[u8]> = Arc::from(distill_wire::dswl::dswl_bytes(&node).unwrap());
     let layout_hash = distill_wire::dswl::dswl_hash(&node).unwrap();
-    server.install_wire_tree(layout_hash, tree.clone()).unwrap();
+    assert_eq!(distill_test_project::put_wire_tree(&server.handle(), &tree), layout_hash);
     let asset = asset_id(9);
     let (historical_hash, historical) = canonical_artifact(
         asset,
@@ -2586,10 +2578,8 @@ fn wire_tree_coverage_keeps_pinned_compatible_artifact_references() {
         vec![1],
         Vec::new(),
     );
-    server
-        .install_artifact(historical_hash, historical)
-        .unwrap();
-    server.install_artifact(current_hash, current).unwrap();
+    assert_eq!(distill_test_project::put_artifact(&server.handle(), &historical), historical_hash);
+    assert_eq!(distill_test_project::put_artifact(&server.handle(), &current), current_hash);
     // The asset resolves to the historical artifact, then to the current
     // one, then is deleted.
     let builds = BuildsByVersion::install(&server);
@@ -2621,7 +2611,7 @@ fn wire_tree_coverage_keeps_pinned_compatible_artifact_references() {
 }
 
 #[test]
-fn artifact_install_authenticates_header_hash_and_direct_typed_load_edges() {
+fn an_artifact_with_an_unresolved_direct_load_edge_stays_fetchable() {
     let mut project = project();
     let server = project.server();
     let (hash, payload) = canonical_artifact(
@@ -2637,18 +2627,7 @@ fn artifact_install_authenticates_header_hash_and_direct_typed_load_edges() {
         vec![1],
         Vec::new(),
     );
-    let mut omitted_dep = payload.clone();
-    omitted_dep.load_edges.clear();
-    assert!(matches!(
-        server.install_artifact(hash, omitted_dep),
-        Err(AdminError::InvalidArtifact { .. })
-    ));
-    assert!(matches!(
-        server.install_artifact(content_hash(99), payload.clone()),
-        Err(AdminError::InvalidArtifact { .. })
-    ));
-
-    server.install_artifact(hash, payload).unwrap();
+    assert_eq!(distill_test_project::put_artifact(&server.handle(), &payload), hash);
     // The asset 1 resolves to it; its direct dependency, the asset 2, is
     // not in the namespace.
     let builds = TestBuilds::install(&server);
@@ -2675,52 +2654,19 @@ fn artifact_install_authenticates_header_hash_and_direct_typed_load_edges() {
 }
 
 #[test]
-fn an_artifact_s_load_edges_are_its_latest_install_s() {
-    let project = project();
-    let server = project.server();
-    let (hash, first) = canonical_artifact(
-        asset_id(1),
-        type_id(1),
-        type_id(1),
-        type_id(1),
-        LayoutHash([1; 32]),
-        vec![ServedLoadEdge {
-            asset: asset_id(2),
-            expected_terminal: type_id(2),
-        }],
-        vec![1],
-        Vec::new(),
-    );
-    assert_eq!(server.install_artifact(hash, first.clone()), Ok(()));
-    assert_eq!(server.install_artifact(hash, first.clone()), Ok(()));
-    let mut different_edges = first.clone();
-    different_edges.load_edges[0].expected_terminal = type_id(3);
-    assert_eq!(server.install_artifact(hash, different_edges), Ok(()));
-    let hub = connect(&server, &[(1, false), (2, false)]);
-    let RpcResult::Success(fetched) = snapshot(&hub).fetch(hash) else {
-        panic!("an installed artifact must be fetchable");
-    };
-    assert_eq!(
-        fetched.value.load_edges(),
-        &[ServedLoadEdge {
-            asset: asset_id(2),
-            expected_terminal: type_id(3),
-        }]
-    );
-}
-
-#[test]
 fn coordinated_target_set_replacement_advances_once_and_fences_changed_or_removed_hubs() {
     let project = project();
     let server = project.server();
     let changed = connect(&server, &[(1, false)]);
-    let stamp = server
-        .coordinated_replace_target_set(
+    let stamp = coordinated(&server, |handle, store| {
+        handle.coordinated_replace_target_set(
+            store,
             InputVersion(0),
             vec![target_with(8, &[(1, false)])],
             |_| Ok(Commit::default()),
         )
-        .unwrap();
+    })
+    .unwrap();
     assert_eq!(stamp.version, InputVersion(1));
     assert_reconnect(changed.snapshot(), ReconnectReason::TargetDefinitionChanged);
 
@@ -2728,9 +2674,12 @@ fn coordinated_target_set_replacement_advances_once_and_fences_changed_or_remove
         ConnectOutcome::Connected(connected) => connected.hub,
         other => panic!("expected replacement connection, got {other:?}"),
     };
-    let stamp = server
-        .coordinated_replace_target_set(InputVersion(1), Vec::new(), |_| Ok(Commit::default()))
-        .unwrap();
+    let stamp = coordinated(&server, |handle, store| {
+        handle.coordinated_replace_target_set(store, InputVersion(1), Vec::new(), |_| {
+            Ok(Commit::default())
+        })
+    })
+    .unwrap();
     assert_eq!(stamp.version, InputVersion(2));
     assert_reconnect(
         replacement.snapshot(),
@@ -2768,7 +2717,7 @@ impl AuthoringBackend for PartialFailBackend {
         _base: InputVersion,
         _operations: &[AuthoringOp],
         _force_lossy: bool,
-    ) -> Result<Option<WriteReceipt>, RpcFailure> {
+    ) -> Result<WriteReceipt, RpcFailure> {
         write_then_fail(store, "partial-write");
         Err(RpcFailure::InvalidAuthoringRequest {
             detail: "refinement failed".to_owned(),
@@ -2832,10 +2781,9 @@ fn a_failed_backend_step_commits_nothing_it_wrote() {
     let hub = connect(&server, &[(1, false)]);
     let unchanged = |root: &str| {
         assert_eq!(server.current_stamp().unwrap().version, base, "{root}");
-        server.with_writer(|store| {
-            assert_eq!(store.root_id(root).unwrap(), None, "{root} committed");
-            assert_eq!(store.input_version().unwrap(), base, "{root}");
-        });
+        let store = server.handle().opener().open_reader().unwrap();
+        assert_eq!(store.root_id(root).unwrap(), None, "{root} committed");
+        assert_eq!(store.input_version().unwrap(), base, "{root}");
     };
 
     let write = hub.write(
@@ -2866,52 +2814,23 @@ fn a_failed_backend_step_commits_nothing_it_wrote() {
     unchanged("partial-operation");
 }
 
-/// A served admin write the store fails returns the store's error, and
-/// publishes nothing; the server keeps serving.
-#[test]
-fn a_failed_served_write_returns_the_store_error() {
-    let mut project = project();
-    let server = project.server();
-    let before = server.current_stamp().unwrap();
-    let db = server.with_writer(|store| store.state_path().join("meta.sqlite"));
-    rusqlite::Connection::open(&db)
-        .unwrap()
-        .execute_batch(
-            "CREATE TRIGGER fail_epoch BEFORE INSERT ON store_meta
-             WHEN NEW.key = 'rpc_protocol_epoch'
-             BEGIN SELECT RAISE(ABORT, 'injected'); END;
-             CREATE TRIGGER fail_target BEFORE UPDATE ON rpc_targets
-             BEGIN SELECT RAISE(ABORT, 'injected'); END;
-             CREATE TRIGGER fail_discard BEFORE DELETE ON change_log
-             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
-        )
-        .unwrap();
-    assert!(server.replace_protocol_epoch(PROTOCOL_VERSION + 1).is_err());
-    assert!(matches!(
-        server.replace_target(target_with(8, &[(1, false)])),
-        Err(distill_rpc::AdminWriteError::Store(_))
-    ));
-    assert!(matches!(
-        server.replace_target(TargetDefinition::new("absent", TargetDefinitionHash([1; 32]))),
-        Err(distill_rpc::AdminWriteError::Invalid(AdminError::UnknownTarget { .. }))
-    ));
-    // The first publication logs nothing: the second has history to drop.
-    publish_unrelated(&mut project);
-    publish_unrelated(&mut project);
-    assert!(server.discard_history_before(InputVersion(2)).is_err());
-    assert_eq!(server.current_stamp().unwrap().version.0, before.version.0 + 2);
+/// `publish` on a writer of `server`'s store, as the daemon coordinator
+/// runs its coordinated publications.
+fn coordinated<T>(
+    server: &Server,
+    publish: impl FnOnce(&ServerHandle, &mut distill_store::Store) -> T,
+) -> T {
+    let handle = server.handle();
+    let mut writer = handle.opener().open_writer().unwrap();
+    publish(&handle, &mut writer)
 }
 
-/// Publishing a protocol epoch or target definition that is already in
-/// effect changes nothing, so it publishes no version.
-#[test]
-fn an_unchanged_protocol_epoch_or_target_publishes_no_version() {
-    let project = project();
-    let server = project.server();
-    let before = server.current_stamp().unwrap();
-    assert_eq!(server.replace_protocol_epoch(PROTOCOL_VERSION).unwrap(), before);
-    assert_eq!(server.replace_target(target_with(7, &[(1, false)])).unwrap(), before);
-    assert_eq!(server.current_stamp().unwrap(), before);
-    let changed = server.replace_protocol_epoch(PROTOCOL_VERSION + 1).unwrap();
-    assert_eq!(changed.version.0, before.version.0 + 1);
+/// The daemon stages `changes` as its pending restart, as the process
+/// loop does for a restart-only configuration edit.
+fn stage_restart(project: &TestProject, changes: &[RestartOnlyChange]) {
+    let mut writer = project.coordinator().open_writer().unwrap();
+    project
+        .coordinator()
+        .stage_restart_configuration(&mut writer, changes)
+        .unwrap();
 }

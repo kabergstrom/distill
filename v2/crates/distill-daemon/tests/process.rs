@@ -88,7 +88,7 @@ fn write_schema_path(path: &std::path::Path, marker: &str) {
 /// The compiled state the process's latest committed version sees.
 fn compiled(process: &DaemonProcess) -> Option<Arc<Compiled>> {
     let coordinator = process.coordinator();
-    let reader = coordinator.opener().open_reader().unwrap();
+    let reader = coordinator.open_reader().unwrap();
     coordinator.compiled_at(&reader).ok()
 }
 
@@ -556,7 +556,7 @@ fn operational_configuration_applies_live_without_an_input_version() {
         before
     );
     assert_eq!(
-        process.coordinator().opener().config().parallelism,
+        process.coordinator().server_handle().opener().config().parallelism,
         3
     );
 }
@@ -1221,9 +1221,8 @@ fn pipeline_generation(process: &DaemonProcess) -> u64 {
         .coordinator()
         .open_reader()
         .unwrap()
-        .rpc_fences()
+        .rpc_pipeline_generation()
         .unwrap()
-        .pipeline_generation
 }
 
 fn imported_value(temp: &tempfile::TempDir) -> Option<String> {

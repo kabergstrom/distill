@@ -49,7 +49,6 @@ pub struct MetadataHub {
 #[derive(Clone)]
 pub struct MetadataSnapshot {
     server: Server,
-    binding: Rc<MetadataBinding>,
     basis: MetadataBasis,
     hold: Rc<SnapshotHold>,
 }
@@ -57,7 +56,6 @@ pub struct MetadataSnapshot {
 #[derive(Clone)]
 pub struct MetadataAuthoringSnapshot {
     server: Server,
-    binding: Rc<MetadataBinding>,
     basis: MetadataBasis,
     hold: Rc<SnapshotHold>,
 }
@@ -138,10 +136,10 @@ impl fmt::Debug for DeltaStream {
     }
 }
 
-fn metadata_basis(binding: &MetadataBinding, snapshot: SnapshotStamp) -> MetadataBasis {
+fn metadata_basis(snapshot: SnapshotStamp) -> MetadataBasis {
     MetadataBasis {
         snapshot,
-        protocol_epoch: binding.protocol_epoch,
+        protocol_epoch: PROTOCOL_VERSION,
     }
 }
 
@@ -815,7 +813,7 @@ impl MetadataHub {
             .inner
             .current_snapshot()
             .map_err(|error| MetadataCall::Error(store_failure(error)))?;
-        let basis = metadata_basis(&self.binding, txn.stamp);
+        let basis = metadata_basis(txn.stamp);
         let hold = self
             .server
             .inner
@@ -825,13 +823,9 @@ impl MetadataHub {
     }
 
     pub fn snapshot(&self) -> MetadataCall<MetadataSnapshot> {
-        if let Some(reason) = self.server.inner.metadata_fence(&self.binding) {
-            return MetadataCall::ReconnectRequired { reason };
-        }
         match self.open() {
             Ok((basis, hold)) => MetadataCall::Success(MetadataSnapshot {
                 server: self.server.clone(),
-                binding: self.binding.clone(),
                 basis,
                 hold,
             }),
@@ -840,13 +834,9 @@ impl MetadataHub {
     }
 
     pub fn authoring_snapshot(&self) -> MetadataCall<MetadataAuthoringSnapshot> {
-        if let Some(reason) = self.server.inner.metadata_fence(&self.binding) {
-            return MetadataCall::ReconnectRequired { reason };
-        }
         match self.open() {
             Ok((basis, hold)) => MetadataCall::Success(MetadataAuthoringSnapshot {
                 server: self.server.clone(),
-                binding: self.binding.clone(),
                 basis,
                 hold,
             }),
@@ -855,9 +845,6 @@ impl MetadataHub {
     }
 
     pub fn diagnostics(&self) -> MetadataCall<MetadataDiagnostics> {
-        if let Some(reason) = self.server.inner.metadata_fence(&self.binding) {
-            return MetadataCall::ReconnectRequired { reason };
-        }
         let txn = metadata_try!(self.server.inner.current_snapshot());
         MetadataCall::Success(MetadataDiagnostics {
             stamp: txn.stamp,
@@ -868,9 +855,6 @@ impl MetadataHub {
     }
 
     pub fn fetch(&self, hash: ContentHash) -> MetadataCall<ChunkStream> {
-        if let Some(reason) = self.server.inner.metadata_fence(&self.binding) {
-            return MetadataCall::ReconnectRequired { reason };
-        }
         match load_artifact(&self.server.inner.reader, hash) {
             Ok((payload, _)) => MetadataCall::Success(chunk_payload(&payload, DEFAULT_CHUNK_SIZE)),
             Err(error) => MetadataCall::Error(error),
@@ -893,15 +877,11 @@ impl<T> MetadataCall<T> {
 /// The shared body of the two metadata snapshot kinds.
 struct MetadataView<'a> {
     server: &'a Server,
-    binding: &'a MetadataBinding,
     hold: &'a SnapshotHold,
 }
 
 impl MetadataView<'_> {
     fn preflight<T>(&self) -> Option<MetadataCall<T>> {
-        if let Some(reason) = self.server.inner.metadata_fence(self.binding) {
-            return Some(MetadataCall::ReconnectRequired { reason });
-        }
         if !self.hold.alive() {
             return Some(MetadataCall::SnapshotExpired);
         }
@@ -909,9 +889,6 @@ impl MetadataView<'_> {
     }
 
     fn namespace<T>(&self) -> Result<Rc<SnapshotTxn>, MetadataNamespaceCall<T>> {
-        if let Some(reason) = self.server.inner.metadata_fence(self.binding) {
-            return Err(MetadataNamespaceCall::ReconnectRequired { reason });
-        }
         let Some(txn) = self.hold.txn() else {
             return Err(MetadataNamespaceCall::SnapshotExpired);
         };
@@ -947,7 +924,7 @@ impl MetadataView<'_> {
             .inner
             .current_snapshot()
             .map_err(|error| MetadataCall::Error(store_failure(error)))?;
-        let basis = metadata_basis(self.binding, txn.stamp);
+        let basis = metadata_basis(txn.stamp);
         let hold = self
             .server
             .inner
@@ -961,7 +938,6 @@ impl MetadataSnapshot {
     fn view(&self) -> MetadataView<'_> {
         MetadataView {
             server: &self.server,
-            binding: &self.binding,
             hold: &self.hold,
         }
     }
@@ -1024,7 +1000,6 @@ impl MetadataSnapshot {
         match self.view().refresh() {
             Ok((basis, hold)) => MetadataCall::Success(Self {
                 server: self.server.clone(),
-                binding: self.binding.clone(),
                 basis,
                 hold,
             }),
@@ -1046,7 +1021,6 @@ impl MetadataAuthoringSnapshot {
     fn view(&self) -> MetadataView<'_> {
         MetadataView {
             server: &self.server,
-            binding: &self.binding,
             hold: &self.hold,
         }
     }
@@ -1081,7 +1055,6 @@ impl MetadataAuthoringSnapshot {
         match self.view().refresh() {
             Ok((basis, hold)) => MetadataCall::Success(Self {
                 server: self.server.clone(),
-                binding: self.binding.clone(),
                 basis,
                 hold,
             }),
@@ -1159,7 +1132,7 @@ impl Hub {
     ) -> Option<RpcResult<T>> {
         let handle = &self.server.inner.handle;
         let backend = handle.authoring_backend();
-        self.server.with_writer(|store| {
+        self.server.inner.with_writer(|store| {
             let mut value = None;
             let mut failed = None;
             let published =
@@ -1213,29 +1186,23 @@ impl Hub {
                     .to_owned(),
             });
         }
-        if let Some(result) = self.write_files(base, &ops, force_lossy) {
-            return result;
-        }
-        RpcResult::Failure(RpcFailure::AuthoringBackendUnavailable {
-            operation: "write".to_owned(),
-        })
+        self.write_files(base, &ops, force_lossy)
     }
 
     /// Run the backend's file write on this connection's writer, inside an
     /// input at `base` that is rolled back: it holds the write lock while
-    /// the backend plans and writes, and commits nothing. `None` when the
-    /// backend has no filesystem authority.
+    /// the backend plans and writes, and commits nothing.
     fn write_files(
         &self,
         base: InputVersion,
         ops: &[AuthoringOp],
         force_lossy: bool,
-    ) -> Option<RpcResult<WriteReceipt>> {
+    ) -> RpcResult<WriteReceipt> {
         let backend = self.server.inner.handle.authoring_backend();
-        self.server.with_writer(|store| {
+        self.server.inner.with_writer(|store| {
             let observed = match store.open_input() {
                 Ok(observed) => observed,
-                Err(error) => return Some(RpcResult::Failure(store_failure(error))),
+                Err(error) => return RpcResult::Failure(store_failure(error)),
             };
             let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if observed != base {
@@ -1248,9 +1215,8 @@ impl Hub {
             }));
             let _ = store.finish_input(false);
             match written {
-                Ok(Ok(Some(receipt))) => Some(RpcResult::Success(receipt)),
-                Ok(Ok(None)) => None,
-                Ok(Err(error)) => Some(RpcResult::Failure(error)),
+                Ok(Ok(receipt)) => RpcResult::Success(receipt),
+                Ok(Err(error)) => RpcResult::Failure(error),
                 Err(panic) => std::panic::resume_unwind(panic),
             }
         })
@@ -1355,6 +1321,7 @@ impl Hub {
         let backend = self.server.inner.handle.authoring_backend();
         let prepared = match self
             .server
+            .inner
             .with_writer(|store| backend.prepare_operation(store, base, &operation))
         {
             Ok(prepared) => prepared,

@@ -14,15 +14,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use distill_bundle::{AssetEntry, Bundle, BUNDLE_FORMAT_VERSION};
-use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
+use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
 use distill_daemon::config::DaemonConfig;
 use distill_daemon::coordinator::DaemonCoordinator;
 use distill_daemon::scanner::AssetRoot;
 use distill_daemon::watcher::WatcherBatch;
 use distill_json::AuthoredValue;
 use distill_rpc::{
-    ArtifactPayload, BuildAnswer, BuildArtifactPublication, BuildBackend, BuildCompletion,
-    BuildPublication, BuildRequest, BuildStart, BuildTicket, BuildView, BuildWireTree, RpcFailure,
+    ArtifactPayload, BuildAnswer, BuildBackend, BuildCompletion, BuildRequest, BuildStart,
+    BuildTicket, BuildView, RpcFailure,
     Server, ServerHandle, SnapshotStamp, TargetDefinition,
 };
 use distill_schema::ngp_schema::{
@@ -174,18 +174,14 @@ impl TestProject {
     /// it observes. Its pipeline is Ready.
     pub fn configured(optimize: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(ROOT)).unwrap();
-        let schema = project_schema();
-        std::fs::write(dir.path().join("schema.json"), serde_json::to_vec(&schema).unwrap())
+        let root = dir.path().join(ROOT);
+        std::fs::create_dir_all(&root).unwrap();
+        let config = write_configuration(dir.path(), &root, optimize);
+        let targets = config
+            .target_definitions(configuration_authority(&config).identity())
             .unwrap();
-        let config = write_config(dir.path(), optimize);
-        let authority = configuration_authority(&config);
-        let mut project = Self::open(
-            dir,
-            config.target_definitions(authority.identity()).unwrap(),
-            vec![ROOT.to_owned()],
-        );
-        project.publish_configuration(&config, authority);
+        let mut project = Self::open(dir, targets, vec![ROOT.to_owned()]);
+        project.publish_configuration(&config);
         project
     }
 
@@ -194,22 +190,15 @@ impl TestProject {
     /// definition changed, fencing every hub bound to the old one.
     pub fn reconfigure(&mut self, optimize: bool) -> SnapshotStamp {
         assert!(self.authority.is_some(), "the project is not configured");
-        let config = write_config(self.dir.path(), optimize);
-        let authority = configuration_authority(&config);
-        self.publish_configuration(&config, authority)
+        let config = write_configuration(self.dir.path(), &self.root(ROOT), optimize);
+        self.publish_configuration(&config)
     }
 
-    fn publish_configuration(
-        &mut self,
-        config: &DaemonConfig,
-        authority: Arc<ProjectSchemaAuthority>,
-    ) -> SnapshotStamp {
-        let candidate = config.configuration_candidate(&authority).unwrap();
+    fn publish_configuration(&mut self, config: &DaemonConfig) -> SnapshotStamp {
+        let (stamp, authority) = publish_configuration(&self.coordinator, &mut self.writer, config);
         self.targets = config.target_definitions(authority.identity()).unwrap();
         self.authority = Some(authority);
-        self.coordinator
-            .publish_configuration_candidate(&mut self.writer, candidate)
-            .unwrap()
+        stamp
     }
 
     /// The target the daemon serves (the first, for a project with more).
@@ -260,8 +249,7 @@ impl TestProject {
         let mut project = Self::open(dir, targets, roots);
         if authority.is_some() {
             let config = DaemonConfig::load(project.path().join("distill.toml")).unwrap();
-            let authority = configuration_authority(&config);
-            project.publish_configuration(&config, authority);
+            project.publish_configuration(&config);
         }
         project
     }
@@ -414,22 +402,8 @@ impl TestBuilds {
             &[],
         );
         let server = self.server.upgrade().expect("the server outlives its backend");
-        let mut writer = server.opener().open_writer().unwrap();
-        let content_hash = server.install_build_publication(
-            &mut writer,
-            request.requested_asset,
-            BuildPublication {
-                root_content_hash: content_hash,
-                artifacts: vec![BuildArtifactPublication {
-                    content_hash,
-                    payload,
-                }],
-                wire_trees: vec![BuildWireTree {
-                    layout_hash,
-                    bytes: wire_bytes,
-                }],
-            },
-        )?;
+        put_wire_tree(&server, &wire_bytes);
+        assert_eq!(put_artifact(&server, &payload), content_hash);
         Ok(BuildAnswer::Built { content_hash })
     }
 }
@@ -482,13 +456,16 @@ pub fn canonical_artifact(
 /// A project type of the configured project: a struct of one `String`
 /// field `group`, a search tag.
 pub const TAGGED_TYPE: TypeUuid = TypeUuid([0xa4; 16]);
+/// A project type of the configured project no processor cooks: a struct
+/// of one `u8` field `value`.
+pub const VALUE_TYPE: TypeUuid = TypeUuid([0xa5; 16]);
 pub use distill_pipeline_fixture::{
     COOKED_TYPE, PARENT_TYPE, REFLECT, REFLECTION, REFLECTION_TYPE,
 };
 
-/// The configured project's schema: [`TAGGED_TYPE`], and the pipeline
-/// module's [`PARENT_TYPE`], [`COOKED_TYPE`] and [`REFLECTION_TYPE`] (each
-/// a struct of one `u8` field `value`), laid out for this host. Its
+/// The configured project's schema: [`TAGGED_TYPE`], [`VALUE_TYPE`], and the
+/// pipeline module's [`PARENT_TYPE`], [`COOKED_TYPE`] and [`REFLECTION_TYPE`]
+/// (each of these a struct of one `u8` field `value`), laid out for this host. Its
 /// source hashes are the pipeline module's.
 pub fn project_schema() -> Schema {
     let type_def = |id: usize, kind, krate: &str, name: &str, uuid, fields| TypeDef {
@@ -551,6 +528,7 @@ pub fn project_schema() -> Schema {
         ("Parent", PARENT_TYPE),
         ("Cooked", COOKED_TYPE),
         ("Reflection", REFLECTION_TYPE),
+        ("Value", VALUE_TYPE),
     ] {
         types.push(type_def(
             types.len(),
@@ -589,9 +567,14 @@ fn host_triple() -> String {
     }
 }
 
-/// Write the project's `distill.toml` (see [`TestProject::configured`])
-/// and load it.
-fn write_config(dir: &Path, optimize: bool) -> DaemonConfig {
+/// Write the configuration of the project at `dir` whose root [`ROOT`] is
+/// `root`: `dir/distill.toml` (state under `dir/.distill`, the target
+/// "dev", `optimize` as given, the pipeline module
+/// `distill-pipeline-fixture`) and `dir/schema.json` ([`project_schema`]).
+/// Returns it loaded.
+pub fn write_configuration(dir: &Path, root: &Path, optimize: bool) -> DaemonConfig {
+    std::fs::write(dir.join("schema.json"), serde_json::to_vec(&project_schema()).unwrap())
+        .unwrap();
     let toml_path = |path: PathBuf| path.display().to_string().replace('\\', "/");
     let config = format!(
         r#"
@@ -620,7 +603,7 @@ segment_size = "1MiB"
 cache_limit = "16MiB"
 "#,
         state = toml_path(dir.join(".distill")),
-        root = toml_path(dir.join(ROOT)),
+        root = toml_path(root.to_owned()),
         schema = toml_path(dir.join("schema.json")),
         module = toml_path(pipeline_module().0.clone()),
         os = std::env::consts::OS,
@@ -630,6 +613,23 @@ cache_limit = "16MiB"
     let path = dir.join("distill.toml");
     std::fs::write(&path, config).unwrap();
     DaemonConfig::load(path).unwrap()
+}
+
+/// Publish `config` (see [`write_configuration`]) on `coordinator`'s
+/// store, as the daemon's process loop publishes a configuration it
+/// observes; returns the version and the configuration's schema
+/// authority. Its pipeline is Ready.
+pub fn publish_configuration(
+    coordinator: &DaemonCoordinator,
+    writer: &mut StoreWriter,
+    config: &DaemonConfig,
+) -> (SnapshotStamp, Arc<ProjectSchemaAuthority>) {
+    let authority = configuration_authority(config);
+    let candidate = config.configuration_candidate(&authority).unwrap();
+    let stamp = coordinator
+        .publish_configuration_candidate(writer, candidate)
+        .unwrap();
+    (stamp, authority)
 }
 
 /// The schema authority of `config`'s schema file, as the process loop
@@ -680,4 +680,38 @@ fn pipeline_module() -> &'static (PathBuf, (String, String)) {
         library.close();
         (module, (identity.crate_name, identity.source_hash))
     })
+}
+
+/// Put the artifact `payload` (with its load edges) into `server`'s store,
+/// as the daemon's build workers put theirs; returns its content hash.
+pub fn put_artifact(server: &ServerHandle, payload: &ArtifactPayload) -> ContentHash {
+    let blobs = payload.blobs.iter().map(AsRef::as_ref).collect::<Vec<&[u8]>>();
+    let bytes = distill_wire::artifact::assemble_artifact(&payload.structural, &blobs);
+    let edges = payload
+        .load_edges
+        .iter()
+        .map(|edge| (edge.asset, edge.expected_terminal))
+        .collect::<Vec<_>>();
+    server
+        .opener()
+        .open_writer()
+        .unwrap()
+        .write_transaction(|store| store.put_artifact(&bytes, &edges))
+        .unwrap()
+}
+
+/// Put the wire tree `bytes` (canonical DSWL) into `server`'s store, as the
+/// daemon's build workers put theirs; returns its layout hash.
+pub fn put_wire_tree(server: &ServerHandle, bytes: &[u8]) -> LayoutHash {
+    server
+        .opener()
+        .open_writer()
+        .unwrap()
+        .write_transaction(|store| store.put_wire_tree(bytes))
+        .unwrap()
+}
+
+/// The schema authority of [`project_schema`].
+pub fn project_authority() -> Arc<ProjectSchemaAuthority> {
+    Arc::new(ProjectSchemaAuthority::from_schema(project_schema(), [0; 32]).unwrap())
 }

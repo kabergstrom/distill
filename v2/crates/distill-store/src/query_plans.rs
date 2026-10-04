@@ -2063,10 +2063,10 @@ fn cas_verification_reads_per_segment() {
     );
 }
 
-/// A connection's fence check is one statement of three primary-key
+/// A connection's fence check is one statement of two primary-key
 /// searches.
 #[test]
-fn the_rpc_fence_is_three_key_searches() {
+fn the_rpc_fence_is_two_key_searches() {
     let (_dir, store) = store_with(1);
     assert_eq!(
         store.query_plan_details(crate::served::RPC_FENCE).unwrap(),
@@ -2075,8 +2075,6 @@ fn the_rpc_fence_is_three_key_searches() {
             "SCALAR SUBQUERY 1",
             "SEARCH store_meta USING INDEX sqlite_autoindex_store_meta_1 (key=?)",
             "SCALAR SUBQUERY 2",
-            "SEARCH store_meta USING INDEX sqlite_autoindex_store_meta_1 (key=?)",
-            "SCALAR SUBQUERY 3",
             "SEARCH rpc_targets USING INDEX sqlite_autoindex_rpc_targets_1 (name=?)",
         ]
     );
@@ -2086,8 +2084,8 @@ fn the_rpc_fence_is_three_key_searches() {
 /// statement trace.
 static FENCE_WRITER: std::sync::Mutex<Option<Store>> = std::sync::Mutex::new(None);
 
-/// Publish a new protocol epoch and pipeline generation together, once,
-/// just before the reader's first statement that reads the pipeline
+/// Publish a new pipeline generation and target definition together,
+/// once, just before the reader's first statement that reads the pipeline
 /// generation runs.
 fn publish_before_the_generation_read(sql: &str) {
     if !sql.contains("rpc_pipeline_generation") {
@@ -2097,8 +2095,8 @@ fn publish_before_the_generation_read(sql: &str) {
         writer
             .served_transaction(|txn| {
                 use crate::served::ServedWrite;
-                txn.set_rpc_protocol_epoch(99)?;
-                txn.bump_rpc_pipeline_generation().map(drop)
+                txn.bump_rpc_pipeline_generation()?;
+                txn.set_rpc_target("pc", [2; 32]).map(drop)
             })
             .unwrap();
     }
@@ -2106,31 +2104,24 @@ fn publish_before_the_generation_read(sql: &str) {
 
 #[test]
 fn a_connections_fences_are_read_at_one_instant() {
-    // A publication that changes the protocol epoch and the pipeline
-    // generation together lands while a front end reads the fences. It
-    // must see both or neither: seeing the new generation with the old
-    // epoch tells the client PipelineEpochChanged where the protocol
-    // changed.
+    // A publication that changes the pipeline generation and the target
+    // definition together (a configuration candidate) lands while a front
+    // end reads the fences. It must see both or neither: seeing the new
+    // generation with the old target tells the client
+    // PipelineEpochChanged where its target changed too.
     use crate::served::ServedWrite;
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(crate::StoreConfig::new(dir.path().join("state"))).unwrap();
     store
-        .served_transaction(|txn| {
-            txn.set_rpc_protocol_epoch(7)?;
-            txn.set_rpc_target("pc", [1; 32]).map(drop)
-        })
+        .served_transaction(|txn| txn.set_rpc_target("pc", [1; 32]).map(drop))
         .unwrap();
     let mut reader = store.reader().unwrap();
     *FENCE_WRITER.lock().unwrap() = Some(store);
     reader.trace_statements(Some(publish_before_the_generation_read));
-    let (fences, target_generation) = reader.rpc_fence("pc").unwrap();
+    let fence = reader.rpc_fence("pc").unwrap();
     reader.trace_statements(None);
     assert!(FENCE_WRITER.lock().unwrap().is_none(), "the publication landed mid-read");
-    assert_eq!(
-        (fences.protocol_epoch, fences.pipeline_generation, target_generation),
-        (Some(99), 1, Some(0)),
-        "the fences mix two versions"
-    );
+    assert_eq!(fence, (1, Some(1)), "the fences mix two versions");
 }
 
 /// Pages a subscriber's history read fetches: one subscribed asset and

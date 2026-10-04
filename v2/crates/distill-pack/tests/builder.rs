@@ -93,9 +93,10 @@ fn fixture_with_policy_and_cycle(build_only: bool, cycle: bool) -> Fixture {
     let child = AssetUuid([2; 16]);
     let wire = WireNode::Unit { offset: 0 };
     let layout_hash = dswl_hash(&wire).unwrap();
-    server
-        .install_wire_tree(layout_hash, Arc::from(dswl_bytes(&wire).unwrap()))
-        .unwrap();
+    assert_eq!(
+        distill_test_project::put_wire_tree(&server.handle(), &dswl_bytes(&wire).unwrap()),
+        layout_hash
+    );
 
     let child_row = artifact_row(
         child,
@@ -122,8 +123,8 @@ fn fixture_with_policy_and_cycle(build_only: bool, cycle: bool) -> Fixture {
         }],
         None,
     );
-    server.install_artifact(child_row.0, child_row.1).unwrap();
-    server.install_artifact(root_row.0, root_row.1).unwrap();
+    assert_eq!(distill_test_project::put_artifact(&server.handle(), &child_row.1), child_row.0);
+    assert_eq!(distill_test_project::put_artifact(&server.handle(), &root_row.1), root_row.0);
     server.install_build_backend(Arc::new(TypePolicyBackend {
         build_only,
         built: BTreeMap::from([(root, root_row.0), (child, child_row.0)]),

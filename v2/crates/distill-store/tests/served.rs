@@ -86,11 +86,11 @@ fn rpc_targets_advance_generation_only_on_change() {
         .unwrap();
     assert_eq!(changed, [false, false, true]);
     assert_eq!(store.rpc_target("pc").unwrap().unwrap().generation, 1);
-    assert_eq!(store.rpc_fences().unwrap().pipeline_generation, 0);
+    assert_eq!(store.rpc_pipeline_generation().unwrap(), 0);
     store
         .served_transaction(|txn| txn.bump_rpc_pipeline_generation())
         .unwrap();
-    assert_eq!(store.rpc_fences().unwrap().pipeline_generation, 1);
+    assert_eq!(store.rpc_pipeline_generation().unwrap(), 1);
 }
 
 #[test]

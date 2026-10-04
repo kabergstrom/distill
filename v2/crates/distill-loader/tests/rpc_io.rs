@@ -66,9 +66,7 @@ fn fixture() -> Fixture {
     };
     let layout_hash = dswl_hash(&wire).unwrap();
     let wire_bytes = dswl_bytes(&wire).unwrap();
-    server
-        .install_wire_tree(layout_hash, Arc::from(wire_bytes.clone()))
-        .unwrap();
+    assert_eq!(distill_test_project::put_wire_tree(&server.handle(), &wire_bytes), layout_hash);
     let blob = vec![0x5a; 64];
     let complete = write_artifact(
         &ArtifactHeader {
@@ -89,16 +87,17 @@ fn fixture() -> Fixture {
     let structural_len = complete.len() - parsed.blob_section.len();
     let hash = content_hash(&complete);
     let artifact_bytes = complete.len();
-    server
-        .install_artifact(
-            hash,
-            ArtifactPayload {
+    assert_eq!(
+        distill_test_project::put_artifact(
+            &server.handle(),
+            &ArtifactPayload {
                 structural: Arc::from(complete[..structural_len].to_vec()),
                 blobs: vec![Arc::from(blob)],
                 load_edges: Vec::new(),
-            },
-        )
-        .unwrap();
+            }
+        ),
+        hash
+    );
     TestBuilds::install(&server)
         .answer(asset, Ok(BuildAnswer::Built { content_hash: hash }));
     write_asset(&mut project, PATH, asset, 0);

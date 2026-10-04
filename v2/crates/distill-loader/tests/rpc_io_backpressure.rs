@@ -115,9 +115,10 @@ fn serve_sized(blob_lens: &[usize]) -> Daemon {
         fields: Vec::new(),
     };
     let layout_hash = dswl_hash(&wire).unwrap();
-    server
-        .install_wire_tree(layout_hash, Arc::from(dswl_bytes(&wire).unwrap()))
-        .unwrap();
+    assert_eq!(
+        distill_test_project::put_wire_tree(&server.handle(), &dswl_bytes(&wire).unwrap()),
+        layout_hash
+    );
     let mut assets = Vec::new();
     for (seed, &blob_len) in blob_lens.iter().enumerate() {
         let uuid = asset(u16::try_from(seed).unwrap());
@@ -144,10 +145,10 @@ fn serve_sized(blob_lens: &[usize]) -> Daemon {
         .unwrap();
         let structural_len = bytes.len() - parse_artifact(&bytes).unwrap().blob_section.len();
         let hash = content_hash(&bytes);
-        server
-            .install_artifact(
-                hash,
-                ArtifactPayload {
+        assert_eq!(
+            distill_test_project::put_artifact(
+                &server.handle(),
+                &ArtifactPayload {
                     structural: Arc::from(bytes[..structural_len].to_vec()),
                     blobs: if blob_len == 0 {
                         Vec::new()
@@ -155,9 +156,10 @@ fn serve_sized(blob_lens: &[usize]) -> Daemon {
                         vec![Arc::from(blob.clone())]
                     },
                     load_edges: Vec::new(),
-                },
-            )
-            .unwrap();
+                }
+            ),
+            hash
+        );
         builds.answer(uuid, Ok(BuildAnswer::Built { content_hash: hash }));
         write_asset(&mut project, seed, 0);
         assets.push((uuid, hash));

@@ -234,17 +234,6 @@ impl DaemonCoordinator {
         })
     }
 
-    /// Publish one coordinated step against `base` on `store`; `publish`
-    /// runs inside its input, on the same writer.
-    pub fn coordinated_commit(
-        &self,
-        store: &mut Store,
-        base: InputVersion,
-        publish: impl FnOnce(&mut Store) -> Result<Commit, String>,
-    ) -> Result<SnapshotStamp, CoordinatedCommitError> {
-        self.server.coordinated_commit(store, base, publish)
-    }
-
     /// An RPC front end of the caller's own (reads, `root`, admin calls
     /// on a writer of its own).
     pub fn server(&self) -> Server {
@@ -262,10 +251,6 @@ impl DaemonCoordinator {
         let server = self.server();
         server.install_build_backend(backend);
         self.authoring.attach_tag_index_coordinator(self);
-    }
-
-    pub fn opener(&self) -> &Arc<StoreOpener> {
-        &self.opener
     }
 
     /// A writer of the caller's own on the daemon's store.
@@ -419,17 +404,17 @@ impl DaemonCoordinator {
 
     /// Replace the compiled state the store's current version serves with
     /// `with` of it: tests install state no publication compiled.
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(test)]
     fn replace_compiled_for_test(&self, with: impl FnOnce(&Compiled) -> Compiled) {
         let reader = self.open_reader().expect("test reader");
         let current = self.compiled.at(&reader).expect("test compiled state");
         self.compiled.replace_for_test(with(&current));
     }
 
-    /// Test hook: serve `authority` as the compiled schema authority of the
-    /// current version, as a configuration with that schema would.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn install_schema_authority_for_test(&self, authority: Arc<ProjectSchemaAuthority>) {
+    /// Serve `authority` as the compiled schema authority of the current
+    /// version, as a configuration with that schema would.
+    #[cfg(test)]
+    pub(crate) fn install_schema_authority_for_test(&self, authority: Arc<ProjectSchemaAuthority>) {
         self.replace_compiled_for_test(|current| current.with_test_state(Some(authority), None, None));
     }
 

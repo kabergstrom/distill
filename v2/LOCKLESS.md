@@ -968,9 +968,9 @@ should reach zero by the end of phase 6.
     them with their subjects.
   - The import index has no built flag (schema 38): it is kept by the
     dirty work every bundle publication queues, never rebuilt whole.
-  - `ServerHandle::replace_target` writes only the served target hash;
-    builds take targets from the compiled entry, so it installs nothing in
-    memory.
+  - A configuration publication (`coordinated_replace_target_set`) writes
+    only the served target hashes; builds take targets from the compiled
+    entry, so it installs nothing in memory.
   - The node key (`DSNK` v2) includes each named type's build-only policy,
     so a policy change cannot serve a cached node.
   - The unused `publish_pipeline_candidate` is gone.

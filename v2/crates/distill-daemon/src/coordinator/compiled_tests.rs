@@ -1037,7 +1037,7 @@ fn a_repeated_pipeline_failure_neither_publishes_nor_fences() {
         (
             reader.input_version().unwrap(),
             reader.pipeline_failure().unwrap(),
-            reader.rpc_fences().unwrap().pipeline_generation,
+            reader.rpc_pipeline_generation().unwrap(),
         )
     };
     let (version, failure, generation) = served(&coordinator);

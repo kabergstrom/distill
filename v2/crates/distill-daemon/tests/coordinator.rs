@@ -366,7 +366,7 @@ fn write_files(
         .authoring_service()
         .write_files(writer, base, operations, force_lossy);
     writer.finish_input(false).unwrap();
-    written.map(|receipt| receipt.expect("production authoring writes files"))
+    written
 }
 
 /// [`write_files`], then the watcher's batch for the written files. The

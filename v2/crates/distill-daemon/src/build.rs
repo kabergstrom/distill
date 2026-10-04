@@ -4211,9 +4211,7 @@ mod tests {
     use distill_build::pipeline::{GraphicsApi, TargetArch, TargetOs, TargetSelector};
     use distill_json::AuthoredValue;
     use distill_rpc::{
-        ArtifactPayload, BuildEntry,
-        BuildArtifactPublication, BuildPublication, BuildWireTree, TargetDefinition,
-        TargetDefinitionHash,
+        ArtifactPayload, BuildEntry, TargetDefinition, TargetDefinitionHash,
     };
     use distill_schema::ngp_schema::{
         node_hash, Field, FieldAttrs, FieldIdentifier, FieldLayout,
@@ -4559,6 +4557,28 @@ mod tests {
             BuildStart::Answered(answer) => answer,
             BuildStart::Submitted(ticket) => block_on(ticket).answer(requester.view()),
         }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct BuildWireTree {
+        layout_hash: LayoutHash,
+        /// Canonical DSWL body bytes (without the CAS domain/version prefix).
+        bytes: Arc<[u8]>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct BuildArtifactPublication {
+        content_hash: ContentHash,
+        payload: ArtifactPayload,
+    }
+
+    /// The artifacts and wire trees one build published, read back from
+    /// the CAS; the root artifact is among `artifacts`.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct BuildPublication {
+        root_content_hash: ContentHash,
+        artifacts: Vec<BuildArtifactPublication>,
+        wire_trees: Vec<BuildWireTree>,
     }
 
     /// Build `request` at the current snapshot, and read its node's
@@ -5343,7 +5363,7 @@ mod tests {
             },
             StoreLockProbeProcessor {
                 calls: Arc::clone(&calls),
-                opener: Arc::clone(coordinator.opener()),
+                opener: Arc::clone(coordinator.server_handle().opener()),
                 observed_unlocked: Arc::clone(&observed_unlocked),
             },
             move |arena| {
@@ -5380,7 +5400,7 @@ mod tests {
         assert_eq!(
             payload_backend
                 .runtime_type_policy(
-                    &coordinator.opener().open_reader().unwrap(),
+                    &coordinator.open_reader().unwrap(),
                     &RuntimeTypePolicyRequest {
                         basis: coordinator.server().current_stamp().unwrap(),
                         target: request.target.clone(),
@@ -5399,10 +5419,6 @@ mod tests {
         assert!(count("SELECT COUNT(*) FROM result_outputs WHERE role = 0") > 0);
         drop(meta);
         for artifact in &first.artifacts {
-            coordinator
-                .server()
-                .install_artifact(artifact.content_hash, artifact.payload.clone())
-                .unwrap();
             let blobs = artifact
                 .payload
                 .blobs
@@ -5420,10 +5436,6 @@ mod tests {
             );
         }
         for wire_tree in &first.wire_trees {
-            coordinator
-                .server()
-                .install_wire_tree(wire_tree.layout_hash, wire_tree.bytes.clone())
-                .unwrap();
             assert_eq!(
                 coordinator
                     .open_reader()

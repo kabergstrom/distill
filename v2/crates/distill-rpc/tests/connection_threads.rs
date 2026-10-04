@@ -253,9 +253,9 @@ fn fixture() -> Fixture {
     let server = project.server();
     let gate = Arc::new(Gate::default());
     let (hash, payload) = artifact(ASSET, &[7, 8, 9]);
-    server.install_artifact(hash, payload).unwrap();
+    assert_eq!(distill_test_project::put_artifact(&server.handle(), &payload), hash);
     let (large, payload) = artifact(LARGE, &vec![0x5a; 8 << 20]);
-    server.install_artifact(large, payload).unwrap();
+    assert_eq!(distill_test_project::put_artifact(&server.handle(), &payload), large);
     let backend = Arc::new(TestBackend {
         gate: Arc::clone(&gate),
         built: BTreeMap::from([(ASSET, hash), (LARGE, large)]),
@@ -607,7 +607,7 @@ fn deltas_and_fences_reach_every_connection() {
                 fenced_tx
                     .send(matches!(
                         hub.snapshot().await.unwrap(),
-                        RemoteCall::ReconnectRequired(ReconnectReason::TargetDefinitionChanged)
+                        RemoteCall::ReconnectRequired(ReconnectReason::PipelineEpochChanged)
                     ))
                     .unwrap();
             }));
@@ -634,9 +634,7 @@ fn deltas_and_fences_reach_every_connection() {
         }
         assert_eq!(deltas.len(), 4);
 
-        server
-            .replace_target(TargetDefinition::new("dev", TargetDefinitionHash([8; 32])))
-            .unwrap();
+        fence_pipeline(&project);
         let mut fences = BTreeMap::new();
         for _ in 0..4 {
             let (index, event) = event_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -647,7 +645,7 @@ fn deltas_and_fences_reach_every_connection() {
                 event,
                 StreamEvent::Asset {
                     event: AssetEvent::ReconnectRequired {
-                        reason: ReconnectReason::TargetDefinitionChanged
+                        reason: ReconnectReason::PipelineEpochChanged
                     },
                     ..
                 }
@@ -950,7 +948,10 @@ fn concurrent_snapshots_resolves_fetches_and_commits_stay_consistent() {
             .filter(|generation| generation % 2 == 0)
             .map(|generation| {
                 let (content_hash, payload) = artifact(ASSET, &generation.to_le_bytes());
-                server.install_artifact(content_hash, payload).unwrap();
+                assert_eq!(
+                    distill_test_project::put_artifact(&server.handle(), &payload),
+                    content_hash
+                );
                 (InputVersion(base.0 + generation), content_hash)
             })
             .collect::<BTreeMap<_, _>>();
@@ -1115,7 +1116,7 @@ impl AuthoringBackend for LedgerBackend {
         base: InputVersion,
         _operations: &[AuthoringOp],
         _force_lossy: bool,
-    ) -> Result<Option<WriteReceipt>, RpcFailure> {
+    ) -> Result<WriteReceipt, RpcFailure> {
         {
             let mut running = self.running.lock().unwrap();
             running.0 += 1;
@@ -1129,7 +1130,7 @@ impl AuthoringBackend for LedgerBackend {
             .unwrap()
             .push(store.config().segment_size);
         self.running.lock().unwrap().0 -= 1;
-        Ok(Some(WriteReceipt::default()))
+        Ok(WriteReceipt::default())
     }
 
     fn prepare_import(
@@ -1164,7 +1165,10 @@ impl AuthoringBackend for LedgerBackend {
 /// `backend`; the project holds the daemon and its files.
 fn ledger_server(backend: Arc<LedgerBackend>) -> (TestProject, Server) {
     let project = project();
-    let handle = ServerHandle::open(backend, Arc::clone(project.coordinator().opener()));
+    let handle = ServerHandle::open(
+        backend,
+        Arc::clone(project.coordinator().server_handle().opener()),
+    );
     let server = Server::open(&handle);
     (project, server)
 }
@@ -1272,12 +1276,12 @@ fn a_coordinated_commits_backend_row_and_served_projection_land_together() {
             let handle = Arc::clone(&handle);
             std::thread::spawn(move || {
                 // An owner of its own: this thread's writer.
-                let admin = Server::open(&handle);
+                let mut writer = handle.opener().open_writer().unwrap();
                 for _ in 0..COMMITS {
-                    let base = admin.current_stamp().unwrap().version;
+                    let base = handle.stamp_of(&writer).unwrap().version;
                     let next = InputVersion(base.0 + 1);
-                    admin
-                        .coordinated_commit(base, |store| {
+                    handle
+                        .coordinated_commit(&mut writer, base, |store| {
                             ledger_row(store, next).map_err(|error| error.to_string())?;
                             Ok(ledger_commit())
                         })
@@ -1420,4 +1424,21 @@ fn a_configuration_change_reaches_open_writers() {
         writer.join().unwrap();
         assert_eq!(*backend.segment_sizes.lock().unwrap(), [before, before * 2]);
     });
+}
+
+/// Fence every connection: the daemon publishes a rejected pipeline
+/// candidate, which changes the pipeline generation.
+fn fence_pipeline(project: &TestProject) {
+    let failure = PipelineFailure::new(
+        PipelineFailureCode::CandidateRegistration,
+        PipelineFailureOrigin::CandidateOpen,
+        CleanupDisposition::CleanedAndClosed,
+        "duplicate processor id",
+    )
+    .unwrap();
+    let mut writer = project.coordinator().open_writer().unwrap();
+    project
+        .coordinator()
+        .publish_pipeline_rejection(&mut writer, failure)
+        .unwrap();
 }

@@ -831,8 +831,6 @@ pub trait AuthoringBackend: Send + Sync + 'static {
     /// files it changes, and return what it wrote. The write is complete
     /// once the files are atomically on disk: the store follows through the
     /// watcher, as for any other edit. An error means no file changed.
-    /// `Ok(None)`: the backend has no filesystem authority, and the write
-    /// fails as [`RpcFailure::AuthoringBackendUnavailable`].
     ///
     /// The RPC server invokes this inside an input open on `store` at
     /// `base`, which it then rolls back: the input holds the write lock, so
@@ -840,13 +838,11 @@ pub trait AuthoringBackend: Send + Sync + 'static {
     /// not call back into the [`crate::Server`].
     fn write_files(
         &self,
-        _store: &mut distill_store::Store,
-        _base: InputVersion,
-        _operations: &[AuthoringOp],
-        _force_lossy: bool,
-    ) -> Result<Option<WriteReceipt>, RpcFailure> {
-        Ok(None)
-    }
+        store: &mut distill_store::Store,
+        base: InputVersion,
+        operations: &[AuthoringOp],
+        force_lossy: bool,
+    ) -> Result<WriteReceipt, RpcFailure>;
 
     fn prepare_import(
         &self,
@@ -944,28 +940,6 @@ pub struct RuntimeTypePolicy {
     pub build_only: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BuildWireTree {
-    pub layout_hash: LayoutHash,
-    /// Canonical DSWL body bytes (without the CAS domain/version prefix).
-    pub bytes: Arc<[u8]>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BuildArtifactPublication {
-    pub content_hash: ContentHash,
-    pub payload: ArtifactPayload,
-}
-
-/// Artifacts and wire trees a backend outside the daemon publishes for one
-/// build ([`crate::install_build_publication`]). The root artifact must be
-/// present in `artifacts`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BuildPublication {
-    pub root_content_hash: ContentHash,
-    pub artifacts: Vec<BuildArtifactPublication>,
-    pub wire_trees: Vec<BuildWireTree>,
-}
 
 /// What a requester reads while it starts or answers a build: its own
 /// snapshot, whose answers decide whether a result serves it, and the
@@ -1474,10 +1448,6 @@ pub struct Commit {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdminError {
-    UnknownTarget {
-        target: String,
-    },
-    InvalidTargetSet(crate::TargetSetError),
     DuplicateAssetMutation {
         uuid: AssetUuid,
     },
@@ -1490,15 +1460,6 @@ pub enum AdminError {
     },
     InvalidAuthoringIdentity {
         uuid: AssetUuid,
-        detail: String,
-    },
-    IncompleteArtifactTypeCoverage {
-        missing: Vec<TypeUuid>,
-    },
-    InvalidServedClosure {
-        detail: String,
-    },
-    InvalidArtifact {
         detail: String,
     },
     InvalidNamespaceError {
@@ -1515,16 +1476,6 @@ pub enum AdminError {
     },
     EmptyPathCandidates {
         path: String,
-    },
-    WireTreeHashMismatch {
-        expected: LayoutHash,
-        observed: LayoutHash,
-    },
-    InvalidWireTree {
-        detail: String,
-    },
-    WireTreeAlreadyExistsWithDifferentPayload {
-        hash: LayoutHash,
     },
 }
 

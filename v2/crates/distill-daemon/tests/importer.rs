@@ -5,25 +5,22 @@ use distill_bundle::{AssetEntry, Bundle};
 use distill_core::bootstrap::{
     BootstrapControlSpecV1, BootstrapControlSymbol, DIRECTORY_IMPORT_RULES_TYPE_UUID,
 };
-use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
+use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
 use distill_daemon::coordinator::DaemonCoordinator;
 use distill_daemon::importer::{AuthoringImportContext, AuthoringImporter, AuthoringImporterError};
 use distill_daemon::scanner::AssetRoot;
 use distill_daemon::watcher::WatcherBatch;
 use distill_json::AuthoredValue;
 use distill_rpc::{
-    AuthoringBackend, AuthoringValue, Commit, ImportRequest, InputVersion, TargetDefinition,
+    AuthoringValue, ImportRequest, InputVersion, TargetDefinition,
     TargetDefinitionHash,
 };
-use distill_schema::ngp_schema::{
-    Field, FieldAttrs, FieldIdentifier, FieldLayout, LayoutIdentity, LogicalSchema, PrimitiveKind,
-    PrimitiveType, Schema, SchemaLayouts, SchemaNode, SchemaTypeId, TypeAttrs, TypeDef, TypeLayout,
-    TypePath,
-};
-use distill_schema::ProjectSchemaAuthority;
+use distill_schema::ngp_schema::{LogicalSchema, PrimitiveKind, SchemaNode};
 use distill_store::StoreConfig;
 
-const TYPE_UUID: TypeUuid = TypeUuid([71; 16]);
+/// The importers' output type, a project type of the shared test
+/// configuration: a struct of one `u8` field `value`.
+const TYPE_UUID: TypeUuid = distill_test_project::VALUE_TYPE;
 /// The importers' settings type: a `u8` the importer registers itself.
 const SETTINGS_TYPE_UUID: TypeUuid = TypeUuid([70; 16]);
 
@@ -99,7 +96,7 @@ impl AuthoringImporter for ByteImporter {
 }
 
 fn ordinary_bundle() -> (Vec<u8>, LogicalSchema, distill_core::id::LogicalHash) {
-    let authority = byte_authority();
+    let authority = distill_test_project::project_authority();
     let project = authority.project_type(TYPE_UUID).unwrap();
     let schema = project.logical_schema.clone();
     let schema_hash = project.logical_hash;
@@ -128,124 +125,59 @@ fn target() -> TargetDefinition {
     TargetDefinition::new("dev", TargetDefinitionHash([4; 32]))
 }
 
-/// Publish a version whose compiled schema authority names `schema_hash` as
-/// the current schema of `TYPE_UUID` (a project type of one byte), as a
-/// configuration with that schema would: importer outputs are written at
-/// it.
-fn publish_schema_registry(coordinator: &DaemonCoordinator, schema_hash: LogicalHash) {
+/// Configure the project at `dir`, whose root "main" is `root`, with the
+/// shared test configuration (whose schema has the project type
+/// `TYPE_UUID`), and publish it as the daemon's process loop does:
+/// importer outputs are written at that schema.
+fn configure(coordinator: &DaemonCoordinator, dir: &std::path::Path, root: &std::path::Path) {
+    let config = distill_test_project::write_configuration(dir, root, false);
     let mut writer = coordinator.open_writer().unwrap();
-    let base = coordinator.server().current_stamp().unwrap().version;
-    coordinator
-        .coordinated_commit(&mut writer, base, |store| {
-            store
-                .input_transaction(|_| Ok(()))
-                .map_err(|error| error.to_string())?;
-            Ok(Commit::default())
-        })
-        .unwrap();
-    let authority = byte_authority();
-    assert_eq!(
-        authority.project_type(TYPE_UUID).unwrap().logical_hash,
-        schema_hash
-    );
-    coordinator.install_schema_authority_for_test(Arc::new(authority));
+    distill_test_project::publish_configuration(coordinator, &mut writer, &config);
 }
 
-/// A project schema whose one asset type, `TYPE_UUID`, is a struct of one
-/// `u8` field `value`.
-fn type_def(
-    id: usize,
-    kind: PrimitiveType,
-    krate: &str,
-    name: &str,
-    uuid: Option<TypeUuid>,
-    fields: Vec<Field>,
-) -> TypeDef {
-    TypeDef {
-        id: SchemaTypeId(id),
-        kind,
-        path: TypePath {
-            name: Some(name.to_owned()),
-            containing_type: None,
-            modules: Vec::new(),
-            krate: krate.to_owned(),
-        },
-        uuid,
-        attrs: TypeAttrs::default(),
-        fields,
-        generic_parameters: Vec::new(),
-        generic_argument_ids: Vec::new(),
-        has_default: true,
-        generic_const_arguments: Vec::new(),
-        has_explicit_discriminants: false,
+/// A hub bound to the target the daemon serves.
+fn connect(coordinator: &DaemonCoordinator) -> distill_rpc::Hub {
+    let target = coordinator.open_reader().unwrap().rpc_targets().unwrap().remove(0);
+    match coordinator.server().root().connect(distill_rpc::ConnectRequest::new(
+        &target.name,
+        TargetDefinitionHash(target.definition_hash),
+    )) {
+        distill_rpc::ConnectOutcome::Connected(connected) => connected.hub,
+        other => panic!("expected connection, got {other:?}"),
     }
 }
 
-fn byte_authority() -> ProjectSchemaAuthority {
-    ProjectSchemaAuthority::from_schema(
-        Schema {
-            source_hashes: BTreeMap::new(),
-            type_ops_hash: String::new(),
-            layout_hashes: Default::default(),
-            rustc_version: String::new(),
-            types: vec![
-                type_def(
-                    0,
-                    PrimitiveType::Struct,
-                    "game",
-                    "Byte",
-                    Some(TYPE_UUID),
-                    vec![Field {
-                        id: FieldIdentifier::Name("value".to_owned()),
-                        type_id: SchemaTypeId(1),
-                        attrs: FieldAttrs::default(),
-                    }],
-                ),
-                type_def(1, PrimitiveType::U8, "core", "u8", None, Vec::new()),
-            ],
-            layouts: vec![SchemaLayouts {
-                identity: LayoutIdentity {
-                    target_triple: "x86_64-unknown-linux-gnu".into(),
-                    rustc: "rustc test".into(),
-                    algorithm_version: 1,
-                },
-                layouts: vec![
-                    TypeLayout {
-                        size: Some(1),
-                        align: Some(1),
-                        layout_complete: true,
-                        tag_encoding: None,
-                        fields: vec![FieldLayout {
-                            offset: Some(0),
-                            field_size: Some(1),
-                        }],
-                    },
-                    TypeLayout {
-                        size: Some(1),
-                        align: Some(1),
-                        layout_complete: true,
-                        tag_encoding: None,
-                        fields: Vec::new(),
-                    },
-                ],
-            }],
+/// Import `dest` from `sources` with `importer` (its settings the
+/// canonical value `settings`), watched, through the RPC hub as a client
+/// does, at the current version; returns the imported bundle.
+fn import(
+    coordinator: &DaemonCoordinator,
+    importer: &str,
+    sources: &[&str],
+    dest: &str,
+    settings: &[u8],
+) -> BundleUuid {
+    let base = coordinator.server().current_stamp().unwrap().version;
+    let request = ImportRequest {
+        importer: importer.into(),
+        sources: sources.iter().map(|source| (*source).to_owned()).collect(),
+        dest: dest.into(),
+        settings: AuthoringValue {
+            canonical_value: Arc::from(settings),
+            blobs: Vec::new(),
         },
-        [10; 32],
-    )
-    .unwrap()
+        watch: true,
+        root: "main".into(),
+    };
+    match connect(coordinator).import(base, request) {
+        distill_rpc::RpcResult::Success(bundle) => bundle,
+        other => panic!("expected an import, got {other:?}"),
+    }
 }
 
 /// The watched-import failures a runtime client polls, as (path, message).
 fn import_failures(coordinator: &DaemonCoordinator) -> Vec<(String, String)> {
-    let hub = match coordinator
-        .server()
-        .root()
-        .connect(distill_rpc::ConnectRequest::new("dev", TargetDefinitionHash([4; 32])))
-    {
-        distill_rpc::ConnectOutcome::Connected(connected) => connected.hub,
-        other => panic!("expected connection, got {other:?}"),
-    };
-    match hub.import_failures() {
+    match connect(coordinator).import_failures() {
         distill_rpc::RpcResult::Success(failures) => failures
             .into_iter()
             .map(|failure| {
@@ -337,7 +269,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     let temp = tempfile::tempdir().unwrap();
     let assets = temp.path().join("assets");
     std::fs::create_dir_all(&assets).unwrap();
-    let (ordinary, _, schema_hash) = ordinary_bundle();
+    let (ordinary, _, _) = ordinary_bundle();
     std::fs::write(assets.join("ordinary.bundle"), ordinary).unwrap();
     std::fs::write(assets.join("source.txt"), b"7").unwrap();
     let coordinator = DaemonCoordinator::open(
@@ -350,7 +282,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     let mut writer = coordinator.open_writer().unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
 
-    publish_schema_registry(&coordinator, schema_hash);
+    configure(&coordinator, temp.path(), &assets);
 
     coordinator
         .authoring_service()
@@ -358,32 +290,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
             schema: settings_schema(),
         }))
         .unwrap();
-    let backend = Arc::clone(coordinator.authoring_service());
-    let imported_bundle = Arc::new(std::sync::Mutex::new(None));
-    let captured = Arc::clone(&imported_bundle);
-    coordinator
-        .coordinated_commit(&mut writer, InputVersion(2), |store| {
-            let prepared = backend
-                .prepare_import(store, 
-                    InputVersion(2),
-                    &ImportRequest {
-                        importer: "byte-importer".into(),
-                        sources: vec!["source.txt".into()],
-                        dest: "imported.bundle".into(),
-                        settings: AuthoringValue {
-                            canonical_value: Arc::from(&b"3"[..]),
-                            blobs: Vec::new(),
-                        },
-                        watch: true,
-                        root: "main".into(),
-                    },
-                )
-                .map_err(|error| format!("{error:?}"))?;
-            *captured.lock().unwrap() = Some(prepared.bundle);
-            Ok(prepared.commit)
-        })
-        .unwrap();
-    let imported_bundle = imported_bundle.lock().unwrap().unwrap();
+    let imported_bundle = import(&coordinator, "byte-importer", &["source.txt"], "imported.bundle", b"3");
     let path = assets.join("imported.bundle");
     let first = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
     let first_asset = first.assets["asset"].uuid;
@@ -528,7 +435,7 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
     let temp = tempfile::tempdir().unwrap();
     let assets = temp.path().join("assets");
     std::fs::create_dir_all(&assets).unwrap();
-    let (ordinary, _, schema_hash) = ordinary_bundle();
+    let (ordinary, _, _) = ordinary_bundle();
     std::fs::write(assets.join("ordinary.bundle"), ordinary).unwrap();
     std::fs::write(assets.join("rules.bundle"), directory_rules_bundle()).unwrap();
     std::fs::write(assets.join("foo.src"), b"9").unwrap();
@@ -541,7 +448,7 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
     .unwrap();
     let mut writer = coordinator.open_writer().unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
-    publish_schema_registry(&coordinator, schema_hash);
+    configure(&coordinator, temp.path(), &assets);
     coordinator
         .authoring_service()
         .register_importer(Arc::new(ByteImporter {
@@ -660,7 +567,7 @@ fn removing_a_rules_source_orphans_its_outputs_incrementally() {
     let temp = tempfile::tempdir().unwrap();
     let assets = temp.path().join("assets");
     std::fs::create_dir_all(&assets).unwrap();
-    let (ordinary, _, schema_hash) = ordinary_bundle();
+    let (ordinary, _, _) = ordinary_bundle();
     std::fs::write(assets.join("ordinary.bundle"), ordinary).unwrap();
     std::fs::write(assets.join("rules.bundle"), directory_rules_bundle()).unwrap();
     std::fs::write(assets.join("foo.src"), b"9").unwrap();
@@ -673,7 +580,7 @@ fn removing_a_rules_source_orphans_its_outputs_incrementally() {
     .unwrap();
     let mut writer = coordinator.open_writer().unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
-    publish_schema_registry(&coordinator, schema_hash);
+    configure(&coordinator, temp.path(), &assets);
     coordinator
         .authoring_service()
         .register_importer(Arc::new(ByteImporter {
@@ -723,7 +630,7 @@ fn watched_imports_defer_while_their_importer_is_unregistered() {
     let temp = tempfile::tempdir().unwrap();
     let assets = temp.path().join("assets");
     std::fs::create_dir_all(&assets).unwrap();
-    let (ordinary, _, schema_hash) = ordinary_bundle();
+    let (ordinary, _, _) = ordinary_bundle();
     std::fs::write(assets.join("ordinary.bundle"), ordinary).unwrap();
     std::fs::write(assets.join("source.txt"), b"7").unwrap();
     let open = || {
@@ -739,49 +646,22 @@ fn watched_imports_defer_while_their_importer_is_unregistered() {
         let coordinator = open();
     let mut writer = coordinator.open_writer().unwrap();
         coordinator.reconcile_full_scan(&mut writer).unwrap();
-        publish_schema_registry(&coordinator, schema_hash);
+        configure(&coordinator, temp.path(), &assets);
         coordinator
             .authoring_service()
             .register_importer(Arc::new(ByteImporter {
                 schema: settings_schema(),
             }))
             .unwrap();
-        let backend = Arc::clone(coordinator.authoring_service());
-        let base = coordinator.server().current_stamp().unwrap().version;
-        let imported = Arc::new(std::sync::Mutex::new(None));
-        let captured = Arc::clone(&imported);
-        coordinator
-            .coordinated_commit(&mut writer, base, |store| {
-                let prepared = backend
-                    .prepare_import(store, 
-                        base,
-                        &ImportRequest {
-                            importer: "byte-importer".into(),
-                            sources: vec!["source.txt".into()],
-                            dest: "imported.bundle".into(),
-                            settings: AuthoringValue {
-                                canonical_value: Arc::from(&b"3"[..]),
-                                blobs: Vec::new(),
-                            },
-                            watch: true,
-                            root: "main".into(),
-                        },
-                    )
-                    .map_err(|error| format!("{error:?}"))?;
-                *captured.lock().unwrap() = Some(prepared.bundle);
-                Ok(prepared.commit)
-            })
-            .unwrap();
-        let bundle = imported.lock().unwrap().unwrap();
-        bundle
+        import(&coordinator, "byte-importer", &["source.txt"], "imported.bundle", b"3")
     };
     let path = assets.join("imported.bundle");
 
     // Restart with the source edited and no importer registered.
     std::fs::write(assets.join("source.txt"), b"8").unwrap();
     let coordinator = open();
-    // The schema authority is the configuration's, compiled again on open.
-    coordinator.install_schema_authority_for_test(Arc::new(byte_authority()));
+    // Startup publishes the configuration again.
+    configure(&coordinator, temp.path(), &assets);
     let mut writer = coordinator.open_writer().unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
     assert_eq!(
@@ -826,7 +706,7 @@ fn reverting_a_failed_watched_import_clears_its_failure_incrementally() {
     let temp = tempfile::tempdir().unwrap();
     let assets = temp.path().join("assets");
     std::fs::create_dir_all(&assets).unwrap();
-    let (ordinary, _, schema_hash) = ordinary_bundle();
+    let (ordinary, _, _) = ordinary_bundle();
     std::fs::write(assets.join("ordinary.bundle"), ordinary).unwrap();
     std::fs::write(assets.join("source.txt"), b"7").unwrap();
     let coordinator = DaemonCoordinator::open(
@@ -838,36 +718,14 @@ fn reverting_a_failed_watched_import_clears_its_failure_incrementally() {
     .unwrap();
     let mut writer = coordinator.open_writer().unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
-    publish_schema_registry(&coordinator, schema_hash);
+    configure(&coordinator, temp.path(), &assets);
     coordinator
         .authoring_service()
         .register_importer(Arc::new(ByteImporter {
             schema: settings_schema(),
         }))
         .unwrap();
-    let backend = Arc::clone(coordinator.authoring_service());
-    let base = coordinator.server().current_stamp().unwrap().version;
-    coordinator
-        .coordinated_commit(&mut writer, base, |store| {
-            let prepared = backend
-                .prepare_import(store, 
-                    base,
-                    &ImportRequest {
-                        importer: "byte-importer".into(),
-                        sources: vec!["source.txt".into()],
-                        dest: "imported.bundle".into(),
-                        settings: AuthoringValue {
-                            canonical_value: Arc::from(&b"3"[..]),
-                            blobs: Vec::new(),
-                        },
-                        watch: true,
-                        root: "main".into(),
-                    },
-                )
-                .map_err(|error| format!("{error:?}"))?;
-            Ok(prepared.commit)
-        })
-        .unwrap();
+    import(&coordinator, "byte-importer", &["source.txt"], "imported.bundle", b"3");
     // Build the import index as the startup pass does.
     coordinator.reconcile_watched_imports(&mut writer).unwrap();
 
@@ -988,7 +846,7 @@ fn imported_sources(
     let temp = tempfile::tempdir().unwrap();
     let assets = temp.path().join("assets");
     std::fs::create_dir_all(&assets).unwrap();
-    let (ordinary, _, schema_hash) = ordinary_bundle();
+    let (ordinary, _, _) = ordinary_bundle();
     std::fs::write(assets.join("ordinary.bundle"), ordinary).unwrap();
     std::fs::write(assets.join("rules.bundle"), directory_rules_bundle()).unwrap();
     std::fs::write(assets.join("other.txt"), b"7").unwrap();
@@ -1004,7 +862,7 @@ fn imported_sources(
     .unwrap();
     let mut writer = coordinator.open_writer().unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
-    publish_schema_registry(&coordinator, schema_hash);
+    configure(&coordinator, temp.path(), &assets);
     coordinator
         .authoring_service()
         .register_importer(Arc::new(importer(settings_schema())))
@@ -1203,29 +1061,7 @@ fn an_rpc_write_during_a_pass_makes_it_stale_and_its_retry_applies_everything_on
         });
         entered.recv().unwrap();
         // The RPC import commits while the pass's import is running.
-        let backend = Arc::clone(coordinator.authoring_service());
-        coordinator
-            .coordinated_commit(&mut writer, base, |store| {
-                backend
-                    .prepare_import(
-                        store,
-                        base,
-                        &ImportRequest {
-                            importer: "byte-importer".into(),
-                            sources: vec!["other.txt".into()],
-                            dest: "explicit.bundle".into(),
-                            settings: AuthoringValue {
-                                canonical_value: Arc::from(&b"3"[..]),
-                                blobs: Vec::new(),
-                            },
-                            watch: true,
-                            root: "main".into(),
-                        },
-                    )
-                    .map(|prepared| prepared.commit)
-                    .map_err(|error| format!("{error:?}"))
-            })
-            .unwrap();
+        import(&coordinator, "byte-importer", &["other.txt"], "explicit.bundle", b"3");
         release.send(()).unwrap();
         pass.join().unwrap()
     });
@@ -1373,30 +1209,7 @@ impl AuthoringImporter for ChainImporter {
 /// RPC publication, and pass over the watcher work it leaves.
 fn chain_import(coordinator: &DaemonCoordinator, assets: &std::path::Path, dest: &str, sources: &[&str]) {
     let mut writer = coordinator.open_writer().unwrap();
-    let base = writer.input_version().unwrap();
-    let backend = Arc::clone(coordinator.authoring_service());
-    coordinator
-        .coordinated_commit(&mut writer, base, |store| {
-            backend
-                .prepare_import(
-                    store,
-                    base,
-                    &ImportRequest {
-                        importer: "chain-importer".into(),
-                        sources: sources.iter().map(|source| (*source).to_owned()).collect(),
-                        dest: dest.into(),
-                        settings: AuthoringValue {
-                            canonical_value: Arc::from(&b"0"[..]),
-                            blobs: Vec::new(),
-                        },
-                        watch: true,
-                        root: "main".into(),
-                    },
-                )
-                .map(|prepared| prepared.commit)
-                .map_err(|error| format!("{error:?}"))
-        })
-        .unwrap();
+    import(coordinator, "chain-importer", sources, dest, b"0");
     // The watcher's echo of the output: a pass that indexes its import
     // record and consumes its work.
     let echo = coordinator
@@ -1635,7 +1448,7 @@ fn a_failed_rpc_reimport_commits_only_its_memo() {
     let temp = tempfile::tempdir().unwrap();
     let assets = temp.path().join("assets");
     std::fs::create_dir_all(&assets).unwrap();
-    let (ordinary, _, schema_hash) = ordinary_bundle();
+    let (ordinary, _, _) = ordinary_bundle();
     std::fs::write(assets.join("ordinary.bundle"), ordinary).unwrap();
     std::fs::write(assets.join("source.txt"), b"7").unwrap();
     let coordinator = DaemonCoordinator::open(
@@ -1647,39 +1460,14 @@ fn a_failed_rpc_reimport_commits_only_its_memo() {
     .unwrap();
     let mut writer = coordinator.open_writer().unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
-    publish_schema_registry(&coordinator, schema_hash);
+    configure(&coordinator, temp.path(), &assets);
     coordinator
         .authoring_service()
         .register_importer(Arc::new(ByteImporter {
             schema: settings_schema(),
         }))
         .unwrap();
-    let backend = Arc::clone(coordinator.authoring_service());
-    let base = coordinator.server().current_stamp().unwrap().version;
-    let mut bundle = None;
-    coordinator
-        .coordinated_commit(&mut writer, base, |store| {
-            let prepared = backend
-                .prepare_import(
-                    store,
-                    base,
-                    &ImportRequest {
-                        importer: "byte-importer".into(),
-                        sources: vec!["source.txt".into()],
-                        dest: "imported.bundle".into(),
-                        settings: AuthoringValue {
-                            canonical_value: Arc::from(&b"3"[..]),
-                            blobs: Vec::new(),
-                        },
-                        watch: true,
-                        root: "main".into(),
-                    },
-                )
-                .map_err(|error| format!("{error:?}"))?;
-            bundle = Some(prepared.bundle);
-            Ok(prepared.commit)
-        })
-        .unwrap();
+    let bundle = import(&coordinator, "byte-importer", &["source.txt"], "imported.bundle", b"3");
     std::fs::write(assets.join("source.txt"), b"broken").unwrap();
     coordinator
         .reconcile_incremental(&mut writer, &WatcherBatch {
@@ -1690,15 +1478,8 @@ fn a_failed_rpc_reimport_commits_only_its_memo() {
     assert!(import_failures(&coordinator).is_empty());
 
     let base = coordinator.server().current_stamp().unwrap().version;
-    let hub = match coordinator
-        .server()
-        .root()
-        .connect(distill_rpc::ConnectRequest::new("dev", TargetDefinitionHash([4; 32])))
-    {
-        distill_rpc::ConnectOutcome::Connected(connected) => connected.hub,
-        other => panic!("expected connection, got {other:?}"),
-    };
-    let reimport = hub.reimport(base, bundle.unwrap());
+    let hub = connect(&coordinator);
+    let reimport = hub.reimport(base, bundle);
     assert!(matches!(reimport, distill_rpc::RpcResult::Failure(_)), "{reimport:?}");
     assert_eq!(coordinator.server().current_stamp().unwrap().version, base);
     assert_eq!(import_failures(&coordinator).len(), 1, "the failure memo committed");
