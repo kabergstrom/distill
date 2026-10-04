@@ -46,7 +46,7 @@ use crate::apply::{
     apply_commit, configuration_status, publish_pipeline_fence, publish_restart_required,
     publish_target_set, ApplyError,
 };
-use crate::persist::{delta_state, reconnect_reason};
+use crate::persist::delta_state;
 use crate::*;
 
 pub(crate) const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
@@ -1077,7 +1077,6 @@ impl Drop for SnapshotHold {
 pub(crate) struct ConnectionState {
     pub(crate) id: u64,
     pub(crate) target: String,
-    target_generation: u64,
     pipeline_generation: u64,
     /// The change-log cursor: rows up to here are delivered or predate the
     /// connection.
@@ -1343,14 +1342,12 @@ impl Inner {
     pub(crate) fn open_connection(
         &self,
         target: String,
-        target_generation: u64,
         pipeline_generation: u64,
         head: i64,
     ) -> Rc<RefCell<ConnectionState>> {
         Rc::new(RefCell::new(ConnectionState {
             id: self.handle.connection_id(),
             target,
-            target_generation,
             pipeline_generation,
             seen_seq: head,
             fenced: false,
@@ -1364,19 +1361,17 @@ impl Inner {
 
     /// Why `connection` must reconnect, if it must.
     pub(crate) fn generation_fence(&self, connection: &ConnectionState) -> Option<ReconnectReason> {
-        // One statement: the fences and the target generation of one instant.
-        let (pipeline_generation, target_generation) = match self.reader.rpc_fence(&connection.target) {
-            Ok(fence) => fence,
+        // A target definition changes only with a pipeline fence
+        // ([`crate::publish_target_set`]): the one generation covers both.
+        let pipeline_generation = match self.reader.rpc_pipeline_generation() {
+            Ok(generation) => generation,
             Err(error) => {
-                tracing::error!(%error, "cannot read RPC fences");
+                tracing::error!(%error, "cannot read the RPC fence");
                 return Some(ReconnectReason::StoreInstanceChanged);
             }
         };
-        if pipeline_generation != connection.pipeline_generation {
-            return Some(ReconnectReason::PipelineEpochChanged);
-        }
-        (target_generation != Some(connection.target_generation))
-            .then_some(ReconnectReason::TargetDefinitionChanged)
+        (pipeline_generation != connection.pipeline_generation)
+            .then_some(ReconnectReason::PipelineEpochChanged)
     }
 
     /// Deliver to `connection` every change-log row published since its
@@ -1439,22 +1434,14 @@ impl Inner {
                     }
                     continue;
                 }
-                Change::ReconnectAll { reason } | Change::ReconnectTarget { reason, .. } => {
-                    let target = match &row.change {
-                        Change::ReconnectTarget { target, .. } => Some(target),
-                        _ => None,
-                    };
-                    match reconnect_reason(*reason) {
-                        Ok(_) if target.is_some_and(|target| &connection.target != target) => {}
-                        Ok(reason) => {
-                            connection.fenced = true;
-                            connection.enqueue(StreamEvent::Asset {
-                                basis: RpcBasis { snapshot: stamp },
-                                event: AssetEvent::ReconnectRequired { reason },
-                            });
-                        }
-                        Err(error) => tracing::error!(%error, "skipping a corrupt change-log row"),
-                    }
+                Change::ReconnectAll => {
+                    connection.fenced = true;
+                    connection.enqueue(StreamEvent::Asset {
+                        basis: RpcBasis { snapshot: stamp },
+                        event: AssetEvent::ReconnectRequired {
+                            reason: ReconnectReason::PipelineEpochChanged,
+                        },
+                    });
                 }
                 Change::RestartRequired { keys } => {
                     if !keys.is_empty() && connection.stream_installed {
@@ -1557,7 +1544,7 @@ impl Root {
         let server = Server::connection(handle, reader, admission);
         let connection = server
             .inner
-            .open_connection(target_name, target.generation, pipeline_generation, head);
+            .open_connection(target_name, pipeline_generation, head);
         ConnectOutcome::Connected(Connected {
             hub: Hub { connection, server },
             instance: handle.instance,

@@ -2062,65 +2062,20 @@ fn cas_verification_reads_per_segment() {
     );
 }
 
-/// A connection's fence check is one statement of two primary-key
-/// searches.
+/// A target replacement writes each target by its key; a pipeline fence
+/// row is one insert.
 #[test]
-fn the_rpc_fence_is_two_key_searches() {
+fn a_target_replacement_searches_its_key() {
     let (_dir, store) = store_with(1);
     assert_eq!(
-        store.query_plan_details(crate::served::RPC_FENCE).unwrap(),
-        [
-            "SCAN CONSTANT ROW",
-            "SCALAR SUBQUERY 1",
-            "SEARCH store_meta USING INDEX sqlite_autoindex_store_meta_1 (key=?)",
-            "SCALAR SUBQUERY 2",
-            "SEARCH rpc_targets USING INDEX sqlite_autoindex_rpc_targets_1 (name=?)",
-        ]
+        store.query_plan_details("DELETE FROM rpc_targets WHERE name = ?1").unwrap(),
+        ["SEARCH rpc_targets USING INDEX sqlite_autoindex_rpc_targets_1 (name=?)"]
     );
-}
-
-/// The writer the fence test publishes through from inside the reader's
-/// statement trace.
-static FENCE_WRITER: std::sync::Mutex<Option<Store>> = std::sync::Mutex::new(None);
-
-/// Publish a new pipeline generation and target definition together,
-/// once, just before the reader's first statement that reads the pipeline
-/// generation runs.
-fn publish_before_the_generation_read(sql: &str) {
-    if !sql.contains("rpc_pipeline_generation") {
-        return;
-    }
-    if let Some(mut writer) = FENCE_WRITER.lock().unwrap().take() {
-        writer
-            .served_transaction(|txn| {
-                use crate::served::ServedWrite;
-                txn.bump_rpc_pipeline_generation()?;
-                txn.set_rpc_target("pc", [2; 32]).map(drop)
-            })
-            .unwrap();
-    }
-}
-
-#[test]
-fn a_connections_fences_are_read_at_one_instant() {
-    // A publication that changes the pipeline generation and the target
-    // definition together (a configuration candidate) lands while a front
-    // end reads the fences. It must see both or neither: seeing the new
-    // generation with the old target tells the client
-    // PipelineEpochChanged where its target changed too.
-    use crate::served::ServedWrite;
-    let dir = tempfile::tempdir().unwrap();
-    let mut store = Store::open(crate::StoreConfig::new(dir.path().join("state"))).unwrap();
-    store
-        .served_transaction(|txn| txn.set_rpc_target("pc", [1; 32]).map(drop))
-        .unwrap();
-    let mut reader = store.reader().unwrap();
-    *FENCE_WRITER.lock().unwrap() = Some(store);
-    reader.trace_statements(Some(publish_before_the_generation_read));
-    let fence = reader.rpc_fence("pc").unwrap();
-    reader.trace_statements(None);
-    assert!(FENCE_WRITER.lock().unwrap().is_none(), "the publication landed mid-read");
-    assert_eq!(fence, (1, Some(1)), "the fences mix two versions");
+    assert!(store.query_plan_details(crate::served::SET_RPC_TARGET).unwrap().is_empty());
+    assert!(store
+        .query_plan_details(crate::served::APPEND_RECONNECT_ALL)
+        .unwrap()
+        .is_empty());
 }
 
 /// Pages a subscriber's history read fetches: one subscribed asset and
@@ -2412,11 +2367,11 @@ fn cas_and_served_point_statements_search_their_keys() {
             ],
         ),
         (
-            "SELECT name, definition_hash, generation FROM rpc_targets ORDER BY name",
+            "SELECT name, definition_hash FROM rpc_targets ORDER BY name",
             &["SCAN rpc_targets USING INDEX sqlite_autoindex_rpc_targets_1"],
         ),
         (
-            "SELECT name, definition_hash, generation FROM rpc_targets WHERE name = ?",
+            "SELECT name, definition_hash FROM rpc_targets WHERE name = ?",
             &["SEARCH rpc_targets USING INDEX sqlite_autoindex_rpc_targets_1 (name=?)"],
         ),
         // A derived child: its claims (then its and its parent's errors).

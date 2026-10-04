@@ -1782,7 +1782,8 @@ impl Snapshot {
         let target = self.connection.borrow().target.clone();
         let Some(row) = rpc_try!(self.server.inner.reader.rpc_target(&target)) else {
             return RpcResult::ReconnectRequired {
-                reason: ReconnectReason::TargetDefinitionChanged,
+                // A target goes only with a pipeline fence.
+                reason: ReconnectReason::PipelineEpochChanged,
             };
         };
         let request = RuntimeTypePolicyRequest {
@@ -1881,7 +1882,8 @@ impl Snapshot {
             };
             let Some(row) = self.server.inner.reader.rpc_target(&target)? else {
                 return done(RpcResult::ReconnectRequired {
-                    reason: ReconnectReason::TargetDefinitionChanged,
+                    // A target goes only with a pipeline fence.
+                    reason: ReconnectReason::PipelineEpochChanged,
                 });
             };
             let request = BuildRequest {

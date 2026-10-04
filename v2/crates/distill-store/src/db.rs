@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 55;
+pub const SCHEMA_VERSION: u32 = 56;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -368,11 +368,10 @@ CREATE INDEX change_log_by_version ON change_log(version);
 -- Schema 39 (fix-cas): a subscriber's history, one subject at a time.
 CREATE INDEX change_log_assets ON change_log(asset_uuid, version) WHERE kind = 1;
 CREATE INDEX change_log_paths ON change_log(subject, version) WHERE kind = 2;
--- The RPC target set and each target's reconnect generation.
+-- The RPC target set.
 CREATE TABLE rpc_targets (
     name            TEXT NOT NULL PRIMARY KEY,
-    definition_hash BLOB NOT NULL,
-    generation      INTEGER NOT NULL
+    definition_hash BLOB NOT NULL
 );
 -- The one piece of artifact metadata the DSTL bytes do not carry: each
 -- direct load edge's expected terminal type. Written with the CAS index,

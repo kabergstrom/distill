@@ -1338,7 +1338,7 @@ fn indirect_handle_rebinds_only_through_io_and_reconnect_blocks_old_completion()
     let (old_req, old_basis) = loader.io().path_for("textures/main");
 
     loader.io_mut().push(IoEvent::ReconnectRequired {
-        reason: distill_loader::ReconnectReason::TargetDefinitionChanged,
+        reason: distill_loader::ReconnectReason::PipelineEpochChanged,
     });
     loader.io_mut().push(IoEvent::PathResolved {
         req: old_req,
@@ -1567,7 +1567,7 @@ fn path_delta_resolves_only_the_rebound_component() {
 }
 
 #[test]
-fn protocol_epoch_reconnect_fences_old_resolve_and_requires_target_binding() {
+fn a_reconnect_fences_old_resolve_and_requires_target_binding() {
     let token = ModuleEpochToken::new(30);
     let mut loader = Loader::new(mock_io());
     register(&mut loader, 30, &token);
@@ -1578,7 +1578,7 @@ fn protocol_epoch_reconnect_fences_old_resolve_and_requires_target_binding() {
     let (old_req, old_basis) = loader.io().resolve_for(asset_uuid);
 
     loader.io_mut().push(IoEvent::ReconnectRequired {
-        reason: distill_loader::ReconnectReason::ProtocolEpochChanged,
+        reason: distill_loader::ReconnectReason::PipelineEpochChanged,
     });
     loader.io_mut().push(IoEvent::Resolved {
         req: old_req,
@@ -1593,7 +1593,7 @@ fn protocol_epoch_reconnect_fences_old_resolve_and_requires_target_binding() {
     assert_eq!(loader.target_binding_state(), TargetBindingState::Required);
     assert!(loader.take_diagnostics().iter().any(|diagnostic| matches!(
         diagnostic,
-        LoaderDiagnostic::ReconnectRequired(distill_loader::ReconnectReason::ProtocolEpochChanged)
+        LoaderDiagnostic::ReconnectRequired(distill_loader::ReconnectReason::PipelineEpochChanged)
     )));
     loader.process(&mut storage).unwrap();
     assert_ne!(loader.io().resolve_for(asset_uuid).0, old_req);

@@ -37,22 +37,3 @@ pub(crate) fn delta_state(code: u8) -> Result<AssetDeltaState, PersistError> {
         tag => return Err(bad_tag("asset delta state", tag)),
     })
 }
-
-pub(crate) fn reconnect_code(reason: ReconnectReason) -> u8 {
-    match reason {
-        ReconnectReason::TargetDefinitionChanged => 0,
-        ReconnectReason::StoreInstanceChanged => 1,
-        ReconnectReason::ProtocolEpochChanged => 2,
-        ReconnectReason::PipelineEpochChanged => 3,
-    }
-}
-
-pub(crate) fn reconnect_reason(code: u8) -> Result<ReconnectReason, PersistError> {
-    Ok(match code {
-        0 => ReconnectReason::TargetDefinitionChanged,
-        1 => ReconnectReason::StoreInstanceChanged,
-        2 => ReconnectReason::ProtocolEpochChanged,
-        3 => ReconnectReason::PipelineEpochChanged,
-        tag => return Err(bad_tag("reconnect reason", tag)),
-    })
-}

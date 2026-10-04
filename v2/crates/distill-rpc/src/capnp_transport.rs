@@ -3900,19 +3900,12 @@ fn write_metadata_reconnect(
         MetadataReconnectReason::StoreInstanceChanged => {
             schema::MetadataReconnectReason::StoreInstanceChanged
         }
-        MetadataReconnectReason::ProtocolEpochChanged => {
-            schema::MetadataReconnectReason::ProtocolEpochChanged
-        }
     });
 }
 
 fn wire_reconnect(reason: ReconnectReason) -> schema::ReconnectReason {
     match reason {
-        ReconnectReason::TargetDefinitionChanged => {
-            schema::ReconnectReason::TargetDefinitionChanged
-        }
         ReconnectReason::StoreInstanceChanged => schema::ReconnectReason::StoreInstanceChanged,
-        ReconnectReason::ProtocolEpochChanged => schema::ReconnectReason::ProtocolEpochChanged,
         ReconnectReason::PipelineEpochChanged => schema::ReconnectReason::PipelineEpochChanged,
     }
 }

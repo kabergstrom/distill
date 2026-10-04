@@ -21,10 +21,8 @@ struct ConfigurationError {
 }
 
 enum ReconnectReason {
-  targetDefinitionChanged @0;
-  storeInstanceChanged @1;
-  protocolEpochChanged @2;
-  pipelineEpochChanged @3;
+  storeInstanceChanged @0;
+  pipelineEpochChanged @1;
 }
 
 struct ReconnectRequired {
@@ -89,7 +87,6 @@ struct MetadataConnectSuccess {
 
 enum MetadataReconnectReason {
   storeInstanceChanged @0;
-  protocolEpochChanged @1;
 }
 
 struct MetadataReconnectRequired {

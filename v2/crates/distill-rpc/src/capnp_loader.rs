@@ -975,11 +975,7 @@ fn decode_stamp(value: schema::snapshot_stamp::Reader<'_>) -> Result<SnapshotSta
 
 fn decode_reconnect(value: schema::ReconnectReason) -> ReconnectReason {
     match value {
-        schema::ReconnectReason::TargetDefinitionChanged => {
-            ReconnectReason::TargetDefinitionChanged
-        }
         schema::ReconnectReason::StoreInstanceChanged => ReconnectReason::StoreInstanceChanged,
-        schema::ReconnectReason::ProtocolEpochChanged => ReconnectReason::ProtocolEpochChanged,
         schema::ReconnectReason::PipelineEpochChanged => ReconnectReason::PipelineEpochChanged,
     }
 }
@@ -988,9 +984,6 @@ fn decode_metadata_reconnect(value: schema::MetadataReconnectReason) -> Reconnec
     match value {
         schema::MetadataReconnectReason::StoreInstanceChanged => {
             ReconnectReason::StoreInstanceChanged
-        }
-        schema::MetadataReconnectReason::ProtocolEpochChanged => {
-            ReconnectReason::ProtocolEpochChanged
         }
     }
 }

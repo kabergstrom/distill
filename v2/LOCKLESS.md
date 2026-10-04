@@ -114,7 +114,7 @@ read transaction:
 | `build_results` (cleared on every commit) | `resolutions(version, target, asset, outcome)`, written by the authority after a build, pruned on publication |
 | `artifacts` (hash → asset, layout, load edges) | The DSTL bytes in the CAS already carry everything but `ServedLoadEdge.expected_terminal`, which goes in `artifact_load_edges(content_hash, asset, expected_terminal)`, written in the CAS index transaction. |
 | `wire_trees` | presence in `cas_extents` |
-| `pipeline_generation`, `targets[*].target_generation`, `protocol_epoch` | `store_meta` / `pipeline_target_set` columns |
+| `pipeline_generation`, `targets[*].target_generation`, `protocol_epoch` | `store_meta.rpc_pipeline_generation` and `rpc_targets`. (schema-min: no target generation; a target changes only with the configuration's pipeline fence, and the protocol epoch is `PROTOCOL_VERSION`, checked at connect.) |
 | `restart_required_keys` | `pending_restart` |
 | `connections`, subscriptions, queues, `ViewLease`, pack sessions | ephemeral, owned by the RPC front end. Durable pins stay in `pins`. |
 

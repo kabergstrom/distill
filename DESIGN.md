@@ -7414,7 +7414,10 @@ configuration they were taken at; root changes reconcile through the
 normal scan machinery (§14); and a target-bound Hub whose target
 definition changed receives the connection-level
 `ReconnectRequired { reason: TargetDefinitionChanged }` event on its
-subscribe stream (§17): RpcIO tears down the Hub, reconnects —
+subscribe stream (§17) (schema-min, protocol 15: there is no distinct
+reason; a target edit publishes with its configuration's pipeline fence,
+so the Hub receives `PipelineEpochChanged`, and a reconnect under the stale
+definition is rejected with `TargetDefinitionMismatch`): RpcIO tears down the Hub, reconnects —
 `Root.connect` re-verifies target/DSTG and the current PipelineEpoch — and
 resumes with ordinary `Drifted`
 re-resolution. The change is connection-level, deliberately not a
@@ -8775,7 +8778,9 @@ put production image codecs, mesh optimization, or shader compilers in core.
   re-resolution. Deliberately not a `DriftedInput` variant: per-input
   drift would loop the retry-refreshed loader on the same obsolete
   Hub, and `Failed` would freeze the component instead of
-  reconnecting. (Refined in R21: the event is delivery, not
+  reconnecting. (schema-min, protocol 15: the event's reason is
+  `PipelineEpochChanged`; a target changes only with the configuration's
+  pipeline fence.) (Refined in R21: the event is delivery, not
   enforcement — every target-bound method is generation-fenced
   server-side and answers `ReconnectRequired` on a stale capability,
   §17.)
@@ -9347,6 +9352,9 @@ put production image codecs, mesh optimization, or shader compilers in core.
   `LoadPolicyChanged=1`, `StoreInstanceChanged=2`, and
   `ProtocolEpochChanged=3`. (Refined in R27: the exhaustive mapping gains
   `CompiledAttestationChanged=4` for drift in the accepted daemon projection.)
+  (schema-min, protocol 15: the reasons are `StoreInstanceChanged=0` and
+  `PipelineEpochChanged=1`, and the metadata hub's is
+  `StoreInstanceChanged=0`; the others were never produced.)
   (Refined in R25: bootstrap connect is also generated-binding-safe through a
   dedicated typed ConnectResult, and authoring reads move to a pinned
   AuthoringSnapshot capability.)

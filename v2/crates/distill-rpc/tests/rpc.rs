@@ -1244,7 +1244,8 @@ fn authoring_snapshot_refreshes_to_a_successor_stamp_without_tearing() {
 fn every_authoring_snapshot_method_is_expiry_and_generation_fenced() {
     let mut project = TestProject::configured(false);
     let server = project.server();
-    let hub = connect_to(&server, project.target());
+    let old = project.target().clone();
+    let hub = connect_to(&server, &old);
     let expired = authoring_snapshot(&hub);
     expired.expire();
     assert_eq!(
@@ -1265,9 +1266,10 @@ fn every_authoring_snapshot_method_is_expiry_and_generation_fenced() {
     ));
 
     let stale = authoring_snapshot(&hub);
-    // A configuration that redefines the target is a new pipeline
-    // epoch too, which the fence names first.
+    // A configuration that redefines the target publishes with its
+    // pipeline fence: there is no target-specific reason.
     project.reconfigure(true);
+    assert_ne!(project.target().definition_hash(), old.definition_hash());
     let reason = ReconnectReason::PipelineEpochChanged;
     assert_reconnect(hub.authoring_snapshot(), reason);
     assert_reconnect(stale.version(), reason);
@@ -1304,22 +1306,6 @@ fn authoring_inspection_is_a_pinned_pure_metadata_read_under_configuration_error
         RpcResult::Success(AuthoringInspectResult::Inspection(value))
             if value.stamp == failed_stamp
     ));
-}
-
-#[test]
-fn reconnect_reason_vocabulary_is_shared_and_complete() {
-    assert_ne!(
-        ReconnectReason::StoreInstanceChanged,
-        ReconnectReason::ProtocolEpochChanged
-    );
-    assert_ne!(
-        ReconnectReason::TargetDefinitionChanged,
-        ReconnectReason::StoreInstanceChanged
-    );
-    assert_ne!(
-        ReconnectReason::PipelineEpochChanged,
-        ReconnectReason::ProtocolEpochChanged
-    );
 }
 
 #[test]
@@ -2128,16 +2114,18 @@ fn delta_stream_capability_keeps_the_connection_alive_after_hub_drop() {
 fn a_configuration_change_fences_every_target_bound_method_and_prompts_stream() {
     let mut project = TestProject::configured(false);
     let server = project.server();
-    let hub = connect_to(&server, project.target());
+    let old = project.target().clone();
+    let hub = connect_to(&server, &old);
     let snap = snapshot(&hub);
     let install = hub
         .subscribe(InputVersion(0), vec![], vec![])
         .success()
         .unwrap();
     install.deltas.next().unwrap();
-    // A configuration that redefines the target is a new pipeline
-    // epoch too, which the fence names first.
+    // A configuration that redefines the target publishes with its
+    // pipeline fence: there is no target-specific reason.
     project.reconfigure(true);
+    assert_ne!(project.target().definition_hash(), old.definition_hash());
 
     match install.deltas.next().unwrap() {
         StreamEvent::Asset {
@@ -2157,6 +2145,13 @@ fn a_configuration_change_fences_every_target_bound_method_and_prompts_stream() 
     assert_reconnect(hub.unsubscribe(vec![], vec![]), reason);
     assert_reconnect(snap.version(), reason);
     assert_reconnect(snap.configuration(), reason);
+    // The reconnect under the stale definition is what names it.
+    assert!(matches!(
+        server
+            .root()
+            .connect(ConnectRequest::new(old.name(), old.definition_hash())),
+        ConnectOutcome::Rejected(ConnectError::TargetDefinitionMismatch { .. })
+    ));
 }
 
 #[test]
@@ -2650,40 +2645,6 @@ fn an_artifact_with_an_unresolved_direct_load_edge_stays_fetchable() {
             asset: asset_id(2),
             expected_terminal: type_id(2),
         }]
-    );
-}
-
-#[test]
-fn coordinated_target_set_replacement_advances_once_and_fences_changed_or_removed_hubs() {
-    let project = project();
-    let server = project.server();
-    let changed = connect(&server, &[(1, false)]);
-    let stamp = coordinated(&server, |handle, store| {
-        handle.coordinated_replace_target_set(
-            store,
-            InputVersion(0),
-            vec![target_with(8, &[(1, false)])],
-            |_| Ok(Commit::default()),
-        )
-    })
-    .unwrap();
-    assert_eq!(stamp.version, InputVersion(1));
-    assert_reconnect(changed.snapshot(), ReconnectReason::TargetDefinitionChanged);
-
-    let replacement = match server.root().connect(request_for(8, 1, &[(1, false)])) {
-        ConnectOutcome::Connected(connected) => connected.hub,
-        other => panic!("expected replacement connection, got {other:?}"),
-    };
-    let stamp = coordinated(&server, |handle, store| {
-        handle.coordinated_replace_target_set(store, InputVersion(1), Vec::new(), |_| {
-            Ok(Commit::default())
-        })
-    })
-    .unwrap();
-    assert_eq!(stamp.version, InputVersion(2));
-    assert_reconnect(
-        replacement.snapshot(),
-        ReconnectReason::TargetDefinitionChanged,
     );
 }
 

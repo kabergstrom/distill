@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use distill_store::served::{Change, ServedWrite};
 use distill_store::StoreError;
 
-use crate::persist::{delta_state_code, reconnect_code};
+use crate::persist::delta_state_code;
 use crate::validate::validate_commit;
 use crate::*;
 
@@ -117,12 +117,7 @@ pub fn apply_commit<W: ServedWrite>(txn: &mut W, commit: &Commit) -> Result<(), 
 pub fn publish_pipeline_fence<W: ServedWrite>(txn: &mut W) -> Result<(), StoreError> {
     txn.bump_rpc_pipeline_generation()?;
     let version = txn.change_version();
-    txn.append_change(
-        version,
-        &Change::ReconnectAll {
-            reason: reconnect_code(ReconnectReason::PipelineEpochChanged),
-        },
-    )
+    txn.append_change(version, &Change::ReconnectAll)
 }
 
 /// Announce a changed restart-required key set: the keys the store's
@@ -148,44 +143,23 @@ pub(crate) fn publish_restart_required<W: ServedWrite>(
     Ok(true)
 }
 
-/// Replace the complete RPC target set. A changed or removed target fences
-/// its connections. Returns whether anything changed.
+/// Replace the complete RPC target set. It fences nothing itself: a target
+/// changes only in a configuration publication, which fences every
+/// connection with the pipeline fence. The one that does not, a pipeline
+/// failing as the base's did, has no connection to fence, since a target
+/// connects only while its pipeline is ready.
 pub fn publish_target_set<W: ServedWrite>(
     txn: &mut W,
     targets: &BTreeMap<String, TargetDefinitionHash>,
-) -> Result<bool, StoreError> {
-    let version = txn.change_version();
-    let mut changed = false;
-    let mut reconnect = Vec::new();
+) -> Result<(), StoreError> {
     for row in txn.txn_rpc_targets()? {
         if !targets.contains_key(&row.name) {
             txn.remove_rpc_target(&row.name)?;
-            reconnect.push(row.name);
-            changed = true;
         }
     }
-    let existing = txn
-        .txn_rpc_targets()?
-        .into_iter()
-        .map(|row| row.name)
-        .collect::<BTreeSet<_>>();
     for (name, hash) in targets {
-        changed |= !existing.contains(name);
-        if txn.set_rpc_target(name, hash.0)? {
-            reconnect.push(name.clone());
-            changed = true;
-        }
+        txn.set_rpc_target(name, hash.0)?;
     }
-    reconnect.sort();
-    for target in reconnect {
-        txn.append_change(
-            version,
-            &Change::ReconnectTarget {
-                target,
-                reason: reconnect_code(ReconnectReason::TargetDefinitionChanged),
-            },
-        )?;
-    }
-    Ok(changed)
+    Ok(())
 }
 

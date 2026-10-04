@@ -19,8 +19,10 @@ pub use distill_store::state::{
 /// (`RebuildIndexes`, tag 3, is gone). 14: `Hub.write` and a rename's
 /// Completed event answer a [`WriteReceipt`] (the files changed on disk)
 /// instead of a version, and `AuthoringSnapshot.file` reads a file's
-/// published content hash.
-pub const PROTOCOL_VERSION: u32 = 14;
+/// published content hash. 15: the reconnect reasons are
+/// `storeInstanceChanged` and `pipelineEpochChanged` (`targetDefinitionChanged`
+/// and `protocolEpochChanged` were never produced).
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// A watched import whose latest attempt failed. The bundle keeps serving its
 /// last good contents; the failure clears when a later import succeeds.
@@ -161,16 +163,16 @@ pub type ConfigurationState = ConfigurationStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconnectReason {
-    TargetDefinitionChanged,
     StoreInstanceChanged,
-    ProtocolEpochChanged,
+    /// The pipeline changed: an epoch installed, retired or failed. A
+    /// target definition changes only with it (a configuration
+    /// publication), and a reconnect under the old definition is rejected.
     PipelineEpochChanged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataReconnectReason {
     StoreInstanceChanged,
-    ProtocolEpochChanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

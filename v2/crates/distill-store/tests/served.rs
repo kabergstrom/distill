@@ -49,7 +49,7 @@ fn change_log_trim_advances_the_oldest_cursor() {
             .input_transaction(|txn| {
                 let version = txn.version();
                 txn.append_change(version, &Change::Path { path: "a".into() })?;
-                txn.append_change(version, &Change::ReconnectAll { reason: 1 })?;
+                txn.append_change(version, &Change::ReconnectAll)?;
                 txn.trim_change_log(version, 2)
             })
             .unwrap();
@@ -73,20 +73,21 @@ fn change_log_trim_advances_the_oldest_cursor() {
 }
 
 #[test]
-fn rpc_targets_advance_generation_only_on_change() {
+fn a_target_is_installed_replaced_and_removed_without_a_fence() {
     let (_dir, mut store) = store();
-    let changed = store
+    store
         .served_transaction(|txn| {
-            Ok([
-                txn.set_rpc_target("pc", [1; 32])?,
-                txn.set_rpc_target("pc", [1; 32])?,
-                txn.set_rpc_target("pc", [2; 32])?,
-            ])
+            txn.set_rpc_target("pc", [1; 32])?;
+            txn.set_rpc_target("console", [3; 32])?;
+            txn.set_rpc_target("pc", [2; 32])?;
+            txn.remove_rpc_target("console")
         })
         .unwrap();
-    assert_eq!(changed, [false, false, true]);
-    assert_eq!(store.rpc_target("pc").unwrap().unwrap().generation, 1);
+    let targets = store.rpc_targets().unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!((targets[0].name.as_str(), targets[0].definition_hash), ("pc", [2; 32]));
     assert_eq!(store.rpc_pipeline_generation().unwrap(), 0);
+    assert_eq!(store.change_log_head().unwrap(), 0);
     store
         .served_transaction(|txn| txn.bump_rpc_pipeline_generation())
         .unwrap();

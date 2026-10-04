@@ -4,9 +4,9 @@
 //! The namespace itself is the ordinary `bundles` / `assets` / `asset_tags`
 //! / `schemas` rows and the derived outputs `source_claims` names. This
 //! module adds the served-only facts next to them: the change log that
-//! subscriptions and reconnect fences read, the RPC target generations, the
-//! published pipeline diagnostic, and the typed load
-//! edges of stored artifacts.
+//! subscriptions and reconnect fences read, the RPC target set, the
+//! published pipeline diagnostic, and the typed load edges of stored
+//! artifacts.
 //!
 //! A snapshot is a read transaction over these tables
 //! ([`StoreReader::begin_snapshot`]); nothing here is versioned.
@@ -26,11 +26,11 @@ pub const SERVED_PIPELINE: &str = "served_pipeline";
 
 const RPC_PIPELINE_GENERATION: &str = "rpc_pipeline_generation";
 const CHANGE_LOG_OLDEST: &str = "change_log_oldest";
-/// The pipeline generation ([`RPC_PIPELINE_GENERATION`]) and target `?1`'s
-/// generation in one statement, so they are read at one instant.
-pub(crate) const RPC_FENCE: &str = "SELECT
-       (SELECT value FROM store_meta WHERE key = 'rpc_pipeline_generation'),
-       (SELECT generation FROM rpc_targets WHERE name = ?1)";
+/// Install target `?1` with definition `?2`, or replace its definition.
+pub(crate) const SET_RPC_TARGET: &str = "INSERT INTO rpc_targets(name, definition_hash) VALUES (?1, ?2)
+     ON CONFLICT(name) DO UPDATE SET definition_hash = excluded.definition_hash";
+/// A pipeline fence row at version `?1` (kind `?2`: [`CHANGE_RECONNECT_ALL`]).
+pub(crate) const APPEND_RECONNECT_ALL: &str = "INSERT INTO change_log(version, kind) VALUES (?1, ?2)";
 /// Drop an artifact's load edges ahead of recording its latest install's.
 pub(crate) const DELETE_LOAD_EDGES: &str = "DELETE FROM artifact_load_edges WHERE content_hash = ?1";
 
@@ -89,10 +89,8 @@ pub enum Change {
     Asset { asset: AssetUuid, state: u8 },
     /// A published path delta.
     Path { path: String },
-    /// Every connection must reconnect.
-    ReconnectAll { reason: u8 },
-    /// Connections bound to `target` must reconnect.
-    ReconnectTarget { target: String, reason: u8 },
+    /// The pipeline changed: every connection must reconnect.
+    ReconnectAll,
     /// The staged restart-required key set changed.
     RestartRequired { keys: Vec<String> },
 }
@@ -100,7 +98,6 @@ pub enum Change {
 const CHANGE_ASSET: i64 = 1;
 const CHANGE_PATH: i64 = 2;
 const CHANGE_RECONNECT_ALL: i64 = 3;
-const CHANGE_RECONNECT_TARGET: i64 = 4;
 const CHANGE_RESTART: i64 = 5;
 
 /// Asset `?1`'s published deltas with `?2 < version <= ?3`, on the asset
@@ -126,7 +123,6 @@ pub struct ChangeEntry {
 pub struct RpcTargetRow {
     pub name: String,
     pub definition_hash: [u8; 32],
-    pub generation: u64,
 }
 
 
@@ -422,20 +418,9 @@ impl StoreReader {
         Ok(meta_get_u64(&self.conn, RPC_PIPELINE_GENERATION)?.unwrap_or(0))
     }
 
-    /// A connection's fences, the pipeline generation and its target's
-    /// generation, read by one statement: one instant ([`RPC_FENCE`]).
-    pub fn rpc_fence(&self, target: &str) -> Result<(u64, Option<u64>), StoreError> {
-        Ok(self.conn.prepare_cached(RPC_FENCE)?.query_row([target], |row| {
-            Ok((
-                row.get::<_, Option<i64>>(0)?.unwrap_or(0) as u64,
-                row.get::<_, Option<i64>>(1)?.map(|generation| generation as u64),
-            ))
-        })?)
-    }
-
     pub fn rpc_targets(&self) -> Result<Vec<RpcTargetRow>, StoreError> {
         let mut statement = self.conn.prepare_cached(
-            "SELECT name, definition_hash, generation FROM rpc_targets ORDER BY name",
+            "SELECT name, definition_hash FROM rpc_targets ORDER BY name",
         )?;
         let rows = statement.query_map([], rpc_target_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
@@ -443,7 +428,7 @@ impl StoreReader {
 
     pub fn rpc_target(&self, name: &str) -> Result<Option<RpcTargetRow>, StoreError> {
         let mut statement = self.conn.prepare_cached(
-            "SELECT name, definition_hash, generation FROM rpc_targets WHERE name = ?1",
+            "SELECT name, definition_hash FROM rpc_targets WHERE name = ?1",
         )?;
         Ok(statement.query_row([name], rpc_target_row).optional()?)
     }
@@ -545,7 +530,6 @@ fn rpc_target_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RpcTargetRow> {
     Ok(RpcTargetRow {
         name: row.get(0)?,
         definition_hash: blob32(row.get(1)?),
-        generation: row.get::<_, i64>(2)? as u64,
     })
 }
 
@@ -572,13 +556,7 @@ fn change_entry_row(
             state: state as u8,
         },
         (CHANGE_PATH, _, _, Some(path)) => Change::Path { path },
-        (CHANGE_RECONNECT_ALL, _, Some(reason), _) => Change::ReconnectAll {
-            reason: reason as u8,
-        },
-        (CHANGE_RECONNECT_TARGET, _, Some(reason), Some(target)) => Change::ReconnectTarget {
-            target,
-            reason: reason as u8,
-        },
+        (CHANGE_RECONNECT_ALL, _, _, _) => Change::ReconnectAll,
         (CHANGE_RESTART, _, _, _) => {
             let keys = match detail {
                 Some(bytes) => match decode_keys(&bytes) {
@@ -632,7 +610,7 @@ pub trait ServedWrite {
     /// Every RPC target row as this transaction sees them.
     fn txn_rpc_targets(&self) -> Result<Vec<RpcTargetRow>, StoreError> {
         let mut statement = self.served_conn().prepare_cached(
-            "SELECT name, definition_hash, generation FROM rpc_targets ORDER BY name",
+            "SELECT name, definition_hash FROM rpc_targets ORDER BY name",
         )?;
         let rows = statement.query_map([], rpc_target_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
@@ -654,14 +632,9 @@ pub trait ServedWrite {
                     "INSERT INTO change_log(version, kind, subject) VALUES (?1, ?2, ?3)",
                 )?
                 .execute(rusqlite::params![version, CHANGE_PATH, path])?,
-            Change::ReconnectAll { reason } => conn
-                .prepare_cached("INSERT INTO change_log(version, kind, state) VALUES (?1, ?2, ?3)")?
-                .execute(rusqlite::params![version, CHANGE_RECONNECT_ALL, *reason as i64])?,
-            Change::ReconnectTarget { target, reason } => conn
-                .prepare_cached(
-                    "INSERT INTO change_log(version, kind, state, subject) VALUES (?1, ?2, ?3, ?4)",
-                )?
-                .execute(rusqlite::params![version, CHANGE_RECONNECT_TARGET, *reason as i64, target])?,
+            Change::ReconnectAll => conn
+                .prepare_cached(APPEND_RECONNECT_ALL)?
+                .execute(rusqlite::params![version, CHANGE_RECONNECT_ALL])?,
             Change::RestartRequired { keys } => conn
                 .prepare_cached(
                     "INSERT INTO change_log(version, kind, detail) VALUES (?1, ?2, ?3)",
@@ -723,43 +696,19 @@ pub trait ServedWrite {
         Ok(next)
     }
 
-    /// Install or replace one RPC target. A changed definition advances its
-    /// generation. Returns whether it changed.
-    fn set_rpc_target(&mut self, name: &str, definition_hash: [u8; 32]) -> Result<bool, StoreError> {
-        let conn = self.served_conn();
-        let existing = conn
-            .query_row(
-                "SELECT definition_hash, generation FROM rpc_targets WHERE name = ?1",
-                [name],
-                |row| Ok((blob32(row.get(0)?), row.get::<_, i64>(1)?)),
-            )
-            .optional()?;
-        match existing {
-            Some((hash, _)) if hash == definition_hash => Ok(false),
-            Some((_, generation)) => {
-                conn
-                    .prepare_cached(
-                        "UPDATE rpc_targets SET definition_hash = ?2, generation = ?3 WHERE name = ?1",
-                    )?
-                    .execute(rusqlite::params![name, definition_hash.as_slice(), generation + 1])?;
-                Ok(true)
-            }
-            None => {
-                conn
-                    .prepare_cached(
-                        "INSERT INTO rpc_targets(name, definition_hash, generation) VALUES (?1, ?2, 0)",
-                    )?
-                    .execute(rusqlite::params![name, definition_hash.as_slice()])?;
-                Ok(false)
-            }
-        }
+    /// Install one RPC target, or replace its definition.
+    fn set_rpc_target(&mut self, name: &str, definition_hash: [u8; 32]) -> Result<(), StoreError> {
+        self.served_conn()
+            .prepare_cached(SET_RPC_TARGET)?
+            .execute(rusqlite::params![name, definition_hash.as_slice()])?;
+        Ok(())
     }
 
-    fn remove_rpc_target(&mut self, name: &str) -> Result<bool, StoreError> {
-        Ok(self
-            .served_conn()
-            .execute("DELETE FROM rpc_targets WHERE name = ?1", [name])?
-            > 0)
+    fn remove_rpc_target(&mut self, name: &str) -> Result<(), StoreError> {
+        self.served_conn()
+            .prepare_cached("DELETE FROM rpc_targets WHERE name = ?1")?
+            .execute([name])?;
+        Ok(())
     }
 
     /// Record an artifact's typed direct load edges, replacing any an
