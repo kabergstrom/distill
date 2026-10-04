@@ -2395,6 +2395,13 @@ fn publish_scan(
         // pass's earlier step may already have advanced to.
         let observation = transaction.version();
         transaction.replace_source_claims(None, claims)?;
+        // Removals first: a canonical directory path is unique, and a
+        // removed row's may be another's now.
+        for (root_name, path) in &removed_files {
+            let root = transaction.intern_root(root_name)?;
+            transaction.remove_file(root, path)?;
+            transaction.push_dirty(root, path, false, observation)?;
+        }
         let mut root_ids = BTreeMap::new();
         for (key, file) in candidate.scan.file_observations() {
             let root = *root_ids
@@ -2408,15 +2415,6 @@ fn publish_scan(
                 transaction.push_dirty(root, &key.1, true, observation)?;
             }
         }
-        for (root_name, path) in &removed_files {
-            let root = transaction.intern_root(root_name)?;
-            transaction.remove_file(root, path)?;
-            transaction.push_dirty(root, path, false, observation)?;
-        }
-        transaction.replace_scan_structure(
-            None,
-            &candidate.scan.directory_rows(),
-        )?;
         transaction.set_namespace_errors(candidate.namespace_errors.iter().cloned())?;
         transaction.clear_derived_outputs()?;
         for (child, output) in &derived_outputs {
@@ -2703,27 +2701,25 @@ fn publish_incremental_scan(
         let observation = transaction.version();
         let file_mutations = incremental_file_mutations(&transaction.reader(), delta)?;
         let mut root_ids = BTreeMap::new();
+        // Removals first: a canonical directory path is unique, and a
+        // removed row's may be another's now.
         for mutation in &file_mutations {
             let root = *root_ids
                 .entry(mutation.root_name.clone())
                 .or_insert(transaction.intern_root(&mutation.root_name)?);
-            match &mutation.file {
-                Some(file) => {
-                    transaction.upsert_file(root, &mutation.path, file, observation)?;
-                    if mutation.dirty {
-                        transaction.push_dirty(root, &mutation.path, true, observation)?;
-                    }
-                }
-                None => {
-                    transaction.remove_file(root, &mutation.path)?;
-                    transaction.push_dirty(root, &mutation.path, false, observation)?;
-                }
+            if mutation.file.is_none() {
+                transaction.remove_file(root, &mutation.path)?;
+                transaction.push_dirty(root, &mutation.path, false, observation)?;
             }
         }
-        transaction.replace_scan_structure(
-            Some(delta.affected_prefixes()),
-            &delta.observed().directory_rows(),
-        )?;
+        for mutation in &file_mutations {
+            let Some(file) = &mutation.file else { continue };
+            let root = root_ids[&mutation.root_name];
+            transaction.upsert_file(root, &mutation.path, file, observation)?;
+            if mutation.dirty {
+                transaction.push_dirty(root, &mutation.path, true, observation)?;
+            }
+        }
         let pending = transaction.replace_source_claims(Some(delta.affected_prefixes()), claims)?;
         let commit = publish_claimed(
             transaction,
@@ -3123,7 +3119,7 @@ pub(crate) fn publish_incremental_paths(
     let projection = compiled.projection();
     let delta = {
         let store: &StoreReader = store;
-        let stored = StoredBaseline::new(store);
+        let stored = StoredBaseline::new(store, &scanner);
         let delta = scanner.scan_incremental_delta(&stored, paths);
         stored.finish().map_err(|error| error.to_string())?;
         delta

@@ -4,7 +4,7 @@
 
 use distill_core::id::ContentHash;
 use distill_store::files::{
-    FileKind, FileObservation, FileState, LogicalPathState, ObservedDirectory,
+    FileKind, FileObservation, FileState, LogicalPathState,
 };
 use distill_store::state::InputVersion;
 use distill_store::{Store, StoreConfig};
@@ -243,6 +243,7 @@ fn a_transaction_view_reads_its_own_uncommitted_scan_rows() {
         state: file_state(7),
         raw_path: b"\0tex/Rock.bundle".to_vec(),
         symlink_target: Some(b"/project/tex/rock.bundle".to_vec()),
+        canonical_path: None,
     };
     let failed = store.input_transaction::<(), _>(|txn| {
         let root = txn.intern_root("main")?;
@@ -266,50 +267,29 @@ fn a_transaction_view_reads_its_own_uncommitted_scan_rows() {
 }
 
 #[test]
-fn scan_structure_is_replaced_per_subtree() {
+fn a_directory_row_is_found_by_its_unique_canonical_path() {
     let (_d, mut store) = store();
-    let directory = |path: &str| ObservedDirectory {
-        root_name: "main".to_owned(),
-        path: path.to_owned(),
-        canonical_path: format!("/project/{path}").into_bytes(),
-        physical_path: format!("/project/{path}").into_bytes(),
+    let directory = |canonical: &str| FileObservation {
+        canonical_path: Some(format!("/project/{canonical}").into_bytes()),
+        ..FileObservation::from(FileState {
+            kind: FileKind::Directory,
+            content_hash: None,
+            ..file_state(1)
+        })
     };
-    store
-        .input_transaction(|txn| {
-            txn.replace_scan_structure(
-                None,
-                &[directory(""), directory("a"), directory("a/b"), directory("ab")],
-            )
+    let write = |store: &mut Store, path: &str, file: FileObservation| {
+        store.input_transaction(|txn| {
+            let root = txn.intern_root("main")?;
+            txn.upsert_file(root, path, &file, txn.version())
         })
-        .unwrap();
-    store
-        .input_transaction(|txn| {
-            txn.replace_scan_structure(
-                Some(&[("main".to_owned(), "a".to_owned())]),
-                &[directory("a")],
-            )
-        })
-        .unwrap();
-    let paths = store
-        .observed_directories()
-        .unwrap()
-        .into_iter()
-        .map(|row| row.path)
-        .collect::<Vec<_>>();
-    assert_eq!(paths, ["", "a", "ab"], "only the a/ subtree was replaced");
-    assert_eq!(
-        store.directory_by_canonical(b"/project/ab").unwrap(),
-        Some(directory("ab"))
-    );
+    };
+    write(&mut store, "a", directory("a")).unwrap();
+    write(&mut store, "ab", directory("ab")).unwrap();
+    let found = store.directory_by_canonical(b"/project/ab").unwrap().unwrap();
+    assert_eq!((found.path, found.file), ("ab".to_owned(), directory("ab")));
+    assert_eq!(store.directory_by_canonical(b"/project/c").unwrap(), None);
     // Two directories never share a canonical path.
-    let mut alias = directory("c");
-    alias.canonical_path = directory("ab").canonical_path;
-    assert!(store
-        .input_transaction(|txn| txn.replace_scan_structure(
-            Some(&[("main".to_owned(), "c".to_owned())]),
-            &[alias.clone()],
-        ))
-        .is_err());
+    assert!(write(&mut store, "c", directory("ab")).is_err());
 }
 
 #[test]

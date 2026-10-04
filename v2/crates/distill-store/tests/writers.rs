@@ -118,19 +118,22 @@ fn writers_follow_the_operational_configuration_from_their_next_transaction() {
 /// fails, its own writes roll back and the input keeps the rest.
 #[test]
 fn a_failed_nested_write_rolls_back_only_its_own_writes() {
-    use distill_store::files::ObservedDirectory;
+    use distill_store::files::{FileKind, FileObservation, FileState};
     use distill_store::StoreError;
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(StoreConfig::new(dir.path().join("state"))).unwrap();
     let observe = |store: &mut Store, path: &str| {
-        let directory = ObservedDirectory {
-            root_name: "main".to_owned(),
-            path: path.to_owned(),
-            canonical_path: path.as_bytes().to_vec(),
-            physical_path: path.as_bytes().to_vec(),
-        };
+        let file = FileObservation::from(FileState {
+            mtime: 0,
+            size: 0,
+            kind: FileKind::File,
+            content_hash: None,
+        });
         store
-            .input_transaction(|txn| txn.replace_scan_structure(Some(&[]), &[directory]))
+            .input_transaction(|txn| {
+                let root = txn.intern_root("main")?;
+                txn.upsert_file(root, path, &file, txn.version())
+            })
             .map(drop)
     };
     store.open_input().unwrap();
@@ -156,7 +159,7 @@ fn a_failed_nested_write_rolls_back_only_its_own_writes() {
     assert!(failed_with.is_err());
     store.finish_input(true).unwrap();
     let paths = store
-        .observed_directories()
+        .observed_files()
         .unwrap()
         .into_iter()
         .map(|row| row.path)

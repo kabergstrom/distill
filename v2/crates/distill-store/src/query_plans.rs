@@ -248,13 +248,12 @@ fn explain(conn: &Connection, sql: &str) -> Vec<String> {
 }
 
 /// The tables a selective read must never scan.
-const NAMESPACE_TABLES: [&str; 6] = [
+const NAMESPACE_TABLES: [&str; 5] = [
     "assets",
     "bundles",
     "files",
     "asset_tags",
     "bundle_path_refs",
-    "directories",
 ];
 
 /// Partial indexes: walking one visits only the rows it was declared for.
@@ -820,25 +819,30 @@ fn the_bundle_asset_walk_sorts_one_bundle_at_a_time() {
     );
 }
 
-/// Scan-structure and claim rows under every scanned bundle's directory,
+/// A directory row and claim rows under every scanned bundle's directory,
 /// and a symlink beside every hundredth bundle, for the subtree reads.
 fn populate_scan_structure(store: &mut Store, count: u32) {
-    let mut directories = Vec::new();
-    for index in 0..count {
-        let root = ["main", "alt"][(index % 2) as usize].to_owned();
-        let path = bundle_path(index);
-        directories.push(crate::files::ObservedDirectory {
-            root_name: root.clone(),
-            path: format!("{path}.d"),
-            canonical_path: format!("/c/{index}").into_bytes(),
-            physical_path: format!("/p/{index}").into_bytes(),
-        });
-    }
     let claims = populate_scan_structure_claims(count);
     store
         .input_transaction(|txn| {
             let version = txn.version();
-            txn.replace_scan_structure(None, &directories)?;
+            for index in 0..count {
+                let root = txn.intern_root(["main", "alt"][(index % 2) as usize])?;
+                txn.upsert_file(
+                    root,
+                    &format!("{}.d", bundle_path(index)),
+                    &FileObservation {
+                        canonical_path: Some(format!("/c/{index}").into_bytes()),
+                        ..FileObservation::from(FileState {
+                            mtime: 0,
+                            size: 0,
+                            kind: FileKind::Directory,
+                            content_hash: None,
+                        })
+                    },
+                    version,
+                )?;
+            }
             txn.replace_source_claims(None, &claims)?;
             let root = txn.intern_root("main")?;
             for index in (0..count).step_by(100) {
@@ -854,6 +858,7 @@ fn populate_scan_structure(store: &mut Store, count: u32) {
                         },
                         raw_path: Vec::new(),
                         symlink_target: Some(format!("/t/d{:02}/x{index}", index % 50).into_bytes()),
+                        canonical_path: None,
                     },
                     version,
                 )?;
@@ -924,13 +929,12 @@ fn subtree_reads_search_one_key_range() {
         };
         let reads = subtree_plans(&mut store, |store| {
             store.observed_files_under("main", prefix).unwrap();
-            store.observed_directories_under("main", prefix).unwrap();
             store.bundle_file_hashes_under("main", prefix).unwrap();
         });
         let plans = reads.iter().map(|(_, plan)| plan.clone()).collect::<Vec<_>>();
         assert_eq!(
             plans,
-            ["files", "directories", "files"].map(read),
+            ["files", "files"].map(read),
             "{prefix:?}: {reads:#?}"
         );
         let exists = subtree_plans(&mut store, |store| {
@@ -944,9 +948,6 @@ fn subtree_reads_search_one_key_range() {
                 "SCALAR SUBQUERY 1".to_owned(),
                 roots.to_owned(),
                 search("files", true),
-                "SCALAR SUBQUERY 2".to_owned(),
-                roots.to_owned(),
-                search("directories", true),
             ],
             "{prefix:?}: {exists:#?}"
         );
@@ -954,7 +955,6 @@ fn subtree_reads_search_one_key_range() {
         let writes = subtree_plans(&mut store, |store| {
             store
                 .input_transaction(|txn| {
-                    txn.replace_scan_structure(Some(&under), &[])?;
                     txn.replace_source_claims(Some(&under), &[])
                 })
                 .unwrap();
@@ -963,7 +963,6 @@ fn subtree_reads_search_one_key_range() {
         assert_eq!(
             plans,
             [
-                delete("directories"),
                 vec![roots.to_owned(), search("source_claims", true)],
                 delete("source_claims"),
             ],
@@ -994,7 +993,7 @@ fn subtree_reads_search_one_key_range() {
     assert_eq!(
         canonical[0].1,
         [
-            "SEARCH t USING INDEX directories_by_canonical (canonical_path=?)",
+            "SEARCH t USING INDEX files_by_canonical (canonical_path=?)",
             "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)",
         ],
         "{canonical:#?}"
@@ -1009,21 +1008,20 @@ fn a_subtree_read_of_a_large_root_touches_its_rows() {
     populate_scan_structure(&mut store, 20_000);
     let reader = store.reader().unwrap();
     // "d08" holds every 50th bundle, all even, so all "main"'s: 400 of its
-    // 10,000, each with a directory below it.
+    // 10,000, each with a directory row beside it (whose table rows were
+    // written apart from the bundles', so no table page holds two).
     let mut rows = 0;
     let narrow = pages(&reader, || {
         rows = reader.observed_files_under("main", "d08").unwrap().len();
-        rows += reader.observed_directories_under("main", "d08").unwrap().len();
         rows += reader.bundle_file_hashes_under("main", "d08").unwrap().len();
     });
     let whole = pages(&reader, || {
         drop(reader.observed_files_under("main", "").unwrap());
-        drop(reader.observed_directories_under("main", "").unwrap());
         drop(reader.bundle_file_hashes_under("main", "").unwrap());
     });
     println!("subtree: {rows} rows in {narrow} pages (whole root: {whole} pages)");
     assert_eq!(rows, 3 * 400);
-    assert!(narrow <= 16 + 2 * rows as u64, "{narrow} pages for {rows} rows");
+    assert!(narrow <= 32 + 2 * rows as u64, "{narrow} pages for {rows} rows");
     assert!(whole >= 10 * narrow, "{narrow} pages against {whole}");
 }
 
@@ -1663,10 +1661,7 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         kept.pop();
         store
             .input_transaction(|txn| {
-                txn.replace_source_claims(None, &kept)?;
-                // And of the directories, dropping one.
-                let held = txn.reader().observed_directories_under("main", "")?;
-                txn.replace_scan_structure(None, &held[1..])
+                txn.replace_source_claims(None, &kept)
             })
             .unwrap();
     });
@@ -1685,15 +1680,7 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         "SEARCH source_claims USING INDEX source_claims_by_subject (kind=? AND subject=?)",
         "USE TEMP B-TREE FOR DISTINCT",
     ];
-    let cases: [(&str, &[&str]); 23] = [
-        (
-            "SELECT root_id, path, canonical_path, physical_path FROM directories",
-            &["SCAN directories"],
-        ),
-        (
-            "DELETE FROM directories WHERE root_id",
-            &["SEARCH directories USING INDEX sqlite_autoindex_directories_1 (root_id=? AND path=?)"],
-        ),
+    let cases: [(&str, &[&str]); 21] = [
         // A full replacement streams the claims (a whole-namespace pass)
         // and deletes the stale ones by key.
         ("SELECT root_id, path, kind, subject, claimant, detail FROM source_claims", &["SCAN source_claims"]),

@@ -644,7 +644,6 @@ fn publish_completely(
 fn published_tables(store: &Store) -> BTreeMap<&'static str, Vec<String>> {
     [
         "files",
-        "directories",
         "source_claims",
         "file_work",
         "bundles",

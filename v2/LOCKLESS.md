@@ -497,8 +497,9 @@ should reach zero by the end of phase 6.
   - **Scan observation in tables.**
     - `files` gains `raw_path` and `symlink_target`.
     - `bundle_files` holds the bytes each bundle was read as.
-    - `directories` holds the traversal state. Scan diagnostics are the
-      scan's own: `doctor verify` reports what a fresh scan observes.
+    - A traversed directory's canonical path is a column of its `files`
+      row (schema-min). Scan diagnostics are the scan's own: `doctor
+      verify` reports what a fresh scan observes.
     - Incremental scans check against `StoredBaseline`, a `ScanBaseline`
       over those tables, and load only the affected prefixes.
     - `ScanSnapshot` remains only as the scanner's result type and as a

@@ -907,7 +907,7 @@ impl DaemonCoordinator {
             }
         }
         let delta = {
-            let stored = StoredBaseline::new(store);
+            let stored = StoredBaseline::new(store, &scanner);
             let delta = scanner.scan_incremental_delta(&stored, &scan_paths);
             stored.finish()?;
             match delta {

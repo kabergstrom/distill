@@ -19,7 +19,7 @@ use distill_store::db::StoreReader;
 use distill_store::Current;
 use distill_store::error::StoreError;
 use distill_store::files::{
-    FileKind, FileObservation, FileState, ObservedDirectory, ObservedFile,
+    FileKind, FileObservation, FileState, ObservedFile,
 };
 use distill_store::state::{PhysicalPathClaim, PhysicalPathFailureCode, PlatformPathBytes};
 use unicode_normalization::{is_nfc, UnicodeNormalization};
@@ -235,6 +235,8 @@ pub struct ScannedFile {
     pub size: u64,
     pub content_hash: Option<ContentHash>,
     raw_relative_path: PlatformPathBytes,
+    /// A traversed directory's canonical path.
+    canonical_path: Option<PathBuf>,
 }
 
 impl ScannedFile {
@@ -347,7 +349,6 @@ impl ScanSnapshot {
                         && left.normalized_path == right.normalized_path
                         && left.file_hash == right.file_hash
                 })
-            && self.directory_observations == other.directory_observations
             && self.symlink_aliases == other.symlink_aliases
     }
 
@@ -457,8 +458,8 @@ impl ScanDelta {
     }
 
     /// Whether the store publishes, under every affected prefix, the
-    /// namespace this delta observed there: its files and symlink targets,
-    /// its bundle files' hashes (never their bytes) and its directories.
+    /// namespace this delta observed there: its files, symlink targets and
+    /// directories, and its bundle files' hashes (never their bytes).
     /// Diagnostics are scanner state and do not count.
     pub(crate) fn matches_published(&self, published: &StoreReader) -> Result<bool, StoreError> {
         for affected in &self.affected {
@@ -475,11 +476,6 @@ impl ScanDelta {
                 })
                 .collect::<Vec<_>>();
             let bundles = published.bundle_file_hashes_under(root, prefix)?;
-            let directories = published
-                .observed_directories_under(root, prefix)?
-                .into_iter()
-                .map(directory_observation_row)
-                .collect::<Vec<_>>();
             let same = files.iter().eq(matching_values(&self.observed.files, affected))
                 && aliases
                     .iter()
@@ -488,11 +484,7 @@ impl ScanDelta {
                 && bundles
                     .iter()
                     .map(|(path, hash)| (root.as_str(), path.as_str(), BundleFileHash(*hash)))
-                    .eq(matching_bundle_observations(&self.observed.bundles, affected))
-                && directories
-                    .iter()
-                    .map(|(key, observation)| (key, observation))
-                    .eq(subtree_entries(&self.observed.directory_observations, affected));
+                    .eq(matching_bundle_observations(&self.observed.bundles, affected));
             if !same {
                 return Ok(false);
             }
@@ -530,18 +522,21 @@ impl ScanBaseline for ScanSnapshot {
     }
 }
 
-/// [`ScanBaseline`] over the store's scan tables. A failed query answers as
-/// if the row were absent and is kept for [`StoredBaseline::finish`], which
-/// the caller checks before trusting the delta.
+/// [`ScanBaseline`] over the store's scan tables and `scanner`'s roots,
+/// whose own directories are their configuration's. A failed query answers
+/// as if the row were absent and is kept for [`StoredBaseline::finish`],
+/// which the caller checks before trusting the delta.
 pub(crate) struct StoredBaseline<'a> {
     reader: &'a StoreReader,
+    roots: Arc<BTreeMap<String, CanonicalRoot>>,
     failure: RefCell<Option<StoreError>>,
 }
 
 impl<'a> StoredBaseline<'a> {
-    pub(crate) fn new(reader: &'a StoreReader) -> Self {
+    pub(crate) fn new(reader: &'a StoreReader, scanner: &RootedScanner) -> Self {
         Self {
             reader,
+            roots: scanner.root_snapshot(),
             failure: RefCell::new(None),
         }
     }
@@ -578,8 +573,17 @@ impl ScanBaseline for StoredBaseline<'_> {
     }
 
     fn directory_by_target(&self, canonical: &Path) -> Option<(String, String, PathBuf)> {
-        self.keep(self.reader.directory_by_canonical(&encode_path(canonical)))
-            .map(|row| (row.root_name, row.path, decode_path(&row.physical_path)))
+        if let Some((name, root)) =
+            self.roots.iter().find(|(_, root)| root.canonical_path == canonical)
+        {
+            return Some((name.clone(), String::new(), root.canonical_path.clone()));
+        }
+        let row = self.keep(self.reader.directory_by_canonical(&encode_path(canonical)))?;
+        // A traversed directory's physical path is its root's joined with
+        // its on-disk spelling.
+        let root = self.roots.get(&row.root_name)?;
+        let relative = platform_path(&decode_raw_path(&row.file.raw_path))?;
+        Some((row.root_name, row.path, root.canonical_path.join(relative)))
     }
 }
 
@@ -597,7 +601,6 @@ impl ScanSnapshot {
         })?;
         Self::from_rows(
             reader.observed_files()?,
-            reader.observed_directories()?,
             bundles,
         )
     }
@@ -605,7 +608,6 @@ impl ScanSnapshot {
     #[cfg(test)]
     fn from_rows(
         files: Vec<ObservedFile>,
-        directories: Vec<ObservedDirectory>,
         bundles: Vec<(String, String, [u8; 32])>,
     ) -> Result<Self, StoreError> {
         let mut snapshot = Self::default();
@@ -616,10 +618,6 @@ impl ScanSnapshot {
                 snapshot.symlink_aliases.insert(key.clone(), target);
             }
             snapshot.files.insert(key, file);
-        }
-        for row in directories {
-            let (key, observation) = directory_observation_row(row);
-            snapshot.directory_observations.insert(key, observation);
         }
         for (root_name, path, hash) in bundles {
             let mut bundle = scanned_bundle(&root_name, &path, Vec::new());
@@ -663,18 +661,6 @@ impl ScanSnapshot {
         })?;
         same &= files.next().is_none() && aliases.next().is_none();
 
-        let mut directories = self.directory_observations.iter();
-        reader.for_each_observed_directory(|row| {
-            if same {
-                let (key, observation) = directory_observation_row(row);
-                same = directories
-                    .next()
-                    .is_some_and(|(left, right)| *left == key && *right == observation);
-            }
-            Ok(())
-        })?;
-        same &= directories.next().is_none();
-
         let mut bundles = self.bundles.values();
         reader.for_each_bundle_file_hash(|root_name, path, hash| {
             if same {
@@ -706,6 +692,7 @@ impl ScanSnapshot {
             },
             raw_path: encode_raw_path(&file.raw_relative_path),
             symlink_target: self.symlink_aliases.get(key).map(|target| encode_path(target)),
+            canonical_path: file.canonical_path.as_deref().map(encode_path),
         })
     }
 
@@ -722,17 +709,6 @@ impl ScanSnapshot {
         })
     }
 
-    pub(crate) fn directory_rows(&self) -> Vec<ObservedDirectory> {
-        self.directory_observations
-            .iter()
-            .map(|((root, path), observation)| ObservedDirectory {
-                root_name: root.clone(),
-                path: path.clone(),
-                canonical_path: encode_path(&observation.canonical_path),
-                physical_path: encode_path(&observation.physical_path),
-            })
-            .collect()
-    }
 
 }
 
@@ -813,18 +789,9 @@ fn scanned_file_row(row: ObservedFile) -> (ScannedFile, Option<PathBuf>) {
         size: row.file.state.size,
         content_hash: row.file.state.content_hash,
         raw_relative_path: decode_raw_path(&row.file.raw_path),
+        canonical_path: row.file.canonical_path.as_deref().map(decode_path),
     };
     (file, alias)
-}
-
-fn directory_observation_row(row: ObservedDirectory) -> ((String, String), DirectoryObservation) {
-    (
-        (row.root_name, row.path),
-        DirectoryObservation {
-            canonical_path: decode_path(&row.canonical_path),
-            physical_path: decode_path(&row.physical_path),
-        },
-    )
 }
 
 pub(crate) fn scanned_bundle(root_name: &str, normalized_path: &str, bytes: Vec<u8>) -> ScannedBundle {
@@ -1452,6 +1419,7 @@ fn scan_pending(
                     &pending.root_name,
                     &pending.physical_path,
                 ),
+                canonical_path: Some(canonical_path.clone()),
             };
             snapshot
                 .files
@@ -1717,6 +1685,7 @@ fn observe_opened_file(
         size: metadata.len(),
         content_hash: Some(ContentHash(*blake3::hash(&bytes).as_bytes())),
         raw_relative_path,
+        canonical_path: None,
     };
     snapshot
         .files
@@ -2564,6 +2533,7 @@ mod tests {
                 size: 1,
                 content_hash: (kind != ScannedFileKind::Directory).then_some(ContentHash([hash; 32])),
                 raw_relative_path: PlatformPathBytes::Unix(path.as_bytes().to_vec()),
+                canonical_path: None,
             },
         )
     }
@@ -2745,7 +2715,7 @@ mod published_compare_tests {
                     let root = txn.intern_root(&key.0)?;
                     txn.upsert_file(root, &key.1, &file, version)?;
                 }
-                txn.replace_scan_structure(None, &scan.directory_rows())
+                Ok(())
             })
             .unwrap();
     }
@@ -2790,6 +2760,29 @@ mod published_compare_tests {
         }
     }
 
+    /// The stored baseline finds each traversed directory, the roots' own
+    /// included, where the scan that published it does: by its canonical
+    /// path, with the physical path the scan traversed.
+    #[test]
+    fn stored_directories_are_found_as_the_scan_finds_them() {
+        let mut world = new_world();
+        let scan = world.scanner.scan().unwrap();
+        publish(&mut world.store, &scan);
+        let stored = StoredBaseline::new(&world.store, &world.scanner);
+        assert!(scan.directory_observations.len() > 2);
+        for observation in scan.directory_observations.values() {
+            let canonical = &observation.canonical_path;
+            assert_eq!(
+                stored.directory_by_target(canonical),
+                scan.directory_by_target(canonical),
+                "{canonical:?}"
+            );
+            assert!(stored.directory_by_target(canonical).is_some());
+        }
+        assert_eq!(stored.directory_by_target(&world.root.join("nowhere")), None);
+        stored.finish().unwrap();
+    }
+
     #[test]
     fn inconsistent_tables_fail_as_loading_them_fails() {
         // Two traversed directories sharing a canonical path never reach
@@ -2797,14 +2790,15 @@ mod published_compare_tests {
         let mut world = new_world();
         let scan = world.scanner.scan().unwrap();
         publish(&mut world.store, &scan);
-        let mut directories = scan.directory_rows();
-        let mut alias = directories[0].clone();
-        alias.path = "elsewhere".into();
-        directories.push(alias);
+        let (_, directory) = scan
+            .file_observations()
+            .find(|(_, file)| file.canonical_path.is_some())
+            .unwrap();
         assert!(world
             .store
             .input_transaction(|txn| {
-                txn.replace_scan_structure(None, &directories)
+                let root = txn.intern_root("main")?;
+                txn.upsert_file(root, "elsewhere", &directory, txn.version())
             })
             .is_err());
         assert_eq!(compare(&scan, &world.store), Ok(true));

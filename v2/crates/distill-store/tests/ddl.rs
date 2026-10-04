@@ -61,7 +61,6 @@ fn every_section_13_table_exists() {
     // codegen_outputs (§20's daemon-owned expected-preimage authority).
     let expected: BTreeSet<String> = [
         "files",
-        "directories",
         "source_claims",
         "import_keys",
         "file_work",
@@ -144,7 +143,8 @@ fn files_is_keyed_per_root() {
             "content_hash",
             "observation",
             "raw_path",
-            "symlink_target"
+            "symlink_target",
+            "canonical_path"
         ]
     );
     assert_eq!(pk_columns(&conn, "files"), ["root_id", "path"]);

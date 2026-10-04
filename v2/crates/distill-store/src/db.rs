@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 52;
+pub const SCHEMA_VERSION: u32 = 53;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -41,10 +41,12 @@ CREATE TABLE files (
     kind         INTEGER NOT NULL,
     content_hash BLOB,
     observation  INTEGER NOT NULL,
-    -- The scanner's on-disk spelling of `path`, and a symlink's canonical
-    -- target, in the daemon's platform path encoding.
+    -- The scanner's on-disk spelling of `path`, a symlink's canonical
+    -- target, and a traversed directory's canonical path, in the daemon's
+    -- platform path encoding.
     raw_path       BLOB NOT NULL,
     symlink_target BLOB,
+    canonical_path BLOB,
     -- The final path segment, and the text after its last `.` (NULL
     -- without one): what a glob with no literal prefix (`**/name.ext`,
     -- `*.ext`) is looked up by. Derived from `path` on write.
@@ -58,17 +60,12 @@ CREATE INDEX files_by_name ON files(name);
 CREATE INDEX files_by_ext ON files(ext) WHERE ext IS NOT NULL;
 CREATE INDEX files_by_symlink_target ON files(symlink_target)
     WHERE symlink_target IS NOT NULL;
--- Every traversed directory (the root itself at path ''), for alias checks.
--- Two directories never share a canonical path: the scanner rejects an
--- alias before publishing, and the unique index enforces it at write.
-CREATE TABLE directories (
-    root_id        INTEGER NOT NULL,
-    path           TEXT NOT NULL,
-    canonical_path BLOB NOT NULL,
-    physical_path  BLOB NOT NULL,
-    PRIMARY KEY (root_id, path)
-);
-CREATE UNIQUE INDEX directories_by_canonical ON directories(canonical_path);
+-- The traversed directories, for alias checks (a root's own directory is
+-- its configuration's). Two directories never share a canonical path: the
+-- scanner rejects an alias before publishing, and the unique index
+-- enforces it at write.
+CREATE UNIQUE INDEX files_by_canonical ON files(canonical_path)
+    WHERE canonical_path IS NOT NULL;
 -- What each scanned bundle claims (bundle and asset UUIDs, derived
 -- outputs, primary paths, malformed skeletons), keyed
 -- by the claiming source. See `claims`.

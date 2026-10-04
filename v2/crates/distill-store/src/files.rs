@@ -224,13 +224,15 @@ impl QueuedWork {
 const WORK_RENAME: i64 = 2;
 
 /// The scanner's complete record of one (root, path): its tree state plus
-/// the on-disk spelling and, for a symlink, its canonical target. Both paths
-/// are in the daemon's platform path encoding.
+/// the on-disk spelling, for a symlink its canonical target, and for a
+/// traversed directory its canonical path. The paths are in the daemon's
+/// platform path encoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileObservation {
     pub state: FileState,
     pub raw_path: Vec<u8>,
     pub symlink_target: Option<Vec<u8>>,
+    pub canonical_path: Option<Vec<u8>>,
 }
 
 impl From<FileState> for FileObservation {
@@ -240,6 +242,7 @@ impl From<FileState> for FileObservation {
             state,
             raw_path: Vec::new(),
             symlink_target: None,
+            canonical_path: None,
         }
     }
 }
@@ -252,22 +255,14 @@ pub struct ObservedFile {
     pub file: FileObservation,
 }
 
-/// One traversed directory (§13 `directories`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ObservedDirectory {
-    pub root_name: String,
-    pub path: String,
-    pub canonical_path: Vec<u8>,
-    pub physical_path: Vec<u8>,
-}
-
 impl InputTxn<'_> {
     /// Intern a root name to its process-local id, creating it if new.
     pub fn intern_root(&mut self, name: &str) -> Result<RootId, StoreError> {
         interned_root(&self.txn, &mut self.roots, name)
     }
 
-    /// Record the scanner's observation of one (root, path).
+    /// Record the scanner's observation of one (root, path). A directory
+    /// taking the canonical path another row holds fails (an alias).
     pub fn upsert_file(
         &mut self,
         root: RootId,
@@ -279,13 +274,14 @@ impl InputTxn<'_> {
         self.txn
             .prepare_cached(
                 "INSERT INTO files(root_id, path, mtime, size, kind, content_hash, observation,
-                               raw_path, symlink_target)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                               raw_path, symlink_target, canonical_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(root_id, path) DO UPDATE SET
                mtime = excluded.mtime, size = excluded.size,
                kind = excluded.kind, content_hash = excluded.content_hash,
                observation = excluded.observation, raw_path = excluded.raw_path,
-               symlink_target = excluded.symlink_target",
+               symlink_target = excluded.symlink_target,
+               canonical_path = excluded.canonical_path",
             )?
             .execute(
                 rusqlite::params![
@@ -298,6 +294,7 @@ impl InputTxn<'_> {
                     observation.0 as i64,
                     file.raw_path,
                     file.symlink_target,
+                    file.canonical_path,
                 ],
             )?;
         Ok(())
@@ -311,87 +308,6 @@ impl InputTxn<'_> {
         Ok(n > 0)
     }
 
-    /// Replace the directory rows under `under` (every row when `None`)
-    /// with a new observation of that subtree.
-    pub fn replace_scan_structure(
-        &mut self,
-        under: Option<&[(String, String)]>,
-        directories: &[ObservedDirectory],
-    ) -> Result<(), StoreError> {
-        let Some(prefixes) = under else {
-            return self.replace_all_scan_structure(directories);
-        };
-        clear_directories(&self.txn, prefixes)?;
-        for directory in directories {
-            let root = interned_root(&self.txn, &mut self.roots, &directory.root_name)?;
-            self.txn
-                .prepare_cached(
-                    "INSERT INTO directories(root_id, path, canonical_path, physical_path)
-                 VALUES (?1, ?2, ?3, ?4)",
-                )?
-                .execute(
-                    rusqlite::params![
-                        root.0,
-                        directory.path,
-                        directory.canonical_path,
-                        directory.physical_path
-                    ],
-                )?;
-        }
-        Ok(())
-    }
-
-    /// [`InputTxn::replace_scan_structure`] of every root, writing only the
-    /// directory rows that change: a full rescan observes every directory,
-    /// and most are as they were.
-    fn replace_all_scan_structure(
-        &mut self,
-        directories: &[ObservedDirectory],
-    ) -> Result<(), StoreError> {
-        let mut wanted = std::collections::BTreeMap::new();
-        for directory in directories {
-            let root = interned_root(&self.txn, &mut self.roots, &directory.root_name)?;
-            wanted.insert(
-                (root.0, directory.path.clone()),
-                (directory.canonical_path.clone(), directory.physical_path.clone()),
-            );
-        }
-        let mut stale = Vec::new();
-        {
-            let mut select = self.txn.prepare_cached(
-                "SELECT root_id, path, canonical_path, physical_path FROM directories",
-            )?;
-            let mut rows = select.query([])?;
-            while let Some(row) = rows.next()? {
-                let key: (i64, String) = (row.get(0)?, row.get(1)?);
-                let held: (Vec<u8>, Vec<u8>) = (row.get(2)?, row.get(3)?);
-                match wanted.remove(&key) {
-                    Some(same) if same == held => {}
-                    Some(changed) => {
-                        stale.push(key.clone());
-                        wanted.insert(key, changed);
-                    }
-                    None => stale.push(key),
-                }
-            }
-        }
-        // Deleted first: a moved directory keeps its canonical path, which
-        // is unique.
-        for (root, path) in &stale {
-            self.txn
-                .prepare_cached("DELETE FROM directories WHERE root_id = ?1 AND path = ?2")?
-                .execute(rusqlite::params![root, path])?;
-        }
-        for ((root, path), (canonical, physical)) in &wanted {
-            self.txn
-                .prepare_cached(
-                    "INSERT INTO directories(root_id, path, canonical_path, physical_path)
-                     VALUES (?1, ?2, ?3, ?4)",
-                )?
-                .execute(rusqlite::params![root, path, canonical, physical])?;
-        }
-        Ok(())
-    }
 
     /// Queue pending work (§13's `file_work`): written when the
     /// outermost transaction commits, unless a pass consumes it first.
@@ -465,24 +381,6 @@ pub(crate) fn under_sql(prefix: &str) -> &'static str {
         "r.name = ?1 AND t.path >= ?2 AND t.path < ?2 || '0'
          AND (t.path = ?2 OR t.path >= ?2 || '/')"
     }
-}
-
-fn clear_directories(
-    conn: &rusqlite::Connection,
-    prefixes: &[(String, String)],
-) -> Result<(), StoreError> {
-    for (root, prefix) in prefixes {
-        conn.execute(
-            &format!(
-                "DELETE FROM directories WHERE rowid IN (
-                   SELECT t.rowid FROM directories t JOIN roots r USING (root_id)
-                   WHERE {})",
-                under_sql(prefix)
-            ),
-            rusqlite::params![root, prefix],
-        )?;
-    }
-    Ok(())
 }
 
 impl Store {
@@ -671,7 +569,7 @@ impl StoreReader {
 }
 
 const OBSERVED_FILE: &str = "SELECT r.name, t.path, t.mtime, t.size, t.kind, t.content_hash,
-            t.raw_path, t.symlink_target
+            t.raw_path, t.symlink_target, t.canonical_path
      FROM files t JOIN roots r USING (root_id)";
 
 fn observed_file_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObservedFile> {
@@ -691,16 +589,8 @@ fn observed_file_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObservedFile> 
             },
             raw_path: row.get(6)?,
             symlink_target: row.get(7)?,
+            canonical_path: row.get(8)?,
         },
-    })
-}
-
-fn observed_directory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObservedDirectory> {
-    Ok(ObservedDirectory {
-        root_name: row.get(0)?,
-        path: row.get(1)?,
-        canonical_path: row.get(2)?,
-        physical_path: row.get(3)?,
     })
 }
 
@@ -786,48 +676,16 @@ impl StoreReader {
         }
     }
 
-    /// Every traversed directory, in (root name, path) order.
-    pub fn observed_directories(&self) -> Result<Vec<ObservedDirectory>, StoreError> {
-        self.query_rows(
-            "SELECT r.name, t.path, t.canonical_path, t.physical_path
-             FROM directories t JOIN roots r USING (root_id) ORDER BY r.name, t.path",
-            [],
-            observed_directory_row,
-        )
-    }
-
-    /// The traversed directories at or below `prefix` in `root_name`.
-    pub fn observed_directories_under(
-        &self,
-        root_name: &str,
-        prefix: &str,
-    ) -> Result<Vec<ObservedDirectory>, StoreError> {
-        self.query_rows(
-            &format!(
-                "SELECT r.name, t.path, t.canonical_path, t.physical_path
-                 FROM directories t JOIN roots r USING (root_id)
-                 WHERE {} ORDER BY t.path",
-                under_sql(prefix)
-            ),
-            rusqlite::params![root_name, prefix],
-            observed_directory_row,
-        )
-    }
-
     /// The traversed directory whose canonical path is `canonical`; the
     /// unique index admits at most one.
     pub fn directory_by_canonical(
         &self,
         canonical: &[u8],
-    ) -> Result<Option<ObservedDirectory>, StoreError> {
+    ) -> Result<Option<ObservedFile>, StoreError> {
         Ok(self
             .conn
-            .prepare_cached(
-                "SELECT r.name, t.path, t.canonical_path, t.physical_path
-                 FROM directories t JOIN roots r USING (root_id)
-                 WHERE t.canonical_path = ?1",
-            )?
-            .query_row([canonical], observed_directory_row)
+            .prepare_cached(&format!("{OBSERVED_FILE} WHERE t.canonical_path = ?1"))?
+            .query_row([canonical], observed_file_row)
             .optional()?)
     }
 
@@ -855,8 +713,7 @@ impl StoreReader {
     pub fn observes_under(&self, root_name: &str, prefix: &str) -> Result<bool, StoreError> {
         let under = under_sql(prefix);
         Ok(self.conn.prepare_cached(&format!(
-            "SELECT EXISTS(SELECT 1 FROM files t JOIN roots r USING (root_id) WHERE {under})
-                 OR EXISTS(SELECT 1 FROM directories t JOIN roots r USING (root_id) WHERE {under})"
+            "SELECT EXISTS(SELECT 1 FROM files t JOIN roots r USING (root_id) WHERE {under})"
         ))?
         .query_row(rusqlite::params![root_name, prefix], |row| row.get(0))?)
     }
@@ -1051,21 +908,6 @@ impl StoreReader {
         Ok(())
     }
 
-    /// Visit every traversed directory in (root name, path) order.
-    pub fn for_each_observed_directory(
-        &self,
-        mut visit: impl FnMut(ObservedDirectory) -> Result<(), StoreError>,
-    ) -> Result<(), StoreError> {
-        let mut statement = self.conn.prepare_cached(
-            "SELECT r.name, t.path, t.canonical_path, t.physical_path
-             FROM directories t JOIN roots r USING (root_id) ORDER BY r.name, t.path",
-        )?;
-        let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            visit(observed_directory_row(row)?)?;
-        }
-        Ok(())
-    }
 
     /// Visit every observed `.bundle` file's (root name, path, blake3 hash)
     /// in (root name, path) order: its `files` content hash.
