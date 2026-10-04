@@ -579,3 +579,36 @@ fn namespace_errors_persist_the_full_set_in_canonical_order() {
     assert_eq!(diagnostics, vec![first.clone(), later.clone()]);
     assert_eq!(store.namespace_errors().unwrap(), vec![first, later]);
 }
+
+/// A rewritten bundle drops only the assets that vanished from it, with
+/// their tags; the rest keep their rows for the upserts that follow.
+#[test]
+fn retaining_a_bundles_assets_drops_only_the_vanished() {
+    let (_d, mut store) = store();
+    store
+        .input_transaction(|txn| {
+            let root = txn.intern_root("main")?;
+            txn.upsert_bundle(&bundle_meta(root, 1))?;
+            for asset in [1, 2, 3] {
+                txn.upsert_asset(&asset_record(asset, 1, &["kind"]))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    store
+        .input_transaction(|txn| {
+            txn.retain_bundle_assets(
+                BundleUuid([1; 16]),
+                &BTreeSet::from([AssetUuid([1; 16]), AssetUuid([3; 16]), AssetUuid([4; 16])]),
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        store.asset_ids_in_bundle(BundleUuid([1; 16])).unwrap(),
+        BTreeSet::from([AssetUuid([1; 16]), AssetUuid([3; 16])])
+    );
+    assert_eq!(
+        tagged(&store, "kind", None, false).unwrap(),
+        [AssetUuid([1; 16]), AssetUuid([3; 16])]
+    );
+}

@@ -208,12 +208,25 @@ impl InputTxn<'_> {
         Ok(())
     }
 
-    /// Drop what a bundle owns (assets, tags, path references) and keep its
-    /// row, for the [`InputTxn::upsert_bundle`] or
-    /// [`InputTxn::poison_bundle`] that rewrites it in this input.
-    pub fn clear_bundle(&mut self, bundle: BundleUuid) -> Result<(), StoreError> {
-        self.remove_owned_asset_rows(bundle)?;
-        self.clear_path_refs(bundle)
+    /// Drop the assets of `bundle` that `keep` does not name, with their
+    /// tags: what vanished from a bundle this input rewrites with
+    /// [`InputTxn::upsert_bundle`]. The rest stay, for the upserts that
+    /// rewrite them.
+    pub fn retain_bundle_assets(
+        &mut self,
+        bundle: BundleUuid,
+        keep: &BTreeSet<AssetUuid>,
+    ) -> Result<(), StoreError> {
+        let held = self.reader().asset_ids_in_bundle(bundle)?;
+        for asset in held.difference(keep) {
+            self.txn
+                .prepare_cached("DELETE FROM asset_tags WHERE asset_uuid = ?1")?
+                .execute([asset.0.as_slice()])?;
+            self.txn
+                .prepare_cached("DELETE FROM assets WHERE asset_uuid = ?1")?
+                .execute([asset.0.as_slice()])?;
+        }
+        Ok(())
     }
 
     /// Remove a bundle and everything it owns (assets, tags).
@@ -227,14 +240,13 @@ impl InputTxn<'_> {
     }
 
     /// Record the logical path strings `bundle`'s reference fields name
-    /// (§13's `bundle_path_refs`), replacing any it had. Call after
-    /// [`InputTxn::upsert_bundle`], which clears them.
+    /// (§13's `bundle_path_refs`). Call after [`InputTxn::upsert_bundle`],
+    /// which clears the ones it had.
     pub fn set_bundle_path_refs<'a>(
         &mut self,
         bundle: BundleUuid,
         targets: impl IntoIterator<Item = &'a str>,
     ) -> Result<(), StoreError> {
-        self.clear_path_refs(bundle)?;
         for target in targets {
             self.txn
                 .prepare_cached(
@@ -692,7 +704,7 @@ impl StoreReader {
     ) -> Result<BTreeSet<AssetUuid>, StoreError> {
         let mut statement = self
             .conn
-            .prepare("SELECT asset_uuid FROM assets WHERE bundle_uuid = ?1 ORDER BY asset_uuid")?;
+            .prepare_cached("SELECT asset_uuid FROM assets WHERE bundle_uuid = ?1")?;
         let rows = statement.query_map([bundle.0.as_slice()], |row| row.get::<_, Vec<u8>>(0))?;
         rows.map(|row| row.map(|bytes| AssetUuid(blob16(bytes))))
             .collect::<Result<BTreeSet<_>, _>>()

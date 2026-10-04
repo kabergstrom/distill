@@ -2407,9 +2407,17 @@ fn publish_scan(
             .chain(candidate.bundle_poisons.values().map(|poison| poison.bundle))
             .filter(|bundle| publishable_changed_bundles.contains(bundle))
             .collect::<BTreeSet<_>>();
+        let kept = published
+            .iter()
+            .filter_map(|source| source.parsed.as_ref().ok())
+            .map(|bundle| (bundle.uuid, bundle.assets.values().map(|entry| entry.uuid).collect()))
+            .collect::<BTreeMap<_, BTreeSet<_>>>();
         for bundle in old_bundle_summaries.keys() {
             if rewritten.contains(bundle) {
-                transaction.clear_bundle(*bundle)?;
+                // A poisoned rewrite replaces every asset row itself.
+                if let Some(keep) = kept.get(bundle) {
+                    transaction.retain_bundle_assets(*bundle, keep)?;
+                }
             } else if !current_bundle_summaries.contains_key(bundle)
                 || publishable_changed_bundles.contains(bundle)
             {
@@ -2742,7 +2750,7 @@ fn publish_claimed(
             transaction.remove_bundle(*bundle_uuid)?;
             continue;
         };
-        transaction.clear_bundle(*bundle_uuid)?;
+        // A poisoned rewrite replaces every asset row itself.
         if let Some(poison) = plan.bundle_poisons.get(bundle_uuid) {
             let root = *root_ids
                 .entry(poison.root_name.clone())
@@ -2764,6 +2772,10 @@ fn publish_claimed(
             .parsed
             .as_ref()
             .expect("indexed current bundle parsed successfully");
+        transaction.retain_bundle_assets(
+            *bundle_uuid,
+            &bundle.assets.values().map(|entry| entry.uuid).collect(),
+        )?;
         let summary = bundle_summary(source)?;
         let root = *root_ids
             .entry(source.root_name.clone())

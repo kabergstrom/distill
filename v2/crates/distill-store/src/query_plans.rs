@@ -716,6 +716,23 @@ fn a_derived_child_resolves_by_point_reads() {
     assert!(many <= few + 24, "{few} {many}");
 }
 
+/// A rewritten bundle reads its assets and drops each vanished one (and
+/// its tags) by key.
+#[test]
+fn a_rewritten_bundle_drops_its_vanished_assets_by_key() {
+    let (_dir, store) = store_with(0);
+    for (sql, expected) in [
+        (
+            "SELECT asset_uuid FROM assets WHERE bundle_uuid = ?1",
+            vec!["SEARCH assets USING COVERING INDEX assets_by_bundle (bundle_uuid=?)"],
+        ),
+        ("DELETE FROM asset_tags WHERE asset_uuid = ?1", vec!["SEARCH asset_tags USING INDEX sqlite_autoindex_asset_tags_1 (asset_uuid=?)"]),
+        ("DELETE FROM assets WHERE asset_uuid = ?1", vec!["SEARCH assets USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)"]),
+    ] {
+        assert_eq!(store.query_plan_details(sql).unwrap(), expected, "{sql}");
+    }
+}
+
 /// A tool epoch reads each key's last row at its base in one pass over the
 /// primary key: no sort, no per-key subquery.
 #[test]
