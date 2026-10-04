@@ -7123,7 +7123,6 @@ interface Hub {
   unsubscribe @7 (assets :List(Data), paths :List(Text))
               -> (result :VoidCall);
   authoringSnapshot @8 () -> (result :AuthoringSnapshotCall);
-  importFailures @9 () -> (result :ImportFailuresCall);
 }
 
 interface Snapshot {
@@ -7136,6 +7135,7 @@ interface Snapshot {
   configuration @6 () -> (result :VoidCall);
   fetch @7 (hash :Data) -> (result :ChunkStreamCall);
   resolveNamed @9 (path :Text, name :Text) -> (result :PathResolveCall);
+  importFailures @10 () -> (result :ImportFailuresCall);
 }
 
 interface AuthoringSnapshot {
@@ -7161,11 +7161,17 @@ serves the authenticated typed load edges with the payload. Wire trees are
 looked up by LayoutHash, returned as canonical DSWL bytes, and rehashed by the
 consumer.
 
-`importFailures` (protocol 10) lists the current watched-import failures:
-bundle, root, path, and message. They are memo state, not input: recording or
-clearing one publishes no version, so runtime clients poll it (the RPC loader
-does once a second). A bundle listed there keeps serving its last good
-contents; its entry clears when a later import succeeds.
+`Snapshot.importFailures` (protocol 18; protocols 10 to 17 had it on the
+Hub) lists the watched-import failures recorded now: bundle, root, path,
+and message. They are memo state, not input: recording or clearing one
+publishes no version, so runtime clients poll it (the RPC loader polls its
+current snapshot once a second). The failures are read as they stand, not
+as of the snapshot: an idle version's snapshots share one read transaction,
+which would hide every failure recorded after it began. Each is named by
+its bundle's root and path at the snapshot, so the names agree with the
+snapshot's `resolvePath`; a failure whose bundle the snapshot lacks is
+left out until a snapshot that has it. A bundle listed there keeps serving
+its last good contents; its entry clears when a later import succeeds.
 
 Subscriptions are cursor-bound and one connection owns one ordered delta
 stream. Its first installation at `installed >= since` atomically returns the

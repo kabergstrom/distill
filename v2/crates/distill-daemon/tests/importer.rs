@@ -123,7 +123,11 @@ fn import_with(
 
 /// The watched-import failures a runtime client polls, as (path, message).
 fn import_failures(coordinator: &DaemonCoordinator) -> Vec<(String, String)> {
-    match connect(coordinator).import_failures() {
+    let snapshot = match connect(coordinator).snapshot() {
+        distill_rpc::RpcResult::Success(snapshot) => snapshot,
+        other => panic!("expected a snapshot, got {other:?}"),
+    };
+    match snapshot.import_failures() {
         distill_rpc::RpcResult::Success(failures) => failures
             .into_iter()
             .map(|failure| {

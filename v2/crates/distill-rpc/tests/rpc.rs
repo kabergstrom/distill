@@ -172,6 +172,90 @@ fn dependency_depth_exhaustion_is_typed_and_never_memoized() {
     assert_eq!(*backend.calls.lock().unwrap(), 2);
 }
 
+/// Record a watched-import failure for `bundle`: memo state, no version.
+fn record_import_failure(project: &TestProject, bundle: BundleUuid, message: &str) {
+    let mut writer = project.coordinator().open_writer().unwrap();
+    let attempted_input_version = writer.input_version().unwrap();
+    let memo_seq = writer.memo_seq().unwrap();
+    writer
+        .record_watched_import_failure(&distill_store::imports::WatchedImportFailure {
+            bundle,
+            attempted_input_version,
+            basis: vec![1],
+            terminal: distill_store::imports::WatchedImportTerminal::Dependency,
+            message: message.into(),
+            memo_seq,
+        })
+        .unwrap();
+}
+
+#[test]
+fn import_failures_are_named_at_the_snapshot_and_read_as_they_stand() {
+    let mut project = project();
+    let server = project.server();
+    let moved = authoring_entry(1, AuthoringEntryRole::Runtime);
+    publish_entry(&mut project, &moved);
+    let hub = connect(&server, &[]);
+    let before = snapshot(&hub);
+    let failures = |snapshot: &Snapshot| match snapshot.import_failures() {
+        RpcResult::Success(failures) => failures
+            .into_iter()
+            .map(|failure| (failure.bundle, failure.root, failure.path, failure.message))
+            .collect::<Vec<_>>(),
+        other => panic!("expected import failures, got {other:?}"),
+    };
+    assert_eq!(failures(&before), vec![]);
+
+    // The bundle moves, and a second bundle appears, in a later version;
+    // both fail after `before` opened.
+    project.remove(&moved.normalized_path);
+    write_entry(
+        &mut project,
+        &AuthoringEntry {
+            normalized_path: "moved.bundle".into(),
+            ..moved.clone()
+        },
+    );
+    let added = authoring_entry(2, AuthoringEntryRole::Runtime);
+    publish_entry(&mut project, &added);
+    record_import_failure(&project, moved.bundle, "moved failed");
+    record_import_failure(&project, added.bundle, "added failed");
+
+    // Recorded after it opened, yet seen; named as `before` has the bundle,
+    // and the bundle it lacks is left out.
+    assert_eq!(
+        failures(&before),
+        vec![(
+            moved.bundle,
+            ROOT.to_owned(),
+            "bundle-1.bundle".to_owned(),
+            "moved failed".to_owned()
+        )]
+    );
+    assert_eq!(
+        failures(&snapshot(&hub)),
+        vec![
+            (
+                added.bundle,
+                ROOT.to_owned(),
+                "bundle-2.bundle".to_owned(),
+                "added failed".to_owned()
+            ),
+            (
+                moved.bundle,
+                ROOT.to_owned(),
+                "moved.bundle".to_owned(),
+                "moved failed".to_owned()
+            ),
+        ]
+    );
+    before.expire();
+    assert_eq!(
+        before.import_failures(),
+        RpcResult::Failure(RpcFailure::SnapshotExpired)
+    );
+}
+
 #[test]
 fn snapshot_clones_share_one_read_transaction() {
     let mut project = project();

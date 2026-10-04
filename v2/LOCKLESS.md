@@ -1140,6 +1140,14 @@ should reach zero by the end of phase 6.
   and the current one. Before, both were copied into the struct at open.
   `pipeline_failure` takes the read's result, so a store error gates a request
   like a pipeline failure does.
+- **Import failures are named at the client's snapshot.** `importFailures`
+  moved from the hub to the snapshot (protocol 18). The failure rows are memo
+  state and are read current (one walk of `watched_import_failures`): an idle
+  version's shared `SnapshotTxn` would hide a failure recorded after it began.
+  Each row's bundle is named by point reads (`bundle`, `root_name`) through
+  the snapshot's transaction; a bundle the snapshot lacks is left out. Before,
+  the hub joined the rows to the current `bundles`, so a client could get a
+  path its snapshot did not have.
 - **A build reads a tool per use.** `BuildContext` no longer keeps the
   ToolEpoch rows it read: `tool()` is one `tools` primary-key read
   (`TOOL_AT`, plan pinned) at the build's tool version each time.

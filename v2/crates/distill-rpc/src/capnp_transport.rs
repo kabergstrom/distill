@@ -925,18 +925,6 @@ impl schema::hub::Server for HubService {
             Ok(())
         }
     }
-
-    fn import_failures(
-        self: capnp::capability::Rc<Self>,
-        _params: schema::hub::ImportFailuresParams,
-        mut results: schema::hub::ImportFailuresResults,
-    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
-        async move {
-            generation_gate!(self.hub.generation_reconnect(), results);
-            write_import_failures_result(results.get().init_result(), self.hub.import_failures());
-            Ok(())
-        }
-    }
 }
 
 struct SnapshotService {
@@ -1146,6 +1134,21 @@ impl schema::snapshot::Server for SnapshotService {
             write_path_result(
                 results.get().init_result(),
                 self.snapshot.resolve_named(&path, &name),
+            );
+            Ok(())
+        }
+    }
+
+    fn import_failures(
+        self: capnp::capability::Rc<Self>,
+        _params: schema::snapshot::ImportFailuresParams,
+        mut results: schema::snapshot::ImportFailuresResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
+        async move {
+            generation_gate!(self.snapshot.generation_reconnect(), results);
+            write_import_failures_result(
+                results.get().init_result(),
+                self.snapshot.import_failures(),
             );
             Ok(())
         }

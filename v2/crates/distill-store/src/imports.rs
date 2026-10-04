@@ -25,16 +25,6 @@ pub enum WatchedImportTerminal {
     DirectoryOrphan,
 }
 
-/// A current watched-import failure by its bundle's rooted path; what runtime
-/// clients show authors.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WatchedImportFailureSummary {
-    pub bundle: BundleUuid,
-    pub root: String,
-    pub path: String,
-    pub message: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchedImportFailure {
     pub bundle: BundleUuid,
@@ -116,24 +106,15 @@ impl Store {
 }
 
 impl StoreReader {
-    /// Every recorded watched-import failure, ordered by root and path.
-    pub fn watched_import_failure_summaries(
-        &self,
-    ) -> Result<Vec<WatchedImportFailureSummary>, StoreError> {
-        let mut statement = self.conn.prepare(
-            "SELECT f.bundle_uuid, r.name, b.path, f.message
-               FROM watched_import_failures AS f
-               JOIN bundles AS b USING (bundle_uuid)
-               JOIN roots AS r ON r.root_id = b.root_id
-              ORDER BY r.name, b.path",
-        )?;
+    /// Every recorded watched-import failure's bundle and message, in no
+    /// order: one walk of the memo table. The caller names each bundle at
+    /// the version it reads under.
+    pub fn watched_import_failure_messages(&self) -> Result<Vec<(BundleUuid, String)>, StoreError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT bundle_uuid, message FROM watched_import_failures")?;
         let rows = statement.query_map([], |row| {
-            Ok(WatchedImportFailureSummary {
-                bundle: BundleUuid(crate::bundles::blob16(row.get(0)?)),
-                root: row.get(1)?,
-                path: row.get(2)?,
-                message: row.get(3)?,
-            })
+            Ok((BundleUuid(crate::bundles::blob16(row.get(0)?)), row.get(1)?))
         })?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)

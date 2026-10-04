@@ -340,7 +340,7 @@ struct UuidListCall {
   }
 }
 
-# A watched import whose latest attempt failed (see Hub.importFailures).
+# A watched import whose latest attempt failed (see Snapshot.importFailures).
 struct ImportFailure {
   bundle @0 :Data;
   root @1 :Text;
@@ -836,9 +836,6 @@ interface Hub {
   unsubscribe @7 (assets :List(Data), paths :List(Text))
               -> (result :VoidCall);
   authoringSnapshot @8 () -> (result :AuthoringSnapshotCall);
-  # Current watched-import failures: memo state, not versioned input, so
-  # clients poll it. Protocol 10.
-  importFailures @9 () -> (result :ImportFailuresCall);
 }
 
 interface Snapshot {
@@ -856,6 +853,11 @@ interface Snapshot {
   # The runtime asset whose local id is `name` among the assets imported at
   # `path` (a bundle path). Protocol 12.
   resolveNamed @9 (path :Text, name :Text) -> (result :PathResolveCall);
+  # The watched-import failures recorded now (memo state, not versioned
+  # input, so clients poll it), each named by its bundle's root and path
+  # at this snapshot; a failure whose bundle the snapshot lacks is left
+  # out. Protocol 18 (on Hub, unnamed by any snapshot, since 10).
+  importFailures @10 () -> (result :ImportFailuresCall);
 }
 
 struct RuntimeTypePolicy {

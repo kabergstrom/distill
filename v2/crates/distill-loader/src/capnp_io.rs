@@ -1146,12 +1146,21 @@ async fn delta_stream(
     }
 }
 
-/// Per connection: poll watched-import failures and keep the current
-/// snapshot well inside the daemon's TTL.
+/// Per connection: poll watched-import failures, named at the current
+/// snapshot, and keep that snapshot well inside the daemon's TTL.
 async fn maintain(shared: Rc<Shared>, connection: Rc<Connection>) {
     loop {
-        if let Ok(RemoteCall::Success(failures)) = connection.hub.import_failures().await {
-            shared.set_import_failures(failures);
+        let current = {
+            let snapshots = shared.snapshots.borrow();
+            snapshots
+                .current
+                .and_then(|stamp| snapshots.held.get(&stamp))
+                .map(|held| held.snapshot.clone())
+        };
+        if let Some(snapshot) = current {
+            if let Ok(RemoteCall::Success(failures)) = snapshot.import_failures().await {
+                shared.set_import_failures(failures);
+            }
         }
         let stale = shared.snapshots.borrow().current.and_then(|stamp| {
             let held = shared

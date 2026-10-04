@@ -29,7 +29,8 @@ pub use distill_store::state::{
 /// outlives its store either, so nothing could produce
 /// `storeInstanceChanged`). 18: `RpcError` says what failed as a typed
 /// `failure` union (the [`RpcFailure`], or a request the daemon could not
-/// decode) instead of a numeric code.
+/// decode) instead of a numeric code, and `importFailures` moves from the hub
+/// to the snapshot, naming each failure's bundle at that snapshot.
 pub const PROTOCOL_VERSION: u32 = 18;
 
 /// A watched import whose latest attempt failed. The bundle keeps serving its

@@ -193,42 +193,6 @@ impl RemoteHub {
         }
     }
 
-    /// The current watched-import failures (protocol 10). They publish no
-    /// version, so a client polls this.
-    pub async fn import_failures(&self) -> Result<RemoteCall<Vec<ImportFailure>>, capnp::Error> {
-        let response = self.client.import_failures_request().send().promise.await?;
-        let result = response.get()?.get_result()?;
-        match result.which()? {
-            schema::import_failures_call::Which::Success(list) => {
-                let mut failures = Vec::new();
-                for entry in list? {
-                    failures.push(ImportFailure {
-                        bundle: BundleUuid(fixed::<16>(
-                            entry.get_bundle()?,
-                            "importFailures.bundle",
-                        )?),
-                        root: entry.get_root()?.to_string()?,
-                        path: entry.get_path()?.to_string()?,
-                        message: entry.get_message()?.to_string()?,
-                    });
-                }
-                Ok(RemoteCall::Success(failures))
-            }
-            schema::import_failures_call::Which::ReconnectRequired(value) => Ok(
-                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
-            ),
-            schema::import_failures_call::Which::ConfigurationFailed(value) => Ok(
-                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
-            ),
-            schema::import_failures_call::Which::SnapshotExpired(()) => {
-                Ok(RemoteCall::SnapshotExpired)
-            }
-            schema::import_failures_call::Which::Error(value) => {
-                Ok(RemoteCall::Error(decode_rpc_error(value?)?))
-            }
-        }
-    }
-
     /// Run `request` through the hub's authoring `import` at `base`; the
     /// destination bundle's identity on success.
     pub async fn import(
@@ -462,6 +426,42 @@ impl RemoteSnapshot {
         request.get().set_name(name);
         let response = request.send().promise.await?;
         self.path_call(response.get()?.get_result()?)
+    }
+
+    /// The watched-import failures recorded now, named at this snapshot
+    /// (protocol 18). They publish no version, so a client polls this.
+    pub async fn import_failures(&self) -> Result<RemoteCall<Vec<ImportFailure>>, capnp::Error> {
+        let response = self.client.import_failures_request().send().promise.await?;
+        let result = response.get()?.get_result()?;
+        match result.which()? {
+            schema::import_failures_call::Which::Success(list) => {
+                let mut failures = Vec::new();
+                for entry in list? {
+                    failures.push(ImportFailure {
+                        bundle: BundleUuid(fixed::<16>(
+                            entry.get_bundle()?,
+                            "importFailures.bundle",
+                        )?),
+                        root: entry.get_root()?.to_string()?,
+                        path: entry.get_path()?.to_string()?,
+                        message: entry.get_message()?.to_string()?,
+                    });
+                }
+                Ok(RemoteCall::Success(failures))
+            }
+            schema::import_failures_call::Which::ReconnectRequired(value) => Ok(
+                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
+            ),
+            schema::import_failures_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
+            ),
+            schema::import_failures_call::Which::SnapshotExpired(()) => {
+                Ok(RemoteCall::SnapshotExpired)
+            }
+            schema::import_failures_call::Which::Error(value) => {
+                Ok(RemoteCall::Error(decode_rpc_error(value?)?))
+            }
+        }
     }
 
     fn path_call(

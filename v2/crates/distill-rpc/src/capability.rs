@@ -1535,27 +1535,6 @@ impl Hub {
         })
     }
 
-    /// The current watched-import failures. They are memo state, not input:
-    /// recording or clearing one publishes no version, so clients poll.
-    pub fn import_failures(&self) -> RpcResult<Vec<ImportFailure>> {
-        if let Some(result) = self.live() {
-            return result;
-        }
-        match self.server.inner.reader.watched_import_failure_summaries() {
-            Ok(rows) => RpcResult::Success(
-                rows.into_iter()
-                    .map(|row| ImportFailure {
-                        bundle: row.bundle,
-                        root: row.root,
-                        path: row.path,
-                        message: row.message,
-                    })
-                    .collect(),
-            ),
-            Err(error) => RpcResult::Failure(store_failure(error)),
-        }
-    }
-
     pub fn unsubscribe(&self, assets: Vec<AssetUuid>, paths: Vec<String>) -> RpcResult<()> {
         if let Some(result) = self.live() {
             return result;
@@ -1745,6 +1724,40 @@ impl Snapshot {
             Ok(_) => RpcResult::Success(rpc_try!(self.server.inner.configuration())),
             Err(result) => result,
         }
+    }
+
+    /// The watched-import failures recorded now, each named by its bundle's
+    /// root and path at this snapshot. A failure is memo state, not input:
+    /// recording or clearing one publishes no version, so a client polls its
+    /// snapshot, and the failures are read as they stand, not as of the
+    /// version (an idle version's shared transaction would hide every
+    /// failure recorded after it began). A failure whose bundle this
+    /// snapshot does not have is left for the snapshot that does.
+    pub fn import_failures(&self) -> RpcResult<Vec<ImportFailure>> {
+        let txn = match self.preflight() {
+            Ok(txn) => txn,
+            Err(result) => return result,
+        };
+        let reader = txn.snapshot();
+        let mut failures = Vec::new();
+        for (bundle, message) in
+            rpc_try!(self.server.inner.reader.watched_import_failure_messages())
+        {
+            let Some(meta) = rpc_try!(reader.bundle(bundle)) else {
+                continue;
+            };
+            let Some(root) = rpc_try!(reader.root_name(meta.root)) else {
+                continue;
+            };
+            failures.push(ImportFailure {
+                bundle,
+                root,
+                path: meta.path,
+                message,
+            });
+        }
+        failures.sort_by(|a, b| (&a.root, &a.path).cmp(&(&b.root, &b.path)));
+        RpcResult::Success(failures)
     }
 
     pub fn basis(&self) -> &RpcBasis {
