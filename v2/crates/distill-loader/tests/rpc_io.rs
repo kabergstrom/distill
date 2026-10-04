@@ -1,24 +1,30 @@
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
+use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
 use distill_loader::{
     AssetPath, IoBasis, IoEvent, LoaderIO, ManifestHash, ReqId, ResolveResult, RpcIo, RpcIoConfig,
     RuntimeTarget,
 };
 use distill_rpc::capnp_transport::StagedListener;
 use distill_rpc::{
-    ArtifactPayload, AssetDeltaState, AssetMutation, Commit, ConnectRequest, PathMutation,
-    Server, SnapshotPolicy, StoreInstanceId, StoredResolve, TargetDefinition, TargetDefinitionHash,
+    ArtifactPayload, BuildAnswer, ConnectRequest, Server, SnapshotPolicy, TargetDefinition,
+    TargetDefinitionHash,
 };
+use distill_test_project::{Asset, TestBuilds, TestProject};
 use distill_wire::artifact::{content_hash, parse_artifact, write_artifact, ArtifactHeader};
 use distill_wire::dswl::{dswl_bytes, dswl_hash};
 use distill_wire::wire::{WireField, WireNode};
 
 const TARGET_HASH: [u8; 32] = [7; 32];
+const TYPE: TypeUuid = TypeUuid([2; 16]);
+/// The bundle file holding the fixture's asset.
+const PATH: &str = "assets/a.bundle";
 
+/// A project whose daemon serves `asset` from the bundle file [`PATH`] (its
+/// primary); the build backend builds it to the installed artifact `hash`.
 struct Fixture {
+    project: TestProject,
     server: Server,
     request: ConnectRequest,
     asset: AssetUuid,
@@ -27,12 +33,24 @@ struct Fixture {
     wire_bytes: usize,
 }
 
+/// Author the bundle file `path` holding `asset` alone, as its primary,
+/// with the blob `[value]`; a different `value` changes the asset.
+fn write_asset(project: &mut TestProject, path: &str, asset: AssetUuid, value: u8) {
+    project.write_bundle(
+        path,
+        BundleUuid([asset.0[0].wrapping_add(100); 16]),
+        Some("a"),
+        &[Asset::blob("a", asset, TYPE, &[value])],
+    );
+}
+
 fn fixture() -> Fixture {
     let asset = AssetUuid([1; 16]);
-    let type_uuid = TypeUuid([2; 16]);
+    let type_uuid = TYPE;
     let logical_hash = LogicalHash([3; 32]);
     let target = TargetDefinition::new("dev", TargetDefinitionHash(TARGET_HASH));
-    let server = Server::new(StoreInstanceId([5; 16]), vec![target]).unwrap();
+    let mut project = TestProject::new(vec![target]);
+    let server = project.server();
 
     let wire = WireNode::Struct {
         offset: 0,
@@ -81,23 +99,14 @@ fn fixture() -> Fixture {
             },
         )
         .unwrap();
-    server
-        .commit(Commit {
-            assets: vec![AssetMutation::Set {
-                uuid: asset,
-                resolution: StoredResolve::Built { content_hash: hash },
-                delta: AssetDeltaState::Changed,
-            }],
-            paths: vec![PathMutation::Set {
-                path: "assets/a.bundle".into(),
-                candidates: BTreeSet::from([asset]),
-            }],
-            ..Commit::default()
-        })
-        .unwrap();
+    TestBuilds::install(&server)
+        .answer(asset, Ok(BuildAnswer::Built { content_hash: hash }));
+    write_asset(&mut project, PATH, asset, 0);
+    project.publish();
 
     let request = ConnectRequest::new("dev", TargetDefinitionHash(TARGET_HASH));
     Fixture {
+        project,
         server,
         request,
         asset,
@@ -110,6 +119,7 @@ fn fixture() -> Fixture {
 #[test]
 fn rpc_io_drives_the_same_loader_boundary_on_the_callers_thread() {
     let Fixture {
+        mut project,
         server,
         request,
         asset,
@@ -177,7 +187,7 @@ fn rpc_io_drives_the_same_loader_boundary_on_the_callers_thread() {
 
     io.resolve(ReqId(1), asset, &basis);
     io.fetch(ReqId(2), hash, &basis);
-    io.resolve_path(ReqId(3), &AssetPath::from("assets/a.bundle"), &basis);
+    io.resolve_path(ReqId(3), &AssetPath::from(PATH), &basis);
     let events = poll_until(&mut io, 3);
     assert!(events.iter().any(|event| matches!(
         event,
@@ -210,16 +220,8 @@ fn rpc_io_drives_the_same_loader_boundary_on_the_callers_thread() {
     )));
 
     io.subscribe(asset);
-    server
-        .commit(Commit {
-            assets: vec![AssetMutation::Set {
-                uuid: asset,
-                resolution: StoredResolve::Built { content_hash: hash },
-                delta: AssetDeltaState::Changed,
-            }],
-            ..Commit::default()
-        })
-        .unwrap();
+    write_asset(&mut project, PATH, asset, 1);
+    project.publish();
     let deltas = poll_until(&mut io, 1);
     assert!(deltas.iter().any(|event| matches!(
         event,
@@ -235,22 +237,18 @@ fn rpc_io_drives_the_same_loader_boundary_on_the_callers_thread() {
 #[test]
 fn rpc_io_accepts_multiple_asset_subscriptions_on_one_delta_stream() {
     let Fixture {
+        mut project,
         server,
         request,
         asset: first,
         ..
     } = fixture();
+    // The second asset was authored and deleted.
     let second = AssetUuid([9; 16]);
-    server
-        .commit(Commit {
-            assets: vec![AssetMutation::Set {
-                uuid: second,
-                resolution: StoredResolve::Deleted,
-                delta: AssetDeltaState::Deleted,
-            }],
-            ..Commit::default()
-        })
-        .unwrap();
+    write_asset(&mut project, "assets/b.bundle", second, 0);
+    project.publish();
+    project.remove("assets/b.bundle");
+    project.publish();
 
     let (address_tx, address_rx) = std::sync::mpsc::sync_channel(1);
     let root = server.root();
@@ -284,33 +282,24 @@ fn rpc_io_accepts_multiple_asset_subscriptions_on_one_delta_stream() {
     // Both subscribe calls have answered once only the delta stream and the
     // maintenance task remain.
     poll_while(&mut io, |io| io.stats().control_tasks > 2);
-    server
-        .commit(Commit {
-            assets: vec![
-                AssetMutation::Set {
-                    uuid: first,
-                    resolution: StoredResolve::Deleted,
-                    delta: AssetDeltaState::Changed,
-                },
-                AssetMutation::Set {
-                    uuid: second,
-                    resolution: StoredResolve::Deleted,
-                    delta: AssetDeltaState::Restored,
-                },
-            ],
-            ..Commit::default()
-        })
-        .unwrap();
+    // One publication changes the first and authors the second again: the
+    // daemon reports a returning asset as changed.
+    write_asset(&mut project, PATH, first, 1);
+    write_asset(&mut project, "assets/b.bundle", second, 0);
+    project.publish();
 
     let events = poll_until(&mut io, 1);
-    assert!(events.iter().any(|event| matches!(
-        event,
-        IoEvent::Delta { assets, .. }
-            if assets == &vec![
-                (first, distill_loader::AssetDeltaState::Changed),
-                (second, distill_loader::AssetDeltaState::Restored),
-            ]
-    )));
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            IoEvent::Delta { assets, .. }
+                if assets == &vec![
+                    (first, distill_loader::AssetDeltaState::Changed),
+                    (second, distill_loader::AssetDeltaState::Changed),
+                ]
+        )),
+        "{events:?}"
+    );
     assert!(!events
         .iter()
         .any(|event| matches!(event, IoEvent::ConnectionError { .. })));
@@ -322,6 +311,7 @@ fn rpc_io_accepts_multiple_asset_subscriptions_on_one_delta_stream() {
 #[test]
 fn rpc_io_reports_an_expired_snapshot_and_the_next_round_reads_a_new_one() {
     let Fixture {
+        project: _project,
         server,
         request,
         asset,
@@ -378,6 +368,7 @@ fn rpc_io_reports_an_expired_snapshot_and_the_next_round_reads_a_new_one() {
 #[test]
 fn rpc_io_reconnects_a_closed_connection_and_restores_subscriptions() {
     let Fixture {
+        mut project,
         server,
         request,
         asset,
@@ -481,18 +472,14 @@ fn rpc_io_reconnects_a_closed_connection_and_restores_subscriptions() {
         .iter()
         .any(|event| matches!(event, IoEvent::TargetRejected { .. })));
 
-    server
-        .commit(Commit {
-            assets: vec![AssetMutation::Set {
-                uuid: asset,
-                resolution: StoredResolve::Failed {
-                    error: "changed after reconnect".into(),
-                },
-                delta: AssetDeltaState::Changed,
-            }],
-            ..Commit::default()
-        })
-        .unwrap();
+    // A second bundle file claims the asset: the daemon withholds it, failed.
+    project.write_bundle(
+        "assets/dup.bundle",
+        BundleUuid([42; 16]),
+        None,
+        &[Asset::blob("dup", asset, TYPE, &[9])],
+    );
+    project.publish();
     assert!(poll_until(&mut io, 1).iter().any(|event| matches!(
         event,
         IoEvent::Delta { assets, .. }
@@ -506,7 +493,10 @@ fn rpc_io_reconnects_a_closed_connection_and_restores_subscriptions() {
 #[test]
 fn rpc_io_drop_interrupts_a_stalled_reconnect() {
     let Fixture {
-        server, request, ..
+        project: _project,
+        server,
+        request,
+        ..
     } = fixture();
     let (address_tx, address_rx) = std::sync::mpsc::sync_channel(1);
     let (stalled_ready_tx, stalled_ready_rx) = std::sync::mpsc::sync_channel(1);
@@ -577,6 +567,7 @@ fn rpc_io_drop_interrupts_a_stalled_reconnect() {
 #[test]
 fn rpc_io_rebind_fences_everything_of_the_old_connection() {
     let Fixture {
+        project: _project,
         server,
         request,
         asset,
@@ -652,7 +643,10 @@ fn rpc_io_rebind_fences_everything_of_the_old_connection() {
 #[test]
 fn rpc_io_polls_import_failures_and_reports_only_changes() {
     let Fixture {
-        server, request, ..
+        project: _project,
+        server,
+        request,
+        ..
     } = fixture();
     let (address_tx, address_rx) = std::sync::mpsc::sync_channel(1);
     let root = server.root();
