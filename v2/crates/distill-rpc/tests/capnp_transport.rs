@@ -2276,3 +2276,54 @@ fn fence_pipeline(project: &TestProject) {
         .publish_pipeline_rejection(&mut writer, failure)
         .unwrap();
 }
+
+/// A generation fence the server cannot read answers the call's error arm
+/// before its payload is decoded; it is no reason to reconnect.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unreadable_generation_fence_answers_the_error_arm() {
+    LocalSet::new()
+        .run_until(async {
+            let project = project();
+            let server = project.server();
+            let listener = Rc::new(
+                StagedListener::bind(server.root(), "127.0.0.1:0")
+                    .await
+                    .unwrap(),
+            );
+            let address = listener.local_addr().unwrap();
+            let server_listener = listener.clone();
+            let server_task =
+                tokio::task::spawn_local(async move { server_listener.serve_one().await });
+            let client = CapnpClient::connect_local(address).await.unwrap();
+            let hub = match client.connect(&request()).await.unwrap() {
+                RemoteConnectOutcome::Connected { hub, .. } => hub,
+                other => panic!("expected connected, got {other:?}"),
+            };
+
+            rusqlite::Connection::open(project.path().join(".distill/meta.sqlite"))
+                .unwrap()
+                .execute(
+                    "INSERT INTO store_meta(key, value) VALUES ('rpc_pipeline_generation', 'x')
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    [],
+                )
+                .unwrap();
+            let mut reimport = hub.reimport_request();
+            reimport.get().set_base(u64::MAX);
+            reimport.get().reborrow().init_bundle().set_bytes(&[1]);
+            let reimport = reimport.send().promise.await.unwrap();
+            match reimport.get().unwrap().get_result().unwrap().which().unwrap() {
+                schema::uuid_call::Which::Error(error) => {
+                    let error = error.unwrap();
+                    assert_eq!(error.get_code(), 3000);
+                    let message = error.get_message().unwrap().to_str().unwrap();
+                    assert!(message.contains("daemon state read failed"), "{message}");
+                }
+                _ => panic!("an unreadable fence must answer the error arm"),
+            }
+
+            drop(client);
+            server_task.abort();
+        })
+        .await;
+}

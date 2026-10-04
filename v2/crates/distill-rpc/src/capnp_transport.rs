@@ -84,6 +84,32 @@ fn failure_code(error: &RpcFailure) -> u16 {
     }
 }
 
+/// Answer a target-bound call from its generation fence before decoding
+/// its parameters: a reconnect when the pipeline moved, an error when the
+/// fence cannot be read.
+macro_rules! generation_gate {
+    ($fence:expr, $results:ident) => {
+        match $fence {
+            Ok(None) => {}
+            Ok(Some(reason)) => {
+                write_reconnect(
+                    $results.get().init_result().init_reconnect_required(),
+                    reason,
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                write_error(
+                    $results.get().init_result().init_error(),
+                    failure_code(&error),
+                    format!("{error:?}").as_str(),
+                );
+                return Ok(());
+            }
+        }
+    };
+}
+
 #[derive(Debug)]
 pub enum TransportError {
     BindValidation(crate::BindStageError),
@@ -709,13 +735,7 @@ impl schema::hub::Server for HubService {
         mut results: schema::hub::SnapshotResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.hub.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.hub.generation_reconnect(), results);
             write_snapshot_result(results.get().init_result(), self.hub.snapshot());
             Ok(())
         }
@@ -727,13 +747,7 @@ impl schema::hub::Server for HubService {
         mut results: schema::hub::SubscribeResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.hub.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.hub.generation_reconnect(), results);
             let reader = params.get()?;
             let assets = match decode_uuid_list(reader.get_assets()?, "assets") {
                 Ok(assets) => assets,
@@ -763,13 +777,7 @@ impl schema::hub::Server for HubService {
         mut results: schema::hub::WriteResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.hub.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.hub.generation_reconnect(), results);
             let params = params.get()?;
             let ops = match decode_authoring_ops(params.get_ops()?) {
                 Ok(ops) => ops,
@@ -803,13 +811,7 @@ impl schema::hub::Server for HubService {
         mut results: schema::hub::ImportResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.hub.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.hub.generation_reconnect(), results);
             let params = params.get()?;
             let request = match decode_import_request(params.get_request()?) {
                 Ok(request) => request,
@@ -849,13 +851,7 @@ impl schema::hub::Server for HubService {
         mut results: schema::hub::ReimportResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.hub.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.hub.generation_reconnect(), results);
             let params = params.get()?;
             let bundle = match decode_uuid(params.get_bundle()?.get_bytes()?, "bundle") {
                 Ok(bundle) => BundleUuid(bundle),
@@ -891,13 +887,7 @@ impl schema::hub::Server for HubService {
         mut results: schema::hub::OperationResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.hub.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.hub.generation_reconnect(), results);
             let params = params.get()?;
             let operation = match decode_long_running_op(params.get_operation()?) {
                 Ok(operation) => operation,
@@ -925,13 +915,7 @@ impl schema::hub::Server for HubService {
         mut results: schema::hub::WireTreeResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.hub.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.hub.generation_reconnect(), results);
             let hash = match decode_hash(params.get()?.get_layout_hash()?, "layoutHash") {
                 Ok(hash) => LayoutHash(hash),
                 Err(error) => {
@@ -950,13 +934,7 @@ impl schema::hub::Server for HubService {
         mut results: schema::hub::UnsubscribeResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.hub.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.hub.generation_reconnect(), results);
             let reader = params.get()?;
             let assets = match decode_uuid_list(reader.get_assets()?, "assets") {
                 Ok(assets) => assets,
@@ -986,13 +964,7 @@ impl schema::hub::Server for HubService {
         mut results: schema::hub::AuthoringSnapshotResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.hub.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.hub.generation_reconnect(), results);
             write_authoring_snapshot_result(
                 results.get().init_result(),
                 self.hub.authoring_snapshot(),
@@ -1007,13 +979,7 @@ impl schema::hub::Server for HubService {
         mut results: schema::hub::ImportFailuresResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.hub.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.hub.generation_reconnect(), results);
             write_import_failures_result(results.get().init_result(), self.hub.import_failures());
             Ok(())
         }
@@ -1032,13 +998,7 @@ impl schema::snapshot::Server for SnapshotService {
         mut results: schema::snapshot::VersionResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.snapshot.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.snapshot.generation_reconnect(), results);
             write_uint64_result(
                 results.get().init_result(),
                 self.snapshot.version().map_success(|version| version.0),
@@ -1053,13 +1013,7 @@ impl schema::snapshot::Server for SnapshotService {
         mut results: schema::snapshot::QueryResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.snapshot.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.snapshot.generation_reconnect(), results);
             let query = match decode_asset_query(params.get()?.get_query()?) {
                 Ok(query) => query,
                 Err(error) => {
@@ -1078,13 +1032,7 @@ impl schema::snapshot::Server for SnapshotService {
         mut results: schema::snapshot::EntryResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.snapshot.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.snapshot.generation_reconnect(), results);
             let uuid = match decode_uuid(params.get()?.get_uuid()?, "uuid") {
                 Ok(uuid) => AssetUuid(uuid),
                 Err(error) => {
@@ -1103,13 +1051,7 @@ impl schema::snapshot::Server for SnapshotService {
         mut results: schema::snapshot::ResolveResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.snapshot.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.snapshot.generation_reconnect(), results);
             let params = params.get()?;
             let uuid = match decode_uuid(params.get_uuid()?, "uuid") {
                 Ok(uuid) => AssetUuid(uuid),
@@ -1146,13 +1088,7 @@ impl schema::snapshot::Server for SnapshotService {
         mut results: schema::snapshot::RefreshResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.snapshot.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.snapshot.generation_reconnect(), results);
             write_snapshot_result(results.get().init_result(), self.snapshot.refresh());
             Ok(())
         }
@@ -1164,13 +1100,7 @@ impl schema::snapshot::Server for SnapshotService {
         mut results: schema::snapshot::ResolvePathResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.snapshot.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.snapshot.generation_reconnect(), results);
             let path = match decode_text(params.get()?.get_path()?, "path") {
                 Ok(path) => path,
                 Err(error) => {
@@ -1192,13 +1122,7 @@ impl schema::snapshot::Server for SnapshotService {
         mut results: schema::snapshot::ConfigurationResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.snapshot.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.snapshot.generation_reconnect(), results);
             write_snapshot_configuration_result(
                 results.get().init_result(),
                 self.snapshot.configuration(),
@@ -1213,13 +1137,7 @@ impl schema::snapshot::Server for SnapshotService {
         mut results: schema::snapshot::FetchResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.snapshot.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.snapshot.generation_reconnect(), results);
             let hash = match decode_hash(params.get()?.get_hash()?, "hash") {
                 Ok(hash) => ContentHash(hash),
                 Err(error) => {
@@ -1238,13 +1156,7 @@ impl schema::snapshot::Server for SnapshotService {
         mut results: schema::snapshot::RuntimeTypePolicyResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.snapshot.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.snapshot.generation_reconnect(), results);
             let type_uuid = match decode_uuid(params.get()?.get_type_uuid()?, "typeUuid") {
                 Ok(uuid) => TypeUuid(uuid),
                 Err(error) => {
@@ -1266,13 +1178,7 @@ impl schema::snapshot::Server for SnapshotService {
         mut results: schema::snapshot::ResolveNamedResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.snapshot.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.snapshot.generation_reconnect(), results);
             let params = params.get()?;
             let (path, name) = (params.get_path()?, params.get_name()?);
             let decoded =
@@ -1305,13 +1211,7 @@ impl schema::authoring_snapshot::Server for AuthoringSnapshotService {
         mut results: schema::authoring_snapshot::FileResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.snapshot.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.snapshot.generation_reconnect(), results);
             let params = params.get()?;
             let root = params.get_root()?.to_str()?;
             let path = params.get_path()?.to_str()?;
@@ -1331,13 +1231,7 @@ impl schema::authoring_snapshot::Server for AuthoringSnapshotService {
         mut results: schema::authoring_snapshot::VersionResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.snapshot.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.snapshot.generation_reconnect(), results);
             write_uint64_result(
                 results.get().init_result(),
                 self.snapshot.version().map_success(|version| version.0),
@@ -1352,13 +1246,7 @@ impl schema::authoring_snapshot::Server for AuthoringSnapshotService {
         mut results: schema::authoring_snapshot::QueryResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.snapshot.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.snapshot.generation_reconnect(), results);
             let query = match decode_asset_query(params.get()?.get_query()?) {
                 Ok(query) => query,
                 Err(error) => {
@@ -1377,13 +1265,7 @@ impl schema::authoring_snapshot::Server for AuthoringSnapshotService {
         mut results: schema::authoring_snapshot::InspectResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.snapshot.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.snapshot.generation_reconnect(), results);
             let uuid = match decode_uuid(params.get()?.get_uuid()?, "uuid") {
                 Ok(uuid) => AssetUuid(uuid),
                 Err(error) => {
@@ -1405,13 +1287,7 @@ impl schema::authoring_snapshot::Server for AuthoringSnapshotService {
         mut results: schema::authoring_snapshot::RefreshResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            if let Some(reason) = self.snapshot.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
+            generation_gate!(self.snapshot.generation_reconnect(), results);
             write_authoring_snapshot_result(results.get().init_result(), self.snapshot.refresh());
             Ok(())
         }

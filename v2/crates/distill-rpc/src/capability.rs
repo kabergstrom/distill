@@ -612,6 +612,15 @@ fn inspect_authoring(
     }))
 }
 
+/// What a generation fence answers in place of the call, if anything: a
+/// reconnect, or the failure to read the fence.
+fn fenced<T>(fence: Result<Option<ReconnectReason>, RpcFailure>) -> Option<RpcResult<T>> {
+    match fence {
+        Ok(reason) => reason.map(|reason| RpcResult::ReconnectRequired { reason }),
+        Err(error) => Some(RpcResult::Failure(error)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Authoring gates and completions
 
@@ -637,8 +646,10 @@ fn authoring_gate(
     connection: &ConnectionState,
     base: InputVersion,
 ) -> Option<AuthoringGate> {
-    if let Some(reason) = server.inner.generation_fence(connection) {
-        return Some(AuthoringGate::Reconnect(reason));
+    match server.inner.generation_fence(connection) {
+        Ok(None) => {}
+        Ok(Some(reason)) => return Some(AuthoringGate::Reconnect(reason)),
+        Err(error) => return Some(AuthoringGate::Failure(error)),
     }
     let current = match server.inner.current_stamp() {
         Ok(stamp) => stamp.version,
@@ -1094,8 +1105,9 @@ impl Hub {
 
     /// Cheap transport gate used before decoding target-bound request
     /// parameters. A stale capability must reconnect even when its payload is
-    /// malformed or the requested method is reserved.
-    pub fn generation_reconnect(&self) -> Option<ReconnectReason> {
+    /// malformed or the requested method is reserved. `Err`: the fence
+    /// could not be read, the call's failure.
+    pub fn generation_reconnect(&self) -> Result<Option<ReconnectReason>, RpcFailure> {
         self.server
             .inner
             .generation_fence(&self.connection.borrow())
@@ -1104,10 +1116,7 @@ impl Hub {
     fn live<T>(&self) -> Option<RpcResult<T>> {
         self.server.inner.pump(&self.connection);
         let connection = self.connection.borrow();
-        self.server
-            .inner
-            .generation_fence(&connection)
-            .map(|reason| RpcResult::ReconnectRequired { reason })
+        fenced(self.server.inner.generation_fence(&connection))
     }
 
     pub fn snapshot(&self) -> RpcResult<Snapshot> {
@@ -1701,7 +1710,7 @@ impl Snapshot {
         self.basis.snapshot
     }
 
-    pub fn generation_reconnect(&self) -> Option<ReconnectReason> {
+    pub fn generation_reconnect(&self) -> Result<Option<ReconnectReason>, RpcFailure> {
         self.server
             .inner
             .generation_fence(&self.connection.borrow())
@@ -1709,8 +1718,8 @@ impl Snapshot {
 
     fn preflight<T>(&self) -> Result<Rc<SnapshotTxn>, RpcResult<T>> {
         let connection = self.connection.borrow();
-        if let Some(reason) = self.server.inner.generation_fence(&connection) {
-            return Err(RpcResult::ReconnectRequired { reason });
+        if let Some(result) = fenced(self.server.inner.generation_fence(&connection)) {
+            return Err(result);
         }
         self.hold
             .txn()
@@ -1747,8 +1756,8 @@ impl Snapshot {
     pub fn refresh(&self) -> RpcResult<Snapshot> {
         {
             let connection = self.connection.borrow();
-            if let Some(reason) = self.server.inner.generation_fence(&connection) {
-                return RpcResult::ReconnectRequired { reason };
+            if let Some(result) = fenced(self.server.inner.generation_fence(&connection)) {
+                return result;
             }
         }
         if !self.hold.alive() {
@@ -2086,7 +2095,7 @@ impl Snapshot {
 // AuthoringSnapshot
 
 impl AuthoringSnapshot {
-    pub fn generation_reconnect(&self) -> Option<ReconnectReason> {
+    pub fn generation_reconnect(&self) -> Result<Option<ReconnectReason>, RpcFailure> {
         self.server
             .inner
             .generation_fence(&self.connection.borrow())
@@ -2098,8 +2107,8 @@ impl AuthoringSnapshot {
 
     fn preflight<T>(&self) -> Result<Rc<SnapshotTxn>, RpcResult<T>> {
         let connection = self.connection.borrow();
-        if let Some(reason) = self.server.inner.generation_fence(&connection) {
-            return Err(RpcResult::ReconnectRequired { reason });
+        if let Some(result) = fenced(self.server.inner.generation_fence(&connection)) {
+            return Err(result);
         }
         self.hold
             .txn()
@@ -2171,8 +2180,8 @@ impl AuthoringSnapshot {
     pub fn refresh(&self) -> RpcResult<AuthoringSnapshot> {
         {
             let connection = self.connection.borrow();
-            if let Some(reason) = self.server.inner.generation_fence(&connection) {
-                return RpcResult::ReconnectRequired { reason };
+            if let Some(result) = fenced(self.server.inner.generation_fence(&connection)) {
+                return result;
             }
         }
         if !self.hold.alive() {

@@ -1380,19 +1380,20 @@ impl Inner {
         }))
     }
 
-    /// Why `connection` must reconnect, if it must.
-    pub(crate) fn generation_fence(&self, connection: &ConnectionState) -> Option<ReconnectReason> {
+    /// Why `connection` must reconnect, if it must. A fence that cannot be
+    /// read is the call's failure: it says nothing about the connection.
+    pub(crate) fn generation_fence(
+        &self,
+        connection: &ConnectionState,
+    ) -> Result<Option<ReconnectReason>, RpcFailure> {
         // A target definition changes only with a pipeline fence
         // ([`crate::publish_target_set`]): the one generation covers both.
-        let pipeline_generation = match self.reader.rpc_pipeline_generation() {
-            Ok(generation) => generation,
-            Err(error) => {
-                tracing::error!(%error, "cannot read the RPC fence");
-                return Some(ReconnectReason::StoreInstanceChanged);
-            }
-        };
-        (pipeline_generation != connection.pipeline_generation)
-            .then_some(ReconnectReason::PipelineEpochChanged)
+        let pipeline_generation = self
+            .reader
+            .rpc_pipeline_generation()
+            .map_err(store_failure)?;
+        Ok((pipeline_generation != connection.pipeline_generation)
+            .then_some(ReconnectReason::PipelineEpochChanged))
     }
 
     /// Deliver to `connection` every change-log row published since its

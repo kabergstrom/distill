@@ -1484,6 +1484,38 @@ fn every_authoring_snapshot_method_is_expiry_and_generation_fenced() {
 }
 
 #[test]
+fn an_unreadable_generation_fence_is_an_error_not_a_reconnect() {
+    let project = project();
+    let server = project.server();
+    let hub = connect(&server, &[(1, false)]);
+    let pinned = snapshot(&hub);
+    let authoring = authoring_snapshot(&hub);
+    // Break the fence row underneath the server: reading it fails.
+    rusqlite::Connection::open(project.path().join(".distill/meta.sqlite"))
+        .unwrap()
+        .execute(
+            "INSERT INTO store_meta(key, value) VALUES ('rpc_pipeline_generation', 'x')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .unwrap();
+    let read_failure = |result: &dyn std::fmt::Debug| {
+        let result = format!("{result:?}");
+        assert!(
+            result.starts_with("Failure(InvalidQuery")
+                && result.contains("daemon state read failed"),
+            "{result}"
+        );
+    };
+    read_failure(&hub.snapshot());
+    read_failure(&hub.authoring_snapshot());
+    read_failure(&pinned.version());
+    read_failure(&pinned.refresh());
+    read_failure(&authoring.version());
+    read_failure(&authoring.refresh());
+}
+
+#[test]
 fn authoring_inspection_is_a_pinned_pure_metadata_read_under_configuration_error() {
     let mut project = project();
     let server = project.server();
