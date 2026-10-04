@@ -10,28 +10,29 @@ mod bind;
 pub mod distill_rpc_capnp {
     include!(concat!(env!("OUT_DIR"), "/schema/distill_rpc_capnp.rs"));
 }
-pub mod capnp_loader;
-pub mod capnp_transport;
 mod apply;
 mod capability;
+pub mod capnp_loader;
+pub mod capnp_transport;
 mod persist;
 mod protocol;
 mod server;
-mod validate;
 mod target;
+mod validate;
 
-pub use bind::{validate_bind_address, BindStageError};
-pub use protocol::*;
 pub use apply::{
     apply_commit, publish_pipeline_fence, publish_target_set, ApplyError, RETAINED_HISTORY_VERSIONS,
 };
+pub use bind::{validate_bind_address, BindStageError};
 pub use capability::{
     AuthoringSnapshot, DeltaStream, FinishedBuild, Hub, MetadataAuthoringSnapshot, MetadataHub,
     MetadataSnapshot, PendingBuild, ResolveStep, Snapshot,
 };
+pub use protocol::*;
 pub use server::{
-    bundle_authoring_entry, target_map, CoordinatedCommitError, ReportSnapshot, Root, Server, ServerHandle, SnapshotPolicy,
-    DEFAULT_SNAPSHOT_TTL, MAX_SUBSCRIBED_ASSETS, MAX_SUBSCRIBED_PATHS,
+    bundle_authoring_entry, target_map, CoordinatedCommitError, ReportSnapshot, Root, Server,
+    ServerHandle, SnapshotPolicy, DEFAULT_SNAPSHOT_TTL, MAX_SUBSCRIBED_ASSETS,
+    MAX_SUBSCRIBED_PATHS,
 };
-pub use validate::{decode_asset_reference_query, decode_authoring_payload};
 pub use target::{TargetDefinition, TargetSetError};
+pub use validate::{decode_asset_reference_query, decode_authoring_payload};

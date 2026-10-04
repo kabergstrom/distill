@@ -9,8 +9,8 @@ use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
 use distill_daemon::epoch::{
     CandidateCleanupDisposition, CandidateRegistrationArena, CandidateRequirements,
     HostCallbackBoundary, HostCallbackSurface, LoadedPipelineModule, ModuleAbiIdentity,
-    ModuleCallError, ModuleEpochPin, ModuleHost, PipelineModuleLoader, PipelineFailureCode,
-    PipelineFailureOrigin, Registration, RegistrationDisposition, RegistrationKind,
+    ModuleCallError, ModuleEpochPin, ModuleHost, PipelineFailureCode, PipelineFailureOrigin,
+    PipelineModuleLoader, Registration, RegistrationDisposition, RegistrationKind,
     RegistrationResource, RegistrationSet, StagedModule, TargetDefinition,
 };
 

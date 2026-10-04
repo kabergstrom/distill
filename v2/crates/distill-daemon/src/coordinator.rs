@@ -9,10 +9,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 #[cfg(test)]
 use std::sync::mpsc;
-
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use rayon::ThreadPool;
 
@@ -21,16 +20,14 @@ use distill_bundle::Bundle;
 use distill_core::bootstrap::is_bootstrap_control_type;
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, TypeUuid};
 use distill_rpc::{
-    AssetDeltaState, AssetMutation, AuthoringEntry, AuthoringEntryRole, AuthoringMutation,
-    Commit, ConfigurationError, ConfigurationStatus, CoordinatedCommitError,
-    PathMutation, PipelineDiagnostic,
-    Server, ServerHandle, SnapshotStamp, TargetDefinition, NamespaceError,
-    RpcFailure, NamespaceErrorV1,
+    AssetDeltaState, AssetMutation, AuthoringEntry, AuthoringEntryRole, AuthoringMutation, Commit,
+    ConfigurationError, ConfigurationStatus, CoordinatedCommitError, NamespaceError,
+    NamespaceErrorV1, PathMutation, PipelineDiagnostic, RpcFailure, Server, ServerHandle,
+    SnapshotStamp, TargetDefinition,
 };
 use distill_schema::ProjectSchemaAuthority;
 use distill_store::bundles::{
-    AssetRecord, BundleMeta, NamespaceSkeleton as StoreNamespaceSkeleton,
-    SkeletonEntry,
+    AssetRecord, BundleMeta, NamespaceSkeleton as StoreNamespaceSkeleton, SkeletonEntry,
 };
 use distill_store::claims::{DerivedOutputClaim, PendingClaims, SourceClaim, SourceClaims};
 use distill_store::config::{PendingRestart, RestartOnlyChange};
@@ -39,9 +36,8 @@ use distill_store::files::{FileObservation, PendingFileWork};
 use distill_store::pipeline::ValidatedPipelineEpoch;
 use distill_store::served::AssetResolution;
 use distill_store::state::{
-    AssetClaimant, CleanupDisposition, DirectoryAliasSide, DscpV1,
-    InputVersion, PipelineFailure, PipelineFailureCode, PipelineFailureOrigin,
-    ReadableBundleSource, ScanFailureCode, ScanSubject,
+    AssetClaimant, CleanupDisposition, DirectoryAliasSide, DscpV1, InputVersion, PipelineFailure,
+    PipelineFailureCode, PipelineFailureOrigin, ReadableBundleSource, ScanFailureCode, ScanSubject,
     SkeletonFailureCode,
 };
 use distill_store::{Store, StoreConfig, StoreError, StoreOpener, StoreReader, StoreWriter};
@@ -56,15 +52,15 @@ use crate::epoch::{
 use crate::module_loader::DynamicPipelineModuleLoader;
 use crate::pipeline_map::PipelineProjection;
 use crate::scanner::{
-    AssetRoot, DaemonOwnedDirectoryKind, RootedScanner, ScanDelta, ScanError,
-    ScanSnapshot, ScannedBundle, StoredBaseline,
+    AssetRoot, DaemonOwnedDirectoryKind, RootedScanner, ScanDelta, ScanError, ScanSnapshot,
+    ScannedBundle, StoredBaseline,
 };
 use crate::scheduler::{ScheduledPool, Scheduler, SchedulerConfig, WorkClass};
 use crate::watcher::{WatcherAction, WatcherBatch, WatcherQueue};
 
-mod pass;
 #[cfg(test)]
 mod compiled_tests;
+mod pass;
 
 use pass::ImportScope;
 pub use pass::PassOutcome;
@@ -178,9 +174,8 @@ impl DaemonCoordinator {
         )?;
         let target_set = distill_rpc::target_map(targets)?;
         if opened_store.pending_restart()?.is_some() {
-            opened_store.input_transaction(|transaction| {
-                transaction.adopt_pending_restart().map(|_| ())
-            })?;
+            opened_store
+                .input_transaction(|transaction| transaction.adopt_pending_restart().map(|_| ()))?;
         }
         let version = opened_store.input_version()?;
         opened_store.served_transaction(|transaction| {
@@ -202,7 +197,10 @@ impl DaemonCoordinator {
         if compiled_version.is_none() {
             compiled.install(boot.clone());
         }
-        let backend = Arc::new(AuthoringService::new(Arc::clone(&opener), Arc::clone(&compiled)));
+        let backend = Arc::new(AuthoringService::new(
+            Arc::clone(&opener),
+            Arc::clone(&compiled),
+        ));
         let server = ServerHandle::open(backend.clone(), Arc::clone(&opener));
         let pipeline = CoordinatedPipelineRuntime {
             host,
@@ -335,7 +333,10 @@ impl DaemonCoordinator {
 
     /// Whether a Ready pipeline epoch serves.
     pub(crate) fn has_ready_pipeline(&self) -> bool {
-        lock_pipeline(&self.pipeline).host.published_ready_epoch().is_some()
+        lock_pipeline(&self.pipeline)
+            .host
+            .published_ready_epoch()
+            .is_some()
     }
 
     /// Whether publishing `candidate` with the current configuration and the
@@ -415,7 +416,9 @@ impl DaemonCoordinator {
     /// version, as a configuration with that schema would.
     #[cfg(test)]
     pub(crate) fn install_schema_authority_for_test(&self, authority: Arc<ProjectSchemaAuthority>) {
-        self.replace_compiled_for_test(|current| current.with_test_state(Some(authority), None, None));
+        self.replace_compiled_for_test(|current| {
+            current.with_test_state(Some(authority), None, None)
+        });
     }
 
     #[cfg(test)]
@@ -427,7 +430,9 @@ impl DaemonCoordinator {
 
     #[cfg(test)]
     pub(crate) fn install_pipeline_epoch_for_test(&self, epoch: PipelineEpoch) {
-        lock_pipeline(&self.pipeline).host.install_ready(epoch.clone());
+        lock_pipeline(&self.pipeline)
+            .host
+            .install_ready(epoch.clone());
         self.replace_compiled_for_test(|current| {
             current.with_test_state(None, None, Some(PipelineSnapshot::ready(epoch)))
         });
@@ -555,7 +560,10 @@ impl DaemonCoordinator {
         self.publish_configuration_source_error(store, Some(error))
     }
 
-    pub fn heal_configuration_rejection(&self, store: &mut Store) -> Result<SnapshotStamp, CoordinatorError> {
+    pub fn heal_configuration_rejection(
+        &self,
+        store: &mut Store,
+    ) -> Result<SnapshotStamp, CoordinatorError> {
         self.publish_configuration_source_error(store, None)
     }
 
@@ -571,7 +579,9 @@ impl DaemonCoordinator {
         let base = self.server.stamp_of(store)?.version;
         self.server
             .coordinated_commit(store, base, |store| {
-                let generation = store.configuration_generation().map_err(|error| error.to_string())?;
+                let generation = store
+                    .configuration_generation()
+                    .map_err(|error| error.to_string())?;
                 let (configuration, _) = store
                     .input_transaction(|transaction| {
                         transaction.set_configuration_source_error(error.as_ref())?;
@@ -616,7 +626,9 @@ impl DaemonCoordinator {
             .scanner
             .candidate_with_roots(roots.clone())
             .map_err(|error| {
-                CoordinatorError::InvalidManifest(AuthoringServiceInitError::from(error).to_string())
+                CoordinatorError::InvalidManifest(
+                    AuthoringServiceInitError::from(error).to_string(),
+                )
             })?;
         let filesystem_changed = !self.scanner.has_same_roots(&scanner);
         // The compiled state the published rows were derived under. A
@@ -625,11 +637,13 @@ impl DaemonCoordinator {
         // process that has neither observed the roots nor compiled the
         // store's version, scans them physically and publishes completely.
         let previous = self.compiled.at(store).ok();
-        let candidate_scan_heals = filesystem_changed
-            || self.scan_initialized.get().is_none()
-            || previous.is_none();
+        let candidate_scan_heals =
+            filesystem_changed || self.scan_initialized.get().is_none() || previous.is_none();
         let candidate = if candidate_scan_heals {
-            Some(ScanCandidate::build(scanner.scan()?, Some(&schema_authority))?)
+            Some(ScanCandidate::build(
+                scanner.scan()?,
+                Some(&schema_authority),
+            )?)
         } else {
             None
         };
@@ -721,7 +735,13 @@ impl DaemonCoordinator {
         };
         let installed_claims = match candidate
             .as_ref()
-            .map(|candidate| bundle_claims(candidate.scan.bundle_rows(), &projection, Some(&schema_authority)))
+            .map(|candidate| {
+                bundle_claims(
+                    candidate.scan.bundle_rows(),
+                    &projection,
+                    Some(&schema_authority),
+                )
+            })
             .transpose()
         {
             Ok(claims) => claims,
@@ -747,13 +767,18 @@ impl DaemonCoordinator {
                     Err(error) => return Err(error.to_string()),
                 };
                 let retyped = projection.retyped(
-                    previous.as_deref().map_or(self.boot.projection(), Compiled::projection),
+                    previous
+                        .as_deref()
+                        .map_or(self.boot.projection(), Compiled::projection),
                 );
                 // A failure identical to the one the base's loaded state
                 // serves changes no pipeline: no connection is fenced.
                 let pipeline_changed = match (&pipeline, &previous) {
                     (ConfigurationPipelinePublication::Failed(failure), Some(_)) => {
-                        store.pipeline_failure().map_err(|error| error.to_string())?.as_ref()
+                        store
+                            .pipeline_failure()
+                            .map_err(|error| error.to_string())?
+                            .as_ref()
                             != Some(failure)
                     }
                     _ => true,
@@ -800,7 +825,8 @@ impl DaemonCoordinator {
                         PipelineDiagnostic::Failed(failure.clone())
                     }
                 };
-                let (snapshot, importers) = match (&pipeline, prepared_epoch.as_ref(), &diagnostic) {
+                let (snapshot, importers) = match (&pipeline, prepared_epoch.as_ref(), &diagnostic)
+                {
                     (
                         ConfigurationPipelinePublication::Epoch { .. },
                         Some(prepared),
@@ -832,7 +858,8 @@ impl DaemonCoordinator {
                 staged = Some(entry);
                 published_pipeline = Some(diagnostic);
                 crate::build::refine_tag_index(
-                    crate::build::OpenInput::new(store).expect("tag-index refinement runs inside its input"),
+                    crate::build::OpenInput::new(store)
+                        .expect("tag-index refinement runs inside its input"),
                     compiled.scanner().clone(),
                     Arc::clone(&schema_authority),
                     compiled.pipeline_snapshot(),
@@ -928,53 +955,62 @@ impl DaemonCoordinator {
         let diagnostic = failure.clone();
         let mut staged: Option<StagedCompiled<'_>> = None;
         let mut changed = false;
-        let result = self.server.coordinated_maybe_commit(store, base.version, |store| {
-            // The compiled state this version keeps but for its pipeline: the
-            // base's, or, when this process has compiled nothing for the
-            // store yet, what it holds since it opened.
-            let (previous, loaded) = match self.compiled.at(store) {
-                Ok(previous) => (previous, true),
-                Err(CompiledLookupError::NotLoaded { .. }) => (Arc::new(self.boot.clone()), false),
-                Err(error) => return Err(error.to_string()),
-            };
-            // The failure the base already serves is no change to the
-            // pipeline: nothing is fenced, and without a configuration to
-            // heal nothing is published. A store version this process has
-            // compiled nothing for is published regardless, so the process
-            // holds the state it serves.
-            let unchanged = loaded
-                && store.pipeline_failure().map_err(|error| error.to_string())?.as_ref()
-                    == Some(&diagnostic);
-            if unchanged && !heal_configuration {
-                return Ok(None);
-            }
-            changed = !unchanged;
-            let generation = store.configuration_generation().map_err(|error| error.to_string())?;
-            let ((configuration, version), _) = store
-                .input_transaction(|transaction| {
-                    if !unchanged {
-                        transaction.publish_pipeline_failure(&diagnostic)?;
+        let result = self
+            .server
+            .coordinated_maybe_commit(store, base.version, |store| {
+                // The compiled state this version keeps but for its pipeline: the
+                // base's, or, when this process has compiled nothing for the
+                // store yet, what it holds since it opened.
+                let (previous, loaded) = match self.compiled.at(store) {
+                    Ok(previous) => (previous, true),
+                    Err(CompiledLookupError::NotLoaded { .. }) => {
+                        (Arc::new(self.boot.clone()), false)
                     }
-                    transaction.mark_compiled()?;
-                    let configuration = if heal_configuration {
-                        transaction.set_configuration_source_error(None)?;
-                        Some(transaction.publish_configuration_status(generation)?)
-                    } else {
-                        None
-                    };
-                    Ok((configuration, transaction.version()))
-                })
-                .map_err(|error| error.to_string())?;
-            staged = Some(
-                self.compiled
-                    .stage(previous.with_pipeline_failure(version, diagnostic.clone())),
-            );
-            Ok(Some(Commit {
-                configuration: configuration.map(configuration_status),
-                pipeline_epoch_changed: !unchanged,
-                ..Commit::default()
-            }))
-        });
+                    Err(error) => return Err(error.to_string()),
+                };
+                // The failure the base already serves is no change to the
+                // pipeline: nothing is fenced, and without a configuration to
+                // heal nothing is published. A store version this process has
+                // compiled nothing for is published regardless, so the process
+                // holds the state it serves.
+                let unchanged = loaded
+                    && store
+                        .pipeline_failure()
+                        .map_err(|error| error.to_string())?
+                        .as_ref()
+                        == Some(&diagnostic);
+                if unchanged && !heal_configuration {
+                    return Ok(None);
+                }
+                changed = !unchanged;
+                let generation = store
+                    .configuration_generation()
+                    .map_err(|error| error.to_string())?;
+                let ((configuration, version), _) = store
+                    .input_transaction(|transaction| {
+                        if !unchanged {
+                            transaction.publish_pipeline_failure(&diagnostic)?;
+                        }
+                        transaction.mark_compiled()?;
+                        let configuration = if heal_configuration {
+                            transaction.set_configuration_source_error(None)?;
+                            Some(transaction.publish_configuration_status(generation)?)
+                        } else {
+                            None
+                        };
+                        Ok((configuration, transaction.version()))
+                    })
+                    .map_err(|error| error.to_string())?;
+                staged = Some(
+                    self.compiled
+                        .stage(previous.with_pipeline_failure(version, diagnostic.clone())),
+                );
+                Ok(Some(Commit {
+                    configuration: configuration.map(configuration_status),
+                    pipeline_epoch_changed: !unchanged,
+                    ..Commit::default()
+                }))
+            });
         match result {
             Ok(Some(stamp)) => {
                 if changed {
@@ -997,7 +1033,10 @@ impl DaemonCoordinator {
 
     /// Reconcile one complete identity-checked namespace scan, as a pass
     /// with no imports.
-    pub fn reconcile_full_scan(&self, store: &mut Store) -> Result<SnapshotStamp, CoordinatorError> {
+    pub fn reconcile_full_scan(
+        &self,
+        store: &mut Store,
+    ) -> Result<SnapshotStamp, CoordinatorError> {
         let compiled = self.loop_compiled(store)?;
         let base = self.server.stamp_of(store)?.version;
         let step = self.full_step(&compiled, store)?;
@@ -1022,7 +1061,10 @@ impl DaemonCoordinator {
 
     /// Rerun every watched import whose complete outcome-bearing basis
     /// drifted, as one pass: all of them publish as one version.
-    pub fn reconcile_watched_imports(&self, store: &mut Store) -> Result<Vec<BundleUuid>, CoordinatorError> {
+    pub fn reconcile_watched_imports(
+        &self,
+        store: &mut Store,
+    ) -> Result<Vec<BundleUuid>, CoordinatorError> {
         self.import_pass(store, ImportScope::watched(None))
     }
 
@@ -1034,13 +1076,19 @@ impl DaemonCoordinator {
         work: &PendingFileWork,
         capabilities_changed: bool,
     ) -> Result<Vec<BundleUuid>, CoordinatorError> {
-        self.import_pass(store, ImportScope::watched(Some((work, capabilities_changed))))
+        self.import_pass(
+            store,
+            ImportScope::watched(Some((work, capabilities_changed))),
+        )
     }
 
     /// Discover and apply authored directory-import rules, as one pass.
     /// Orphaned prior outputs are deliberately retained and therefore never
     /// appear as deletion work.
-    pub fn reconcile_directory_imports(&self, store: &mut Store) -> Result<Vec<BundleUuid>, CoordinatorError> {
+    pub fn reconcile_directory_imports(
+        &self,
+        store: &mut Store,
+    ) -> Result<Vec<BundleUuid>, CoordinatorError> {
         self.import_pass(store, ImportScope::directories(None))
     }
 
@@ -1050,7 +1098,10 @@ impl DaemonCoordinator {
         work: &PendingFileWork,
         capabilities_changed: bool,
     ) -> Result<Vec<BundleUuid>, CoordinatorError> {
-        self.import_pass(store, ImportScope::directories(Some((work, capabilities_changed))))
+        self.import_pass(
+            store,
+            ImportScope::directories(Some((work, capabilities_changed))),
+        )
     }
 
     /// An imports-only pass. An importer failure with no bundle to hold its
@@ -1064,12 +1115,17 @@ impl DaemonCoordinator {
         let base = self.server.stamp_of(store)?.version;
         let outcome = self.pass(store, base, pass::ScanStep::Unchanged, scope)?;
         if !outcome.failures.is_empty() {
-            return Err(CoordinatorError::InvalidManifest(outcome.failures.join("; ")));
+            return Err(CoordinatorError::InvalidManifest(
+                outcome.failures.join("; "),
+            ));
         }
         Ok(outcome.imported)
     }
 
-    pub fn pending_file_work(&self, store: &mut Store) -> Result<PendingFileWork, CoordinatorError> {
+    pub fn pending_file_work(
+        &self,
+        store: &mut Store,
+    ) -> Result<PendingFileWork, CoordinatorError> {
         store
             .pending_file_work()
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
@@ -1179,7 +1235,10 @@ mod cas_pass_tests {
         assert_eq!(idle[0], idle[1], "{idle:?}");
         commit(&mut store, 250);
         let after_write = pass(&mut store, &mut swept);
-        assert!(after_write.iter().any(|sql| sql.contains("SUM(")), "{after_write:?}");
+        assert!(
+            after_write.iter().any(|sql| sql.contains("SUM(")),
+            "{after_write:?}"
+        );
     }
 
     /// The writer that commits while the pass compacts.
@@ -1221,7 +1280,10 @@ mod cas_pass_tests {
         store.trace_statements(Some(commit_after_the_sweep));
         maintain_cas(&mut store, &mut sweeper, &mut swept).unwrap();
         store.trace_statements(None);
-        assert!(LATE_WRITER.lock().unwrap().is_none(), "the late write landed");
+        assert!(
+            LATE_WRITER.lock().unwrap().is_none(),
+            "the late write landed"
+        );
 
         let next = pass(&mut store, &mut swept);
         assert!(next.iter().any(|sql| sql.contains("SUM(")), "{next:?}");
@@ -1492,7 +1554,10 @@ pub enum CoordinatorError {
     /// A file the pass read changed on disk since its version observed it
     /// (`StoreError::Drifted`): nothing was published, the watcher reports
     /// the change, and the pass is retried.
-    Drifted { root: String, path: String },
+    Drifted {
+        root: String,
+        path: String,
+    },
 }
 
 impl std::fmt::Display for CoordinatorError {
@@ -1609,12 +1674,22 @@ impl Withheld {
         }
         for source in sources {
             let uuids = match (&source.parsed, &source.namespace_skeleton) {
-                (Ok(bundle), _) => bundle_errors
-                    .get(&bundle.uuid)
-                    .map(|message| (message, bundle.assets.values().map(|entry| entry.uuid).collect::<Vec<_>>())),
-                (Err(_), Some(skeleton)) => bundle_errors
-                    .get(&skeleton.uuid)
-                    .map(|message| (message, skeleton.assets.values().map(|entry| entry.uuid).collect())),
+                (Ok(bundle), _) => bundle_errors.get(&bundle.uuid).map(|message| {
+                    (
+                        message,
+                        bundle
+                            .assets
+                            .values()
+                            .map(|entry| entry.uuid)
+                            .collect::<Vec<_>>(),
+                    )
+                }),
+                (Err(_), Some(skeleton)) => bundle_errors.get(&skeleton.uuid).map(|message| {
+                    (
+                        message,
+                        skeleton.assets.values().map(|entry| entry.uuid).collect(),
+                    )
+                }),
                 (Err(_), None) => None,
             };
             if let Some((message, uuids)) = uuids {
@@ -1753,7 +1828,13 @@ fn source_claims(
                 source: readable.clone(),
             });
             for (local_id, entry) in &bundle.assets {
-                authored_claims(&mut claims, bundle.uuid, local_id, entry.uuid, entry.type_uuid);
+                authored_claims(
+                    &mut claims,
+                    bundle.uuid,
+                    local_id,
+                    entry.uuid,
+                    entry.type_uuid,
+                );
             }
             if let Some(primary) = &bundle.primary {
                 claims.push(SourceClaim::PrimaryPath {
@@ -1810,7 +1891,11 @@ fn claimed_source(
     if let Some(source) = inputs.fresh.get(&(root_name.to_owned(), path.to_owned())) {
         return Ok(Arc::clone(source));
     }
-    Ok(Arc::new(inputs.scanner.read_published_bundle(reader, root_name, path)?))
+    Ok(Arc::new(
+        inputs
+            .scanner
+            .read_published_bundle(reader, root_name, path)?,
+    ))
 }
 
 fn incremental_plan(
@@ -1826,12 +1911,7 @@ fn incremental_plan(
         let sources = sources
             .iter()
             .map(|source| {
-                claimed_source(
-                    reader,
-                    inputs,
-                    &source.root_name,
-                    &source.normalized_path,
-                )
+                claimed_source(reader, inputs, &source.root_name, &source.normalized_path)
             })
             .collect::<Result<Vec<_>, _>>()?;
         claimed.insert(bundle, sources);
@@ -2097,14 +2177,15 @@ fn candidate_bundle_summaries(
         let Ok(bundle) = &source.parsed else {
             continue;
         };
-        let (origin, import_watched) = crate::importer::decoded_record_facts(bundle).map_err(|error| {
-            StoreError::InvalidConfiguration {
-                error: format!(
-                    "invalid import record in {}: {error:?}",
-                    source.normalized_path
-                ),
-            }
-        })?;
+        let (origin, import_watched) =
+            crate::importer::decoded_record_facts(bundle).map_err(|error| {
+                StoreError::InvalidConfiguration {
+                    error: format!(
+                        "invalid import record in {}: {error:?}",
+                        source.normalized_path
+                    ),
+                }
+            })?;
         summaries.insert(
             bundle.uuid,
             BundleSummary {
@@ -2301,17 +2382,24 @@ fn publish_scan(
         );
         Ok(())
     })?;
-    let current_bundle_summaries = candidate_bundle_summaries(&published, &candidate.bundle_poisons)?;
+    let current_bundle_summaries =
+        candidate_bundle_summaries(&published, &candidate.bundle_poisons)?;
     // A bundle whose assets changed without its bytes (an asset started or
     // stopped colliding) republishes too.
     let current_bundle_assets = published_bundle_assets(&published, &candidate.bundle_poisons);
     let asset_changes = AssetGroupChanges::read(store, &current_bundle_assets)?;
-    let assets_changed = |bundle: &BundleUuid| asset_changes.changed(bundle, &current_bundle_assets);
+    let assets_changed =
+        |bundle: &BundleUuid| asset_changes.changed(bundle, &current_bundle_assets);
     // So does one holding an asset whose type the projection retyped.
     let retyped_bundles = published
         .iter()
         .filter_map(|source| source.parsed.as_ref().ok())
-        .filter(|bundle| bundle.assets.values().any(|entry| retyped.contains(&entry.type_uuid)))
+        .filter(|bundle| {
+            bundle
+                .assets
+                .values()
+                .any(|entry| retyped.contains(&entry.type_uuid))
+        })
         .map(|bundle| bundle.uuid)
         .collect::<BTreeSet<_>>();
     // So does a poisoned one holding an asset of a type whose tag epoch the
@@ -2429,18 +2517,30 @@ fn publish_scan(
         let rewritten = published
             .iter()
             .filter_map(|source| source.parsed.as_ref().ok().map(|bundle| bundle.uuid))
-            .chain(candidate.bundle_poisons.values().map(|poison| poison.bundle))
+            .chain(
+                candidate
+                    .bundle_poisons
+                    .values()
+                    .map(|poison| poison.bundle),
+            )
             .filter(|bundle| publishable_changed_bundles.contains(bundle))
             .collect::<BTreeSet<_>>();
         let kept = published
             .iter()
             .filter_map(|source| source.parsed.as_ref().ok())
-            .map(|bundle| (bundle.uuid, bundle.assets.values().map(|entry| entry.uuid).collect()))
+            .map(|bundle| {
+                (
+                    bundle.uuid,
+                    bundle.assets.values().map(|entry| entry.uuid).collect(),
+                )
+            })
             .collect::<BTreeMap<_, BTreeSet<_>>>();
         for bundle in old_bundle_summaries.keys() {
             if rewritten.contains(bundle) {
                 // A poisoned rewrite replaces every asset row itself.
-                if let (Some(keep), Some(held)) = (kept.get(bundle), asset_changes.stored.get(bundle)) {
+                if let (Some(keep), Some(held)) =
+                    (kept.get(bundle), asset_changes.stored.get(bundle))
+                {
                     transaction.retain_bundle_assets(held, keep)?;
                 }
             } else if !current_bundle_summaries.contains_key(bundle)
@@ -2483,11 +2583,16 @@ fn publish_scan(
                     terminal_type: Some(projection.interface(entry.type_uuid).terminal),
                 })
                 .collect::<Vec<_>>();
-            let primary = bundle.primary.as_ref().map(|primary| bundle.assets[primary].uuid);
+            let primary = bundle
+                .primary
+                .as_ref()
+                .map(|primary| bundle.assets[primary].uuid);
             // A bundle with a row, or whose asset has one (a poisoned
             // bundle's skeleton row, say), republishes over them.
             if old_bundle_summaries.contains_key(&bundle.uuid)
-                || assets.iter().any(|asset| stored_assets.contains(&asset.asset))
+                || assets
+                    .iter()
+                    .any(|asset| stored_assets.contains(&asset.asset))
             {
                 transaction.upsert_bundle(&meta)?;
                 for asset in &assets {
@@ -2602,11 +2707,13 @@ fn publish_reconfiguration(
         #[cfg(test)]
         compiled_tests::source_reclaimed();
         let source = Arc::new(scanner.read_published_bundle(store, root_name, path)?);
-        claims.push(source_claims(&source, projection, Some(authority)).map_err(|error| {
-            StoreError::InvalidConfiguration {
-                error: error.to_string(),
-            }
-        })?);
+        claims.push(
+            source_claims(&source, projection, Some(authority)).map_err(|error| {
+                StoreError::InvalidConfiguration {
+                    error: error.to_string(),
+                }
+            })?,
+        );
         match (&source.parsed, &source.namespace_skeleton) {
             (Ok(bundle), _) => {
                 forced.insert(bundle.uuid);
@@ -2723,7 +2830,13 @@ fn publish_incremental_scan(
                 .or_insert(transaction.intern_root(&mutation.root_name)?);
             if mutation.file.is_none() {
                 transaction.remove_file(root, &mutation.path)?;
-                transaction.push_dirty(root, &mutation.root_name, &mutation.path, false, observation)?;
+                transaction.push_dirty(
+                    root,
+                    &mutation.root_name,
+                    &mutation.path,
+                    false,
+                    observation,
+                )?;
             }
         }
         for mutation in &file_mutations {
@@ -2731,7 +2844,13 @@ fn publish_incremental_scan(
             let root = root_ids[&mutation.root_name];
             transaction.upsert_file(root, &mutation.path, file, observation)?;
             if mutation.dirty {
-                transaction.push_dirty(root, &mutation.root_name, &mutation.path, true, observation)?;
+                transaction.push_dirty(
+                    root,
+                    &mutation.root_name,
+                    &mutation.path,
+                    true,
+                    observation,
+                )?;
             }
         }
         let pending = transaction.replace_source_claims(Some(delta.affected_prefixes()), claims)?;
@@ -2890,12 +3009,15 @@ fn prepare_incremental_publication(
     projection: &PipelineProjection,
     forced: &BTreeSet<BundleUuid>,
 ) -> Result<IncrementalPublication, StoreError> {
-    let plan = incremental_plan(store, inputs, pending, namespace_errors).map_err(|error| match error {
-        CoordinatorError::Drifted { root, path } => StoreError::Drifted { root, path },
-        error => StoreError::InvalidConfiguration {
-            error: error.to_string(),
-        },
-    })?;
+    let plan =
+        incremental_plan(store, inputs, pending, namespace_errors).map_err(
+            |error| match error {
+                CoordinatorError::Drifted { root, path } => StoreError::Drifted { root, path },
+                error => StoreError::InvalidConfiguration {
+                    error: error.to_string(),
+                },
+            },
+        )?;
     let configuration_generation = store.configuration_generation()?;
     let mut durable_bundles = BTreeMap::new();
     for bundle in plan.bundles.keys() {
@@ -3000,7 +3122,9 @@ fn prepare_incremental_publication(
                 push_entry(
                     &mut commit,
                     // An asset of the bundle had a row; another may have one elsewhere.
-                    |asset| Ok(old.assets.contains(&asset) || store.asset_resolution(asset)?.is_some()),
+                    |asset| {
+                        Ok(old.assets.contains(&asset) || store.asset_resolution(asset)?.is_some())
+                    },
                     rpc_entry(
                         source.normalized_path.clone(),
                         bundle,
@@ -3057,11 +3181,13 @@ pub(crate) fn incremental_overlay(
         incremental_file_mutations(published, delta)?
             .into_iter()
             .map(|mutation| {
-                let row = mutation.file.map(|file| distill_store::files::ObservedFile {
-                    root_name: mutation.root_name.clone(),
-                    path: mutation.path.clone(),
-                    file,
-                });
+                let row = mutation
+                    .file
+                    .map(|file| distill_store::files::ObservedFile {
+                        root_name: mutation.root_name.clone(),
+                        path: mutation.path.clone(),
+                        file,
+                    });
                 ((mutation.root_name, mutation.path), row)
             }),
     ))
@@ -3106,14 +3232,15 @@ fn bundle_summary(source: &ScannedBundle) -> Result<BundleSummary, StoreError> {
         .parsed
         .as_ref()
         .expect("indexed current bundle parsed successfully");
-    let (origin, import_watched) = crate::importer::decoded_record_facts(bundle).map_err(|error| {
-        StoreError::InvalidConfiguration {
-            error: format!(
-                "invalid import record in {}: {error:?}",
-                source.normalized_path
-            ),
-        }
-    })?;
+    let (origin, import_watched) =
+        crate::importer::decoded_record_facts(bundle).map_err(|error| {
+            StoreError::InvalidConfiguration {
+                error: format!(
+                    "invalid import record in {}: {error:?}",
+                    source.normalized_path
+                ),
+            }
+        })?;
     Ok(BundleSummary {
         root_name: source.root_name.clone(),
         path: source.normalized_path.clone(),
@@ -3162,19 +3289,13 @@ pub(crate) fn publish_incremental_paths(
         fresh: fresh_bundles(&delta),
         scanner,
     };
-    let (mut commit, _) = publish_incremental_scan(
-        store,
-        base,
-        &delta,
-        &claims,
-        &inputs,
-        &[],
-        projection,
-    )
-    .map_err(|error| error.to_string())?;
+    let (mut commit, _) =
+        publish_incremental_scan(store, base, &delta, &claims, &inputs, &[], projection)
+            .map_err(|error| error.to_string())?;
     if let (Some(coordinator), Some(authority)) = (coordinator, authority) {
         crate::build::refine_tag_index(
-            crate::build::OpenInput::new(store).expect("tag-index refinement runs inside its input"),
+            crate::build::OpenInput::new(store)
+                .expect("tag-index refinement runs inside its input"),
             scanner.clone(),
             authority,
             compiled.pipeline_snapshot(),
@@ -3211,11 +3332,7 @@ fn rpc_commit(
     };
 
     // A withheld asset is not deleted: it resolves to its error.
-    let mut current_assets = withheld
-        .assets
-        .keys()
-        .copied()
-        .collect::<BTreeSet<_>>();
+    let mut current_assets = withheld.assets.keys().copied().collect::<BTreeSet<_>>();
     for asset in newly_failed {
         commit.assets.push(AssetMutation {
             uuid: *asset,
@@ -3385,7 +3502,6 @@ fn readable_source(source: &crate::scanner::ScannedBundle) -> ReadableBundleSour
     }
 }
 
-
 fn skeleton_failure(error: &distill_bundle::BundleError) -> SkeletonFailureCode {
     use distill_bundle::BundleError;
     match error {
@@ -3408,7 +3524,6 @@ fn skeleton_failure(error: &distill_bundle::BundleError) -> SkeletonFailureCode 
         _ => SkeletonFailureCode::EnvelopeMalformed,
     }
 }
-
 
 /// The pipeline runtime. Other threads read the epoch of their own version
 /// through its compiled state (`crate::compiled`), never this.
@@ -3453,7 +3568,9 @@ fn lock_pipeline(pipeline: &PipelineState) -> PipelineGuard<'_> {
 
 /// `mutex`, locked; a panic while it was held leaves the state as it was.
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn build_worker_pool(parallelism: usize) -> Result<Arc<ThreadPool>, String> {
@@ -3540,13 +3657,8 @@ mod scheduler_tests {
         config.parallelism = 1;
         config.batch_reserved_workers = 1;
         let coordinator = Arc::new(
-            DaemonCoordinator::open(
-                config,
-                vec![AssetRoot::new("main", &assets)],
-                Vec::new(),
-                8,
-            )
-            .unwrap(),
+            DaemonCoordinator::open(config, vec![AssetRoot::new("main", &assets)], Vec::new(), 8)
+                .unwrap(),
         );
         let (first_entered_tx, first_entered_rx) = mpsc::sync_channel(1);
         let (release_first_tx, release_first_rx) = mpsc::sync_channel(1);
@@ -3655,7 +3767,10 @@ mod publish_diff_tests {
 
     impl Lcg {
         fn next(&mut self, bound: u64) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (self.0 >> 33) % bound
         }
     }
@@ -3729,7 +3844,10 @@ mod publish_diff_tests {
                 .filter(|key| !candidate.files.contains_key(*key))
                 .cloned()
                 .collect::<Vec<_>>();
-            assert_eq!(scan_file_changes(&store, &candidate).unwrap(), (writes, removed));
+            assert_eq!(
+                scan_file_changes(&store, &candidate).unwrap(),
+                (writes, removed)
+            );
         }
     }
 
@@ -3785,7 +3903,9 @@ mod publish_diff_tests {
                 if random.next(3) != 0 {
                     current.insert(
                         bundle(index),
-                        (0..random.next(3)).map(|entry| asset(index * 8 + entry)).collect(),
+                        (0..random.next(3))
+                            .map(|entry| asset(index * 8 + entry))
+                            .collect(),
                     );
                 }
             }
@@ -3814,7 +3934,10 @@ mod publish_diff_tests {
             let old_paths: Vec<(String, RootId, AssetUuid)> = store.all_path_entries().unwrap();
             let mut old_path_candidates = BTreeMap::<String, BTreeSet<AssetUuid>>::new();
             for (path, _, asset) in &old_paths {
-                old_path_candidates.entry(path.clone()).or_default().insert(*asset);
+                old_path_candidates
+                    .entry(path.clone())
+                    .or_default()
+                    .insert(*asset);
             }
             let mut expected = Vec::new();
             let names = old_path_candidates
@@ -3840,20 +3963,21 @@ mod publish_diff_tests {
     }
 }
 
-
 #[cfg(test)]
 mod projection_tests {
     //! A publication under a new pipeline projection leaves no asset row
     //! with the old projection's served interface.
 
     use super::*;
-    use distill_bundle::AssetEntry;
-    use distill_json::AuthoredValue;
     use crate::callbacks::ProcessorDescriptor;
     use crate::scanner::{AssetRoot, RootedScanner};
     use distill_build::outputs::OutputDecls;
     use distill_build::pipeline::{GraphicsApi, TargetArch, TargetOs, TargetSelector};
-    use distill_schema::ngp_schema::{node_hash, LayoutIdentity, LogicalSchema, PrimitiveKind, SchemaNode};
+    use distill_bundle::AssetEntry;
+    use distill_json::AuthoredValue;
+    use distill_schema::ngp_schema::{
+        node_hash, LayoutIdentity, LogicalSchema, PrimitiveKind, SchemaNode,
+    };
 
     const SOURCE: TypeUuid = TypeUuid([1; 16]);
     const TERMINAL: TypeUuid = TypeUuid([2; 16]);
@@ -3900,7 +4024,10 @@ mod projection_tests {
         let candidate = ScanCandidate::build(scanner.scan().unwrap(), None).unwrap();
         let claims = bundle_claims(candidate.scan.bundle_rows(), projection, None).unwrap();
         let base = store.input_version().unwrap();
-        publish_scan(store, base, candidate, false, None, projection, retyped, None, &claims).unwrap();
+        publish_scan(
+            store, base, candidate, false, None, projection, retyped, None, &claims,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -3936,13 +4063,23 @@ mod projection_tests {
         .unwrap();
         let scanner = RootedScanner::new([AssetRoot::new("main", &root)]).unwrap();
         let mut store = Store::open(StoreConfig::new(dir.path().join(".distill"))).unwrap();
-        let terminal = |store: &Store| store.served_entry_meta(asset).unwrap().unwrap().terminal_type;
+        let terminal = |store: &Store| {
+            store
+                .served_entry_meta(asset)
+                .unwrap()
+                .unwrap()
+                .terminal_type
+        };
 
         let (before, after) = (projection(None), projection(Some(TERMINAL)));
         publish(&mut store, &scanner, &before, &BTreeSet::new());
         assert_eq!(terminal(&store), SOURCE);
         assert_eq!(after.retyped(&before), BTreeSet::from([SOURCE]));
         publish(&mut store, &scanner, &after, &after.retyped(&before));
-        assert_eq!(terminal(&store), TERMINAL, "the unchanged bundle kept the old terminal type");
+        assert_eq!(
+            terminal(&store),
+            TERMINAL,
+            "the unchanged bundle kept the old terminal type"
+        );
     }
 }

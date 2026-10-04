@@ -58,7 +58,9 @@ use std::collections::BTreeSet;
 use distill_store::files::ObservedFile;
 
 use super::*;
-use crate::importer::{FileOverlay, ImportRun, PassImport, PassOutput, PassPublication, PlannedImport};
+use crate::importer::{
+    FileOverlay, ImportRun, PassImport, PassOutput, PassPublication, PlannedImport,
+};
 
 /// What a reconciliation pass did.
 #[derive(Debug, Clone)]
@@ -376,7 +378,9 @@ impl DaemonCoordinator {
             if scope.imports() {
                 let work = match scope.affected.and_then(|affected| affected.work) {
                     Some(work) => work.clone(),
-                    None => store.pending_file_work().map_err(|error| error.to_string())?,
+                    None => store
+                        .pending_file_work()
+                        .map_err(|error| error.to_string())?,
                 };
                 let imports = self.discover(store, &step, &work, &written, scope, None)?;
                 if !imports.is_empty() {
@@ -451,7 +455,9 @@ impl DaemonCoordinator {
             self.refine_scan_tags(store, &step, &mut commit)?;
             let work = match scope.affected.and_then(|affected| affected.work) {
                 Some(work) => work.clone(),
-                None => store.pending_file_work().map_err(|error| error.to_string())?,
+                None => store
+                    .pending_file_work()
+                    .map_err(|error| error.to_string())?,
             };
             // Each level's imports are those due under the work the level
             // before published; level 0's, under the pass's own work.
@@ -462,8 +468,14 @@ impl DaemonCoordinator {
             for level in 0..levels.len() {
                 let mut outputs = Vec::new();
                 // Only the step wrote bundle rows before level 0's imports.
-                let written = if level == 0 { written.clone() } else { BTreeSet::new() };
-                for import in self.discover(store, &step, &level_work, &written, level_scope, None)? {
+                let written = if level == 0 {
+                    written.clone()
+                } else {
+                    BTreeSet::new()
+                };
+                for import in
+                    self.discover(store, &step, &level_work, &written, level_scope, None)?
+                {
                     let Some(index) = levels[level]
                         .iter()
                         .position(|(planned, _)| *planned == import)
@@ -503,7 +515,11 @@ impl DaemonCoordinator {
                         PassPublication::Memoized => {}
                         PassPublication::Drifted => more_work = true,
                         PassPublication::Failed(error) => {
-                            tracing::warn!(?import, ?error, "import failed with no bundle to hold its failure");
+                            tracing::warn!(
+                                ?import,
+                                ?error,
+                                "import failed with no bundle to hold its failure"
+                            );
                             failures.push(format!("{error:?}"));
                         }
                     }
@@ -546,7 +562,11 @@ impl DaemonCoordinator {
     /// The `files` rows `step` changes, as the overlay its imports run
     /// under: only the rows that differ from the committed ones, read
     /// outside any input (the step's input rolled back).
-    fn step_overlay(&self, store: &StoreReader, step: &ScanStep) -> Result<FileOverlay, CoordinatorError> {
+    fn step_overlay(
+        &self,
+        store: &StoreReader,
+        step: &ScanStep,
+    ) -> Result<FileOverlay, CoordinatorError> {
         Ok(match step {
             ScanStep::Full(step) => FileOverlay::differences(
                 store,
@@ -610,8 +630,9 @@ impl DaemonCoordinator {
         levels: &mut Vec<Level>,
         chain: &mut Chain,
     ) -> Result<(), CoordinatorError> {
-        let publication =
-            |error: String| CoordinatorError::Coordinated(CoordinatedCommitError::Publication(error));
+        let publication = |error: String| {
+            CoordinatorError::Coordinated(CoordinatedCommitError::Publication(error))
+        };
         let rpc = |error: RpcFailure| publication(format!("{error:?}"));
         // What the input will hold at each output path, once every level
         // so far publishes.
@@ -753,22 +774,26 @@ impl DaemonCoordinator {
         step: &ScanStep,
         plan: impl FnOnce(&mut Store) -> Result<T, CoordinatorError>,
     ) -> Result<T, CoordinatorError> {
-        let publication =
-            |error: String| CoordinatorError::Coordinated(CoordinatedCommitError::Publication(error));
+        let publication = |error: String| {
+            CoordinatorError::Coordinated(CoordinatedCommitError::Publication(error))
+        };
         let observed = store
             .open_input()
             .map_err(|error| publication(error.to_string()))?;
         let planned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if observed != base {
-                return Err(CoordinatorError::Coordinated(CoordinatedCommitError::Stale {
-                    expected: base,
-                    observed,
-                }));
+                return Err(CoordinatorError::Coordinated(
+                    CoordinatedCommitError::Stale {
+                        expected: base,
+                        observed,
+                    },
+                ));
             }
-            self.apply_scan_step(store, step).map_err(|failure| match failure {
-                StepFailure::Drifted { root, path } => CoordinatorError::Drifted { root, path },
-                StepFailure::Failed(error) => publication(error),
-            })?;
+            self.apply_scan_step(store, step)
+                .map_err(|failure| match failure {
+                    StepFailure::Drifted { root, path } => CoordinatorError::Drifted { root, path },
+                    StepFailure::Failed(error) => publication(error),
+                })?;
             plan(store)
         }));
         let rolled_back = store.finish_input(false);
@@ -799,7 +824,9 @@ impl DaemonCoordinator {
         // `work` names, parsed once each.
         let refreshed = self
             .authoring
-            .refresh_import_index(store, &work.dirty, written, |root, path| step.fresh_bundle(root, path))
+            .refresh_import_index(store, &work.dirty, written, |root, path| {
+                step.fresh_bundle(root, path)
+            })
             .map_err(failure)?;
         // `None` revalidates every import.
         let affected = scope.affected.map(|affected| {
@@ -925,7 +952,8 @@ impl DaemonCoordinator {
         // echo of an import's bundle write publishes nothing.
         let mut echo = healthy && delta.matches_published(store)?;
         for rename in &renames {
-            echo = echo && delta.rename_moves_nothing(store, &rename.root_name, &rename.from_path)?;
+            echo =
+                echo && delta.rename_moves_nothing(store, &rename.root_name, &rename.from_path)?;
         }
         if echo {
             return Ok(ScanStep::Unchanged);
@@ -973,7 +1001,11 @@ impl DaemonCoordinator {
 
     /// The step publishing `scan`, which observed every root, as the
     /// complete namespace: it heals the pending scan rejection.
-    fn candidate_step(&self, compiled: &Arc<Compiled>, scan: ScanSnapshot) -> Result<ScanStep, CoordinatorError> {
+    fn candidate_step(
+        &self,
+        compiled: &Arc<Compiled>,
+        scan: ScanSnapshot,
+    ) -> Result<ScanStep, CoordinatorError> {
         let tags = self.tag_inputs(compiled);
         let authority = tags.authority();
         let candidate = ScanCandidate::build(scan, authority.as_deref())?;
@@ -1037,7 +1069,8 @@ impl DaemonCoordinator {
             return Ok(());
         };
         crate::build::refine_tag_index(
-            crate::build::OpenInput::new(store).expect("tag-index refinement runs inside its input"),
+            crate::build::OpenInput::new(store)
+                .expect("tag-index refinement runs inside its input"),
             tags.compiled.scanner().clone(),
             authority,
             tags.compiled.pipeline_snapshot(),
@@ -1079,8 +1112,7 @@ impl DaemonCoordinator {
                     &inputs,
                     &step.renames,
                     tags.compiled.projection(),
-                )
-                ?;
+                )?;
                 Ok((Some(commit), written))
             }
             ScanStep::Full(step) => {
@@ -1109,8 +1141,8 @@ impl DaemonCoordinator {
                 let pending = if step.replaces_pending {
                     step.observed.clone()
                 } else {
-                    let previous = PendingScanRejection::stored(store)
-                        .map_err(|error| error.to_string())?;
+                    let previous =
+                        PendingScanRejection::stored(store).map_err(|error| error.to_string())?;
                     let rejection = select_scan_rejection(
                         previous
                             .as_ref()
@@ -1128,7 +1160,9 @@ impl DaemonCoordinator {
                         subjects,
                     }
                 };
-                let generation = store.configuration_generation().map_err(|error| error.to_string())?;
+                let generation = store
+                    .configuration_generation()
+                    .map_err(|error| error.to_string())?;
                 let (configuration, _) = store
                     .input_transaction(|transaction| {
                         transaction.publish_claims_namespace_errors()?;
@@ -1225,10 +1259,14 @@ fn absorb_into(commit: &mut Commit, later: Commit) {
         earlier.extend(later);
     }
     keyed(&mut commit.assets, later.assets, |mutation| mutation.uuid);
-    keyed(&mut commit.authoring, later.authoring, |mutation| match mutation {
-        AuthoringMutation::Set(entry) => entry.uuid,
-        AuthoringMutation::Remove { uuid } => *uuid,
-    });
+    keyed(
+        &mut commit.authoring,
+        later.authoring,
+        |mutation| match mutation {
+            AuthoringMutation::Set(entry) => entry.uuid,
+            AuthoringMutation::Remove { uuid } => *uuid,
+        },
+    );
     keyed(&mut commit.paths, later.paths, |mutation| match mutation {
         PathMutation::Set { path, .. } | PathMutation::Remove { path } => path.clone(),
     });

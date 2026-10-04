@@ -40,7 +40,10 @@ impl<T> Current<T> {
 
 impl<T: std::fmt::Debug> std::fmt::Debug for Current<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_tuple("Current").field(&self.load()).finish()
+        formatter
+            .debug_tuple("Current")
+            .field(&self.load())
+            .finish()
     }
 }
 

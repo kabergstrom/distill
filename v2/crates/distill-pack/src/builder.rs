@@ -681,7 +681,10 @@ async fn build_paths(
         }
         // Every packed runtime entry is reachable by its name too.
         let name = entry.local_id;
-        match terminal(snapshot, remote(snapshot.resolve_named(&path, &name).await)?)? {
+        match terminal(
+            snapshot,
+            remote(snapshot.resolve_named(&path, &name).await)?,
+        )? {
             PathResolveResult::Resolved(named) if named == asset => paths.push(PathRow {
                 path,
                 name: Some(name),

@@ -45,15 +45,14 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::{
     AssetDeltaState, AssetEvent, AssetQuery, AssetUuid, AuthoringEntryRole, AuthoringInspectResult,
-    AuthoringInspection, AuthoringSnapshot, BundleUuid, ChunkStream,
-    ConfigurationError, ConfigurationStatus, ConnectError, ConnectOutcome, ConnectRequest,
-    ContentHash, Delta, DeltaStream, DriftedInput, Hub, InputVersion, LayoutHash,
-    MetadataAuthoringSnapshot, MetadataCall, MetadataConnectOutcome, MetadataDiagnostics,
-    MetadataEntry, MetadataHub, MetadataNamespaceCall, MetadataReconnectReason, MetadataSnapshot,
-    PathResolveFailure, PathResolveResult, ProgressStream,
-    PureMetadataEntry, PureMetadataQuery, ReconnectReason, ResolveResult, Root, RpcBasis,
-    RpcFailure, RpcResult, Snapshot, SnapshotStamp, StoreInstanceId, TagSelector,
-    TargetDefinitionHash, TypeUuid, NamespaceError, NamespaceErrorV1,
+    AuthoringInspection, AuthoringSnapshot, BundleUuid, ChunkStream, ConfigurationError,
+    ConfigurationStatus, ConnectError, ConnectOutcome, ConnectRequest, ContentHash, Delta,
+    DeltaStream, DriftedInput, Hub, InputVersion, LayoutHash, MetadataAuthoringSnapshot,
+    MetadataCall, MetadataConnectOutcome, MetadataDiagnostics, MetadataEntry, MetadataHub,
+    MetadataNamespaceCall, MetadataReconnectReason, MetadataSnapshot, NamespaceError,
+    NamespaceErrorV1, PathResolveFailure, PathResolveResult, ProgressStream, PureMetadataEntry,
+    PureMetadataQuery, ReconnectReason, ResolveResult, Root, RpcBasis, RpcFailure, RpcResult,
+    Snapshot, SnapshotStamp, StoreInstanceId, TagSelector, TargetDefinitionHash, TypeUuid,
 };
 
 pub use crate::distill_rpc_capnp as schema;
@@ -91,7 +90,9 @@ pub enum TransportError {
     Io(io::Error),
     Capnp(capnp::Error),
     /// The listener is serving `limit` connections, or shutting down.
-    Refused { limit: usize },
+    Refused {
+        limit: usize,
+    },
 }
 
 impl fmt::Display for TransportError {
@@ -229,7 +230,11 @@ impl StagedListener {
     /// capability it hands out live and die there. Past `max_connections`
     /// running threads, or after shutdown, the connection is closed
     /// unserved.
-    fn start(&self, stream: TcpStream, peer: SocketAddr) -> Result<ConnectionHandle, TransportError> {
+    fn start(
+        &self,
+        stream: TcpStream,
+        peer: SocketAddr,
+    ) -> Result<ConnectionHandle, TransportError> {
         if !peer.ip().is_loopback() {
             return Err(TransportError::BindValidation(
                 crate::BindStageError::NonLoopbackAddress {
@@ -322,7 +327,10 @@ impl StagedListener {
         let _ = tokio::time::timeout(grace, live.wait_for(|live| *live == 0)).await;
         let remaining = *live.borrow();
         if remaining > 0 {
-            tracing::warn!(remaining, "RPC connection threads still running after shutdown");
+            tracing::warn!(
+                remaining,
+                "RPC connection threads still running after shutdown"
+            );
         }
         remaining
     }
@@ -496,10 +504,9 @@ impl fmt::Debug for RemoteConnectOutcome {
                 .debug_struct("Connected")
                 .field("instance", instance)
                 .finish_non_exhaustive(),
-            Self::ConfigurationFailed(error) => f
-                .debug_tuple("ConfigurationFailed")
-                .field(error)
-                .finish(),
+            Self::ConfigurationFailed(error) => {
+                f.debug_tuple("ConfigurationFailed").field(error).finish()
+            }
             Self::PipelineUnavailable(diagnostic) => f
                 .debug_tuple("PipelineUnavailable")
                 .field(diagnostic)
@@ -581,7 +588,11 @@ impl schema::root::Server for RootService {
                     write_connect_error(result, &error);
                 }
                 ConnectOutcome::Refused(failure) => {
-                    write_error(result.init_error(), CONNECTION_LIMIT, &format!("{failure:?}"));
+                    write_error(
+                        result.init_error(),
+                        CONNECTION_LIMIT,
+                        &format!("{failure:?}"),
+                    );
                 }
             }
             Ok(())
@@ -612,13 +623,16 @@ impl schema::root::Server for RootService {
                     failure.set_message("metadata bootstrap protocol mismatch");
                 }
                 MetadataConnectOutcome::Refused(failure) => {
-                    write_error(result.init_error(), CONNECTION_LIMIT, &format!("{failure:?}"));
+                    write_error(
+                        result.init_error(),
+                        CONNECTION_LIMIT,
+                        &format!("{failure:?}"),
+                    );
                 }
             }
             Ok(())
         }
     }
-
 }
 
 struct MetadataHubService {
@@ -680,7 +694,6 @@ impl schema::metadata_hub::Server for MetadataHubService {
             Ok(())
         }
     }
-
 }
 
 struct HubService {
@@ -808,7 +821,10 @@ impl schema::hub::Server for HubService {
                     return Ok(());
                 }
             };
-            let result = match self.hub.import_prepare(InputVersion(params.get_base()), request) {
+            let result = match self
+                .hub
+                .import_prepare(InputVersion(params.get_base()), request)
+            {
                 // The importer runs on a blocking worker, never on the
                 // single-threaded capnp-rpc driver.
                 Ok(pending) => {
@@ -847,7 +863,10 @@ impl schema::hub::Server for HubService {
                     return Ok(());
                 }
             };
-            let result = match self.hub.reimport_prepare(InputVersion(params.get_base()), bundle) {
+            let result = match self
+                .hub
+                .reimport_prepare(InputVersion(params.get_base()), bundle)
+            {
                 // The importer runs on a blocking worker, never on the
                 // single-threaded capnp-rpc driver.
                 Ok(pending) => {
@@ -1255,8 +1274,8 @@ impl schema::snapshot::Server for SnapshotService {
             }
             let params = params.get()?;
             let (path, name) = (params.get_path()?, params.get_name()?);
-            let decoded = decode_text(path, "path")
-                .and_then(|path| Ok((path, decode_text(name, "name")?)));
+            let decoded =
+                decode_text(path, "path").and_then(|path| Ok((path, decode_text(name, "name")?)));
             let (path, name) = match decoded {
                 Ok(decoded) => decoded,
                 Err(error) => {
@@ -1617,10 +1636,7 @@ impl schema::progress_stream::Server for ProgressStreamService {
         mut results: schema::progress_stream::CancelResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            let cancelled = self
-                .stream
-                .borrow_mut()
-                .cancel();
+            let cancelled = self.stream.borrow_mut().cancel();
             results.get().set_cancelled(cancelled);
             Ok(())
         }
@@ -1635,10 +1651,7 @@ impl schema::chunk_stream::Server for ChunkStreamService {
         mut results: schema::chunk_stream::NextResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            let chunk = self
-                .stream
-                .borrow_mut()
-                .next_chunk();
+            let chunk = self.stream.borrow_mut().next_chunk();
             let mut output = results.get();
             match chunk {
                 None => output.set_done(true),
@@ -2769,9 +2782,11 @@ fn write_authoring_snapshot_result(
             write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
-        RpcResult::Failure(error) => {
-            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        RpcResult::Failure(error) => write_error(
+            result.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
 }
 
@@ -2791,9 +2806,11 @@ fn write_metadata_snapshot_result(
             write_metadata_reconnect(result.init_reconnect_required(), reason)
         }
         MetadataCall::SnapshotExpired => result.set_snapshot_expired(()),
-        MetadataCall::Error(error) => {
-            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        MetadataCall::Error(error) => write_error(
+            result.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
 }
 
@@ -2813,9 +2830,11 @@ fn write_metadata_authoring_snapshot_result(
             write_metadata_reconnect(result.init_reconnect_required(), reason)
         }
         MetadataCall::SnapshotExpired => result.set_snapshot_expired(()),
-        MetadataCall::Error(error) => {
-            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        MetadataCall::Error(error) => write_error(
+            result.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
 }
 
@@ -2835,9 +2854,11 @@ fn write_metadata_authoring_refresh_result(
             write_metadata_reconnect(result.init_reconnect_required(), reason)
         }
         MetadataCall::SnapshotExpired => result.set_snapshot_expired(()),
-        MetadataCall::Error(error) => {
-            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        MetadataCall::Error(error) => write_error(
+            result.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
 }
 
@@ -2863,7 +2884,8 @@ fn write_metadata_diagnostics_result(
                     write_pipeline_failure(pipeline.init_failed(), failure)?
                 }
             }
-            let mut errors = output.init_namespace_errors(diagnostics.namespace_errors.len() as u32);
+            let mut errors =
+                output.init_namespace_errors(diagnostics.namespace_errors.len() as u32);
             for (index, error) in diagnostics.namespace_errors.iter().enumerate() {
                 write_namespace_error(errors.reborrow().get(index as u32), error);
             }
@@ -2872,9 +2894,11 @@ fn write_metadata_diagnostics_result(
             write_metadata_reconnect(result.init_reconnect_required(), reason)
         }
         MetadataCall::SnapshotExpired => result.set_snapshot_expired(()),
-        MetadataCall::Error(error) => {
-            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        MetadataCall::Error(error) => write_error(
+            result.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
     Ok(())
 }
@@ -2889,9 +2913,11 @@ fn write_metadata_uint64_result(
             write_metadata_reconnect(result.init_reconnect_required(), reason)
         }
         MetadataCall::SnapshotExpired => result.set_snapshot_expired(()),
-        MetadataCall::Error(error) => {
-            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        MetadataCall::Error(error) => write_error(
+            result.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
 }
 
@@ -2910,9 +2936,11 @@ fn write_metadata_uuid_list_result(
             write_metadata_reconnect(result.init_reconnect_required(), reason)
         }
         MetadataNamespaceCall::SnapshotExpired => result.set_snapshot_expired(()),
-        MetadataNamespaceCall::Error(error) => {
-            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        MetadataNamespaceCall::Error(error) => write_error(
+            result.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
 }
 
@@ -2928,9 +2956,11 @@ fn write_metadata_entry_result(
             write_metadata_reconnect(result.init_reconnect_required(), reason)
         }
         MetadataNamespaceCall::SnapshotExpired => result.set_snapshot_expired(()),
-        MetadataNamespaceCall::Error(error) => {
-            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        MetadataNamespaceCall::Error(error) => write_error(
+            result.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
 }
 
@@ -2956,9 +2986,11 @@ fn write_metadata_path_result(
             write_metadata_reconnect(result.init_reconnect_required(), reason)
         }
         MetadataNamespaceCall::SnapshotExpired => result.set_snapshot_expired(()),
-        MetadataNamespaceCall::Error(error) => {
-            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        MetadataNamespaceCall::Error(error) => write_error(
+            result.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
 }
 
@@ -2983,9 +3015,11 @@ fn write_metadata_authoring_inspect_result(
             write_metadata_reconnect(result.init_reconnect_required(), reason)
         }
         MetadataNamespaceCall::SnapshotExpired => result.set_snapshot_expired(()),
-        MetadataNamespaceCall::Error(error) => {
-            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        MetadataNamespaceCall::Error(error) => write_error(
+            result.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
 }
 
@@ -3049,9 +3083,11 @@ fn write_uuid_list_result(
             write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
-        RpcResult::Failure(error) => {
-            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        RpcResult::Failure(error) => write_error(
+            result.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
 }
 
@@ -3067,12 +3103,12 @@ fn write_target_entry_result(
         RpcResult::ConfigurationFailed(error) => {
             write_configuration_error(result.init_configuration_failed(), &error)
         }
-        RpcResult::Failure(RpcFailure::SnapshotExpired) => {
-            result.set_snapshot_expired(())
-        }
-        RpcResult::Failure(error) => {
-            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
+        RpcResult::Failure(error) => write_error(
+            result.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
 }
 
@@ -3100,9 +3136,11 @@ fn write_authoring_inspect_result(
             write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
-        RpcResult::Failure(error) => {
-            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        RpcResult::Failure(error) => write_error(
+            result.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
 }
 
@@ -3181,12 +3219,12 @@ fn write_void_result(mut result: schema::void_call::Builder<'_>, outcome: RpcRes
         RpcResult::ConfigurationFailed(error) => {
             write_configuration_error(result.init_configuration_failed(), &error)
         }
-        RpcResult::Failure(RpcFailure::SnapshotExpired) => {
-            result.set_snapshot_expired(())
-        }
-        RpcResult::Failure(error) => {
-            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
+        RpcResult::Failure(error) => write_error(
+            result.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
 }
 
@@ -3199,12 +3237,12 @@ fn write_uint64_result(mut result: schema::u_int64_call::Builder<'_>, outcome: R
         RpcResult::ConfigurationFailed(error) => {
             write_configuration_error(result.init_configuration_failed(), &error)
         }
-        RpcResult::Failure(RpcFailure::SnapshotExpired) => {
-            result.set_snapshot_expired(())
-        }
-        RpcResult::Failure(error) => {
-            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
+        RpcResult::Failure(error) => write_error(
+            result.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
 }
 
@@ -3220,12 +3258,12 @@ fn write_bundle_uuid_result(
         RpcResult::ConfigurationFailed(error) => {
             write_configuration_error(result.init_configuration_failed(), &error)
         }
-        RpcResult::Failure(RpcFailure::SnapshotExpired) => {
-            result.set_snapshot_expired(())
-        }
-        RpcResult::Failure(error) => {
-            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
+        RpcResult::Failure(error) => write_error(
+            result.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
 }
 
@@ -3247,12 +3285,12 @@ fn write_progress_result(
         RpcResult::ConfigurationFailed(error) => {
             write_configuration_error(result.init_configuration_failed(), &error)
         }
-        RpcResult::Failure(RpcFailure::SnapshotExpired) => {
-            result.set_snapshot_expired(())
-        }
-        RpcResult::Failure(error) => {
-            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
+        RpcResult::Failure(error) => write_error(
+            result.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
 }
 
@@ -3278,9 +3316,11 @@ fn write_import_failures_result(
             write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
-        RpcResult::Failure(error) => {
-            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        RpcResult::Failure(error) => write_error(
+            result.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
 }
 
@@ -3293,12 +3333,12 @@ fn write_data_result(mut result: schema::data_call::Builder<'_>, outcome: RpcRes
         RpcResult::ConfigurationFailed(error) => {
             write_configuration_error(result.init_configuration_failed(), &error)
         }
-        RpcResult::Failure(RpcFailure::SnapshotExpired) => {
-            result.set_snapshot_expired(())
-        }
-        RpcResult::Failure(error) => {
-            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
+        RpcResult::Failure(error) => write_error(
+            result.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
 }
 
@@ -3330,12 +3370,12 @@ fn write_resolve_result(
         RpcResult::ConfigurationFailed(error) => {
             write_configuration_error(result.init_configuration_failed(), &error)
         }
-        RpcResult::Failure(RpcFailure::SnapshotExpired) => {
-            result.set_snapshot_expired(())
-        }
-        RpcResult::Failure(error) => {
-            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
+        RpcResult::Failure(error) => write_error(
+            result.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
 }
 
@@ -3368,9 +3408,11 @@ fn write_runtime_type_policy_result(
             write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
-        RpcResult::Failure(error) => {
-            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        RpcResult::Failure(error) => write_error(
+            result.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
 }
 
@@ -3400,12 +3442,12 @@ fn write_path_result(
         RpcResult::ConfigurationFailed(error) => {
             write_configuration_error(result.init_configuration_failed(), &error)
         }
-        RpcResult::Failure(RpcFailure::SnapshotExpired) => {
-            result.set_snapshot_expired(())
-        }
-        RpcResult::Failure(error) => {
-            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
+        RpcResult::Failure(error) => write_error(
+            result.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
 }
 
@@ -3438,12 +3480,12 @@ fn write_fetch_result(
         RpcResult::ConfigurationFailed(error) => {
             write_configuration_error(result.init_configuration_failed(), &error)
         }
-        RpcResult::Failure(RpcFailure::SnapshotExpired) => {
-            result.set_snapshot_expired(())
-        }
-        RpcResult::Failure(error) => {
-            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
+        RpcResult::Failure(error) => write_error(
+            result.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
 }
 
@@ -3463,9 +3505,11 @@ fn write_metadata_fetch_result(
             write_metadata_reconnect(result.init_reconnect_required(), reason)
         }
         MetadataCall::SnapshotExpired => result.set_snapshot_expired(()),
-        MetadataCall::Error(error) => {
-            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        MetadataCall::Error(error) => write_error(
+            result.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
 }
 
@@ -3539,12 +3583,12 @@ fn write_snapshot_configuration_result(
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(output.init_reconnect_required(), reason)
         }
-        RpcResult::Failure(RpcFailure::SnapshotExpired) => {
-            output.set_snapshot_expired(())
-        }
-        RpcResult::Failure(error) => {
-            write_error(output.init_error(), failure_code(&error), &format!("{error:?}"))
-        }
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => output.set_snapshot_expired(()),
+        RpcResult::Failure(error) => write_error(
+            output.init_error(),
+            failure_code(&error),
+            &format!("{error:?}"),
+        ),
     }
 }
 

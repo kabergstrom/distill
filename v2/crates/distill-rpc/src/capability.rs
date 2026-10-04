@@ -22,9 +22,8 @@ use distill_store::served::{AssetResolution, ServedEntryMeta};
 use distill_store::{Store, StoreError, StoreReader};
 
 use crate::server::{
-    entry_role, history_deltas, pipeline_failure,
-    store_failure, ConnectionState,
-    MetadataBinding, SnapshotHold, SnapshotTxn, DEFAULT_CHUNK_SIZE,
+    entry_role, history_deltas, pipeline_failure, store_failure, ConnectionState, MetadataBinding,
+    SnapshotHold, SnapshotTxn, DEFAULT_CHUNK_SIZE,
 };
 use crate::validate::{
     path_glob_matches, valid_identifier, valid_logical_path, valid_logical_path_prefix,
@@ -272,7 +271,10 @@ fn query_pure_metadata(
 /// The whole-table scan [`query_pure_metadata`] replaced, kept to pin its
 /// results.
 #[cfg(test)]
-fn query_pure_metadata_scan(entries: &[ServedEntryMeta], query: &PureMetadataQuery) -> Vec<AssetUuid> {
+fn query_pure_metadata_scan(
+    entries: &[ServedEntryMeta],
+    query: &PureMetadataQuery,
+) -> Vec<AssetUuid> {
     entries
         .iter()
         .filter(|entry| {
@@ -433,7 +435,10 @@ fn query_assets(
             .as_ref()
             .is_none_or(|glob| path_glob_matches(glob, path))
     };
-    Ok(assets(snapshot.served_assets_matching(&asset_filter(query, role), glob_matches)?))
+    Ok(assets(snapshot.served_assets_matching(
+        &asset_filter(query, role),
+        glob_matches,
+    )?))
 }
 
 /// The assets an asset query answered, or the failure naming the poisoned
@@ -547,7 +552,11 @@ fn inspect_authoring(
     let Some(meta) = snapshot.served_entry_meta(uuid).map_err(store_failure)? else {
         // A served derived output is a runtime asset with no authored
         // entry; any other UUID without a served entry is missing here.
-        if snapshot.derived_output(uuid).map_err(store_failure)?.is_some() {
+        if snapshot
+            .derived_output(uuid)
+            .map_err(store_failure)?
+            .is_some()
+        {
             return Ok(AuthoringInspectResult::RoleIneligible {
                 observed: AuthoringEntryRole::Runtime,
             });
@@ -580,7 +589,8 @@ fn inspect_authoring(
         }
     };
     let invalid = |detail: String| RpcFailure::InvalidQuery { detail };
-    let parsed = distill_bundle::parse_bundle(&bytes).map_err(|error| invalid(error.to_string()))?;
+    let parsed =
+        distill_bundle::parse_bundle(&bytes).map_err(|error| invalid(error.to_string()))?;
     let entry = crate::server::bundle_authoring_entry(
         &parsed,
         &meta.local_id,
@@ -722,7 +732,9 @@ fn complete_publication(
         let published = server.coordinated_maybe_commit(base, |store| {
             let (commit, terminal_error) = match publication {
                 PreparedOperationPublication::Immediate(commit) => (Some(*commit), None),
-                PreparedOperationPublication::Report(_) => unreachable!("a report publishes nothing"),
+                PreparedOperationPublication::Report(_) => {
+                    unreachable!("a report publishes nothing")
+                }
                 PreparedOperationPublication::Deferred(operation) => {
                     match operation.complete(store, base) {
                         Ok(completed) => (completed.commit, completed.terminal_error),
@@ -788,7 +800,12 @@ impl ProgressCompletion for ServerOperationCompletion {
                 "long-running operation lost its publication basis: {gate:?}"
             ));
         }
-        complete_publication(&self.server, self.base, publication, "long-running operation")
+        complete_publication(
+            &self.server,
+            self.base,
+            publication,
+            "long-running operation",
+        )
     }
 
     fn cancel(&self) -> bool {
@@ -857,7 +874,6 @@ impl MetadataHub {
             Err(error) => MetadataCall::Error(error),
         }
     }
-
 }
 
 impl<T> MetadataCall<T> {
@@ -1081,7 +1097,9 @@ impl Hub {
     /// parameters. A stale capability must reconnect even when its payload is
     /// malformed or the requested method is reserved.
     pub fn generation_reconnect(&self) -> Option<ReconnectReason> {
-        self.server.inner.generation_fence(&self.connection.borrow())
+        self.server
+            .inner
+            .generation_fence(&self.connection.borrow())
     }
 
     fn live<T>(&self) -> Option<RpcResult<T>> {
@@ -1125,15 +1143,18 @@ impl Hub {
     fn prepared<T>(
         &self,
         base: InputVersion,
-        prepare: impl FnOnce(&dyn AuthoringBackend, &mut Store) -> Result<Option<(Commit, T)>, RpcFailure>,
+        prepare: impl FnOnce(
+            &dyn AuthoringBackend,
+            &mut Store,
+        ) -> Result<Option<(Commit, T)>, RpcFailure>,
     ) -> Option<RpcResult<T>> {
         let handle = &self.server.inner.handle;
         let backend = handle.authoring_backend();
         self.server.inner.with_writer(|store| {
             let mut value = None;
             let mut failed = None;
-            let published =
-                handle.coordinated_maybe_commit(store, base, |store| match prepare(&*backend, store) {
+            let published = handle.coordinated_maybe_commit(store, base, |store| {
+                match prepare(&*backend, store) {
                     Ok(Some((commit, prepared))) => {
                         value = Some(prepared);
                         Ok(Some(commit))
@@ -1144,12 +1165,15 @@ impl Hub {
                         failed = Some(error);
                         Err(detail)
                     }
-                });
+                }
+            });
             if let Some(error) = failed {
                 return Some(RpcResult::Failure(error));
             }
             match published {
-                Ok(Some(_)) => Some(RpcResult::Success(value.expect("a publication has a value"))),
+                Ok(Some(_)) => Some(RpcResult::Success(
+                    value.expect("a publication has a value"),
+                )),
                 Ok(None) => None,
                 Err(error) => Some(RpcResult::Failure(coordinated_failure(error))),
             }
@@ -1242,7 +1266,9 @@ impl Hub {
         request: ImportRequest,
     ) -> Result<PendingImport, RpcResult<BundleUuid>> {
         if let Err(detail) = validate_import_request(&request) {
-            return Err(RpcResult::Failure(RpcFailure::InvalidAuthoringRequest { detail }));
+            return Err(RpcResult::Failure(RpcFailure::InvalidAuthoringRequest {
+                detail,
+            }));
         }
         if let Some(result) = self.authoring_gate(base) {
             return Err(result);
@@ -1677,7 +1703,9 @@ impl Snapshot {
     }
 
     pub fn generation_reconnect(&self) -> Option<ReconnectReason> {
-        self.server.inner.generation_fence(&self.connection.borrow())
+        self.server
+            .inner
+            .generation_fence(&self.connection.borrow())
     }
 
     fn preflight<T>(&self) -> Result<Rc<SnapshotTxn>, RpcResult<T>> {
@@ -1903,7 +1931,13 @@ impl Snapshot {
                 latest: &self.server.inner.reader,
             };
             let started = Instant::now();
-            return match self.server.inner.handle.build_backend().start(view, &request) {
+            return match self
+                .server
+                .inner
+                .handle
+                .build_backend()
+                .start(view, &request)
+            {
                 BuildStart::Answered(answer) => {
                     drop(txn);
                     done(self.build_answer(answer))
@@ -1967,8 +2001,7 @@ impl Snapshot {
         }
         match self.preflight::<()>() {
             Ok(txn) => {
-                if let Some(error) = pipeline_failure(self.server.inner.effective_pipeline(&txn))
-                {
+                if let Some(error) = pipeline_failure(self.server.inner.effective_pipeline(&txn)) {
                     outcome = Err(error);
                 }
             }
@@ -2055,7 +2088,9 @@ impl Snapshot {
 
 impl AuthoringSnapshot {
     pub fn generation_reconnect(&self) -> Option<ReconnectReason> {
-        self.server.inner.generation_fence(&self.connection.borrow())
+        self.server
+            .inner
+            .generation_fence(&self.connection.borrow())
     }
 
     pub fn stamp(&self) -> SnapshotStamp {
@@ -2256,7 +2291,8 @@ mod query_tests {
                         let mut tags = BTreeMap::new();
                         tags.insert(
                             "kind".to_owned(),
-                            (index % 3 != 0).then(|| ["mesh", "rock"][index as usize % 2].to_owned()),
+                            (index % 3 != 0)
+                                .then(|| ["mesh", "rock"][index as usize % 2].to_owned()),
                         );
                         if index % 4 == entry as u32 {
                             tags.insert("hero".into(), None);
@@ -2341,8 +2377,25 @@ mod query_tests {
             });
         }
         for glob in [
-            "*", "dir*", "dir/*", "*child*", "d?r*", "é/*", "a*b", "a?b/*", "bulk/b000?", "?",
-            "dir", "*.txt", "*/child", "*/leaf", "*/ü.bundle", "*/c", "*.bundle", "*b/c", "a?b/c",
+            "*",
+            "dir*",
+            "dir/*",
+            "*child*",
+            "d?r*",
+            "é/*",
+            "a*b",
+            "a?b/*",
+            "bulk/b000?",
+            "?",
+            "dir",
+            "*.txt",
+            "*/child",
+            "*/leaf",
+            "*/ü.bundle",
+            "*/c",
+            "*.bundle",
+            "*b/c",
+            "a?b/c",
         ] {
             queries.push(AssetQuery {
                 path_glob: Some(glob.into()),
@@ -2430,7 +2483,13 @@ mod query_tests {
     #[test]
     fn an_rpc_glob_matches_only_paths_with_its_keys() {
         let paths = PATHS.iter().copied().chain([
-            "", "x/child", "a/b/c", "q.txt", "x.y/z", "bulk/b12345", "dir/child/x",
+            "",
+            "x/child",
+            "a/b/c",
+            "q.txt",
+            "x.y/z",
+            "bulk/b12345",
+            "dir/child/x",
         ]);
         let mut matched = 0;
         for query in selectors() {
@@ -2442,8 +2501,14 @@ mod query_tests {
                 if path_glob_matches(pattern, path) {
                     matched += 1;
                     let name = path.rsplit_once('/').map_or(path, |(_, name)| name);
-                    assert!(path.starts_with(keys.prefix), "{pattern:?} matched {path:?}");
-                    assert!(keys.name.is_none_or(|key| key == name), "{pattern:?} matched {path:?}");
+                    assert!(
+                        path.starts_with(keys.prefix),
+                        "{pattern:?} matched {path:?}"
+                    );
+                    assert!(
+                        keys.name.is_none_or(|key| key == name),
+                        "{pattern:?} matched {path:?}"
+                    );
                     assert!(
                         keys.extension
                             .is_none_or(|key| name.rsplit_once('.').map(|(_, e)| e) == Some(key)),
@@ -2461,7 +2526,10 @@ mod query_tests {
         let reader = store.reader().unwrap();
         let mut nonempty = 0;
         for query in selectors() {
-            for role in [AuthoringEntryRole::Runtime, AuthoringEntryRole::AuthoringOnly] {
+            for role in [
+                AuthoringEntryRole::Runtime,
+                AuthoringEntryRole::AuthoringOnly,
+            ] {
                 let indexed = query_assets(&reader, &query, role).unwrap();
                 let scanned = query_assets_scan(&reader, &query, role).unwrap();
                 assert_eq!(
@@ -2481,8 +2549,19 @@ mod query_tests {
         let (_dir, store) = namespace(30);
         let reader = store.reader().unwrap();
         let entries = reader.served_entries().unwrap();
-        let roles = [None, Some(AuthoringEntryRole::Runtime), Some(AuthoringEntryRole::AuthoringOnly)];
-        let prefixes = [None, Some(""), Some("dir"), Some("dir/"), Some("é"), Some("bulk/b001")];
+        let roles = [
+            None,
+            Some(AuthoringEntryRole::Runtime),
+            Some(AuthoringEntryRole::AuthoringOnly),
+        ];
+        let prefixes = [
+            None,
+            Some(""),
+            Some("dir"),
+            Some("dir/"),
+            Some("é"),
+            Some("bulk/b001"),
+        ];
         for role in roles {
             for prefix in prefixes {
                 for (uuid, bundle, authored_type) in [
@@ -2594,7 +2673,10 @@ mod query_tests {
                 ..none.clone()
             },
         ] {
-            assert!(query_assets(&reader, &missing, role).unwrap().is_ok(), "{missing:?}");
+            assert!(
+                query_assets(&reader, &missing, role).unwrap().is_ok(),
+                "{missing:?}"
+            );
         }
         let pure = PureMetadataQuery {
             uuid: None,
@@ -2673,7 +2755,10 @@ mod query_tests {
             assert!(!indexed.is_empty());
             println!("{query:?}: {indexed_pages} pages (scan: {scanned_pages})");
             assert!(indexed_pages <= 128, "{indexed_pages} pages");
-            assert!(scanned_pages >= 100 * indexed_pages, "{scanned_pages} pages");
+            assert!(
+                scanned_pages >= 100 * indexed_pages,
+                "{scanned_pages} pages"
+            );
         }
         let query = PureMetadataQuery {
             uuid: None,
@@ -2689,6 +2774,9 @@ mod query_tests {
         assert_eq!(indexed.unwrap().unwrap(), scanned);
         println!("pure metadata prefix: {indexed_pages} pages (scan: {scanned_pages})");
         assert!(indexed_pages <= 64, "{indexed_pages} pages");
-        assert!(scanned_pages >= 100 * indexed_pages, "{scanned_pages} pages");
+        assert!(
+            scanned_pages >= 100 * indexed_pages,
+            "{scanned_pages} pages"
+        );
     }
 }

@@ -6,10 +6,10 @@ pub use distill_core::id::{
 };
 pub use distill_store::state::{
     AssetClaimant, CleanupDisposition, ConfigurationError, ConfigurationErrorCode, DscpV1,
-    GlobalBundleReadFailureCode, InputVersion, PhysicalPathClaim, PhysicalPathFailureCode,
-    PipelineFailure, PipelineFailureCode, PipelineFailureOrigin, PlatformPathBytes,
-    ReadableBundleSource, ScanFailureCode, ScanSubject, SkeletonFailureCode,
-    SnapshotStamp, StoreInstanceId, NamespaceError, NamespaceErrorCode, NamespaceErrorV1,
+    GlobalBundleReadFailureCode, InputVersion, NamespaceError, NamespaceErrorCode,
+    NamespaceErrorV1, PhysicalPathClaim, PhysicalPathFailureCode, PipelineFailure,
+    PipelineFailureCode, PipelineFailureOrigin, PlatformPathBytes, ReadableBundleSource,
+    ScanFailureCode, ScanSubject, SkeletonFailureCode, SnapshotStamp, StoreInstanceId,
 };
 
 /// 10: `Hub.importFailures`. 11: snapshot `runtimeTypePolicy`, batch-class
@@ -90,7 +90,10 @@ pub enum PipelineUnavailableDiagnostic {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataConnectOutcome {
     Connected(MetadataConnected),
-    ProtocolMismatch { expected: u32, observed: u32 },
+    ProtocolMismatch {
+        expected: u32,
+        observed: u32,
+    },
     /// Past `max_connections`; retry later.
     Refused(RpcFailure),
 }
@@ -737,7 +740,10 @@ pub trait ReportOperation: Send + Sync {
     /// Report on `snapshot`, a read snapshot of the operation's base.
     /// `Ok(None)` completes the operation; `Ok(Some(findings))` fails it
     /// with them.
-    fn report(&self, snapshot: &crate::server::ReportSnapshot<'_>) -> Result<Option<String>, String>;
+    fn report(
+        &self,
+        snapshot: &crate::server::ReportSnapshot<'_>,
+    ) -> Result<Option<String>, String>;
 }
 
 #[derive(Clone)]
@@ -781,7 +787,10 @@ impl PreparedOperationCommit {
         }
     }
 
-    pub fn report(operation: Arc<dyn ReportOperation>, progress: Vec<AuthoringProgressEvent>) -> Self {
+    pub fn report(
+        operation: Arc<dyn ReportOperation>,
+        progress: Vec<AuthoringProgressEvent>,
+    ) -> Self {
         Self {
             publication: PreparedOperationPublication::Report(operation),
             progress,
@@ -867,7 +876,9 @@ pub trait AuthoringBackend: Send + Sync + 'static {
         base: InputVersion,
         request: ImportRequest,
     ) -> Result<ImportJob, RpcFailure> {
-        Ok(Box::new(move |store| self.prepare_import(store, base, &request).map(Ok)))
+        Ok(Box::new(move |store| {
+            self.prepare_import(store, base, &request).map(Ok)
+        }))
     }
 
     /// [`AuthoringBackend::run_import`] for a reimport.
@@ -876,7 +887,9 @@ pub trait AuthoringBackend: Send + Sync + 'static {
         base: InputVersion,
         bundle: BundleUuid,
     ) -> Result<ImportJob, RpcFailure> {
-        Ok(Box::new(move |store| self.prepare_reimport(store, base, bundle).map(Ok)))
+        Ok(Box::new(move |store| {
+            self.prepare_reimport(store, base, bundle).map(Ok)
+        }))
     }
 
     /// Check an operation against `store` and describe its progress; a
@@ -887,7 +900,6 @@ pub trait AuthoringBackend: Send + Sync + 'static {
         base: InputVersion,
         operation: &LongRunningOp,
     ) -> Result<PreparedOperationCommit, RpcFailure>;
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -941,7 +953,6 @@ pub struct RuntimeTypePolicy {
     pub build_only: bool,
 }
 
-
 /// What a requester reads while it starts or answers a build: its own
 /// snapshot, whose answers decide whether a result serves it, and the
 /// store's latest committed state, where shared build results and artifacts
@@ -958,11 +969,17 @@ pub struct BuildView<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuildAnswer {
     /// The requested artifact is in the CAS.
-    Built { content_hash: ContentHash },
-    Failed { error: String },
+    Built {
+        content_hash: ContentHash,
+    },
+    Failed {
+        error: String,
+    },
     /// An input the build observed differs at the requester's snapshot; a
     /// fresher snapshot resolves it.
-    Drifted { input: DriftedInput },
+    Drifted {
+        input: DriftedInput,
+    },
 }
 
 /// A finished build, still to be answered at each waiter's own snapshot.
@@ -1083,7 +1100,9 @@ pub struct AuthoringInspection {
 pub enum AuthoringInspectResult {
     Inspection(AuthoringInspection),
     Missing,
-    RoleIneligible { observed: AuthoringEntryRole },
+    RoleIneligible {
+        observed: AuthoringEntryRole,
+    },
     /// The entry's bundle file no longer holds the bytes the snapshot
     /// published; a fresher snapshot (`current` or later) inspects it.
     Drifted {

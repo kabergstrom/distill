@@ -64,7 +64,11 @@ fn dirty_paths_join_the_read_sets_that_observed_them() {
         .replace_import_index(
             &sources(&["a.bundle", "b.bundle", "c.bundle"]),
             &[
-                source("a.bundle", 1, vec![ImportReadKey::Path("tex/a.png".to_owned())]),
+                source(
+                    "a.bundle",
+                    1,
+                    vec![ImportReadKey::Path("tex/a.png".to_owned())],
+                ),
                 source("b.bundle", 2, vec![ImportReadKey::Listing]),
                 source("c.bundle", 3, vec![ImportReadKey::Capability]),
             ],
@@ -104,18 +108,31 @@ fn a_source_replacement_drops_only_that_source() {
     store
         .replace_import_index(&[("main".to_owned(), "a.bundle".to_owned())], &[])
         .unwrap();
-    assert_eq!(bundles(store.watched_imports_reading(["x"], false).unwrap()), [2]);
+    assert_eq!(
+        bundles(store.watched_imports_reading(["x"], false).unwrap()),
+        [2]
+    );
     assert!(rules_at(&store, "a.bundle").is_empty());
     // A bundle that moved is reindexed at its new source; its old rows go.
     publish(&mut store, "c.bundle", 2);
     store
         .replace_import_index(
             &sources(&["b.bundle", "c.bundle"]),
-            &[source("c.bundle", 2, vec![ImportReadKey::Path("y".to_owned())])],
+            &[source(
+                "c.bundle",
+                2,
+                vec![ImportReadKey::Path("y".to_owned())],
+            )],
         )
         .unwrap();
-    assert!(store.watched_imports_reading(["x"], false).unwrap().is_empty());
-    assert_eq!(bundles(store.watched_imports_reading(["y"], false).unwrap()), [2]);
+    assert!(store
+        .watched_imports_reading(["x"], false)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        bundles(store.watched_imports_reading(["y"], false).unwrap()),
+        [2]
+    );
     assert_eq!(
         rules_at(&store, "c.bundle")[0].rules_bundle,
         BundleUuid([2; 16])
@@ -129,7 +146,11 @@ fn a_removed_bundle_takes_its_rows_with_it() {
     store
         .replace_import_index(
             &sources(&["a.bundle"]),
-            &[source("a.bundle", 1, vec![ImportReadKey::Path("x".to_owned())])],
+            &[source(
+                "a.bundle",
+                1,
+                vec![ImportReadKey::Path("x".to_owned())],
+            )],
         )
         .unwrap();
     store
@@ -171,7 +192,10 @@ fn rules_are_found_by_the_directories_a_path_is_under() {
 }
 
 /// The directory-import rules the source `path` of the root "main" holds.
-fn rules_at(store: &distill_store::StoreReader, path: &str) -> Vec<distill_store::imports::DirectoryRuleSource> {
+fn rules_at(
+    store: &distill_store::StoreReader,
+    path: &str,
+) -> Vec<distill_store::imports::DirectoryRuleSource> {
     store
         .directory_rule_sources()
         .unwrap()

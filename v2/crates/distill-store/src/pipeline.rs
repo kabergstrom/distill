@@ -2,8 +2,8 @@
 //! version's pipeline failure (an `errors` row), and the `tools` ToolEpoch
 //! table. Everything else about an epoch is the loaded module's.
 
-use std::collections::{BTreeMap, BTreeSet};
 use crate::atomic_file;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use distill_core::bootstrap::bootstrap_control_logical_registry_v1;
@@ -183,9 +183,11 @@ impl StagedPackage {
     ) -> Result<Self, StoreError> {
         let dir = atomic_file::stage_dir(tools, root).map_err(atomic_error)?;
         for (metadata, source) in files.iter().zip(sources) {
-            dir.write_member(std::path::Path::new(&metadata.path), &source.bytes, |file| {
-                set_staged_permissions(file, metadata.executable)
-            })
+            dir.write_member(
+                std::path::Path::new(&metadata.path),
+                &source.bytes,
+                |file| set_staged_permissions(file, metadata.executable),
+            )
             .map_err(atomic_error)?;
         }
         verify_package_root(key, dir.path(), files)?;
@@ -447,7 +449,8 @@ impl InputTxn<'_> {
     ) -> Result<(), StoreError> {
         validate_target_set(&epoch.target_set)?;
         validate_bootstrap_schema_registry(&epoch.schema_registry)?;
-        if meta_get_blob(&self.txn, PIPELINE_MODULE_HASH)?.as_deref() != Some(&epoch.dylib_hash[..]) {
+        if meta_get_blob(&self.txn, PIPELINE_MODULE_HASH)?.as_deref() != Some(&epoch.dylib_hash[..])
+        {
             meta_set_blob(&self.txn, PIPELINE_MODULE_HASH, &epoch.dylib_hash)?;
         }
         self.set_pipeline_failure(None)
@@ -535,14 +538,12 @@ impl InputTxn<'_> {
                identity_object = excluded.identity_object,
                tool_hash = excluded.tool_hash",
             )?
-            .execute(
-                rusqlite::params![
-                    key,
-                    identity_object,
-                    tool_hash.as_slice(),
-                    self.version().0 as i64,
-                ],
-            )?;
+            .execute(rusqlite::params![
+                key,
+                identity_object,
+                tool_hash.as_slice(),
+                self.version().0 as i64,
+            ])?;
         Ok(RegisteredTool {
             key: key.to_owned(),
             root,
@@ -565,7 +566,13 @@ impl InputTxn<'_> {
             let mut statement = self.txn.prepare_cached(PUBLISHED_TOOLS)?;
             let rows = statement.query_map(
                 [i64::try_from(self.base_stamp().version.0).unwrap_or(i64::MAX)],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get(2)?,
+                    ))
+                },
             )?;
             for row in rows {
                 let (key, present, hash) = row?;
@@ -631,7 +638,6 @@ fn exact_blob32(bytes: Vec<u8>, name: &str) -> Result<[u8; 32], StoreError> {
         .try_into()
         .map_err(|_| invalid_state(&format!("{name} is not exactly 32 bytes")))
 }
-
 
 /// Each key's last ToolEpoch row at a version, `(key, present, hash)`:
 /// one pass over the primary key (the row of a group's `MAX` supplies the

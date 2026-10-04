@@ -21,7 +21,8 @@ use crate::error::StoreError;
 use crate::state::InputVersion;
 
 /// [`StoreReader::file_content_hash`]'s statement.
-pub(crate) const FILE_CONTENT_HASH: &str = "SELECT t.content_hash FROM files t JOIN roots r USING (root_id)
+pub(crate) const FILE_CONTENT_HASH: &str =
+    "SELECT t.content_hash FROM files t JOIN roots r USING (root_id)
      WHERE r.name = ?1 AND t.path = ?2";
 
 /// A process-local interned root id (§18) — never serialized beyond this
@@ -279,31 +280,29 @@ impl InputTxn<'_> {
                symlink_target = excluded.symlink_target,
                canonical_path = excluded.canonical_path",
             )?
-            .execute(
-                rusqlite::params![
-                    root.0,
-                    path,
-                    state.mtime,
-                    state.size as i64,
-                    state.kind.to_i64(),
-                    state.content_hash.as_ref().map(|h| h.0.as_slice()),
-                    observation.0 as i64,
-                    file.raw_path,
-                    file.symlink_target,
-                    file.canonical_path,
-                ],
-            )?;
+            .execute(rusqlite::params![
+                root.0,
+                path,
+                state.mtime,
+                state.size as i64,
+                state.kind.to_i64(),
+                state.content_hash.as_ref().map(|h| h.0.as_slice()),
+                observation.0 as i64,
+                file.raw_path,
+                file.symlink_target,
+                file.canonical_path,
+            ])?;
         Ok(())
     }
 
     /// Remove a (root, path) row; `Ok(false)` when it was absent.
     pub fn remove_file(&mut self, root: RootId, path: &str) -> Result<bool, StoreError> {
-        let n = self.txn
+        let n = self
+            .txn
             .prepare_cached("DELETE FROM files WHERE root_id = ?1 AND path = ?2")?
             .execute(rusqlite::params![root.0, path])?;
         Ok(n > 0)
     }
-
 
     /// Queue pending work (§13's `file_work`): written when the
     /// outermost transaction commits, unless a pass consumes it first.
@@ -351,8 +350,7 @@ pub(crate) fn intern_root(conn: &rusqlite::Connection, name: &str) -> Result<Roo
     {
         return Ok(RootId(id));
     }
-    conn
-        .prepare_cached("INSERT INTO roots(name) VALUES (?1)")?
+    conn.prepare_cached("INSERT INTO roots(name) VALUES (?1)")?
         .execute([name])?;
     Ok(RootId(conn.last_insert_rowid()))
 }
@@ -513,7 +511,9 @@ impl StoreReader {
     pub fn root_id(&self, name: &str) -> Result<Option<RootId>, StoreError> {
         Ok(self
             .conn
-            .query_row("SELECT root_id FROM roots WHERE name = ?1", [name], |r| r.get(0))
+            .query_row("SELECT root_id FROM roots WHERE name = ?1", [name], |r| {
+                r.get(0)
+            })
             .optional()?
             .map(RootId))
     }
@@ -609,7 +609,10 @@ impl StoreReader {
         prefix: &str,
     ) -> Result<Vec<ObservedFile>, StoreError> {
         self.query_rows(
-            &format!("{OBSERVED_FILE} WHERE {} ORDER BY t.path", under_sql(prefix)),
+            &format!(
+                "{OBSERVED_FILE} WHERE {} ORDER BY t.path",
+                under_sql(prefix)
+            ),
             rusqlite::params![root_name, prefix],
             observed_file_row,
         )
@@ -684,10 +687,12 @@ impl StoreReader {
     /// `prefix` in `root_name`.
     pub fn observes_under(&self, root_name: &str, prefix: &str) -> Result<bool, StoreError> {
         let under = under_sql(prefix);
-        Ok(self.conn.prepare_cached(&format!(
-            "SELECT EXISTS(SELECT 1 FROM files t JOIN roots r USING (root_id) WHERE {under})"
-        ))?
-        .query_row(rusqlite::params![root_name, prefix], |row| row.get(0))?)
+        Ok(self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT EXISTS(SELECT 1 FROM files t JOIN roots r USING (root_id) WHERE {under})"
+            ))?
+            .query_row(rusqlite::params![root_name, prefix], |row| row.get(0))?)
     }
 
     /// The content hash of the file observed at (`root_name`, `path`):
@@ -754,7 +759,9 @@ pub fn path_name(path: &str) -> &str {
 /// The text after the last `.` of a logical path's final segment, if it
 /// has one: the `ext` column of `files`.
 pub fn path_extension(path: &str) -> Option<&str> {
-    path_name(path).rsplit_once('.').map(|(_, extension)| extension)
+    path_name(path)
+        .rsplit_once('.')
+        .map(|(_, extension)| extension)
 }
 
 /// `globset`'s metacharacters, its `\` escape among them.
@@ -796,7 +803,9 @@ impl<'a> GlobKeys<'a> {
         Self {
             prefix: &pattern[..first],
             name: name.filter(|name| !name.is_empty()),
-            extension: segment_tail.rsplit_once('.').map(|(_, extension)| extension),
+            extension: segment_tail
+                .rsplit_once('.')
+                .map(|(_, extension)| extension),
         }
     }
 }
@@ -820,9 +829,7 @@ pub(crate) fn starts_with_sql(column: &str, param: usize) -> String {
 
 /// The SQL that selects `?{param}` itself and every path below it.
 pub(crate) fn subtree_sql(column: &str, param: usize) -> String {
-    format!(
-        "({column} = ?{param} OR ({column} >= ?{param} || '/' AND {column} < ?{param} || '0'))"
-    )
+    format!("({column} = ?{param} OR ({column} >= ?{param} || '/' AND {column} < ?{param} || '0'))")
 }
 
 impl StoreReader {
@@ -880,7 +887,6 @@ impl StoreReader {
         Ok(())
     }
 
-
     /// Visit every observed `.bundle` file's (root name, path, blake3 hash)
     /// in (root name, path) order: its `files` content hash.
     pub fn for_each_bundle_file_hash(
@@ -903,5 +909,4 @@ impl StoreReader {
         }
         Ok(())
     }
-
 }

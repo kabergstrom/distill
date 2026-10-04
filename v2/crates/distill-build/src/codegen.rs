@@ -128,7 +128,9 @@ impl CodegenCoordinator {
                 if let Err(collision) = validate_namespace(&files) {
                     return CodegenPublication::Failed(collision);
                 }
-                files.sort_unstable_by(|left, right| left.relative_path().cmp(right.relative_path()));
+                files.sort_unstable_by(|left, right| {
+                    left.relative_path().cmp(right.relative_path())
+                });
                 let count = files.len();
                 if let Err(error) = world.publish(&attempt.basis, &files) {
                     return CodegenPublication::PublicationFailed(error);

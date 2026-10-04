@@ -6,8 +6,7 @@ mod common;
 
 use common::*;
 use distill_bundle::{
-    extract_namespace_skeleton, parse_bundle, write_bundle, Bundle,
-    BundleError as E,
+    extract_namespace_skeleton, parse_bundle, write_bundle, Bundle, BundleError as E,
 };
 use distill_core::bootstrap::BOOTSTRAP_CONTROL_TYPE_UUIDS;
 use distill_json::AuthoredValue as V;

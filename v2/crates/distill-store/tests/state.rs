@@ -75,7 +75,9 @@ fn configuration_error_never_serves_last_good_as_current() {
         reason: configuration_error(),
         last_good: Some(configuration()),
     };
-    let err = state.epoch().expect_err("a failed configuration has no current epoch");
+    let err = state
+        .epoch()
+        .expect_err("a failed configuration has no current epoch");
     assert!(err.message.contains("loopback"));
 }
 

@@ -458,7 +458,9 @@ impl LoaderIO for RpcIo {
         }
         self.discard();
         let _local = self.local.enter();
-        let task = self.shared.spawn(rebind(Rc::clone(&self.shared), target.clone()));
+        let task = self
+            .shared
+            .spawn(rebind(Rc::clone(&self.shared), target.clone()));
         *self.shared.link.borrow_mut() = Link::Rebinding {
             target,
             task: task.abort_handle(),
@@ -534,7 +536,13 @@ impl LoaderIO for RpcIo {
     }
 
     fn subscribe_path(&mut self, path: &str) {
-        if self.shared.subscriptions.borrow_mut().paths.insert(path.to_owned()) {
+        if self
+            .shared
+            .subscriptions
+            .borrow_mut()
+            .paths
+            .insert(path.to_owned())
+        {
             let _local = self.local.enter();
             self.shared.subscribe(Vec::new(), vec![path.to_owned()]);
         }
@@ -667,7 +675,9 @@ impl Snapshots {
     }
 
     fn satisfies(&self, need: &Need) -> bool {
-        let Some(current) = self.current.and_then(|stamp| Some((stamp, self.held.get(&stamp)?)))
+        let Some(current) = self
+            .current
+            .and_then(|stamp| Some((stamp, self.held.get(&stamp)?)))
         else {
             return false;
         };
@@ -1063,7 +1073,15 @@ async fn run_request(
         RequestKind::Resolve(uuid) => (resolve_event(&snapshot, req, uuid, basis).await, None),
         RequestKind::Path(path) => (path_event(&snapshot, req, path, basis).await, None),
         RequestKind::Fetch(content_hash) => {
-            fetch_event(&shared, &connection.hub, &snapshot, req, content_hash, basis).await
+            fetch_event(
+                &shared,
+                &connection.hub,
+                &snapshot,
+                req,
+                content_hash,
+                basis,
+            )
+            .await
         }
     };
     // The loader answers these with a new round: publish them only once the
@@ -1111,7 +1129,8 @@ async fn delta_stream(
                     })
                     .max_by_key(|stamp| stamp.version);
                 if let Some(stamp) = newest {
-                    if let Err(event) = ensure_current(&shared, &connection, Need::AtLeast(stamp)).await
+                    if let Err(event) =
+                        ensure_current(&shared, &connection, Need::AtLeast(stamp)).await
                     {
                         shared.push_connection(&connection, event);
                     }
@@ -1136,7 +1155,12 @@ async fn maintain(shared: Rc<Shared>, connection: Rc<Connection>) {
             shared.set_import_failures(failures);
         }
         let stale = shared.snapshots.borrow().current.and_then(|stamp| {
-            let held = shared.snapshots.borrow().held.get(&stamp).map(|held| (held.serial, held.opened))?;
+            let held = shared
+                .snapshots
+                .borrow()
+                .held
+                .get(&stamp)
+                .map(|held| (held.serial, held.opened))?;
             (held.1.elapsed() >= shared.snapshot_refresh_after).then_some(held.0)
         });
         if let Some(serial) = stale {
@@ -1191,7 +1215,8 @@ async fn open_connection(
     assets: Vec<AssetUuid>,
     paths: Vec<String>,
 ) -> Result<Opened, RpcIoInitError> {
-    let unavailable = |error: &dyn std::fmt::Display| RpcIoInitError::Unavailable(error.to_string());
+    let unavailable =
+        |error: &dyn std::fmt::Display| RpcIoInitError::Unavailable(error.to_string());
     let client = CapnpClient::connect_local(address)
         .await
         .map_err(|error| unavailable(&error))?;
@@ -1216,7 +1241,11 @@ async fn open_connection(
         None
     } else {
         match hub
-            .subscribe(snapshot.basis().snapshot.version, assets.clone(), paths.clone())
+            .subscribe(
+                snapshot.basis().snapshot.version,
+                assets.clone(),
+                paths.clone(),
+            )
             .await
         {
             Ok(RemoteCall::Success(subscription)) => Some(subscription),

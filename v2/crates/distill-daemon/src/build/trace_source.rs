@@ -286,9 +286,9 @@ impl TraceQueries for StoreTraceSource<'_> {
     fn query_results(&self, query: &AssetQuery) -> Vec<AssetUuid> {
         let failure = match self.try_query_results(query) {
             Ok(Ok(results)) => return results,
-            Ok(Err(bundle)) => {
-                BuildError::Failed(format!("asset query {query:?} reaches poisoned bundle {bundle}"))
-            }
+            Ok(Err(bundle)) => BuildError::Failed(format!(
+                "asset query {query:?} reaches poisoned bundle {bundle}"
+            )),
             Err(error) => error,
         };
         self.failure.borrow_mut().get_or_insert(failure);
@@ -298,9 +298,10 @@ impl TraceQueries for StoreTraceSource<'_> {
 
 impl TraceSource for StoreTraceSource<'_> {
     fn authoring_read(&self, asset: AssetUuid) -> Observed<Option<BundleFileHash>> {
-        self.answer(self.entry(asset).map(|entry| {
-            Observed::Ok(entry.map(|entry| BundleFileHash(entry.bundle_hash.0)))
-        }))
+        self.answer(
+            self.entry(asset)
+                .map(|entry| Observed::Ok(entry.map(|entry| BundleFileHash(entry.bundle_hash.0)))),
+        )
     }
 
     fn read(&self, asset: AssetUuid) -> Observed<ContentHash> {
@@ -346,15 +347,16 @@ impl TraceSource for StoreTraceSource<'_> {
                 .tool_hash_at(id, self.basis.tool_version)
                 .map_err(BuildError::infrastructure)
                 .map(|hash| {
-            hash.map_or_else(
-                || {
-                    Observed::Err(StableFailureFingerprint::MissingCapability {
-                        key: CapabilityKey::Tool(id.to_owned()),
-                    })
-                },
-                Observed::Ok,
-            )
-        }))
+                    hash.map_or_else(
+                        || {
+                            Observed::Err(StableFailureFingerprint::MissingCapability {
+                                key: CapabilityKey::Tool(id.to_owned()),
+                            })
+                        },
+                        Observed::Ok,
+                    )
+                }),
+        )
     }
 
     fn capability(&self, key: &CapabilityKey) -> Observed<[u8; 32]> {

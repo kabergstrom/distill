@@ -417,23 +417,23 @@ pub trait PipelineDefaults: Send + Sync + 'static {
     fn parent_default(&self, to_schema: &SchemaNode, at: &FieldPath) -> Option<AuthoredValue>;
 }
 
-pub type ImporterCall = unsafe fn(
-    *const u8,
-    &mut dyn AuthoringImportContext,
-    &AuthoredValue,
-) -> Result<
-    Result<ImportOutput, AuthoringImporterError>,
-    CallbackPanic,
->;
-pub type ProcessorCall = unsafe fn(
-    *const u8,
-    AuthoredValue,
-    &mut dyn PipelineProcessContext,
-) -> Result<Result<ProcessorProducts, ProcessorError>, CallbackPanic>;
-pub type CodegenCall = unsafe fn(
-    *const u8,
-    &mut dyn PipelineCodegenContext,
-) -> Result<Result<Vec<GeneratedFile>, CodegenFailure>, CallbackPanic>;
+pub type ImporterCall =
+    unsafe fn(
+        *const u8,
+        &mut dyn AuthoringImportContext,
+        &AuthoredValue,
+    ) -> Result<Result<ImportOutput, AuthoringImporterError>, CallbackPanic>;
+pub type ProcessorCall =
+    unsafe fn(
+        *const u8,
+        AuthoredValue,
+        &mut dyn PipelineProcessContext,
+    ) -> Result<Result<ProcessorProducts, ProcessorError>, CallbackPanic>;
+pub type CodegenCall =
+    unsafe fn(
+        *const u8,
+        &mut dyn PipelineCodegenContext,
+    ) -> Result<Result<Vec<GeneratedFile>, CodegenFailure>, CallbackPanic>;
 pub type ValidatorCall = unsafe fn(
     *const u8,
     &AuthoredValue,

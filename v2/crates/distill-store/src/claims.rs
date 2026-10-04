@@ -21,8 +21,8 @@ use crate::db::{InputTxn, StoreReader};
 use crate::error::StoreError;
 use crate::errors::{write_namespace_error, NAMESPACE};
 use crate::state::{
-    encode_asset_claimant, encode_bundle_source, AssetClaimant, ReadableBundleSource, NamespaceError, NamespaceErrorDecoder,
-    NamespaceErrorDecodeError, NamespaceErrorV1,
+    encode_asset_claimant, encode_bundle_source, AssetClaimant, NamespaceError,
+    NamespaceErrorDecodeError, NamespaceErrorDecoder, NamespaceErrorV1, ReadableBundleSource,
 };
 
 const BUNDLE: i64 = 0;
@@ -233,7 +233,10 @@ fn refresh_collision(
         .prepare_cached(
             "SELECT identity FROM errors WHERE scope_kind = ?1 AND scope_id = ?2 AND family = ?3",
         )?
-        .query_row(rusqlite::params![group_scope(group), subject, NAMESPACE], |row| row.get(0))
+        .query_row(
+            rusqlite::params![group_scope(group), subject, NAMESPACE],
+            |row| row.get(0),
+        )
         .optional()?;
     let claimants = group_claimants(conn, group, subject)?;
     let current = if claimants.len() > 1 {
@@ -279,9 +282,8 @@ fn asset_dependents_pending(
             bundles.insert(bundle);
         }
     }
-    let mut naming = conn.prepare_cached(
-        "SELECT subject FROM source_claims WHERE kind = ?1 AND claimant = ?2",
-    )?;
+    let mut naming =
+        conn.prepare_cached("SELECT subject FROM source_claims WHERE kind = ?1 AND claimant = ?2")?;
     for path in naming.query_map(rusqlite::params![PRIMARY_PATH, asset], |row| {
         row.get::<_, Vec<u8>>(0)
     })? {
@@ -390,7 +392,6 @@ impl InputTxn<'_> {
         Ok(pending)
     }
 
-
     /// Replace every source's claims with `sources`, writing only the rows
     /// that change: a full rescan republishes every source, and most keep
     /// their claims. When any changed, every collision is recomputed.
@@ -402,7 +403,10 @@ impl InputTxn<'_> {
             let root = self.intern_root(&source.root_name)?;
             for claim in &source.claims {
                 let (kind, subject, claimant, detail) = claim_row(claim)?;
-                wanted.insert((root.0, source.path.clone(), kind, subject, claimant), detail);
+                wanted.insert(
+                    (root.0, source.path.clone(), kind, subject, claimant),
+                    detail,
+                );
             }
         }
         let conn = &*self.txn;
@@ -413,7 +417,13 @@ impl InputTxn<'_> {
             )?;
             let mut rows = select.query([])?;
             while let Some(row) = rows.next()? {
-                let key: Key = (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?);
+                let key: Key = (
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                );
                 let detail: Vec<u8> = row.get(5)?;
                 match wanted.remove(&key) {
                     Some(same) if same == detail => {}
@@ -448,7 +458,9 @@ impl InputTxn<'_> {
                  WHERE kind IN (0, 1, 2)
                  GROUP BY g, subject HAVING COUNT(DISTINCT claimant) > 1",
             )?;
-            let rows = select.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)))?;
+            let rows = select.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         let mut recorded = {
@@ -566,7 +578,9 @@ impl StoreReader {
         for (claimant, detail) in rows {
             let AssetClaimant::Derived { parent, output_key } = decode_asset_claimant(&claimant)?
             else {
-                return Err(invalid_namespace_error(NamespaceErrorDecodeError::InvalidClaimant));
+                return Err(invalid_namespace_error(
+                    NamespaceErrorDecodeError::InvalidClaimant,
+                ));
             };
             outputs.insert(DerivedOutputClaim {
                 parent,
@@ -588,5 +602,4 @@ impl StoreReader {
         .map(|bytes| Ok(AssetUuid(uuid16(bytes)?)))
         .collect()
     }
-
 }

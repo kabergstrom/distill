@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 
 use crate::cas::record::KeyKind;
 use crate::cas::store::{
-    count_cas_write, fsync_dir, segment_file_name, segment_open_options, SegmentKind,
-    SEGMENT_DEAD, SEGMENT_OPEN, SEGMENT_SEALED,
+    count_cas_write, fsync_dir, segment_file_name, segment_open_options, SegmentKind, SEGMENT_DEAD,
+    SEGMENT_OPEN, SEGMENT_SEALED,
 };
 use crate::db::Store;
 use crate::error::StoreError;
@@ -100,7 +100,11 @@ pub(crate) fn evict_result_rows(
     trace_digest: &[u8; 32],
 ) -> Result<Option<u64>, StoreError> {
     use rusqlite::OptionalExtension;
-    let key = rusqlite::params![key_kind as i64, static_key.as_slice(), trace_digest.as_slice()];
+    let key = rusqlite::params![
+        key_kind as i64,
+        static_key.as_slice(),
+        trace_digest.as_slice()
+    ];
     let hashes: Vec<Vec<u8>> = {
         let mut statement = txn.prepare_cached(RESULT_EXTENTS)?;
         let rows = statement.query_map(key, |row| row.get(0))?;
@@ -249,15 +253,16 @@ impl Store {
     /// (copied, then they die). A sealed segment, or this writer's open one.
     fn compaction_candidates(&self) -> Result<Vec<CompactionCandidate>, StoreError> {
         let mut statement = self.conn.prepare_cached(COMPACTION_CANDIDATES)?;
-        let rows = statement.query_map(rusqlite::params![SEGMENT_SEALED, self.cas.owner], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
-        })?;
+        let rows =
+            statement.query_map(rusqlite::params![SEGMENT_SEALED, self.cas.owner], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?;
         let mut out = Vec::new();
         for row in rows {
             let (id, name, kind, indexed_len, live) = row?;
@@ -313,7 +318,10 @@ impl Store {
             let mut file = segment_open_options()
                 .read(true)
                 .open(&path)
-                .map_err(|source| StoreError::Io { path: path.clone(), source })?;
+                .map_err(|source| StoreError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
             let mut statement = self.conn.prepare_cached(SEGMENT_EXTENTS)?;
             let mut rows = statement.query([candidate.id as i64])?;
             while let Some(row) = rows.next()? {
@@ -322,7 +330,10 @@ impl Store {
                 let mut bytes = vec![0u8; row.get::<_, i64>(2)? as usize];
                 file.seek(SeekFrom::Start(offset))
                     .and_then(|_| file.read_exact(&mut bytes))
-                    .map_err(|source| StoreError::Io { path: path.clone(), source })?;
+                    .map_err(|source| StoreError::Io {
+                        path: path.clone(),
+                        source,
+                    })?;
                 extents.push((bytes, candidate.id, offset, hash));
             }
         }
@@ -353,7 +364,10 @@ impl Store {
         let mut destinations = Vec::with_capacity(written.len());
         for bytes in &written {
             let id = self.create_segment(SegmentKind::Regular, SEGMENT_SEALED)?;
-            let path = self.cas.dir.join(segment_file_name(id, SegmentKind::Regular));
+            let path = self
+                .cas
+                .dir
+                .join(segment_file_name(id, SegmentKind::Regular));
             segment_open_options()
                 .write(true)
                 .open(&path)
@@ -392,7 +406,10 @@ impl Store {
             txn.prepare_cached("UPDATE cas_segments SET state = ?2 WHERE segment_id = ?1")?
                 .execute(rusqlite::params![*victim as i64, SEGMENT_DEAD])?;
         }
-        let dead_bytes: u64 = candidates.iter().map(|candidate| candidate.indexed_len).sum();
+        let dead_bytes: u64 = candidates
+            .iter()
+            .map(|candidate| candidate.indexed_len)
+            .sum();
         Ok(CompactionReport {
             extents_copied,
             reclaimed_bytes: dead_bytes.saturating_sub(copied_bytes),
@@ -434,9 +451,7 @@ impl SegmentSweeper {
     pub fn sweep(&mut self, store: &mut Store) -> Result<usize, StoreError> {
         let now = Instant::now();
         let dead: Vec<(u64, String)> = {
-            let mut statement = store
-                .conn
-                .prepare_cached(SEGMENTS_IN_STATE)?;
+            let mut statement = store.conn.prepare_cached(SEGMENTS_IN_STATE)?;
             let rows = statement.query_map([SEGMENT_DEAD], |row| {
                 Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
             })?;
@@ -465,7 +480,8 @@ impl SegmentSweeper {
         fsync_dir(&store.cas.dir)?;
         store.write_txn(|store| {
             for id in &deleted {
-                store.conn
+                store
+                    .conn
                     .prepare_cached(
                         "DELETE FROM cas_segments WHERE segment_id = ?1 AND state = ?2",
                     )?
@@ -553,7 +569,10 @@ mod tests {
             for index in 0..results {
                 commit_result(&mut store, index);
             }
-            store.conn.query_row(LIVE_BYTES, [], |r| r.get::<_, i64>(0)).unwrap() as u64
+            store
+                .conn
+                .query_row(LIVE_BYTES, [], |r| r.get::<_, i64>(0))
+                .unwrap() as u64
         };
         let mut config = config;
         config.cache_limit = live - under;
@@ -568,7 +587,10 @@ mod tests {
             .iter()
             .filter(|sql| sql.contains("content_hash >= zeroblob(0)"))
             .count();
-        let sums = statements.iter().filter(|sql| sql.as_str() == LIVE_BYTES).count();
+        let sums = statements
+            .iter()
+            .filter(|sql| sql.as_str() == LIVE_BYTES)
+            .count();
         (sweep.evicted, statements.len() - fallbacks, sums)
     }
 
@@ -617,7 +639,12 @@ mod tests {
         drop(store);
         let (store, recovery) = Store::open_with_recovery(config).unwrap();
         assert_eq!(recovery, crate::cas::RecoveryReport::default());
-        (pass, store.pages_fetched().unwrap(), index_pages, table_pages)
+        (
+            pass,
+            store.pages_fetched().unwrap(),
+            index_pages,
+            table_pages,
+        )
     }
 
     /// The live bytes and each compactable segment's are sums over the
@@ -631,7 +658,10 @@ mod tests {
         assert_eq!(small.1, large.1, "{small:?} {large:?}");
         let growth = large.0 - small.0;
         assert!(growth <= 2 * large.2, "{small:?} {large:?}");
-        assert!(large.2 * 2 < large.3, "the covering indexes are the smaller read: {large:?}");
+        assert!(
+            large.2 * 2 < large.3,
+            "the covering indexes are the smaller read: {large:?}"
+        );
     }
 
     /// Every extent is held, whatever wrote, moved or released it: a
@@ -669,9 +699,16 @@ mod tests {
         };
         check(&store);
         // Two in three go: the survivors fill under half of each segment.
-        for key in digests.iter().enumerate().filter(|(index, _)| index % 3 != 1).map(|(_, key)| key) {
+        for key in digests
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| index % 3 != 1)
+            .map(|(_, key)| key)
+        {
             let digest = store.lookup_candidates(KeyKind::Processor, key).unwrap()[0].trace_digest;
-            assert!(store.evict_result(KeyKind::Processor, key, &digest).unwrap());
+            assert!(store
+                .evict_result(KeyKind::Processor, key, &digest)
+                .unwrap());
         }
         check(&store);
         let compaction = store.compact().unwrap();
@@ -679,7 +716,13 @@ mod tests {
         assert!(!compaction.dead_segments.is_empty());
         check(&store);
         for key in digests.iter().skip(1).step_by(3) {
-            assert_eq!(store.lookup_candidates(KeyKind::Processor, key).unwrap().len(), 1);
+            assert_eq!(
+                store
+                    .lookup_candidates(KeyKind::Processor, key)
+                    .unwrap()
+                    .len(),
+                1
+            );
         }
         let mut capped = store.config().clone();
         capped.cache_limit = 0;
@@ -687,7 +730,10 @@ mod tests {
         let mut store = Store::open(capped).unwrap();
         store.enforce_cache_limit().unwrap();
         check(&store);
-        let live: i64 = store.conn.query_row(LIVE_BYTES, [], |row| row.get(0)).unwrap();
+        let live: i64 = store
+            .conn
+            .query_row(LIVE_BYTES, [], |row| row.get(0))
+            .unwrap();
         assert_eq!(live, 0);
     }
 
@@ -699,7 +745,10 @@ mod tests {
         commit_result(&mut store, 1);
         assert_eq!(open_segments(&store), 1);
         let second = store.write_txn(|store| {
-            store.create_segment(crate::cas::store::SegmentKind::Regular, crate::cas::store::SEGMENT_OPEN)
+            store.create_segment(
+                crate::cas::store::SegmentKind::Regular,
+                crate::cas::store::SEGMENT_OPEN,
+            )
         });
         assert!(
             matches!(&second, Err(StoreError::Sqlite(error)) if error.to_string().contains("UNIQUE")),
@@ -709,8 +758,14 @@ mod tests {
         // a writer's append target, and are not constrained.
         store
             .write_txn(|store| {
-                store.create_segment(crate::cas::store::SegmentKind::Regular, crate::cas::store::SEGMENT_SEALED)?;
-                store.create_segment(crate::cas::store::SegmentKind::Oversize, crate::cas::store::SEGMENT_OPEN)
+                store.create_segment(
+                    crate::cas::store::SegmentKind::Regular,
+                    crate::cas::store::SEGMENT_SEALED,
+                )?;
+                store.create_segment(
+                    crate::cas::store::SegmentKind::Oversize,
+                    crate::cas::store::SEGMENT_OPEN,
+                )
             })
             .unwrap();
     }
@@ -725,7 +780,9 @@ mod tests {
         assert!(committed > start);
         store.enforce_cache_limit().unwrap();
         store.compact().unwrap();
-        store.lookup_candidates(KeyKind::Processor, &[0; 32]).unwrap();
+        store
+            .lookup_candidates(KeyKind::Processor, &[0; 32])
+            .unwrap();
         assert_eq!(store.cas_writes().unwrap(), committed);
     }
 
@@ -758,7 +815,10 @@ mod tests {
         .unwrap();
 
         a.open_writer().unwrap().evict_installed(&layout.0).unwrap();
-        assert!(matches!(a.wire_tree_read(layout), Err(StoreError::NotFound { .. })));
+        assert!(matches!(
+            a.wire_tree_read(layout),
+            Err(StoreError::NotFound { .. })
+        ));
         let receipt = a
             .commit_build(BuildCommit {
                 wire_trees: vec![wire_bytes.clone()],
@@ -799,13 +859,20 @@ mod tests {
         assert!(a
             .evict_result(KeyKind::Processor, &[1; 32], &receipt.trace_digest)
             .unwrap());
-        assert!(matches!(a.wire_tree_read(layout), Err(StoreError::NotFound { .. })));
+        assert!(matches!(
+            a.wire_tree_read(layout),
+            Err(StoreError::NotFound { .. })
+        ));
     }
 
     fn open_segments(store: &Store) -> i64 {
         store
             .conn
-            .query_row("SELECT COUNT(*) FROM cas_segments WHERE state = 0", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM cas_segments WHERE state = 0",
+                [],
+                |row| row.get(0),
+            )
             .unwrap()
     }
 
@@ -880,7 +947,9 @@ mod tests {
             .write_txn(|store| {
                 store.conn.execute_batch("SAVEPOINT inner")?;
                 store.put_artifact(b"rolled back", &[])?;
-                store.conn.execute_batch("ROLLBACK TO inner; RELEASE inner")?;
+                store
+                    .conn
+                    .execute_batch("ROLLBACK TO inner; RELEASE inner")?;
                 Ok(())
             })
             .unwrap();
@@ -894,7 +963,12 @@ mod tests {
             "an artifact committed after the rolled-back savepoint: {read:?}, extent {:?}",
             store.extent_of(&kept)
         );
-        assert_eq!(other.cas_read(blake3::hash(b"another writer's").as_bytes()).unwrap(), b"another writer's");
+        assert_eq!(
+            other
+                .cas_read(blake3::hash(b"another writer's").as_bytes())
+                .unwrap(),
+            b"another writer's"
+        );
     }
 
     /// The open segments `store`'s writer owns, and every segment's
@@ -916,25 +990,40 @@ mod tests {
             .unwrap();
         let all = all
             .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?))
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
             })
             .unwrap()
             .map(|row| {
                 let (id, state, indexed, kind) = row.unwrap();
                 let kind = SegmentKind::from_i64(kind).unwrap();
                 let path = store.cas.dir.join(segment_file_name(id as u64, kind));
-                (id as u64, state, indexed as u64, std::fs::metadata(path).ok().map(|m| m.len()))
+                (
+                    id as u64,
+                    state,
+                    indexed as u64,
+                    std::fs::metadata(path).ok().map(|m| m.len()),
+                )
             })
             .collect();
         (open, all)
     }
 
     fn rejected() -> StoreError {
-        StoreError::Rejected { detail: "the nested step failed".to_owned() }
+        StoreError::Rejected {
+            detail: "the nested step failed".to_owned(),
+        }
     }
 
     fn not_found(store: &Store, bytes: &[u8]) -> bool {
-        matches!(store.cas_read(blake3::hash(bytes).as_bytes()), Err(StoreError::NotFound { .. }))
+        matches!(
+            store.cas_read(blake3::hash(bytes).as_bytes()),
+            Err(StoreError::NotFound { .. })
+        )
     }
 
     #[test]
@@ -965,18 +1054,35 @@ mod tests {
             .unwrap();
         let (open, all) = segments(&store);
         assert_eq!(open, [0]);
-        let [(0, 0, indexed, Some(file_len))] = all[..] else { panic!("{all:?}") };
-        assert_eq!(indexed, file_len, "the index covers the dead bytes and the record after them");
-        assert_eq!(store.cas_read(blake3::hash(b"before").as_bytes()).unwrap(), b"before");
-        assert_eq!(store.cas_read(blake3::hash(b"after").as_bytes()).unwrap(), b"after");
+        let [(0, 0, indexed, Some(file_len))] = all[..] else {
+            panic!("{all:?}")
+        };
+        assert_eq!(
+            indexed, file_len,
+            "the index covers the dead bytes and the record after them"
+        );
+        assert_eq!(
+            store.cas_read(blake3::hash(b"before").as_bytes()).unwrap(),
+            b"before"
+        );
+        assert_eq!(
+            store.cas_read(blake3::hash(b"after").as_bytes()).unwrap(),
+            b"after"
+        );
         assert!(not_found(&store, b"rolled back"));
         drop(store);
 
         let (store, recovery) = Store::open_with_recovery(config).unwrap();
         assert_eq!(recovery.truncated_tails, []);
         assert_eq!(recovery.lost_tails, []);
-        assert_eq!(store.cas_read(blake3::hash(b"before").as_bytes()).unwrap(), b"before");
-        assert_eq!(store.cas_read(blake3::hash(b"after").as_bytes()).unwrap(), b"after");
+        assert_eq!(
+            store.cas_read(blake3::hash(b"before").as_bytes()).unwrap(),
+            b"before"
+        );
+        assert_eq!(
+            store.cas_read(blake3::hash(b"after").as_bytes()).unwrap(),
+            b"after"
+        );
     }
 
     #[test]
@@ -999,16 +1105,29 @@ mod tests {
             .write_txn(|store| {
                 let failed = store.isolated_write_transaction(|store| {
                     store.put_artifact(&payload(2), &[])?;
-                    assert_eq!(segments(store).0, [1], "the savepoint rolled onto segment 1");
+                    assert_eq!(
+                        segments(store).0,
+                        [1],
+                        "the savepoint rolled onto segment 1"
+                    );
                     Err::<(), _>(rejected())
                 });
                 assert!(matches!(failed, Err(StoreError::Rejected { .. })));
                 let (open, all) = segments(store);
                 assert_eq!(open, [0], "the seal rolled back with the allocation");
                 assert_eq!(all, first, "segment 1's row rolled back");
-                assert_eq!(crate::db::meta_get_u64(&store.conn, "next_segment_id")?, Some(1));
-                let stray = store.cas.dir.join(crate::cas::store::segment_file_name(1, crate::cas::store::SegmentKind::Regular));
-                assert!(std::fs::metadata(&stray).unwrap().len() > 0, "the rolled-back allocation left its file");
+                assert_eq!(
+                    crate::db::meta_get_u64(&store.conn, "next_segment_id")?,
+                    Some(1)
+                );
+                let stray = store.cas.dir.join(crate::cas::store::segment_file_name(
+                    1,
+                    crate::cas::store::SegmentKind::Regular,
+                ));
+                assert!(
+                    std::fs::metadata(&stray).unwrap().len() > 0,
+                    "the rolled-back allocation left its file"
+                );
                 store.put_artifact(&payload(3), &[])?;
                 Ok(())
             })
@@ -1018,9 +1137,23 @@ mod tests {
         let [(0, 1, indexed_0, Some(len_0)), (1, 0, indexed_1, Some(len_1))] = all[..] else {
             panic!("{all:?}")
         };
-        assert_eq!((indexed_0, indexed_1), (len_0, len_1), "the reused id's file holds only its committed record");
-        assert_eq!(store.cas_read(blake3::hash(&payload(1)).as_bytes()).unwrap(), payload(1));
-        assert_eq!(store.cas_read(blake3::hash(&payload(3)).as_bytes()).unwrap(), payload(3));
+        assert_eq!(
+            (indexed_0, indexed_1),
+            (len_0, len_1),
+            "the reused id's file holds only its committed record"
+        );
+        assert_eq!(
+            store
+                .cas_read(blake3::hash(&payload(1)).as_bytes())
+                .unwrap(),
+            payload(1)
+        );
+        assert_eq!(
+            store
+                .cas_read(blake3::hash(&payload(3)).as_bytes())
+                .unwrap(),
+            payload(3)
+        );
         assert!(not_found(&store, &payload(2)));
 
         // A failed savepoint's allocation that nothing reuses before the
@@ -1043,15 +1176,35 @@ mod tests {
         let (mut store, recovery) = Store::open_with_recovery(config).unwrap();
         assert_eq!(recovery.truncated_tails, []);
         assert_eq!(recovery.lost_tails, []);
-        assert_eq!(store.cas_read(blake3::hash(&payload(1)).as_bytes()).unwrap(), payload(1));
-        assert_eq!(store.cas_read(blake3::hash(&payload(3)).as_bytes()).unwrap(), payload(3));
+        assert_eq!(
+            store
+                .cas_read(blake3::hash(&payload(1)).as_bytes())
+                .unwrap(),
+            payload(1)
+        );
+        assert_eq!(
+            store
+                .cas_read(blake3::hash(&payload(3)).as_bytes())
+                .unwrap(),
+            payload(3)
+        );
         assert!(not_found(&store, &payload(4)));
         store.put_artifact(&payload(5), &[]).unwrap();
-        assert_eq!(store.cas_read(blake3::hash(&payload(5)).as_bytes()).unwrap(), payload(5));
+        assert_eq!(
+            store
+                .cas_read(blake3::hash(&payload(5)).as_bytes())
+                .unwrap(),
+            payload(5)
+        );
         let (open, all) = segments(&store);
         assert_eq!(open, [2]);
-        let (2, 0, indexed, Some(file_len)) = all[2] else { panic!("{all:?}") };
-        assert_eq!(indexed, file_len, "the allocation truncated the uncommitted file");
+        let (2, 0, indexed, Some(file_len)) = all[2] else {
+            panic!("{all:?}")
+        };
+        assert_eq!(
+            indexed, file_len,
+            "the allocation truncated the uncommitted file"
+        );
     }
 
     #[test]
@@ -1064,6 +1217,10 @@ mod tests {
         assert_eq!(open_segments(&*first), 1);
         writer.open_input().unwrap();
         drop(writer);
-        assert_eq!(open_segments(&*first), 0, "a closed writer's segment stays open");
+        assert_eq!(
+            open_segments(&*first),
+            0,
+            "a closed writer's segment stays open"
+        );
     }
 }

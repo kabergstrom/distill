@@ -52,7 +52,10 @@ pub fn pack_definition_bundle(
         AuthoredValue::Object(fields)
     };
     let data = AuthoredValue::Object(BTreeMap::from([
-        ("include_path_table".to_owned(), AuthoredValue::Bool(include_path_table)),
+        (
+            "include_path_table".to_owned(),
+            AuthoredValue::Bool(include_path_table),
+        ),
         (
             "roots".to_owned(),
             AuthoredValue::Array(roots.iter().map(query).collect()),

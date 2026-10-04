@@ -252,7 +252,9 @@ impl InputTxn<'_> {
                 meta.path,
                 meta.format_version,
                 meta.content_hash.0.as_slice(),
-                meta.origin.as_ref().map(|o| o.rules_bundle.0.as_slice().to_vec()),
+                meta.origin
+                    .as_ref()
+                    .map(|o| o.rules_bundle.0.as_slice().to_vec()),
                 meta.origin.as_ref().map(|o| o.rule.0.as_slice()),
                 meta.origin.as_ref().map(|o| o.group_root.as_str()),
                 meta.origin.as_ref().map(|o| o.group_path.as_str()),
@@ -306,7 +308,8 @@ impl InputTxn<'_> {
     pub fn remove_bundle(&mut self, bundle: BundleUuid) -> Result<bool, StoreError> {
         self.remove_owned_asset_rows(bundle)?;
         self.clear_path_refs(bundle)?;
-        let n = self.txn
+        let n = self
+            .txn
             .prepare_cached("DELETE FROM bundles WHERE bundle_uuid = ?1")?
             .execute([bundle.0.as_slice()])?;
         Ok(n > 0)
@@ -364,7 +367,11 @@ impl InputTxn<'_> {
         self.write_asset(rec, Some(TAG_PENDING))
     }
 
-    fn write_asset(&mut self, rec: &AssetRecord, tag_poison: Option<&str>) -> Result<(), StoreError> {
+    fn write_asset(
+        &mut self,
+        rec: &AssetRecord,
+        tag_poison: Option<&str>,
+    ) -> Result<(), StoreError> {
         self.txn
             .prepare_cached(
                 "INSERT INTO assets(
@@ -378,18 +385,16 @@ impl InputTxn<'_> {
                terminal_type = excluded.terminal_type,
                tag_poison = excluded.tag_poison, tag_module = NULL",
             )?
-            .execute(
-                rusqlite::params![
-                    rec.asset.0.as_slice(),
-                    rec.bundle.0.as_slice(),
-                    rec.local_id,
-                    rec.type_uuid.0.as_slice(),
-                    rec.logical_hash.0.as_slice(),
-                    i64::from(rec.authoring_only),
-                    rec.terminal_type.map(|terminal| terminal.0.to_vec()),
-                    tag_poison,
-                ],
-            )?;
+            .execute(rusqlite::params![
+                rec.asset.0.as_slice(),
+                rec.bundle.0.as_slice(),
+                rec.local_id,
+                rec.type_uuid.0.as_slice(),
+                rec.logical_hash.0.as_slice(),
+                i64::from(rec.authoring_only),
+                rec.terminal_type.map(|terminal| terminal.0.to_vec()),
+                tag_poison,
+            ])?;
         self.txn
             .prepare_cached("DELETE FROM asset_tags WHERE asset_uuid = ?1")?
             .execute([rec.asset.0.as_slice()])?;
@@ -499,15 +504,13 @@ impl InputTxn<'_> {
                      asset_uuid, bundle_uuid, local_id, type_uuid, logical_hash, authoring_only
                  ) VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
                 )?
-                .execute(
-                    rusqlite::params![
-                        entry.asset.0.as_slice(),
-                        skeleton.bundle.0.as_slice(),
-                        entry.local_id,
-                        entry.type_uuid.0.as_slice(),
-                        i64::from(entry.authoring_only),
-                    ],
-                )?;
+                .execute(rusqlite::params![
+                    entry.asset.0.as_slice(),
+                    skeleton.bundle.0.as_slice(),
+                    entry.local_id,
+                    entry.type_uuid.0.as_slice(),
+                    i64::from(entry.authoring_only),
+                ])?;
             for (tag, value) in &entry.tags {
                 self.txn
                     .prepare_cached(
@@ -518,11 +521,9 @@ impl InputTxn<'_> {
         }
         Ok(())
     }
-
 }
 
 impl Store {
-
     /// Complete tag extraction after the owning input transaction has made
     /// the candidate namespace readable but before that version is exposed by
     /// the RPC publication step. This deliberately does not
@@ -549,15 +550,17 @@ impl Store {
                         error: format!("poisoned tag-index update {} carried tags", update.asset),
                     });
                 }
-                txn
-                    .prepare_cached("DELETE FROM asset_tags WHERE asset_uuid = ?1")?
+                txn.prepare_cached("DELETE FROM asset_tags WHERE asset_uuid = ?1")?
                     .execute([update.asset.0.as_slice()])?;
                 for (tag, value) in &update.tags {
-                    txn
-                        .prepare_cached(
-                            "INSERT INTO asset_tags(asset_uuid, tag, value) VALUES (?1, ?2, ?3)",
-                        )?
-                        .execute(rusqlite::params![update.asset.0.as_slice(), tag, value])?;
+                    txn.prepare_cached(
+                        "INSERT INTO asset_tags(asset_uuid, tag, value) VALUES (?1, ?2, ?3)",
+                    )?
+                    .execute(rusqlite::params![
+                        update.asset.0.as_slice(),
+                        tag,
+                        value
+                    ])?;
                 }
                 let updated = txn
                     .prepare_cached(
@@ -595,17 +598,14 @@ impl Store {
             let txn: &rusqlite::Connection = &store.read.conn;
             for type_uuid in &changed {
                 let type_uuid_bytes = type_uuid.0.as_slice();
-                txn
-                    .prepare_cached(
-                        "UPDATE assets SET tag_poison = ?2, tag_module = NULL WHERE type_uuid = ?1",
-                    )?
-                    .execute(rusqlite::params![type_uuid_bytes, TAG_PENDING])?;
-                txn
-                    .prepare_cached("DELETE FROM tag_epochs WHERE type_uuid = ?1")?
+                txn.prepare_cached(
+                    "UPDATE assets SET tag_poison = ?2, tag_module = NULL WHERE type_uuid = ?1",
+                )?
+                .execute(rusqlite::params![type_uuid_bytes, TAG_PENDING])?;
+                txn.prepare_cached("DELETE FROM tag_epochs WHERE type_uuid = ?1")?
                     .execute([type_uuid_bytes])?;
                 if let Some(epoch) = epochs.get(type_uuid) {
-                    txn
-                        .prepare_cached("INSERT INTO tag_epochs(type_uuid, epoch) VALUES (?1, ?2)")?
+                    txn.prepare_cached("INSERT INTO tag_epochs(type_uuid, epoch) VALUES (?1, ?2)")?
                         .execute(rusqlite::params![type_uuid_bytes, epoch.as_slice()])?;
                 }
             }
@@ -779,9 +779,7 @@ impl StoreReader {
     /// Every bundle's primary asset by (logical path, root): several roots
     /// at one path remain several candidates; no root is selected here.
     pub fn all_path_entries(&self) -> Result<Vec<(String, RootId, AssetUuid)>, StoreError> {
-        let mut statement = self
-            .conn
-            .prepare(PRIMARY_ASSETS)?;
+        let mut statement = self.conn.prepare(PRIMARY_ASSETS)?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get(0)?,
@@ -797,9 +795,7 @@ impl StoreReader {
     /// its bundles in every root. Ordinary watcher publications use this
     /// bounded lookup instead of enumerating every bundle.
     pub fn path_assets(&self, path: &str) -> Result<BTreeSet<AssetUuid>, StoreError> {
-        let mut statement = self
-            .conn
-            .prepare_cached(PATH_PRIMARIES)?;
+        let mut statement = self.conn.prepare_cached(PATH_PRIMARIES)?;
         let rows = statement.query_map([path], |row| row.get::<_, Vec<u8>>(0))?;
         rows.map(|row| row.map(|bytes| AssetUuid(blob16(bytes))))
             .collect::<Result<BTreeSet<_>, _>>()
@@ -945,12 +941,14 @@ impl StoreReader {
         &self,
         mut visit: impl FnMut(String, RootId, AssetUuid) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
-        let mut statement = self
-            .conn
-            .prepare_cached(PRIMARY_ASSETS)?;
+        let mut statement = self.conn.prepare_cached(PRIMARY_ASSETS)?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
-            visit(row.get(0)?, RootId(row.get(1)?), AssetUuid(blob16(row.get(2)?)))?;
+            visit(
+                row.get(0)?,
+                RootId(row.get(1)?),
+                AssetUuid(blob16(row.get(2)?)),
+            )?;
         }
         Ok(())
     }
@@ -1067,7 +1065,6 @@ impl StoreReader {
             bundle_meta,
         )))
     }
-
 }
 
 macro_rules! bundle_columns {
@@ -1085,7 +1082,8 @@ const NEXT_RULES_BUNDLE: &str = "SELECT g.origin_rules_bundle, r.root_id, r.path
      WHERE g.origin_rules_bundle IS NOT NULL AND g.origin_rules_bundle > ?1
      ORDER BY g.origin_rules_bundle LIMIT 1";
 /// Every bundle's primary asset by (path, root): a walk of `bundles_by_path`.
-const PRIMARY_ASSETS: &str = "SELECT path, root_id, primary_asset FROM bundles INDEXED BY bundles_by_path
+const PRIMARY_ASSETS: &str =
+    "SELECT path, root_id, primary_asset FROM bundles INDEXED BY bundles_by_path
      WHERE primary_asset IS NOT NULL ORDER BY path, root_id";
 /// The primaries of the bundles at one path: a search of `bundles_by_path`.
 pub(crate) const PATH_PRIMARIES: &str =
@@ -1216,7 +1214,12 @@ impl AssetFilter {
             .filter(|prefix| !prefix.is_empty())
             .max_by_key(|prefix| prefix.len());
         match longest {
-            Some(longest) if self.path_prefixes.iter().any(|p| !longest.starts_with(p.as_str())) => {
+            Some(longest)
+                if self
+                    .path_prefixes
+                    .iter()
+                    .any(|p| !longest.starts_with(p.as_str())) =>
+            {
                 Err(())
             }
             longest => Ok(longest),
@@ -1225,8 +1228,7 @@ impl AssetFilter {
 
     /// Whether no row can satisfy the filter, without asking SQLite.
     fn selects_nothing(&self) -> bool {
-        self.path_prefix().is_err()
-            || self.authored_type_in.as_ref().is_some_and(Vec::is_empty)
+        self.path_prefix().is_err() || self.authored_type_in.as_ref().is_some_and(Vec::is_empty)
     }
 
     fn driver(&self, tag_poisoned: bool) -> Driver {
@@ -1241,7 +1243,8 @@ impl AssetFilter {
             Driver::BundleName
         } else if self.local_id.is_some() {
             Driver::LocalId
-        } else if tag_poisoned && (self.authored_type.is_some() || self.authored_type_in.is_some()) {
+        } else if tag_poisoned && (self.authored_type.is_some() || self.authored_type_in.is_some())
+        {
             // A typed query walks the poisoned rows of its types only.
             Driver::TagPoisonedTypes
         } else if tag_poisoned {
@@ -1377,7 +1380,10 @@ impl AssetFilter {
         if let Some((tag, value)) = &self.tag {
             let n = bind(params, Value::Text(tag.clone()));
             let value = match value {
-                Some(value) => format!(" AND t.value = ?{}", bind(params, Value::Text(value.clone()))),
+                Some(value) => format!(
+                    " AND t.value = ?{}",
+                    bind(params, Value::Text(value.clone()))
+                ),
                 None => String::new(),
             };
             // Driving, the tag's rows are the candidates; otherwise each

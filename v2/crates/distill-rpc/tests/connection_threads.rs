@@ -142,7 +142,13 @@ struct TestBackend {
 impl BuildBackend for TestBackend {
     fn start(&self, view: BuildView<'_>, request: &BuildRequest) -> BuildStart {
         let at_version = (request.requested_asset == ASSET)
-            .then(|| self.by_version.lock().unwrap().get(&view.stamp.version).copied())
+            .then(|| {
+                self.by_version
+                    .lock()
+                    .unwrap()
+                    .get(&view.stamp.version)
+                    .copied()
+            })
             .flatten();
         BuildStart::Answered(
             match at_version.or_else(|| self.built.get(&request.requested_asset).copied()) {
@@ -253,9 +259,15 @@ fn fixture() -> Fixture {
     let server = project.server();
     let gate = Arc::new(Gate::default());
     let (hash, payload) = artifact(ASSET, &[7, 8, 9]);
-    assert_eq!(distill_test_project::put_artifact(&server.handle(), &payload), hash);
+    assert_eq!(
+        distill_test_project::put_artifact(&server.handle(), &payload),
+        hash
+    );
     let (large, payload) = artifact(LARGE, &vec![0x5a; 8 << 20]);
-    assert_eq!(distill_test_project::put_artifact(&server.handle(), &payload), large);
+    assert_eq!(
+        distill_test_project::put_artifact(&server.handle(), &payload),
+        large
+    );
     let backend = Arc::new(TestBackend {
         gate: Arc::clone(&gate),
         built: BTreeMap::from([(ASSET, hash), (LARGE, large)]),
@@ -502,7 +514,12 @@ fn a_stalled_request_on_one_connection_does_not_delay_another() {
 #[test]
 fn connections_up_to_the_bound_are_served_at_once_and_one_more_is_refused() {
     watchdog(Duration::from_secs(60), || {
-        let Fixture { project: _project, server, hash, .. } = fixture();
+        let Fixture {
+            project: _project,
+            server,
+            hash,
+            ..
+        } = fixture();
         server
             .install_snapshot_policy(SnapshotPolicy {
                 max_connections: 4,
@@ -546,7 +563,10 @@ fn connections_up_to_the_bound_are_served_at_once_and_one_more_is_refused() {
             let client = CapnpClient::connect_local(address).await.unwrap();
             client.connect(&request()).await.is_err()
         });
-        assert!(refused.join().unwrap(), "a connection past the bound was served");
+        assert!(
+            refused.join().unwrap(),
+            "a connection past the bound was served"
+        );
         assert_eq!(daemon.connections(), 4);
 
         // When one leaves, a new one is admitted.
@@ -576,7 +596,11 @@ fn connections_up_to_the_bound_are_served_at_once_and_one_more_is_refused() {
 #[test]
 fn deltas_and_fences_reach_every_connection() {
     watchdog(Duration::from_secs(60), || {
-        let Fixture { mut project, server, .. } = fixture();
+        let Fixture {
+            mut project,
+            server,
+            ..
+        } = fixture();
         let daemon = Daemon::start(server.root());
         let address = daemon.address;
         let since = server.current_stamp().unwrap().version;
@@ -591,17 +615,22 @@ fn deltas_and_fences_reach_every_connection() {
             let fenced_tx = fenced_tx.clone();
             clients.push(on_thread(move || async move {
                 let (_client, hub) = connect(address).await;
-                let mut subscription = match hub.subscribe(since, vec![ASSET], vec![]).await.unwrap() {
-                    RemoteCall::Success(subscription) => subscription,
-                    other => panic!("subscribe failed: {other:?}"),
-                };
+                let mut subscription =
+                    match hub.subscribe(since, vec![ASSET], vec![]).await.unwrap() {
+                        RemoteCall::Success(subscription) => subscription,
+                        other => panic!("subscribe failed: {other:?}"),
+                    };
                 assert!(matches!(
                     subscription.next().await.unwrap(),
                     Some(StreamEvent::InitialDelta { .. })
                 ));
                 ready_tx.send(()).unwrap();
                 for _ in 0..2 {
-                    let event = subscription.next().await.unwrap().expect("the stream ended");
+                    let event = subscription
+                        .next()
+                        .await
+                        .unwrap()
+                        .expect("the stream ended");
                     event_tx.send((index, event)).unwrap();
                 }
                 fenced_tx
@@ -667,7 +696,12 @@ fn deltas_and_fences_reach_every_connection() {
 #[test]
 fn the_snapshot_bound_and_ttl_hold_across_connection_threads() {
     watchdog(Duration::from_secs(60), || {
-        let Fixture { project: _project, server, hash, .. } = fixture();
+        let Fixture {
+            project: _project,
+            server,
+            hash,
+            ..
+        } = fixture();
         server
             .install_snapshot_policy(SnapshotPolicy {
                 ttl: Duration::from_millis(1500),
@@ -690,12 +724,18 @@ fn the_snapshot_bound_and_ttl_hold_across_connection_threads() {
             a_step_rx.recv().unwrap();
             let _third = snapshot(&hub).await;
             a_done_tx
-                .send(matches!(first.resolve(ASSET).await.unwrap(), RemoteCall::SnapshotExpired))
+                .send(matches!(
+                    first.resolve(ASSET).await.unwrap(),
+                    RemoteCall::SnapshotExpired
+                ))
                 .unwrap();
             // Past the TTL every snapshot of A is gone.
             a_step_rx.recv().unwrap();
             a_done_tx
-                .send(matches!(_second.resolve(ASSET).await.unwrap(), RemoteCall::SnapshotExpired))
+                .send(matches!(
+                    _second.resolve(ASSET).await.unwrap(),
+                    RemoteCall::SnapshotExpired
+                ))
                 .unwrap();
             let _ = a_step_rx.recv();
         });
@@ -723,7 +763,10 @@ fn the_snapshot_bound_and_ttl_hold_across_connection_threads() {
             }
         });
         let refused = b_done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        assert!(refused.contains("open snapshots"), "B was not refused: {refused}");
+        assert!(
+            refused.contains("open snapshots"),
+            "B was not refused: {refused}"
+        );
         assert_eq!(server.open_snapshots(), 2);
 
         a_step_tx.send(()).unwrap();
@@ -731,16 +774,23 @@ fn the_snapshot_bound_and_ttl_hold_across_connection_threads() {
         assert_eq!(server.open_snapshots(), 2);
 
         // The TTL expires A's snapshots on A's thread; then B opens one.
-        assert!(eventually(Duration::from_secs(5), || server.open_snapshots() == 0));
+        assert!(eventually(Duration::from_secs(5), || server
+            .open_snapshots()
+            == 0));
         a_step_tx.send(()).unwrap();
         assert!(a_done_rx.recv_timeout(Duration::from_secs(10)).unwrap());
         b_step_tx.send(()).unwrap();
-        assert_eq!(b_done_rx.recv_timeout(Duration::from_secs(10)).unwrap(), "opened");
+        assert_eq!(
+            b_done_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            "opened"
+        );
 
         drop((a_step_tx, b_step_tx));
         a.join().unwrap();
         b.join().unwrap();
-        assert!(eventually(Duration::from_secs(5), || server.open_snapshots() == 0));
+        assert!(eventually(Duration::from_secs(5), || server
+            .open_snapshots()
+            == 0));
     });
 }
 
@@ -778,7 +828,10 @@ fn a_connection_dropped_mid_fetch_releases_everything() {
         client.join().unwrap();
         let outcome = wait_for(Duration::from_secs(5), connection)
             .expect("the connection thread outlived its client");
-        assert!(outcome.is_ok(), "the connection thread panicked: {outcome:?}");
+        assert!(
+            outcome.is_ok(),
+            "the connection thread panicked: {outcome:?}"
+        );
         assert_eq!(daemon.connections(), 0);
         assert_eq!(server.open_snapshots(), 0);
         assert_eq!(server.handle().open_connections(), 0);
@@ -799,7 +852,12 @@ fn a_connection_dropped_mid_fetch_releases_everything() {
 #[test]
 fn shutdown_is_prompt_with_stuck_clients() {
     watchdog(Duration::from_secs(60), || {
-        let Fixture { project: _project, server, gate, .. } = fixture();
+        let Fixture {
+            project: _project,
+            server,
+            gate,
+            ..
+        } = fixture();
         let daemon = Daemon::start(server.root());
         let address = daemon.address;
 
@@ -833,8 +891,14 @@ fn shutdown_is_prompt_with_stuck_clients() {
 
         let (remaining, took) = daemon.shutdown(Duration::from_millis(500));
         assert!(took < Duration::from_secs(2), "shutdown took {took:?}");
-        assert_eq!(remaining, 1, "only the thread inside the stalled call remains");
-        assert!(idle.join().unwrap(), "the idle client's connection was not closed");
+        assert_eq!(
+            remaining, 1,
+            "only the thread inside the stalled call remains"
+        );
+        assert!(
+            idle.join().unwrap(),
+            "the idle client's connection was not closed"
+        );
         assert!(wait_for(Duration::from_secs(2), idle_connection).is_some());
         assert!(wait_for(Duration::from_secs(2), silent_connection).is_some());
         silent
@@ -867,7 +931,12 @@ fn shutdown_is_prompt_with_stuck_clients() {
 #[test]
 fn a_panic_ends_only_its_own_connection() {
     watchdog(Duration::from_secs(60), || {
-        let Fixture { project: _project, server, hash, .. } = fixture();
+        let Fixture {
+            project: _project,
+            server,
+            hash,
+            ..
+        } = fixture();
         let daemon = Daemon::start(server.root());
         let address = daemon.address;
 
@@ -894,14 +963,19 @@ fn a_panic_ends_only_its_own_connection() {
         let a_connection = daemon.next_connection();
         assert!(a.join().unwrap(), "the panicking call answered");
         let outcome = wait_for(Duration::from_secs(5), a_connection).expect("A's thread lingered");
-        assert!(matches!(outcome, Err(capnp_transport::ConnectionPanicked(ref message)) if message.contains("panics on request")));
+        assert!(
+            matches!(outcome, Err(capnp_transport::ConnectionPanicked(ref message)) if message.contains("panics on request"))
+        );
 
         // B and the listener carry on, and A's capabilities are released.
         b_step_tx.send(()).unwrap();
         b_done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(eventually(Duration::from_secs(5), || daemon.connections() == 1));
         assert!(
-            eventually(Duration::from_secs(5), || server.handle().open_connections() == 1),
+            eventually(Duration::from_secs(5), || server
+                .handle()
+                .open_connections()
+                == 1),
             "the panicked connection kept its admission: {}",
             server.handle().open_connections()
         );
@@ -981,15 +1055,19 @@ fn concurrent_snapshots_resolves_fetches_and_commits_stay_consistent() {
                             RemoteCall::Success(terminal) => {
                                 assert_eq!(terminal.basis.snapshot.version, stamp);
                                 if let ResolveResult::Built { content_hash } = &terminal.value {
-                                    let mut fetched = match snapshot.fetch(*content_hash).await.unwrap() {
-                                        RemoteCall::Success(terminal) => terminal.value,
-                                        other => panic!("fetch failed: {other:?}"),
-                                    };
+                                    let mut fetched =
+                                        match snapshot.fetch(*content_hash).await.unwrap() {
+                                            RemoteCall::Success(terminal) => terminal.value,
+                                            other => panic!("fetch failed: {other:?}"),
+                                        };
                                     let mut bytes = Vec::new();
                                     while let Some(chunk) = fetched.next_chunk().await.unwrap() {
                                         bytes.extend_from_slice(&chunk.bytes);
                                     }
-                                    assert_eq!(distill_wire::artifact::content_hash(&bytes), *content_hash);
+                                    assert_eq!(
+                                        distill_wire::artifact::content_hash(&bytes),
+                                        *content_hash
+                                    );
                                 }
                                 observed.push((stamp, terminal.value));
                             }
@@ -1000,11 +1078,9 @@ fn concurrent_snapshots_resolves_fetches_and_commits_stay_consistent() {
                             other => panic!("refresh failed: {other:?}"),
                         };
                         // Drain what the stream has without waiting long.
-                        while let Ok(Ok(Some(event))) = tokio::time::timeout(
-                            Duration::from_millis(1),
-                            subscription.next(),
-                        )
-                        .await
+                        while let Ok(Ok(Some(event))) =
+                            tokio::time::timeout(Duration::from_millis(1), subscription.next())
+                                .await
                         {
                             let version = event.basis().snapshot.version;
                             assert!(version >= last_delta.min(version));
@@ -1099,7 +1175,10 @@ fn ledger_commit() -> Commit {
 
 /// The backend's row for the version `next` (a root named for it), written
 /// through `store`.
-fn ledger_row(store: &mut distill_store::Store, next: InputVersion) -> Result<(), distill_store::StoreError> {
+fn ledger_row(
+    store: &mut distill_store::Store,
+    next: InputVersion,
+) -> Result<(), distill_store::StoreError> {
     store
         .input_transaction(|transaction| transaction.intern_root(&ledger_root(next)))
         .map(|_| ())
@@ -1110,7 +1189,12 @@ fn ledger_root(version: InputVersion) -> String {
 }
 
 impl AuthoringBackend for LedgerBackend {
-    fn read_file(&self, _: &distill_store::StoreReader, _: &str, _: &str) -> Result<Vec<u8>, String> {
+    fn read_file(
+        &self,
+        _: &distill_store::StoreReader,
+        _: &str,
+        _: &str,
+    ) -> Result<Vec<u8>, String> {
         unreachable!("never inspects")
     }
 
@@ -1203,7 +1287,14 @@ async fn write_at(hub: &schema::hub::Client, base: InputVersion) -> Result<Write
         ops.reborrow().get(0).init_remove().set_bytes(&ASSET.0);
     }
     let response = call.send().promise.await.unwrap();
-    match response.get().unwrap().get_result().unwrap().which().unwrap() {
+    match response
+        .get()
+        .unwrap()
+        .get_result()
+        .unwrap()
+        .which()
+        .unwrap()
+    {
         schema::data_call::Which::Success(bytes) => {
             Ok(WriteReceipt::decode(bytes.unwrap()).unwrap())
         }
@@ -1261,7 +1352,12 @@ fn two_connections_writing_concurrently_are_serialized_and_commit_nothing() {
         );
         let reader = server.handle().opener().open_reader().unwrap();
         assert_eq!(reader.input_version().unwrap(), start);
-        assert_eq!(reader.root_id(&ledger_root(InputVersion(start.0 + 1))).unwrap(), None);
+        assert_eq!(
+            reader
+                .root_id(&ledger_root(InputVersion(start.0 + 1)))
+                .unwrap(),
+            None
+        );
     });
 }
 
@@ -1304,7 +1400,9 @@ fn a_coordinated_commits_backend_row_and_served_projection_land_together() {
                 .unwrap();
             let version = snapshot.input_version().unwrap();
             let ledger = snapshot.root_id(&ledger_root(version)).unwrap();
-            let next_ledger = snapshot.root_id(&ledger_root(InputVersion(version.0 + 1))).unwrap();
+            let next_ledger = snapshot
+                .root_id(&ledger_root(InputVersion(version.0 + 1)))
+                .unwrap();
             let served = snapshot
                 .change_log_after(0)
                 .unwrap()
@@ -1318,7 +1416,13 @@ fn a_coordinated_commits_backend_row_and_served_projection_land_together() {
             if version != start && version.0 > 1 {
                 assert_eq!(
                     served,
-                    Some((version, distill_store::served::Change::Asset { asset: ASSET, state: 0 })),
+                    Some((
+                        version,
+                        distill_store::served::Change::Asset {
+                            asset: ASSET,
+                            state: 0
+                        }
+                    )),
                     "served projection at {version:?}"
                 );
             }
@@ -1328,7 +1432,10 @@ fn a_coordinated_commits_backend_row_and_served_projection_land_together() {
             }
         }
         committer.join().unwrap();
-        assert!(seen.len() > 2, "the reader saw versions while commits ran: {seen:?}");
+        assert!(
+            seen.len() > 2,
+            "the reader saw versions while commits ran: {seen:?}"
+        );
     });
 }
 
@@ -1356,7 +1463,10 @@ fn a_connection_blocked_on_the_write_lock_does_not_stall_another() {
             written_tx.send(write_at(&raw, start).await).unwrap();
         });
         std::thread::sleep(Duration::from_millis(200));
-        assert!(written_rx.try_recv().is_err(), "the write waits on the lock");
+        assert!(
+            written_rx.try_recv().is_err(),
+            "the write waits on the lock"
+        );
 
         let (ready_tx, ready_rx) = mpsc::channel();
         let reader = on_thread(move || async move {

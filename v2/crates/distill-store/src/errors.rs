@@ -21,8 +21,7 @@ use rusqlite::OptionalExtension;
 use crate::db::{InputTxn, StoreReader};
 use crate::error::StoreError;
 use crate::state::{
-    ConfigurationError, ConfigurationErrorCode, DscpV1, ErrorScope, NamespaceError,
-    PipelineFailure,
+    ConfigurationError, ConfigurationErrorCode, DscpV1, ErrorScope, NamespaceError, PipelineFailure,
 };
 
 /// The scan's namespace errors.
@@ -154,17 +153,15 @@ impl InputTxn<'_> {
                 "INSERT INTO errors(family, scope_kind, scope_id, identity, code, record, message)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?
-            .execute(
-                rusqlite::params![
-                    family,
-                    scope.kind(),
-                    scope.id(),
-                    error.reason_hash.as_slice(),
-                    error.code as u16,
-                    error.detail.canonical_detail_bytes(),
-                    error.message,
-                ],
-            )?;
+            .execute(rusqlite::params![
+                family,
+                scope.kind(),
+                scope.id(),
+                error.reason_hash.as_slice(),
+                error.code as u16,
+                error.detail.canonical_detail_bytes(),
+                error.message,
+            ])?;
         Ok(())
     }
 
@@ -176,7 +173,9 @@ impl InputTxn<'_> {
         let held = self
             .txn
             .prepare_cached("SELECT identity, record FROM errors WHERE family = ?1")?
-            .query_map([family], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)))?
+            .query_map([family], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
             .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
         self.write_namespace_family(family, errors, held)
     }
@@ -357,7 +356,9 @@ impl StoreReader {
             detail: Box::new(detail),
             message,
         };
-        error.validate().map_err(|error| invalid(error.to_string()))?;
+        error
+            .validate()
+            .map_err(|error| invalid(error.to_string()))?;
         Ok(Some(error))
     }
 

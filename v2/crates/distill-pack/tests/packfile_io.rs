@@ -1,8 +1,8 @@
 use distill_bundle::PathComponent;
 use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
 use distill_loader::{
-    AssetPath, GameModuleEpoch, IoBasis, IoEvent, LoaderIO, PathResolveResult, ReqId, ResolveResult,
-    RuntimeTarget as LoaderRuntimeTarget,
+    AssetPath, GameModuleEpoch, IoBasis, IoEvent, LoaderIO, PathResolveResult, ReqId,
+    ResolveResult, RuntimeTarget as LoaderRuntimeTarget,
 };
 use distill_pack::archive::{encode_archive, ArtifactPayload};
 use distill_pack::manifest::{
@@ -252,7 +252,11 @@ fn path_queries_are_normalized_before_lookup() {
     let manifest = encode_manifest(&decoded).unwrap();
     let mut io = mount_pack(&manifest, &archive, &runtime).unwrap();
     let basis = io.begin_sweep();
-    io.resolve_path(ReqId(1), &AssetPath::from("te\u{301}xtures/a.bundle"), &basis);
+    io.resolve_path(
+        ReqId(1),
+        &AssetPath::from("te\u{301}xtures/a.bundle"),
+        &basis,
+    );
 
     assert!(matches!(io.poll().as_slice(), [IoEvent::PathResolved {
         result: PathResolveResult::Resolved(got), ..
@@ -342,8 +346,16 @@ fn named_paths_resolve_by_path_and_name() {
     let (manifest, archive, runtime, asset_uuid, _) = fixture(true);
     let mut io = mount_pack(&manifest, &archive, &runtime).unwrap();
     let basis = io.begin_sweep();
-    io.resolve_path(ReqId(1), &AssetPath::named("assets/a.bundle", "main"), &basis);
-    io.resolve_path(ReqId(2), &AssetPath::named("assets/a.bundle", "other"), &basis);
+    io.resolve_path(
+        ReqId(1),
+        &AssetPath::named("assets/a.bundle", "main"),
+        &basis,
+    );
+    io.resolve_path(
+        ReqId(2),
+        &AssetPath::named("assets/a.bundle", "other"),
+        &basis,
+    );
     let events = io.poll();
 
     assert!(matches!(&events[0], IoEvent::PathResolved {
@@ -351,6 +363,10 @@ fn named_paths_resolve_by_path_and_name() {
     } if *got == asset_uuid && path.name.as_deref() == Some("main")));
     assert!(matches!(
         &events[1],
-        IoEvent::PathResolved { req: ReqId(2), result: PathResolveResult::Missing, .. }
+        IoEvent::PathResolved {
+            req: ReqId(2),
+            result: PathResolveResult::Missing,
+            ..
+        }
     ));
 }

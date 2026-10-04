@@ -162,4 +162,3 @@ pub fn publish_target_set<W: ServedWrite>(
     }
     Ok(())
 }
-

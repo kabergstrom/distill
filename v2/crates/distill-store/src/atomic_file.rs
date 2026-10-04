@@ -106,8 +106,13 @@ impl From<Option<ContentHash>> for Expected {
 #[derive(Debug)]
 pub enum AtomicWriteError {
     /// The target changed since it was read.
-    Conflict { path: PathBuf },
-    Io { path: PathBuf, source: io::Error },
+    Conflict {
+        path: PathBuf,
+    },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
 }
 
 impl fmt::Display for AtomicWriteError {
@@ -605,8 +610,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let owner = temp.path();
         let target = owner.join("objects/abc");
-        assert!(stage(owner, &target, b"bytes").unwrap().commit_new().unwrap());
-        assert!(!stage(owner, &target, b"bytes").unwrap().commit_new().unwrap());
+        assert!(stage(owner, &target, b"bytes")
+            .unwrap()
+            .commit_new()
+            .unwrap());
+        assert!(!stage(owner, &target, b"bytes")
+            .unwrap()
+            .commit_new()
+            .unwrap());
         assert_eq!(fs::read(&target).unwrap(), b"bytes");
         assert!(names(&staging_dir(owner)).is_empty());
     }

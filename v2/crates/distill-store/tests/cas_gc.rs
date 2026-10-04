@@ -7,9 +7,7 @@ use std::time::Duration;
 
 use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
 use distill_store::cas::record::KeyKind;
-use distill_store::cas::{
-    AuxSpec, BuildCommit, CommitOutcome, OutputSpec, SegmentSweeper,
-};
+use distill_store::cas::{AuxSpec, BuildCommit, CommitOutcome, OutputSpec, SegmentSweeper};
 use distill_store::{Store, StoreConfig, StoreError};
 use distill_wire::artifact::{write_artifact, ArtifactHeader};
 use distill_wire::dswl::dswl_bytes;
@@ -282,7 +280,12 @@ fn compaction_repoints_live_records_and_the_sweeper_deletes_the_dead_segment() {
         0
     );
     assert!(segment_bytes(&dir) > size_before);
-    assert_eq!(SegmentSweeper::new(Duration::ZERO).sweep(&mut store).unwrap(), 1);
+    assert_eq!(
+        SegmentSweeper::new(Duration::ZERO)
+            .sweep(&mut store)
+            .unwrap(),
+        1
+    );
     let size_after: u64 = segment_bytes(&dir);
     assert!(
         size_after < size_before,
@@ -326,12 +329,18 @@ fn a_snapshot_reads_its_blobs_until_the_dead_segment_is_swept() {
 
     assert_eq!(view.cas_read(&kept).unwrap(), b"kept artifact");
     assert_eq!(view.cas_read(&evicted).unwrap(), vec![5u8; 4096]);
-    assert!(matches!(store.cas_read(&evicted), Err(StoreError::NotFound { .. })));
+    assert!(matches!(
+        store.cas_read(&evicted),
+        Err(StoreError::NotFound { .. })
+    ));
 
     std::thread::sleep(Duration::from_millis(250));
     assert_eq!(sweeper.sweep(&mut store).unwrap(), 1);
     // Past the bound the old location is a cache miss, never wrong bytes.
-    assert!(matches!(view.cas_read(&evicted), Err(StoreError::NotFound { .. })));
+    assert!(matches!(
+        view.cas_read(&evicted),
+        Err(StoreError::NotFound { .. })
+    ));
     let reader = view.into_reader().unwrap();
     assert_eq!(reader.cas_read(&kept).unwrap(), b"kept artifact");
 }
@@ -350,7 +359,9 @@ fn compaction_keeps_a_shared_payload_for_its_surviving_result() {
         .unwrap());
 
     assert!(!store.compact().unwrap().dead_segments.is_empty());
-    SegmentSweeper::new(Duration::ZERO).sweep(&mut store).unwrap();
+    SegmentSweeper::new(Duration::ZERO)
+        .sweep(&mut store)
+        .unwrap();
     drop(store);
 
     let (store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
@@ -444,7 +455,9 @@ fn a_segment_a_rolled_back_input_left_behind_is_reclaimed() {
         .evict_result(KeyKind::Processor, &[1u8; 32], &first)
         .unwrap());
     let report = store.compact().unwrap();
-    SegmentSweeper::new(Duration::ZERO).sweep(&mut store).unwrap();
+    SegmentSweeper::new(Duration::ZERO)
+        .sweep(&mut store)
+        .unwrap();
     let remaining = segment_files(&dir);
     assert!(
         !remaining.contains(&left_behind[0]),

@@ -435,12 +435,14 @@ impl Counters {
     /// A transaction began on the connection.
     pub(crate) fn begin(&self) {
         self.forget();
-        self.active.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.active
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The connection's transaction ended.
     pub(crate) fn end(&self) {
-        self.active.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.active
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         self.forget();
     }
 
@@ -451,7 +453,11 @@ impl Counters {
         }
     }
 
-    pub(crate) fn get(&self, conn: &Connection, counter: Counter) -> Result<Option<u64>, StoreError> {
+    pub(crate) fn get(
+        &self,
+        conn: &Connection,
+        counter: Counter,
+    ) -> Result<Option<u64>, StoreError> {
         use std::sync::atomic::Ordering::Relaxed;
         let active = self.active.load(Relaxed);
         if active {
@@ -468,7 +474,12 @@ impl Counters {
         Ok(value)
     }
 
-    pub(crate) fn set(&self, conn: &Connection, counter: Counter, value: u64) -> Result<(), StoreError> {
+    pub(crate) fn set(
+        &self,
+        conn: &Connection,
+        counter: Counter,
+        value: u64,
+    ) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering::Relaxed;
         meta_set_u64(conn, counter.key(), value)?;
         if self.active.load(Relaxed) && value < COUNTER_ABSENT {
@@ -573,7 +584,9 @@ enum InputState {
     /// The next input transaction begins the input.
     Armed,
     /// Writes join the input begun at `base`.
-    Begun { base: InputVersion },
+    Begun {
+        base: InputVersion,
+    },
 }
 
 impl std::fmt::Debug for Store {
@@ -777,21 +790,23 @@ impl Store {
         let version = InputVersion(base.0 + 1);
         let out = {
             let mut input_txn = InputTxn {
-            txn,
-            counters: Arc::clone(&self.read.counters),
-            base_stamp: SnapshotStamp {
-                instance,
-                version: base,
-            },
-            version,
-            state_path,
-            config,
-            roots: std::collections::BTreeMap::new(),
+                txn,
+                counters: Arc::clone(&self.read.counters),
+                base_stamp: SnapshotStamp {
+                    instance,
+                    version: base,
+                },
+                version,
+                state_path,
+                config,
+                roots: std::collections::BTreeMap::new(),
                 staged_packages: &mut self.staged_packages,
                 queued_work: &mut self.queued_work,
             };
             f(&mut input_txn).and_then(|out| {
-                input_txn.counters.set(input_txn.txn, Counter::InputVersion, version.0)?;
+                input_txn
+                    .counters
+                    .set(input_txn.txn, Counter::InputVersion, version.0)?;
                 Ok(out)
             })
         };
@@ -1194,7 +1209,10 @@ impl StoreReader {
     pub fn pages_fetched(&self) -> Result<u64, StoreError> {
         use rusqlite::ffi;
         let mut total = 0;
-        for op in [ffi::SQLITE_DBSTATUS_CACHE_HIT, ffi::SQLITE_DBSTATUS_CACHE_MISS] {
+        for op in [
+            ffi::SQLITE_DBSTATUS_CACHE_HIT,
+            ffi::SQLITE_DBSTATUS_CACHE_MISS,
+        ] {
             let (mut current, mut highwater) = (0, 0);
             // SAFETY: the handle is this reader's open connection, used on
             // this thread; db_status only reads its counters.
@@ -1214,7 +1232,11 @@ impl StoreReader {
 
     /// The committed input version visible to this connection.
     pub fn input_version(&self) -> Result<InputVersion, StoreError> {
-        Ok(InputVersion(self.counters.get(&self.conn, Counter::InputVersion)?.unwrap_or(0)))
+        Ok(InputVersion(
+            self.counters
+                .get(&self.conn, Counter::InputVersion)?
+                .unwrap_or(0),
+        ))
     }
 
     /// The committed memo sequence visible to this connection.
@@ -1236,11 +1258,12 @@ impl StoreReader {
     /// roots): what in-memory state derived from it is keyed by. `None`
     /// until a publication records one.
     pub fn compiled_version(&self) -> Result<Option<InputVersion>, StoreError> {
-        Ok(self.counters.get(&self.conn, Counter::CompiledVersion)?.map(InputVersion))
+        Ok(self
+            .counters
+            .get(&self.conn, Counter::CompiledVersion)?
+            .map(InputVersion))
     }
-
 }
-
 
 /// One atomic input-version transaction (§13). Every input-versioned
 /// table writes through methods on this; dropping without commit rolls
@@ -1292,7 +1315,8 @@ impl InputTxn<'_> {
     /// Record that this input publishes the daemon's compiled configuration
     /// state (see [`StoreReader::compiled_version`]).
     pub fn mark_compiled(&mut self) -> Result<(), StoreError> {
-        self.counters.set(self.txn, Counter::CompiledVersion, self.version.0)
+        self.counters
+            .set(self.txn, Counter::CompiledVersion, self.version.0)
     }
 }
 
@@ -1418,6 +1442,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(StoreConfig::new(dir.path().join("state"))).unwrap();
         let reader = store.reader().unwrap();
-        assert!(reader.conn.execute_batch("CREATE TABLE written (x)").is_err());
+        assert!(reader
+            .conn
+            .execute_batch("CREATE TABLE written (x)")
+            .is_err());
     }
 }

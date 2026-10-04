@@ -375,10 +375,7 @@ impl DaemonConfig {
                 address,
                 state_path,
             },
-            assets: AssetsSection {
-                roots,
-                schema_path,
-            },
+            assets: AssetsSection { roots, schema_path },
             modules: ModulesSection { pipeline_dylib },
             targets,
             codegen: CodegenSection {
@@ -949,7 +946,9 @@ fn host_target_os() -> Result<TargetOs, DaemonConfigError> {
         "linux" => Ok(TargetOs::Linux),
         "macos" => Ok(TargetOs::MacOs),
         "windows" => Ok(TargetOs::Windows),
-        os => Err(DaemonConfigError::Target(format!("host OS {os} is no target OS"))),
+        os => Err(DaemonConfigError::Target(format!(
+            "host OS {os} is no target OS"
+        ))),
     }
 }
 
@@ -1154,17 +1153,33 @@ segment_size = "1MiB"
 cache_limit = "8MiB"
 "#;
         let config = DaemonConfig::parse(temp.path().join("distill.toml"), source).unwrap();
-        let dylib = config.modules.pipeline_dylib.file_name().unwrap().to_str().unwrap();
+        let dylib = config
+            .modules
+            .pipeline_dylib
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(
             dylib,
-            format!("{}pipeline{}", std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX)
+            format!(
+                "{}pipeline{}",
+                std::env::consts::DLL_PREFIX,
+                std::env::consts::DLL_SUFFIX
+            )
         );
         let target = &config.targets["dev"];
         assert_eq!(target.os, host_target_os().unwrap());
         assert_eq!(target.arch, host_target_arch().unwrap());
         assert_eq!(
             target.os,
-            if cfg!(windows) { TargetOs::Windows } else if cfg!(target_os = "macos") { TargetOs::MacOs } else { TargetOs::Linux }
+            if cfg!(windows) {
+                TargetOs::Windows
+            } else if cfg!(target_os = "macos") {
+                TargetOs::MacOs
+            } else {
+                TargetOs::Linux
+            }
         );
     }
 }

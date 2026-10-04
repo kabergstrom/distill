@@ -211,8 +211,7 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
     // publishes it; a snapshot taken in between resolves the old shader, as
     // it should.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while resolved_hash(process.coordinator().server().root(), &request, shader)
-        == old_shader_hash
+    while resolved_hash(process.coordinator().server().root(), &request, shader) == old_shader_hash
     {
         assert!(
             Instant::now() < deadline,
@@ -510,11 +509,7 @@ fn resolved_hash(
     }
 }
 
-fn import_assets(
-    process: &DaemonProcess,
-    config: &DaemonConfig,
-    assets: &Path,
-) -> [AssetUuid; 3] {
+fn import_assets(process: &DaemonProcess, config: &DaemonConfig, assets: &Path) -> [AssetUuid; 3] {
     // Through the RPC hub, as `distilld import` does.
     distill_daemon::bootstrap::import(
         config,

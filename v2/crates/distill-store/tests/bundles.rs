@@ -4,12 +4,12 @@
 
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_store::bundles::{
-    AssetFilter,     AssetRecord, BundleMeta, DirectoryOrigin, DirectoryRuleId, NamespaceSkeleton,
+    AssetFilter, AssetRecord, BundleMeta, DirectoryOrigin, DirectoryRuleId, NamespaceSkeleton,
     SkeletonEntry, TagIndexUpdate,
 };
 use distill_store::files::RootId;
 use distill_store::state::{
-    ReadableBundleSource, SkeletonFailureCode, NamespaceError, NamespaceErrorV1,
+    NamespaceError, NamespaceErrorV1, ReadableBundleSource, SkeletonFailureCode,
 };
 use distill_store::{Store, StoreConfig, StoreError};
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,7 +28,9 @@ fn tagged(
         authoring_only: (!authoring).then_some(false),
         ..AssetFilter::default()
     };
-    let matched = store.namespace_assets_matching(&filter, |_| true).unwrap()?;
+    let matched = store
+        .namespace_assets_matching(&filter, |_| true)
+        .unwrap()?;
     Ok(matched.into_iter().map(|matched| matched.asset).collect())
 }
 
@@ -164,8 +166,17 @@ fn the_watch_flag_rides_in_the_bundle_row_until_poison() {
     store
         .input_transaction(|txn| txn.upsert_bundle(&watched))
         .unwrap();
-    assert!(store.bundle(BundleUuid([4u8; 16])).unwrap().unwrap().import_watched);
-    assert_eq!(store.import_watched_bundles().unwrap(), [BundleUuid([4u8; 16])]);
+    assert!(
+        store
+            .bundle(BundleUuid([4u8; 16]))
+            .unwrap()
+            .unwrap()
+            .import_watched
+    );
+    assert_eq!(
+        store.import_watched_bundles().unwrap(),
+        [BundleUuid([4u8; 16])]
+    );
 
     // A poisoned bundle's row cannot say: the flag clears with the poison.
     let mut poisoned = skeleton(root, vec![]);
@@ -266,18 +277,15 @@ fn tag_index_refinement_is_value_aware_and_pending_state_never_underapproximates
     ));
 
     store
-        .refine_unpublished_tag_index(
-            &[TagIndexUpdate {
-                asset: AssetUuid([10; 16]),
-                tags: BTreeMap::from([("category".to_owned(), Some("enemy".to_owned()))]),
-                dylib_hash: Some([8; 32]),
-                poison: None,
-            }],
-        )
+        .refine_unpublished_tag_index(&[TagIndexUpdate {
+            asset: AssetUuid([10; 16]),
+            tags: BTreeMap::from([("category".to_owned(), Some("enemy".to_owned()))]),
+            dylib_hash: Some([8; 32]),
+            poison: None,
+        }])
         .unwrap();
     assert_eq!(
-        tagged(&store, "category", Some("enemy"), false)
-            .unwrap(),
+        tagged(&store, "category", Some("enemy"), false).unwrap(),
         [AssetUuid([10; 16])]
     );
     assert!(tagged(&store, "category", Some("friend"), false)
@@ -388,12 +396,11 @@ fn poisoning_a_bundle_fails_resolves_against_its_uuids() {
 
     // Queries whose selectors could match the file's entries fail naming
     // the poisoned bundle — the same shape as §10's tag poisoning.
-    assert!(matches!(
-        tagged(&store, "hero", None, false),
-        Err(_)
-    ));
+    assert!(matches!(tagged(&store, "hero", None, false), Err(_)));
     // A selector that cannot match the poisoned file's entries still works.
-    assert!(tagged(&store, "unrelated-tag", None, false).unwrap().is_empty());
+    assert!(tagged(&store, "unrelated-tag", None, false)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -460,10 +467,7 @@ fn bundle_scoped_poison_needs_no_prior_row() {
         store.entry(AssetUuid([78u8; 16])).unwrap_err(),
         StoreError::BundlePoisoned { bundle, .. } if bundle == BundleUuid([77u8; 16])
     ));
-    assert!(matches!(
-        tagged(&store, "fresh-tag", None, false),
-        Err(_)
-    ));
+    assert!(matches!(tagged(&store, "fresh-tag", None, false), Err(_)));
     // The unrelated seeded bundle still answers.
     assert!(store.entry(AssetUuid([10u8; 16])).unwrap().is_some());
 }

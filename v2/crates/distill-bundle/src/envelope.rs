@@ -12,8 +12,7 @@
 use std::collections::BTreeMap;
 
 use distill_core::bootstrap::{
-    BootstrapControlSpecV1, BOOTSTRAP_CONTROL_TYPE_UUIDS,
-    IMPORT_RECORD_TYPE_UUID,
+    BootstrapControlSpecV1, BOOTSTRAP_CONTROL_TYPE_UUIDS, IMPORT_RECORD_TYPE_UUID,
 };
 use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
 use distill_json::AuthoredValue;

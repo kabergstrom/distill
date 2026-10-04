@@ -110,11 +110,13 @@ impl Store {
         let dead = report.removed_dead_segments.clone();
         self.write_txn(|store| {
             for id in &dead {
-                store
-                    .conn
-                    .execute("DELETE FROM cas_segments WHERE segment_id = ?1", [*id as i64])?;
+                store.conn.execute(
+                    "DELETE FROM cas_segments WHERE segment_id = ?1",
+                    [*id as i64],
+                )?;
             }
-            store.conn
+            store
+                .conn
                 .prepare_cached("UPDATE cas_segments SET state = ?1 WHERE state = ?2")?
                 .execute([SEGMENT_SEALED, SEGMENT_OPEN])?;
             Ok(())

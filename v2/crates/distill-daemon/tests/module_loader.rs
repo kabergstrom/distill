@@ -31,7 +31,12 @@ fn module_abi_identity_covers_the_resolved_interface_closure() {
         .any(|(path, _)| *path == "ngp-schema/src/identity.rs"));
     // Host crates are outside the closure, so editing them leaves built
     // modules valid.
-    for host in ["distill-daemon/", "distill-build/", "distill-store/", "distill-rpc/"] {
+    for host in [
+        "distill-daemon/",
+        "distill-build/",
+        "distill-store/",
+        "distill-rpc/",
+    ] {
         assert!(
             manifest.iter().all(|(path, _)| !path.starts_with(host)),
             "{host} is in the module interface closure"

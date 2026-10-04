@@ -22,8 +22,7 @@ use distill_daemon::watcher::WatcherBatch;
 use distill_json::AuthoredValue;
 use distill_rpc::{
     ArtifactPayload, BuildAnswer, BuildBackend, BuildCompletion, BuildRequest, BuildStart,
-    BuildTicket, BuildView, RpcFailure,
-    Server, ServerHandle, SnapshotStamp, TargetDefinition,
+    BuildTicket, BuildView, RpcFailure, Server, ServerHandle, SnapshotStamp, TargetDefinition,
 };
 use distill_schema::ngp_schema::{
     node_hash, Field, FieldAttrs, FieldIdentifier, FieldLayout, LayoutIdentity, LogicalSchema,
@@ -137,7 +136,10 @@ impl TestProject {
     /// An empty project with the roots `roots`, serving `targets`.
     pub fn with_roots(targets: Vec<TargetDefinition>, roots: &[&str]) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let roots = roots.iter().map(|root| (*root).to_owned()).collect::<Vec<_>>();
+        let roots = roots
+            .iter()
+            .map(|root| (*root).to_owned())
+            .collect::<Vec<_>>();
         for root in &roots {
             std::fs::create_dir_all(dir.path().join(root)).unwrap();
         }
@@ -401,7 +403,10 @@ impl TestBuilds {
             &[],
             &[],
         );
-        let server = self.server.upgrade().expect("the server outlives its backend");
+        let server = self
+            .server
+            .upgrade()
+            .expect("the server outlives its backend");
         put_wire_tree(&server, &wire_bytes);
         assert_eq!(put_artifact(&server, &payload), content_hash);
         Ok(BuildAnswer::Built { content_hash })
@@ -507,7 +512,14 @@ pub fn project_schema() -> Schema {
     let string_align = std::mem::align_of::<String>();
     let mut types = vec![
         type_def(0, PrimitiveType::U8, "core", "u8", None, Vec::new()),
-        type_def(1, PrimitiveType::String, "alloc", "String", None, Vec::new()),
+        type_def(
+            1,
+            PrimitiveType::String,
+            "alloc",
+            "String",
+            None,
+            Vec::new(),
+        ),
         type_def(
             2,
             PrimitiveType::Struct,
@@ -516,7 +528,14 @@ pub fn project_schema() -> Schema {
             Some(TAGGED_TYPE),
             vec![field("group", 1, true)],
         ),
-        type_def(3, PrimitiveType::Struct, "fixture", "Settings", Some(SETTINGS_TYPE), Vec::new()),
+        type_def(
+            3,
+            PrimitiveType::Struct,
+            "fixture",
+            "Settings",
+            Some(SETTINGS_TYPE),
+            Vec::new(),
+        ),
     ];
     let mut layouts = vec![
         layout(1, 1, Vec::new()),
@@ -573,8 +592,11 @@ fn host_triple() -> String {
 /// `distill-pipeline-fixture`) and `dir/schema.json` ([`project_schema`]).
 /// Returns it loaded.
 pub fn write_configuration(dir: &Path, root: &Path, optimize: bool) -> DaemonConfig {
-    std::fs::write(dir.join("schema.json"), serde_json::to_vec(&project_schema()).unwrap())
-        .unwrap();
+    std::fs::write(
+        dir.join("schema.json"),
+        serde_json::to_vec(&project_schema()).unwrap(),
+    )
+    .unwrap();
     let toml_path = |path: PathBuf| path.display().to_string().replace('\\', "/");
     let config = format!(
         r#"
@@ -661,17 +683,21 @@ fn pipeline_module() -> &'static (PathBuf, (String, String)) {
             "pipeline fixture build failed:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let module = target_dir.join("debug").join(if cfg!(target_os = "windows") {
-            "distill_pipeline_fixture.dll"
-        } else if cfg!(target_os = "macos") {
-            "libdistill_pipeline_fixture.dylib"
-        } else {
-            "libdistill_pipeline_fixture.so"
-        });
+        let module = target_dir
+            .join("debug")
+            .join(if cfg!(target_os = "windows") {
+                "distill_pipeline_fixture.dll"
+            } else if cfg!(target_os = "macos") {
+                "libdistill_pipeline_fixture.dylib"
+            } else {
+                "libdistill_pipeline_fixture.so"
+            });
         let staging = tempfile::tempdir().unwrap();
-        let staged =
-            ngp_module_host::stage_copy_to(&module, &staging.path().join(module.file_name().unwrap()))
-                .unwrap();
+        let staged = ngp_module_host::stage_copy_to(
+            &module,
+            &staging.path().join(module.file_name().unwrap()),
+        )
+        .unwrap();
         // SAFETY: the fixture was just built from this workspace and is
         // opened only to read its bounded source-identity export.
         let library = unsafe { ngp_module_host::HostedLibrary::open(staged) }.unwrap();
@@ -685,7 +711,11 @@ fn pipeline_module() -> &'static (PathBuf, (String, String)) {
 /// Put the artifact `payload` (with its load edges) into `server`'s store,
 /// as the daemon's build workers put theirs; returns its content hash.
 pub fn put_artifact(server: &ServerHandle, payload: &ArtifactPayload) -> ContentHash {
-    let blobs = payload.blobs.iter().map(AsRef::as_ref).collect::<Vec<&[u8]>>();
+    let blobs = payload
+        .blobs
+        .iter()
+        .map(AsRef::as_ref)
+        .collect::<Vec<&[u8]>>();
     let bytes = distill_wire::artifact::assemble_artifact(&payload.structural, &blobs);
     let edges = payload
         .load_edges

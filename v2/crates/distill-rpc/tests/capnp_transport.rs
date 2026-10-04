@@ -2,13 +2,13 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
+use distill_json::AuthoredValue;
 use distill_rpc::capnp_loader::{RemoteCall, RemoteHub};
 use distill_rpc::capnp_transport::{
     schema, CapnpClient, RemoteConnectOutcome, RemoteMetadataOutcome, StagedListener,
 };
 use distill_rpc::*;
 use distill_schema::ngp_schema::{node_hash, SchemaNode};
-use distill_json::AuthoredValue;
 use distill_test_project::{
     Asset, TestBuilds, TestProject, PARENT_TYPE, REFLECTION, ROOT, TAGGED_TYPE,
 };
@@ -271,7 +271,14 @@ async fn capnp_snapshots_hard_expire_and_a_closed_connection_releases_them() {
             };
             let open_snapshot = || async {
                 let response = hub.snapshot_request().send().promise.await.unwrap();
-                match response.get().unwrap().get_result().unwrap().which().unwrap() {
+                match response
+                    .get()
+                    .unwrap()
+                    .get_result()
+                    .unwrap()
+                    .which()
+                    .unwrap()
+                {
                     schema::snapshot_call::Which::Success(snapshot) => snapshot.unwrap(),
                     _ => panic!("expected a snapshot"),
                 }
@@ -279,7 +286,13 @@ async fn capnp_snapshots_hard_expire_and_a_closed_connection_releases_them() {
             let version = |snapshot: schema::snapshot::Client| async move {
                 let response = snapshot.version_request().send().promise.await.unwrap();
                 matches!(
-                    response.get().unwrap().get_result().unwrap().which().unwrap(),
+                    response
+                        .get()
+                        .unwrap()
+                        .get_result()
+                        .unwrap()
+                        .which()
+                        .unwrap(),
                     schema::u_int64_call::Which::Success(_)
                 )
             };
@@ -294,7 +307,13 @@ async fn capnp_snapshots_hard_expire_and_a_closed_connection_releases_them() {
             assert_eq!(server.open_snapshots(), 0);
             let response = first.version_request().send().promise.await.unwrap();
             assert!(matches!(
-                response.get().unwrap().get_result().unwrap().which().unwrap(),
+                response
+                    .get()
+                    .unwrap()
+                    .get_result()
+                    .unwrap()
+                    .which()
+                    .unwrap(),
                 schema::u_int64_call::Which::SnapshotExpired(())
             ));
 
@@ -347,7 +366,12 @@ fn receipt_of(operations: &[AuthoringOp]) -> WriteReceipt {
 }
 
 impl AuthoringBackend for RecordingAuthoringBackend {
-    fn read_file(&self, _: &distill_store::StoreReader, _: &str, _: &str) -> Result<Vec<u8>, String> {
+    fn read_file(
+        &self,
+        _: &distill_store::StoreReader,
+        _: &str,
+        _: &str,
+    ) -> Result<Vec<u8>, String> {
         unreachable!("never inspects")
     }
 
@@ -624,12 +648,15 @@ async fn authoring_snapshot_round_trips_over_real_tcp_with_exact_stamp_and_role_
             );
             let runtime_uuid = AssetUuid::v5(parent.uuid, REFLECTION);
             write_entry(&mut project, &entry);
-            project.write_bundle("parent.bundle", BundleUuid([60; 16]), Some("parent"), &[parent]);
-            let first_stamp = project.publish();
-            let request = ConnectRequest::new(
-                project.target().name(),
-                project.target().definition_hash(),
+            project.write_bundle(
+                "parent.bundle",
+                BundleUuid([60; 16]),
+                Some("parent"),
+                &[parent],
             );
+            let first_stamp = project.publish();
+            let request =
+                ConnectRequest::new(project.target().name(), project.target().definition_hash());
 
             let listener = Rc::new(
                 StagedListener::bind(server.root(), "127.0.0.1:0")
@@ -1051,7 +1078,10 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
             let (hash, payload) =
                 canonical_artifact(uuid, TypeUuid([1; 16]), LayoutHash([4; 32]), &[10, 11, 12]);
             let expected_structural = payload.structural.clone();
-            assert_eq!(distill_test_project::put_artifact(&server.handle(), &payload), hash);
+            assert_eq!(
+                distill_test_project::put_artifact(&server.handle(), &payload),
+                hash
+            );
             builds.answer(uuid, Ok(BuildAnswer::Built { content_hash: hash }));
             let asset_bundle = |value: u8| {
                 (
@@ -1545,7 +1575,10 @@ async fn hub_authoring_operation_and_wire_tree_methods_are_live_and_generation_f
             let wire_node = distill_wire::wire::WireNode::Unit { offset: 0 };
             let tree: Arc<[u8]> = Arc::from(distill_wire::dswl::dswl_bytes(&wire_node).unwrap());
             let layout_hash = distill_wire::dswl::dswl_hash(&wire_node).unwrap();
-            assert_eq!(distill_test_project::put_wire_tree(&server.handle(), &tree), layout_hash);
+            assert_eq!(
+                distill_test_project::put_wire_tree(&server.handle(), &tree),
+                layout_hash
+            );
             let listener = Rc::new(
                 StagedListener::bind(server.root(), "127.0.0.1:0")
                     .await
@@ -1780,7 +1813,8 @@ fn pipeline_failure_capnp_decode_rejects_unknown_width_and_matrix_failures() {
         let mut root = unknown.init_root::<schema::pipeline_failure::Builder<'_>>();
         initialize(root.reborrow(), &[0; 32]);
         use capnp::introspect::{Introspect, TypeVariant};
-        let TypeVariant::Enum(raw_schema) = schema::PipelineFailureCode::introspect().which() else {
+        let TypeVariant::Enum(raw_schema) = schema::PipelineFailureCode::introspect().which()
+        else {
             panic!("pipeline failure code must introspect as an enum")
         };
         let enum_schema: capnp::schema::EnumSchema = raw_schema.into();
@@ -2059,13 +2093,21 @@ async fn remote_snapshot_serves_the_pack_surface() {
             let definition = project
                 .asset("entry-6", AssetUuid([6; 16]), TAGGED_TYPE, group("group-6"))
                 .authoring_only();
-            project.write_bundle("bundle-5.bundle", BundleUuid([6; 16]), Some("entry-5"), &[entry.clone()]);
-            project.write_bundle("bundle-6.bundle", BundleUuid([7; 16]), None, &[definition.clone()]);
-            project.publish();
-            let request = ConnectRequest::new(
-                project.target().name(),
-                project.target().definition_hash(),
+            project.write_bundle(
+                "bundle-5.bundle",
+                BundleUuid([6; 16]),
+                Some("entry-5"),
+                &[entry.clone()],
             );
+            project.write_bundle(
+                "bundle-6.bundle",
+                BundleUuid([7; 16]),
+                None,
+                &[definition.clone()],
+            );
+            project.publish();
+            let request =
+                ConnectRequest::new(project.target().name(), project.target().definition_hash());
             let listener = Rc::new(
                 StagedListener::bind(server.root(), "127.0.0.1:0")
                     .await
@@ -2106,7 +2148,12 @@ async fn remote_snapshot_serves_the_pack_surface() {
             }
 
             // A batch resolve admits its build as batch work.
-            snapshot.resolve_batch(entry.uuid).await.unwrap().success().unwrap();
+            snapshot
+                .resolve_batch(entry.uuid)
+                .await
+                .unwrap()
+                .success()
+                .unwrap();
             assert_eq!(
                 *backend.work_classes.lock().unwrap(),
                 vec![BuildWorkClass::Batch]
@@ -2128,8 +2175,19 @@ async fn remote_snapshot_serves_the_pack_surface() {
             )
             .ok()
             .expect("metadata connects");
-            let authoring = metadata.authoring_snapshot().await.unwrap().success().unwrap();
-            match authoring.inspect(definition.uuid).await.unwrap().success().unwrap() {
+            let authoring = metadata
+                .authoring_snapshot()
+                .await
+                .unwrap()
+                .success()
+                .unwrap();
+            match authoring
+                .inspect(definition.uuid)
+                .await
+                .unwrap()
+                .success()
+                .unwrap()
+            {
                 AuthoringInspectResult::Inspection(inspection) => {
                     assert_eq!(inspection.role, AuthoringEntryRole::AuthoringOnly);
                     assert_eq!(inspection.stamp, snapshot.basis().snapshot);
@@ -2144,7 +2202,11 @@ async fn remote_snapshot_serves_the_pack_surface() {
                 other => panic!("expected an inspection, got {other:?}"),
             }
             assert!(matches!(
-                authoring.inspect(AssetUuid([99; 16])).await.unwrap().success(),
+                authoring
+                    .inspect(AssetUuid([99; 16]))
+                    .await
+                    .unwrap()
+                    .success(),
                 Some(AuthoringInspectResult::Missing)
             ));
             // A definition file rewritten since the snapshot is drift over

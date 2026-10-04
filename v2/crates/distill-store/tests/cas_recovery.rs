@@ -89,7 +89,10 @@ fn bytes_past_the_index_are_cut_off_and_publish_nothing() {
         store.cas_read(blake3::hash(&payload).as_bytes()),
         Err(StoreError::NotFound { .. })
     ));
-    assert!(store.lookup_candidates(KeyKind::Processor, &[9u8; 32]).unwrap().is_empty());
+    assert!(store
+        .lookup_candidates(KeyKind::Processor, &[9u8; 32])
+        .unwrap()
+        .is_empty());
     assert_eq!(store.cas_read(&committed).unwrap(), b"committed artifact");
     drop(store);
     assert_eq!(
@@ -117,7 +120,10 @@ fn a_lost_tail_is_reported_and_changes_nothing() {
     drop(store);
 
     let files = segment_files(&dir);
-    assert!(files.len() >= 2, "the install and the results are in separate segments");
+    assert!(
+        files.len() >= 2,
+        "the install and the results are in separate segments"
+    );
     let last = files.last().unwrap();
     let full = std::fs::metadata(last).unwrap().len();
     std::fs::OpenOptions::new()
@@ -132,13 +138,35 @@ fn a_lost_tail_is_reported_and_changes_nothing() {
         assert_eq!(recovery.lost_tails.len(), 1, "{recovery:?}");
         assert_eq!(recovery.lost_tails[0].1, full - 7);
         assert_eq!(recovery.truncated_tails, []);
-        assert_eq!(std::fs::metadata(last).unwrap().len(), full - 7, "nothing was cut or grown");
-        assert_eq!(store.lookup_candidates(KeyKind::Processor, &[2u8; 32]).unwrap().len(), 1);
-        assert!(store.cas_read(&second).is_err(), "the lost bytes read as an error");
+        assert_eq!(
+            std::fs::metadata(last).unwrap().len(),
+            full - 7,
+            "nothing was cut or grown"
+        );
+        assert_eq!(
+            store
+                .lookup_candidates(KeyKind::Processor, &[2u8; 32])
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store.cas_read(&second).is_err(),
+            "the lost bytes read as an error"
+        );
         assert_eq!(store.cas_read(&first).unwrap(), b"first artifact");
-        assert_eq!(store.lookup_candidates(KeyKind::Processor, &[1u8; 32]).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .lookup_candidates(KeyKind::Processor, &[1u8; 32])
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(store.cas_read(&installed.0).unwrap(), [5u8; 250]);
-        assert_eq!(store.artifact_load_edges(ContentHash(installed.0)).unwrap(), edges);
+        assert_eq!(
+            store.artifact_load_edges(ContentHash(installed.0)).unwrap(),
+            edges
+        );
     }
 }
 
@@ -163,10 +191,21 @@ fn a_segment_file_no_row_names_is_left_for_the_allocation_of_its_id() {
     // Recovery sealed the earlier writer's segment: this writer allocates
     // the next id.
     commit(&mut store, 2, b"after");
-    assert_eq!(store.cas_read(blake3::hash(b"after").as_bytes()).unwrap(), b"after");
-    assert_eq!(store.cas_read(blake3::hash(b"artifact").as_bytes()).unwrap(), b"artifact");
+    assert_eq!(
+        store.cas_read(blake3::hash(b"after").as_bytes()).unwrap(),
+        b"after"
+    );
+    assert_eq!(
+        store
+            .cas_read(blake3::hash(b"artifact").as_bytes())
+            .unwrap(),
+        b"artifact"
+    );
     let bytes = std::fs::read(&uncommitted).unwrap();
-    assert!(!bytes.starts_with(b"garbage"), "the allocation truncated the uncommitted file");
+    assert!(
+        !bytes.starts_with(b"garbage"),
+        "the allocation truncated the uncommitted file"
+    );
 }
 
 #[test]
@@ -177,7 +216,9 @@ fn dead_segments_are_deleted_at_startup() {
     let mut store = Store::open(cfg(&dir)).unwrap();
     let (_, digest) = {
         let hash = commit(&mut store, 1, &[1u8; 4096]);
-        let candidates = store.lookup_candidates(KeyKind::Processor, &[1; 32]).unwrap();
+        let candidates = store
+            .lookup_candidates(KeyKind::Processor, &[1; 32])
+            .unwrap();
         (hash, candidates[0].trace_digest)
     };
     assert!(store
@@ -261,19 +302,31 @@ fn a_rolled_back_publication_stays_rolled_back_across_a_restart() {
         })
     });
     assert!(rolled_back.is_err());
-    assert!(store.candidate_rows(KeyKind::Node, &[2; 32]).unwrap().is_empty());
+    assert!(store
+        .candidate_rows(KeyKind::Node, &[2; 32])
+        .unwrap()
+        .is_empty());
     drop(store);
 
     let (store, _) = Store::open_with_recovery(cfg(&dir)).unwrap();
     let hash = ContentHash(*blake3::hash(&second_bytes).as_bytes());
     assert!(
-        store.candidate_rows(KeyKind::Node, &[2; 32]).unwrap().is_empty(),
+        store
+            .candidate_rows(KeyKind::Node, &[2; 32])
+            .unwrap()
+            .is_empty(),
         "recovery adopted a rolled-back node result; its load edges: {:?}",
         store.artifact_load_edges(hash).unwrap()
     );
-    assert!(matches!(store.cas_read(&hash.0), Err(StoreError::NotFound { .. })));
+    assert!(matches!(
+        store.cas_read(&hash.0),
+        Err(StoreError::NotFound { .. })
+    ));
     // The committed publication is intact.
-    assert_eq!(store.candidate_rows(KeyKind::Node, &[1; 32]).unwrap().len(), 1);
+    assert_eq!(
+        store.candidate_rows(KeyKind::Node, &[1; 32]).unwrap().len(),
+        1
+    );
     let first_hash = ContentHash(*blake3::hash(&first_bytes).as_bytes());
     assert_eq!(store.artifact_load_edges(first_hash).unwrap(), edges);
 }

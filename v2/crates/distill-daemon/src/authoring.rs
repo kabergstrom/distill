@@ -10,7 +10,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, Weak};
 
-
 use distill_bundle::{AssetEntry, Bundle, BUNDLE_FORMAT_VERSION};
 use distill_core::bootstrap::is_bootstrap_control_type;
 use distill_core::id::{BundleUuid, ContentHash, LogicalHash};
@@ -24,11 +23,11 @@ use distill_rpc::{
 use distill_store::state::{PipelineFailure, PipelineFailureOrigin};
 use distill_store::{Store, StoreOpener, StoreReader};
 
-use distill_store::atomic_file;
 use crate::compiled::{Compiled, CompiledRegistry};
 use crate::coordinator::publish_incremental_paths;
 use crate::importer::{RegisteredImporter, RegisteredImporters};
 use crate::scanner::ScanError;
+use distill_store::atomic_file;
 
 pub struct AuthoringService {
     /// Opens the reader an import run reads through when it runs outside
@@ -42,10 +41,7 @@ pub struct AuthoringService {
 }
 
 impl AuthoringService {
-    pub(crate) fn new(
-        opener: Arc<StoreOpener>,
-        compiled: Arc<CompiledRegistry>,
-    ) -> Self {
+    pub(crate) fn new(opener: Arc<StoreOpener>, compiled: Arc<CompiledRegistry>) -> Self {
         Self {
             opener,
             compiled,
@@ -150,7 +146,10 @@ impl AuthoringService {
         let compiled = self.compiled(store)?;
         match proposed.as_deref() {
             Some(bytes) => {
-                let root = compiled.scanner().root_containing(&target).map_err(invalid)?;
+                let root = compiled
+                    .scanner()
+                    .root_containing(&target)
+                    .map_err(invalid)?;
                 atomic_file::write(&root, &target, bytes, preimage.into())
             }
             None => atomic_file::remove(&target, preimage.into()),
@@ -212,12 +211,8 @@ impl AuthoringService {
                 .root_name(meta.root)
                 .map_err(invalid)?
                 .ok_or_else(|| invalid("bundle root identity is missing"))?;
-            let target = scanner
-                .physical_path(&root, &meta.path)
-                .map_err(invalid)?;
-            let bytes = scanner
-                .read_identity_checked(&target)
-                .map_err(invalid)?;
+            let target = scanner.physical_path(&root, &meta.path).map_err(invalid)?;
+            let bytes = scanner.read_identity_checked(&target).map_err(invalid)?;
             let observed = ContentHash(*blake3::hash(&bytes).as_bytes());
             if observed != meta.content_hash {
                 return Err(invalid(format!(
@@ -265,9 +260,7 @@ impl AuthoringService {
                     "direct bundle creation requires exactly one configured asset root; import supplies an explicit root",
                 ));
             };
-            let target = scanner
-                .physical_path(&root.name, path)
-                .map_err(invalid)?;
+            let target = scanner.physical_path(&root.name, path).map_err(invalid)?;
             if fs::symlink_metadata(&target).is_ok() {
                 return Err(invalid("new bundle destination already exists"));
             }
@@ -431,13 +424,16 @@ impl AuthoringService {
                     return Ok(());
                 }
                 Err(lossy(
-                    refusal.reasons.iter().map(|(path, _)| path.clone()).collect(),
+                    refusal
+                        .reasons
+                        .iter()
+                        .map(|(path, _)| path.clone())
+                        .collect(),
                     format!("no registered migration function and {refusal}"),
                 ))
             }
         }
     }
-
 }
 
 /// The renamed fields of the type's schema at `compiled`, when the write is
@@ -463,15 +459,14 @@ fn migration_function_registered(compiled: &Compiled, key: &MigrationKey) -> boo
 }
 
 impl AuthoringBackend for AuthoringService {
-    fn read_file(
-        &self,
-        snapshot: &StoreReader,
-        root: &str,
-        path: &str,
-    ) -> Result<Vec<u8>, String> {
-        let compiled = self.compiled(snapshot).map_err(|error| format!("{error:?}"))?;
+    fn read_file(&self, snapshot: &StoreReader, root: &str, path: &str) -> Result<Vec<u8>, String> {
+        let compiled = self
+            .compiled(snapshot)
+            .map_err(|error| format!("{error:?}"))?;
         let scanner = compiled.scanner();
-        let physical = scanner.physical_path(root, path).map_err(|error| error.to_string())?;
+        let physical = scanner
+            .physical_path(root, path)
+            .map_err(|error| error.to_string())?;
         scanner
             .read_identity_checked(&physical)
             .map_err(|error| error.to_string())
@@ -525,7 +520,9 @@ impl AuthoringBackend for AuthoringService {
         request: ImportRequest,
     ) -> Result<ImportJob, RpcFailure> {
         let run = self.run_import_request(base, &request)?;
-        Ok(Box::new(move |store| self.publish_import_run(store, base, run)))
+        Ok(Box::new(move |store| {
+            self.publish_import_run(store, base, run)
+        }))
     }
 
     fn run_reimport(
@@ -534,7 +531,9 @@ impl AuthoringBackend for AuthoringService {
         bundle: BundleUuid,
     ) -> Result<ImportJob, RpcFailure> {
         let run = self.run_reimport_bundle(base, bundle)?;
-        Ok(Box::new(move |store| self.publish_import_run(store, base, run)))
+        Ok(Box::new(move |store| {
+            self.publish_import_run(store, base, run)
+        }))
     }
 
     fn prepare_operation(
@@ -545,7 +544,6 @@ impl AuthoringBackend for AuthoringService {
     ) -> Result<PreparedOperationCommit, RpcFailure> {
         self.prepare_long_operation(store, base, operation)
     }
-
 }
 
 struct PlannedBundleMutation {

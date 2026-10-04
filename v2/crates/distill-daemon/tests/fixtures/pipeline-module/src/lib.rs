@@ -47,7 +47,10 @@ pub const CHAIN_IMPORTER: &str = "chain-importer";
 
 /// A [`VALUE_TYPE`] value.
 pub fn value(value: u128) -> AuthoredValue {
-    AuthoredValue::Object(BTreeMap::from([("value".to_owned(), AuthoredValue::UInt(value))]))
+    AuthoredValue::Object(BTreeMap::from([(
+        "value".to_owned(),
+        AuthoredValue::UInt(value),
+    )]))
 }
 
 /// The `u8` of a [`VALUE_TYPE`] value.

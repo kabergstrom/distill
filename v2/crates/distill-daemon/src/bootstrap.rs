@@ -19,7 +19,10 @@ use crate::config::DaemonConfig;
 
 #[derive(Debug)]
 pub enum BootstrapError {
-    Io { path: PathBuf, source: std::io::Error },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     Schema(String),
     Config(String),
     Rpc(String),
@@ -46,7 +49,10 @@ pub fn load_authority(config: &DaemonConfig) -> Result<ProjectSchemaAuthority, B
 
 /// The target a command addresses: the named one, else the only (or first)
 /// configured target.
-fn target_name<'a>(config: &'a DaemonConfig, target: Option<&'a str>) -> Result<&'a str, BootstrapError> {
+fn target_name<'a>(
+    config: &'a DaemonConfig,
+    target: Option<&'a str>,
+) -> Result<&'a str, BootstrapError> {
     match target {
         Some(name) if config.targets.contains_key(name) => Ok(name),
         Some(name) => Err(BootstrapError::Config(format!("unknown target {name}"))),

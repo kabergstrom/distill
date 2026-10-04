@@ -272,7 +272,10 @@ enum Message<O> {
         reply: oneshot::Sender<Arc<O>>,
     },
     /// A ticket was dropped before its cell finished.
-    Release { ticket: u64, key: CellKey },
+    Release {
+        ticket: u64,
+        key: CellKey,
+    },
     /// A worker needs the cell `key` for a dependency.
     Claim {
         worker: u64,
@@ -789,7 +792,12 @@ impl<O: CellOutcome> Actor<O> {
                 }
                 // Only tickets wait on a queued cell: a worker takes a
                 // queued cell over instead of waiting on it.
-                match cell.tickets.values().map(|(class, _)| *class).max_by_key(|c| rank(*c)) {
+                match cell
+                    .tickets
+                    .values()
+                    .map(|(class, _)| *class)
+                    .max_by_key(|c| rank(*c))
+                {
                     None => {
                         let id = cell.id;
                         self.scheduler.remove_queued(id);
@@ -868,9 +876,9 @@ impl<O: CellOutcome> Actor<O> {
     /// Notify every waiter of the cell `key` running on `worker`, and
     /// remove it.
     fn finish(&mut self, worker: u64, key: CellKey, outcome: Arc<O>) {
-        let running_here = self.cells.get(&key).is_some_and(|cell| {
-            matches!(cell.state, CellState::Running { worker: runner } if runner == worker)
-        });
+        let running_here = self.cells.get(&key).is_some_and(
+            |cell| matches!(cell.state, CellState::Running { worker: runner } if runner == worker),
+        );
         if !running_here {
             return;
         }
@@ -904,7 +912,10 @@ impl<O: CellOutcome> Actor<O> {
                 .queued_cells
                 .remove(&id)
                 .expect("an admitted job was queued");
-            let cell = self.cells.get_mut(&key).expect("a queued cell is in flight");
+            let cell = self
+                .cells
+                .get_mut(&key)
+                .expect("a queued cell is in flight");
             let CellState::Queued(job) =
                 std::mem::replace(&mut cell.state, CellState::Running { worker: id })
             else {
@@ -981,9 +992,7 @@ mod tests {
 
     const WATCHDOG: Duration = Duration::from_secs(20);
 
-    fn pool(
-        parallelism: usize,
-    ) -> (tempfile::TempDir, ScheduledPool<TestOutcome>) {
+    fn pool(parallelism: usize) -> (tempfile::TempDir, ScheduledPool<TestOutcome>) {
         let temp = tempfile::tempdir().unwrap();
         let store =
             Store::open(distill_store::StoreConfig::new(temp.path().join("state"))).unwrap();
@@ -1051,8 +1060,12 @@ mod tests {
         assert_eq!(pool.cells_in_flight(), 1);
         drop((blocker, blocker_batch));
         let outcomes = tickets.into_iter().map(block_on).collect::<Vec<_>>();
-        assert!(outcomes.iter().all(|outcome| **outcome == TestOutcome::Value(7)));
-        assert!(outcomes.windows(2).all(|pair| Arc::ptr_eq(&pair[0], &pair[1])));
+        assert!(outcomes
+            .iter()
+            .all(|outcome| **outcome == TestOutcome::Value(7)));
+        assert!(outcomes
+            .windows(2)
+            .all(|pair| Arc::ptr_eq(&pair[0], &pair[1])));
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         wait_until(|| pool.cells_in_flight() == 0);
     }
@@ -1090,7 +1103,11 @@ mod tests {
         let (done, finished) = mpsc::sync_channel(1);
         pool.submit(WorkClass::Interactive, move |_| done.send(()).unwrap());
         finished.recv_timeout(WATCHDOG).unwrap();
-        assert_eq!(ran.load(Ordering::SeqCst), 0, "the abandoned cell never ran");
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "the abandoned cell never ran"
+        );
         assert_eq!(pool.cells_in_flight(), 0);
     }
 
@@ -1199,7 +1216,10 @@ mod tests {
         });
         drop(blocker);
         for ticket in tickets {
-            assert_eq!(*block_on(ticket), TestOutcome::Failed("rejected".to_owned()));
+            assert_eq!(
+                *block_on(ticket),
+                TestOutcome::Failed("rejected".to_owned())
+            );
         }
         assert_eq!(*block_on(panicking), TestOutcome::Lost);
         wait_until(|| pool.cells_in_flight() == 0);

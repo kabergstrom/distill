@@ -11,7 +11,6 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-
 use crate::db::{InputTxn, Store, StoreReader};
 use crate::error::StoreError;
 use crate::state::{ConfigurationEpoch, ConfigurationState};
@@ -160,18 +159,18 @@ impl Store {
         let generation = self
             .write_txn(|store| {
                 let active = store.configuration_generation()?;
-                let prior = store.conn
+                let prior = store
+                    .conn
                     .prepare_cached("SELECT COALESCE(MAX(generation), 0) FROM pending_restart")?
-                    .query_row(
-                        [],
-                        |r| r.get::<_, i64>(0),
-                    )? as u64;
+                    .query_row([], |r| r.get::<_, i64>(0))? as u64;
                 let generation = active.max(prior) + 1;
-                store.conn
+                store
+                    .conn
                     .prepare_cached("DELETE FROM pending_restart")?
                     .execute([])?;
                 for (key, value) in &rows {
-                    store.conn
+                    store
+                        .conn
                         .prepare_cached(
                             "INSERT INTO pending_restart(generation, config_key, config_value)
                          VALUES (?1, ?2, ?3)",
@@ -191,7 +190,8 @@ impl Store {
     /// active startup values. This is not an input event.
     pub fn clear_pending_restart(&mut self) -> Result<(), StoreError> {
         self.write_txn(|store| {
-            store.conn
+            store
+                .conn
                 .prepare_cached("DELETE FROM pending_restart")?
                 .execute([])?;
             Ok(())
@@ -248,10 +248,16 @@ impl StoreReader {
 impl InputTxn<'_> {
     /// Make `generation` the active configuration generation: written only
     /// when it changes.
-    pub(crate) fn set_configuration_generation(&mut self, generation: u64) -> Result<(), StoreError> {
+    pub(crate) fn set_configuration_generation(
+        &mut self,
+        generation: u64,
+    ) -> Result<(), StoreError> {
         if self.reader().configuration_generation()? != generation {
-            self.counters
-                .set(self.txn, crate::db::Counter::ConfigurationGeneration, generation)?;
+            self.counters.set(
+                self.txn,
+                crate::db::Counter::ConfigurationGeneration,
+                generation,
+            )?;
         }
         Ok(())
     }

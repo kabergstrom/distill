@@ -123,7 +123,11 @@ fn a_rejected_candidate_still_publishes_as_a_failure() {
         .input_transaction(|txn| txn.publish_pipeline_failure(&failure))
         .unwrap();
     assert_eq!(store.pipeline_failure().unwrap(), Some(failure));
-    assert_eq!(store.pipeline_module_hash().unwrap(), None, "no module serves");
+    assert_eq!(
+        store.pipeline_module_hash().unwrap(),
+        None,
+        "no module serves"
+    );
 }
 
 #[test]
@@ -346,8 +350,6 @@ fn ambient_registration_is_not_staged_and_trust_controls_cacheability() {
     assert!(registered.is_cacheable());
 }
 
-
-
 #[test]
 fn a_rolled_back_registration_leaves_no_package() {
     // A registration stages its package tree in the tool store's staging
@@ -365,11 +367,16 @@ fn a_rolled_back_registration_leaves_no_package() {
         // Uncommitted: the tree is staged, not published.
         assert!(!registered.root.as_ref().unwrap().exists());
         rolled_back = Some(registered);
-        Err(StoreError::Rejected { detail: "the publication failed".into() })
+        Err(StoreError::Rejected {
+            detail: "the publication failed".into(),
+        })
     });
     assert!(out.is_err());
     let dropped_root = rolled_back.unwrap().root.unwrap();
-    assert!(!dropped_root.exists(), "a rolled-back registration published its package");
+    assert!(
+        !dropped_root.exists(),
+        "a rolled-back registration published its package"
+    );
     let tools = config.state_path.join("tools");
     let staging = distill_store::atomic_file::staging_dir(&tools);
     let names = |dir: &std::path::Path| -> Vec<String> {
@@ -381,9 +388,15 @@ fn a_rolled_back_registration_leaves_no_package() {
             })
             .unwrap_or_default()
     };
-    assert!(names(&staging).is_empty(), "a rolled-back stage outlived its input");
+    assert!(
+        names(&staging).is_empty(),
+        "a rolled-back stage outlived its input"
+    );
     let root = kept.root.unwrap();
-    assert_eq!(names(&tools.join("packages")), [root.file_name().unwrap().to_string_lossy().into_owned()]);
+    assert_eq!(
+        names(&tools.join("packages")),
+        [root.file_name().unwrap().to_string_lossy().into_owned()]
+    );
     assert_eq!(std::fs::read(root.join("bin/tool")).unwrap(), b"kept tool");
     assert_eq!(std::fs::read(root.join("share/config")).unwrap(), b"shared");
     drop(store);
@@ -406,12 +419,14 @@ fn a_failed_nested_input_fails_the_input_and_drops_its_packages() {
         .unwrap();
     let inner: Result<((), _), StoreError> = store.input_transaction(|txn| {
         txn.register_tool("inner", tool_package(b"inner tool", b"b"))?;
-        Err(StoreError::Rejected { detail: "nested failure".into() })
+        Err(StoreError::Rejected {
+            detail: "nested failure".into(),
+        })
     });
     assert!(inner.is_err());
     assert!(store.finish_input(true).is_err());
-    let packages = std::fs::read_dir(config.state_path.join("tools/packages"))
-        .map_or(0, Iterator::count);
+    let packages =
+        std::fs::read_dir(config.state_path.join("tools/packages")).map_or(0, Iterator::count);
     assert_eq!(packages, 0);
     assert!(!outer.root.unwrap().exists());
     assert!(store.tool("outer").unwrap().is_none());

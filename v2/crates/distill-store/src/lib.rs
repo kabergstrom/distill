@@ -19,17 +19,17 @@ pub mod error;
 pub mod errors;
 pub mod files;
 pub mod imports;
+pub mod opener;
 pub mod pipeline;
 pub mod served;
-pub mod opener;
 pub mod state;
 pub mod trace_reads;
 
 #[cfg(test)]
 mod query_plans;
 
-pub use current::Current;
 pub use config::{parse_byte_size, ByteSizeError, StoreConfig};
+pub use current::Current;
 pub use db::{InputTxn, Store, StoreReader, SCHEMA_VERSION};
 pub use error::StoreError;
 pub use opener::{StoreOpener, StoreWriter};

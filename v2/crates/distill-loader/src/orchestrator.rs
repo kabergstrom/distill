@@ -28,8 +28,8 @@ use crate::component::{
     MemberFailure,
 };
 use crate::io::{
-    AssetPath, FetchedArtifact, IoEvent, LoaderIO, PathResolveResult, ReconnectReason, ResolveResult,
-    RuntimeTarget,
+    AssetPath, FetchedArtifact, IoEvent, LoaderIO, PathResolveResult, ReconnectReason,
+    ResolveResult, RuntimeTarget,
 };
 use crate::runtime::{
     AdoptionId, CompletionDisposition, HandleId, ManifestEntry, ManifestState, OutstandingPurpose,
@@ -1311,7 +1311,14 @@ impl<I: LoaderIO> Loader<I> {
             IoEvent::SnapshotExpired { req, basis } => {
                 if self.sweep_retries >= MAX_SWEEP_RETRIES {
                     let message = "the daemon snapshot kept expiring".to_owned();
-                    return self.handle_event(IoEvent::RequestError { req, message, basis }, storage);
+                    return self.handle_event(
+                        IoEvent::RequestError {
+                            req,
+                            message,
+                            basis,
+                        },
+                        storage,
+                    );
                 }
                 let disposition = self.requests.complete(req, &basis);
                 if disposition != CompletionDisposition::Accepted {
@@ -1319,7 +1326,11 @@ impl<I: LoaderIO> Loader<I> {
                     return Ok(());
                 }
                 // Retry the round at a new snapshot.
-                if self.sweep.as_ref().is_some_and(|sweep| sweep.basis == basis) {
+                if self
+                    .sweep
+                    .as_ref()
+                    .is_some_and(|sweep| sweep.basis == basis)
+                {
                     self.sweep_retries += 1;
                     self.restart_sweep();
                 }

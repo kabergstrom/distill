@@ -17,8 +17,8 @@ use distill_schema::ngp_schema::{
     node_hash, snapshot_to_json, LogicalSchema, PrimitiveKind, SchemaNode,
 };
 use distill_store::config::RestartOnlyChange;
-use distill_store::state::{ConfigurationState, DscpV1, InputVersion, NamespaceErrorV1};
 use distill_store::served::AssetResolution;
+use distill_store::state::{ConfigurationState, DscpV1, InputVersion, NamespaceErrorV1};
 use distill_store::{Store, StoreConfig, StoreReader};
 
 fn ordinary_bundle() -> (Vec<u8>, BundleUuid, AssetUuid) {
@@ -57,7 +57,6 @@ fn ordinary_bundle_with(
         asset,
     )
 }
-
 
 fn add_unknown_envelope_key(bytes: &[u8]) -> Vec<u8> {
     let mut value = distill_json::parse(std::str::from_utf8(bytes).unwrap()).unwrap();
@@ -103,10 +102,13 @@ fn incremental_bundle_edit_does_not_invalidate_an_unrelated_bundle() {
     edited.assets.get_mut("entry").unwrap().data = AuthoredValue::UInt(9);
     std::fs::write(&first_path, distill_bundle::write_bundle(&edited).unwrap()).unwrap();
     let published = coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![first_path],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![first_path],
+                renames: Vec::new(),
+            },
+        )
         .unwrap();
     assert_eq!(published.version.0, startup.version.0 + 1);
     assert!(matches!(
@@ -132,10 +134,13 @@ fn complete_malformed_skeleton_is_bundle_scoped_and_heals_incrementally() {
 
     std::fs::write(&manifest_path, add_unknown_envelope_key(&manifest)).unwrap();
     coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![manifest_path.clone()],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![manifest_path.clone()],
+                renames: Vec::new(),
+            },
+        )
         .unwrap();
 
     {
@@ -155,16 +160,18 @@ fn complete_malformed_skeleton_is_bundle_scoped_and_heals_incrementally() {
 
     std::fs::write(&manifest_path, manifest).unwrap();
     coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![manifest_path],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![manifest_path],
+                renames: Vec::new(),
+            },
+        )
         .unwrap();
     let store = coordinator.open_reader().unwrap();
     assert!(store.namespace_errors().unwrap().is_empty());
     assert!(store.entry(AssetUuid([94; 16])).unwrap().is_some());
 }
-
 
 /// A bundle holding its own asset plus `shared`, which another bundle may
 /// claim too.
@@ -218,10 +225,13 @@ fn a_colliding_asset_is_withheld_alone_and_heals_when_one_claimant_leaves() {
     let second = temp.path().join("assets/second.bundle");
     std::fs::remove_file(&second).unwrap();
     coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![second],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![second],
+                renames: Vec::new(),
+            },
+        )
         .unwrap();
     let store = coordinator.open_reader().unwrap();
     assert!(store.namespace_errors().unwrap().is_empty());
@@ -246,10 +256,13 @@ fn an_incremental_collision_withholds_the_asset_and_republishes_the_survivor_on_
     let second = temp.path().join("assets/second.bundle");
     std::fs::write(&second, bundle_sharing(33, 34, AssetUuid([40; 16]))).unwrap();
     coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![second.clone()],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![second.clone()],
+                renames: Vec::new(),
+            },
+        )
         .unwrap();
     assert_only_the_shared_asset_is_withheld(&coordinator.open_reader().unwrap());
 
@@ -257,10 +270,13 @@ fn an_incremental_collision_withholds_the_asset_and_republishes_the_survivor_on_
     // bytes never changed, publishes it again.
     std::fs::write(&second, ordinary_bundle_with(33, 34, 1).0).unwrap();
     coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![second],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![second],
+                renames: Vec::new(),
+            },
+        )
         .unwrap();
     let store = coordinator.open_reader().unwrap();
     assert!(store.namespace_errors().unwrap().is_empty());
@@ -303,7 +319,10 @@ fn claims_survive_a_restart_whose_first_scan_is_rejected() {
     let mut writer = coordinator.open_writer().unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
     let reader = coordinator.open_reader().unwrap();
-    assert!(reader.scan_rejection().unwrap().is_some(), "the first scan is rejected");
+    assert!(
+        reader.scan_rejection().unwrap().is_some(),
+        "the first scan is rejected"
+    );
     let errors = reader.namespace_errors().unwrap();
     assert!(
         errors.iter().any(|error| matches!(
@@ -323,14 +342,21 @@ fn claims_survive_a_restart_whose_first_scan_is_rejected() {
     std::fs::remove_file(&second).unwrap();
     std::fs::remove_file(&link).unwrap();
     coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![second, link],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![second, link],
+                renames: Vec::new(),
+            },
+        )
         .unwrap();
     let store = coordinator.open_reader().unwrap();
     assert_eq!(store.scan_rejection().unwrap(), None);
-    assert!(store.namespace_errors().unwrap().is_empty(), "{:?}", store.namespace_errors());
+    assert!(
+        store.namespace_errors().unwrap().is_empty(),
+        "{:?}",
+        store.namespace_errors()
+    );
     assert!(store.entry(AssetUuid([32; 16])).unwrap().is_some());
     assert!(store.entry(AssetUuid([34; 16])).unwrap().is_none());
     assert!(store.entry(AssetUuid([40; 16])).unwrap().is_some());
@@ -362,9 +388,10 @@ fn write_files(
     force_lossy: bool,
 ) -> Result<WriteReceipt, RpcFailure> {
     assert_eq!(writer.open_input().unwrap(), base);
-    let written = coordinator
-        .authoring_service()
-        .write_files(writer, base, operations, force_lossy);
+    let written =
+        coordinator
+            .authoring_service()
+            .write_files(writer, base, operations, force_lossy);
     writer.finish_input(false).unwrap();
     written
 }
@@ -386,10 +413,13 @@ fn write_and_publish(
         .map(|file| scanner.physical_path(&file.root, &file.path).unwrap())
         .collect();
     let version = coordinator
-        .reconcile_incremental(writer, &WatcherBatch {
-            paths,
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            writer,
+            &WatcherBatch {
+                paths,
+                renames: Vec::new(),
+            },
+        )
         .unwrap()
         .version;
     let reader = coordinator.open_reader().unwrap();
@@ -514,9 +544,14 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
             blobs: Vec::new(),
         },
     });
-    let (receipt, version) =
-        write_and_publish(&coordinator, &mut writer, InputVersion(1), &[operation], false)
-            .unwrap();
+    let (receipt, version) = write_and_publish(
+        &coordinator,
+        &mut writer,
+        InputVersion(1),
+        &[operation],
+        false,
+    )
+    .unwrap();
     assert_eq!(version, InputVersion(2));
     let bytes = std::fs::read(&bundle_path).unwrap();
     assert_eq!(
@@ -597,7 +632,10 @@ fn a_direct_write_changes_the_file_and_commits_nothing() {
         false,
     )
     .is_err());
-    assert_eq!(std::fs::read(&bundle_path).unwrap(), b"not the published bytes");
+    assert_eq!(
+        std::fs::read(&bundle_path).unwrap(),
+        b"not the published bytes"
+    );
 }
 
 #[cfg(unix)]
@@ -614,7 +652,10 @@ fn unreadable_scan_state_publishes_a_typed_version_and_heals() {
     symlink(&outside, &link).unwrap();
 
     assert_eq!(
-        coordinator.reconcile_full_scan(&mut writer).unwrap().version,
+        coordinator
+            .reconcile_full_scan(&mut writer)
+            .unwrap()
+            .version,
         InputVersion(1)
     );
     let store = coordinator.open_reader().unwrap();
@@ -625,7 +666,10 @@ fn unreadable_scan_state_publishes_a_typed_version_and_heals() {
 
     std::fs::remove_file(link).unwrap();
     assert_eq!(
-        coordinator.reconcile_full_scan(&mut writer).unwrap().version,
+        coordinator
+            .reconcile_full_scan(&mut writer)
+            .unwrap()
+            .version,
         InputVersion(2)
     );
     assert!(store.namespace_errors().unwrap().is_empty());
@@ -640,7 +684,10 @@ fn incremental_scan_error_heals_when_observation_returns_to_last_good() {
     let coordinator = coordinator(&temp);
     let mut writer = coordinator.open_writer().unwrap();
     assert_eq!(
-        coordinator.reconcile_full_scan(&mut writer).unwrap().version,
+        coordinator
+            .reconcile_full_scan(&mut writer)
+            .unwrap()
+            .version,
         InputVersion(1)
     );
     let outside = temp.path().join("outside");
@@ -649,10 +696,13 @@ fn incremental_scan_error_heals_when_observation_returns_to_last_good() {
     symlink(&outside, &link).unwrap();
     assert_eq!(
         coordinator
-            .reconcile_incremental(&mut writer, &WatcherBatch {
-                paths: vec![link.clone()],
-                renames: Vec::new(),
-            })
+            .reconcile_incremental(
+                &mut writer,
+                &WatcherBatch {
+                    paths: vec![link.clone()],
+                    renames: Vec::new(),
+                }
+            )
             .unwrap()
             .version,
         InputVersion(2)
@@ -661,10 +711,13 @@ fn incremental_scan_error_heals_when_observation_returns_to_last_good() {
     std::fs::remove_file(&link).unwrap();
     assert_eq!(
         coordinator
-            .reconcile_incremental(&mut writer, &WatcherBatch {
-                paths: vec![link],
-                renames: Vec::new(),
-            })
+            .reconcile_incremental(
+                &mut writer,
+                &WatcherBatch {
+                    paths: vec![link],
+                    renames: Vec::new(),
+                }
+            )
             .unwrap()
             .version,
         InputVersion(3)
@@ -686,7 +739,10 @@ fn unrelated_incremental_observation_does_not_heal_pending_scan_error() {
     let coordinator = coordinator(&temp);
     let mut writer = coordinator.open_writer().unwrap();
     assert_eq!(
-        coordinator.reconcile_full_scan(&mut writer).unwrap().version,
+        coordinator
+            .reconcile_full_scan(&mut writer)
+            .unwrap()
+            .version,
         InputVersion(1)
     );
     let outside = temp.path().join("outside");
@@ -694,19 +750,25 @@ fn unrelated_incremental_observation_does_not_heal_pending_scan_error() {
     let link = temp.path().join("assets/escape");
     symlink(&outside, &link).unwrap();
     coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![link.clone()],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![link.clone()],
+                renames: Vec::new(),
+            },
+        )
         .unwrap();
 
     let unrelated = temp.path().join("assets/unrelated.txt");
     std::fs::write(&unrelated, b"new observation").unwrap();
     coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![unrelated],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![unrelated],
+                renames: Vec::new(),
+            },
+        )
         .unwrap();
     assert!(!coordinator
         .open_reader()
@@ -717,10 +779,13 @@ fn unrelated_incremental_observation_does_not_heal_pending_scan_error() {
 
     std::fs::remove_file(&link).unwrap();
     coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![link],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![link],
+                renames: Vec::new(),
+            },
+        )
         .unwrap();
     assert!(coordinator
         .open_reader()
@@ -754,10 +819,13 @@ fn configuration_scan_rejection_preserves_existing_namespace_errors() {
     let alias = assets.join("alias");
     symlink(&real, &alias).unwrap();
     coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![alias],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![alias],
+                renames: Vec::new(),
+            },
+        )
         .unwrap();
 
     assert_eq!(
@@ -783,7 +851,10 @@ fn directory_alias_publishes_configuration_error_without_aborting_the_version() 
     let mut writer = coordinator.open_writer().unwrap();
 
     assert_eq!(
-        coordinator.reconcile_full_scan(&mut writer).unwrap().version,
+        coordinator
+            .reconcile_full_scan(&mut writer)
+            .unwrap()
+            .version,
         InputVersion(1)
     );
     let store = coordinator.open_reader().unwrap();
@@ -797,7 +868,13 @@ fn directory_alias_publishes_configuration_error_without_aborting_the_version() 
 /// What a fresh scan of the coordinator's roots diagnoses.
 #[cfg(unix)]
 fn diagnostics(coordinator: &DaemonCoordinator) -> Vec<ScanDiagnostic> {
-    coordinator.scanner().scan().unwrap().diagnostic_rows().cloned().collect()
+    coordinator
+        .scanner()
+        .scan()
+        .unwrap()
+        .diagnostic_rows()
+        .cloned()
+        .collect()
 }
 
 #[cfg(unix)]
@@ -842,22 +919,34 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
 
     std::fs::remove_file(&alias).unwrap();
     coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![alias.clone()],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![alias.clone()],
+                renames: Vec::new(),
+            },
+        )
         .unwrap();
     assert!(diagnostics(&coordinator).is_empty());
-    assert_eq!(coordinator.server().current_stamp().unwrap().version, version);
+    assert_eq!(
+        coordinator.server().current_stamp().unwrap().version,
+        version
+    );
     symlink(temp.path().join(".distill"), &alias).unwrap();
     coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![alias],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![alias],
+                renames: Vec::new(),
+            },
+        )
         .unwrap();
     assert_eq!(diagnostics(&coordinator).len(), 1);
-    assert_eq!(coordinator.server().current_stamp().unwrap().version, version);
+    assert_eq!(
+        coordinator.server().current_stamp().unwrap().version,
+        version
+    );
 
     let base = coordinator.server().current_stamp().unwrap().version;
     let hub = match coordinator
@@ -909,7 +998,13 @@ fn u8_struct(fields: &[&str]) -> LogicalSchema {
             rev: 0,
             fields: fields
                 .iter()
-                .map(|name| (name.to_string(), 0, SchemaNode::Primitive(PrimitiveKind::U8)))
+                .map(|name| {
+                    (
+                        name.to_string(),
+                        0,
+                        SchemaNode::Primitive(PrimitiveKind::U8),
+                    )
+                })
                 .collect(),
         },
     }
@@ -976,8 +1071,13 @@ fn rewrite_under_a_new_schema(
             blobs: Vec::new(),
         },
     });
-    let (_, version) =
-        write_and_publish(&coordinator, &mut writer, InputVersion(1), &[operation], force_lossy)?;
+    let (_, version) = write_and_publish(
+        &coordinator,
+        &mut writer,
+        InputVersion(1),
+        &[operation],
+        force_lossy,
+    )?;
     assert_eq!(version, InputVersion(2));
     let rewritten = distill_bundle::parse_bundle(&std::fs::read(&bundle_path).unwrap()).unwrap();
     Ok(rewritten.assets["entry"].data.clone())
@@ -1070,13 +1170,17 @@ fn the_echo_of_an_atomic_write_through_an_unobserved_temporary_file_publishes_no
             to: path,
         }],
     };
-    let published = coordinator.reconcile_incremental(&mut writer, &batch).unwrap();
+    let published = coordinator
+        .reconcile_incremental(&mut writer, &batch)
+        .unwrap();
     assert_eq!(published.version.0, startup.version.0 + 1);
 
     // The same events again, as the watcher delivers the echo of a write the
     // daemon already observed: the namespace is unchanged and the rename
     // moved nothing, so no version is published.
-    let echo = coordinator.reconcile_incremental(&mut writer, &batch).unwrap();
+    let echo = coordinator
+        .reconcile_incremental(&mut writer, &batch)
+        .unwrap();
     assert_eq!(echo.version, published.version);
 }
 
@@ -1103,10 +1207,13 @@ fn a_pending_scan_rejection_survives_an_authoring_write_and_a_restart() {
         coordinator.reconcile_full_scan(&mut writer).unwrap();
         symlink(&outside, &link).unwrap();
         coordinator
-            .reconcile_incremental(&mut writer, &WatcherBatch {
-                paths: vec![link.clone()],
-                renames: Vec::new(),
-            })
+            .reconcile_incremental(
+                &mut writer,
+                &WatcherBatch {
+                    paths: vec![link.clone()],
+                    renames: Vec::new(),
+                },
+            )
             .unwrap();
         let pending = coordinator
             .open_reader()
@@ -1164,20 +1271,31 @@ fn a_pending_scan_rejection_survives_an_authoring_write_and_a_restart() {
     let unrelated = temp.path().join("assets/unrelated.txt");
     std::fs::write(&unrelated, b"new observation").unwrap();
     coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![unrelated],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![unrelated],
+                renames: Vec::new(),
+            },
+        )
         .unwrap();
     assert_eq!(
-        coordinator.open_reader().unwrap().scan_rejection().unwrap().as_ref(),
+        coordinator
+            .open_reader()
+            .unwrap()
+            .scan_rejection()
+            .unwrap()
+            .as_ref(),
         Some(&pending)
     );
     coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![link],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![link],
+                renames: Vec::new(),
+            },
+        )
         .unwrap();
     let store = coordinator.open_reader().unwrap();
     assert_eq!(store.scan_rejection().unwrap(), None);
@@ -1208,10 +1326,13 @@ fn single_edit_pages(filler: usize) -> u64 {
     let before = writer.pages_fetched().unwrap();
     let base = writer.input_version().unwrap();
     let published = coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![edited],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![edited],
+                renames: Vec::new(),
+            },
+        )
         .unwrap();
     assert_eq!(published.version.0, base.0 + 1);
     writer.pages_fetched().unwrap() - before
@@ -1225,7 +1346,10 @@ fn a_single_bundle_edit_reads_independent_of_namespace_size() {
     let small = single_edit_pages(100);
     let large = single_edit_pages(6000);
     println!("single bundle edit: {small} pages beside 100 files, {large} beside 6000");
-    assert!(large <= small + 16, "{small} pages beside 100 files, {large} beside 6000");
+    assert!(
+        large <= small + 16,
+        "{small} pages beside 100 files, {large} beside 6000"
+    );
 }
 
 /// Pages a configuration source rejection and its heal read and write beside
@@ -1260,9 +1384,14 @@ fn configuration_error_pages(filler: usize) -> u64 {
         writer.configuration_state().unwrap(),
         ConfigurationState::Failed { .. }
     ));
-    let healed = coordinator.heal_configuration_rejection(&mut writer).unwrap();
+    let healed = coordinator
+        .heal_configuration_rejection(&mut writer)
+        .unwrap();
     assert_eq!(healed.version.0, base.0 + 2);
-    assert_eq!(format!("{:?}", writer.configuration_state().unwrap()), format!("{ready:?}"));
+    assert_eq!(
+        format!("{:?}", writer.configuration_state().unwrap()),
+        format!("{ready:?}")
+    );
     writer.pages_fetched().unwrap() - before
 }
 
@@ -1273,7 +1402,10 @@ fn a_configuration_error_reads_independent_of_namespace_size() {
     let small = configuration_error_pages(100);
     let large = configuration_error_pages(6000);
     println!("configuration error and heal: {small} pages beside 100 files, {large} beside 6000");
-    assert!(large <= small + 16, "{small} pages beside 100 files, {large} beside 6000");
+    assert!(
+        large <= small + 16,
+        "{small} pages beside 100 files, {large} beside 6000"
+    );
 }
 
 static EDIT_STATEMENTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
@@ -1315,7 +1447,10 @@ fn edit_cost(n: u32) -> (Vec<String>, u64) {
     let coordinator = coordinator(&temp);
     let mut writer = coordinator.open_writer().unwrap();
     coordinator
-        .reconcile_rescan(&mut writer, &mut distill_daemon::watcher::WatcherQueue::new())
+        .reconcile_rescan(
+            &mut writer,
+            &mut distill_daemon::watcher::WatcherQueue::new(),
+        )
         .unwrap();
     let edited = assets.join("d7/b7.bundle");
     let batch = WatcherBatch {
@@ -1324,12 +1459,16 @@ fn edit_cost(n: u32) -> (Vec<String>, u64) {
     };
     // The first edit warms the connection's statement cache.
     std::fs::write(&edited, bundle(7, 2)).unwrap();
-    coordinator.reconcile_batch(&mut writer, &batch, false).unwrap();
+    coordinator
+        .reconcile_batch(&mut writer, &batch, false)
+        .unwrap();
     std::fs::write(&edited, bundle(7, 3)).unwrap();
     let pages = writer.pages_fetched().unwrap();
     EDIT_STATEMENTS.lock().unwrap().clear();
     writer.trace_statements(Some(record_edit_statement));
-    coordinator.reconcile_batch(&mut writer, &batch, false).unwrap();
+    coordinator
+        .reconcile_batch(&mut writer, &batch, false)
+        .unwrap();
     writer.trace_statements(None);
     let pages = writer.pages_fetched().unwrap() - pages;
     (std::mem::take(&mut *EDIT_STATEMENTS.lock().unwrap()), pages)
@@ -1342,9 +1481,16 @@ fn edit_cost(n: u32) -> (Vec<String>, u64) {
 fn an_edit_pass_runs_the_same_statements_at_any_namespace_size() {
     let (small, small_pages) = edit_cost(40);
     let (large, large_pages) = edit_cost(1200);
-    println!("statements {} / {}, pages {small_pages} / {large_pages}", small.len(), large.len());
+    println!(
+        "statements {} / {}, pages {small_pages} / {large_pages}",
+        small.len(),
+        large.len()
+    );
     assert_eq!(small.len(), large.len(), "{small:#?}\n{large:#?}");
-    assert!(2 * large_pages <= 3 * small_pages, "{small_pages} -> {large_pages} pages");
+    assert!(
+        2 * large_pages <= 3 * small_pages,
+        "{small_pages} -> {large_pages} pages"
+    );
 }
 
 /// A staged restart and its RestartRequired announcement are one
@@ -1361,10 +1507,13 @@ fn a_staged_restart_commits_with_its_announcement_or_not_at_all() {
              BEGIN SELECT RAISE(ABORT, 'injected'); END;",
         )
         .unwrap();
-    let staged =
-        coordinator.stage_restart_configuration(&mut writer, &[RestartOnlyChange::AutoCodegen(true)]);
+    let staged = coordinator
+        .stage_restart_configuration(&mut writer, &[RestartOnlyChange::AutoCodegen(true)]);
     assert!(staged.is_err());
-    assert!(writer.pending_restart().unwrap().is_none(), "the staging committed alone");
+    assert!(
+        writer.pending_restart().unwrap().is_none(),
+        "the staging committed alone"
+    );
 }
 
 /// The RestartRequired keys a new subscription is told are the store's
@@ -1382,7 +1531,10 @@ fn restart_required_clears_once_a_restart_adopts_the_staged_values() {
             ConnectOutcome::Connected(connected) => connected.hub,
             outcome => panic!("target connection failed: {outcome:?}"),
         };
-        let subscription = hub.subscribe(InputVersion(0), vec![], vec![]).success().unwrap();
+        let subscription = hub
+            .subscribe(InputVersion(0), vec![], vec![])
+            .success()
+            .unwrap();
         let mut keys = Vec::new();
         while let Some(event) = subscription.deltas.next() {
             if let StreamEvent::Asset {
@@ -1410,7 +1562,10 @@ fn restart_required_clears_once_a_restart_adopts_the_staged_values() {
     let coordinator = coordinator(&temp);
     let mut writer = coordinator.open_writer().unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
-    assert!(writer.pending_restart().unwrap().is_none(), "the restart adopted the values");
+    assert!(
+        writer.pending_restart().unwrap().is_none(),
+        "the restart adopted the values"
+    );
     assert_eq!(restart_events(&coordinator), Vec::<Vec<String>>::new());
 }
 
@@ -1440,23 +1595,43 @@ fn a_full_rescan_logs_only_what_changed() {
             .collect::<Vec<_>>()
     };
 
-    let first = coordinator.reconcile_full_scan(&mut writer).unwrap().version;
+    let first = coordinator
+        .reconcile_full_scan(&mut writer)
+        .unwrap()
+        .version;
     assert_eq!(first, InputVersion(1));
     assert_eq!(log(first), []);
 
     let (edited, _, _) = ordinary_bundle_with(73, 72, 8);
     std::fs::write(assets.join("edited.bundle"), edited).unwrap();
-    let edit = coordinator.reconcile_full_scan(&mut writer).unwrap().version;
+    let edit = coordinator
+        .reconcile_full_scan(&mut writer)
+        .unwrap()
+        .version;
     assert_eq!(edit, InputVersion(2));
-    assert_eq!(log(edit), [Change::Asset { asset: edited_asset, state: 0 }]);
+    assert_eq!(
+        log(edit),
+        [Change::Asset {
+            asset: edited_asset,
+            state: 0
+        }]
+    );
 
     std::fs::remove_file(assets.join("kept.bundle")).unwrap();
-    let removal = coordinator.reconcile_full_scan(&mut writer).unwrap().version;
+    let removal = coordinator
+        .reconcile_full_scan(&mut writer)
+        .unwrap()
+        .version;
     assert_eq!(
         log(removal),
         [
-            Change::Asset { asset: kept_asset, state: 1 },
-            Change::Path { path: "kept.bundle".to_owned() },
+            Change::Asset {
+                asset: kept_asset,
+                state: 1
+            },
+            Change::Path {
+                path: "kept.bundle".to_owned()
+            },
         ]
     );
 }

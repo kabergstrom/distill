@@ -4,13 +4,12 @@
 
 use distill_core::id::{AssetUuid, BundleFileHash, ContentHash};
 use distill_store::cas::record::{
-    CapabilityKey, FailureCause, FailureFingerprint, KeyKind, LocalFailureClass,
-    ResultOutcome,
+    CapabilityKey, FailureCause, FailureFingerprint, KeyKind, LocalFailureClass, ResultOutcome,
 };
 use distill_store::cas::{AuxSpec, BuildCommit, CommitOutcome, OutputSpec};
 use distill_store::claims::{DerivedOutputClaim, SourceClaim, SourceClaims};
 use distill_store::state::{
-    ReadableBundleSource, SkeletonFailureCode, NamespaceError, NamespaceErrorV1,
+    NamespaceError, NamespaceErrorV1, ReadableBundleSource, SkeletonFailureCode,
 };
 use distill_store::{Store, StoreConfig, StoreError};
 use distill_wire::dswl::{dswl_bytes, dswl_hash};
@@ -91,7 +90,10 @@ fn under(path: &str) -> Vec<(String, String)> {
 fn declare_child(store: &mut Store, parent: AssetUuid, key: &str) -> AssetUuid {
     store
         .input_transaction(|txn| {
-            txn.replace_source_claims(Some(&under("p.bundle")), &[deriving_source("p.bundle", parent, key)])
+            txn.replace_source_claims(
+                Some(&under("p.bundle")),
+                &[deriving_source("p.bundle", parent, key)],
+            )
         })
         .unwrap();
     AssetUuid::v5(parent, key)
@@ -466,7 +468,10 @@ fn derived_output_namespace_replacement_is_atomic_and_complete() {
     let next = AssetUuid::v5(next_parent, "meshlets");
     store
         .input_transaction(|txn| {
-            txn.replace_source_claims(None, &[deriving_source("q.bundle", next_parent, "meshlets")])
+            txn.replace_source_claims(
+                None,
+                &[deriving_source("q.bundle", next_parent, "meshlets")],
+            )
         })
         .unwrap();
     assert!(store.resolve_child(old).unwrap().is_none());

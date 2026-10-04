@@ -115,7 +115,12 @@ fn watcher_changes_wait_for_the_configured_quiet_window() {
     let process = DaemonProcess::start(DaemonConfig::load(path).unwrap()).unwrap();
     // The pass that follows startup.
     std::thread::sleep(SETTLED);
-    let before = process.coordinator().server().current_stamp().unwrap().version;
+    let before = process
+        .coordinator()
+        .server()
+        .current_stamp()
+        .unwrap()
+        .version;
 
     // Three writes 300 ms apart: each restarts the 1 s window.
     let asset = temp.path().join("assets/source.txt");
@@ -126,13 +131,26 @@ fn watcher_changes_wait_for_the_configured_quiet_window() {
         std::fs::write(&asset, content).unwrap();
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(
-            process.coordinator().server().current_stamp().unwrap().version,
+            process
+                .coordinator()
+                .server()
+                .current_stamp()
+                .unwrap()
+                .version,
             before,
             "nothing reconciles while changes keep arriving"
         );
     }
     wait_until(
-        || process.coordinator().server().current_stamp().unwrap().version > before,
+        || {
+            process
+                .coordinator()
+                .server()
+                .current_stamp()
+                .unwrap()
+                .version
+                > before
+        },
         "the burst was not reconciled",
     );
     assert!(
@@ -158,7 +176,13 @@ fn process_serves_rpc_and_consumes_watcher_changes_until_drop() {
     let mut socket = TcpStream::connect(process.rpc_address()).unwrap();
     socket.write_all(&[]).unwrap();
 
-    let before = process.coordinator().server().current_stamp().unwrap().version.0;
+    let before = process
+        .coordinator()
+        .server()
+        .current_stamp()
+        .unwrap()
+        .version
+        .0;
     assert!(matches!(
         process
             .coordinator()
@@ -171,7 +195,15 @@ fn process_serves_rpc_and_consumes_watcher_changes_until_drop() {
 
     std::fs::write(temp.path().join("assets/source.txt"), b"source").unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
-    while process.coordinator().server().current_stamp().unwrap().version.0 <= before {
+    while process
+        .coordinator()
+        .server()
+        .current_stamp()
+        .unwrap()
+        .version
+        .0
+        <= before
+    {
         assert!(Instant::now() < deadline, "watcher batch did not publish");
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -323,7 +355,10 @@ fn colliding_directory_rules_bundle() -> Vec<u8> {
             ("output", AuthoredValue::Str("collide.bundle".into())),
             (
                 "settings",
-                object(vec![("UInt", object(vec![("value", AuthoredValue::UInt(5))]))]),
+                object(vec![(
+                    "UInt",
+                    object(vec![("value", AuthoredValue::UInt(5))]),
+                )]),
             ),
         ])
     };
@@ -404,10 +439,20 @@ fn malformed_configuration_publishes_once_and_a_valid_edit_heals_it() {
         },
         "malformed configuration was not published",
     );
-    let failed = process.coordinator().server().current_stamp().unwrap().version;
+    let failed = process
+        .coordinator()
+        .server()
+        .current_stamp()
+        .unwrap()
+        .version;
     std::thread::sleep(SETTLED);
     assert_eq!(
-        process.coordinator().server().current_stamp().unwrap().version,
+        process
+            .coordinator()
+            .server()
+            .current_stamp()
+            .unwrap()
+            .version,
         failed
     );
 
@@ -417,7 +462,12 @@ fn malformed_configuration_publishes_once_and_a_valid_edit_heals_it() {
             if let Some(error) = process.last_background_error() {
                 panic!("background reconciliation failed: {error}");
             }
-            let version = process.coordinator().server().current_stamp().unwrap().version;
+            let version = process
+                .coordinator()
+                .server()
+                .current_stamp()
+                .unwrap()
+                .version;
             let state = process
                 .coordinator()
                 .open_reader()
@@ -537,7 +587,12 @@ fn schema_bound_target_mismatches_publish_configuration_error() {
 fn operational_configuration_applies_live_without_an_input_version() {
     let temp = tempfile::tempdir().unwrap();
     let process = DaemonProcess::start(config(&temp)).unwrap();
-    let before = process.coordinator().server().current_stamp().unwrap().version;
+    let before = process
+        .coordinator()
+        .server()
+        .current_stamp()
+        .unwrap()
+        .version;
     let edited = config_source(&temp).replace("parallelism = 2", "parallelism = 3");
     std::fs::write(temp.path().join("distill.toml"), edited).unwrap();
 
@@ -552,11 +607,21 @@ fn operational_configuration_applies_live_without_an_input_version() {
         "operational parallelism was not applied",
     );
     assert_eq!(
-        process.coordinator().server().current_stamp().unwrap().version,
+        process
+            .coordinator()
+            .server()
+            .current_stamp()
+            .unwrap()
+            .version,
         before
     );
     assert_eq!(
-        process.coordinator().server_handle().opener().config().parallelism,
+        process
+            .coordinator()
+            .server_handle()
+            .opener()
+            .config()
+            .parallelism,
         3
     );
 }
@@ -565,7 +630,12 @@ fn operational_configuration_applies_live_without_an_input_version() {
 fn restart_only_configuration_is_staged_without_an_input_version() {
     let temp = tempfile::tempdir().unwrap();
     let process = DaemonProcess::start(config(&temp)).unwrap();
-    let before = process.coordinator().server().current_stamp().unwrap().version;
+    let before = process
+        .coordinator()
+        .server()
+        .current_stamp()
+        .unwrap()
+        .version;
     let edited = config_source(&temp).replace("auto_codegen = false", "auto_codegen = true");
     std::fs::write(temp.path().join("distill.toml"), edited).unwrap();
 
@@ -582,7 +652,12 @@ fn restart_only_configuration_is_staged_without_an_input_version() {
         "restart-only edit was not staged",
     );
     assert_eq!(
-        process.coordinator().server().current_stamp().unwrap().version,
+        process
+            .coordinator()
+            .server()
+            .current_stamp()
+            .unwrap()
+            .version,
         before
     );
     assert!(
@@ -618,7 +693,11 @@ fn target_configuration_and_pipeline_validation_publish_as_one_version() {
     let temp = tempfile::tempdir().unwrap();
     let process = DaemonProcess::start(config(&temp)).unwrap();
     wait_until(
-        || compiled(&process).and_then(|compiled| compiled.build_target("dev")).is_some(),
+        || {
+            compiled(&process)
+                .and_then(|compiled| compiled.build_target("dev"))
+                .is_some()
+        },
         "initial build target was not retained",
     );
     assert!(
@@ -627,19 +706,42 @@ fn target_configuration_and_pipeline_validation_publish_as_one_version() {
             .expect("initial target is retained for build execution")
             .optimize
     );
-    let before = process.coordinator().server().current_stamp().unwrap().version;
+    let before = process
+        .coordinator()
+        .server()
+        .current_stamp()
+        .unwrap()
+        .version;
     let edited = config_source(&temp).replace("optimize = false", "optimize = true");
     std::fs::write(temp.path().join("distill.toml"), edited).unwrap();
 
     wait_until(
-        || process.coordinator().server().current_stamp().unwrap().version > before,
+        || {
+            process
+                .coordinator()
+                .server()
+                .current_stamp()
+                .unwrap()
+                .version
+                > before
+        },
         "target configuration did not publish",
     );
-    let after = process.coordinator().server().current_stamp().unwrap().version;
+    let after = process
+        .coordinator()
+        .server()
+        .current_stamp()
+        .unwrap()
+        .version;
     assert_eq!(after.0, before.0 + 1);
     std::thread::sleep(SETTLED);
     assert_eq!(
-        process.coordinator().server().current_stamp().unwrap().version,
+        process
+            .coordinator()
+            .server()
+            .current_stamp()
+            .unwrap()
+            .version,
         after
     );
     assert!(
@@ -655,7 +757,12 @@ fn target_configuration_and_pipeline_validation_publish_as_one_version() {
 fn root_configuration_reconciles_new_namespace_in_the_same_version() {
     let temp = tempfile::tempdir().unwrap();
     let process = DaemonProcess::start(config(&temp)).unwrap();
-    let before = process.coordinator().server().current_stamp().unwrap().version;
+    let before = process
+        .coordinator()
+        .server()
+        .current_stamp()
+        .unwrap()
+        .version;
     let second = temp.path().join("second-assets");
     std::fs::create_dir(&second).unwrap();
     std::fs::write(second.join("new.txt"), b"new root").unwrap();
@@ -667,7 +774,13 @@ fn root_configuration_reconciles_new_namespace_in_the_same_version() {
 
     wait_until(
         || {
-            process.coordinator().server().current_stamp().unwrap().version > before
+            process
+                .coordinator()
+                .server()
+                .current_stamp()
+                .unwrap()
+                .version
+                > before
                 && process
                     .coordinator()
                     .open_reader()
@@ -679,11 +792,21 @@ fn root_configuration_reconciles_new_namespace_in_the_same_version() {
         },
         "new root was not reconciled",
     );
-    let after = process.coordinator().server().current_stamp().unwrap().version;
+    let after = process
+        .coordinator()
+        .server()
+        .current_stamp()
+        .unwrap()
+        .version;
     assert_eq!(after.0, before.0 + 1);
     std::thread::sleep(SETTLED);
     assert_eq!(
-        process.coordinator().server().current_stamp().unwrap().version,
+        process
+            .coordinator()
+            .server()
+            .current_stamp()
+            .unwrap()
+            .version,
         after
     );
     assert_eq!(
@@ -700,14 +823,32 @@ fn root_configuration_reconciles_new_namespace_in_the_same_version() {
 fn same_path_schema_edits_publish_exactly_one_atomic_candidate_version() {
     let temp = tempfile::tempdir().unwrap();
     let process = DaemonProcess::start(config(&temp)).unwrap();
-    let before = process.coordinator().server().current_stamp().unwrap().version;
+    let before = process
+        .coordinator()
+        .server()
+        .current_stamp()
+        .unwrap()
+        .version;
 
     write_schema(&temp, "changed");
     wait_until(
-        || process.coordinator().server().current_stamp().unwrap().version > before,
+        || {
+            process
+                .coordinator()
+                .server()
+                .current_stamp()
+                .unwrap()
+                .version
+                > before
+        },
         "same-path schema edit did not publish",
     );
-    let after = process.coordinator().server().current_stamp().unwrap().version;
+    let after = process
+        .coordinator()
+        .server()
+        .current_stamp()
+        .unwrap()
+        .version;
     assert_eq!(after.0, before.0 + 1);
     let expected_schema_hash =
         *blake3::hash(&std::fs::read(temp.path().join("schema.json")).unwrap()).as_bytes();
@@ -720,7 +861,12 @@ fn same_path_schema_edits_publish_exactly_one_atomic_candidate_version() {
     );
     std::thread::sleep(SETTLED);
     assert_eq!(
-        process.coordinator().server().current_stamp().unwrap().version,
+        process
+            .coordinator()
+            .server()
+            .current_stamp()
+            .unwrap()
+            .version,
         after
     );
     assert!(process.last_background_error().is_none());
@@ -733,33 +879,70 @@ fn config_retargets_native_schema_watch_without_polling_the_old_path() {
     let old_schema = temp.path().join("schema.json");
     let next_schema = temp.path().join("schema-next.json");
     write_schema_path(&next_schema, "next-initial");
-    let before = process.coordinator().server().current_stamp().unwrap().version;
+    let before = process
+        .coordinator()
+        .server()
+        .current_stamp()
+        .unwrap()
+        .version;
     let edited = config_source(&temp).replace(
         &old_schema.display().to_string(),
         &next_schema.display().to_string(),
     );
     std::fs::write(temp.path().join("distill.toml"), edited).unwrap();
     wait_until(
-        || process.coordinator().server().current_stamp().unwrap().version > before,
+        || {
+            process
+                .coordinator()
+                .server()
+                .current_stamp()
+                .unwrap()
+                .version
+                > before
+        },
         "schema watch path replacement did not publish",
     );
-    let replaced = process.coordinator().server().current_stamp().unwrap().version;
+    let replaced = process
+        .coordinator()
+        .server()
+        .current_stamp()
+        .unwrap()
+        .version;
 
     write_schema_path(&old_schema, "obsolete-path");
     std::thread::sleep(SETTLED);
     assert_eq!(
-        process.coordinator().server().current_stamp().unwrap().version,
+        process
+            .coordinator()
+            .server()
+            .current_stamp()
+            .unwrap()
+            .version,
         replaced,
         "the retired schema path must no longer drive candidates"
     );
 
     write_schema_path(&next_schema, "next-edited");
     wait_until(
-        || process.coordinator().server().current_stamp().unwrap().version > replaced,
+        || {
+            process
+                .coordinator()
+                .server()
+                .current_stamp()
+                .unwrap()
+                .version
+                > replaced
+        },
         "replacement schema path was not watched",
     );
     assert_eq!(
-        process.coordinator().server().current_stamp().unwrap().version.0,
+        process
+            .coordinator()
+            .server()
+            .current_stamp()
+            .unwrap()
+            .version
+            .0,
         replaced.0 + 1
     );
 }
@@ -768,7 +951,12 @@ fn config_retargets_native_schema_watch_without_polling_the_old_path() {
 fn malformed_schema_is_a_stable_pipeline_failure_and_a_valid_edit_retries() {
     let temp = tempfile::tempdir().unwrap();
     let process = DaemonProcess::start(config(&temp)).unwrap();
-    let before = process.coordinator().server().current_stamp().unwrap().version;
+    let before = process
+        .coordinator()
+        .server()
+        .current_stamp()
+        .unwrap()
+        .version;
     std::fs::write(temp.path().join("schema.json"), b"not-json").unwrap();
 
     wait_until(
@@ -785,21 +973,45 @@ fn malformed_schema_is_a_stable_pipeline_failure_and_a_valid_edit_retries() {
         },
         "malformed schema was not published as a pipeline failure",
     );
-    let failed = process.coordinator().server().current_stamp().unwrap().version;
+    let failed = process
+        .coordinator()
+        .server()
+        .current_stamp()
+        .unwrap()
+        .version;
     assert_eq!(failed.0, before.0 + 1);
     std::thread::sleep(SETTLED);
     assert_eq!(
-        process.coordinator().server().current_stamp().unwrap().version,
+        process
+            .coordinator()
+            .server()
+            .current_stamp()
+            .unwrap()
+            .version,
         failed
     );
 
     write_schema(&temp, "healed");
     wait_until(
-        || process.coordinator().server().current_stamp().unwrap().version > failed,
+        || {
+            process
+                .coordinator()
+                .server()
+                .current_stamp()
+                .unwrap()
+                .version
+                > failed
+        },
         "valid schema edit did not retry the atomic candidate",
     );
     assert_eq!(
-        process.coordinator().server().current_stamp().unwrap().version.0,
+        process
+            .coordinator()
+            .server()
+            .current_stamp()
+            .unwrap()
+            .version
+            .0,
         failed.0 + 1
     );
     assert!(process.last_background_error().is_none());
@@ -1055,7 +1267,10 @@ ngp-source-hash = {{ path = '{}' }}
             library.close();
             let _ = std::fs::remove_file(staged.path());
             assert_eq!(identity.source.crate_name, GATE_CRATE);
-            assert!(!identity.layout_hash.is_empty(), "NgpSourceIdentity exports a layout hash");
+            assert!(
+                !identity.layout_hash.is_empty(),
+                "NgpSourceIdentity exports a layout hash"
+            );
             GateVariant {
                 dylib,
                 source_hash: identity.source.source_hash,
@@ -1066,9 +1281,15 @@ ngp-source-hash = {{ path = '{}' }}
         let v2 = build("v2", 2, true);
         let v3 = build("v3", 3, true);
         assert_ne!(v1.source_hash, v2.source_hash);
-        assert_ne!(v1.layout_hash, v2.layout_hash, "a new struct changes the layout hash");
+        assert_ne!(
+            v1.layout_hash, v2.layout_hash,
+            "a new struct changes the layout hash"
+        );
         assert_ne!(v2.source_hash, v3.source_hash);
-        assert_eq!(v2.layout_hash, v3.layout_hash, "a fn body keeps the layout hash");
+        assert_eq!(
+            v2.layout_hash, v3.layout_hash,
+            "a fn body keeps the layout hash"
+        );
         GateVariants { v1, v2, v3 }
     })
 }
@@ -1127,7 +1348,14 @@ fn write_gate_schema(temp: &tempfile::TempDir, variant: &GateVariant) {
             .collect(),
         rustc_version: String::new(),
         types: vec![
-            type_def(0, PrimitiveType::U8, path("core", "u8"), None, TypeAttrs::default(), Vec::new()),
+            type_def(
+                0,
+                PrimitiveType::U8,
+                path("core", "u8"),
+                None,
+                TypeAttrs::default(),
+                Vec::new(),
+            ),
             type_def(
                 1,
                 PrimitiveType::Struct,
@@ -1139,7 +1367,14 @@ fn write_gate_schema(temp: &tempfile::TempDir, variant: &GateVariant) {
                 },
                 vec![field("value", 0)],
             ),
-            type_def(2, PrimitiveType::String, path("alloc", "String"), None, TypeAttrs::default(), Vec::new()),
+            type_def(
+                2,
+                PrimitiveType::String,
+                path("alloc", "String"),
+                None,
+                TypeAttrs::default(),
+                Vec::new(),
+            ),
             type_def(
                 3,
                 PrimitiveType::Struct,
@@ -1254,13 +1489,26 @@ fn pipeline_ahead_of_its_schema_keeps_serving_until_the_schema_catches_up() {
     // Let the watcher publish the import's own bundle write first.
     std::thread::sleep(SETTLED);
     let generation = pipeline_generation(&process);
-    let before = process.coordinator().server().current_stamp().unwrap().version;
+    let before = process
+        .coordinator()
+        .server()
+        .current_stamp()
+        .unwrap()
+        .version;
 
     // Cargo rewrote the dylib; source-walk hasn't rewritten the schema yet,
     // and the layout changed: the candidate waits, nothing is published.
     install_gate_pipeline(&temp, &variants.v2);
     std::thread::sleep(Duration::from_millis(500));
-    assert_eq!(process.coordinator().server().current_stamp().unwrap().version, before);
+    assert_eq!(
+        process
+            .coordinator()
+            .server()
+            .current_stamp()
+            .unwrap()
+            .version,
+        before
+    );
     assert_eq!(pipeline_generation(&process), generation);
     assert_eq!(ready_dylib_hash(&process), Some(dylib_hash(&variants.v1)));
     assert_eq!(process.last_background_error(), None);
@@ -1325,14 +1573,27 @@ fn source_walk_catching_up_after_an_ahead_of_walk_adoption_is_not_republished() 
     // Let the watcher publish the import's own bundle write first.
     std::thread::sleep(SETTLED);
     let generation = pipeline_generation(&process);
-    let before = process.coordinator().server().current_stamp().unwrap().version;
+    let before = process
+        .coordinator()
+        .server()
+        .current_stamp()
+        .unwrap()
+        .version;
 
     // The order a rebuild job produces. cargo removes the dylib and links
     // the new one; a pass in between sees no module and keeps serving.
     std::fs::remove_file(temp.path().join("pipeline.so")).unwrap();
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(pipeline_generation(&process), generation);
-    assert_eq!(process.coordinator().server().current_stamp().unwrap().version, before);
+    assert_eq!(
+        process
+            .coordinator()
+            .server()
+            .current_stamp()
+            .unwrap()
+            .version,
+        before
+    );
     assert_eq!(ready_dylib_hash(&process), Some(dylib_hash(&variants.v2)));
     assert_eq!(process.last_background_error(), None);
 
@@ -1350,7 +1611,12 @@ fn source_walk_catching_up_after_an_ahead_of_walk_adoption_is_not_republished() 
     // Let the watcher publish the reimport's own bundle write first.
     std::thread::sleep(SETTLED);
     assert_eq!(pipeline_generation(&process), generation + 1);
-    let before = process.coordinator().server().current_stamp().unwrap().version;
+    let before = process
+        .coordinator()
+        .server()
+        .current_stamp()
+        .unwrap()
+        .version;
 
     // Then source-walk's fast path refreshes only the pipeline crate's
     // source hash, to the adopted module's. Exactly one epoch change for
@@ -1358,7 +1624,15 @@ fn source_walk_catching_up_after_an_ahead_of_walk_adoption_is_not_republished() 
     write_gate_schema(&temp, &variants.v3);
     std::thread::sleep(Duration::from_millis(1000));
     assert_eq!(pipeline_generation(&process), generation + 1);
-    assert_eq!(process.coordinator().server().current_stamp().unwrap().version, before);
+    assert_eq!(
+        process
+            .coordinator()
+            .server()
+            .current_stamp()
+            .unwrap()
+            .version,
+        before
+    );
     assert_eq!(ready_dylib_hash(&process), Some(dylib_hash(&variants.v3)));
     assert_eq!(process.last_background_error(), None);
 
@@ -1385,14 +1659,27 @@ fn a_schema_refresh_observed_before_its_dylib_gives_one_epoch_change() {
     assert_eq!(imported_value(&temp).as_deref(), Some("v2:note"));
     std::thread::sleep(SETTLED);
     let generation = pipeline_generation(&process);
-    let before = process.coordinator().server().current_stamp().unwrap().version;
+    let before = process
+        .coordinator()
+        .server()
+        .current_stamp()
+        .unwrap()
+        .version;
 
     // The schema already names v3's source while v2 still serves: v2 would
     // load against it as it is, so nothing is published.
     write_gate_schema(&temp, &variants.v3);
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(pipeline_generation(&process), generation);
-    assert_eq!(process.coordinator().server().current_stamp().unwrap().version, before);
+    assert_eq!(
+        process
+            .coordinator()
+            .server()
+            .current_stamp()
+            .unwrap()
+            .version,
+        before
+    );
     assert_eq!(ready_dylib_hash(&process), Some(dylib_hash(&variants.v2)));
     assert_eq!(process.last_background_error(), None);
 

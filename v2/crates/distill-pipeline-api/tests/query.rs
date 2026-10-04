@@ -1,5 +1,5 @@
-use distill_pipeline_api::query::*;
 use distill_core::id::{AssetUuid, BundleUuid};
+use distill_pipeline_api::query::*;
 
 #[test]
 fn paths_are_lexically_contained_and_nfc_normalized() {

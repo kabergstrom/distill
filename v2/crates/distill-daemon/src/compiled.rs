@@ -99,7 +99,11 @@ impl Compiled {
 
     /// This state with its pipeline failed, for the version `key`: the
     /// schema, targets and projection stay, the pipeline's importers go.
-    pub(crate) fn with_pipeline_failure(&self, key: InputVersion, failure: PipelineFailure) -> Self {
+    pub(crate) fn with_pipeline_failure(
+        &self,
+        key: InputVersion,
+        failure: PipelineFailure,
+    ) -> Self {
         Self {
             key: Some(key),
             importers: Arc::new(RegisteredImporters::new()),
@@ -179,7 +183,10 @@ pub enum CompiledLookupError {
     /// process's version.
     NotLoaded { key: CompiledKey },
     /// The key's entry was superseded and released; a newer snapshot serves.
-    Superseded { key: CompiledKey, latest: CompiledKey },
+    Superseded {
+        key: CompiledKey,
+        latest: CompiledKey,
+    },
     /// The key itself could not be read.
     Store(String),
 }
@@ -254,7 +261,11 @@ impl CompiledRegistry {
     /// The entry for `key` exactly.
     pub(crate) fn get(&self, key: CompiledKey) -> Result<Arc<Compiled>, CompiledLookupError> {
         let entries = self.entries();
-        if let Some(entry) = entries.slots.get(&key).and_then(|slot| slot.entry.upgrade()) {
+        if let Some(entry) = entries
+            .slots
+            .get(&key)
+            .and_then(|slot| slot.entry.upgrade())
+        {
             return Ok(entry);
         }
         match entries.latest {
@@ -268,7 +279,10 @@ impl CompiledRegistry {
     pub(crate) fn latest(&self) -> Option<Arc<Compiled>> {
         let entries = self.entries();
         let key = entries.latest?;
-        entries.slots.get(&key).and_then(|slot| slot.entry.upgrade())
+        entries
+            .slots
+            .get(&key)
+            .and_then(|slot| slot.entry.upgrade())
     }
 
     /// Register `entry` as the confirmed state of its key: the boot state,
@@ -379,7 +393,9 @@ pub(crate) struct StagedCompiled<'a> {
 
 impl StagedCompiled<'_> {
     pub(crate) fn entry(&self) -> &Arc<Compiled> {
-        self.entry.as_ref().expect("a staged entry is held until it resolves")
+        self.entry
+            .as_ref()
+            .expect("a staged entry is held until it resolves")
     }
 
     /// The input that publishes the entry's key committed.
@@ -412,7 +428,10 @@ mod tests {
         registry.install(entry(1));
         {
             let staged = registry.stage(entry(2));
-            assert_eq!(registry.get(Some(InputVersion(2))).unwrap().key(), Some(InputVersion(2)));
+            assert_eq!(
+                registry.get(Some(InputVersion(2))).unwrap().key(),
+                Some(InputVersion(2))
+            );
             assert_eq!(registry.latest().unwrap().key(), Some(InputVersion(1)));
             drop(staged);
         }
@@ -426,7 +445,10 @@ mod tests {
         registry.stage(entry(2)).confirm();
         assert_eq!(registry.latest().unwrap().key(), Some(InputVersion(2)));
         // The superseded entry is still retained for older snapshots.
-        assert_eq!(registry.get(Some(InputVersion(1))).unwrap().key(), Some(InputVersion(1)));
+        assert_eq!(
+            registry.get(Some(InputVersion(1))).unwrap().key(),
+            Some(InputVersion(1))
+        );
     }
 
     #[test]
@@ -445,7 +467,10 @@ mod tests {
             })
         );
         // Key 1 is held by a reader: it still serves.
-        assert!(Arc::ptr_eq(&registry.get(Some(InputVersion(1))).unwrap(), &held));
+        assert!(Arc::ptr_eq(
+            &registry.get(Some(InputVersion(1))).unwrap(),
+            &held
+        ));
         // A key no publication reached is not another version's state.
         assert_eq!(
             registry.get(Some(InputVersion(99))).err(),

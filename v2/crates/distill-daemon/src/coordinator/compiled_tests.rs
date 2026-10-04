@@ -12,9 +12,9 @@ use distill_schema::ngp_schema::{LayoutIdentity, Schema, SchemaLayouts};
 use distill_store::state::InputVersion;
 
 use super::*;
+use crate::epoch::ModuleAbiIdentity;
 use distill_bundle::AssetEntry;
 use distill_json::AuthoredValue;
-use crate::epoch::ModuleAbiIdentity;
 
 type Hook = Box<dyn FnMut() -> Result<(), String>>;
 
@@ -173,7 +173,11 @@ fn optimized(compiled: &Compiled) -> bool {
 }
 
 fn root_names(compiled: &Compiled) -> Vec<String> {
-    compiled.roots().iter().map(|root| root.name.clone()).collect()
+    compiled
+        .roots()
+        .iter()
+        .map(|root| root.name.clone())
+        .collect()
 }
 
 #[test]
@@ -195,7 +199,8 @@ fn a_failed_configuration_commit_changes_no_compiled_state() {
         let staged = Rc::clone(&staged);
         let coordinator = Arc::clone(&coordinator);
         on_candidate_staged(move || {
-            *staged.borrow_mut() = Some(coordinator.compiled.get(Some(InputVersion(version.0 + 1))));
+            *staged.borrow_mut() =
+                Some(coordinator.compiled.get(Some(InputVersion(version.0 + 1))));
             Err("injected commit failure".to_owned())
         });
     }
@@ -212,16 +217,29 @@ fn a_failed_configuration_commit_changes_no_compiled_state() {
     // registry's latest entry and the watcher's roots.
     let reader = coordinator.open_reader().unwrap();
     assert_eq!(reader.input_version().unwrap(), version);
-    assert!(Arc::ptr_eq(&coordinator.compiled_at(&reader).unwrap(), &before));
-    assert!(Arc::ptr_eq(&coordinator.compiled_at(&snapshot).unwrap(), &before));
-    assert!(Arc::ptr_eq(&coordinator.compiled.latest().unwrap(), &before));
+    assert!(Arc::ptr_eq(
+        &coordinator.compiled_at(&reader).unwrap(),
+        &before
+    ));
+    assert!(Arc::ptr_eq(
+        &coordinator.compiled_at(&snapshot).unwrap(),
+        &before
+    ));
+    assert!(Arc::ptr_eq(
+        &coordinator.compiled.latest().unwrap(),
+        &before
+    ));
     assert!(matches!(
         coordinator.compiled.get(Some(InputVersion(version.0 + 1))),
         Err(CompiledLookupError::NotLoaded { .. })
     ));
     assert!(coordinator.scanner().has_same_roots(before.scanner()));
     assert_eq!(
-        coordinator.authoring_service().compiled(&reader).unwrap().key(),
+        coordinator
+            .authoring_service()
+            .compiled(&reader)
+            .unwrap()
+            .key(),
         before.key()
     );
 
@@ -291,7 +309,9 @@ fn readers_writers_and_build_workers_see_a_configuration_only_once_it_commits() 
     let worker_view = |coordinator: &Arc<DaemonCoordinator>| {
         let compiled_at = Arc::clone(coordinator);
         coordinator.run_scheduled(WorkClass::Interactive, move |store| {
-            compiled_at.compiled_at(store).map(|compiled| optimized(&compiled))
+            compiled_at
+                .compiled_at(store)
+                .map(|compiled| optimized(&compiled))
         })
     };
     assert_eq!(worker_view(&coordinator), Ok(false));
@@ -326,8 +346,16 @@ fn readers_writers_and_build_workers_see_a_configuration_only_once_it_commits() 
         .unwrap();
     let (reader, writer, worker, fresh) = during.borrow_mut().take().expect("the hook ran");
     assert_eq!(reader, Ok(false), "an RPC reader saw the uncommitted state");
-    assert_eq!(writer.map_err(|_| ()), Ok(false), "an RPC writer saw the uncommitted state");
-    assert_eq!(worker, Ok(false), "a build worker saw the uncommitted state");
+    assert_eq!(
+        writer.map_err(|_| ()),
+        Ok(false),
+        "an RPC writer saw the uncommitted state"
+    );
+    assert_eq!(
+        worker,
+        Ok(false),
+        "a build worker saw the uncommitted state"
+    );
     assert_eq!(fresh, Ok(false), "a new snapshot saw the uncommitted state");
 
     // Committed: every new view sees all of it.
@@ -335,16 +363,28 @@ fn readers_writers_and_build_workers_see_a_configuration_only_once_it_commits() 
     assert_eq!(after.key(), Some(stamp.version));
     assert!(optimized(&after));
     assert!(Arc::ptr_eq(
-        &coordinator.authoring_service().compiled(&rpc_writer).unwrap(),
+        &coordinator
+            .authoring_service()
+            .compiled(&rpc_writer)
+            .unwrap(),
         &after
     ));
     assert_eq!(worker_view(&coordinator), Ok(true));
     assert_eq!(
-        coordinator.open_reader().unwrap().rpc_target("dev").unwrap().unwrap().definition_hash,
+        coordinator
+            .open_reader()
+            .unwrap()
+            .rpc_target("dev")
+            .unwrap()
+            .unwrap()
+            .definition_hash,
         rpc_target(true).definition_hash().0
     );
     // The older snapshot keeps the state of the version it sees.
-    assert!(Arc::ptr_eq(&coordinator.compiled_at(&old_snapshot).unwrap(), &old));
+    assert!(Arc::ptr_eq(
+        &coordinator.compiled_at(&old_snapshot).unwrap(),
+        &old
+    ));
     assert!(!optimized(&coordinator.compiled_at(&old_snapshot).unwrap()));
 }
 
@@ -409,9 +449,21 @@ fn typed_authority(edited: bool) -> Arc<ProjectSchemaAuthority> {
                 layout_hashes: Default::default(),
                 rustc_version: String::new(),
                 types: vec![
-                    def(0, PrimitiveType::Struct, path("game", "Bytes"), Some(BYTES_TYPE), field(false)),
+                    def(
+                        0,
+                        PrimitiveType::Struct,
+                        path("game", "Bytes"),
+                        Some(BYTES_TYPE),
+                        field(false),
+                    ),
                     def(1, PrimitiveType::U8, path("core", "u8"), None, Vec::new()),
-                    def(2, PrimitiveType::Struct, path("game", "Tagged"), Some(EDITED_TYPE), field(edited)),
+                    def(
+                        2,
+                        PrimitiveType::Struct,
+                        path("game", "Tagged"),
+                        Some(EDITED_TYPE),
+                        field(edited),
+                    ),
                 ],
                 layouts: vec![SchemaLayouts {
                     identity: layout_identity(),
@@ -479,8 +531,13 @@ fn schema_edit_pages(filler: u32) -> (u64, u64) {
     let mut config = StoreConfig::new(temp.path().join("state"));
     config.parallelism = 1;
     let coordinator = Arc::new(
-        DaemonCoordinator::open(config, vec![AssetRoot::new("main", &assets)], vec![rpc_target(false)], 8)
-            .unwrap(),
+        DaemonCoordinator::open(
+            config,
+            vec![AssetRoot::new("main", &assets)],
+            vec![rpc_target(false)],
+            8,
+        )
+        .unwrap(),
     );
     let writer = coordinator.open_writer().unwrap();
     let mut fixture = Fixture {
@@ -488,7 +545,9 @@ fn schema_edit_pages(filler: u32) -> (u64, u64) {
         coordinator: Arc::clone(&coordinator),
         writer,
     };
-    coordinator.reconcile_full_scan(&mut fixture.writer).unwrap();
+    coordinator
+        .reconcile_full_scan(&mut fixture.writer)
+        .unwrap();
     let publish = |fixture: &mut Fixture, edited| {
         let mut candidate = fixture.candidate(false, false);
         candidate.schema_authority = typed_authority(edited);
@@ -520,8 +579,14 @@ fn schema_edit_pages(filler: u32) -> (u64, u64) {
             .any(|sql| sql.starts_with("UPDATE assets SET tag_poison") && sql.contains(&key))
     };
     let edit = publish(&mut fixture, true);
-    assert!(refined(asset(EDITED_TYPE, 2)), "the edited type's rows were refined again");
-    assert!(!refined(asset(BYTES_TYPE, 0)), "the other type's rows were kept");
+    assert!(
+        refined(asset(EDITED_TYPE, 2)),
+        "the edited type's rows were refined again"
+    );
+    assert!(
+        !refined(asset(BYTES_TYPE, 0)),
+        "the other type's rows were kept"
+    );
     let unchanged = publish(&mut fixture, true);
     (edit, unchanged)
 }
@@ -546,7 +611,10 @@ fn a_schema_edit_reads_independent_of_other_types() {
         "schema edit: {small_edit} pages beside 1000 bundles, {large_edit} beside 8000; \
          unchanged candidate: {small_unchanged} and {large_unchanged}"
     );
-    assert!(large_edit <= small_edit + 16, "{small_edit} beside 1000, {large_edit} beside 8000");
+    assert!(
+        large_edit <= small_edit + 16,
+        "{small_edit} beside 1000, {large_edit} beside 8000"
+    );
     assert!(
         large_unchanged <= small_unchanged + 16,
         "{small_unchanged} beside 1000, {large_unchanged} beside 8000"
@@ -588,14 +656,19 @@ fn bytes_projection(terminal: Option<TypeUuid>) -> PipelineProjection {
 }
 
 /// A pipeline epoch of module `dylib` over `authority`'s types.
-fn pipeline_publication(authority: &ProjectSchemaAuthority, dylib: u8) -> ConfigurationPipelinePublication {
+fn pipeline_publication(
+    authority: &ProjectSchemaAuthority,
+    dylib: u8,
+) -> ConfigurationPipelinePublication {
     use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
     ConfigurationPipelinePublication::Epoch {
         epoch: ValidatedPipelineEpoch::validate(distill_store::state::PipelineEpoch {
             dylib_hash: [dylib; 32],
             target_set: CanonicalTargetSet::canonical(vec![TargetSetRow {
                 name: "dev".into(),
-                target_definition_hash: distill_build::keys::target_definition_hash(&build_target(false)),
+                target_definition_hash: distill_build::keys::target_definition_hash(&build_target(
+                    false,
+                )),
             }])
             .unwrap(),
             schema_registry: authority.logical_registry().unwrap(),
@@ -621,7 +694,12 @@ fn publish_completely(
 ) {
     let authority = &*configuration.authority;
     let candidate = ScanCandidate::build(scanner.scan().unwrap(), Some(authority)).unwrap();
-    let claims = bundle_claims(candidate.scan.bundle_rows(), &configuration.projection, Some(authority)).unwrap();
+    let claims = bundle_claims(
+        candidate.scan.bundle_rows(),
+        &configuration.projection,
+        Some(authority),
+    )
+    .unwrap();
     let base = store.input_version().unwrap();
     publish_scan(
         store,
@@ -679,12 +757,18 @@ fn assert_reconfiguration_matches_oracle(before: &Configuration, after: &Configu
     std::fs::create_dir_all(&assets).unwrap();
     let authority = typed_authority(false);
     for index in 0..3 {
-        std::fs::write(assets.join(format!("bytes{index}.bundle")), typed_bundle(&authority, BYTES_TYPE, index))
-            .unwrap();
+        std::fs::write(
+            assets.join(format!("bytes{index}.bundle")),
+            typed_bundle(&authority, BYTES_TYPE, index),
+        )
+        .unwrap();
     }
     for index in 0..2 {
-        std::fs::write(assets.join(format!("edited{index}.bundle")), typed_bundle(&authority, EDITED_TYPE, index))
-            .unwrap();
+        std::fs::write(
+            assets.join(format!("edited{index}.bundle")),
+            typed_bundle(&authority, EDITED_TYPE, index),
+        )
+        .unwrap();
     }
     // A malformed bundle whose skeleton validates only under an authority
     // knowing its type.
@@ -694,12 +778,25 @@ fn assert_reconfiguration_matches_oracle(before: &Configuration, after: &Configu
         panic!("a bundle envelope is an object");
     };
     envelope.insert("future-extension".to_owned(), AuthoredValue::UInt(1));
-    std::fs::write(assets.join("malformed.bundle"), distill_json::write(&value).unwrap()).unwrap();
+    std::fs::write(
+        assets.join("malformed.bundle"),
+        distill_json::write(&value).unwrap(),
+    )
+    .unwrap();
     // Two bundles claiming one asset.
-    let mut shared = distill_bundle::parse_bundle(&typed_bundle(&authority, BYTES_TYPE, 8)).unwrap();
-    std::fs::write(assets.join("shared-a.bundle"), distill_bundle::write_bundle(&shared).unwrap()).unwrap();
+    let mut shared =
+        distill_bundle::parse_bundle(&typed_bundle(&authority, BYTES_TYPE, 8)).unwrap();
+    std::fs::write(
+        assets.join("shared-a.bundle"),
+        distill_bundle::write_bundle(&shared).unwrap(),
+    )
+    .unwrap();
     shared.uuid = BundleUuid([0x99; 16]);
-    std::fs::write(assets.join("shared-b.bundle"), distill_bundle::write_bundle(&shared).unwrap()).unwrap();
+    std::fs::write(
+        assets.join("shared-b.bundle"),
+        distill_bundle::write_bundle(&shared).unwrap(),
+    )
+    .unwrap();
 
     let scanner = RootedScanner::new([AssetRoot::new("main", &assets)]).unwrap();
     let mut oracle = Store::open(StoreConfig::new(temp.path().join("oracle"))).unwrap();
@@ -729,7 +826,10 @@ fn assert_reconfiguration_matches_oracle(before: &Configuration, after: &Configu
     }
     let refined = store.stale_tag_index_assets(None).unwrap();
     for asset in oracle.stale_tag_index_assets(None).unwrap().keys() {
-        assert!(refined.contains_key(asset), "{asset} is pending in the oracle only");
+        assert!(
+            refined.contains_key(asset),
+            "{asset} is pending in the oracle only"
+        );
     }
     BUNDLE_READS.with(Cell::get)
 }
@@ -851,7 +951,13 @@ fn labeled_authority(tagged: bool) -> Arc<ProjectSchemaAuthority> {
                             },
                         }],
                     ),
-                    def(1, PrimitiveType::String, path("alloc", "String"), None, Vec::new()),
+                    def(
+                        1,
+                        PrimitiveType::String,
+                        path("alloc", "String"),
+                        None,
+                        Vec::new(),
+                    ),
                 ],
                 layouts: vec![SchemaLayouts {
                     identity: layout_identity(),
@@ -909,7 +1015,11 @@ fn a_complete_publication_revalidates_a_poisoned_skeleton_after_a_schema_edit() 
         panic!("a bundle envelope is an object");
     };
     envelope.insert("future-extension".to_owned(), AuthoredValue::UInt(1));
-    std::fs::write(assets.join("malformed.bundle"), distill_json::write(&value).unwrap()).unwrap();
+    std::fs::write(
+        assets.join("malformed.bundle"),
+        distill_json::write(&value).unwrap(),
+    )
+    .unwrap();
 
     let scanner = RootedScanner::new([AssetRoot::new("main", &assets)]).unwrap();
     let configuration = |tagged| {
@@ -941,7 +1051,11 @@ fn a_complete_publication_revalidates_a_poisoned_skeleton_after_a_schema_edit() 
     let mut reconfigured = Store::open(StoreConfig::new(temp.path().join("reconfigured"))).unwrap();
     for store in [&mut complete, &mut reconfigured] {
         publish_completely(store, &scanner, &before, &BTreeSet::new());
-        assert_eq!(query(store), Ok(0), "untagged, the skeleton answers no tag query");
+        assert_eq!(
+            query(store),
+            Ok(0),
+            "untagged, the skeleton answers no tag query"
+        );
     }
 
     publish_completely(&mut complete, &scanner, &after, &BTreeSet::new());
@@ -958,7 +1072,11 @@ fn a_complete_publication_revalidates_a_poisoned_skeleton_after_a_schema_edit() 
         .replace_tag_epochs(&crate::build::type_tag_epochs(&after.authority))
         .unwrap();
     assert_eq!(query(&reconfigured), Err(vec![bundle]));
-    assert_eq!(query(&complete), Err(vec![bundle]), "the complete publication kept the old skeleton");
+    assert_eq!(
+        query(&complete),
+        Err(vec![bundle]),
+        "the complete publication kept the old skeleton"
+    );
     let (complete, reconfigured) = (published_tables(&complete), published_tables(&reconfigured));
     for table in ["bundles", "assets", "asset_tags"] {
         assert_eq!(complete[table], reconfigured[table], "{table}");
@@ -1071,7 +1189,10 @@ fn labeled_store(temp: &tempfile::TempDir, files: &[(&str, Vec<u8>)]) -> (Store,
 #[test]
 fn a_scan_republishes_a_changed_bundle_over_its_row() {
     let temp = tempfile::tempdir().unwrap();
-    let (mut store, scanner) = labeled_store(&temp, &[("a.bundle", labeled_bundle(0x70, 0x71, "enemy", false))]);
+    let (mut store, scanner) = labeled_store(
+        &temp,
+        &[("a.bundle", labeled_bundle(0x70, 0x71, "enemy", false))],
+    );
     assert!(store.bundle(BundleUuid([0x70; 16])).unwrap().is_some());
     assert_republication_matches_a_fresh_one(
         &temp,
@@ -1087,8 +1208,14 @@ fn a_scan_republishes_a_changed_bundle_over_its_row() {
 #[test]
 fn a_scan_publishes_a_new_bundle_over_its_assets_skeleton_row() {
     let temp = tempfile::tempdir().unwrap();
-    let (mut store, scanner) = labeled_store(&temp, &[("a.bundle", labeled_bundle(0x70, 0x71, "enemy", true))]);
-    assert_eq!(store.poisoned_bundles().unwrap(), vec![BundleUuid([0x70; 16])]);
+    let (mut store, scanner) = labeled_store(
+        &temp,
+        &[("a.bundle", labeled_bundle(0x70, 0x71, "enemy", true))],
+    );
+    assert_eq!(
+        store.poisoned_bundles().unwrap(),
+        vec![BundleUuid([0x70; 16])]
+    );
     assert!(store.bundle(BundleUuid([0x72; 16])).unwrap().is_none());
     assert_republication_matches_a_fresh_one(
         &temp,
@@ -1184,7 +1311,10 @@ fn a_repeated_pipeline_failure_neither_publishes_nor_fences() {
         .publish_pipeline_rejection(&mut fixture.writer, failure.clone())
         .unwrap();
     assert_eq!(stamp.version, version);
-    assert_eq!(served(&coordinator), (version, Some(failure.clone()), generation));
+    assert_eq!(
+        served(&coordinator),
+        (version, Some(failure.clone()), generation)
+    );
 
     let candidate = fixture.candidate(true, false);
     let stamp = coordinator

@@ -138,11 +138,7 @@ struct JobState {
 
 impl JobState {
     fn new(job: RebuildJob) -> Self {
-        let target_dir = job
-            .dep_info
-            .parent()
-            .and_then(Path::parent)
-            .map(simplified);
+        let target_dir = job.dep_info.parent().and_then(Path::parent).map(simplified);
         let mut state = Self {
             job,
             target_dir,
@@ -323,7 +319,11 @@ impl Worker {
                     self.jobs.push(state);
                 }
                 replaced => {
-                    let change = if replaced.is_some() { "changed" } else { "added" };
+                    let change = if replaced.is_some() {
+                        "changed"
+                    } else {
+                        "added"
+                    };
                     tracing::info!(job = %job.name, change, "rebuild job configured");
                     self.queued.insert(index);
                     self.jobs.push(JobState::new(job));
@@ -711,7 +711,9 @@ fn resume_threads(pid: u32) -> std::io::Result<()> {
         more = unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) } != 0;
     }
     if resumed == 0 {
-        return Err(std::io::Error::other("the suspended step has no thread to resume"));
+        return Err(std::io::Error::other(
+            "the suspended step has no thread to resume",
+        ));
     }
     Ok(())
 }
@@ -788,8 +790,7 @@ fn split_rule(line: &str) -> Option<&str> {
     let bytes = line.as_bytes();
     (0..bytes.len().saturating_sub(1)).find_map(|index| {
         let escaped = index > 0 && bytes[index - 1] == b'\\';
-        (bytes[index] == b':' && bytes[index + 1] == b' ' && !escaped)
-            .then(|| &line[index + 2..])
+        (bytes[index] == b':' && bytes[index + 1] == b' ' && !escaped).then(|| &line[index + 2..])
     })
 }
 
@@ -826,7 +827,9 @@ mod tests {
     /// A script waiting a second, then appending `source` to `file`.
     fn slow_copy(source: &str, file: &str) -> Vec<String> {
         if cfg!(windows) {
-            shell(&format!("ping -n 2 127.0.0.1 >nul & type {source} >> {file}"))
+            shell(&format!(
+                "ping -n 2 127.0.0.1 >nul & type {source} >> {file}"
+            ))
         } else {
             shell(&format!("sleep 1; cat {source} >> {file}"))
         }
@@ -855,7 +858,11 @@ mod tests {
         }
         let dep_info = dir.join(format!("target/debug/lib{name}.d"));
         std::fs::create_dir_all(dep_info.parent().unwrap()).unwrap();
-        std::fs::write(&dep_info, dep_info_line(&format!("lib{name}.rlib"), &source)).unwrap();
+        std::fs::write(
+            &dep_info,
+            dep_info_line(&format!("lib{name}.rlib"), &source),
+        )
+        .unwrap();
         RebuildJob {
             name: name.to_owned(),
             dep_info,
@@ -944,8 +951,7 @@ mod tests {
     fn saving_an_input_runs_the_steps() {
         let temp = tempfile::tempdir().unwrap();
         let ran = temp.path().join("ran");
-        let _rebuilder =
-            Rebuilder::start(vec![job(temp.path(), "a", append_line("ran"))], QUIET);
+        let _rebuilder = Rebuilder::start(vec![job(temp.path(), "a", append_line("ran"))], QUIET);
         // The watch is installed on the rebuild thread; give it a moment.
         thread::sleep(Duration::from_millis(200));
         assert!(!ran.exists(), "nothing ran before a change");
@@ -962,8 +968,7 @@ mod tests {
         let quiet = Duration::from_millis(300);
         let temp = tempfile::tempdir().unwrap();
         let ran = temp.path().join("ran");
-        let _rebuilder =
-            Rebuilder::start(vec![job(temp.path(), "a", copy("a.rs", "ran"))], quiet);
+        let _rebuilder = Rebuilder::start(vec![job(temp.path(), "a", copy("a.rs", "ran"))], quiet);
         thread::sleep(Duration::from_millis(200));
         for save in 2..=40 {
             std::fs::write(temp.path().join("a.rs"), format!("{save}\n")).unwrap();
@@ -995,7 +1000,10 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
         std::fs::write(temp.path().join("a.rs"), "2").unwrap();
         let ran = temp.path().join("ran-a");
-        assert!(wait_for(Duration::from_secs(10), || ran.exists()), "job a ran");
+        assert!(
+            wait_for(Duration::from_secs(10), || ran.exists()),
+            "job a ran"
+        );
         assert!(!temp.path().join("ran-b").exists(), "a read is no change");
     }
 
@@ -1030,20 +1038,26 @@ mod tests {
         rebuilder
             .jobs()
             .replace(vec![a.clone(), job(dir, "b", append_line("ran-b"))]);
-        assert!(wait_for(Duration::from_secs(10), || dir.join("ran-b").exists()));
+        assert!(wait_for(Duration::from_secs(10), || dir
+            .join("ran-b")
+            .exists()));
         thread::sleep(Duration::from_millis(200));
         assert!(!dir.join("ran-a").exists(), "an unchanged job does not run");
         assert_eq!(lines(&dir.join("ran-b")), 1);
 
         // A save to b.rs runs b, now watched.
         std::fs::write(dir.join("b.rs"), "2").unwrap();
-        assert!(wait_for(Duration::from_secs(10), || lines(&dir.join("ran-b")) == 2));
+        assert!(wait_for(Duration::from_secs(10), || lines(
+            &dir.join("ran-b")
+        ) == 2));
 
         // a removed, b changed: b runs its new step once; a.rs is no input.
         rebuilder
             .jobs()
             .replace(vec![job(dir, "b", append_line("ran-b2"))]);
-        assert!(wait_for(Duration::from_secs(10), || dir.join("ran-b2").exists()));
+        assert!(wait_for(Duration::from_secs(10), || dir
+            .join("ran-b2")
+            .exists()));
         std::fs::write(dir.join("a.rs"), "2").unwrap();
         thread::sleep(Duration::from_millis(500));
         assert!(!dir.join("ran-a").exists(), "a removed job does not run");

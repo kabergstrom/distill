@@ -89,7 +89,10 @@ fn watch_quiet_defaults_to_250_ms_and_is_bounded() {
     for rejected in ["quiet_ms = 0", "quiet_ms = 5001"] {
         let error = DaemonConfig::parse(&path, &with(&format!("[watch]\n{rejected}\n")))
             .expect_err(rejected);
-        assert!(matches!(error, DaemonConfigError::Watch(_)), "{rejected}: {error:?}");
+        assert!(
+            matches!(error, DaemonConfigError::Watch(_)),
+            "{rejected}: {error:?}"
+        );
     }
     let unknown =
         DaemonConfig::parse(&path, &with("[watch]\nquiet = 10\n")).expect_err("unknown key");
@@ -99,10 +102,7 @@ fn watch_quiet_defaults_to_250_ms_and_is_bounded() {
 #[test]
 fn rejects_unknown_keys_nonloopback_and_invalid_scheduler_bounds() {
     let temp = tempfile::tempdir().unwrap();
-    let source = valid_config(&temp).replace(
-        "state_path = ",
-        "unknown = true\nstate_path = ",
-    );
+    let source = valid_config(&temp).replace("state_path = ", "unknown = true\nstate_path = ");
     assert!(matches!(
         DaemonConfig::parse(temp.path().join("distill.toml"), &source),
         Err(DaemonConfigError::Toml(_))

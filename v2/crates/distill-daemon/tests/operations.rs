@@ -7,9 +7,9 @@ use distill_daemon::scanner::AssetRoot;
 use distill_daemon::watcher::WatcherBatch;
 use distill_json::AuthoredValue;
 use distill_rpc::{
-    AuthoringBackend, AuthoringProgressState, DeferredOperationResult, InputVersion,
-    LongRunningOp, PreparedOperationCommit, PreparedOperationPublication,
-    RenameWithFixupsRequest, TargetDefinition, TargetDefinitionHash, WriteReceipt,
+    AuthoringBackend, AuthoringProgressState, DeferredOperationResult, InputVersion, LongRunningOp,
+    PreparedOperationCommit, PreparedOperationPublication, RenameWithFixupsRequest,
+    TargetDefinition, TargetDefinitionHash, WriteReceipt,
 };
 use distill_schema::ngp_schema::{node_hash, LogicalSchema, PrimitiveKind, SchemaNode};
 use distill_store::atomic_file::{self, Expected};
@@ -65,7 +65,10 @@ fn complete(
         .server_handle()
         .coordinated_maybe_commit(writer, base, |store| {
             let result = operation.complete(store, base);
-            let commit = result.as_ref().ok().and_then(|result| result.commit.clone());
+            let commit = result
+                .as_ref()
+                .ok()
+                .and_then(|result| result.commit.clone());
             completed = Some(result);
             Ok(commit)
         })
@@ -87,10 +90,13 @@ fn publish_receipt(
         .map(|file| scanner.physical_path(&file.root, &file.path).unwrap())
         .collect();
     let version = coordinator
-        .reconcile_incremental(writer, &WatcherBatch {
-            paths,
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            writer,
+            &WatcherBatch {
+                paths,
+                renames: Vec::new(),
+            },
+        )
         .unwrap()
         .version;
     let reader = coordinator.open_reader().unwrap();
@@ -137,7 +143,11 @@ fn rename_world(temp: &tempfile::TempDir) -> (std::path::PathBuf, DaemonCoordina
     let assets = temp.path().join("assets");
     std::fs::create_dir_all(&assets).unwrap();
     std::fs::write(assets.join("old.bundle"), value_bundle()).unwrap();
-    std::fs::write(assets.join("consumer.bundle"), consumer_bundle("old.bundle")).unwrap();
+    std::fs::write(
+        assets.join("consumer.bundle"),
+        consumer_bundle("old.bundle"),
+    )
+    .unwrap();
     let coordinator = DaemonCoordinator::open(
         StoreConfig::new(temp.path().join(".distill")),
         vec![AssetRoot::new("main", &assets)],
@@ -201,7 +211,10 @@ fn rename_with_fixups_writes_files_and_the_watcher_publishes_them() {
     assert_eq!(completed.terminal_error, None);
 
     assert!(!assets.join("old.bundle").exists());
-    assert_eq!(std::fs::read(assets.join("renamed.bundle")).unwrap(), value_bundle());
+    assert_eq!(
+        std::fs::read(assets.join("renamed.bundle")).unwrap(),
+        value_bundle()
+    );
     assert_eq!(
         std::fs::read(assets.join("consumer.bundle")).unwrap(),
         consumer_bundle("renamed.bundle")
@@ -212,8 +225,14 @@ fn rename_with_fixups_writes_files_and_the_watcher_publishes_them() {
         .is_none());
     // The completion published nothing; the watcher publishes the files.
     assert_eq!(coordinator.server().current_stamp().unwrap().version, base);
-    assert_eq!(publish_receipt(&coordinator, &mut writer, &receipt), InputVersion(2));
-    assert_eq!(coordinator.server().current_stamp().unwrap().version, InputVersion(2));
+    assert_eq!(
+        publish_receipt(&coordinator, &mut writer, &receipt),
+        InputVersion(2)
+    );
+    assert_eq!(
+        coordinator.server().current_stamp().unwrap().version,
+        InputVersion(2)
+    );
 }
 
 /// Every pre-image and the destination are checked before the first
@@ -232,12 +251,18 @@ fn a_rename_conflict_found_before_the_first_rename_changes_nothing() {
 
     let error = complete(&coordinator, &mut writer, prepared.publication, base).unwrap_err();
     assert!(error.contains("renamed.bundle"), "{error}");
-    assert_eq!(std::fs::read(assets.join("old.bundle")).unwrap(), value_bundle());
+    assert_eq!(
+        std::fs::read(assets.join("old.bundle")).unwrap(),
+        value_bundle()
+    );
     assert_eq!(
         std::fs::read(assets.join("consumer.bundle")).unwrap(),
         consumer_bundle("old.bundle")
     );
-    assert_eq!(std::fs::read(assets.join("renamed.bundle")).unwrap(), b"someone else's");
+    assert_eq!(
+        std::fs::read(assets.join("renamed.bundle")).unwrap(),
+        b"someone else's"
+    );
     assert!(std::fs::read_dir(assets.join(".distill-staging"))
         .unwrap()
         .next()
@@ -255,19 +280,30 @@ fn a_rename_cut_short_between_its_renames_is_finished_by_a_retry() {
     let (assets, coordinator, mut writer) = rename_world(&temp);
     // Step 1 of the rename landed, as one atomic replace; then the crash.
     let consumer = assets.join("consumer.bundle");
-    atomic_file::write(&assets, &consumer, &consumer_bundle("renamed.bundle"), Expected::Any)
-        .unwrap();
+    atomic_file::write(
+        &assets,
+        &consumer,
+        &consumer_bundle("renamed.bundle"),
+        Expected::Any,
+    )
+    .unwrap();
     let version = coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![consumer.clone()],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![consumer.clone()],
+                renames: Vec::new(),
+            },
+        )
         .unwrap()
         .version;
     assert_eq!(version, InputVersion(2));
     let reader = coordinator.open_reader().unwrap();
     assert!(reader.namespace_errors().unwrap().is_empty());
-    assert!(reader.bundles_referencing_path("old.bundle").unwrap().is_empty());
+    assert!(reader
+        .bundles_referencing_path("old.bundle")
+        .unwrap()
+        .is_empty());
     assert_eq!(
         reader.bundles_referencing_path("renamed.bundle").unwrap(),
         [BundleUuid([85; 16])]
@@ -290,8 +326,17 @@ fn a_rename_cut_short_between_its_renames_is_finished_by_a_retry() {
     );
     let completed = complete(&coordinator, &mut writer, prepared.publication, version).unwrap();
     assert_eq!(completed.terminal_error, None);
-    assert_eq!(publish_receipt(&coordinator, &mut writer, &receipt), InputVersion(3));
+    assert_eq!(
+        publish_receipt(&coordinator, &mut writer, &receipt),
+        InputVersion(3)
+    );
     assert!(!assets.join("old.bundle").exists());
-    assert_eq!(std::fs::read(assets.join("renamed.bundle")).unwrap(), value_bundle());
-    assert_eq!(std::fs::read(&consumer).unwrap(), consumer_bundle("renamed.bundle"));
+    assert_eq!(
+        std::fs::read(assets.join("renamed.bundle")).unwrap(),
+        value_bundle()
+    );
+    assert_eq!(
+        std::fs::read(&consumer).unwrap(),
+        consumer_bundle("renamed.bundle")
+    );
 }

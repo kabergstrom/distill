@@ -14,19 +14,19 @@ use distill_core::id::TypeUuid;
 use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
 use distill_pipeline_api::registration::{ErasedCallback, RegistrationArena, RegistrationHost};
 use distill_store::pipeline::ValidatedPipelineEpoch;
+use distill_store::state::PipelineEpoch as StoredPipelineEpoch;
 pub use distill_store::state::{
     CleanupDisposition as CandidateCleanupDisposition, PipelineFailure, PipelineFailureCode,
     PipelineFailureOrigin,
 };
-use distill_store::state::PipelineEpoch as StoredPipelineEpoch;
 use distill_store::StoreError;
 
 use crate::callbacks::{
     CallbackHandle, CallbackInvokeError, CodegenDescriptor, ContainedCodegenContext,
     ContainedImportContext, ContainedProcessContext, Diagnostics, ImporterDescriptor,
     InfallibleCallbackError, MigrationFunctionError, PipelineCodegenContext,
-    PipelineProcessContext, ProcessorDescriptor, ProcessorError, ProcessorProducts,
-    ToolDescriptor, ValidatorDescriptor,
+    PipelineProcessContext, ProcessorDescriptor, ProcessorError, ProcessorProducts, ToolDescriptor,
+    ValidatorDescriptor,
 };
 use crate::tool_resolver::resolve_tool_epoch;
 
@@ -78,9 +78,8 @@ impl HostCallbackBoundary {
     where
         F: FnOnce() -> HostCallbackStatus<T>,
     {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback)).unwrap_or_else(|_| {
-            Err(host_callback_panic(self.surface, operation))
-        })
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback))
+            .unwrap_or_else(|_| Err(host_callback_panic(self.surface, operation)))
     }
 }
 
@@ -1182,10 +1181,13 @@ impl EpochInner {
     /// Clean the registrations up in reverse order, unload the module and
     /// close the library. On failure the module and arena stay in place.
     fn unload(&mut self) -> Result<(), EpochCleanupError> {
-        let arena = self.registration_arena.as_mut().ok_or_else(|| EpochCleanupError {
-            disposition: CandidateCleanupDisposition::RegistrationCleanupFailed,
-            detail: "registration arena is absent".to_owned(),
-        })?;
+        let arena = self
+            .registration_arena
+            .as_mut()
+            .ok_or_else(|| EpochCleanupError {
+                disposition: CandidateCleanupDisposition::RegistrationCleanupFailed,
+                detail: "registration arena is absent".to_owned(),
+            })?;
         arena.cleanup_reverse().map_err(|error| EpochCleanupError {
             disposition: CandidateCleanupDisposition::RegistrationCleanupFailed,
             detail: error.to_string(),
@@ -1212,12 +1214,12 @@ impl EpochInner {
                 detail: format!("epoch token retains {pins} residency pin(s)"),
             });
         }
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| module.dlclose())).map_err(|_| {
-            EpochCleanupError {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| module.dlclose())).map_err(
+            |_| EpochCleanupError {
                 disposition: CandidateCleanupDisposition::DlcloseFailed,
                 detail: boundary_panic("dlclose").to_string(),
-            }
-        })?;
+            },
+        )?;
         self.module.take();
         self.registration_arena.take();
         Ok(())
@@ -1573,7 +1575,10 @@ impl ModuleHost {
         self.published = Some(PublishedState::Ready(epoch));
     }
 
-    pub(crate) fn discard_unpublished(&mut self, mut epoch: PipelineEpoch) -> Option<PipelineFailure> {
+    pub(crate) fn discard_unpublished(
+        &mut self,
+        mut epoch: PipelineEpoch,
+    ) -> Option<PipelineFailure> {
         match unload_epoch(&mut epoch) {
             Ok(()) => None,
             Err(error) => {
@@ -2207,9 +2212,9 @@ mod callback_tests {
     use super::*;
     use crate::callbacks::{
         CodegenAsset, CodegenContextError, CodegenDescriptor, DefaultsDescriptor,
-        DiagnosticSeverity, MigrationFunctionError, PipelineCodegen, PipelineCodegenContext, PipelineDefaults,
-        PipelineImporter, PipelineProcessContext, PipelineProcessor, PipelineValidator,
-        ProcessorProduct, ProcessorProducts, ToolRegistration, ToolSource,
+        DiagnosticSeverity, MigrationFunctionError, PipelineCodegen, PipelineCodegenContext,
+        PipelineDefaults, PipelineImporter, PipelineProcessContext, PipelineProcessor,
+        PipelineValidator, ProcessorProduct, ProcessorProducts, ToolRegistration, ToolSource,
     };
     use crate::importer::{AuthoringImportContext, AuthoringImporterError};
     use distill_build::codegen::{CodegenFailure, GeneratedFile};

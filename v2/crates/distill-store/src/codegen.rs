@@ -61,4 +61,3 @@ fn read_outputs(
     rows.collect::<Result<BTreeMap<_, _>, _>>()
         .map_err(StoreError::from)
 }
-

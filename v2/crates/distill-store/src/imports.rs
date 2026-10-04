@@ -85,17 +85,15 @@ impl Store {
                    message = excluded.message,
                    memo_seq = excluded.memo_seq",
                 )?
-                .execute(
-                    rusqlite::params![
-                        bundle.0.as_slice(),
-                        version.0 as i64,
-                        basis,
-                        terminal_kind,
-                        terminal_code,
-                        message,
-                        sequence.0 as i64,
-                    ],
-                )?;
+                .execute(rusqlite::params![
+                    bundle.0.as_slice(),
+                    version.0 as i64,
+                    basis,
+                    terminal_kind,
+                    terminal_code,
+                    message,
+                    sequence.0 as i64,
+                ])?;
             Ok(())
         })?;
         Ok(sequence)
@@ -109,7 +107,8 @@ impl Store {
             let (removed, _) = store.memo_transaction(|transaction, _| {
                 Ok(transaction
                     .prepare_cached("DELETE FROM watched_import_failures WHERE bundle_uuid = ?1")?
-                    .execute([bundle.0.as_slice()])? > 0)
+                    .execute([bundle.0.as_slice()])?
+                    > 0)
             })?;
             Ok(removed)
         })
@@ -136,9 +135,9 @@ impl StoreReader {
                 message: row.get(3)?,
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
-
 
     pub fn watched_import_failure(
         &self,
@@ -293,16 +292,15 @@ impl Store {
 }
 
 fn uuid16(bytes: Vec<u8>) -> rusqlite::Result<[u8; 16]> {
-    bytes
-        .try_into()
-        .map_err(|_| rusqlite::Error::InvalidQuery)
+    bytes.try_into().map_err(|_| rusqlite::Error::InvalidQuery)
 }
 
 /// The watched imports, by bundle.
 const WATCHED_IMPORTS: &str =
     "SELECT DISTINCT bundle_uuid FROM import_keys WHERE kind < 3 ORDER BY bundle_uuid";
 /// The watched imports whose basis reads a path.
-const WATCHED_READING_PATH: &str = "SELECT bundle_uuid FROM import_keys WHERE kind = 0 AND key = ?1";
+const WATCHED_READING_PATH: &str =
+    "SELECT bundle_uuid FROM import_keys WHERE kind = 0 AND key = ?1";
 /// The watched imports whose basis lists a directory or, with `?1`,
 /// observes an importer capability.
 const WATCHED_LISTING: &str =
@@ -314,7 +312,9 @@ const RULE_COLUMNS: &str = "SELECT r.name, b.path, k.bundle_uuid, k.asset_uuid
 impl StoreReader {
     /// Every watched import's bundle, in order.
     pub fn watched_imports(&self) -> Result<Vec<BundleUuid>, StoreError> {
-        self.query_rows(WATCHED_IMPORTS, [], |row| Ok(BundleUuid(uuid16(row.get(0)?)?)))
+        self.query_rows(WATCHED_IMPORTS, [], |row| {
+            Ok(BundleUuid(uuid16(row.get(0)?)?))
+        })
     }
 
     /// The bundles of the watched imports that read one of `paths`, list a

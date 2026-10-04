@@ -66,7 +66,10 @@ fn fixture() -> Fixture {
     };
     let layout_hash = dswl_hash(&wire).unwrap();
     let wire_bytes = dswl_bytes(&wire).unwrap();
-    assert_eq!(distill_test_project::put_wire_tree(&server.handle(), &wire_bytes), layout_hash);
+    assert_eq!(
+        distill_test_project::put_wire_tree(&server.handle(), &wire_bytes),
+        layout_hash
+    );
     let blob = vec![0x5a; 64];
     let complete = write_artifact(
         &ArtifactHeader {
@@ -98,8 +101,7 @@ fn fixture() -> Fixture {
         ),
         hash
     );
-    TestBuilds::install(&server)
-        .answer(asset, Ok(BuildAnswer::Built { content_hash: hash }));
+    TestBuilds::install(&server).answer(asset, Ok(BuildAnswer::Built { content_hash: hash }));
     write_asset(&mut project, PATH, asset, 0);
     project.publish();
 
@@ -667,7 +669,10 @@ fn rpc_io_polls_import_failures_and_reports_only_changes() {
         if let Some(failures) = io.take_import_failures() {
             break failures;
         }
-        assert!(Instant::now() < deadline, "import failures were never polled");
+        assert!(
+            Instant::now() < deadline,
+            "import failures were never polled"
+        );
         std::thread::sleep(Duration::from_millis(5));
     };
     assert!(first.is_empty());
@@ -707,7 +712,11 @@ fn poll_while(io: &mut RpcIo, mut condition: impl FnMut(&RpcIo) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(3);
     while condition(io) {
         assert!(io.poll().is_empty());
-        assert!(Instant::now() < deadline, "RPC IO never settled: {:?}", io.stats());
+        assert!(
+            Instant::now() < deadline,
+            "RPC IO never settled: {:?}",
+            io.stats()
+        );
         std::thread::sleep(Duration::from_millis(2));
     }
 }

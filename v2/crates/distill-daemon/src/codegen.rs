@@ -26,8 +26,8 @@ use crate::callbacks::{
     CallbackInvokeError, CodegenAsset, CodegenContextError, PipelineCodegenContext,
 };
 use crate::coordinator::DaemonCoordinator;
-use distill_store::atomic_file::{self, content_hash, Expected};
 use crate::scanner::{DaemonOwnedDirectoryKind, RootedScanner};
+use distill_store::atomic_file::{self, content_hash, Expected};
 
 /// The first line of every generated file, followed by the blake3 of the
 /// rest of the file. A file whose mark matches its body is distill's own
@@ -120,7 +120,9 @@ impl CodegenService {
         output.verify()?;
 
         // The pipeline compiled for the version this store sees.
-        let compiled = daemon.compiled_at(store).map_err(|error| error.to_string())?;
+        let compiled = daemon
+            .compiled_at(store)
+            .map_err(|error| error.to_string())?;
         let snapshot = compiled.pipeline_snapshot();
         let epoch = snapshot.epoch().map_err(|failure| failure.to_string())?;
         let basis = store.input_version().map_err(|error| error.to_string())?;
@@ -228,7 +230,11 @@ impl<'s> AuthoredCodegenContext<'s> {
         if self.stopped {
             return Err(CodegenContextError::AttemptStopped);
         }
-        if store.input_version().map_err(|error| CodegenContextError::Failed(error.to_string()))? != self.basis {
+        if store
+            .input_version()
+            .map_err(|error| CodegenContextError::Failed(error.to_string()))?
+            != self.basis
+        {
             self.stopped = true;
             return Err(CodegenContextError::AttemptStopped);
         }
@@ -334,37 +340,42 @@ impl CodegenWorld<'_> {
         output.verify()?;
         // The basis check, the file writes and the rows share one write
         // transaction.
-        self.store.write_transaction_with(|error| error.to_string(), |store| {
-            if store.input_version().map_err(|error| error.to_string())? != basis {
-                return Err("codegen input version changed before publication".into());
-            }
-            let previous = store.codegen_outputs().map_err(|error| error.to_string())?;
-            let desired = desired_namespace(files)?;
-            let proposed = desired
-                .iter()
-                .map(|(path, bytes)| (path.clone(), content_hash(bytes)))
-                .collect::<BTreeMap<_, _>>();
-            let current = Self::verify_preimages(output, &previous, &proposed)?;
+        self.store.write_transaction_with(
+            |error| error.to_string(),
+            |store| {
+                if store.input_version().map_err(|error| error.to_string())? != basis {
+                    return Err("codegen input version changed before publication".into());
+                }
+                let previous = store.codegen_outputs().map_err(|error| error.to_string())?;
+                let desired = desired_namespace(files)?;
+                let proposed = desired
+                    .iter()
+                    .map(|(path, bytes)| (path.clone(), content_hash(bytes)))
+                    .collect::<BTreeMap<_, _>>();
+                let current = Self::verify_preimages(output, &previous, &proposed)?;
 
-            for (relative, &on_disk) in &current {
-                if on_disk == proposed.get(relative).copied() {
-                    continue;
-                }
-                let target = output.path.join(relative);
-                output.verify()?;
-                match desired.get(relative) {
-                    Some(bytes) => atomic_file::write(&output.path, &target, bytes, on_disk.into()),
-                    None => atomic_file::remove(&target, Expected::from(on_disk)),
-                }
-                .map_err(|error| error.to_string())?;
-            }
-            if previous != proposed {
-                store
-                    .commit_codegen_outputs(&previous, &proposed)
+                for (relative, &on_disk) in &current {
+                    if on_disk == proposed.get(relative).copied() {
+                        continue;
+                    }
+                    let target = output.path.join(relative);
+                    output.verify()?;
+                    match desired.get(relative) {
+                        Some(bytes) => {
+                            atomic_file::write(&output.path, &target, bytes, on_disk.into())
+                        }
+                        None => atomic_file::remove(&target, Expected::from(on_disk)),
+                    }
                     .map_err(|error| error.to_string())?;
-            }
-            Ok(())
-        })
+                }
+                if previous != proposed {
+                    store
+                        .commit_codegen_outputs(&previous, &proposed)
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            },
+        )
     }
 
     /// What every generated name holds now, once each is checked to be
@@ -400,8 +411,14 @@ impl CodegenWorld<'_> {
                 || bytes.as_deref().is_some_and(is_certified);
             if !owned {
                 return Err(match recorded {
-                    Some(_) => format!("generated file {} was edited outside distill", target.display()),
-                    None => format!("unowned path {} occupies the generated namespace", target.display()),
+                    Some(_) => format!(
+                        "generated file {} was edited outside distill",
+                        target.display()
+                    ),
+                    None => format!(
+                        "unowned path {} occupies the generated namespace",
+                        target.display()
+                    ),
                 });
             }
             current.insert(relative, actual);
@@ -523,7 +540,10 @@ fn query_results_scan(
                    untagged: bool| {
         query.uuid.is_none_or(|wanted| wanted == asset)
             && query.bundle_uuid.is_none_or(|wanted| wanted == bundle)
-            && query.local_id.as_ref().is_none_or(|wanted| wanted == local_id)
+            && query
+                .local_id
+                .as_ref()
+                .is_none_or(|wanted| wanted == local_id)
             && query.authored_type.is_none_or(|wanted| wanted == type_uuid)
             && (untagged
                 || query.tag.as_ref().is_none_or(|tag| {
@@ -531,7 +551,10 @@ fn query_results_scan(
                         tag.value.is_none() || value.as_ref() == tag.value.as_ref()
                     })
                 }))
-            && query.bundle_path.as_ref().is_none_or(|wanted| wanted == path)
+            && query
+                .bundle_path
+                .as_ref()
+                .is_none_or(|wanted| wanted == path)
             && query
                 .path_prefix
                 .as_ref()
@@ -604,13 +627,14 @@ fn load_authored_asset(
     scanner: &RootedScanner,
     asset: AssetUuid,
 ) -> Result<Option<(BundleFileHash, CodegenAsset)>, String> {
-    let Some((entry, bundle_meta)) =
-        store.entry_with_bundle(asset).map_err(|error| error.to_string())?
+    let Some((entry, bundle_meta)) = store
+        .entry_with_bundle(asset)
+        .map_err(|error| error.to_string())?
     else {
         return Ok(None);
     };
-    let bundle_meta = bundle_meta
-        .ok_or_else(|| format!("asset {asset} has no owning bundle row"))?;
+    let bundle_meta =
+        bundle_meta.ok_or_else(|| format!("asset {asset} has no owning bundle row"))?;
     let root = store
         .root_name(bundle_meta.root)
         .map_err(|error| error.to_string())?
@@ -732,7 +756,9 @@ impl OutputDirectory {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
             .map_err(|error| invalid(&error.to_string()))?;
-        let after = file.metadata().map_err(|error| invalid(&error.to_string()))?;
+        let after = file
+            .metadata()
+            .map_err(|error| invalid(&error.to_string()))?;
         let current = fs::symlink_metadata(path).map_err(|error| invalid(&error.to_string()))?;
         if current.file_type().is_symlink()
             || file_identity(&after) != file_identity(&opened)
@@ -745,7 +771,6 @@ impl OutputDirectory {
         }
         Ok(Some(bytes))
     }
-
 
     fn entry_names(&self) -> Result<Vec<OsString>, String> {
         self.verify()?;
@@ -774,7 +799,6 @@ impl OutputDirectory {
             })
             .collect()
     }
-
 }
 
 fn ensure_real_directory_tree(path: &Path) -> Result<(), String> {
@@ -833,7 +857,6 @@ fn file_identity(metadata: &Metadata) -> FileIdentity {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -844,16 +867,15 @@ mod tests {
     use distill_store::bundles::{AssetRecord, BundleMeta};
     use distill_store::StoreConfig;
 
-    fn publication_world(
-        temp: &tempfile::TempDir,
-    ) -> (Store, RootedScanner, OutputDirectory) {
+    fn publication_world(temp: &tempfile::TempDir) -> (Store, RootedScanner, OutputDirectory) {
         let assets = temp.path().join("assets");
         let output = temp.path().join("generated");
         fs::create_dir(&assets).unwrap();
-        let scanner = RootedScanner::new([crate::scanner::AssetRoot::new("main", &assets)])
-        .unwrap();
+        let scanner =
+            RootedScanner::new([crate::scanner::AssetRoot::new("main", &assets)]).unwrap();
         let output = OutputDirectory::open(&output).unwrap();
-        let store = distill_store::Store::open(StoreConfig::new(temp.path().join("state"))).unwrap();
+        let store =
+            distill_store::Store::open(StoreConfig::new(temp.path().join("state"))).unwrap();
         (store, scanner, output)
     }
 
@@ -895,7 +917,11 @@ mod tests {
         let module = fs::read(output.path.join("mod.rs")).unwrap();
         assert!(is_certified(&module));
         assert_eq!(
-            String::from_utf8(module).unwrap().split_once('\n').unwrap().1,
+            String::from_utf8(module)
+                .unwrap()
+                .split_once('\n')
+                .unwrap()
+                .1,
             concat!(
                 "pub mod sp_01010101010101010101010101010101;\n",
                 "pub mod sp_02020202020202020202020202020202;\n"
@@ -963,8 +989,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let assets = temp.path().join("assets");
         fs::create_dir(&assets).unwrap();
-        let scanner = RootedScanner::new([crate::scanner::AssetRoot::new("main", &assets)])
-        .unwrap();
+        let scanner =
+            RootedScanner::new([crate::scanner::AssetRoot::new("main", &assets)]).unwrap();
         let type_uuid = TypeUuid([7; 16]);
         let schema = LogicalSchema {
             root: SchemaNode::Primitive(PrimitiveKind::U8),
@@ -990,7 +1016,8 @@ mod tests {
         })
         .unwrap();
         fs::write(assets.join("shader.bundle"), &bytes).unwrap();
-        let mut store = distill_store::Store::open(StoreConfig::new(temp.path().join("state"))).unwrap();
+        let mut store =
+            distill_store::Store::open(StoreConfig::new(temp.path().join("state"))).unwrap();
         let basis = {
             let (root, _) = store
                 .input_transaction(|transaction| {
@@ -1112,8 +1139,13 @@ mod tests {
         let files = [first.clone()];
         // The files reached the disk, the rows were never committed.
         for (relative, bytes) in desired_namespace(&files).unwrap() {
-            atomic_file::write(&output.path, &output.path.join(relative), &bytes, Expected::Any)
-                .unwrap();
+            atomic_file::write(
+                &output.path,
+                &output.path.join(relative),
+                &bytes,
+                Expected::Any,
+            )
+            .unwrap();
         }
         assert!(store.codegen_outputs().unwrap().is_empty());
 
@@ -1144,12 +1176,14 @@ mod tests {
             scanner,
             output: &output,
         };
-        world.publish_files(basis, &[generated(3, b"one\n")]).unwrap();
+        world
+            .publish_files(basis, &[generated(3, b"one\n")])
+            .unwrap();
 
         // The next publication wrote mod.rs and the new unit, then crashed
         // before replacing sp_03 and committing its rows.
-        let interrupted = desired_namespace(&[generated(2, b"new\n"), generated(3, b"two\n")])
-            .unwrap();
+        let interrupted =
+            desired_namespace(&[generated(2, b"new\n"), generated(3, b"two\n")]).unwrap();
         let added = generated(2, b"").relative_path().to_owned();
         for relative in ["mod.rs", added.as_str()] {
             atomic_file::write(
@@ -1163,7 +1197,9 @@ mod tests {
 
         // The inputs changed before the restart: sp_02 is gone again.
         let third = generated(3, b"three\n");
-        world.publish_files(basis, std::slice::from_ref(&third)).unwrap();
+        world
+            .publish_files(basis, std::slice::from_ref(&third))
+            .unwrap();
         assert!(!output.path.join(&added).exists());
         let expected = desired_namespace(std::slice::from_ref(&third)).unwrap();
         for (relative, bytes) in &expected {
@@ -1171,7 +1207,10 @@ mod tests {
         }
         let recorded = world.store.codegen_outputs().unwrap();
         assert_eq!(recorded.len(), 2);
-        assert_eq!(recorded[third.relative_path()], content_hash(&expected[third.relative_path()]));
+        assert_eq!(
+            recorded[third.relative_path()],
+            content_hash(&expected[third.relative_path()])
+        );
     }
 }
 
@@ -1221,7 +1260,9 @@ mod query_tests {
     }
 
     /// The skeleton entries of the bundles `damage` poisons.
-    fn skeletons(damage: Damage) -> Vec<(BundleUuid, String, distill_store::bundles::SkeletonEntry)> {
+    fn skeletons(
+        damage: Damage,
+    ) -> Vec<(BundleUuid, String, distill_store::bundles::SkeletonEntry)> {
         match damage {
             Damage::PoisonedBundle => vec![(
                 BundleUuid(uuid(0x10, 5)),
@@ -1264,7 +1305,8 @@ mod query_tests {
                         let mut tags = BTreeMap::new();
                         tags.insert(
                             "kind".to_owned(),
-                            (index % 3 != 0).then(|| ["mesh", "rock"][index as usize % 2].to_owned()),
+                            (index % 3 != 0)
+                                .then(|| ["mesh", "rock"][index as usize % 2].to_owned()),
                         );
                         if index % 4 == u32::from(entry) {
                             tags.insert("hero".into(), None);
@@ -1456,7 +1498,11 @@ mod query_tests {
 
     #[test]
     fn asset_queries_answer_what_the_scan_answered() {
-        for damage in [Damage::None, Damage::PoisonedBundle, Damage::PendingTagIndex] {
+        for damage in [
+            Damage::None,
+            Damage::PoisonedBundle,
+            Damage::PendingTagIndex,
+        ] {
             let (_dir, store) = namespace(30, damage);
             let reader = store.reader().unwrap();
             let mut nonempty = 0;
@@ -1481,13 +1527,24 @@ mod query_tests {
     /// tail names, which is what lets SQL narrow to those rows.
     #[test]
     fn a_glob_matches_only_paths_with_its_keys() {
-        let paths = PATHS
-            .iter()
-            .copied()
-            .chain([
-                "", "/", "d", "dir/", "dirx/y", "z/z", "é", "a{b,c}", "x/dir", "q.txt",
-                "x/y.z", "a/q/b.c.d", "[x].y", "w/x.y", "a.b/c", "dir/child/x",
-            ]);
+        let paths = PATHS.iter().copied().chain([
+            "",
+            "/",
+            "d",
+            "dir/",
+            "dirx/y",
+            "z/z",
+            "é",
+            "a{b,c}",
+            "x/dir",
+            "q.txt",
+            "x/y.z",
+            "a/q/b.c.d",
+            "[x].y",
+            "w/x.y",
+            "a.b/c",
+            "dir/child/x",
+        ]);
         let globs = GLOBS.iter().copied().chain([
             "dir/",
             "dir/{a,b}",
@@ -1513,7 +1570,10 @@ mod query_tests {
             for path in paths.clone() {
                 if glob.is_match(path) {
                     matched += 1;
-                    assert!(path.starts_with(keys.prefix), "{pattern:?} matched {path:?}");
+                    assert!(
+                        path.starts_with(keys.prefix),
+                        "{pattern:?} matched {path:?}"
+                    );
                     assert!(
                         keys.name.is_none_or(|name| path_name(path) == name),
                         "{pattern:?} matched {path:?}"
@@ -1562,7 +1622,10 @@ mod query_tests {
             assert!(!indexed.is_empty());
             println!("{query:?}: {indexed_pages} pages (scan: {scanned_pages})");
             assert!(indexed_pages <= 128, "{indexed_pages} pages");
-            assert!(scanned_pages >= 100 * indexed_pages, "{scanned_pages} pages");
+            assert!(
+                scanned_pages >= 100 * indexed_pages,
+                "{scanned_pages} pages"
+            );
         }
     }
 }

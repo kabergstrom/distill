@@ -2,7 +2,7 @@
 
 use distill_store::config::RestartOnlyChange;
 use distill_store::state::{
-    ConfigurationPathKey, ConfigurationError, ConfigurationErrorCode,
+    ConfigurationError, ConfigurationErrorCode, ConfigurationPathKey,
     ConfigurationSourceFailureCode, ConfigurationSourcePath, ConfigurationState,
     DirectoryAliasSide, DscpV1, OwnedPathKind, OwnedPathSide,
 };
@@ -34,10 +34,7 @@ fn dscp_v1_discriminants_and_one_complete_preimage_are_byte_pinned() {
     assert_eq!(ConfigurationErrorCode::InvalidParallelism as u16, 7);
     assert_eq!(ConfigurationErrorCode::InvalidBatchReservation as u16, 8);
     assert_eq!(ConfigurationErrorCode::DirectoryAlias as u16, 9);
-    assert_eq!(
-        ConfigurationErrorCode::UnsupportedTargetIdentity as u16,
-        12
-    );
+    assert_eq!(ConfigurationErrorCode::UnsupportedTargetIdentity as u16, 12);
     assert_eq!(ConfigurationErrorCode::DuplicateTargetName as u16, 13);
     assert_eq!(
         ConfigurationErrorCode::ConfigurationSourceUnavailable as u16,
@@ -468,7 +465,9 @@ fn persisted_configuration_error_recomputes_detail_authority() {
         match case {
             "trailing-detail" => {
                 let mut detail: Vec<u8> = conn
-                    .query_row("SELECT record FROM errors WHERE family = 4", [], |row| row.get(0))
+                    .query_row("SELECT record FROM errors WHERE family = 4", [], |row| {
+                        row.get(0)
+                    })
                     .unwrap();
                 detail.push(0);
                 conn.execute("UPDATE errors SET record = ?1 WHERE family = 4", [detail])

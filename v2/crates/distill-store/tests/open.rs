@@ -40,7 +40,10 @@ fn a_refused_open_leaves_the_live_stores_tool_stage_files() {
         Store::open(config.clone()),
         Err(StoreError::StateLocked { .. })
     ));
-    assert!(staged.exists(), "a refused open deleted the live store's stage file");
+    assert!(
+        staged.exists(),
+        "a refused open deleted the live store's stage file"
+    );
 }
 
 #[test]
@@ -122,8 +125,16 @@ fn a_failed_input_transaction_publishes_nothing() {
         })
         .unwrap_err();
     assert!(matches!(err, StoreError::InvalidConfiguration { .. }));
-    assert_eq!(store.input_version().unwrap().0, 0, "the version was never advanced");
-    assert_eq!(store.root_id("main").unwrap(), None, "the write rolled back");
+    assert_eq!(
+        store.input_version().unwrap().0,
+        0,
+        "the version was never advanced"
+    );
+    assert_eq!(
+        store.root_id("main").unwrap(),
+        None,
+        "the write rolled back"
+    );
 }
 
 #[test]
@@ -213,10 +224,17 @@ fn a_reader_connection_observes_each_commit_and_cannot_write() {
     let mut store = Store::open(cfg(&dir)).unwrap();
     let reader = store.reader().unwrap();
     assert_eq!(reader.instance_id(), store.instance_id());
-    assert_eq!(reader.input_version().unwrap(), store.input_version().unwrap());
+    assert_eq!(
+        reader.input_version().unwrap(),
+        store.input_version().unwrap()
+    );
 
     let (_, version) = store.input_transaction(|_txn| Ok(())).unwrap();
-    assert_eq!(reader.input_version().unwrap(), version, "no cached counter");
+    assert_eq!(
+        reader.input_version().unwrap(),
+        version,
+        "no cached counter"
+    );
     assert_eq!(reader.stamp().unwrap(), store.stamp().unwrap());
 }
 

@@ -4,7 +4,7 @@
 
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, TypeUuid};
 use distill_store::claims::{DerivedOutputClaim, SourceClaim, SourceClaims};
-use distill_store::state::{AssetClaimant, ReadableBundleSource, NamespaceErrorV1};
+use distill_store::state::{AssetClaimant, NamespaceErrorV1, ReadableBundleSource};
 use distill_store::{Store, StoreConfig, StoreError};
 
 fn store() -> (tempfile::TempDir, Store) {
@@ -60,7 +60,10 @@ fn a_shared_bundle_uuid_collides_until_one_claimant_leaves() {
     let (_d, mut store) = store();
     let (pending, _) = store
         .input_transaction(|txn| {
-            txn.replace_source_claims(None, &[source("a.bundle", 1, 10), source("b.bundle", 1, 20)])
+            txn.replace_source_claims(
+                None,
+                &[source("a.bundle", 1, 10), source("b.bundle", 1, 20)],
+            )
         })
         .unwrap();
     let [error] = <[_; 1]>::try_from(store.namespace_errors().unwrap()).unwrap();
@@ -82,10 +85,7 @@ fn a_shared_bundle_uuid_collides_until_one_claimant_leaves() {
         pending.bundles.keys().copied().collect::<Vec<_>>(),
         [BundleUuid([1; 16]), BundleUuid([2; 16])]
     );
-    assert_eq!(
-        pending.paths.into_iter().collect::<Vec<_>>(),
-        ["b.bundle"]
-    );
+    assert_eq!(pending.paths.into_iter().collect::<Vec<_>>(), ["b.bundle"]);
     assert_eq!(
         pending.bundles[&BundleUuid([2; 16])][0].normalized_path,
         "b.bundle"
@@ -99,7 +99,11 @@ fn a_shared_bundle_uuid_collides_until_one_claimant_leaves() {
         }]
     );
     assert_eq!(
-        store.path_claims("b.bundle").unwrap().into_iter().collect::<Vec<_>>(),
+        store
+            .path_claims("b.bundle")
+            .unwrap()
+            .into_iter()
+            .collect::<Vec<_>>(),
         [AssetUuid([20; 16])]
     );
 }
@@ -123,7 +127,13 @@ fn an_asset_uuid_authored_twice_collides() {
         "{error:?}"
     );
     // Both sources derive the same child from the same parent: one claimant.
-    assert_eq!(store.derived_output_claims(AssetUuid([110; 16])).unwrap().len(), 1);
+    assert_eq!(
+        store
+            .derived_output_claims(AssetUuid([110; 16]))
+            .unwrap()
+            .len(),
+        1
+    );
     // The withheld parent withholds its child.
     assert_eq!(store.resolve_child(AssetUuid([110; 16])).unwrap(), None);
 
@@ -145,8 +155,10 @@ fn an_asset_uuid_authored_twice_collides() {
 fn claims_roll_back_with_their_transaction() {
     let (_d, mut store) = store();
     let failed = store.input_transaction::<(), _>(|txn| {
-        let pending =
-            txn.replace_source_claims(Some(&under("")), &[source("a.bundle", 1, 10), source("b.bundle", 1, 20)])?;
+        let pending = txn.replace_source_claims(
+            Some(&under("")),
+            &[source("a.bundle", 1, 10), source("b.bundle", 1, 20)],
+        )?;
         assert_eq!(pending.bundles.len(), 1);
         // Both sources claim the bundle.
         assert_eq!(pending.bundles[&BundleUuid([1; 16])].len(), 2);
@@ -208,6 +220,9 @@ fn the_claims_namespace_errors_publish_as_the_scan_family() {
         })
         .unwrap();
     let [collision] = <[_; 1]>::try_from(published).unwrap();
-    assert!(matches!(collision.detail, NamespaceErrorV1::DuplicateBundleUuid { .. }));
+    assert!(matches!(
+        collision.detail,
+        NamespaceErrorV1::DuplicateBundleUuid { .. }
+    ));
     assert_eq!(store.namespace_errors().unwrap(), [collision]);
 }

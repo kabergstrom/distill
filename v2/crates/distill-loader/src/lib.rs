@@ -23,8 +23,8 @@ pub use component::{
     MemberFailure,
 };
 pub use io::{
-    AssetDeltaState, AssetPath, DriftedInput, FetchedArtifact, IoEvent, LoaderIO, PathResolveResult,
-    ReconnectReason, ReqId, ResolveResult, RuntimeTarget,
+    AssetDeltaState, AssetPath, DriftedInput, FetchedArtifact, IoEvent, LoaderIO,
+    PathResolveResult, ReconnectReason, ReqId, ResolveResult, RuntimeTarget,
 };
 pub use orchestrator::{
     Handle, LoadStatus, Loader, LoaderDiagnostic, LoaderError, RegistrationError,

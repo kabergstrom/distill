@@ -29,7 +29,13 @@ fn snapshot_keeps_its_version_while_the_writer_publishes() {
     store
         .input_transaction(|txn| {
             let version = txn.version();
-            txn.append_change(version, &Change::Asset { asset: ASSET, state: 3 })
+            txn.append_change(
+                version,
+                &Change::Asset {
+                    asset: ASSET,
+                    state: 3,
+                },
+            )
         })
         .unwrap();
     assert_eq!(snapshot.input_version().unwrap(), InputVersion(1));
@@ -38,7 +44,13 @@ fn snapshot_keeps_its_version_while_the_writer_publishes() {
     let changes = reader.change_log_after(0).unwrap();
     assert_eq!(changes.len(), 2);
     assert_eq!(changes[1].version, InputVersion(2));
-    assert_eq!(changes[1].change, Change::Asset { asset: ASSET, state: 3 });
+    assert_eq!(
+        changes[1].change,
+        Change::Asset {
+            asset: ASSET,
+            state: 3
+        }
+    );
 }
 
 #[test]
@@ -64,7 +76,10 @@ fn change_log_trim_advances_the_oldest_cursor() {
         )
         .unwrap();
     assert_eq!(
-        history.iter().map(|entry| entry.version.0).collect::<Vec<_>>(),
+        history
+            .iter()
+            .map(|entry| entry.version.0)
+            .collect::<Vec<_>>(),
         [4, 5]
     );
     assert!(history
@@ -85,7 +100,10 @@ fn a_target_is_installed_replaced_and_removed_without_a_fence() {
         .unwrap();
     let targets = store.rpc_targets().unwrap();
     assert_eq!(targets.len(), 1);
-    assert_eq!((targets[0].name.as_str(), targets[0].definition_hash), ("pc", [2; 32]));
+    assert_eq!(
+        (targets[0].name.as_str(), targets[0].definition_hash),
+        ("pc", [2; 32])
+    );
     assert_eq!(store.rpc_pipeline_generation().unwrap(), 0);
     assert_eq!(store.change_log_head().unwrap(), 0);
     store

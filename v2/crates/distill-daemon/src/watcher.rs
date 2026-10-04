@@ -407,7 +407,10 @@ impl WatcherThread {
         sink: WatcherSink,
     ) -> Result<Self, WatcherStartError> {
         let control_paths = control_paths.into_iter().collect::<BTreeSet<_>>();
-        let asset_roots = scanner.watch_coverage().into_iter().collect::<BTreeSet<_>>();
+        let asset_roots = scanner
+            .watch_coverage()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
         let initial_control = control_coverage(&control_paths)
             .map_err(|message| WatcherStartError::Thread(std::io::Error::other(message)))?;
         let mut coverage = WatchCoverage {
@@ -640,4 +643,3 @@ fn replace_watched_directories(
     }
     Ok(())
 }
-

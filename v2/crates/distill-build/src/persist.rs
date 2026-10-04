@@ -2,8 +2,8 @@
 
 use distill_core::id::{AssetUuid, ContentHash, TypeUuid};
 use distill_store::cas::record::{FailureCause, FailureFingerprint, KeyKind, ResultOutcome};
-use distill_store::state::MemoSeq;
 use distill_store::cas::{Candidate, CandidateRow};
+use distill_store::state::MemoSeq;
 use distill_store::{StoreError, StoreReader};
 
 use crate::trace::{

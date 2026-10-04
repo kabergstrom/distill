@@ -250,7 +250,15 @@ fn candidate_buckets_are_keyed_by_key_kind_static_key_and_trace_digest() {
     );
     assert_eq!(
         columns(&conn, "result_outputs"),
-        ["key_kind", "static_key", "trace_digest", "role", "name", "types", "content_hash"]
+        [
+            "key_kind",
+            "static_key",
+            "trace_digest",
+            "role",
+            "name",
+            "types",
+            "content_hash"
+        ]
     );
     let cols = columns(&conn, "results");
     for required in [
@@ -297,7 +305,14 @@ fn cas_segments_are_typed_regular_or_oversize() {
     let conn = open_conn(&dir);
     assert_eq!(
         columns(&conn, "cas_segments"),
-        ["segment_id", "file_name", "segment_kind", "indexed_len", "state", "owner"]
+        [
+            "segment_id",
+            "file_name",
+            "segment_kind",
+            "indexed_len",
+            "state",
+            "owner"
+        ]
     );
 }
 

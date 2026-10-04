@@ -372,7 +372,6 @@ impl Ctx<'_> {
                     }
                 }
                 Some((_, orev, _)) => {
-
                     self.refuse(
                         &ndisp,
                         format!(
@@ -417,7 +416,10 @@ impl Ctx<'_> {
         new: &str,
         disp: &str,
     ) -> Vec<MigrationOp> {
-        let (from, to) = (FieldPath(vec![old.to_owned()]), FieldPath(vec![new.to_owned()]));
+        let (from, to) = (
+            FieldPath(vec![old.to_owned()]),
+            FieldPath(vec![new.to_owned()]),
+        );
         match ops.as_slice() {
             [MigrationOp::CopyField { .. }] => vec![MigrationOp::CopyField { from, to }],
             [MigrationOp::Widen { .. }] => vec![MigrationOp::Widen { from, to }],

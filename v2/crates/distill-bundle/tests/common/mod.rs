@@ -4,9 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use distill_bundle::{
-    crc32c, AssetEntry, Bundle, CONTAINER_MAGIC, CONTAINER_VERSION,
-};
+use distill_bundle::{crc32c, AssetEntry, Bundle, CONTAINER_MAGIC, CONTAINER_VERSION};
 use distill_core::id::{LogicalHash, TypeUuid};
 use distill_json::AuthoredValue as V;
 use ngp_schema::{node_hash, LogicalSchema, PrimitiveKind, SchemaNode as N};

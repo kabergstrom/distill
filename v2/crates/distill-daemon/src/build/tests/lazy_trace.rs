@@ -932,7 +932,15 @@ fn revalidating_a_trace_reads_only_what_it_asks_about() {
         }
         // One bundle whose name and local id no other shares.
         put_bundle(txn, bundle_uuid(BUNDLES), 1, "extra/solo.bundle", 0xee)?;
-        put_asset(txn, uuid(BUNDLES, 0), bundle_uuid(BUNDLES), "solo", TA, false, &[])?;
+        put_asset(
+            txn,
+            uuid(BUNDLES, 0),
+            bundle_uuid(BUNDLES),
+            "solo",
+            TA,
+            false,
+            &[],
+        )?;
         Ok(())
     });
     let registry = registry();

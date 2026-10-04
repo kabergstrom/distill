@@ -27,9 +27,8 @@ use distill_build::dslf::{
     OutputBindingFailureV1, OutputBindingSlotV1,
 };
 use distill_build::keys::{
-    build_import_digest, node_digest,
-    static_inputs_digest, AppliedMigration, AutomaticMigration, BuildImportInputs, NodeInputs,
-    NodeStage, NodeType, OutputHash, StaticInputs,
+    build_import_digest, node_digest, static_inputs_digest, AppliedMigration, AutomaticMigration,
+    BuildImportInputs, NodeInputs, NodeStage, NodeType, OutputHash, StaticInputs,
 };
 use distill_build::persist::{
     hydrate_persisted_candidate, lookup_persisted_candidate, persisted_candidate, PersistedHit,
@@ -42,13 +41,10 @@ use distill_build::query::{asset_query_result_hash, normalize_path, AssetQuery};
 use distill_build::tool::{ProcessContext, ToolEpochSnapshot, ToolRuntimeBinding};
 use distill_build::trace::{
     decode_trace_payload_bytes, revalidate, trace_digest, trace_payload_bytes, CapabilityKey,
-    EntryRole, Observed,
-    StableFailureFingerprint, TraceOp, TraceSource,
+    EntryRole, Observed, StableFailureFingerprint, TraceOp, TraceSource,
 };
 use distill_bundle::{AssetEntry, Bundle};
-use distill_core::id::{
-    AssetUuid, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid,
-};
+use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
 use distill_json::AuthoredValue;
 use distill_migrate::{
     conforms, execute_ops, plan_automatic_renamed, validate_plan, DefaultProvider, EdgeKind,
@@ -69,8 +65,8 @@ use distill_store::cas::record::{
 };
 use distill_store::cas::{AuxSpec, BuildCommit, CommitOutcome, OutputSpec};
 use distill_store::pipeline::RegisteredTool;
-use distill_store::state::SnapshotStamp;
 use distill_store::served::StoreSnapshot;
+use distill_store::state::SnapshotStamp;
 use distill_store::{Store, StoreError, StoreReader};
 use distill_wire::artifact::{parse_artifact, ArtifactError, ARTIFACT_FORMAT_VERSION};
 use distill_wire::encode::EncodeError;
@@ -87,8 +83,8 @@ use crate::scheduler::{CellOutcome, CellRun, CellWorker, Claim, WorkClass};
 
 mod trace_source;
 
-use trace_source::{BuiltNodes, StoreTraceSource, TraceBasis, TraceQueries};
 pub(crate) use trace_source::runtime_asset_filter;
+use trace_source::{BuiltNodes, StoreTraceSource, TraceBasis, TraceQueries};
 
 const MIGRATION_PLANNER_VERSION: u32 = 1;
 
@@ -139,12 +135,7 @@ impl BuildBackend for CoordinatorBuildBackend {
             Err(error) => return BuildStart::Answered(error.answer()),
         };
         match lookup.node(asset, 0) {
-            Ok(Some(hit)) => {
-                return BuildStart::Answered(Ok(select_output(
-                    &hit.outputs,
-                    request,
-                )))
-            }
+            Ok(Some(hit)) => return BuildStart::Answered(Ok(select_output(&hit.outputs, request))),
             Ok(None) => {}
             Err(error) => return BuildStart::Answered(error.answer()),
         }
@@ -200,11 +191,12 @@ impl BuildBackend for CoordinatorBuildBackend {
                 ),
             });
         }
-        let authority = compiled.schema_authority().ok_or_else(|| {
-            RpcFailure::AuthoringBackendUnavailable {
-                operation: "runtime type-policy schema authority is not published".to_owned(),
-            }
-        })?;
+        let authority =
+            compiled
+                .schema_authority()
+                .ok_or_else(|| RpcFailure::AuthoringBackendUnavailable {
+                    operation: "runtime type-policy schema authority is not published".to_owned(),
+                })?;
         let project =
             authority
                 .project_type(request.type_uuid)
@@ -244,7 +236,10 @@ pub(crate) enum BuildOutcome {
     },
     /// The build failed at the worker's view `at`. A failure keeps no
     /// complete trace, so it answers only requesters at that same snapshot.
-    Failed { error: String, at: SnapshotStamp },
+    Failed {
+        error: String,
+        at: SnapshotStamp,
+    },
     /// The worker's view, or the files on disk, disagree with the key the
     /// cell was requested under: every requester of the key is behind.
     Drifted(DriftedInput),
@@ -792,13 +787,18 @@ fn node_content_hashes<'n>(
     Ok(content_hashes)
 }
 
-
 #[derive(Debug, Clone)]
 enum BuildError {
     Drifted(DriftedInput),
-    DepthExceeded { limit: usize, chain: Vec<AssetUuid> },
+    DepthExceeded {
+        limit: usize,
+        chain: Vec<AssetUuid>,
+    },
     Failed(String),
-    Deterministic { message: String, facts: Box<DslfV1> },
+    Deterministic {
+        message: String,
+        facts: Box<DslfV1>,
+    },
     Infrastructure(String),
     /// The compiled state the build needs is not loaded (retryable).
     Unavailable(RpcFailure),
@@ -1052,10 +1052,7 @@ fn flush_writes(context: &BuildContext) -> Result<(), BuildError> {
                 BuildWrite::Commit(commit) => {
                     store.commit_build(commit)?;
                 }
-                BuildWrite::Artifact {
-                    bytes,
-                    load_edges,
-                } => {
+                BuildWrite::Artifact { bytes, load_edges } => {
                     store.put_artifact(&bytes, &load_edges)?;
                 }
                 BuildWrite::LoadEdges { hash, load_edges } => {
@@ -1071,7 +1068,9 @@ fn flush_writes(context: &BuildContext) -> Result<(), BuildError> {
         // the failure (a tag-index refinement poisons the asset) and go on.
         BuildStores::Inline(store) => store.borrow_mut().isolated_write_transaction(publish),
         BuildStores::Snapshot(_) => {
-            return Err(BuildError::Failed("a build at a read snapshot publishes nothing".to_owned()))
+            return Err(BuildError::Failed(
+                "a build at a read snapshot publishes nothing".to_owned(),
+            ))
         }
     }
     .map_err(BuildError::infrastructure)
@@ -1393,7 +1392,14 @@ fn build_process_artifact(
 /// An artifact's parsed header, structural section and blobs.
 fn split_artifact(
     bytes: &[u8],
-) -> Result<(distill_wire::artifact::ArtifactView<'_>, Arc<[u8]>, Vec<Arc<[u8]>>), BuildError> {
+) -> Result<
+    (
+        distill_wire::artifact::ArtifactView<'_>,
+        Arc<[u8]>,
+        Vec<Arc<[u8]>>,
+    ),
+    BuildError,
+> {
     let view = parse_artifact(bytes).map_err(BuildError::failed)?;
     let structural_len = bytes
         .len()
@@ -1421,8 +1427,11 @@ fn verify_at_snapshot(
     let compiled = compiled_for_build(coordinator, snapshot)?;
     let env = NodeEnv::capture(coordinator, &compiled, &request.target)?;
     check_request(&env, request)?;
-    let tool_version = snapshot.input_version().map_err(BuildError::infrastructure)?;
-    let cached = NodeLookup::new(&env, snapshot, snapshot, tool_version).node(request.entry.uuid, 0)?;
+    let tool_version = snapshot
+        .input_version()
+        .map_err(BuildError::infrastructure)?;
+    let cached =
+        NodeLookup::new(&env, snapshot, snapshot, tool_version).node(request.entry.uuid, 0)?;
     Ok((
         cached,
         [
@@ -1686,7 +1695,11 @@ impl TagBundle {
             .entry(asset)
             .map_err(BuildError::infrastructure)?
             .ok_or_else(|| BuildError::Failed(format!("asset {asset} is missing")))?;
-        if self.0.as_ref().is_none_or(|(bundle, _)| *bundle != meta.bundle) {
+        if self
+            .0
+            .as_ref()
+            .is_none_or(|(bundle, _)| *bundle != meta.bundle)
+        {
             #[cfg(test)]
             tests::TAG_BUNDLE_LOADS.with(|loads| loads.set(loads.get() + 1));
             self.0 = Some((meta.bundle, read_tag_bundle(store, scanner, meta.bundle)));
@@ -1696,8 +1709,8 @@ impl TagBundle {
             Some((_, Err(error))) => return Err(error.clone()),
             None => unreachable!("the bundle was just read"),
         };
-        let (local_id, entry) =
-            find_bundle_asset(&bundle, asset).ok_or(BuildError::Drifted(DriftedInput::Asset(asset)))?;
+        let (local_id, entry) = find_bundle_asset(&bundle, asset)
+            .ok_or(BuildError::Drifted(DriftedInput::Asset(asset)))?;
         if local_id != meta.local_id
             || entry.type_uuid != meta.type_uuid
             || entry.schema_hash != meta.logical_hash
@@ -1749,11 +1762,15 @@ fn try_refine_tag_index(
 ) -> Result<(), BuildError> {
     #[cfg(test)]
     if tests::FAIL_TAG_REFINEMENT.with(|fail| fail.replace(false)) {
-        return Err(BuildError::Failed("injected tag-index refinement failure".to_owned()));
+        return Err(BuildError::Failed(
+            "injected tag-index refinement failure".to_owned(),
+        ));
     }
     #[cfg(test)]
     if tests::FAIL_TAG_REFINEMENT_TRANSIENT.with(|fail| fail.replace(false)) {
-        return Err(BuildError::Infrastructure("injected store failure".to_owned()));
+        return Err(BuildError::Infrastructure(
+            "injected store failure".to_owned(),
+        ));
     }
     // A bundle's assets one after another, so each bundle is parsed once.
     let mut order = assets
@@ -1821,8 +1838,12 @@ fn try_refine_tag_index(
                 if entry.schema_hash != project.logical_hash {
                     return Err(format!("tag load unavailable: {unavailable}"));
                 }
-                distill_schema::extract_search_tags(authority.schema(), project.schema_type, &entry.data)
-                    .map_err(|error| error.to_string())
+                distill_schema::extract_search_tags(
+                    authority.schema(),
+                    project.schema_type,
+                    &entry.data,
+                )
+                .map_err(|error| error.to_string())
             })();
             match direct {
                 Ok(extracted) => {
@@ -2094,10 +2115,7 @@ fn node_lookup<'a>(
 }
 
 /// Keep what a lookup found: the nodes it looked up hold at this view.
-fn absorb_lookup(
-    context: &mut BuildContext,
-    nodes: BTreeMap<AssetUuid, Option<NodeResult>>,
-) {
+fn absorb_lookup(context: &mut BuildContext, nodes: BTreeMap<AssetUuid, Option<NodeResult>>) {
     for (asset, node) in nodes {
         if let Some(node) = node {
             context.memo.entry(asset).or_insert(node);
@@ -2352,7 +2370,8 @@ fn process_chain(
     cacheable: &mut bool,
 ) -> Result<Vec<EncodedNodeOutput>, BuildError> {
     if !context.verify_fresh {
-        if let Some((outputs, traces)) = hydrate_complete_chain(context, loaded, chain, &imported)? {
+        if let Some((outputs, traces)) = hydrate_complete_chain(context, loaded, chain, &imported)?
+        {
             node_trace.extend(traces);
             return Ok(outputs);
         }
@@ -2416,7 +2435,8 @@ fn run_processor_stage(
 ) -> Result<(AuthoredValue, Vec<EncodedNodeOutput>, Vec<TraceOp>, bool), BuildError> {
     std::fs::create_dir_all(&context.execution_root).map_err(BuildError::infrastructure)?;
     let epoch = context
-        .env.pipeline
+        .env
+        .pipeline
         .epoch()
         .map_err(|failure| BuildError::Failed(failure.to_string()))?
         .clone();
@@ -2567,11 +2587,15 @@ fn processor_static_inputs(
                 .map(|(key, ty)| (key.clone(), *ty)),
         )
     {
-        let authority = context.env.authority.project_type(type_uuid).ok_or_else(|| {
-            BuildError::Failed(format!(
-                "processor output type {type_uuid} has no schema authority"
-            ))
-        })?;
+        let authority = context
+            .env
+            .authority
+            .project_type(type_uuid)
+            .ok_or_else(|| {
+                BuildError::Failed(format!(
+                    "processor output type {type_uuid} has no schema authority"
+                ))
+            })?;
         output_hashes.push(OutputHash {
             key,
             logical: authority.logical_hash,
@@ -2626,7 +2650,8 @@ fn hydrate_processor_stage(
                 let (asset, authored_type, encoded_type, terminal_type) =
                     expected_output_identity(loaded, chain, stage, &output.output_key)?;
                 let project = context
-                    .env.authority
+                    .env
+                    .authority
                     .project_type(encoded_type)
                     .cloned()
                     .ok_or_else(|| {
@@ -2783,7 +2808,8 @@ fn encode_processor_products(
         let (asset, authored_type, encoded_type, terminal_type) =
             expected_output_identity(loaded, chain, stage, &output_key)?;
         let project = context
-            .env.authority
+            .env
+            .authority
             .project_type(encoded_type)
             .cloned()
             .ok_or_else(|| {
@@ -2793,12 +2819,13 @@ fn encode_processor_products(
             })?;
         let source_bundle = loaded.meta.bundle;
         let encoded = ask_trace(context, |trace_source| {
-            let mut resolver = |query: &distill_json::AuthoredValue,
-                                expected: TypeUuid,
-                                strong: bool,
-                                _path: &[distill_bundle::PathComponent]| {
-                resolve_reference(trace_source, source_bundle, query, expected, strong, trace)
-            };
+            let mut resolver =
+                |query: &distill_json::AuthoredValue,
+                 expected: TypeUuid,
+                 strong: bool,
+                 _path: &[distill_bundle::PathComponent]| {
+                    resolve_reference(trace_source, source_bundle, query, expected, strong, trace)
+                };
             encode_artifact_value(
                 ArtifactValueSpec {
                     asset_uuid: asset,
@@ -2884,7 +2911,9 @@ fn commit_processor_stage(
     outputs: &[EncodedNodeOutput],
     debug: &BTreeMap<String, Vec<u8>>,
 ) -> Result<(), BuildError> {
-    record_write(context, BuildWrite::Commit(BuildCommit {
+    record_write(
+        context,
+        BuildWrite::Commit(BuildCommit {
             wire_trees: outputs
                 .iter()
                 .map(|output| output.project.dswl_bytes.clone())
@@ -2910,7 +2939,8 @@ fn commit_processor_stage(
                     })
                     .collect(),
             },
-        }));
+        }),
+    );
     Ok(())
 }
 
@@ -2922,14 +2952,17 @@ fn commit_processor_failure(
     facts: Option<&DslfV1>,
 ) -> Result<(), BuildError> {
     let cause = build_failure_cause(trace, facts)?;
-    record_write(context, BuildWrite::Commit(BuildCommit {
+    record_write(
+        context,
+        BuildWrite::Commit(BuildCommit {
             key_kind: KeyKind::Processor,
             static_input_key: static_inputs_digest(static_inputs),
             asset_uuid: loaded.entry.uuid,
             trace: trace_payload_bytes(trace),
             outcome: CommitOutcome::Failure { cause },
             wire_trees: Vec::new(),
-        }));
+        }),
+    );
     Ok(())
 }
 
@@ -3245,7 +3278,8 @@ fn resolved_terminal_type(
     let store = lock_build_store(context)?;
     if let Some(entry) = store.entry(asset).map_err(BuildError::failed)? {
         return context
-            .env.registry
+            .env
+            .registry
             .chain(entry.type_uuid, &context.env.target)
             .map(|chain| chain.terminal)
             .map_err(BuildError::failed);
@@ -3259,7 +3293,8 @@ fn resolved_terminal_type(
         .map_err(BuildError::failed)?
         .ok_or_else(|| BuildError::Failed("derived parent is missing".to_owned()))?;
     context
-        .env.registry
+        .env
+        .registry
         .chain(parent.type_uuid, &context.env.target)
         .map_err(BuildError::failed)?
         .extras
@@ -3540,14 +3575,17 @@ fn commit_build_import_failure(
     facts: Option<&DslfV1>,
 ) -> Result<(), BuildError> {
     let cause = build_failure_cause(trace, facts)?;
-    record_write(context, BuildWrite::Commit(BuildCommit {
+    record_write(
+        context,
+        BuildWrite::Commit(BuildCommit {
             key_kind: KeyKind::BuildImport,
             static_input_key: key,
             asset_uuid: loaded.entry.uuid,
             trace: trace_payload_bytes(trace),
             outcome: CommitOutcome::Failure { cause },
             wire_trees: Vec::new(),
-        }));
+        }),
+    );
     Ok(())
 }
 
@@ -3844,26 +3882,27 @@ fn encode_or_hydrate(
     }
 
     let mut trace = Vec::new();
-    let current_value =
-        match load_current_value(context, loaded, project, current_load, &mut trace) {
-            Ok(value) => value,
-            Err(error) => {
-                let facts = match &error {
-                    BuildError::Deterministic { facts, .. } => Some(facts.as_ref()),
-                    _ => None,
-                };
-                if !context.verify_fresh
-                    && (trace.last().is_some_and(TraceOp::failed) || facts.is_some())
-                {
-                    commit_build_import_failure(context, loaded, key, &trace, facts)?;
-                }
-                return Err(error);
+    let current_value = match load_current_value(context, loaded, project, current_load, &mut trace)
+    {
+        Ok(value) => value,
+        Err(error) => {
+            let facts = match &error {
+                BuildError::Deterministic { facts, .. } => Some(facts.as_ref()),
+                _ => None,
+            };
+            if !context.verify_fresh
+                && (trace.last().is_some_and(TraceOp::failed) || facts.is_some())
+            {
+                commit_build_import_failure(context, loaded, key, &trace, facts)?;
             }
-        };
+            return Err(error);
+        }
+    };
 
     if validator_dylib_hash.is_some() {
         let diagnostics = context
-            .env.pipeline
+            .env
+            .pipeline
             .epoch()
             .map_err(|failure| BuildError::Failed(failure.to_string()))?
             .invoke_validators(loaded.entry.type_uuid, &current_value)
@@ -3881,7 +3920,9 @@ fn encode_or_hydrate(
             };
             let detail = facts.digest().map_err(BuildError::failed)?;
             if !context.verify_fresh {
-                record_write(context, BuildWrite::Commit(BuildCommit {
+                record_write(
+                    context,
+                    BuildWrite::Commit(BuildCommit {
                         key_kind: KeyKind::BuildImport,
                         static_input_key: key,
                         asset_uuid: loaded.entry.uuid,
@@ -3893,7 +3934,8 @@ fn encode_or_hydrate(
                             }),
                         },
                         wire_trees: Vec::new(),
-                    }));
+                    }),
+                );
             }
             return Err(BuildError::Failed(format!(
                 "asset {} failed validation: {diagnostics:?}",
@@ -3961,7 +4003,9 @@ fn encode_or_hydrate(
         terminal_type,
     );
     if !context.verify_fresh {
-        record_write(context, BuildWrite::Commit(BuildCommit {
+        record_write(
+            context,
+            BuildWrite::Commit(BuildCommit {
                 wire_trees: vec![project.dswl_bytes.clone()],
                 key_kind: KeyKind::BuildImport,
                 static_input_key: key,
@@ -3975,7 +4019,8 @@ fn encode_or_hydrate(
                     }],
                     aux: Vec::new(),
                 },
-            }));
+            }),
+        );
     }
     trace_out.extend(trace);
     Ok((bytes, references, Some(current_value)))
@@ -4210,13 +4255,11 @@ mod tests {
     use distill_build::outputs::OutputDecls;
     use distill_build::pipeline::{GraphicsApi, TargetArch, TargetOs, TargetSelector};
     use distill_json::AuthoredValue;
-    use distill_rpc::{
-        ArtifactPayload, BuildEntry, TargetDefinition, TargetDefinitionHash,
-    };
+    use distill_rpc::{ArtifactPayload, BuildEntry, TargetDefinition, TargetDefinitionHash};
     use distill_schema::ngp_schema::{
-        node_hash, Field, FieldAttrs, FieldIdentifier, FieldLayout,
-        LayoutIdentity, LogicalSchema, PrimitiveKind, PrimitiveType, Schema, SchemaLayouts,
-        SchemaNode, SchemaTypeId, TypeAttrs, TypeDef, TypeLayout, TypePath,
+        node_hash, Field, FieldAttrs, FieldIdentifier, FieldLayout, LayoutIdentity, LogicalSchema,
+        PrimitiveKind, PrimitiveType, Schema, SchemaLayouts, SchemaNode, SchemaTypeId, TypeAttrs,
+        TypeDef, TypeLayout, TypePath,
     };
     use distill_store::StoreConfig;
 
@@ -4652,7 +4695,10 @@ mod tests {
     /// Build `request` at a read snapshot without any cache, as a doctor's
     /// verification does, and read the outputs it would publish (identical
     /// content is already in the CAS).
-    fn build_fresh(coordinator: &Arc<DaemonCoordinator>, request: &BuildRequest) -> BuildPublication {
+    fn build_fresh(
+        coordinator: &Arc<DaemonCoordinator>,
+        request: &BuildRequest,
+    ) -> BuildPublication {
         let snapshot = coordinator.open_reader().unwrap().begin_snapshot().unwrap();
         let node = build_fresh_at(coordinator, &snapshot, request).unwrap();
         let root = node.outputs[&request.output_key];
@@ -4850,7 +4896,10 @@ mod tests {
             },
             PrimaryCountingProcessor(Arc::clone(&calls)),
         ));
-        let pipeline = coordinator.compiled_at(&writer).unwrap().pipeline_snapshot();
+        let pipeline = coordinator
+            .compiled_at(&writer)
+            .unwrap()
+            .pipeline_snapshot();
         writer.open_input().unwrap();
         refine_tag_index(
             OpenInput::new(&mut writer).unwrap(),
@@ -5138,7 +5187,10 @@ mod tests {
         let (_, after) = refine(&mut writer);
         // No reader trusts the row the failed refinement left.
         assert!(
-            after.poison.as_deref().is_some_and(|poison| poison.starts_with("tag indexing failed")),
+            after
+                .poison
+                .as_deref()
+                .is_some_and(|poison| poison.starts_with("tag indexing failed")),
             "{after:?}"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -5164,7 +5216,11 @@ mod tests {
         assert!(refined.is_err());
         writer.finish_input(false).unwrap();
         let state = writer.tag_index_state(ASSET).unwrap().unwrap();
-        assert_eq!(state.poison.as_deref(), Some("tag indexing pending"), "{state:?}");
+        assert_eq!(
+            state.poison.as_deref(),
+            Some("tag indexing pending"),
+            "{state:?}"
+        );
     }
 
     /// A full step refines only the rows its publication made pending, and
@@ -5192,7 +5248,9 @@ mod tests {
         writer.finish_input(true).unwrap();
         let authority = authority();
         let project = authority.project_type(TYPE).unwrap();
-        let many = (0..4u8).map(|index| AssetUuid([90 + index; 16])).collect::<Vec<_>>();
+        let many = (0..4u8)
+            .map(|index| AssetUuid([90 + index; 16]))
+            .collect::<Vec<_>>();
         let bundle = Bundle {
             format_version: 1,
             uuid: BundleUuid([89; 16]),
@@ -5228,7 +5286,11 @@ mod tests {
 
         TAG_BUNDLE_LOADS.with(|loads| loads.set(0));
         coordinator.reconcile_full_scan(&mut writer).unwrap();
-        assert_eq!(TAG_BUNDLE_LOADS.with(std::cell::Cell::get), 1, "one parse of many.bundle");
+        assert_eq!(
+            TAG_BUNDLE_LOADS.with(std::cell::Cell::get),
+            1,
+            "one parse of many.bundle"
+        );
         for asset in &many {
             let state = writer.tag_index_state(*asset).unwrap().unwrap();
             assert_eq!(state.poison, None, "{state:?}");
@@ -5525,7 +5587,10 @@ mod tests {
 
         let hydrated = build(&coordinator, &request).unwrap();
         assert_eq!(hydrated, first);
-        assert_eq!(coordinator.open_reader().unwrap().memo_seq().unwrap(), first_memo);
+        assert_eq!(
+            coordinator.open_reader().unwrap().memo_seq().unwrap(),
+            first_memo
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(validator_calls.load(Ordering::SeqCst), 2);
 

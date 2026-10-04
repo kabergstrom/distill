@@ -62,7 +62,9 @@ struct OldInner {
 enum OldMode {
     #[allow(dead_code)]
     Off,
-    On { level: u32 },
+    On {
+        level: u32,
+    },
 }
 
 fn schema<T: AssetReflect>() -> SchemaNode {
@@ -137,6 +139,9 @@ fn field_and_parent_defaults_resolve_nested_containers() {
     );
 
     let outer = schema::<Outer>();
-    assert_eq!(defaults.field_default(&outer, &FieldPath::of(&["missing"])), None);
+    assert_eq!(
+        defaults.field_default(&outer, &FieldPath::of(&["missing"])),
+        None
+    );
     assert_eq!(defaults.field_default(&outer, &FieldPath::root()), None);
 }

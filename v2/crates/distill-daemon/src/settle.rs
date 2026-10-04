@@ -145,7 +145,9 @@ impl QuietWindow {
     /// When the window closes: the last change plus the quiet time; `None`
     /// with no change since the last [`QuietWindow::close`].
     pub fn closes_at(&self) -> Option<Instant> {
-        self.episode.as_ref().map(|episode| episode.last + self.quiet)
+        self.episode
+            .as_ref()
+            .map(|episode| episode.last + self.quiet)
     }
 
     /// The waiting work starts: the episode ends.
@@ -184,7 +186,11 @@ mod tests {
         window.change(start, [Path::new("/a")]);
         assert_eq!(window.closes_at(), Some(start + QUIET));
         window.change(start + ms(200), [Path::new("/a")]);
-        assert_eq!(window.closes_at(), Some(start + ms(450)), "trailing, not first-wins");
+        assert_eq!(
+            window.closes_at(),
+            Some(start + ms(450)),
+            "trailing, not first-wins"
+        );
         window.close();
         assert_eq!(window.closes_at(), None);
     }
@@ -213,7 +219,10 @@ mod tests {
         assert_eq!(first.open_for, HELD_OPEN_WARNING);
         assert_eq!(first.changes, 51);
         assert_eq!(first.paths[0], (noisy.to_path_buf(), 51));
-        assert_eq!(first.paths[1], (PathBuf::from("/project/assets/other.png"), 2));
+        assert_eq!(
+            first.paths[1],
+            (PathBuf::from("/project/assets/other.png"), 2)
+        );
     }
 
     #[test]
@@ -229,7 +238,9 @@ mod tests {
         for step in 0..50u64 {
             assert_eq!(window.change(resumed + ms(step * 100), [path]), None);
         }
-        let held = window.change(resumed + ms(5000), [path]).expect("5 s since the gap");
+        let held = window
+            .change(resumed + ms(5000), [path])
+            .expect("5 s since the gap");
         assert_eq!(held.changes, 51, "only the changes since the gap");
     }
 }

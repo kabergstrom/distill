@@ -111,7 +111,10 @@ fn writers_follow_the_operational_configuration_from_their_next_transaction() {
     store.write_transaction(|_| Ok(())).unwrap();
     assert_eq!(store.config().segment_size, before * 2);
     // A writer opened afterwards starts from it.
-    assert_eq!(opener.open_writer().unwrap().config().segment_size, before * 2);
+    assert_eq!(
+        opener.open_writer().unwrap().config().segment_size,
+        before * 2
+    );
 }
 
 /// Records `path` as an observed file in its own input transaction.
@@ -132,7 +135,12 @@ fn observe(store: &mut Store, path: &str) -> Result<(), distill_store::StoreErro
 }
 
 fn observed_paths(store: &Store) -> Vec<String> {
-    store.observed_files().unwrap().into_iter().map(|row| row.path).collect()
+    store
+        .observed_files()
+        .unwrap()
+        .into_iter()
+        .map(|row| row.path)
+        .collect()
 }
 
 /// A write transaction nested in an open input is part of it: when it
@@ -145,7 +153,9 @@ fn a_failed_nested_write_fails_the_open_input() {
     let mut store = Store::open(StoreConfig::new(dir.path().join("state"))).unwrap();
     for handled in [false, true] {
         store.open_input().unwrap();
-        store.write_transaction(|store| observe(store, "before")).unwrap();
+        store
+            .write_transaction(|store| observe(store, "before"))
+            .unwrap();
         let failed = if handled {
             store.write_transaction_with(
                 |error| error.to_string(),
@@ -165,13 +175,17 @@ fn a_failed_nested_write_fails_the_open_input() {
                 .map_err(|error| error.to_string())
         };
         assert!(failed.is_err());
-        store.write_transaction(|store| observe(store, "after")).unwrap();
+        store
+            .write_transaction(|store| observe(store, "after"))
+            .unwrap();
         assert!(store.finish_input(true).is_err());
         assert!(observed_paths(&store).is_empty());
     }
     // The next input is unaffected.
     store.open_input().unwrap();
-    store.write_transaction(|store| observe(store, "next")).unwrap();
+    store
+        .write_transaction(|store| observe(store, "next"))
+        .unwrap();
     store.finish_input(true).unwrap();
     assert_eq!(observed_paths(&store), ["next"]);
 }
@@ -184,7 +198,9 @@ fn a_failed_isolated_write_rolls_back_only_its_own_writes() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(StoreConfig::new(dir.path().join("state"))).unwrap();
     store.open_input().unwrap();
-    store.write_transaction(|store| observe(store, "kept")).unwrap();
+    store
+        .write_transaction(|store| observe(store, "kept"))
+        .unwrap();
     let failed = store.isolated_write_transaction(|store| {
         observe(store, "dropped")?;
         Err::<(), _>(StoreError::Rejected {
@@ -253,14 +269,21 @@ fn a_failed_inline_build_flush_commits_no_partial_node() {
     });
     assert!(flush.is_err());
     store.finish_input(true).unwrap();
-    assert!(store.candidate_rows(KeyKind::Node, &[3; 32]).unwrap().is_empty());
+    assert!(store
+        .candidate_rows(KeyKind::Node, &[3; 32])
+        .unwrap()
+        .is_empty());
 
     store
         .write_transaction(|store| store.commit_build(node_commit(4)).map(drop))
         .unwrap();
     let conn = rusqlite::Connection::open(dir.path().join("state/meta.sqlite")).unwrap();
     let open: i64 = conn
-        .query_row("SELECT COUNT(*) FROM cas_segments WHERE state = 0", [], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM cas_segments WHERE state = 0",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(open, 1, "only the live writer's segment is OPEN");
 }

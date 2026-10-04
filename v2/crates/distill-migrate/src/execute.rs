@@ -205,7 +205,16 @@ pub fn execute_sparse(
             None
         }
     }
-    exec_frame(ops, input, from, to, &NoDefaults, &[], &mut Vec::new(), true)
+    exec_frame(
+        ops,
+        input,
+        from,
+        to,
+        &NoDefaults,
+        &[],
+        &mut Vec::new(),
+        true,
+    )
 }
 
 /// Execute one custom edge: Ops plans are validated (EdgeKind::Custom —
@@ -409,11 +418,15 @@ fn exec_frame(
                 }
             }
             MigrationOp::MigrateElements { at, element } => {
-                let out = exec_elements(element, input, from, to, at, defaults, prefix, defaulted, sparse)?;
+                let out = exec_elements(
+                    element, input, from, to, at, defaults, prefix, defaulted, sparse,
+                )?;
                 insert_write(&mut writes, at, out, prefix)?;
             }
             MigrationOp::MigrateMapKeys { at, key } => {
-                let out = exec_map_keys(key, input, from, to, at, defaults, prefix, defaulted, sparse)?;
+                let out = exec_map_keys(
+                    key, input, from, to, at, defaults, prefix, defaulted, sparse,
+                )?;
                 insert_write(&mut writes, at, out, prefix)?;
             }
             MigrationOp::MigrateInline { at, ops: inner } => {
@@ -437,7 +450,9 @@ fn exec_frame(
     }
 
     for (at, group) in mv_groups {
-        let out = exec_map_variants(&group, input, from, to, at, defaults, prefix, defaulted, sparse)?;
+        let out = exec_map_variants(
+            &group, input, from, to, at, defaults, prefix, defaulted, sparse,
+        )?;
         insert_write(&mut writes, at, out, prefix)?;
     }
 
@@ -463,7 +478,12 @@ fn exec_frame(
 /// [`materialize`] for sparse output: a struct holds the fields written
 /// beneath it and is omitted when none were (the frame root excepted);
 /// an unwritten leaf is absent.
-fn materialize_sparse(to: &SchemaNode, path: Vec<String>, writes: &mut Writes, root: bool) -> Option<AuthoredValue> {
+fn materialize_sparse(
+    to: &SchemaNode,
+    path: Vec<String>,
+    writes: &mut Writes,
+    root: bool,
+) -> Option<AuthoredValue> {
     if let Some(v) = writes.remove(&path) {
         return Some(v);
     }
@@ -628,7 +648,9 @@ fn exec_elements(
             let mut out = Vec::with_capacity(items.len());
             for (i, item) in items.iter().enumerate() {
                 let sub = child_prefix(prefix, at, Some(format!("[{i}]")));
-                out.push(exec_frame(element, item, a, b, defaults, &sub, defaulted, sparse)?);
+                out.push(exec_frame(
+                    element, item, a, b, defaults, &sub, defaulted, sparse,
+                )?);
             }
             Ok(AuthoredValue::Array(out))
         }
@@ -709,7 +731,8 @@ fn exec_elements(
                         });
                     }
                     let sub = child_prefix(prefix, at, Some(format!("[{i}]")));
-                    let nv = exec_frame(element, &kv[1], v1, v2, defaults, &sub, defaulted, sparse)?;
+                    let nv =
+                        exec_frame(element, &kv[1], v1, v2, defaults, &sub, defaulted, sparse)?;
                     out.push(AuthoredValue::Array(vec![kv[0].clone(), nv]));
                 }
                 Ok(AuthoredValue::Array(out))
@@ -919,7 +942,9 @@ fn exec_map_variants(
                     detail: format!("variant {tname:?} not in the to-schema enum"),
                 })?;
             let sub = child_prefix(prefix, at, Some(format!("{{{vname}}}")));
-            let out = exec_frame(pops, payload, fpayload, tpayload, defaults, &sub, defaulted, sparse)?;
+            let out = exec_frame(
+                pops, payload, fpayload, tpayload, defaults, &sub, defaulted, sparse,
+            )?;
             let mut result = std::collections::BTreeMap::new();
             result.insert(tname.clone(), out);
             Ok(AuthoredValue::Object(result))

@@ -427,11 +427,21 @@ impl LoaderIO for PackfileIO {
     /// answers to requests under `basis`.
     fn end_sweep(&mut self, basis: &IoBasis) {
         self.events.retain(|event| match event {
-            IoEvent::Resolved { basis: answered, .. }
-            | IoEvent::PathResolved { basis: answered, .. }
-            | IoEvent::Fetched { basis: answered, .. }
-            | IoEvent::RequestError { basis: answered, .. }
-            | IoEvent::SnapshotExpired { basis: answered, .. } => answered != basis,
+            IoEvent::Resolved {
+                basis: answered, ..
+            }
+            | IoEvent::PathResolved {
+                basis: answered, ..
+            }
+            | IoEvent::Fetched {
+                basis: answered, ..
+            }
+            | IoEvent::RequestError {
+                basis: answered, ..
+            }
+            | IoEvent::SnapshotExpired {
+                basis: answered, ..
+            } => answered != basis,
             _ => true,
         });
     }

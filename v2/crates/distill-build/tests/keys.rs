@@ -199,7 +199,10 @@ fn node_inputs() -> distill_build::keys::NodeInputs {
         dylib_hash: [7; 32],
         validated: false,
         terminal_type: TypeUuid([8; 16]),
-        extras: vec![("b".to_owned(), TypeUuid([9; 16])), ("a".to_owned(), TypeUuid([10; 16]))],
+        extras: vec![
+            ("b".to_owned(), TypeUuid([9; 16])),
+            ("a".to_owned(), TypeUuid([10; 16])),
+        ],
         stages: vec![NodeStage {
             processor_id: "cook".to_owned(),
             processor_version: 1,
@@ -239,7 +242,11 @@ fn the_node_key_covers_static_inputs_only_and_ignores_declaration_order() {
 
     let mut other_asset = inputs.clone();
     other_asset.asset = AssetUuid([99; 16]);
-    assert_ne!(node_digest(&other_asset), key, "the asset uuid is observable");
+    assert_ne!(
+        node_digest(&other_asset),
+        key,
+        "the asset uuid is observable"
+    );
 
     let mut edited = inputs.clone();
     edited.bundle_hash = ContentHash([99; 32]);

@@ -1,5 +1,5 @@
-use distill_pipeline_api::outputs::{OutputDecls, OutputError};
 use distill_core::id::TypeUuid;
+use distill_pipeline_api::outputs::{OutputDecls, OutputError};
 
 #[test]
 fn declarations_normalize_keys_and_reject_duplicates() {

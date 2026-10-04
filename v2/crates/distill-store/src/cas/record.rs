@@ -350,9 +350,7 @@ impl FailureCause {
                         }
                         3 => ancestors.push(AssetUuid(r.array16()?)),
                         4 => {
-                            return Err(bad_payload(
-                                "fingerprint tag 4 is permanently reserved",
-                            ));
+                            return Err(bad_payload("fingerprint tag 4 is permanently reserved"));
                         }
                         5 => {
                             let key = match r.u8()? {
@@ -368,10 +366,8 @@ impl FailureCause {
                             break FailureFingerprint::MissingCapability { key };
                         }
                         6 => {
-                            let class =
-                                LocalFailureClass::from_u16(r.u16()?).ok_or_else(|| {
-                                    bad_payload("unknown local failure class")
-                                })?;
+                            let class = LocalFailureClass::from_u16(r.u16()?)
+                                .ok_or_else(|| bad_payload("unknown local failure class"))?;
                             break FailureFingerprint::Local {
                                 class,
                                 detail: r.array32()?,
@@ -389,13 +385,12 @@ impl FailureCause {
                         _ => return Err(bad_payload("unknown fingerprint tag")),
                     }
                 };
-                let fingerprint =
-                    ancestors.into_iter().rev().fold(terminal, |inner, asset| {
-                        FailureFingerprint::Descendant {
-                            asset,
-                            fingerprint: Box::new(inner),
-                        }
-                    });
+                let fingerprint = ancestors.into_iter().rev().fold(terminal, |inner, asset| {
+                    FailureFingerprint::Descendant {
+                        asset,
+                        fingerprint: Box::new(inner),
+                    }
+                });
                 FailureCause::Local(fingerprint)
             }
             _ => return Err(bad_payload("unknown failure-cause tag")),

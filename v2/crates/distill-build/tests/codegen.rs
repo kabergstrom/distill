@@ -85,7 +85,10 @@ fn stale_basis_or_newly_discovered_dependency_discards_and_requeues() {
         CodegenPublication::Requeued
     );
     assert!(world.published.is_empty());
-    assert!(!coordinator.holds(&world), "a requeued attempt installs nothing");
+    assert!(
+        !coordinator.holds(&world),
+        "a requeued attempt installs nothing"
+    );
 }
 
 #[test]

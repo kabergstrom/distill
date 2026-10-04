@@ -5,8 +5,8 @@ use distill_bundle::PathComponent;
 use distill_core::id::{AssetUuid, LayoutHash, LogicalHash, TypeUuid};
 use distill_wire::artifact::{
     artifact_header_layout_hash, assemble_artifact, canonical_blob_order, content_hash,
-    parse_artifact, parse_artifact_parts, split_artifact, write_artifact,
-    ArtifactError, ArtifactHeader, ARTIFACT_FORMAT_VERSION, ARTIFACT_MAGIC,
+    parse_artifact, parse_artifact_parts, split_artifact, write_artifact, ArtifactError,
+    ArtifactHeader, ARTIFACT_FORMAT_VERSION, ARTIFACT_MAGIC,
 };
 
 fn header() -> ArtifactHeader {
@@ -133,7 +133,10 @@ fn split_transport_reconstructs_metadata_and_complete_content_identity() {
 fn header_layout_hash_reads_the_header_alone() {
     let bytes = write_simple(&[AssetUuid([9; 16])], &[1, 2, 3, 4], &[5, 6], &[]);
     let header_len = 8 + 4 + 4 * 16 + 32 + 32;
-    assert_eq!(artifact_header_layout_hash(&bytes).unwrap(), header().layout_hash);
+    assert_eq!(
+        artifact_header_layout_hash(&bytes).unwrap(),
+        header().layout_hash
+    );
     assert_eq!(
         artifact_header_layout_hash(&bytes[..header_len]).unwrap(),
         header().layout_hash
@@ -144,7 +147,10 @@ fn header_layout_hash_reads_the_header_alone() {
     ));
     let mut bad = bytes.clone();
     bad[0] ^= 1;
-    assert!(matches!(artifact_header_layout_hash(&bad), Err(ArtifactError::BadMagic)));
+    assert!(matches!(
+        artifact_header_layout_hash(&bad),
+        Err(ArtifactError::BadMagic)
+    ));
 }
 
 #[test]
@@ -156,11 +162,20 @@ fn split_and_assemble_are_inverse() {
         &[AssetUuid([9; 16])],
         &[1, 2, 3, 4],
         &[5, 6],
-        &[(vec![field("a")], a), (vec![field("b")], b), (vec![field("c")], c)],
+        &[
+            (vec![field("a")], a),
+            (vec![field("b")], b),
+            (vec![field("c")], c),
+        ],
     );
     let (structural, blobs) = split_artifact(&bytes).unwrap();
     assert_eq!(blobs.len(), 3);
-    assert_eq!(parse_artifact_parts(structural, &blobs).unwrap().content_hash, content_hash(&bytes));
+    assert_eq!(
+        parse_artifact_parts(structural, &blobs)
+            .unwrap()
+            .content_hash,
+        content_hash(&bytes)
+    );
     assert_eq!(assemble_artifact(structural, &blobs), bytes);
 }
 

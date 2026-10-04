@@ -194,7 +194,11 @@ impl AuthoringService {
                 let source = match fresh(root, path) {
                     Some(source) => source,
                     None => {
-                        if store.file_content_hash(root, path).map_err(invalid)?.is_none() {
+                        if store
+                            .file_content_hash(root, path)
+                            .map_err(invalid)?
+                            .is_none()
+                        {
                             continue;
                         }
                         Arc::new(
@@ -210,7 +214,12 @@ impl AuthoringService {
                 };
                 // A row the input just wrote from this source is its own.
                 if written.contains(&(root.clone(), path.clone())) {
-                    rows.push(self.index_import_bundle(store, path.clone(), root.clone(), bundle)?);
+                    rows.push(self.index_import_bundle(
+                        store,
+                        path.clone(),
+                        root.clone(),
+                        bundle,
+                    )?);
                     continue;
                 }
                 let Some(meta) = store.bundle(bundle.uuid).map_err(invalid)? else {
@@ -252,9 +261,9 @@ impl AuthoringService {
                 .map_err(invalid)?
                 .into_iter()
                 .filter(|(_, source)| {
-                    source.as_ref().is_none_or(|(root, path)| {
-                        changed_ids.contains(&(*root, path.as_str()))
-                    })
+                    source
+                        .as_ref()
+                        .is_none_or(|(root, path)| changed_ids.contains(&(*root, path.as_str())))
                 })
                 .map(|(rules, _)| rules)
                 .collect();
@@ -431,7 +440,8 @@ impl AuthoringService {
             }) {
                 continue;
             }
-            let mut backend = RootedImportBackend::over(compiled.scanner(), &store, &capabilities, overlay);
+            let mut backend =
+                RootedImportBackend::over(compiled.scanner(), &store, &capabilities, overlay);
             if !revalidate_read_set(&basis, &mut backend) {
                 pending.push(meta.bundle);
             }
@@ -478,7 +488,8 @@ impl AuthoringService {
         } else {
             self.directory_rules_listing(&store, paths.iter().map(|(_, path)| path.as_str()))?
         };
-        let mut backend = RootedImportBackend::over(compiled.scanner(), &store, &capabilities, overlay);
+        let mut backend =
+            RootedImportBackend::over(compiled.scanner(), &store, &capabilities, overlay);
         let mut groups = BTreeMap::new();
         let mut touched = BTreeSet::<(BundleUuid, AssetUuid, usize, RootedPath)>::new();
         let mut touched_origins = BTreeSet::<StoredDirectoryOrigin>::new();
@@ -486,11 +497,11 @@ impl AuthoringService {
             // A changed rules source may have dropped rules: every bundle its
             // previous rules generated is rechecked for orphaning.
             for rules in previous {
-                for bundle in store
-                    .bundles_owned_by(*rules)
-                    .map_err(invalid)?
-                {
-                    if let Some(origin) = store.bundle(bundle).map_err(invalid)?.and_then(|meta| meta.origin)
+                for bundle in store.bundles_owned_by(*rules).map_err(invalid)? {
+                    if let Some(origin) = store
+                        .bundle(bundle)
+                        .map_err(invalid)?
+                        .and_then(|meta| meta.origin)
                     {
                         touched_origins.insert(origin);
                     }
@@ -665,7 +676,9 @@ impl AuthoringService {
             store
                 .record_watched_import_failure(&WatchedImportFailure {
                     bundle,
-                    attempted_input_version: store.input_version().map_err(crate::authoring::invalid)?,
+                    attempted_input_version: store
+                        .input_version()
+                        .map_err(crate::authoring::invalid)?,
                     basis,
                     terminal: WatchedImportTerminal::DirectoryOrphan,
                     message,
@@ -691,7 +704,12 @@ impl AuthoringService {
                     .directory_import_invocation(store, base, task)
                     .map_err(ImportExecutionError::unmemoized);
                 let compiled = self.compiled(store)?;
-                self.defer_unavailable(&compiled, &task.importer, &task.destination_path, invocation)?
+                self.defer_unavailable(
+                    &compiled,
+                    &task.importer,
+                    &task.destination_path,
+                    invocation,
+                )?
             }
             PassImport::Watched(bundle) => {
                 let invocation = self
@@ -769,17 +787,15 @@ impl AuthoringService {
             let Some(basis) = self.watched_basis(store, &meta)? else {
                 return Ok(true);
             };
-            let reads = basis
-                .iter()
-                .any(|dependency| match dependency {
-                    FileDep::Read { path, .. } | FileDep::Probe { path, .. } => {
-                        paths.contains(&path.as_str())
-                    }
-                    FileDep::Listing { query, .. } => {
-                        paths.iter().any(|path| query_matches(query, path))
-                    }
-                    FileDep::Capability { .. } => false,
-                });
+            let reads = basis.iter().any(|dependency| match dependency {
+                FileDep::Read { path, .. } | FileDep::Probe { path, .. } => {
+                    paths.contains(&path.as_str())
+                }
+                FileDep::Listing { query, .. } => {
+                    paths.iter().any(|path| query_matches(query, path))
+                }
+                FileDep::Capability { .. } => false,
+            });
             if reads {
                 return Ok(true);
             }
@@ -787,7 +803,11 @@ impl AuthoringService {
         Ok(self
             .directory_rules_listing(store, paths.iter().copied())?
             .iter()
-            .any(|entry| paths.iter().any(|path| query_matches(&entry.rules.listing, path))))
+            .any(|entry| {
+                paths
+                    .iter()
+                    .any(|path| query_matches(&entry.rules.listing, path))
+            }))
     }
 
     /// The (root, path) a pass import writes, as `store` holds it: what the
@@ -996,7 +1016,8 @@ impl AuthoringService {
             return Ok(true);
         }
         let compiled = self.compiled(store)?;
-        let mut backend = RootedImportBackend::over(compiled.scanner(), store, capabilities, overlay);
+        let mut backend =
+            RootedImportBackend::over(compiled.scanner(), store, capabilities, overlay);
         let basis = match store.watched_import_failure(meta.bundle).map_err(invalid)? {
             Some(failure) if failure.terminal == WatchedImportTerminal::DirectoryOrphan => {
                 return Ok(true);
@@ -1328,7 +1349,8 @@ impl AuthoringService {
         read_set.extend(basis_deps);
         let outcome = match result {
             Ok(_) if read_set.iter().any(dep_has_failure) => {
-                let message = "an importer cannot publish after catching a failed context observation";
+                let message =
+                    "an importer cannot publish after catching a failed context observation";
                 Err(ImportRunFailure {
                     terminal: WatchedImportTerminal::Dependency,
                     message: message.to_owned(),
@@ -1414,10 +1436,12 @@ impl AuthoringService {
         if run_base != base {
             require_base(store, base).map_err(ImportExecutionError::unmemoized)?;
             if !destination_unchanged(store, &destination)? {
-                return Err(ImportExecutionError::drifted(RpcFailure::StaleInputVersion {
-                    expected: base,
-                    got: run_base,
-                }));
+                return Err(ImportExecutionError::drifted(
+                    RpcFailure::StaleInputVersion {
+                        expected: base,
+                        got: run_base,
+                    },
+                ));
             }
         }
         let output = match outcome {
@@ -1489,13 +1513,7 @@ impl AuthoringService {
             }
         }
         let commit = self
-            .publish_file(
-                store,
-                base,
-                destination.target,
-                preimage,
-                Some(bytes),
-            )
+            .publish_file(store, base, destination.target, preimage, Some(bytes))
             .map_err(ImportExecutionError::unmemoized)?;
         Ok(PreparedImportCommit { bundle, commit })
     }
@@ -1641,11 +1659,17 @@ impl AuthoringService {
     /// reconciliation revalidates only the indexed basis; left at the last
     /// success's, a revert to that source revalidates and the failure never
     /// clears.
-    fn reindex_watched_bundle(&self, store: &mut Store, meta: &BundleMeta) -> Result<(), RpcFailure> {
+    fn reindex_watched_bundle(
+        &self,
+        store: &mut Store,
+        meta: &BundleMeta,
+    ) -> Result<(), RpcFailure> {
         let (root_name, bundle) = self.published_bundle(store, meta)?;
         let row = self.index_import_bundle(store, meta.path.clone(), root_name, bundle)?;
         let source = [(row.root_name.clone(), row.path.clone())];
-        store.replace_import_index(&source, &[row]).map_err(invalid)?;
+        store
+            .replace_import_index(&source, &[row])
+            .map_err(invalid)?;
         Ok(())
     }
 
@@ -1753,12 +1777,19 @@ impl AuthoringService {
             }
         } else {
             let root = normalize_identifier(requested_root).map_err(invalid)?;
-            if !compiled.roots().iter().any(|candidate| candidate.name == root) {
+            if !compiled
+                .roots()
+                .iter()
+                .any(|candidate| candidate.name == root)
+            {
                 return Err(invalid(format!("unknown import destination root {root:?}")));
             }
             root
         };
-        let target = compiled.scanner().physical_path(&root, path).map_err(invalid)?;
+        let target = compiled
+            .scanner()
+            .physical_path(&root, path)
+            .map_err(invalid)?;
         Ok(ImportDestination {
             root,
             path: path.to_owned(),
@@ -1776,7 +1807,11 @@ impl AuthoringService {
         let root = normalize_identifier(root).map_err(invalid)?;
         let path = normalize_path(path).map_err(invalid)?;
         let compiled = self.compiled(store)?;
-        if !compiled.roots().iter().any(|candidate| candidate.name == root) {
+        if !compiled
+            .roots()
+            .iter()
+            .any(|candidate| candidate.name == root)
+        {
             return Err(invalid(format!(
                 "unknown directory import destination root {root:?}"
             )));
@@ -1792,7 +1827,10 @@ impl AuthoringService {
                 break;
             }
         }
-        let target = compiled.scanner().physical_path(&root, &path).map_err(invalid)?;
+        let target = compiled
+            .scanner()
+            .physical_path(&root, &path)
+            .map_err(invalid)?;
         if meta.is_none() && std::fs::symlink_metadata(&target).is_ok() {
             return Err(invalid(format!(
                 "directory import destination {}:{} is occupied by a non-bundle file",
@@ -1992,8 +2030,6 @@ fn directory_groups(
     Ok(groups)
 }
 
-
-
 fn directory_assignment(
     rules: &DecodedDirectoryRules,
     source: &RootedPath,
@@ -2151,7 +2187,11 @@ fn listing_dir(listing: &FileQuery) -> String {
         .as_deref()
         .map_or("", |pattern| GlobKeys::of(pattern, GLOBSET_META).prefix);
     let prefix = listing.path_prefix.as_deref().unwrap_or("");
-    let literal = if glob.len() > prefix.len() { glob } else { prefix };
+    let literal = if glob.len() > prefix.len() {
+        glob
+    } else {
+        prefix
+    };
     literal
         .rfind('/')
         .map_or_else(String::new, |slash| literal[..=slash].to_owned())
@@ -2247,7 +2287,9 @@ impl ImportRows<'_> {
 
     /// The bytes an earlier import of the pass will publish at (root, path).
     fn output(&self, root: &str, path: &str) -> Option<&[u8]> {
-        self.parts().1.and_then(|overlay| overlay.output(root, path))
+        self.parts()
+            .1
+            .and_then(|overlay| overlay.output(root, path))
     }
 }
 
@@ -2330,7 +2372,10 @@ impl FileOverlay {
 
     /// This overlay with `outputs` over it, each replacing the row at its
     /// path, a later output replacing an earlier one.
-    pub(crate) fn with_outputs<'o>(&self, outputs: impl IntoIterator<Item = &'o PassOutput>) -> Self {
+    pub(crate) fn with_outputs<'o>(
+        &self,
+        outputs: impl IntoIterator<Item = &'o PassOutput>,
+    ) -> Self {
         let mut overlay = self.clone();
         for output in outputs {
             let key = (output.root.clone(), output.path.clone());
@@ -2348,7 +2393,9 @@ impl FileOverlay {
                     .into(),
                 }),
             );
-            overlay.outputs.insert(key, Arc::from(output.bytes.as_slice()));
+            overlay
+                .outputs
+                .insert(key, Arc::from(output.bytes.as_slice()));
         }
         overlay
     }
@@ -2902,12 +2949,14 @@ pub(crate) fn decoded_record_facts(
     let Some(record) = decoded_import_record(bundle)? else {
         return Ok((None, false));
     };
-    let origin = record.origin.map(|origin| distill_store::bundles::DirectoryOrigin {
-        rules_bundle: origin.rules_bundle,
-        rule: distill_store::bundles::DirectoryRuleId(origin.rule.0),
-        group_root: origin.group.root.0,
-        group_path: origin.group.path,
-    });
+    let origin = record
+        .origin
+        .map(|origin| distill_store::bundles::DirectoryOrigin {
+            rules_bundle: origin.rules_bundle,
+            rule: distill_store::bundles::DirectoryRuleId(origin.rule.0),
+            group_root: origin.group.root.0,
+            group_path: origin.group.path,
+        });
     Ok((origin, record.watch))
 }
 
@@ -3992,7 +4041,12 @@ mod enumerate_tests {
     ];
 
     fn kind(index: usize) -> FileKind {
-        [FileKind::File, FileKind::File, FileKind::Directory, FileKind::Symlink][index % 4]
+        [
+            FileKind::File,
+            FileKind::File,
+            FileKind::Directory,
+            FileKind::Symlink,
+        ][index % 4]
     }
 
     /// `paths` in both roots (`alt` only every other one), with `version`
@@ -4100,9 +4154,27 @@ mod enumerate_tests {
             });
         }
         for glob in [
-            "*", "**", "dir*", "dir/**", "**/dir", "{dir,z}*", "[d]ir*", "a\\*b", "a{b,c}/*",
-            "é/*", "bulk/b000?", "z/*", "[", "**/leaf", "*/child", "**/ü.png", "*.png", "*.txt",
-            "**/[x]", "d*/c*", "**/dir",
+            "*",
+            "**",
+            "dir*",
+            "dir/**",
+            "**/dir",
+            "{dir,z}*",
+            "[d]ir*",
+            "a\\*b",
+            "a{b,c}/*",
+            "é/*",
+            "bulk/b000?",
+            "z/*",
+            "[",
+            "**/leaf",
+            "*/child",
+            "**/ü.png",
+            "*.png",
+            "*.txt",
+            "**/[x]",
+            "d*/c*",
+            "**/dir",
         ] {
             queries.push(FileQuery {
                 path_prefix: None,
@@ -4110,7 +4182,12 @@ mod enumerate_tests {
             });
         }
         // A final segment or extension beside a prefix subtree.
-        for (prefix, glob) in [("dir", "*/leaf"), ("dir", "*.txt"), ("é", "*.png"), ("z", "**/dir")] {
+        for (prefix, glob) in [
+            ("dir", "*/leaf"),
+            ("dir", "*.txt"),
+            ("é", "*.png"),
+            ("z", "**/dir"),
+        ] {
             queries.push(FileQuery {
                 path_prefix: Some(prefix.into()),
                 path_glob: Some(glob.into()),
@@ -4292,7 +4369,10 @@ mod enumerate_tests {
             assert!(!indexed.is_empty());
             println!("{query:?}: {indexed_pages} pages (scan: {scanned_pages})");
             assert!(indexed_pages <= 64, "{indexed_pages} pages");
-            assert!(scanned_pages >= 100 * indexed_pages, "{scanned_pages} pages");
+            assert!(
+                scanned_pages >= 100 * indexed_pages,
+                "{scanned_pages} pages"
+            );
         }
     }
 }

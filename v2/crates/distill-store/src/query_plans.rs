@@ -11,8 +11,7 @@ use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid
 use rusqlite::Connection;
 
 use crate::bundles::{
-    AssetFilter, AssetRecord, BundleMeta, NamespaceSkeleton, SkeletonEntry,
-    TagIndexUpdate,
+    AssetFilter, AssetRecord, BundleMeta, NamespaceSkeleton, SkeletonEntry, TagIndexUpdate,
 };
 use crate::db::{ReaderConn, StoreReader};
 use crate::files::{path_name, FileKind, FileObservation, FileState, PathSelection};
@@ -181,16 +180,27 @@ fn selective_reads(reader: &StoreReader) {
     reader.generated_bundles().unwrap();
     reader.import_watched_bundles().unwrap();
     reader.bundles_referencing_path(REFERENCED).unwrap();
-    reader.observed_files_in(PathSelection::Subtree("d07")).unwrap();
-    reader.observed_files_in(PathSelection::Prefix("d07/b000")).unwrap();
-    reader.observed_files_in(PathSelection::Name("b00042.bundle")).unwrap();
-    reader.observed_files_in(PathSelection::Extension("png")).unwrap();
+    reader
+        .observed_files_in(PathSelection::Subtree("d07"))
+        .unwrap();
+    reader
+        .observed_files_in(PathSelection::Prefix("d07/b000"))
+        .unwrap();
+    reader
+        .observed_files_in(PathSelection::Name("b00042.bundle"))
+        .unwrap();
+    reader
+        .observed_files_in(PathSelection::Extension("png"))
+        .unwrap();
     // Every shape but the whole read, which has no index to search.
     let whole = AssetFilter {
         authoring_only: Some(false),
         ..AssetFilter::default()
     };
-    for (filter, _, _) in filter_shapes().into_iter().filter(|(filter, _, _)| *filter != whole) {
+    for (filter, _, _) in filter_shapes()
+        .into_iter()
+        .filter(|(filter, _, _)| *filter != whole)
+    {
         let _ = reader.served_assets_matching(&filter, |_| true).unwrap();
         let _ = reader.namespace_assets_matching(&filter, |_| true).unwrap();
     }
@@ -284,7 +294,9 @@ fn scans_namespace(step: &str) -> bool {
 
 #[test]
 fn selective_namespace_reads_search_indexes() {
-    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tracing = TRACING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, store) = store_with(200);
     let mut reader = store.reader().unwrap();
     connection(&mut reader).trace(Some(trace));
@@ -306,7 +318,11 @@ fn selective_namespace_reads_search_indexes() {
 /// One filter per driving shape, each beside the broader selectors it must
 /// not be driven by, with the exact plan of its rows statement and, for a
 /// tag query, of its tag-poison statement.
-fn filter_shapes() -> Vec<(AssetFilter, &'static [&'static str], &'static [&'static str])> {
+fn filter_shapes() -> Vec<(
+    AssetFilter,
+    &'static [&'static str],
+    &'static [&'static str],
+)> {
     let name = |index: u32| path_name(&bundle_path(index)).to_owned();
     let kind_mesh = Some(("kind".to_owned(), Some("mesh".to_owned())));
     vec![
@@ -533,7 +549,9 @@ fn filter_shapes() -> Vec<(AssetFilter, &'static [&'static str], &'static [&'sta
 #[test]
 fn filters_are_driven_by_their_most_selective_index() {
     use crate::bundles::NAMESPACE_ROWS;
-    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tracing = TRACING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, store) = store_with(200);
     let mut reader = store.reader().unwrap();
     let mut mismatches = Vec::new();
@@ -545,10 +563,17 @@ fn filters_are_driven_by_their_most_selective_index() {
             }
             expected.push(rows_plan);
             connection(&mut reader).trace(Some(trace));
-            reader.assets_matching(&filter, rows, |_| true).unwrap().ok();
+            reader
+                .assets_matching(&filter, rows, |_| true)
+                .unwrap()
+                .ok();
             connection(&mut reader).trace(None);
             let statements = std::mem::take(&mut *TRACED.lock().unwrap());
-            assert_eq!(statements.len(), expected.len(), "{filter:?}: {statements:#?}");
+            assert_eq!(
+                statements.len(),
+                expected.len(),
+                "{filter:?}: {statements:#?}"
+            );
             for (sql, plan) in statements.iter().zip(expected) {
                 // Whether an index covers a step depends on the columns the rows
                 // need, not on which index drives the read.
@@ -595,7 +620,10 @@ fn typed_tag_query_pages(count: u32, pending: bool) -> u64 {
         ..AssetFilter::default()
     };
     pages(&reader, || {
-        reader.namespace_assets_matching(&records, |_| true).unwrap().unwrap();
+        reader
+            .namespace_assets_matching(&records, |_| true)
+            .unwrap()
+            .unwrap();
     })
 }
 
@@ -669,7 +697,10 @@ fn derived_resolution_pages(count: u32) -> u64 {
                 root_name: "main".to_owned(),
                 path,
                 claims: vec![
-                    SourceClaim::Bundle { bundle, source: readable.clone() },
+                    SourceClaim::Bundle {
+                        bundle,
+                        source: readable.clone(),
+                    },
                     SourceClaim::Authored {
                         asset: parent,
                         claimant: AssetClaimant::Authored {
@@ -710,7 +741,10 @@ fn derived_resolution_pages(count: u32) -> u64 {
     pages(&reader, || {
         assert!(reader.derived_output(served).unwrap().is_some());
         assert!(reader.derived_output(withheld).unwrap().is_none());
-        assert!(reader.asset_resolution(asset_uuid(count + 7, 1)).unwrap().is_none());
+        assert!(reader
+            .asset_resolution(asset_uuid(count + 7, 1))
+            .unwrap()
+            .is_none());
     })
 }
 
@@ -729,7 +763,9 @@ fn a_derived_child_resolves_by_point_reads() {
 /// writes, and keeps nothing past its end.
 #[test]
 fn a_transaction_reads_each_counter_once() {
-    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tracing = TRACING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, mut store) = store_with(0);
     TRACED.lock().unwrap().clear();
     store.read.conn.trace(Some(trace));
@@ -747,7 +783,11 @@ fn a_transaction_reads_each_counter_once() {
         .unwrap();
     store.read.conn.trace(None);
     let statements = std::mem::take(&mut *TRACED.lock().unwrap());
-    for key in ["input_version", "compiled_version", "configuration_generation"] {
+    for key in [
+        "input_version",
+        "compiled_version",
+        "configuration_generation",
+    ] {
         let reads = statements
             .iter()
             .filter(|sql| sql.contains(&format!("FROM store_meta WHERE key = '{key}'")))
@@ -759,8 +799,14 @@ fn a_transaction_reads_each_counter_once() {
     assert_eq!(store.compiled_version().unwrap(), Some(version));
     let other = store.reader().unwrap();
     store.input_transaction(|_| Ok(())).unwrap();
-    assert_eq!(other.input_version().unwrap(), crate::state::InputVersion(version.0 + 1));
-    assert_eq!(store.input_version().unwrap(), crate::state::InputVersion(version.0 + 1));
+    assert_eq!(
+        other.input_version().unwrap(),
+        crate::state::InputVersion(version.0 + 1)
+    );
+    assert_eq!(
+        store.input_version().unwrap(),
+        crate::state::InputVersion(version.0 + 1)
+    );
 }
 
 /// A rewritten bundle's assets are read by bundle, and each vanished one
@@ -773,8 +819,14 @@ fn a_rewritten_bundle_drops_its_vanished_assets_by_key() {
             "SELECT asset_uuid FROM assets WHERE bundle_uuid = ?1",
             vec!["SEARCH assets USING COVERING INDEX assets_by_bundle (bundle_uuid=?)"],
         ),
-        ("DELETE FROM asset_tags WHERE asset_uuid = ?1", vec!["SEARCH asset_tags USING INDEX sqlite_autoindex_asset_tags_1 (asset_uuid=?)"]),
-        ("DELETE FROM assets WHERE asset_uuid = ?1", vec!["SEARCH assets USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)"]),
+        (
+            "DELETE FROM asset_tags WHERE asset_uuid = ?1",
+            vec!["SEARCH asset_tags USING INDEX sqlite_autoindex_asset_tags_1 (asset_uuid=?)"],
+        ),
+        (
+            "DELETE FROM assets WHERE asset_uuid = ?1",
+            vec!["SEARCH assets USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)"],
+        ),
     ] {
         assert_eq!(store.query_plan_details(sql).unwrap(), expected, "{sql}");
     }
@@ -786,7 +838,9 @@ fn a_rewritten_bundle_drops_its_vanished_assets_by_key() {
 fn a_tool_epoch_reads_the_published_tools_in_one_pass() {
     let (_dir, store) = store_with(0);
     assert_eq!(
-        store.query_plan_details(crate::pipeline::PUBLISHED_TOOLS).unwrap(),
+        store
+            .query_plan_details(crate::pipeline::PUBLISHED_TOOLS)
+            .unwrap(),
         ["SCAN tools USING INDEX sqlite_autoindex_tools_1"]
     );
 }
@@ -817,7 +871,9 @@ fn narrow_reads_of_a_large_namespace_touch_few_pages() {
     let costs = [
         (
             "bundle at a path",
-            pages(&reader, || rows = count(reader.bundles_at_path(&path).unwrap().len(), 1)),
+            pages(&reader, || {
+                rows = count(reader.bundles_at_path(&path).unwrap().len(), 1)
+            }),
             rows,
             pages(&reader, || drop(reader.all_bundles().unwrap())),
         ),
@@ -842,7 +898,14 @@ fn narrow_reads_of_a_large_namespace_touch_few_pages() {
         (
             "served entries at a path",
             pages(&reader, || {
-                rows = count(reader.served_assets_matching(&at_path(&path), |_| true).unwrap().unwrap().len(), 1);
+                rows = count(
+                    reader
+                        .served_assets_matching(&at_path(&path), |_| true)
+                        .unwrap()
+                        .unwrap()
+                        .len(),
+                    1,
+                );
             }),
             rows,
             pages(&reader, || drop(reader.served_entries().unwrap())),
@@ -850,7 +913,14 @@ fn narrow_reads_of_a_large_namespace_touch_few_pages() {
         (
             "rarely tagged entries",
             pages(&reader, || {
-                rows = count(reader.namespace_assets_matching(&rare(), |_| true).unwrap().unwrap().len(), 20);
+                rows = count(
+                    reader
+                        .namespace_assets_matching(&rare(), |_| true)
+                        .unwrap()
+                        .unwrap()
+                        .len(),
+                    20,
+                );
             }),
             rows,
             pages(&reader, || {
@@ -880,7 +950,14 @@ fn narrow_reads_of_a_large_namespace_touch_few_pages() {
                     authored_type: Some(RUNTIME_TYPE),
                     ..AssetFilter::default()
                 };
-                rows = count(reader.served_assets_matching(&filter, |_| true).unwrap().unwrap().len(), 1);
+                rows = count(
+                    reader
+                        .served_assets_matching(&filter, |_| true)
+                        .unwrap()
+                        .unwrap()
+                        .len(),
+                    1,
+                );
             }),
             rows,
             pages(&reader, || drop(reader.served_entries().unwrap())),
@@ -892,7 +969,14 @@ fn narrow_reads_of_a_large_namespace_touch_few_pages() {
                     local_id: Some("$record".into()),
                     ..AssetFilter::default()
                 };
-                rows = count(reader.namespace_assets_matching(&filter, |_| true).unwrap().unwrap().len(), 20);
+                rows = count(
+                    reader
+                        .namespace_assets_matching(&filter, |_| true)
+                        .unwrap()
+                        .unwrap()
+                        .len(),
+                    20,
+                );
             }),
             rows,
             pages(&reader, || drop(reader.all_asset_bundles().unwrap())),
@@ -904,7 +988,14 @@ fn narrow_reads_of_a_large_namespace_touch_few_pages() {
                     authoring_only: Some(true),
                     ..AssetFilter::default()
                 };
-                rows = count(reader.namespace_assets_matching(&filter, |_| true).unwrap().unwrap().len(), 20);
+                rows = count(
+                    reader
+                        .namespace_assets_matching(&filter, |_| true)
+                        .unwrap()
+                        .unwrap()
+                        .len(),
+                    20,
+                );
             }),
             rows,
             pages(&reader, || drop(reader.all_asset_bundles().unwrap())),
@@ -930,7 +1021,10 @@ fn narrow_reads_of_a_large_namespace_touch_few_pages() {
         (
             "bundles referencing a path",
             pages(&reader, || {
-                rows = count(reader.bundles_referencing_path(REFERENCED).unwrap().len(), 200);
+                rows = count(
+                    reader.bundles_referencing_path(REFERENCED).unwrap().len(),
+                    200,
+                );
             }),
             rows,
             pages(&reader, || drop(reader.all_bundles().unwrap())),
@@ -938,7 +1032,10 @@ fn narrow_reads_of_a_large_namespace_touch_few_pages() {
     ];
     for (read, narrow, rows, full) in costs {
         println!("{read}: {rows} rows in {narrow} pages (whole-table read: {full} pages)");
-        assert!(narrow <= 16 + 8 * rows, "{read} fetched {narrow} pages for {rows} rows");
+        assert!(
+            narrow <= 16 + 8 * rows,
+            "{read} fetched {narrow} pages for {rows} rows"
+        );
         assert!(full >= 4 * narrow, "{read}: {narrow} pages against {full}");
     }
 }
@@ -1002,7 +1099,9 @@ fn populate_scan_structure(store: &mut Store, count: u32) {
                             content_hash: None,
                         },
                         raw_path: Vec::new(),
-                        symlink_target: Some(format!("/t/d{:02}/x{index}", index % 50).into_bytes()),
+                        symlink_target: Some(
+                            format!("/t/d{:02}/x{index}", index % 50).into_bytes(),
+                        ),
                         canonical_path: None,
                     },
                     version,
@@ -1039,7 +1138,9 @@ fn subtree_plans(store: &mut Store, run: impl FnOnce(&mut Store)) -> Vec<(String
     let statements = std::mem::take(&mut *TRACED.lock().unwrap());
     statements
         .into_iter()
-        .filter(|sql| sql.contains("JOIN roots r USING (root_id)") || sql.contains("symlink_target >="))
+        .filter(|sql| {
+            sql.contains("JOIN roots r USING (root_id)") || sql.contains("symlink_target >=")
+        })
         .map(|sql| {
             let plan = explain(&store.read.conn, &sql);
             (sql, plan)
@@ -1054,11 +1155,16 @@ fn subtree_plans(store: &mut Store, run: impl FnOnce(&mut Store)) -> Vec<(String
 /// their target index.
 #[test]
 fn subtree_reads_search_one_key_range() {
-    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tracing = TRACING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, mut store) = store_with(200);
     populate_scan_structure(&mut store, 200);
     let roots = "SEARCH r USING COVERING INDEX sqlite_autoindex_roots_1 (name=?)";
-    for (prefix, key) in [("d07", "root_id=? AND path>? AND path<?"), ("", "root_id=?")] {
+    for (prefix, key) in [
+        ("d07", "root_id=? AND path>? AND path<?"),
+        ("", "root_id=?"),
+    ] {
         let search = |table: &str, covering: bool| {
             let index = if covering { "COVERING INDEX" } else { "INDEX" };
             format!("SEARCH t USING {index} sqlite_autoindex_{table}_1 ({key})")
@@ -1076,7 +1182,10 @@ fn subtree_reads_search_one_key_range() {
             store.observed_files_under("main", prefix).unwrap();
             store.bundle_file_hashes_under("main", prefix).unwrap();
         });
-        let plans = reads.iter().map(|(_, plan)| plan.clone()).collect::<Vec<_>>();
+        let plans = reads
+            .iter()
+            .map(|(_, plan)| plan.clone())
+            .collect::<Vec<_>>();
         assert_eq!(
             plans,
             ["files", "files"].map(read),
@@ -1099,12 +1208,13 @@ fn subtree_reads_search_one_key_range() {
         let under = [("main".to_owned(), prefix.to_owned())];
         let writes = subtree_plans(&mut store, |store| {
             store
-                .input_transaction(|txn| {
-                    txn.replace_source_claims(Some(&under), &[])
-                })
+                .input_transaction(|txn| txn.replace_source_claims(Some(&under), &[]))
                 .unwrap();
         });
-        let plans = writes.iter().map(|(_, plan)| plan.clone()).collect::<Vec<_>>();
+        let plans = writes
+            .iter()
+            .map(|(_, plan)| plan.clone())
+            .collect::<Vec<_>>();
         assert_eq!(
             plans,
             [
@@ -1158,7 +1268,10 @@ fn a_subtree_read_of_a_large_root_touches_its_rows() {
     let mut rows = 0;
     let narrow = pages(&reader, || {
         rows = reader.observed_files_under("main", "d08").unwrap().len();
-        rows += reader.bundle_file_hashes_under("main", "d08").unwrap().len();
+        rows += reader
+            .bundle_file_hashes_under("main", "d08")
+            .unwrap()
+            .len();
     });
     let whole = pages(&reader, || {
         drop(reader.observed_files_under("main", "").unwrap());
@@ -1166,7 +1279,10 @@ fn a_subtree_read_of_a_large_root_touches_its_rows() {
     });
     println!("subtree: {rows} rows in {narrow} pages (whole root: {whole} pages)");
     assert_eq!(rows, 3 * 400);
-    assert!(narrow <= 32 + 2 * rows as u64, "{narrow} pages for {rows} rows");
+    assert!(
+        narrow <= 32 + 2 * rows as u64,
+        "{narrow} pages for {rows} rows"
+    );
     assert!(whole >= 10 * narrow, "{narrow} pages against {whole}");
 }
 
@@ -1174,7 +1290,9 @@ fn a_subtree_read_of_a_large_root_touches_its_rows() {
 /// bundle rows with their roots, never a root-name lookup per bundle.
 #[test]
 fn bundles_with_root_names_are_one_join() {
-    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tracing = TRACING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, mut store) = store_with(200);
     let plans = subtree_plans(&mut store, |store| {
         let mut count = 0;
@@ -1203,7 +1321,9 @@ fn bundles_with_root_names_are_one_join() {
 /// migration), never by walking every row; and finds exactly those.
 #[test]
 fn stale_tag_rows_are_index_searches() {
-    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tracing = TRACING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, mut store) = store_with(200);
     let (module, old_module) = ([9; 32], [8; 32]);
     let updates = (0..200)
@@ -1229,7 +1349,9 @@ fn stale_tag_rows_are_index_searches() {
             .unwrap()
             .into_iter()
             .map(|(asset, bundle)| {
-                let index = (0..200).find(|index| asset_uuid(*index, 1) == asset).unwrap();
+                let index = (0..200)
+                    .find(|index| asset_uuid(*index, 1) == asset)
+                    .unwrap();
                 assert_eq!(bundle, bundle_uuid(index));
                 index % 50
             })
@@ -1267,7 +1389,10 @@ fn stale_tag_rows_are_index_searches() {
 }
 
 /// The statements a configuration change issues, with their plans.
-fn configuration_plans(store: &mut Store, run: impl FnOnce(&mut Store)) -> Vec<(String, Vec<String>)> {
+fn configuration_plans(
+    store: &mut Store,
+    run: impl FnOnce(&mut Store),
+) -> Vec<(String, Vec<String>)> {
     store.read.conn.trace(Some(trace));
     run(store);
     store.read.conn.trace(None);
@@ -1292,13 +1417,19 @@ fn configuration_plans(store: &mut Store, run: impl FnOnce(&mut Store)) -> Vec<(
 fn import_index_statements_search_their_keys() {
     use crate::bundles::{DirectoryOrigin, DirectoryRuleId};
     use crate::imports::{ImportIndexSource, ImportReadKey, WatchedImport};
-    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tracing = TRACING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, mut store) = store_with(20);
     // Two bundles generated by rules bundle 2 and one by a removed one.
     store
         .input_transaction(|txn| {
             let root = txn.intern_root("main")?;
-            for (index, rules) in [(100, bundle_uuid(2)), (101, bundle_uuid(2)), (102, bundle_uuid(99))] {
+            for (index, rules) in [
+                (100, bundle_uuid(2)),
+                (101, bundle_uuid(2)),
+                (102, bundle_uuid(99)),
+            ] {
                 txn.upsert_bundle(&BundleMeta {
                     bundle: bundle_uuid(index),
                     root,
@@ -1323,7 +1454,10 @@ fn import_index_statements_search_their_keys() {
         bundle: bundle_uuid(index),
         watched: Some(WatchedImport {
             record: asset_uuid(index, 2),
-            reads: vec![ImportReadKey::Path("tex/a.png".to_owned()), ImportReadKey::Listing],
+            reads: vec![
+                ImportReadKey::Path("tex/a.png".to_owned()),
+                ImportReadKey::Listing,
+            ],
         }),
         directory_rules: vec![(asset_uuid(index, 3), "d02/".to_owned())],
     };
@@ -1333,7 +1467,10 @@ fn import_index_statements_search_their_keys() {
             .unwrap();
         // A row of a bundle at a source not cleared.
         store.replace_import_index(&[], &[row(4)]).unwrap();
-        assert_eq!(store.watched_imports().unwrap(), [bundle_uuid(2), bundle_uuid(4)]);
+        assert_eq!(
+            store.watched_imports().unwrap(),
+            [bundle_uuid(2), bundle_uuid(4)]
+        );
         assert_eq!(
             store.watched_imports_reading(["tex/a.png"], true).unwrap(),
             [bundle_uuid(2), bundle_uuid(4)]
@@ -1344,7 +1481,10 @@ fn import_index_statements_search_their_keys() {
         assert_eq!(
             generating,
             [
-                (bundle_uuid(2), Some((crate::files::RootId(1), bundle_path(2)))),
+                (
+                    bundle_uuid(2),
+                    Some((crate::files::RootId(1), bundle_path(2)))
+                ),
                 (bundle_uuid(99), None),
             ]
         );
@@ -1421,7 +1561,9 @@ fn import_index_statements_search_their_keys() {
 /// the poisoned rows are a walk of their partial index.
 #[test]
 fn tag_state_statements_search_the_asset_key() {
-    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tracing = TRACING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, mut store) = store_with(20);
     let asset = asset_uuid(3, 1);
     let plans = configuration_plans(&mut store, |store| {
@@ -1443,14 +1585,28 @@ fn tag_state_statements_search_the_asset_key() {
     let plans = plans
         .iter()
         .filter(|(sql, _)| !sql.contains("store_meta") && !sql.contains("asset_tags"))
-        .map(|(sql, plan)| (sql.split_whitespace().take(4).collect::<Vec<_>>().join(" "), plan.clone()))
+        .map(|(sql, plan)| {
+            (
+                sql.split_whitespace().take(4).collect::<Vec<_>>().join(" "),
+                plan.clone(),
+            )
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         plans,
         [
-            ("UPDATE assets SET tag_poison".to_owned(), vec![by_key.to_owned()]),
-            ("UPDATE assets SET tag_poison".to_owned(), vec![by_key.to_owned()]),
-            ("SELECT tag_module, tag_poison FROM".to_owned(), vec![by_key.to_owned()]),
+            (
+                "UPDATE assets SET tag_poison".to_owned(),
+                vec![by_key.to_owned()]
+            ),
+            (
+                "UPDATE assets SET tag_poison".to_owned(),
+                vec![by_key.to_owned()]
+            ),
+            (
+                "SELECT tag_module, tag_poison FROM".to_owned(),
+                vec![by_key.to_owned()]
+            ),
             (
                 "SELECT asset_uuid, bundle_uuid FROM".to_owned(),
                 vec!["SCAN assets USING INDEX assets_tag_poisoned".to_owned()],
@@ -1466,7 +1622,9 @@ fn tag_state_statements_search_the_asset_key() {
 /// primary, for a full publication, is that index in order).
 #[test]
 fn primary_asset_statements_search_their_keys() {
-    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tracing = TRACING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, mut store) = store_with(20);
     let plans = configuration_plans(&mut store, |store| {
         store
@@ -1486,18 +1644,30 @@ fn primary_asset_statements_search_their_keys() {
     let plans = plans
         .iter()
         .filter(|(sql, _)| !sql.contains("store_meta"))
-        .map(|(sql, plan)| (sql.split_whitespace().take(4).collect::<Vec<_>>().join(" "), plan.clone()))
+        .map(|(sql, plan)| {
+            (
+                sql.split_whitespace().take(4).collect::<Vec<_>>().join(" "),
+                plan.clone(),
+            )
+        })
         .collect::<Vec<_>>();
     let set = (
         "UPDATE bundles SET primary_asset".to_owned(),
-        vec![bundle_key.to_owned(), "SCALAR SUBQUERY 1".to_owned(), by_key.to_owned()],
+        vec![
+            bundle_key.to_owned(),
+            "SCALAR SUBQUERY 1".to_owned(),
+            by_key.to_owned(),
+        ],
     );
     assert_eq!(
         plans,
         [
             set.clone(),
             set,
-            ("SELECT authoring_only FROM assets".to_owned(), vec![by_key.to_owned()]),
+            (
+                "SELECT authoring_only FROM assets".to_owned(),
+                vec![by_key.to_owned()]
+            ),
             (
                 "SELECT primary_asset FROM bundles".to_owned(),
                 vec!["SEARCH bundles USING INDEX bundles_by_path (path=?)".to_owned()],
@@ -1516,7 +1686,9 @@ fn primary_asset_statements_search_their_keys() {
 /// epochs are one read of the per-type table.
 #[test]
 fn a_changed_tag_epoch_marks_only_its_types_rows() {
-    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tracing = TRACING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, mut store) = store_with(200);
     let refined = |store: &mut Store| {
         let updates = [asset_uuid(3, 1), asset_uuid(3, 2), asset_uuid(4, 1)]
@@ -1530,11 +1702,17 @@ fn a_changed_tag_epoch_marks_only_its_types_rows() {
             .collect::<Vec<_>>();
         store.refine_unpublished_tag_index(&updates).unwrap();
     };
-    let epochs = |record: u8| BTreeMap::from([(RUNTIME_TYPE, [1; 32]), (RECORD_TYPE, [record; 32])]);
+    let epochs =
+        |record: u8| BTreeMap::from([(RUNTIME_TYPE, [1; 32]), (RECORD_TYPE, [record; 32])]);
     let pending = |store: &Store| {
         [asset_uuid(3, 1), asset_uuid(3, 2), asset_uuid(4, 1)]
             .into_iter()
-            .filter(|asset| store.stale_tag_index_assets(None).unwrap().contains_key(asset))
+            .filter(|asset| {
+                store
+                    .stale_tag_index_assets(None)
+                    .unwrap()
+                    .contains_key(asset)
+            })
             .collect::<Vec<_>>()
     };
     let mark = |store: &mut Store, epochs: &BTreeMap<TypeUuid, [u8; 32]>| {
@@ -1559,7 +1737,10 @@ fn a_changed_tag_epoch_marks_only_its_types_rows() {
         );
     });
     assert_eq!(pending(&store), [asset_uuid(3, 2)]);
-    let plans = plans.iter().map(|(_, plan)| plan.clone()).collect::<Vec<_>>();
+    let plans = plans
+        .iter()
+        .map(|(_, plan)| plan.clone())
+        .collect::<Vec<_>>();
     assert_eq!(
         plans,
         [
@@ -1577,7 +1758,9 @@ fn a_changed_tag_epoch_marks_only_its_types_rows() {
 /// `source_claims_by_subject`.
 #[test]
 fn reconfigured_sources_are_index_searches() {
-    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tracing = TRACING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, mut store) = store_with(1000);
     let plans = configuration_plans(&mut store, |store| {
         let records = store.bundle_sources_of_type(RECORD_TYPE, false).unwrap();
@@ -1585,12 +1768,18 @@ fn reconfigured_sources_are_index_searches() {
         assert!(records.iter().all(|(_, path)| *path == bundle_path(3)));
         let poisoned = store.bundle_sources_of_type(RUNTIME_TYPE, true).unwrap();
         assert_eq!(
-            poisoned.into_iter().map(|(_, path)| path).collect::<Vec<_>>(),
+            poisoned
+                .into_iter()
+                .map(|(_, path)| path)
+                .collect::<Vec<_>>(),
             [bundle_path(199), bundle_path(699)]
         );
         store.unpublished_claim_sources().unwrap();
     });
-    let plans = plans.iter().map(|(_, plan)| plan.clone()).collect::<Vec<_>>();
+    let plans = plans
+        .iter()
+        .map(|(_, plan)| plan.clone())
+        .collect::<Vec<_>>();
     let source_type = [
         "SEARCH a USING INDEX assets_by_type (type_uuid=?)",
         "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)",
@@ -1622,7 +1811,9 @@ fn reconfigured_sources_are_index_searches() {
 /// (`bundles_poisoned`), the watched imports' (`bundles_import_watched`).
 #[test]
 fn rare_row_reads_walk_their_partial_index() {
-    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tracing = TRACING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, store) = store_with(200);
     let mut reader = store.reader().unwrap();
     let cases: [(&dyn Fn(&StoreReader), &[&str]); 3] = [
@@ -1657,7 +1848,9 @@ fn rare_row_reads_walk_their_partial_index() {
 /// or value read.
 #[test]
 fn runtime_entry_types_are_one_statement() {
-    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tracing = TRACING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut answered = Vec::new();
     for count in [50, 500] {
         let (_dir, store) = store_with(count);
@@ -1675,7 +1868,10 @@ fn runtime_entry_types_are_one_statement() {
             ]
         );
     }
-    assert!(answered[1] > 9 * answered[0] && answered[0] > 0, "{answered:?}");
+    assert!(
+        answered[1] > 9 * answered[0] && answered[0] > 0,
+        "{answered:?}"
+    );
 }
 
 /// A candidate bucket's rows are one search of its primary key, and a
@@ -1684,7 +1880,9 @@ fn runtime_entry_types_are_one_statement() {
 fn candidate_rows_search_their_bucket() {
     let (_dir, store) = store_with(10);
     assert_eq!(
-        store.query_plan_details(crate::cas::store::CANDIDATE_ROWS).unwrap(),
+        store
+            .query_plan_details(crate::cas::store::CANDIDATE_ROWS)
+            .unwrap(),
         [
             "SEARCH results USING INDEX sqlite_autoindex_results_1 (key_kind=? AND static_key=?)",
             "USE TEMP B-TREE FOR ORDER BY",
@@ -1711,7 +1909,9 @@ fn pass_bookkeeping_statements_search_their_indexes() {
     use crate::imports::ImportIndexSource;
     use crate::state::{AssetClaimant, ReadableBundleSource};
     use distill_core::id::BundleFileHash;
-    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tracing = TRACING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, mut store) = store_with(200);
     populate_scan_structure(&mut store, 200);
     let rules = |index: u32| ImportIndexSource {
@@ -1721,7 +1921,10 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         watched: None,
         directory_rules: vec![(asset_uuid(index, 3), format!("d{:02}/", index % 50))],
     };
-    let sources = (0..200).step_by(2).map(|index| ("main".to_owned(), bundle_path(index))).collect::<Vec<_>>();
+    let sources = (0..200)
+        .step_by(2)
+        .map(|index| ("main".to_owned(), bundle_path(index)))
+        .collect::<Vec<_>>();
     let rows = (0..200).step_by(2).map(rules).collect::<Vec<_>>();
     store.replace_import_index(&sources, &rows).unwrap();
     store
@@ -1735,30 +1938,36 @@ fn pass_bookkeeping_statements_search_their_indexes() {
     let authored = |path: &str| crate::claims::SourceClaims {
         root_name: "main".to_owned(),
         path: path.to_owned(),
-        claims: vec![crate::claims::SourceClaim::Bundle {
-            bundle: bundle_uuid(42),
-            source: ReadableBundleSource {
-                root_name: "main".to_owned(),
-                normalized_path: path.to_owned(),
-                file_hash: BundleFileHash([1; 32]),
-            },
-        }, crate::claims::SourceClaim::Authored {
-            asset: asset_uuid(42, 1),
-            claimant: AssetClaimant::Authored {
+        claims: vec![
+            crate::claims::SourceClaim::Bundle {
+                bundle: bundle_uuid(42),
                 source: ReadableBundleSource {
                     root_name: "main".to_owned(),
                     normalized_path: path.to_owned(),
                     file_hash: BundleFileHash([1; 32]),
                 },
-                bundle: bundle_uuid(42),
-                local_id: "main".to_owned(),
             },
-        }],
+            crate::claims::SourceClaim::Authored {
+                asset: asset_uuid(42, 1),
+                claimant: AssetClaimant::Authored {
+                    source: ReadableBundleSource {
+                        root_name: "main".to_owned(),
+                        normalized_path: path.to_owned(),
+                        file_hash: BundleFileHash([1; 32]),
+                    },
+                    bundle: bundle_uuid(42),
+                    local_id: "main".to_owned(),
+                },
+            },
+        ],
     };
     let under = [("main".to_owned(), "x/b.bundle".to_owned())];
     store
         .input_transaction(|txn| {
-            txn.replace_source_claims(Some(&[("main".to_owned(), "x/a.bundle".to_owned())]), &[authored("x/a.bundle")])?;
+            txn.replace_source_claims(
+                Some(&[("main".to_owned(), "x/a.bundle".to_owned())]),
+                &[authored("x/a.bundle")],
+            )?;
             txn.replace_source_claims(Some(&under), &[authored("x/b.bundle")])
         })
         .unwrap();
@@ -1766,7 +1975,9 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         store.path_claims(&bundle_path(4)).unwrap();
         let work = store.pending_file_work().unwrap();
         store.acknowledge_file_work(&work).unwrap();
-        store.replace_import_index(&sources[..1], &rows[..1]).unwrap();
+        store
+            .replace_import_index(&sources[..1], &rows[..1])
+            .unwrap();
         store.directory_rule_sources_listing(["", "d04/"]).unwrap();
         store
             .input_transaction(|txn| txn.publish_claims_namespace_errors().map(drop))
@@ -1796,22 +2007,29 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         let mut kept = populate_scan_structure_claims(200);
         kept.pop();
         store
-            .input_transaction(|txn| {
-                txn.replace_source_claims(None, &kept)
-            })
+            .input_transaction(|txn| txn.replace_source_claims(None, &kept))
             .unwrap();
     });
     let plan = |prefix: &str| {
         let found = plans
             .iter()
-            .filter(|(sql, _)| sql.split_whitespace().collect::<Vec<_>>().join(" ").starts_with(prefix))
+            .filter(|(sql, _)| {
+                sql.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .starts_with(prefix)
+            })
             .map(|(_, plan)| plan.clone())
             .collect::<Vec<_>>();
-        assert!(!found.is_empty(), "no statement starts with {prefix:?}: {plans:#?}");
+        assert!(
+            !found.is_empty(),
+            "no statement starts with {prefix:?}: {plans:#?}"
+        );
         found
     };
     let by_root = "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)";
-    let by_subject = ["SEARCH source_claims USING INDEX source_claims_by_subject (kind=? AND subject=?)"];
+    let by_subject =
+        ["SEARCH source_claims USING INDEX source_claims_by_subject (kind=? AND subject=?)"];
     let distinct = [
         "SEARCH source_claims USING INDEX source_claims_by_subject (kind=? AND subject=?)",
         "USE TEMP B-TREE FOR DISTINCT",
@@ -2016,7 +2234,9 @@ fn cas_statements_search_their_indexes() {
 fn cas_verification_reads_per_segment() {
     use crate::cas::store::{VERIFY_SEGMENTS, VERIFY_SEGMENT_EXTENTS};
     use crate::cas::{BuildCommit, CommitOutcome, OutputSpec};
-    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tracing = TRACING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let mut config = crate::StoreConfig::new(dir.path().join("state"));
     config.segment_size = 512;
@@ -2044,7 +2264,9 @@ fn cas_verification_reads_per_segment() {
     }
     let segments: usize = store
         .conn
-        .query_row("SELECT COUNT(*) FROM cas_segments", [], |row| row.get::<_, i64>(0))
+        .query_row("SELECT COUNT(*) FROM cas_segments", [], |row| {
+            row.get::<_, i64>(0)
+        })
         .unwrap() as usize;
     assert!(segments > 1 && segments < 100, "{segments}");
     let mut reader = store.reader().unwrap();
@@ -2069,10 +2291,15 @@ fn cas_verification_reads_per_segment() {
 fn a_target_replacement_searches_its_key() {
     let (_dir, store) = store_with(1);
     assert_eq!(
-        store.query_plan_details("DELETE FROM rpc_targets WHERE name = ?1").unwrap(),
+        store
+            .query_plan_details("DELETE FROM rpc_targets WHERE name = ?1")
+            .unwrap(),
         ["SEARCH rpc_targets USING INDEX sqlite_autoindex_rpc_targets_1 (name=?)"]
     );
-    assert!(store.query_plan_details(crate::served::SET_RPC_TARGET).unwrap().is_empty());
+    assert!(store
+        .query_plan_details(crate::served::SET_RPC_TARGET)
+        .unwrap()
+        .is_empty());
     assert!(store
         .query_plan_details(crate::served::APPEND_RECONNECT_ALL)
         .unwrap()
@@ -2082,8 +2309,8 @@ fn a_target_replacement_searches_its_key() {
 /// Pages a subscriber's history read fetches: one subscribed asset and
 /// one subscribed path among `unrelated` other changes in the window.
 fn history_pages(unrelated: u32) -> u64 {
-    use crate::state::InputVersion;
     use crate::served::{Change, ServedWrite};
+    use crate::state::InputVersion;
     use distill_core::id::AssetUuid;
     use std::collections::BTreeSet;
     let dir = tempfile::tempdir().unwrap();
@@ -2094,11 +2321,33 @@ fn history_pages(unrelated: u32) -> u64 {
             for index in 0..unrelated {
                 let mut uuid = [0u8; 16];
                 uuid[..4].copy_from_slice(&index.to_le_bytes());
-                txn.append_change(version, &Change::Asset { asset: AssetUuid(uuid), state: 1 })?;
-                txn.append_change(version, &Change::Path { path: format!("other/{index}") })?;
+                txn.append_change(
+                    version,
+                    &Change::Asset {
+                        asset: AssetUuid(uuid),
+                        state: 1,
+                    },
+                )?;
+                txn.append_change(
+                    version,
+                    &Change::Path {
+                        path: format!("other/{index}"),
+                    },
+                )?;
             }
-            txn.append_change(version, &Change::Asset { asset: AssetUuid([0xff; 16]), state: 1 })?;
-            txn.append_change(version, &Change::Path { path: "watched".into() })
+            txn.append_change(
+                version,
+                &Change::Asset {
+                    asset: AssetUuid([0xff; 16]),
+                    state: 1,
+                },
+            )?;
+            txn.append_change(
+                version,
+                &Change::Path {
+                    path: "watched".into(),
+                },
+            )
         })
         .unwrap();
     let reader = store.reader().unwrap();
@@ -2121,7 +2370,10 @@ fn subscription_history_reads_the_subscribed_subjects() {
     let small = history_pages(10);
     let large = history_pages(5000);
     println!("history pages: {small} at 10 unrelated changes, {large} at 5000");
-    assert!(large <= 16, "history pages: {small} at 10 unrelated changes, {large} at 5000");
+    assert!(
+        large <= 16,
+        "history pages: {small} at 10 unrelated changes, {large} at 5000"
+    );
 }
 
 #[test]
@@ -2141,7 +2393,9 @@ fn subscription_history_searches_one_subject() {
 /// searches: the asset, its bundle, its tags.
 #[test]
 fn an_entry_and_its_bundle_are_one_statement() {
-    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tracing = TRACING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, store) = store_with(1000);
     let mut reader = store.reader().unwrap();
     connection(&mut reader).trace(Some(trace));
@@ -2161,7 +2415,10 @@ fn an_entry_and_its_bundle_are_one_statement() {
         ])
     );
     assert_eq!(untagged.tags.len(), 1);
-    assert!(matches!(poisoned, Err(crate::StoreError::BundlePoisoned { .. })), "{poisoned:?}");
+    assert!(
+        matches!(poisoned, Err(crate::StoreError::BundlePoisoned { .. })),
+        "{poisoned:?}"
+    );
     assert_eq!(
         store.query_plan_details(crate::bundles::ENTRY).unwrap(),
         [
@@ -2211,7 +2468,9 @@ fn statement_shape(sql: &str) -> String {
 #[test]
 fn cas_and_served_point_statements_search_their_keys() {
     use crate::cas::{BuildCommit, CommitOutcome, OutputSpec};
-    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tracing = TRACING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let mut config = crate::StoreConfig::new(dir.path().join(".distill"));
     config.segment_size = 4096;
@@ -2245,7 +2504,9 @@ fn cas_and_served_point_statements_search_their_keys() {
             },
         })
         .unwrap();
-    let candidates = store.lookup_candidates(crate::cas::record::KeyKind::Processor, &key).unwrap();
+    let candidates = store
+        .lookup_candidates(crate::cas::record::KeyKind::Processor, &key)
+        .unwrap();
     let hash = installed[11];
     store.cas_read(&hash.0).unwrap();
     store.artifact_load_edges(hash).unwrap();
@@ -2258,7 +2519,9 @@ fn cas_and_served_point_statements_search_their_keys() {
     store.asset_resolution(asset_uuid(200, 1)).unwrap();
     store.derived_output(asset).unwrap();
     store.served_path_candidates(&bundle_path(42)).unwrap();
-    store.served_named_candidates(&bundle_path(42), "main").unwrap();
+    store
+        .served_named_candidates(&bundle_path(42), "main")
+        .unwrap();
     store.rpc_target("pc").unwrap();
     store.rpc_targets().unwrap();
     store.change_log_head().unwrap();
@@ -2485,7 +2748,12 @@ fn cas_and_served_point_statements_search_their_keys() {
     ];
     let expected = expected
         .iter()
-        .map(|(sql, plan)| (sql.to_string(), plan.iter().map(|step| step.to_string()).collect::<Vec<_>>()))
+        .map(|(sql, plan)| {
+            (
+                sql.to_string(),
+                plan.iter().map(|step| step.to_string()).collect::<Vec<_>>(),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
     assert_eq!(plans, expected);
 }
@@ -2496,7 +2764,9 @@ fn cas_and_served_point_statements_search_their_keys() {
 fn a_file_content_hash_searches_two_keys() {
     let (_dir, store) = store_with(10);
     assert_eq!(
-        store.query_plan_details(crate::files::FILE_CONTENT_HASH).unwrap(),
+        store
+            .query_plan_details(crate::files::FILE_CONTENT_HASH)
+            .unwrap(),
         [
             "SEARCH r USING COVERING INDEX sqlite_autoindex_roots_1 (name=?)",
             "SEARCH t USING INDEX sqlite_autoindex_files_1 (root_id=? AND path=?)",
@@ -2512,14 +2782,15 @@ fn a_file_content_hash_searches_two_keys() {
     assert_eq!(reader.file_content_hash("main", "missing").unwrap(), None);
 }
 
-
 /// The complete published observation's bundle hashes (the full scan's
 /// comparison of its candidate with the store) are the `files` rows of
 /// `.bundle` files, read through their extension index; the store keeps no
 /// bundle bytes.
 #[test]
 fn every_bundle_file_hash_is_one_extension_search() {
-    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tracing = TRACING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, mut store) = store_with(200);
     let plans = subtree_plans(&mut store, |store| {
         let mut count = 0;
@@ -2560,7 +2831,9 @@ fn rules_at(store: &StoreReader, path: &str) -> Vec<crate::imports::DirectoryRul
 fn the_withheld_assets_are_searched_from_the_collisions() {
     let (_dir, store) = store_with(0);
     assert_eq!(
-        store.query_plan_details(crate::served::WITHHELD_ASSETS).unwrap(),
+        store
+            .query_plan_details(crate::served::WITHHELD_ASSETS)
+            .unwrap(),
         [
             "COMPOUND QUERY",
             "LEFT-MOST SUBQUERY",

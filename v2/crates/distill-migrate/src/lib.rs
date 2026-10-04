@@ -23,7 +23,9 @@ mod validate;
 mod walk;
 
 pub use conform::{conforms, ConformError};
-pub use execute::{execute_edge, execute_ops, execute_sparse, DefaultProvider, Exec, FnProvider, MigrationError};
+pub use execute::{
+    execute_edge, execute_ops, execute_sparse, DefaultProvider, Exec, FnProvider, MigrationError,
+};
 pub use identical::resolve_path;
 pub use lossy::{lossy_drops, zero_value};
 pub use plan::{plan_automatic, plan_automatic_renamed, PlanRefusal};

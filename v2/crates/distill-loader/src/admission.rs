@@ -65,7 +65,10 @@ impl FetchAdmission {
             granted: Cell::new(false),
             waker: RefCell::new(None),
         });
-        self.state.borrow_mut().waiting.push_back(Rc::clone(&waiter));
+        self.state
+            .borrow_mut()
+            .waiting
+            .push_back(Rc::clone(&waiter));
         self.grant();
         Admit {
             admission: self.clone(),

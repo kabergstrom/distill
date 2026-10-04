@@ -170,8 +170,7 @@ fn native_watcher_reports_create_without_scanning() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("assets");
     std::fs::create_dir(&root).unwrap();
-    let scanner = RootedScanner::new([AssetRoot::new("main", &root)])
-    .unwrap();
+    let scanner = RootedScanner::new([AssetRoot::new("main", &root)]).unwrap();
     let queue = Arc::new(Mutex::new(WatcherQueue::new()));
     let _watcher = WatcherThread::start(scanner, [], sink(&queue)).unwrap();
     let path = root.join("source.txt");
@@ -193,8 +192,7 @@ fn root_replacement_requests_one_catch_up_scan_then_watches_new_root() {
     let second = temp.path().join("second");
     std::fs::create_dir(&first).unwrap();
     std::fs::create_dir(&second).unwrap();
-    let scanner = RootedScanner::new([AssetRoot::new("main", &first)])
-    .unwrap();
+    let scanner = RootedScanner::new([AssetRoot::new("main", &first)]).unwrap();
     let queue = Arc::new(Mutex::new(WatcherQueue::new()));
     let watcher = WatcherThread::start(scanner.clone(), [], sink(&queue)).unwrap();
 
@@ -248,8 +246,7 @@ fn native_watcher_maps_parent_introduction_to_missing_control_without_a_scan() {
     let root = temp.path().join("assets");
     std::fs::create_dir(&root).unwrap();
     let control = temp.path().join("controls/generated/schema.json");
-    let scanner = RootedScanner::new([AssetRoot::new("main", &root)])
-    .unwrap();
+    let scanner = RootedScanner::new([AssetRoot::new("main", &root)]).unwrap();
     let queue = Arc::new(Mutex::new(WatcherQueue::new()));
     let _watcher = WatcherThread::start(scanner, [control.clone()], sink(&queue)).unwrap();
 

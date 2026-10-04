@@ -3,10 +3,10 @@
 
 mod common;
 use common::*;
+use distill_json::AuthoredValue;
 use distill_migrate::{
     execute_ops, lossy_drops, plan_automatic_renamed, validate_plan, EdgeKind, MigrationOp,
 };
-use distill_json::AuthoredValue;
 use ngp_schema::{Renames, SchemaNode};
 
 fn renames(pairs: &[(&str, &str)]) -> Renames {
@@ -25,7 +25,9 @@ fn a_renamed_field_is_copied_from_its_old_name() {
         from: path(&["hp"]),
         to: path(&["health"])
     }));
-    assert!(!ops.iter().any(|op| matches!(op, MigrationOp::DropField { .. })));
+    assert!(!ops
+        .iter()
+        .any(|op| matches!(op, MigrationOp::DropField { .. })));
     validate_plan(&ops, &old, &new, EdgeKind::Automatic).unwrap();
     let input = obj(&[("a", ui(1)), ("hp", ui(40))]);
     assert!(lossy_drops(&ops, &old, &input).is_empty());
@@ -56,28 +58,42 @@ fn renames_apply_inside_elements_and_variant_payloads() {
         0,
         &[
             ("items", 0, vec_of(item("label"))),
-            ("shape", 0, enm(0, &[("Circle", 0, strct(0, &[("r", 0, p(PK::F32))]))])),
+            (
+                "shape",
+                0,
+                enm(0, &[("Circle", 0, strct(0, &[("r", 0, p(PK::F32))]))]),
+            ),
         ],
     );
     let new = strct(
         0,
         &[
             ("items", 0, vec_of(item("name"))),
-            ("shape", 0, enm(0, &[("Circle", 0, strct(0, &[("radius", 0, p(PK::F32))]))])),
+            (
+                "shape",
+                0,
+                enm(0, &[("Circle", 0, strct(0, &[("radius", 0, p(PK::F32))]))]),
+            ),
         ],
     );
     let table = renames(&[("$.items[].name", "label"), ("$.shape{Circle}.radius", "r")]);
     let ops = plan_automatic_renamed(&old, &new, &table).unwrap();
     validate_plan(&ops, &old, &new, EdgeKind::Automatic).unwrap();
     let input = obj(&[
-        ("items", arr_v(&[obj(&[("label", AuthoredValue::Str("one".into()))])])),
+        (
+            "items",
+            arr_v(&[obj(&[("label", AuthoredValue::Str("one".into()))])]),
+        ),
         ("shape", obj(&[("Circle", obj(&[("r", fl(2.0))]))])),
     ]);
     let out = execute_ops(&ops, &input, &old, &new, &NoDefaults).unwrap();
     assert_eq!(
         out.value,
         obj(&[
-            ("items", arr_v(&[obj(&[("name", AuthoredValue::Str("one".into()))])])),
+            (
+                "items",
+                arr_v(&[obj(&[("name", AuthoredValue::Str("one".into()))])])
+            ),
             ("shape", obj(&[("Circle", obj(&[("radius", fl(2.0))]))])),
         ])
     );
@@ -102,7 +118,11 @@ fn a_rename_that_also_changes_shape_or_rev_is_refused() {
     let old = strct(0, &[("inner", 0, strct(0, &[("a", 0, p(PK::U8))]))]);
     let new = strct(
         0,
-        &[("outer", 0, strct(0, &[("a", 0, p(PK::U8)), ("b", 0, p(PK::U8))]))],
+        &[(
+            "outer",
+            0,
+            strct(0, &[("a", 0, p(PK::U8)), ("b", 0, p(PK::U8))]),
+        )],
     );
     let refusal =
         plan_automatic_renamed(&old, &new, &renames(&[("$.outer", "inner")])).unwrap_err();
@@ -120,13 +140,31 @@ fn a_rename_that_also_changes_shape_or_rev_is_refused() {
 #[test]
 fn sparse_values_migrate_only_their_present_fields() {
     let mode_old = enm(0, &[("A", 0, unit_payload()), ("B", 0, unit_payload())]);
-    let mode_new = enm(0, &[("A", 0, unit_payload()), ("B", 0, unit_payload()), ("C", 0, unit_payload())]);
+    let mode_new = enm(
+        0,
+        &[
+            ("A", 0, unit_payload()),
+            ("B", 0, unit_payload()),
+            ("C", 0, unit_payload()),
+        ],
+    );
     let old = strct(
         0,
         &[
             ("a", 0, p(PK::U32)),
             ("hp", 0, p(PK::U16)),
-            ("inner", 0, strct(0, &[("gone", 0, p(PK::U32)), ("keep", 0, p(PK::U16)), ("same", 0, p(PK::U8))])),
+            (
+                "inner",
+                0,
+                strct(
+                    0,
+                    &[
+                        ("gone", 0, p(PK::U32)),
+                        ("keep", 0, p(PK::U16)),
+                        ("same", 0, p(PK::U8)),
+                    ],
+                ),
+            ),
             ("mode", 0, mode_old),
             ("name", 0, SchemaNode::String),
         ],
@@ -137,7 +175,18 @@ fn sparse_values_migrate_only_their_present_fields() {
             ("a", 0, p(PK::U32)),
             ("added", 0, opt(p(PK::F32))),
             ("health", 0, p(PK::U32)),
-            ("inner", 0, strct(0, &[("keep", 0, p(PK::U32)), ("new", 0, p(PK::U8)), ("same", 0, p(PK::U8))])),
+            (
+                "inner",
+                0,
+                strct(
+                    0,
+                    &[
+                        ("keep", 0, p(PK::U32)),
+                        ("new", 0, p(PK::U8)),
+                        ("same", 0, p(PK::U8)),
+                    ],
+                ),
+            ),
             ("mode", 0, mode_new),
             ("name", 0, SchemaNode::String),
         ],
@@ -151,7 +200,11 @@ fn sparse_values_migrate_only_their_present_fields() {
     let out = distill_migrate::execute_sparse(&ops, &input, &old, &new).unwrap();
     assert_eq!(
         out,
-        obj(&[("health", ui(7)), ("inner", obj(&[("keep", ui(3))])), ("mode", st("B"))])
+        obj(&[
+            ("health", ui(7)),
+            ("inner", obj(&[("keep", ui(3))])),
+            ("mode", st("B"))
+        ])
     );
     let empty = distill_migrate::execute_sparse(&ops, &obj(&[]), &old, &new).unwrap();
     assert_eq!(empty, obj(&[]));

@@ -1,9 +1,9 @@
 use distill_core::canonical::{CanonicalEncoder, DSVP};
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid};
 use distill_store::state::{
-    AssetClaimant, PhysicalPathClaim, PhysicalPathFailureCode, PlatformPathBytes,
-    ReadableBundleSource, ScanFailureCode, ScanSubject, NamespaceError, NamespaceErrorCode,
-    NamespaceErrorDecodeError, NamespaceErrorV1,
+    AssetClaimant, NamespaceError, NamespaceErrorCode, NamespaceErrorDecodeError, NamespaceErrorV1,
+    PhysicalPathClaim, PhysicalPathFailureCode, PlatformPathBytes, ReadableBundleSource,
+    ScanFailureCode, ScanSubject,
 };
 
 fn source(root: &str, path: &str, byte: u8) -> ReadableBundleSource {

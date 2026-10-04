@@ -122,8 +122,7 @@ pub struct CandidateRow {
 }
 
 /// A candidate bucket's rows, newest first.
-pub(crate) const CANDIDATE_ROWS: &str =
-    "SELECT trace_digest, memo_seq FROM results
+pub(crate) const CANDIDATE_ROWS: &str = "SELECT trace_digest, memo_seq FROM results
      WHERE key_kind = ?1 AND static_key = ?2 ORDER BY memo_seq DESC";
 
 /// One result with what it names, its outputs in role and name order.
@@ -271,20 +270,21 @@ fn io_err(path: &std::path::Path) -> impl Fn(std::io::Error) -> StoreError + '_ 
     }
 }
 
-
 /// Install `holder` as a holder of the extent `hash`.
 pub(crate) fn insert_ref(
     txn: &rusqlite::Connection,
     holder: &[u8; 32],
     hash: &[u8; 32],
 ) -> Result<(), StoreError> {
-    txn
-        .prepare_cached("INSERT OR IGNORE INTO cas_refs(holder, content_hash) VALUES (?1, ?2)")?
+    txn.prepare_cached("INSERT OR IGNORE INTO cas_refs(holder, content_hash) VALUES (?1, ?2)")?
         .execute(rusqlite::params![holder.as_slice(), hash.as_slice()])?;
     Ok(())
 }
 
-pub(crate) fn extent_exists(txn: &rusqlite::Connection, hash: &[u8; 32]) -> Result<bool, StoreError> {
+pub(crate) fn extent_exists(
+    txn: &rusqlite::Connection,
+    hash: &[u8; 32],
+) -> Result<bool, StoreError> {
     use rusqlite::OptionalExtension;
     Ok(txn
         .prepare_cached("SELECT 1 FROM cas_extents WHERE content_hash = ?1")?
@@ -353,7 +353,10 @@ impl Store {
         kind: SegmentKind,
         state: i64,
     ) -> Result<u64, StoreError> {
-        debug_assert!(!self.conn.is_autocommit(), "segments are allocated in a write transaction");
+        debug_assert!(
+            !self.conn.is_autocommit(),
+            "segments are allocated in a write transaction"
+        );
         let id = meta_get_u64(&self.conn, "next_segment_id")?.unwrap_or(0);
         meta_set_u64(&self.conn, "next_segment_id", id + 1)?;
         let name = segment_file_name(id, kind);
@@ -412,7 +415,10 @@ impl Store {
     /// the transaction that allocates the next. An extent larger than the
     /// cap gets an oversize segment of its own.
     fn append_extents(&mut self, encoded: &[&[u8]]) -> Result<Appended, StoreError> {
-        debug_assert!(!self.conn.is_autocommit(), "extents are appended in a write transaction");
+        debug_assert!(
+            !self.conn.is_autocommit(),
+            "extents are appended in a write transaction"
+        );
         if encoded.is_empty() {
             return Ok(Appended {
                 locations: Vec::new(),
@@ -607,17 +613,22 @@ impl Store {
             // names the bytes its last stage committed.
             let mut group: Vec<([u8; 32], &[u8])> = Vec::new();
             for (hash, preimage) in &trees {
-                if !extent_exists(&store.conn, &hash.0)? && !group.iter().any(|(held, _)| *held == hash.0) {
+                if !extent_exists(&store.conn, &hash.0)?
+                    && !group.iter().any(|(held, _)| *held == hash.0)
+                {
                     group.push((hash.0, preimage));
                 }
             }
             for (hash, bytes) in &extents {
-                if !extent_exists(&store.conn, hash)? && !group.iter().any(|(held, _)| held == hash) {
+                if !extent_exists(&store.conn, hash)? && !group.iter().any(|(held, _)| held == hash)
+                {
                     group.push((*hash, bytes));
                 }
             }
             for (_, layout) in &layouts {
-                if !extent_exists(&store.conn, layout)? && !trees.iter().any(|(tree, _)| tree.0 == *layout) {
+                if !extent_exists(&store.conn, layout)?
+                    && !trees.iter().any(|(tree, _)| tree.0 == *layout)
+                {
                     return Err(StoreError::MissingWireTree { hash: *layout });
                 }
             }
@@ -664,7 +675,12 @@ impl Store {
                 };
                 for row in &output_rows {
                     let types = row.type_uuids.iter().flat_map(|uuid| uuid.0).collect();
-                    name(ROLE_OUTPUT, &row.output_key, Some(types), &row.content_hash.0)?;
+                    name(
+                        ROLE_OUTPUT,
+                        &row.output_key,
+                        Some(types),
+                        &row.content_hash.0,
+                    )?;
                 }
                 for row in &aux_rows {
                     name(ROLE_AUX, &row.debug_key, None, &row.content_hash.0)?;
@@ -787,8 +803,16 @@ impl StoreReader {
         while let Some(r) = rows.next()? {
             if found.is_none() {
                 let asset: Vec<u8> = r.get(0)?;
-                let asset = AssetUuid(asset.try_into().map_err(|_| bad("asset uuid is not 16 bytes"))?);
-                found = Some((asset, r.get::<_, Vec<u8>>(1)?, r.get::<_, Option<Vec<u8>>>(2)?));
+                let asset = AssetUuid(
+                    asset
+                        .try_into()
+                        .map_err(|_| bad("asset uuid is not 16 bytes"))?,
+                );
+                found = Some((
+                    asset,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, Option<Vec<u8>>>(2)?,
+                ));
             }
             let Some(role) = r.get::<_, Option<i64>>(3)? else {
                 continue;
@@ -991,8 +1015,7 @@ impl StoreReader {
             .read(true)
             .open(&path)
             .map_err(io_err(&path))?;
-        f.seek(SeekFrom::Start(offset))
-            .map_err(io_err(&path))?;
+        f.seek(SeekFrom::Start(offset)).map_err(io_err(&path))?;
         let mut buf = vec![0u8; len as usize];
         f.read_exact(&mut buf).map_err(io_err(&path))?;
         Ok(buf)

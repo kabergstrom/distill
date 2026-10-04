@@ -35,8 +35,7 @@ fn ordinary_bundle() -> Vec<u8> {
 fn scanner(temp: &tempfile::TempDir) -> RootedScanner {
     let root = temp.path().join("assets");
     std::fs::create_dir_all(&root).unwrap();
-    RootedScanner::new([AssetRoot::new("main", &root)])
-    .unwrap()
+    RootedScanner::new([AssetRoot::new("main", &root)]).unwrap()
 }
 
 #[test]
@@ -168,8 +167,7 @@ fn replacement_roots_are_shared_by_existing_scanner_clones() {
     std::fs::write(first.join("old.txt"), b"old").unwrap();
     std::fs::write(second.join("new.txt"), b"new").unwrap();
 
-    let scanner = RootedScanner::new([AssetRoot::new("main", &first)])
-    .unwrap();
+    let scanner = RootedScanner::new([AssetRoot::new("main", &first)]).unwrap();
     let watcher_view = scanner.clone();
     scanner
         .replace_roots([AssetRoot::new("main", &second)])
@@ -417,8 +415,7 @@ fn canonical_error_path_maps_to_exact_subject_under_symlinked_root() {
     let configured = temp.path().join("assets");
     std::fs::create_dir_all(real.join("nested")).unwrap();
     symlink(&real, &configured).unwrap();
-    let scanner = RootedScanner::new([AssetRoot::new("main", &configured)])
-    .unwrap();
+    let scanner = RootedScanner::new([AssetRoot::new("main", &configured)]).unwrap();
     let canonical = std::fs::canonicalize(&real).unwrap();
 
     assert_eq!(

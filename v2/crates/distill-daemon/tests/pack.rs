@@ -135,7 +135,10 @@ fn pack_output_inside_an_asset_root_is_rejected() {
             matches!(&error, PackCommandError::OutputInsideAssetRoot { root, .. } if root == "main"),
             "{error:?}"
         );
-        assert!(error.to_string().contains("inside asset root `main`"), "{error}");
+        assert!(
+            error.to_string().contains("inside asset root `main`"),
+            "{error}"
+        );
     }
 }
 
@@ -154,9 +157,10 @@ fn pack_without_a_daemon_says_to_start_one() {
         "{error:?}"
     );
     assert!(
-        error
-            .to_string()
-            .starts_with(&format!("no distilld at {}; start it first", config.daemon.address)),
+        error.to_string().starts_with(&format!(
+            "no distilld at {}; start it first",
+            config.daemon.address
+        )),
         "{error}"
     );
 }

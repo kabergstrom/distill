@@ -6,10 +6,10 @@ use std::sync::{Arc, OnceLock};
 use distill_asset::{AssetRuntimeDescriptor, AssetType, EncodeSink, ErasedValue, ModuleEpochToken};
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash, TypeUuid};
 use distill_loader::{
-    AdoptionId, AssetPath, AssetStorage, CompletionDisposition, FetchedArtifact, GameModuleEpoch, HandleId,
-    IoBasis, IoEvent, LoadStatus, Loader, LoaderDiagnostic, LoaderIO, ManifestHash, ManifestState,
-    PathResolveResult, PendingState, PendingToken, RegistrationError, ReqId, ResolveResult,
-    RuntimeTarget, StorageError, TargetBindingState, UpdateResult,
+    AdoptionId, AssetPath, AssetStorage, CompletionDisposition, FetchedArtifact, GameModuleEpoch,
+    HandleId, IoBasis, IoEvent, LoadStatus, Loader, LoaderDiagnostic, LoaderIO, ManifestHash,
+    ManifestState, PathResolveResult, PendingState, PendingToken, RegistrationError, ReqId,
+    ResolveResult, RuntimeTarget, StorageError, TargetBindingState, UpdateResult,
 };
 use distill_rpc::ServedLoadEdge;
 use distill_store::state::{InputVersion, StoreInstanceId};
@@ -178,14 +178,17 @@ impl MockIo {
     }
 
     fn named_for(&self, path: &str, name: &str) -> Option<(ReqId, IoBasis)> {
-        self.commands.iter().rev().find_map(|command| match command {
-            Command::ResolvePath(req, candidate, basis)
-                if *candidate == AssetPath::named(path, name) =>
-            {
-                Some((*req, basis.clone()))
-            }
-            _ => None,
-        })
+        self.commands
+            .iter()
+            .rev()
+            .find_map(|command| match command {
+                Command::ResolvePath(req, candidate, basis)
+                    if *candidate == AssetPath::named(path, name) =>
+                {
+                    Some((*req, basis.clone()))
+                }
+                _ => None,
+            })
     }
 }
 
@@ -1141,7 +1144,9 @@ fn an_expired_snapshot_retries_the_round_a_bounded_number_of_times() {
     // restarts the round at a new snapshot.
     let sweeps = loader.io().sweeps;
     let (req, basis) = loader.io().resolve_for(asset_uuid);
-    loader.io_mut().push(IoEvent::SnapshotExpired { req, basis });
+    loader
+        .io_mut()
+        .push(IoEvent::SnapshotExpired { req, basis });
     loader.process(&mut storage).unwrap();
     assert_eq!(loader.io().sweeps, sweeps + 1);
     let (retry, _) = loader.io().resolve_for(asset_uuid);
@@ -1149,20 +1154,27 @@ fn an_expired_snapshot_retries_the_round_a_bounded_number_of_times() {
     resolve(&mut loader, asset_uuid, hash);
     loader.process(&mut storage).unwrap();
     let (req, basis) = loader.io().fetch_for(hash);
-    loader.io_mut().push(IoEvent::SnapshotExpired { req, basis });
+    loader
+        .io_mut()
+        .push(IoEvent::SnapshotExpired { req, basis });
     loader.process(&mut storage).unwrap();
     assert_eq!(loader.io().sweeps, sweeps + 2);
     assert_eq!(loader.status(&handle), LoadStatus::Resolving);
 
     let (req, basis) = loader.io().resolve_for(asset_uuid);
-    loader.io_mut().push(IoEvent::SnapshotExpired { req, basis });
+    loader
+        .io_mut()
+        .push(IoEvent::SnapshotExpired { req, basis });
     loader.process(&mut storage).unwrap();
     assert_eq!(loader.io().sweeps, sweeps + 3);
-    assert!(!loader.take_diagnostics().iter().any(
-        |diagnostic| matches!(diagnostic, LoaderDiagnostic::ComponentPoisoned { .. })
-    ));
+    assert!(!loader
+        .take_diagnostics()
+        .iter()
+        .any(|diagnostic| matches!(diagnostic, LoaderDiagnostic::ComponentPoisoned { .. })));
     let (req, basis) = loader.io().resolve_for(asset_uuid);
-    loader.io_mut().push(IoEvent::SnapshotExpired { req, basis });
+    loader
+        .io_mut()
+        .push(IoEvent::SnapshotExpired { req, basis });
     loader.process(&mut storage).unwrap();
     assert!(loader.take_diagnostics().iter().any(|diagnostic| matches!(
         diagnostic,
@@ -2031,7 +2043,10 @@ fn named_refs_resolve_by_path_and_name_and_rebind_when_the_path_changes() {
     let walk = loader.add_ref_named::<A>(path, "Walk").unwrap();
     let run = loader.add_ref_named::<A>(path, "Run").unwrap();
     let skeleton = loader.add_ref_indirect::<A>(path).unwrap();
-    assert_eq!(loader.add_ref_named::<A>(path, "Walk").unwrap().id(), walk.id());
+    assert_eq!(
+        loader.add_ref_named::<A>(path, "Walk").unwrap().id(),
+        walk.id()
+    );
     assert_ne!(walk.id(), run.id());
     assert_ne!(walk.id(), skeleton.id());
 

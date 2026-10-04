@@ -51,7 +51,10 @@ fn drops_inside_nested_structs_elements_and_variants_name_their_path() {
     let held = obj(&[("keep", ui(1)), ("gone", ui(2))]);
     let value = obj(&[
         ("inline", held.clone()),
-        ("items", arr_v(&[obj(&[("keep", ui(1)), ("gone", ui(0))]), held.clone()])),
+        (
+            "items",
+            arr_v(&[obj(&[("keep", ui(1)), ("gone", ui(0))]), held.clone()]),
+        ),
         ("choice", obj(&[("Some", held)])),
     ]);
     assert_eq!(

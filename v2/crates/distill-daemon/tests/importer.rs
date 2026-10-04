@@ -12,8 +12,7 @@ use distill_daemon::watcher::WatcherBatch;
 use distill_json::AuthoredValue;
 use distill_pipeline_fixture::{value as byte, value_of as byte_of, BYTE_IMPORTER, CHAIN_IMPORTER};
 use distill_rpc::{
-    AuthoringValue, ImportRequest, InputVersion, TargetDefinition,
-    TargetDefinitionHash,
+    AuthoringValue, ImportRequest, InputVersion, TargetDefinition, TargetDefinitionHash,
 };
 use distill_schema::ngp_schema::LogicalSchema;
 use distill_store::StoreConfig;
@@ -64,11 +63,19 @@ fn configure(coordinator: &DaemonCoordinator, dir: &std::path::Path, root: &std:
 
 /// A hub bound to the target the daemon serves.
 fn connect(coordinator: &DaemonCoordinator) -> distill_rpc::Hub {
-    let target = coordinator.open_reader().unwrap().rpc_targets().unwrap().remove(0);
-    match coordinator.server().root().connect(distill_rpc::ConnectRequest::new(
-        &target.name,
-        TargetDefinitionHash(target.definition_hash),
-    )) {
+    let target = coordinator
+        .open_reader()
+        .unwrap()
+        .rpc_targets()
+        .unwrap()
+        .remove(0);
+    match coordinator
+        .server()
+        .root()
+        .connect(distill_rpc::ConnectRequest::new(
+            &target.name,
+            TargetDefinitionHash(target.definition_hash),
+        )) {
         distill_rpc::ConnectOutcome::Connected(connected) => connected.hub,
         other => panic!("expected connection, got {other:?}"),
     }
@@ -164,7 +171,10 @@ fn directory_rules_bundle_with_rule(include_rule: bool) -> Vec<u8> {
         ("importer", AuthoredValue::Str(BYTE_IMPORTER.into())),
         ("matches", matches),
         ("output", AuthoredValue::Str("{stem}.bundle".into())),
-        ("settings", object([("Object", object([("value", object([]))]))])),
+        (
+            "settings",
+            object([("Object", object([("value", object([]))]))]),
+        ),
     ])];
     let data = object([("listing", query()), ("rules", AuthoredValue::Array(rules))]);
     distill_bundle::write_bundle(&Bundle {
@@ -206,28 +216,40 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
 
     configure(&coordinator, temp.path(), &assets);
 
-    let imported_bundle = import(&coordinator, BYTE_IMPORTER, &["source.txt"], "imported.bundle");
+    let imported_bundle = import(
+        &coordinator,
+        BYTE_IMPORTER,
+        &["source.txt"],
+        "imported.bundle",
+    );
     let path = assets.join("imported.bundle");
     let first = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
     let first_asset = first.assets["asset"].uuid;
     assert_eq!(first.assets["asset"].data, byte(7));
     assert_eq!(first.assets["$settings"].data, object([]));
     assert!(first.assets.contains_key("$record"));
-    assert!(coordinator.authoring_service().watched_imports_needing_reimport(&mut writer)
+    assert!(coordinator
+        .authoring_service()
+        .watched_imports_needing_reimport(&mut writer)
         .unwrap()
         .is_empty());
 
     std::fs::write(assets.join("source.txt"), b"8").unwrap();
     assert_eq!(
-        coordinator.authoring_service().watched_imports_needing_reimport(&mut writer)
+        coordinator
+            .authoring_service()
+            .watched_imports_needing_reimport(&mut writer)
             .unwrap(),
         vec![imported_bundle]
     );
     coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![assets.join("source.txt")],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![assets.join("source.txt")],
+                renames: Vec::new(),
+            },
+        )
         .unwrap();
     assert_eq!(
         coordinator.reconcile_watched_imports(&mut writer).unwrap(),
@@ -245,12 +267,18 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
 
     std::fs::write(assets.join("source.txt"), b"not-a-byte").unwrap();
     coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![assets.join("source.txt")],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![assets.join("source.txt")],
+                renames: Vec::new(),
+            },
+        )
         .unwrap();
-    assert!(coordinator.reconcile_watched_imports(&mut writer).unwrap().is_empty());
+    assert!(coordinator
+        .reconcile_watched_imports(&mut writer)
+        .unwrap()
+        .is_empty());
     let failed = coordinator
         .open_reader()
         .unwrap()
@@ -271,10 +299,15 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     assert_eq!(failures[0].0, "imported.bundle");
     assert!(failures[0].1.contains("invalid digit"), "{failures:?}");
     let failed_memo = failed.memo_seq;
-    assert!(coordinator.authoring_service().watched_imports_needing_reimport(&mut writer)
+    assert!(coordinator
+        .authoring_service()
+        .watched_imports_needing_reimport(&mut writer)
         .unwrap()
         .is_empty());
-    assert!(coordinator.reconcile_watched_imports(&mut writer).unwrap().is_empty());
+    assert!(coordinator
+        .reconcile_watched_imports(&mut writer)
+        .unwrap()
+        .is_empty());
     assert_eq!(
         coordinator.open_reader().unwrap().memo_seq().unwrap(),
         failed_memo,
@@ -283,10 +316,13 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
 
     std::fs::write(assets.join("source.txt"), b"9").unwrap();
     coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![assets.join("source.txt")],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![assets.join("source.txt")],
+                renames: Vec::new(),
+            },
+        )
         .unwrap();
     assert_eq!(
         coordinator.reconcile_watched_imports(&mut writer).unwrap(),
@@ -308,12 +344,18 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
 
     std::fs::remove_file(assets.join("source.txt")).unwrap();
     coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![assets.join("source.txt")],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![assets.join("source.txt")],
+                renames: Vec::new(),
+            },
+        )
         .unwrap();
-    assert!(coordinator.reconcile_watched_imports(&mut writer).unwrap().is_empty());
+    assert!(coordinator
+        .reconcile_watched_imports(&mut writer)
+        .unwrap()
+        .is_empty());
     assert_eq!(
         coordinator
             .open_reader()
@@ -324,15 +366,20 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
             .terminal,
         distill_store::imports::WatchedImportTerminal::Dependency
     );
-    assert!(coordinator.authoring_service().watched_imports_needing_reimport(&mut writer)
+    assert!(coordinator
+        .authoring_service()
+        .watched_imports_needing_reimport(&mut writer)
         .unwrap()
         .is_empty());
     std::fs::write(assets.join("source.txt"), b"10").unwrap();
     coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![assets.join("source.txt")],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![assets.join("source.txt")],
+                renames: Vec::new(),
+            },
+        )
         .unwrap();
     assert_eq!(
         coordinator.reconcile_watched_imports(&mut writer).unwrap(),
@@ -366,7 +413,9 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
     coordinator.reconcile_full_scan(&mut writer).unwrap();
     configure(&coordinator, temp.path(), &assets);
 
-    let imported = coordinator.reconcile_directory_imports(&mut writer).unwrap();
+    let imported = coordinator
+        .reconcile_directory_imports(&mut writer)
+        .unwrap();
     assert_eq!(imported.len(), 1);
     let generated_path = assets.join("foo.bundle");
     let generated = distill_bundle::parse_bundle(&std::fs::read(&generated_path).unwrap()).unwrap();
@@ -390,17 +439,22 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
 
     std::fs::remove_file(assets.join("foo.src")).unwrap();
     coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![assets.join("foo.src")],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![assets.join("foo.src")],
+                renames: Vec::new(),
+            },
+        )
         .unwrap();
     let work = coordinator.pending_file_work(&mut writer).unwrap();
     assert!(coordinator
         .reconcile_directory_imports_affected(&mut writer, &work, false)
         .unwrap()
         .is_empty());
-    coordinator.acknowledge_file_work(&mut writer, &work).unwrap();
+    coordinator
+        .acknowledge_file_work(&mut writer, &work)
+        .unwrap();
     let failure = coordinator
         .open_reader()
         .unwrap()
@@ -428,7 +482,9 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
 
     std::fs::write(assets.join("foo.src"), b"9").unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
-    coordinator.reconcile_directory_imports(&mut writer).unwrap();
+    coordinator
+        .reconcile_directory_imports(&mut writer)
+        .unwrap();
     assert!(coordinator
         .open_reader()
         .unwrap()
@@ -460,7 +516,9 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
 
     std::fs::write(assets.join("rules.bundle"), directory_rules_bundle()).unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
-    coordinator.reconcile_directory_imports(&mut writer).unwrap();
+    coordinator
+        .reconcile_directory_imports(&mut writer)
+        .unwrap();
     assert!(coordinator
         .open_reader()
         .unwrap()
@@ -491,7 +549,13 @@ fn removing_a_rules_source_orphans_its_outputs_incrementally() {
     let mut writer = coordinator.open_writer().unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
     configure(&coordinator, temp.path(), &assets);
-    assert_eq!(coordinator.reconcile_directory_imports(&mut writer).unwrap().len(), 1);
+    assert_eq!(
+        coordinator
+            .reconcile_directory_imports(&mut writer)
+            .unwrap()
+            .len(),
+        1
+    );
     let generated =
         distill_bundle::parse_bundle(&std::fs::read(assets.join("foo.bundle")).unwrap()).unwrap();
     // The generated bundle's own publication is work of its own.
@@ -499,21 +563,28 @@ fn removing_a_rules_source_orphans_its_outputs_incrementally() {
     coordinator
         .reconcile_directory_imports_affected(&mut writer, &work, false)
         .unwrap();
-    coordinator.acknowledge_file_work(&mut writer, &work).unwrap();
+    coordinator
+        .acknowledge_file_work(&mut writer, &work)
+        .unwrap();
 
     std::fs::remove_file(assets.join("rules.bundle")).unwrap();
     coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![assets.join("rules.bundle")],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![assets.join("rules.bundle")],
+                renames: Vec::new(),
+            },
+        )
         .unwrap();
     let work = coordinator.pending_file_work(&mut writer).unwrap();
     assert!(coordinator
         .reconcile_directory_imports_affected(&mut writer, &work, false)
         .unwrap()
         .is_empty());
-    coordinator.acknowledge_file_work(&mut writer, &work).unwrap();
+    coordinator
+        .acknowledge_file_work(&mut writer, &work)
+        .unwrap();
     assert_eq!(
         coordinator
             .open_reader()
@@ -548,10 +619,15 @@ fn watched_imports_defer_while_their_importer_is_unregistered() {
     };
     let imported_bundle = {
         let coordinator = open();
-    let mut writer = coordinator.open_writer().unwrap();
+        let mut writer = coordinator.open_writer().unwrap();
         coordinator.reconcile_full_scan(&mut writer).unwrap();
         configure(&coordinator, temp.path(), &assets);
-        import(&coordinator, BYTE_IMPORTER, &["source.txt"], "imported.bundle")
+        import(
+            &coordinator,
+            BYTE_IMPORTER,
+            &["source.txt"],
+            "imported.bundle",
+        )
     };
     let path = assets.join("imported.bundle");
 
@@ -568,7 +644,10 @@ fn watched_imports_defer_while_their_importer_is_unregistered() {
             .unwrap(),
         vec![imported_bundle]
     );
-    assert!(coordinator.reconcile_watched_imports(&mut writer).unwrap().is_empty());
+    assert!(coordinator
+        .reconcile_watched_imports(&mut writer)
+        .unwrap()
+        .is_empty());
     let unchanged = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(unchanged.assets["asset"].data, byte(7));
     assert!(
@@ -611,23 +690,33 @@ fn reverting_a_failed_watched_import_clears_its_failure_incrementally() {
     let mut writer = coordinator.open_writer().unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
     configure(&coordinator, temp.path(), &assets);
-    import(&coordinator, BYTE_IMPORTER, &["source.txt"], "imported.bundle");
+    import(
+        &coordinator,
+        BYTE_IMPORTER,
+        &["source.txt"],
+        "imported.bundle",
+    );
     // Build the import index as the startup pass does.
     coordinator.reconcile_watched_imports(&mut writer).unwrap();
 
     let mut edit = |content: &[u8]| {
         std::fs::write(assets.join("source.txt"), content).unwrap();
         coordinator
-            .reconcile_incremental(&mut writer, &WatcherBatch {
-                paths: vec![assets.join("source.txt")],
-                renames: Vec::new(),
-            })
+            .reconcile_incremental(
+                &mut writer,
+                &WatcherBatch {
+                    paths: vec![assets.join("source.txt")],
+                    renames: Vec::new(),
+                },
+            )
             .unwrap();
         let work = coordinator.pending_file_work(&mut writer).unwrap();
         coordinator
             .reconcile_watched_imports_affected(&mut writer, &work, false)
             .unwrap();
-        coordinator.acknowledge_file_work(&mut writer, &work).unwrap();
+        coordinator
+            .acknowledge_file_work(&mut writer, &work)
+            .unwrap();
     };
     edit(b"broken");
     assert_eq!(import_failures(&coordinator).len(), 1);
@@ -664,12 +753,17 @@ fn imported_sources(
     coordinator.reconcile_full_scan(&mut writer).unwrap();
     configure(&coordinator, temp.path(), &assets);
     assert_eq!(
-        coordinator.reconcile_directory_imports(&mut writer).unwrap().len(),
+        coordinator
+            .reconcile_directory_imports(&mut writer)
+            .unwrap()
+            .len(),
         sources.len()
     );
     // Earlier passes consumed the setup's watcher work.
     let work = coordinator.pending_file_work(&mut writer).unwrap();
-    assert!(coordinator.acknowledge_file_work(&mut writer, &work).unwrap());
+    assert!(coordinator
+        .acknowledge_file_work(&mut writer, &work)
+        .unwrap());
     (temp, assets, coordinator)
 }
 
@@ -681,7 +775,11 @@ fn generated_hashes(
 ) -> Vec<Option<distill_core::id::ContentHash>> {
     stems
         .iter()
-        .map(|stem| store.file_content_hash("main", &format!("{stem}.bundle")).unwrap())
+        .map(|stem| {
+            store
+                .file_content_hash("main", &format!("{stem}.bundle"))
+                .unwrap()
+        })
         .collect()
 }
 
@@ -699,7 +797,11 @@ fn generated_values(
         .map(|(stem, hash)| {
             let hash = hash?;
             let bytes = std::fs::read(assets.join(format!("{stem}.bundle"))).unwrap();
-            assert_eq!(*blake3::hash(&bytes).as_bytes(), hash.0, "{stem}.bundle is the published file");
+            assert_eq!(
+                *blake3::hash(&bytes).as_bytes(),
+                hash.0,
+                "{stem}.bundle is the published file"
+            );
             let data = &distill_bundle::parse_bundle(&bytes).unwrap().assets["asset"].data;
             Some(byte_of(data).unwrap_or_else(|| panic!("unexpected value {data:?}")))
         })
@@ -768,12 +870,14 @@ fn batch(assets: &std::path::Path, files: &[&str]) -> WatcherBatch {
 #[test]
 fn a_burst_across_bundles_publishes_one_version() {
     let stems = ["a", "b", "c"];
-    let (_temp, assets, coordinator) =
-        imported_sources(&[("a", "1"), ("b", "2"), ("c", "3")]);
+    let (_temp, assets, coordinator) = imported_sources(&[("a", "1"), ("b", "2"), ("c", "3")]);
     let mut writer = coordinator.open_writer().unwrap();
     let base = writer.input_version().unwrap();
     let old_hashes = generated_hashes(&writer, &stems);
-    assert_eq!(generated_values(&writer, &assets, &stems), [Some(1), Some(2), Some(3)]);
+    assert_eq!(
+        generated_values(&writer, &assets, &stems),
+        [Some(1), Some(2), Some(3)]
+    );
 
     std::fs::write(assets.join("a.src"), b"9").unwrap();
     std::fs::write(assets.join("b.src"), b"5").unwrap();
@@ -785,14 +889,21 @@ fn a_burst_across_bundles_publishes_one_version() {
             loop {
                 let finished = done.load(std::sync::atomic::Ordering::Acquire);
                 let snapshot = coordinator.open_reader().unwrap().begin_snapshot().unwrap();
-                seen.push((snapshot.input_version().unwrap(), generated_hashes(&snapshot, &stems)));
+                seen.push((
+                    snapshot.input_version().unwrap(),
+                    generated_hashes(&snapshot, &stems),
+                ));
                 if finished {
                     return seen;
                 }
             }
         });
         let outcome = coordinator
-            .reconcile_batch(&mut writer, &batch(&assets, &["a.src", "b.src", "c.src"]), false)
+            .reconcile_batch(
+                &mut writer,
+                &batch(&assets, &["a.src", "b.src", "c.src"]),
+                false,
+            )
             .unwrap();
         done.store(true, std::sync::atomic::Ordering::Release);
         (outcome, observer.join().unwrap())
@@ -804,15 +915,24 @@ fn a_burst_across_bundles_publishes_one_version() {
     assert!(!outcome.more_work);
     assert!(outcome.failures.is_empty());
     let reader = coordinator.open_reader().unwrap();
-    assert_eq!(generated_values(&reader, &assets, &stems), [Some(9), Some(5), Some(1)]);
+    assert_eq!(
+        generated_values(&reader, &assets, &stems),
+        [Some(9), Some(5), Some(1)]
+    );
     let new_hashes = generated_hashes(&reader, &stems);
-    assert!(old_hashes.iter().zip(&new_hashes).all(|(old, new)| old != new));
+    assert!(old_hashes
+        .iter()
+        .zip(&new_hashes)
+        .all(|(old, new)| old != new));
     for (observed, hashes) in &seen {
         if *observed == base {
             assert_eq!(hashes, &old_hashes, "the base holds every old bundle");
         } else {
             assert_eq!(*observed, version);
-            assert_eq!(hashes, &new_hashes, "the pass's version holds every new bundle");
+            assert_eq!(
+                hashes, &new_hashes,
+                "the pass's version holds every new bundle"
+            );
         }
     }
     assert_eq!(seen.last().unwrap().0, version);
@@ -857,7 +977,12 @@ fn an_rpc_write_during_a_pass_makes_it_stale_and_its_retry_applies_everything_on
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         // The RPC import commits while the pass's import is running.
-        import(&coordinator, BYTE_IMPORTER, &["other.txt"], "explicit.bundle");
+        import(
+            &coordinator,
+            BYTE_IMPORTER,
+            &["other.txt"],
+            "explicit.bundle",
+        );
         std::fs::write(gate.join("release"), b"").unwrap();
         pass.join().unwrap()
     });
@@ -878,7 +1003,9 @@ fn an_rpc_write_during_a_pass_makes_it_stale_and_its_retry_applies_everything_on
         "the stale pass published nothing"
     );
 
-    let outcome = coordinator.reconcile_batch(&mut writer, &burst, false).unwrap();
+    let outcome = coordinator
+        .reconcile_batch(&mut writer, &burst, false)
+        .unwrap();
     let version = InputVersion(base.0 + 2);
     assert_eq!(outcome.stamp.version, version);
     assert_eq!(outcome.imported.len(), 3);
@@ -901,8 +1028,7 @@ fn an_rpc_write_during_a_pass_makes_it_stale_and_its_retry_applies_everything_on
 /// a new output whose importer fails is reported, all in one version.
 #[test]
 fn an_import_failure_in_a_pass_keeps_its_last_good_bundle_while_the_rest_publish() {
-    let (_temp, assets, coordinator) =
-        imported_sources(&[("a", "1"), ("b", "2"), ("c", "3")]);
+    let (_temp, assets, coordinator) = imported_sources(&[("a", "1"), ("b", "2"), ("c", "3")]);
     let mut writer = coordinator.open_writer().unwrap();
     let base = writer.input_version().unwrap();
 
@@ -936,7 +1062,12 @@ fn an_import_failure_in_a_pass_keeps_its_last_good_bundle_while_the_rest_publish
 
 /// Import `dest` from `sources` with [`CHAIN_IMPORTER`], watched, as one
 /// RPC publication, and pass over the watcher work it leaves.
-fn chain_import(coordinator: &DaemonCoordinator, assets: &std::path::Path, dest: &str, sources: &[&str]) {
+fn chain_import(
+    coordinator: &DaemonCoordinator,
+    assets: &std::path::Path,
+    dest: &str,
+    sources: &[&str],
+) {
     let mut writer = coordinator.open_writer().unwrap();
     import(coordinator, CHAIN_IMPORTER, sources, dest);
     // The watcher's echo of the output: a pass that indexes its import
@@ -1010,7 +1141,10 @@ fn assert_chain_publishes_in_one_version(stems: &[&str]) {
     let echo = coordinator
         .reconcile_batch(&mut writer, &batch(&assets, &outputs), false)
         .unwrap();
-    assert_eq!(echo.stamp.version, version, "nothing drifted to another pass");
+    assert_eq!(
+        echo.stamp.version, version,
+        "nothing drifted to another pass"
+    );
     assert!(echo.imported.is_empty());
     assert!(!echo.more_work);
 }
@@ -1046,7 +1180,8 @@ fn a_chain_deeper_than_the_bound_continues_in_the_next_pass() {
     assert!(first.more_work);
     assert_eq!(first.failures.len(), 1, "{:?}", first.failures);
     assert!(
-        first.failures[0].contains("deeper than 8 levels") && first.failures[0].contains("l9.bundle"),
+        first.failures[0].contains("deeper than 8 levels")
+            && first.failures[0].contains("l9.bundle"),
         "{:?}",
         first.failures
     );
@@ -1147,12 +1282,20 @@ fn import_index_pages(filler: usize) -> u64 {
     let mut writer = coordinator.open_writer().unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
     let authoring = coordinator.authoring_service();
-    assert!(authoring.watched_imports_needing_reimport(&mut writer).unwrap().is_empty());
+    assert!(authoring
+        .watched_imports_needing_reimport(&mut writer)
+        .unwrap()
+        .is_empty());
     let work = coordinator.pending_file_work(&mut writer).unwrap();
-    assert!(coordinator.acknowledge_file_work(&mut writer, &work).unwrap());
+    assert!(coordinator
+        .acknowledge_file_work(&mut writer, &work)
+        .unwrap());
 
     let before = writer.pages_fetched().unwrap();
-    assert!(authoring.watched_imports_needing_reimport(&mut writer).unwrap().is_empty());
+    assert!(authoring
+        .watched_imports_needing_reimport(&mut writer)
+        .unwrap()
+        .is_empty());
     writer.pages_fetched().unwrap() - before
 }
 
@@ -1163,7 +1306,10 @@ fn an_indexed_namespace_is_not_reindexed() {
     let small = import_index_pages(20);
     let large = import_index_pages(2000);
     println!("watched-import check: {small} pages beside 20 bundles, {large} beside 2000");
-    assert!(large <= small + 16, "{small} pages beside 20 bundles, {large} beside 2000");
+    assert!(
+        large <= small + 16,
+        "{small} pages beside 20 bundles, {large} beside 2000"
+    );
 }
 
 /// An RPC reimport whose importer fails memoizes the failure: the memo
@@ -1186,20 +1332,35 @@ fn a_failed_rpc_reimport_commits_only_its_memo() {
     let mut writer = coordinator.open_writer().unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
     configure(&coordinator, temp.path(), &assets);
-    let bundle = import(&coordinator, BYTE_IMPORTER, &["source.txt"], "imported.bundle");
+    let bundle = import(
+        &coordinator,
+        BYTE_IMPORTER,
+        &["source.txt"],
+        "imported.bundle",
+    );
     std::fs::write(assets.join("source.txt"), b"broken").unwrap();
     coordinator
-        .reconcile_incremental(&mut writer, &WatcherBatch {
-            paths: vec![assets.join("source.txt")],
-            renames: Vec::new(),
-        })
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![assets.join("source.txt")],
+                renames: Vec::new(),
+            },
+        )
         .unwrap();
     assert!(import_failures(&coordinator).is_empty());
 
     let base = coordinator.server().current_stamp().unwrap().version;
     let hub = connect(&coordinator);
     let reimport = hub.reimport(base, bundle);
-    assert!(matches!(reimport, distill_rpc::RpcResult::Failure(_)), "{reimport:?}");
+    assert!(
+        matches!(reimport, distill_rpc::RpcResult::Failure(_)),
+        "{reimport:?}"
+    );
     assert_eq!(coordinator.server().current_stamp().unwrap().version, base);
-    assert_eq!(import_failures(&coordinator).len(), 1, "the failure memo committed");
+    assert_eq!(
+        import_failures(&coordinator).len(),
+        1,
+        "the failure memo committed"
+    );
 }

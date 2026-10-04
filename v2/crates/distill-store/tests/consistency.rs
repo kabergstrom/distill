@@ -13,8 +13,8 @@ use distill_store::cas::{BuildCommit, CommitOutcome, OutputSpec};
 use distill_store::pipeline::ValidatedPipelineEpoch;
 use distill_store::pipeline::{ResolvedToolPackageFile, ResolvedToolSourceV2, ToolRegistrationV2};
 use distill_store::state::{
-    CleanupDisposition, PipelineEpoch, PipelineFailure, PipelineFailureCode, PipelineFailureOrigin,
-    ReadableBundleSource, SkeletonFailureCode, NamespaceError, NamespaceErrorV1,
+    CleanupDisposition, NamespaceError, NamespaceErrorV1, PipelineEpoch, PipelineFailure,
+    PipelineFailureCode, PipelineFailureOrigin, ReadableBundleSource, SkeletonFailureCode,
 };
 use distill_store::{Store, StoreConfig, StoreError};
 
@@ -128,7 +128,8 @@ fn multi_table_input_transactions_are_all_or_nothing() {
                     size: 1,
                     kind: distill_store::files::FileKind::File,
                     content_hash: None,
-                }.into(),
+                }
+                .into(),
                 distill_store::state::InputVersion(1),
             )?;
             txn.upsert_bundle(&BundleMeta {
@@ -203,7 +204,8 @@ fn wal_readers_only_observe_complete_input_versions() {
                     size: 1,
                     kind: distill_store::files::FileKind::File,
                     content_hash: None,
-                }.into(),
+                }
+                .into(),
                 distill_store::state::InputVersion(1),
             )
         })
@@ -229,7 +231,8 @@ fn wal_readers_only_observe_complete_input_versions() {
                     size: 2,
                     kind: distill_store::files::FileKind::File,
                     content_hash: None,
-                }.into(),
+                }
+                .into(),
                 distill_store::state::InputVersion(2),
             )
         })

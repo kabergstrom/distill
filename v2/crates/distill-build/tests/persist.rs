@@ -157,14 +157,23 @@ fn a_lookup_reads_only_the_candidates_it_reaches() {
         let mut reader = store.reader().unwrap();
         reader.trace_statements(Some(record_statement));
         STATEMENTS.lock().unwrap().clear();
-        let hit = lookup_persisted_candidate(&reader, KeyKind::Processor, &key, asset, &Snapshot::default())
-            .unwrap()
-            .unwrap();
+        let hit = lookup_persisted_candidate(
+            &reader,
+            KeyKind::Processor,
+            &key,
+            asset,
+            &Snapshot::default(),
+        )
+        .unwrap()
+        .unwrap();
         reader.trace_statements(None);
         let PersistedOutcome::Success { outputs, .. } = hit.outcome else {
             panic!("expected success")
         };
-        assert_eq!(outputs[0].bytes, format!("artifact {}", size - 1).as_bytes());
+        assert_eq!(
+            outputs[0].bytes,
+            format!("artifact {}", size - 1).as_bytes()
+        );
         counts.push(std::mem::take(&mut *STATEMENTS.lock().unwrap()).len());
     }
     assert_eq!(counts[0], counts[1], "{counts:?}");

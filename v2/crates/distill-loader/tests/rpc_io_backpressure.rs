@@ -93,7 +93,12 @@ fn write_asset(project: &mut TestProject, seed: usize, value: u32) {
         &bundle_path(seed),
         BundleUuid(bundle),
         Some("a"),
-        &[Asset::blob("a", asset(seed16), A::TYPE_UUID, &value.to_le_bytes())],
+        &[Asset::blob(
+            "a",
+            asset(seed16),
+            A::TYPE_UUID,
+            &value.to_le_bytes(),
+        )],
     );
 }
 
@@ -260,7 +265,8 @@ impl Relay {
 }
 
 fn pump(mut from: TcpStream, mut to: TcpStream, stalled: Arc<AtomicBool>) {
-    from.set_read_timeout(Some(Duration::from_millis(5))).unwrap();
+    from.set_read_timeout(Some(Duration::from_millis(5)))
+        .unwrap();
     let mut buffer = [0u8; 16 * 1024];
     loop {
         if stalled.load(Ordering::SeqCst) {
@@ -393,9 +399,15 @@ fn a_superseded_fetch_backlog_never_blocks_the_next_sweep() {
         let next = io.begin_sweep();
         io.fetch(ReqId(1_000), hash, &next);
         let (events, _) = frames_until(&mut io, Duration::from_secs(5), |events| {
-            events
-                .iter()
-                .any(|event| matches!(event, IoEvent::Fetched { req: ReqId(1_000), .. }))
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    IoEvent::Fetched {
+                        req: ReqId(1_000),
+                        ..
+                    }
+                )
+            })
         });
         assert!(
             !events.iter().any(|event| matches!(
@@ -497,7 +509,11 @@ fn fetch_throughput_is_not_one_per_two_frames() {
             stats.undelivered_events == 200
         });
         let events = io.poll();
-        assert_eq!(count(&events, is_fetched), 200, "one frame delivers every answer");
+        assert_eq!(
+            count(&events, is_fetched),
+            200,
+            "one frame delivers every answer"
+        );
         assert_eq!(events.len(), 200);
     });
 }
@@ -534,7 +550,11 @@ fn ending_a_sweep_cancels_its_requests_and_releases_what_they_held() {
         }
         assert_eq!(api::in_flight(&io), 0);
         assert_eq!(api::resident(&io), 0);
-        assert_eq!(io.stats().waiting_fetches, 0, "a cancelled fetch kept its admission wait");
+        assert_eq!(
+            io.stats().waiting_fetches,
+            0,
+            "a cancelled fetch kept its admission wait"
+        );
         // The IO still serves the next sweep.
         let next = io.begin_sweep();
         io.fetch(ReqId(5_000), hash, &next);
@@ -596,7 +616,10 @@ fn repeated_binds_to_one_target_do_not_storm_the_daemon() {
             std::thread::sleep(Duration::from_millis(2));
         }
         let attempts = relay.accepted() - before;
-        assert!(attempts <= 4, "{attempts} connection attempts for one rebind");
+        assert!(
+            attempts <= 4,
+            "{attempts} connection attempts for one rebind"
+        );
         relay.resume();
         frames_until(&mut io, Duration::from_secs(5), |events| {
             events
@@ -777,7 +800,10 @@ fn ending_a_sweep_cancels_a_fetch_waiting_for_admission() {
         let deadline = Instant::now() + Duration::from_millis(200);
         while Instant::now() < deadline {
             let events = io.poll();
-            assert!(events.is_empty(), "delivered for an ended sweep: {events:?}");
+            assert!(
+                events.is_empty(),
+                "delivered for an ended sweep: {events:?}"
+            );
             std::thread::sleep(Duration::from_millis(2));
         }
         let stats = io.stats();

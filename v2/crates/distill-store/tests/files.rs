@@ -57,8 +57,18 @@ fn file_rows_roundtrip_and_are_keyed_per_root() {
         .input_transaction(|txn| {
             let main = txn.intern_root("main")?;
             let engine = txn.intern_root("engine")?;
-            txn.upsert_file(main, "tex/rock.bundle", &file_state(100).into(), InputVersion(1))?;
-            txn.upsert_file(engine, "tex/rock.bundle", &file_state(200).into(), InputVersion(1))?;
+            txn.upsert_file(
+                main,
+                "tex/rock.bundle",
+                &file_state(100).into(),
+                InputVersion(1),
+            )?;
+            txn.upsert_file(
+                engine,
+                "tex/rock.bundle",
+                &file_state(200).into(),
+                InputVersion(1),
+            )?;
             Ok((main, engine))
         })
         .unwrap();
@@ -192,7 +202,8 @@ fn a_transaction_view_reads_its_own_uncommitted_scan_rows() {
         let root = txn.intern_root("main")?;
         txn.upsert_file(root, "tex/rock.bundle", &observation, InputVersion(1))?;
         let view = txn.reader();
-        let [row] = <[_; 1]>::try_from(view.observed_files_under("main", "tex/rock.bundle")?).unwrap();
+        let [row] =
+            <[_; 1]>::try_from(view.observed_files_under("main", "tex/rock.bundle")?).unwrap();
         assert_eq!(row.file, observation);
         assert_eq!(
             view.symlinks_targeting(b"/project/tex")?
@@ -206,7 +217,10 @@ fn a_transaction_view_reads_its_own_uncommitted_scan_rows() {
         })
     });
     assert!(failed.is_err());
-    assert!(store.observed_files_under("main", "tex/rock.bundle").unwrap().is_empty());
+    assert!(store
+        .observed_files_under("main", "tex/rock.bundle")
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -228,7 +242,10 @@ fn a_directory_row_is_found_by_its_unique_canonical_path() {
     };
     write(&mut store, "a", directory("a")).unwrap();
     write(&mut store, "ab", directory("ab")).unwrap();
-    let found = store.directory_by_canonical(b"/project/ab").unwrap().unwrap();
+    let found = store
+        .directory_by_canonical(b"/project/ab")
+        .unwrap()
+        .unwrap();
     assert_eq!((found.path, found.file), ("ab".to_owned(), directory("ab")));
     assert_eq!(store.directory_by_canonical(b"/project/c").unwrap(), None);
     // Two directories never share a canonical path.

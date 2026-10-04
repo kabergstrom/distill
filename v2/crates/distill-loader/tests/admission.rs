@@ -86,7 +86,10 @@ fn a_payload_larger_than_the_budget_is_admitted_alone() {
     let oversized = oversized.poll().expect("admitted once nothing is resident");
     assert_eq!(admission.resident(), 250);
     let mut small = Pending::new(&admission, 1);
-    assert!(small.poll().is_none(), "admitted beside an oversized payload");
+    assert!(
+        small.poll().is_none(),
+        "admitted beside an oversized payload"
+    );
     drop(oversized);
     assert!(small.poll().is_some());
 
@@ -129,7 +132,11 @@ fn dropping_a_waiter_leaves_the_queue_and_admits_those_behind_it() {
     assert_eq!(admission.waiting(), 2);
     drop(blocked);
     assert_eq!(admission.waiting(), 0);
-    assert_eq!(behind.woken(), 1, "leaving the queue did not wake the next waiter");
+    assert_eq!(
+        behind.woken(),
+        1,
+        "leaving the queue did not wake the next waiter"
+    );
     let behind = behind.poll().expect("admitted once the waiter ahead left");
     assert_eq!(admission.resident(), 80);
     drop((held, behind));

@@ -119,11 +119,10 @@ fn cook_mesh(value: &str) -> Result<AuthoredValue, ProcessorError> {
                 let face = words
                     .map(|word| {
                         let position = word.split('/').next().unwrap_or_default();
-                        let one_based: usize = position.parse().map_err(
-                            |error: std::num::ParseIntError| {
+                        let one_based: usize =
+                            position.parse().map_err(|error: std::num::ParseIntError| {
                                 ProcessorError::new(23, error.to_string())
-                            },
-                        )?;
+                            })?;
                         let zero_based = one_based
                             .checked_sub(1)
                             .ok_or_else(|| ProcessorError::new(24, "OBJ indices are one-based"))?;
@@ -132,7 +131,10 @@ fn cook_mesh(value: &str) -> Result<AuthoredValue, ProcessorError> {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 if face.len() != 3 {
-                    return Err(ProcessorError::new(26, "fixture OBJ faces must be triangles"));
+                    return Err(ProcessorError::new(
+                        26,
+                        "fixture OBJ faces must be triangles",
+                    ));
                 }
                 indices.extend(face);
             }
@@ -145,7 +147,10 @@ fn cook_mesh(value: &str) -> Result<AuthoredValue, ProcessorError> {
             .iter()
             .any(|index| usize::from(*index) >= positions.len())
     {
-        return Err(ProcessorError::new(27, "OBJ geometry is empty or out of range"));
+        return Err(ProcessorError::new(
+            27,
+            "OBJ geometry is empty or out of range",
+        ));
     }
     let mut vertices = Vec::with_capacity(positions.len() * 16);
     for position in positions {
@@ -163,9 +168,7 @@ fn cook_mesh(value: &str) -> Result<AuthoredValue, ProcessorError> {
         ("indices".to_owned(), bytes_array(&indices)),
         (
             "vertex_channels".to_owned(),
-            AuthoredValue::UInt(u128::from(
-                newgameplus_assets::VERTEX_CHANNEL_POSITION,
-            )),
+            AuthoredValue::UInt(u128::from(newgameplus_assets::VERTEX_CHANNEL_POSITION)),
         ),
         ("index_stride".to_owned(), AuthoredValue::UInt(2)),
     ])))
@@ -332,10 +335,7 @@ fn parse_shader(
     let include = context.read(include_path)?;
     let include = std::str::from_utf8(&include)
         .map_err(|error| AuthoringImporterError::rejected(32, error.to_string()))?;
-    Ok(source.replace(
-        &format!("#include \"{include_path}\""),
-        include.trim(),
-    ))
+    Ok(source.replace(&format!("#include \"{include_path}\""), include.trim()))
 }
 
 struct FixtureCook(Kind);

@@ -124,7 +124,10 @@ impl PipelineProcessor for ScriptedProcessor {
             self.0.pass_gate(value);
         }
         if fails {
-            return Err(ProcessorError::new(7, format!("value {value} does not cook")));
+            return Err(ProcessorError::new(
+                7,
+                format!("value {value} does not cook"),
+            ));
         }
         Ok(ProcessorProducts {
             primary: Some(ProcessorProduct::new(TERMINAL, input)),
@@ -219,8 +222,7 @@ impl Cells {
                     version: 1,
                     input: TYPE,
                     selector: TargetSelector::new(None, None).unwrap(),
-                    outputs: OutputDecls::new(TERMINAL, Vec::<(String, TypeUuid)>::new())
-                        .unwrap(),
+                    outputs: OutputDecls::new(TERMINAL, Vec::<(String, TypeUuid)>::new()).unwrap(),
                 },
                 ScriptedProcessor(Arc::clone(&cells.shared)),
             ));

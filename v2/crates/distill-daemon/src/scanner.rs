@@ -5,23 +5,20 @@
 //! paths are excluded, directory aliases/cycles are errors, and a file is
 //! accepted only when its observation remains stable through the read.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata};
 use std::io::Read;
-use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-
 use distill_core::id::{BundleFileHash, ContentHash};
 use distill_store::db::StoreReader;
-use distill_store::Current;
 use distill_store::error::StoreError;
-use distill_store::files::{
-    FileKind, FileObservation, FileState, ObservedFile,
-};
+use distill_store::files::{FileKind, FileObservation, FileState, ObservedFile};
 use distill_store::state::{PhysicalPathClaim, PhysicalPathFailureCode, PlatformPathBytes};
+use distill_store::Current;
 use unicode_normalization::{is_nfc, UnicodeNormalization};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,7 +385,6 @@ impl ScanSnapshot {
         self.diagnostics.values()
     }
 
-
     pub fn apply_delta(&mut self, delta: ScanDelta) {
         for affected in &delta.affected {
             for key in matching_keys(&self.files, affected) {
@@ -495,7 +491,9 @@ impl ScanDelta {
                 }
             };
             let bundles = published.bundle_file_hashes_under(root, prefix)?;
-            let same = files.iter().eq(matching_values(&self.observed.files, affected))
+            let same = files
+                .iter()
+                .eq(matching_values(&self.observed.files, affected))
                 && aliases
                     .iter()
                     .map(|(key, target)| (key, target))
@@ -503,7 +501,10 @@ impl ScanDelta {
                 && bundles
                     .iter()
                     .map(|(path, hash)| (root.as_str(), path.as_str(), BundleFileHash(*hash)))
-                    .eq(matching_bundle_observations(&self.observed.bundles, affected));
+                    .eq(matching_bundle_observations(
+                        &self.observed.bundles,
+                        affected,
+                    ));
             if !same {
                 return Ok(false);
             }
@@ -595,8 +596,10 @@ impl ScanBaseline for StoredBaseline<'_> {
     }
 
     fn directory_by_target(&self, canonical: &Path) -> Option<(String, String, PathBuf)> {
-        if let Some((name, root)) =
-            self.roots.iter().find(|(_, root)| root.canonical_path == canonical)
+        if let Some((name, root)) = self
+            .roots
+            .iter()
+            .find(|(_, root)| root.canonical_path == canonical)
         {
             return Some((name.clone(), String::new(), root.canonical_path.clone()));
         }
@@ -621,10 +624,7 @@ impl ScanSnapshot {
             bundles.push((root_name, path, hash));
             Ok(())
         })?;
-        Self::from_rows(
-            reader.observed_files()?,
-            bundles,
-        )
+        Self::from_rows(reader.observed_files()?, bundles)
     }
 
     #[cfg(test)]
@@ -659,10 +659,7 @@ impl ScanSnapshot {
     /// The tables are streamed in key order and compared
     /// row by row; a bundle file is compared by its stored hash, so no
     /// bundle bytes are read or parsed.
-    pub(crate) fn matches_published(
-        &self,
-        reader: &StoreReader,
-    ) -> Result<bool, StoreError> {
+    pub(crate) fn matches_published(&self, reader: &StoreReader) -> Result<bool, StoreError> {
         let mut same = true;
 
         let (mut files, mut aliases) = (self.files.iter(), self.symlink_aliases.iter());
@@ -713,7 +710,10 @@ impl ScanSnapshot {
                 content_hash: file.content_hash,
             },
             raw_path: encode_raw_path(&file.raw_relative_path),
-            symlink_target: self.symlink_aliases.get(key).map(|target| encode_path(target)),
+            symlink_target: self
+                .symlink_aliases
+                .get(key)
+                .map(|target| encode_path(target)),
             canonical_path: file.canonical_path.as_deref().map(encode_path),
         })
     }
@@ -730,8 +730,6 @@ impl ScanSnapshot {
             )
         })
     }
-
-
 }
 
 impl ScanDelta {
@@ -816,7 +814,11 @@ fn scanned_file_row(row: ObservedFile) -> (ScannedFile, Option<PathBuf>) {
     (file, alias)
 }
 
-pub(crate) fn scanned_bundle(root_name: &str, normalized_path: &str, bytes: Vec<u8>) -> ScannedBundle {
+pub(crate) fn scanned_bundle(
+    root_name: &str,
+    normalized_path: &str,
+    bytes: Vec<u8>,
+) -> ScannedBundle {
     let parsed = distill_bundle::parse_bundle(&bytes);
     let namespace_skeleton = parsed
         .is_err()
@@ -1127,7 +1129,6 @@ impl RootedScanner {
             )
     }
 
-
     /// Enumerate the complete raw namespace in deterministic `(root, path)`
     /// order. This is the startup/recovery path; ordinary live watcher batches
     /// use incremental path/subtree observation instead.
@@ -1187,7 +1188,11 @@ impl RootedScanner {
                 let files = baseline.files_under(&key.0, &key.1);
                 let physical = affected.entry(key.clone()).or_default();
                 physical.insert(event_path.clone());
-                if let Some(previous) = files.files.first().filter(|file| file.normalized_path == key.1) {
+                if let Some(previous) = files
+                    .files
+                    .first()
+                    .filter(|file| file.normalized_path == key.1)
+                {
                     if let Some(relative) = platform_path(&previous.raw_relative_path) {
                         physical.insert(roots[&key.0].canonical_path.join(relative));
                     }
@@ -1267,7 +1272,9 @@ impl RootedScanner {
         };
         let expected = reader.file_content_hash(root, path)?.ok_or_else(drifted)?;
         let physical = self.physical_path(root, path).map_err(|_| drifted())?;
-        let bytes = self.read_identity_checked(&physical).map_err(|_| drifted())?;
+        let bytes = self
+            .read_identity_checked(&physical)
+            .map_err(|_| drifted())?;
         if ContentHash(*blake3::hash(&bytes).as_bytes()) != expected {
             return Err(drifted());
         }
@@ -1863,7 +1870,13 @@ fn scan_path_components(
         }
         if let Some(retained) = &opened.daemon_owned {
             let mut snapshot = ScanSnapshot::default();
-            record_daemon_owned_diagnostic(&mut snapshot, root_name, &relative, &physical, retained);
+            record_daemon_owned_diagnostic(
+                &mut snapshot,
+                root_name,
+                &relative,
+                &physical,
+                retained,
+            );
             return Ok(Some(snapshot));
         }
         ancestry.insert(parent_canonical_path);
@@ -2553,7 +2566,8 @@ mod tests {
                 kind,
                 modified_nanos: 1,
                 size: 1,
-                content_hash: (kind != ScannedFileKind::Directory).then_some(ContentHash([hash; 32])),
+                content_hash: (kind != ScannedFileKind::Directory)
+                    .then_some(ContentHash([hash; 32])),
                 raw_relative_path: PlatformPathBytes::Unix(path.as_bytes().to_vec()),
                 canonical_path: None,
             },
@@ -2630,9 +2644,10 @@ mod tests {
         );
         // The store publishing `baseline` answers for it.
         let dir = tempfile::tempdir().unwrap();
-        let mut store =
-            distill_store::Store::open(distill_store::StoreConfig::new(dir.path().join(".distill")))
-                .unwrap();
+        let mut store = distill_store::Store::open(distill_store::StoreConfig::new(
+            dir.path().join(".distill"),
+        ))
+        .unwrap();
         store
             .input_transaction(|txn| {
                 let version = txn.version();
@@ -2665,8 +2680,12 @@ mod tests {
             published: BTreeMap::new(),
         };
         assert!(unchanged.matches_published(&store).unwrap());
-        assert!(!unchanged.rename_moves_nothing(&store, "main", "dir/child").unwrap());
-        assert!(unchanged.rename_moves_nothing(&store, "main", "dir/tmp").unwrap());
+        assert!(!unchanged
+            .rename_moves_nothing(&store, "main", "dir/child")
+            .unwrap());
+        assert!(unchanged
+            .rename_moves_nothing(&store, "main", "dir/tmp")
+            .unwrap());
 
         // Removing the child replaces the subtree and leaves the siblings.
         let mut applied = baseline.clone();
@@ -2676,7 +2695,11 @@ mod tests {
             published: BTreeMap::new(),
         });
         assert_eq!(
-            applied.files.keys().map(|key| key.1.as_str()).collect::<Vec<_>>(),
+            applied
+                .files
+                .keys()
+                .map(|key| key.1.as_str())
+                .collect::<Vec<_>>(),
             ["dir", "dir-old", "dir-old/x", "dir.txt"]
         );
         assert_eq!(applied.logical_roots.get("dir/child"), None);
@@ -2749,7 +2772,9 @@ mod published_compare_tests {
     /// The streamed comparison and the loaded oracle's, which must agree;
     /// returns the agreed answer.
     fn compare(scan: &ScanSnapshot, store: &Store) -> Result<bool, String> {
-        let streamed = scan.matches_published(store).map_err(|error| error.to_string());
+        let streamed = scan
+            .matches_published(store)
+            .map_err(|error| error.to_string());
         let loaded = ScanSnapshot::load(store)
             .map(|published| scan.same_namespace_observation(&published))
             .map_err(|error| error.to_string());
@@ -2761,14 +2786,24 @@ mod published_compare_tests {
     fn an_unchanged_tree_matches_and_every_change_does_not() {
         type Change = fn(&Path);
         let changes: [(&str, Change); 7] = [
-            ("content", |root| fs::write(root.join("dir.txt"), b"changed!").unwrap()),
-            ("added", |root| fs::write(root.join("dir/new.txt"), b"new").unwrap()),
-            ("removed", |root| fs::remove_file(root.join("dir/child/leaf.txt")).unwrap()),
+            ("content", |root| {
+                fs::write(root.join("dir.txt"), b"changed!").unwrap()
+            }),
+            ("added", |root| {
+                fs::write(root.join("dir/new.txt"), b"new").unwrap()
+            }),
+            ("removed", |root| {
+                fs::remove_file(root.join("dir/child/leaf.txt")).unwrap()
+            }),
             ("bundle bytes", |root| {
                 fs::write(root.join("b.bundle"), b"ALSO NOT A BUNDLE").unwrap()
             }),
-            ("bundle removed", |root| fs::remove_file(root.join("a.bundle")).unwrap()),
-            ("directory", |root| fs::create_dir(root.join("empty")).unwrap()),
+            ("bundle removed", |root| {
+                fs::remove_file(root.join("a.bundle")).unwrap()
+            }),
+            ("directory", |root| {
+                fs::create_dir(root.join("empty")).unwrap()
+            }),
             ("symlink target", |root| {
                 fs::remove_file(root.join("alias.txt")).unwrap();
                 #[cfg(unix)]
@@ -2805,7 +2840,10 @@ mod published_compare_tests {
             );
             assert!(stored.directory_by_target(canonical).is_some());
         }
-        assert_eq!(stored.directory_by_target(&world.root.join("nowhere")), None);
+        assert_eq!(
+            stored.directory_by_target(&world.root.join("nowhere")),
+            None
+        );
         stored.finish().unwrap();
     }
 

@@ -100,7 +100,10 @@ fn the_configuration_status_selects_from_the_stored_errors() {
         })
         .unwrap();
     // Malformed (code 1) orders before the alias (code 9).
-    assert_eq!(store.configuration_source_error().unwrap(), Some(malformed()));
+    assert_eq!(
+        store.configuration_source_error().unwrap(),
+        Some(malformed())
+    );
     assert_eq!(store.configuration_error().unwrap(), Some(malformed()));
     match store.configuration_state().unwrap() {
         ConfigurationState::Failed { reason, .. } => assert_eq!(reason, malformed()),

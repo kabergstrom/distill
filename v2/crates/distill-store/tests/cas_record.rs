@@ -110,7 +110,11 @@ fn failure_cause_and_fingerprint_tag_bytes_are_pinned() {
     // The grammar, byte by byte: cause tag (0 = Op, 1 = Local),
     // fingerprint tag (5 = MissingCapability, 6 = Local,
     // 7 = RoleIneligible), capability-key tag, class u16.
-    assert_eq!(FailureCause::Op.encode(), [0], "nothing follows an Op cause");
+    assert_eq!(
+        FailureCause::Op.encode(),
+        [0],
+        "nothing follows an Op cause"
+    );
 
     let bytes = FailureCause::Local(FailureFingerprint::MissingCapability {
         key: CapabilityKey::Processor {
@@ -153,7 +157,10 @@ fn failure_cause_and_fingerprint_tag_bytes_are_pinned() {
 #[test]
 fn trace_digest_is_the_dstr_domain_digest() {
     let trace = b"canonical trace ops";
-    assert_eq!(trace_digest(trace), domain_digest(DSTR, 1, |e| e.raw(trace)));
+    assert_eq!(
+        trace_digest(trace),
+        domain_digest(DSTR, 1, |e| e.raw(trace))
+    );
 }
 
 #[test]

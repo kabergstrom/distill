@@ -209,7 +209,11 @@ fn named_path_rows_sort_after_the_primary_and_normalize() {
         .collect::<Vec<_>>();
     assert_eq!(
         names,
-        [None, Some("Surv\u{e9}y".to_owned()), Some("Walk".to_owned())]
+        [
+            None,
+            Some("Surv\u{e9}y".to_owned()),
+            Some("Walk".to_owned())
+        ]
     );
 }
 

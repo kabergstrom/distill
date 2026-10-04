@@ -123,8 +123,14 @@ fn fixture_with_policy_and_cycle(build_only: bool, cycle: bool) -> Fixture {
         }],
         None,
     );
-    assert_eq!(distill_test_project::put_artifact(&server.handle(), &child_row.1), child_row.0);
-    assert_eq!(distill_test_project::put_artifact(&server.handle(), &root_row.1), root_row.0);
+    assert_eq!(
+        distill_test_project::put_artifact(&server.handle(), &child_row.1),
+        child_row.0
+    );
+    assert_eq!(
+        distill_test_project::put_artifact(&server.handle(), &root_row.1),
+        root_row.0
+    );
     server.install_build_backend(Arc::new(TypePolicyBackend {
         build_only,
         built: BTreeMap::from([(root, root_row.0), (child, child_row.0)]),
@@ -337,7 +343,10 @@ fn build_pack_pulls_the_typed_closure_and_emits_mountable_files() {
     let paths = output.manifest.paths.as_ref().unwrap();
     assert_eq!(paths.len(), 4);
     assert_eq!(
-        paths.iter().filter(|row| row.name.as_deref() == Some("main")).count(),
+        paths
+            .iter()
+            .filter(|row| row.name.as_deref() == Some("main"))
+            .count(),
         2
     );
     assert_eq!(
@@ -393,7 +402,11 @@ fn build_publish_and_activate_pack_commits_the_complete_pack() {
         output.archive_bytes
     );
     let staging = distill_store::atomic_file::staging_dir(directory);
-    assert_eq!(fs::read_dir(&staging).unwrap().count(), 0, "no temp is left behind");
+    assert_eq!(
+        fs::read_dir(&staging).unwrap().count(),
+        0,
+        "no temp is left behind"
+    );
     assert_eq!(
         fs::read_dir(directory).unwrap().count(),
         4,

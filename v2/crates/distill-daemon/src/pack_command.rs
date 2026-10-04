@@ -71,7 +71,10 @@ impl fmt::Display for PackCommandError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoDaemon { address, error } => {
-                write!(formatter, "no distilld at {address}; start it first ({error})")
+                write!(
+                    formatter,
+                    "no distilld at {address}; start it first ({error})"
+                )
             }
             Self::OutputInsideAssetRoot { output, root } => write!(
                 formatter,
@@ -155,12 +158,13 @@ async fn build_pack_at(
     definition_asset: AssetUuid,
     destination: &Path,
 ) -> Result<PackBuildOutput, PackCommandError> {
-    let client = CapnpClient::connect_local(address)
-        .await
-        .map_err(|error| PackCommandError::NoDaemon {
-            address,
-            error: error.to_string(),
-        })?;
+    let client =
+        CapnpClient::connect_local(address)
+            .await
+            .map_err(|error| PackCommandError::NoDaemon {
+                address,
+                error: error.to_string(),
+            })?;
     let metadata = client
         .metadata(PROTOCOL_VERSION)
         .await
@@ -185,7 +189,10 @@ async fn build_pack_at(
         .map_err(|error| PackCommandError::Config(error.to_string()))?;
 
     for _ in 0..MAX_BASIS_RETRIES {
-        let authoring = remote(metadata.authoring_snapshot().await, "pin authoring snapshot")?;
+        let authoring = remote(
+            metadata.authoring_snapshot().await,
+            "pin authoring snapshot",
+        )?;
         // A definition file that changed since the snapshot is read at the
         // next one.
         let Some((definition_stamp, definition)) =

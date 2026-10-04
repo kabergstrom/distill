@@ -107,8 +107,10 @@ impl PolicyCell {
     fn set(&self, policy: SnapshotPolicy) {
         let ttl = u64::try_from(policy.ttl.as_nanos()).unwrap_or(u64::MAX);
         self.ttl_nanos.store(ttl, Ordering::Release);
-        self.max_snapshots.store(policy.max_snapshots, Ordering::Release);
-        self.max_connections.store(policy.max_connections, Ordering::Release);
+        self.max_snapshots
+            .store(policy.max_snapshots, Ordering::Release);
+        self.max_connections
+            .store(policy.max_connections, Ordering::Release);
     }
 }
 
@@ -235,7 +237,8 @@ impl ServerHandle {
 
     /// Wake every front end: the store published a new version or fence.
     pub fn notify_published(&self) {
-        self.published.send_modify(|count| *count = count.wrapping_add(1));
+        self.published
+            .send_modify(|count| *count = count.wrapping_add(1));
         if let Some(hook) = self.on_publish.get() {
             hook();
         }
@@ -362,14 +365,13 @@ impl ServerHandle {
                     })
                     .map(|((), version)| version)
             } else if observed.0 == base.0 + 1 {
-                store
-                    .served_transaction(|txn| {
-                        apply_commit(txn, &commit).map_err(&mut reject)?;
-                        if let Some(targets) = &targets {
-                            publish_target_set(txn, targets)?;
-                        }
-                        Ok(txn.version())
-                    })
+                store.served_transaction(|txn| {
+                    apply_commit(txn, &commit).map_err(&mut reject)?;
+                    if let Some(targets) = &targets {
+                        publish_target_set(txn, targets)?;
+                    }
+                    Ok(txn.version())
+                })
             } else {
                 return Err(PublishError::Stale {
                     expected: base,
@@ -396,7 +398,6 @@ impl ServerHandle {
         }
         result
     }
-
 }
 
 struct UnavailableBuildBackend;
@@ -414,7 +415,12 @@ impl BuildBackend for UnavailableBuildBackend {
 
 #[cfg(test)]
 impl AuthoringBackend for UnavailableAuthoringBackend {
-    fn read_file(&self, _: &distill_store::StoreReader, _: &str, _: &str) -> Result<Vec<u8>, String> {
+    fn read_file(
+        &self,
+        _: &distill_store::StoreReader,
+        _: &str,
+        _: &str,
+    ) -> Result<Vec<u8>, String> {
         unreachable!("never inspects")
     }
 
@@ -603,7 +609,6 @@ impl Server {
             txn: self.inner.current_snapshot()?,
         })
     }
-
 }
 
 /// One read snapshot a report runs on (see
@@ -775,7 +780,9 @@ impl ServerHandle {
                     CoordinatedCommitError::Stale { expected, observed }
                 }
                 PublishError::Invalid(error) => CoordinatedCommitError::Invalid(error),
-                PublishError::Store(error) => CoordinatedCommitError::Publication(error.to_string()),
+                PublishError::Store(error) => {
+                    CoordinatedCommitError::Publication(error.to_string())
+                }
             })
     }
 
@@ -1000,9 +1007,10 @@ impl SnapshotTxn {
 
     /// The configuration status this snapshot pins.
     pub(crate) fn configuration(&self) -> Result<ConfigurationStatus, StoreError> {
-        Ok(configuration_status(&self.snapshot().configuration_state()?))
+        Ok(configuration_status(
+            &self.snapshot().configuration_state()?,
+        ))
     }
-
 }
 
 /// A front end's connection with no read transaction open, kept for its
@@ -1015,7 +1023,10 @@ type Spare = Rc<RefCell<Option<StoreReader>>>;
 
 /// End `snapshot`'s transaction and keep its connection as the spare, if
 /// there is none.
-fn keep_spare(spare: &RefCell<Option<StoreReader>>, snapshot: distill_store::served::StoreSnapshot) {
+fn keep_spare(
+    spare: &RefCell<Option<StoreReader>>,
+    snapshot: distill_store::served::StoreSnapshot,
+) {
     match snapshot.into_reader() {
         Ok(reader) => {
             spare.borrow_mut().get_or_insert(reader);
@@ -1284,7 +1295,10 @@ impl Inner {
 
     /// A snapshot's pipeline: its version's candidate failure, else the
     /// runtime failure of the epoch it serves, which the backend holds.
-    pub(crate) fn effective_pipeline(&self, txn: &SnapshotTxn) -> Result<PipelineDiagnostic, RpcFailure> {
+    pub(crate) fn effective_pipeline(
+        &self,
+        txn: &SnapshotTxn,
+    ) -> Result<PipelineDiagnostic, RpcFailure> {
         pipeline_at(&*self.handle.authoring_backend(), txn.snapshot())
     }
 
@@ -1422,7 +1436,10 @@ impl Inner {
                     let start = index;
                     while index < rows.len()
                         && rows[index].version == row.version
-                        && matches!(rows[index].change, Change::Asset { .. } | Change::Path { .. })
+                        && matches!(
+                            rows[index].change,
+                            Change::Asset { .. } | Change::Path { .. }
+                        )
                     {
                         index += 1;
                     }
@@ -1430,8 +1447,8 @@ impl Inner {
                         continue;
                     }
                     for delta in history_deltas(instance, &rows[start..index]) {
-                        if let Some(delta) =
-                            delta.filtered(&connection.subscribed_assets, &connection.subscribed_paths)
+                        if let Some(delta) = delta
+                            .filtered(&connection.subscribed_assets, &connection.subscribed_paths)
                         {
                             connection.enqueue(StreamEvent::Delta(delta));
                         }
@@ -1593,7 +1610,8 @@ mod bound_tests {
             panic!("the connection is admitted");
         };
         assert_eq!(HANDSHAKE_READERS.with(|opens| opens.get()), 1);
-        let MetadataConnectOutcome::Connected(metadata) = server.root().metadata(PROTOCOL_VERSION) else {
+        let MetadataConnectOutcome::Connected(metadata) = server.root().metadata(PROTOCOL_VERSION)
+        else {
             panic!("the metadata connection is admitted");
         };
         assert_eq!(HANDSHAKE_READERS.with(|opens| opens.get()), 1);
@@ -1616,14 +1634,20 @@ mod bound_tests {
             other => panic!("expected snapshot, got {other:?}"),
         };
         let publish = || {
-            server.inner.with_writer(|store| store.input_transaction(|_| Ok(())).unwrap());
+            server
+                .inner
+                .with_writer(|store| store.input_transaction(|_| Ok(())).unwrap());
         };
         READER_OPENS.with(|opens| opens.set(0));
         for _ in 0..50 {
             drop(snapshot(&hub));
             publish();
         }
-        assert_eq!(READER_OPENS.with(|opens| opens.get()), 1, "a connection per version");
+        assert_eq!(
+            READER_OPENS.with(|opens| opens.get()),
+            1,
+            "a connection per version"
+        );
         // A client holding an old version's snapshot while it takes the
         // new one needs a second connection, and only one.
         let mut held = snapshot(&hub);
@@ -1640,7 +1664,11 @@ mod bound_tests {
     fn test_server() -> Server {
         let dir = tempfile::tempdir().unwrap().keep();
         let mut store = Store::open(StoreConfig::new(dir.join(".distill"))).unwrap();
-        let targets = target_map(vec![TargetDefinition::new("dev", TargetDefinitionHash([7; 32]))]).unwrap();
+        let targets = target_map(vec![TargetDefinition::new(
+            "dev",
+            TargetDefinitionHash([7; 32]),
+        )])
+        .unwrap();
         store
             .served_transaction(|txn| publish_target_set(txn, &targets))
             .unwrap();

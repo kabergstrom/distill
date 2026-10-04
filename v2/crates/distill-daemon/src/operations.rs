@@ -13,17 +13,17 @@ use distill_bundle::Bundle;
 use distill_core::id::ContentHash;
 use distill_json::AuthoredValue;
 use distill_rpc::{
-    AuthoringProgressEvent, AuthoringProgressState, DeferredOperation,
-    DeferredOperationResult, DoctorRequest, InputVersion, LongRunningOp, PreparedOperationCommit,
-    RenameWithFixupsRequest, ReportOperation, ReportSnapshot, RpcFailure, WriteReceipt, WrittenFile,
+    AuthoringProgressEvent, AuthoringProgressState, DeferredOperation, DeferredOperationResult,
+    DoctorRequest, InputVersion, LongRunningOp, PreparedOperationCommit, RenameWithFixupsRequest,
+    ReportOperation, ReportSnapshot, RpcFailure, WriteReceipt, WrittenFile,
 };
 use distill_schema::ngp_schema::SchemaNode;
 use distill_store::{Store, StoreReader};
 
 use crate::authoring::{invalid, require_base, AuthoringService};
-use distill_store::atomic_file::{self, Expected};
 use crate::compiled::CompiledRegistry;
 use crate::scanner::RootedScanner;
+use distill_store::atomic_file::{self, Expected};
 
 impl AuthoringService {
     pub(crate) fn prepare_long_operation(
@@ -127,9 +127,7 @@ impl AuthoringService {
                 .root_name(meta.root)
                 .map_err(invalid)?
                 .ok_or_else(|| invalid("bundle root identity is missing"))?;
-            let path = scanner
-                .physical_path(&root, &meta.path)
-                .map_err(invalid)?;
+            let path = scanner.physical_path(&root, &meta.path).map_err(invalid)?;
             let bytes = scanner.read_identity_checked(&path).map_err(invalid)?;
             let observed = ContentHash(*blake3::hash(&bytes).as_bytes());
             if observed != meta.content_hash {
@@ -159,7 +157,9 @@ impl AuthoringService {
                     root: request.destination_root.clone(),
                     path: request.destination_path.clone(),
                     content_hash: Some(
-                        rewritten.as_deref().map_or(observed, atomic_file::content_hash),
+                        rewritten
+                            .as_deref()
+                            .map_or(observed, atomic_file::content_hash),
                     ),
                 });
                 moved = Some((path, observed, rewritten));
@@ -189,7 +189,6 @@ impl AuthoringService {
             receipt: WriteReceipt { files: receipt },
         })
     }
-
 }
 
 /// What a deferred operation completes with: it reads the compiled state of
@@ -347,8 +346,14 @@ impl OperationRuntime {
             .authoring_service()
             .verify_watched_import_fixpoints(reader, base)
             .map_err(|error| format!("{error:?}"))?;
-        let compiled = self.compiled.at(reader).map_err(|error| error.to_string())?;
-        let observed = compiled.scanner().scan().map_err(|error| error.to_string())?;
+        let compiled = self
+            .compiled
+            .at(reader)
+            .map_err(|error| error.to_string())?;
+        let observed = compiled
+            .scanner()
+            .scan()
+            .map_err(|error| error.to_string())?;
         let filesystem_mismatch = !observed
             .matches_published(reader)
             .map_err(|error| error.to_string())?;
@@ -363,7 +368,9 @@ impl OperationRuntime {
             .map_err(|error| error.to_string())?;
         let mut defects = Vec::new();
         if filesystem_mismatch {
-            defects.push("full filesystem rehash differs from the published input snapshot".to_owned());
+            defects.push(
+                "full filesystem rehash differs from the published input snapshot".to_owned(),
+            );
         }
         defects.extend(observed.diagnostic_rows().map(|row| row.to_string()));
         if !import_failures.is_empty() {
@@ -380,7 +387,6 @@ impl OperationRuntime {
         defects.extend(build_defects);
         Ok((!defects.is_empty()).then(|| defects.join("; ")))
     }
-
 }
 
 /// One bundle file rewritten in place: it must hold `preimage` right before
@@ -649,8 +655,16 @@ mod reference_tests {
                     ("direct".into(), 0, reference.clone()),
                     ("weak".into(), 0, SchemaNode::WeakRef(target)),
                     ("label".into(), 0, SchemaNode::String),
-                    ("list".into(), 0, SchemaNode::Vec(Box::new(reference.clone()))),
-                    ("set".into(), 0, SchemaNode::Set(Box::new(reference.clone()))),
+                    (
+                        "list".into(),
+                        0,
+                        SchemaNode::Vec(Box::new(reference.clone())),
+                    ),
+                    (
+                        "set".into(),
+                        0,
+                        SchemaNode::Set(Box::new(reference.clone())),
+                    ),
                     (
                         "fixed".into(),
                         0,
@@ -659,8 +673,16 @@ mod reference_tests {
                             elem: Box::new(reference.clone()),
                         },
                     ),
-                    ("maybe".into(), 0, SchemaNode::Option(Box::new(reference.clone()))),
-                    ("absent".into(), 0, SchemaNode::Option(Box::new(reference.clone()))),
+                    (
+                        "maybe".into(),
+                        0,
+                        SchemaNode::Option(Box::new(reference.clone())),
+                    ),
+                    (
+                        "absent".into(),
+                        0,
+                        SchemaNode::Option(Box::new(reference.clone())),
+                    ),
                     (
                         "by_name".into(),
                         0,
@@ -701,10 +723,19 @@ mod reference_tests {
         };
         let data = object(&[
             ("direct", text("a.bundle")),
-            ("weak", object(&[("path", text("b.bundle")), ("local_id", text("x"))])),
+            (
+                "weak",
+                object(&[("path", text("b.bundle")), ("local_id", text("x"))]),
+            ),
             ("label", text("label.bundle")),
-            ("list", AuthoredValue::Array(vec![text("c.bundle"), text("a.bundle")])),
-            ("set", AuthoredValue::Array(vec![object(&[("path", text("d.bundle"))])])),
+            (
+                "list",
+                AuthoredValue::Array(vec![text("c.bundle"), text("a.bundle")]),
+            ),
+            (
+                "set",
+                AuthoredValue::Array(vec![object(&[("path", text("d.bundle"))])]),
+            ),
             ("fixed", AuthoredValue::Array(vec![text("e.bundle")])),
             ("maybe", text("f.bundle")),
             ("absent", AuthoredValue::Null),
@@ -717,7 +748,10 @@ mod reference_tests {
                 ])]),
             ),
             ("choice", object(&[("Linked", text("h.bundle"))])),
-            ("other_choice", object(&[("Unknown", text("unknown.bundle"))])),
+            (
+                "other_choice",
+                object(&[("Unknown", text("unknown.bundle"))]),
+            ),
             ("unnamed", text("unnamed.bundle")),
         ]);
         let hash = LogicalHash([1; 32]);

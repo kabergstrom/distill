@@ -12,10 +12,10 @@ use crate::capnp_transport::{
     RemoteConnectOutcome, RemoteMetadataOutcome,
 };
 use crate::{
-    ArtifactChunk, ArtifactChunkKind, AssetDeltaState, AssetEvent, AssetQuery,
-    AuthoringEntryRole, AuthoringInspectResult, ConfigurationError, Delta, DriftedInput,
-    ImportFailure, ImportRequest, MetadataEntry, PathResolveFailure, PathResolveResult, ReconnectReason,
-    ResolveResult, RpcBasis, RuntimeTypePolicy, ServedLoadEdge, StreamEvent, TerminalEvent,
+    ArtifactChunk, ArtifactChunkKind, AssetDeltaState, AssetEvent, AssetQuery, AuthoringEntryRole,
+    AuthoringInspectResult, ConfigurationError, Delta, DriftedInput, ImportFailure, ImportRequest,
+    MetadataEntry, PathResolveFailure, PathResolveResult, ReconnectReason, ResolveResult, RpcBasis,
+    RuntimeTypePolicy, ServedLoadEdge, StreamEvent, TerminalEvent,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,9 +196,7 @@ impl RemoteHub {
 
     /// The current watched-import failures (protocol 10). They publish no
     /// version, so a client polls this.
-    pub async fn import_failures(
-        &self,
-    ) -> Result<RemoteCall<Vec<ImportFailure>>, capnp::Error> {
+    pub async fn import_failures(&self) -> Result<RemoteCall<Vec<ImportFailure>>, capnp::Error> {
         let response = self.client.import_failures_request().send().promise.await?;
         let result = response.get()?.get_result()?;
         match result.which()? {
@@ -206,7 +204,10 @@ impl RemoteHub {
                 let mut failures = Vec::new();
                 for entry in list? {
                     failures.push(ImportFailure {
-                        bundle: BundleUuid(fixed::<16>(entry.get_bundle()?, "importFailures.bundle")?),
+                        bundle: BundleUuid(fixed::<16>(
+                            entry.get_bundle()?,
+                            "importFailures.bundle",
+                        )?),
                         root: entry.get_root()?.to_string()?,
                         path: entry.get_path()?.to_string()?,
                         message: entry.get_message()?.to_string()?,
@@ -380,7 +381,9 @@ impl RemoteSnapshot {
             schema::chunk_stream_call::Which::ConfigurationFailed(value) => Ok(
                 RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
-            schema::chunk_stream_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
+            schema::chunk_stream_call::Which::SnapshotExpired(()) => {
+                Ok(RemoteCall::SnapshotExpired)
+            }
             schema::chunk_stream_call::Which::Error(value) => {
                 Ok(RemoteCall::Error(decode_error(value?)?))
             }
@@ -480,7 +483,9 @@ impl RemoteSnapshot {
             schema::path_resolve_call::Which::ConfigurationFailed(value) => Ok(
                 RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
-            schema::path_resolve_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
+            schema::path_resolve_call::Which::SnapshotExpired(()) => {
+                Ok(RemoteCall::SnapshotExpired)
+            }
             schema::path_resolve_call::Which::Error(value) => {
                 Ok(RemoteCall::Error(decode_error(value?)?))
             }
@@ -581,14 +586,14 @@ pub struct RemoteMetadataHub {
 
 impl std::fmt::Debug for RemoteMetadataHub {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("RemoteMetadataHub").finish_non_exhaustive()
+        formatter
+            .debug_struct("RemoteMetadataHub")
+            .finish_non_exhaustive()
     }
 }
 
 impl RemoteMetadataHub {
-    pub fn connected(
-        outcome: RemoteMetadataOutcome,
-    ) -> Result<Self, Box<RemoteMetadataOutcome>> {
+    pub fn connected(outcome: RemoteMetadataOutcome) -> Result<Self, Box<RemoteMetadataOutcome>> {
         match outcome {
             RemoteMetadataOutcome::Connected { hub, .. } => Ok(Self { client: hub }),
             other => Err(Box::new(other)),
@@ -599,12 +604,19 @@ impl RemoteMetadataHub {
     pub async fn authoring_snapshot(
         &self,
     ) -> Result<RemoteCall<RemoteMetadataAuthoringSnapshot>, capnp::Error> {
-        let response = self.client.authoring_snapshot_request().send().promise.await?;
+        let response = self
+            .client
+            .authoring_snapshot_request()
+            .send()
+            .promise
+            .await?;
         let result = response.get()?.get_result()?;
         match result.which()? {
-            schema::metadata_authoring_snapshot_call::Which::Success(client) => Ok(
-                RemoteCall::Success(RemoteMetadataAuthoringSnapshot { client: client? }),
-            ),
+            schema::metadata_authoring_snapshot_call::Which::Success(client) => {
+                Ok(RemoteCall::Success(RemoteMetadataAuthoringSnapshot {
+                    client: client?,
+                }))
+            }
             schema::metadata_authoring_snapshot_call::Which::ReconnectRequired(value) => Ok(
                 RemoteCall::ReconnectRequired(decode_metadata_reconnect(value?.get_reason()?)),
             ),
@@ -645,22 +657,25 @@ impl RemoteMetadataAuthoringSnapshot {
         let response = request.send().promise.await?;
         let result = response.get()?.get_result()?;
         match result.which()? {
-            schema::metadata_authoring_inspect_call::Which::Success(value) => Ok(
-                RemoteCall::Success(AuthoringInspectResult::Inspection(
+            schema::metadata_authoring_inspect_call::Which::Success(value) => {
+                Ok(RemoteCall::Success(AuthoringInspectResult::Inspection(
                     decode_authoring_inspection(value?)?,
-                )),
-            ),
+                )))
+            }
             schema::metadata_authoring_inspect_call::Which::Missing(()) => {
                 Ok(RemoteCall::Success(AuthoringInspectResult::Missing))
             }
-            schema::metadata_authoring_inspect_call::Which::RoleIneligible(value) => {
-                Ok(RemoteCall::Success(AuthoringInspectResult::RoleIneligible {
+            schema::metadata_authoring_inspect_call::Which::RoleIneligible(value) => Ok(
+                RemoteCall::Success(AuthoringInspectResult::RoleIneligible {
                     observed: decode_role(value?.get_observed()?),
-                }))
-            }
+                }),
+            ),
             schema::metadata_authoring_inspect_call::Which::Drifted(value) => {
                 let (input, current) = decode_drifted(value?)?;
-                Ok(RemoteCall::Success(AuthoringInspectResult::Drifted { input, current }))
+                Ok(RemoteCall::Success(AuthoringInspectResult::Drifted {
+                    input,
+                    current,
+                }))
             }
             schema::metadata_authoring_inspect_call::Which::ReconnectRequired(value) => Ok(
                 RemoteCall::ReconnectRequired(decode_metadata_reconnect(value?.get_reason()?)),
@@ -845,19 +860,31 @@ fn write_asset_query(mut output: schema::asset_query::Builder<'_>, query: &Asset
         output.reborrow().init_uuid().set_value(&uuid.0);
     }
     if let Some(path) = &query.bundle_path {
-        output.reborrow().init_bundle_path().set_value(path.as_str());
+        output
+            .reborrow()
+            .init_bundle_path()
+            .set_value(path.as_str());
     }
     if let Some(local_id) = &query.local_id {
-        output.reborrow().init_local_id().set_value(local_id.as_str());
+        output
+            .reborrow()
+            .init_local_id()
+            .set_value(local_id.as_str());
     }
     if let Some(bundle) = query.bundle_uuid {
         output.reborrow().init_bundle_uuid().set_value(&bundle.0);
     }
     if let Some(authored) = query.authored_type {
-        output.reborrow().init_authored_type().set_value(&authored.0);
+        output
+            .reborrow()
+            .init_authored_type()
+            .set_value(&authored.0);
     }
     if let Some(terminal) = query.terminal_type {
-        output.reborrow().init_terminal_type().set_value(&terminal.0);
+        output
+            .reborrow()
+            .init_terminal_type()
+            .set_value(&terminal.0);
     }
     if let Some(tag) = &query.tag {
         let mut selector = output.reborrow().init_tag().init_value();
@@ -867,7 +894,10 @@ fn write_asset_query(mut output: schema::asset_query::Builder<'_>, query: &Asset
         }
     }
     if let Some(prefix) = &query.path_prefix {
-        output.reborrow().init_path_prefix().set_value(prefix.as_str());
+        output
+            .reborrow()
+            .init_path_prefix()
+            .set_value(prefix.as_str());
     }
     if let Some(glob) = &query.path_glob {
         output.reborrow().init_path_glob().set_value(glob.as_str());
@@ -890,7 +920,10 @@ fn decode_entry(value: schema::entry_meta::Reader<'_>) -> Result<MetadataEntry, 
     }
     Ok(MetadataEntry {
         uuid: AssetUuid(fixed::<16>(value.get_uuid()?.get_bytes()?, "entry.uuid")?),
-        bundle: BundleUuid(fixed::<16>(value.get_bundle()?.get_bytes()?, "entry.bundle")?),
+        bundle: BundleUuid(fixed::<16>(
+            value.get_bundle()?.get_bytes()?,
+            "entry.bundle",
+        )?),
         local_id: text(value.get_local_id()?, "entry.localId")?,
         normalized_path: text(value.get_normalized_path()?, "entry.normalizedPath")?,
         authored_type: TypeUuid(fixed::<16>(

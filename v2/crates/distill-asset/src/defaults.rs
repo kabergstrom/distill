@@ -74,7 +74,6 @@ impl DefaultCollector {
     pub fn add(&mut self, node: SchemaNodeId, path: Vec<PathStep>, writer: DefaultWriter) {
         self.nodes.push((node, path, writer));
     }
-
 }
 
 pub struct DefaultTable<T: AssetType> {

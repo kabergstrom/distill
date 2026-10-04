@@ -462,9 +462,7 @@ impl DscpV1 {
             Self::OwnedPathOverlap { .. } => ConfigurationErrorCode::OwnedPathOverlap,
             Self::EmptyTargetApis { .. } => ConfigurationErrorCode::EmptyTargetApis,
             Self::InvalidParallelism { .. } => ConfigurationErrorCode::InvalidParallelism,
-            Self::InvalidBatchReservation { .. } => {
-                ConfigurationErrorCode::InvalidBatchReservation
-            }
+            Self::InvalidBatchReservation { .. } => ConfigurationErrorCode::InvalidBatchReservation,
             Self::DirectoryAlias { .. } => ConfigurationErrorCode::DirectoryAlias,
             Self::UnsupportedTargetIdentity { .. } => {
                 ConfigurationErrorCode::UnsupportedTargetIdentity
@@ -1265,7 +1263,8 @@ impl<'a> NamespaceErrorDecoder<'a> {
     }
 
     fn sources(&mut self) -> Result<Vec<ReadableBundleSource>, NamespaceErrorDecodeError> {
-        let count = usize::try_from(self.u32()?).map_err(|_| NamespaceErrorDecodeError::Truncated)?;
+        let count =
+            usize::try_from(self.u32()?).map_err(|_| NamespaceErrorDecodeError::Truncated)?;
         if count > self.bytes.len().saturating_sub(self.cursor) / 40 {
             return Err(NamespaceErrorDecodeError::Truncated);
         }
@@ -1273,7 +1272,8 @@ impl<'a> NamespaceErrorDecoder<'a> {
     }
 
     fn claimants(&mut self) -> Result<Vec<AssetClaimant>, NamespaceErrorDecodeError> {
-        let count = usize::try_from(self.u32()?).map_err(|_| NamespaceErrorDecodeError::Truncated)?;
+        let count =
+            usize::try_from(self.u32()?).map_err(|_| NamespaceErrorDecodeError::Truncated)?;
         if count > self.bytes.len().saturating_sub(self.cursor) / 2 {
             return Err(NamespaceErrorDecodeError::Truncated);
         }
@@ -1296,7 +1296,8 @@ impl<'a> NamespaceErrorDecoder<'a> {
     }
 
     fn path_claims(&mut self) -> Result<Vec<PhysicalPathClaim>, NamespaceErrorDecodeError> {
-        let count = usize::try_from(self.u32()?).map_err(|_| NamespaceErrorDecodeError::Truncated)?;
+        let count =
+            usize::try_from(self.u32()?).map_err(|_| NamespaceErrorDecodeError::Truncated)?;
         if count > self.bytes.len().saturating_sub(self.cursor) / 6 {
             return Err(NamespaceErrorDecodeError::Truncated);
         }
@@ -1313,13 +1314,13 @@ impl<'a> NamespaceErrorDecoder<'a> {
     fn platform_path(&mut self) -> Result<PlatformPathBytes, NamespaceErrorDecodeError> {
         match self.u8()? {
             1 => {
-                let len =
-                    usize::try_from(self.u32()?).map_err(|_| NamespaceErrorDecodeError::Truncated)?;
+                let len = usize::try_from(self.u32()?)
+                    .map_err(|_| NamespaceErrorDecodeError::Truncated)?;
                 Ok(PlatformPathBytes::Unix(self.take(len)?.to_vec()))
             }
             2 => {
-                let count =
-                    usize::try_from(self.u32()?).map_err(|_| NamespaceErrorDecodeError::Truncated)?;
+                let count = usize::try_from(self.u32()?)
+                    .map_err(|_| NamespaceErrorDecodeError::Truncated)?;
                 if count > self.bytes.len().saturating_sub(self.cursor) / 2 {
                     return Err(NamespaceErrorDecodeError::Truncated);
                 }
@@ -1782,7 +1783,10 @@ impl std::error::Error for NamespaceError {}
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ErrorScope {
     /// A file, or with an empty or directory `path`, a subtree.
-    File { root_name: String, path: String },
+    File {
+        root_name: String,
+        path: String,
+    },
     Bundle(BundleUuid),
     Asset(AssetUuid),
     Target(String),

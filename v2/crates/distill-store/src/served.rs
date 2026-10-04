@@ -27,12 +27,15 @@ pub const SERVED_PIPELINE: &str = "served_pipeline";
 const RPC_PIPELINE_GENERATION: &str = "rpc_pipeline_generation";
 const CHANGE_LOG_OLDEST: &str = "change_log_oldest";
 /// Install target `?1` with definition `?2`, or replace its definition.
-pub(crate) const SET_RPC_TARGET: &str = "INSERT INTO rpc_targets(name, definition_hash) VALUES (?1, ?2)
+pub(crate) const SET_RPC_TARGET: &str =
+    "INSERT INTO rpc_targets(name, definition_hash) VALUES (?1, ?2)
      ON CONFLICT(name) DO UPDATE SET definition_hash = excluded.definition_hash";
 /// A pipeline fence row at version `?1` (kind `?2`: [`CHANGE_RECONNECT_ALL`]).
-pub(crate) const APPEND_RECONNECT_ALL: &str = "INSERT INTO change_log(version, kind) VALUES (?1, ?2)";
+pub(crate) const APPEND_RECONNECT_ALL: &str =
+    "INSERT INTO change_log(version, kind) VALUES (?1, ?2)";
 /// Drop an artifact's load edges ahead of recording its latest install's.
-pub(crate) const DELETE_LOAD_EDGES: &str = "DELETE FROM artifact_load_edges WHERE content_hash = ?1";
+pub(crate) const DELETE_LOAD_EDGES: &str =
+    "DELETE FROM artifact_load_edges WHERE content_hash = ?1";
 
 /// One served authoring entry without its schema and value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,11 +105,13 @@ const CHANGE_RESTART: i64 = 5;
 
 /// Asset `?1`'s published deltas with `?2 < version <= ?3`, on the asset
 /// deltas' partial index (kind literal: [`CHANGE_ASSET`]).
-pub(crate) const ASSET_HISTORY: &str = "SELECT seq, version, kind, asset_uuid, state, subject, detail
+pub(crate) const ASSET_HISTORY: &str =
+    "SELECT seq, version, kind, asset_uuid, state, subject, detail
      FROM change_log WHERE kind = 1 AND asset_uuid = ?1 AND version > ?2 AND version <= ?3";
 /// Path `?1`'s published deltas with `?2 < version <= ?3`, on the path
 /// deltas' partial index (kind literal: [`CHANGE_PATH`]).
-pub(crate) const PATH_HISTORY: &str = "SELECT seq, version, kind, asset_uuid, state, subject, detail
+pub(crate) const PATH_HISTORY: &str =
+    "SELECT seq, version, kind, asset_uuid, state, subject, detail
      FROM change_log WHERE kind = 2 AND subject = ?1 AND version > ?2 AND version <= ?3";
 const _: () = assert!(CHANGE_ASSET == 1 && CHANGE_PATH == 2);
 
@@ -124,7 +129,6 @@ pub struct RpcTargetRow {
     pub name: String,
     pub definition_hash: [u8; 32],
 }
-
 
 /// A read transaction held open on its own connection: every read sees the
 /// one committed input version current when it began. Dropping it ends the
@@ -292,7 +296,10 @@ impl StoreReader {
     }
 
     /// One served authoring entry's metadata.
-    pub fn served_entry_meta(&self, asset: AssetUuid) -> Result<Option<ServedEntryMeta>, StoreError> {
+    pub fn served_entry_meta(
+        &self,
+        asset: AssetUuid,
+    ) -> Result<Option<ServedEntryMeta>, StoreError> {
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT {SERVED_ENTRY_COLUMNS} {SERVED_ENTRY_FROM} AND a.asset_uuid = ?1"
         ))?;
@@ -310,9 +317,9 @@ impl StoreReader {
         &self,
         asset: AssetUuid,
     ) -> Result<BTreeMap<String, Option<String>>, StoreError> {
-        let mut statement = self
-            .conn
-            .prepare_cached("SELECT tag, value FROM asset_tags WHERE asset_uuid = ?1 ORDER BY tag")?;
+        let mut statement = self.conn.prepare_cached(
+            "SELECT tag, value FROM asset_tags WHERE asset_uuid = ?1 ORDER BY tag",
+        )?;
         let rows = statement.query_map([asset.0.as_slice()], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
         })?;
@@ -323,7 +330,10 @@ impl StoreReader {
     /// with its bundle's poison), else the namespace error withholding it
     /// (its own UUID's collision, else its bundle UUID's). `None` is
     /// missing: never published, or deleted.
-    pub fn asset_resolution(&self, asset: AssetUuid) -> Result<Option<AssetResolution>, StoreError> {
+    pub fn asset_resolution(
+        &self,
+        asset: AssetUuid,
+    ) -> Result<Option<AssetResolution>, StoreError> {
         let id = asset.0.as_slice();
         if let Some(poison) = self
             .conn
@@ -331,7 +341,9 @@ impl StoreReader {
             .query_row([id], |row| row.get::<_, Option<String>>(0))
             .optional()?
         {
-            return Ok(Some(poison.map_or(AssetResolution::Published, AssetResolution::Failed)));
+            return Ok(Some(
+                poison.map_or(AssetResolution::Published, AssetResolution::Failed),
+            ));
         }
         Ok(self.withholding(asset)?.map(AssetResolution::Failed))
     }
@@ -343,9 +355,10 @@ impl StoreReader {
             if let Some(message) = self
                 .conn
                 .prepare_cached(sql)?
-                .query_row(rusqlite::params![asset.0.as_slice(), crate::errors::NAMESPACE], |row| {
-                    row.get(0)
-                })
+                .query_row(
+                    rusqlite::params![asset.0.as_slice(), crate::errors::NAMESPACE],
+                    |row| row.get(0),
+                )
                 .optional()?
             {
                 return Ok(Some(message));
@@ -357,16 +370,14 @@ impl StoreReader {
     /// Every asset a namespace error withholds (see [`Self::withholding`]).
     pub fn withheld_assets(&self) -> Result<BTreeSet<AssetUuid>, StoreError> {
         let mut statement = self.conn.prepare_cached(WITHHELD_ASSETS)?;
-        let rows = statement.query_map([crate::errors::NAMESPACE], |row| row.get::<_, Vec<u8>>(0))?;
-        rows.map(|row| Ok(AssetUuid(blob16(row?))))
-            .collect()
+        let rows =
+            statement.query_map([crate::errors::NAMESPACE], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.map(|row| Ok(AssetUuid(blob16(row?)))).collect()
     }
 
     /// Every asset a logical path names; more than one is an ambiguity.
     pub fn served_path_candidates(&self, path: &str) -> Result<BTreeSet<AssetUuid>, StoreError> {
-        let mut statement = self
-            .conn
-            .prepare_cached(crate::bundles::PATH_PRIMARIES)?;
+        let mut statement = self.conn.prepare_cached(crate::bundles::PATH_PRIMARIES)?;
         let rows = statement.query_map([path], |row| row.get::<_, Vec<u8>>(0))?;
         rows.map(|row| row.map(|bytes| AssetUuid(blob16(bytes))))
             .collect::<Result<BTreeSet<_>, _>>()
@@ -404,7 +415,8 @@ impl StoreReader {
                 BundleUuid(blob16(row.get(1)?)),
             ))
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     /// The pipeline reconnect generation every connection records at
@@ -414,17 +426,18 @@ impl StoreReader {
     }
 
     pub fn rpc_targets(&self) -> Result<Vec<RpcTargetRow>, StoreError> {
-        let mut statement = self.conn.prepare_cached(
-            "SELECT name, definition_hash FROM rpc_targets ORDER BY name",
-        )?;
+        let mut statement = self
+            .conn
+            .prepare_cached("SELECT name, definition_hash FROM rpc_targets ORDER BY name")?;
         let rows = statement.query_map([], rpc_target_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     pub fn rpc_target(&self, name: &str) -> Result<Option<RpcTargetRow>, StoreError> {
-        let mut statement = self.conn.prepare_cached(
-            "SELECT name, definition_hash FROM rpc_targets WHERE name = ?1",
-        )?;
+        let mut statement = self
+            .conn
+            .prepare_cached("SELECT name, definition_hash FROM rpc_targets WHERE name = ?1")?;
         Ok(statement.query_row([name], rpc_target_row).optional()?)
     }
 
@@ -474,8 +487,10 @@ impl StoreReader {
         }
         let mut by_path = self.conn.prepare_cached(PATH_HISTORY)?;
         for path in paths {
-            let rows =
-                by_path.query_map(rusqlite::params![path, window[0], window[1]], change_entry_row)?;
+            let rows = by_path.query_map(
+                rusqlite::params![path, window[0], window[1]],
+                change_entry_row,
+            )?;
             for row in rows {
                 entries.push(row??);
             }
@@ -507,7 +522,8 @@ impl StoreReader {
                 TypeUuid(blob16(row.get(1)?)),
             ))
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 }
 
@@ -518,9 +534,7 @@ fn rpc_target_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RpcTargetRow> {
     })
 }
 
-fn change_entry_row(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<Result<ChangeEntry, StoreError>> {
+fn change_entry_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ChangeEntry, StoreError>> {
     let seq: i64 = row.get(0)?;
     let version = InputVersion(row.get::<_, i64>(1)? as u64);
     let kind: i64 = row.get(2)?;
@@ -591,16 +605,15 @@ pub trait ServedWrite {
         meta_get_blob(self.served_conn(), key)
     }
 
-
     /// Every RPC target row as this transaction sees them.
     fn txn_rpc_targets(&self) -> Result<Vec<RpcTargetRow>, StoreError> {
-        let mut statement = self.served_conn().prepare_cached(
-            "SELECT name, definition_hash FROM rpc_targets ORDER BY name",
-        )?;
+        let mut statement = self
+            .served_conn()
+            .prepare_cached("SELECT name, definition_hash FROM rpc_targets ORDER BY name")?;
         let rows = statement.query_map([], rpc_target_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
-
 
     /// Append one change-log row at `version`.
     fn append_change(&mut self, version: InputVersion, change: &Change) -> Result<(), StoreError> {
@@ -636,8 +649,7 @@ pub trait ServedWrite {
         let oldest = meta_get_u64(conn, CHANGE_LOG_OLDEST)?.unwrap_or(0);
         let floor = current.0.saturating_sub(retained);
         if floor > oldest {
-            conn
-                .prepare_cached("DELETE FROM change_log WHERE version <= ?1")?
+            conn.prepare_cached("DELETE FROM change_log WHERE version <= ?1")?
                 .execute([floor as i64])?;
             meta_set_u64(conn, CHANGE_LOG_OLDEST, floor)?;
         }
@@ -659,14 +671,12 @@ pub trait ServedWrite {
         match value {
             Some(value) => meta_set_blob(conn, key, value),
             None => {
-                conn
-                    .prepare_cached("DELETE FROM store_meta WHERE key = ?1")?
+                conn.prepare_cached("DELETE FROM store_meta WHERE key = ?1")?
                     .execute([key])?;
                 Ok(())
             }
         }
     }
-
 
     /// Advance the pipeline reconnect generation and return the new value.
     fn bump_rpc_pipeline_generation(&mut self) -> Result<u64, StoreError> {

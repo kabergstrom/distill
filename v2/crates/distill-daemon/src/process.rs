@@ -32,13 +32,12 @@ use crate::coordinator::{CoordinatorError, CoordinatorInitError, DaemonCoordinat
 use crate::settle::{HeldOpen, QuietWindow};
 use crate::watcher::{
     WatcherAction, WatcherBatch, WatcherControl, WatcherEvent, WatcherQueue, WatcherSink,
-    WatcherStartError,
-    WatcherThread,
+    WatcherStartError, WatcherThread,
 };
-use distill_store::config::RestartOnlyChange;
 use distill_store::cas::SegmentSweeper;
-use distill_store::{Store, StoreReader, StoreWriter};
+use distill_store::config::RestartOnlyChange;
 use distill_store::state::{ConfigurationSourceFailureCode, ConfigurationSourcePath, DscpV1};
+use distill_store::{Store, StoreReader, StoreWriter};
 
 /// A failed pass, or a failed codegen run, is retried this much later.
 const RETRY_DELAY: Duration = Duration::from_millis(40);
@@ -225,7 +224,8 @@ impl DaemonProcess {
         // Arm both asset and control-file coverage before any candidate scan.
         // Root replacement is synchronously scanned by candidate publication;
         // the watcher then installs the new root and requests one catch-up scan.
-        let watcher = WatcherThread::start(coordinator.scanner(), config_watch.control_paths(), sink)?;
+        let watcher =
+            WatcherThread::start(coordinator.scanner(), config_watch.control_paths(), sink)?;
         let watcher_control = watcher.control();
         let codegen = CodegenService::new(
             &coordinator,
@@ -313,7 +313,6 @@ impl DaemonProcess {
         };
         Ok(process)
     }
-
 }
 
 impl DaemonProcess {
@@ -491,7 +490,9 @@ impl ProcessLoop {
         // Work an earlier pass left in the store needs a pass of its own
         // even when the watcher has nothing new.
         let action = match action {
-            WatcherAction::None if self.work_pending => WatcherAction::Batch(WatcherBatch::default()),
+            WatcherAction::None if self.work_pending => {
+                WatcherAction::Batch(WatcherBatch::default())
+            }
             action => action,
         };
         let retry_action = action.clone();
@@ -544,7 +545,11 @@ impl ProcessLoop {
                 expected,
                 observed,
             })) => {
-                tracing::debug!(?expected, ?observed, "reconciliation raced a publication; requeued");
+                tracing::debug!(
+                    ?expected,
+                    ?observed,
+                    "reconciliation raced a publication; requeued"
+                );
                 self.queue.requeue_action(retry_action);
             }
             // A file the pass read changed since its version observed it:
@@ -634,7 +639,8 @@ impl ProcessLoop {
             // invalidates nothing, and is no change to wait for.
             WatcherEvent::Invalidate(paths) if paths.is_empty() => {}
             WatcherEvent::Invalidate(paths) => {
-                self.schedule.change(now, paths.iter().map(PathBuf::as_path));
+                self.schedule
+                    .change(now, paths.iter().map(PathBuf::as_path));
             }
             WatcherEvent::Rescan => {
                 self.schedule.change(now, []);
@@ -1029,8 +1035,11 @@ impl ConfigWatch {
                             }))
                             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?
                             .expect("execution staging returned at least one defect");
-                        coordinator
-                            .publish_configuration_rejection(store, *selected.detail, selected.message)?;
+                        coordinator.publish_configuration_rejection(
+                            store,
+                            *selected.detail,
+                            selected.message,
+                        )?;
                         self.staged = candidate;
                         self.observed = Some(config_state);
                         self.observed_schema = Some(schema.state.clone());
@@ -1219,8 +1228,7 @@ fn input_configuration_changed(current: &DaemonConfig, candidate: &DaemonConfig)
 }
 
 fn operational_configuration_changed(current: &DaemonConfig, candidate: &DaemonConfig) -> bool {
-    current.pipeline != candidate.pipeline
-        || current.cas != candidate.cas
+    current.pipeline != candidate.pipeline || current.cas != candidate.cas
 }
 
 fn restart_changes(current: &DaemonConfig, candidate: &DaemonConfig) -> Vec<RestartOnlyChange> {
@@ -1383,7 +1391,11 @@ mod tests {
             5000,
             |_, _| {},
         );
-        assert_eq!(passes, vec![2250], "one pass, a window after the last change");
+        assert_eq!(
+            passes,
+            vec![2250],
+            "one pass, a window after the last change"
+        );
         assert!(warnings.is_empty());
     }
 
@@ -1391,7 +1403,14 @@ mod tests {
     fn a_single_change_reconciles_after_the_quiet_window() {
         let start = Instant::now();
         let mut schedule = Schedule::new(start, QUIET);
-        let (passes, _) = drive(&mut schedule, start, &[0], Path::new(ASSET), 5000, |_, _| {});
+        let (passes, _) = drive(
+            &mut schedule,
+            start,
+            &[0],
+            Path::new(ASSET),
+            5000,
+            |_, _| {},
+        );
         assert_eq!(passes, vec![250]);
     }
 
@@ -1492,8 +1511,14 @@ mod tests {
         let mut schedule = Schedule::new(start, QUIET);
         let noisy = Path::new("/project/assets/editor.log");
         // Rewritten every 100 ms for 7 s.
-        let (passes, warnings) =
-            drive(&mut schedule, start, &every(100, 0, 7000), noisy, 10_000, |_, _| {});
+        let (passes, warnings) = drive(
+            &mut schedule,
+            start,
+            &every(100, 0, 7000),
+            noisy,
+            10_000,
+            |_, _| {},
+        );
         assert_eq!(passes, vec![7250], "no cap: the pass waits for the end");
         assert_eq!(warnings.len(), 1, "once per episode: {warnings:?}");
         assert_eq!(warnings[0].open_for, ms(5000));

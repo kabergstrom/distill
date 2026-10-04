@@ -1,8 +1,8 @@
 //! Commit, diagnostic, and authored-value validation shared by the RPC
 //! server and the publication paths that apply commits to the store.
 
-use std::sync::Arc;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use unicode_normalization::UnicodeNormalization;
 
