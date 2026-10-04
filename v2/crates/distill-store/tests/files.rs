@@ -226,9 +226,12 @@ fn stale_observation_cannot_acknowledge_newer_work_for_the_same_path() {
         })
         .unwrap();
 
+    // The captured row is consumed; the newer one is more work.
     let acknowledged = store.acknowledge_file_work(&stale).unwrap();
     assert!(!acknowledged);
-    assert_eq!(store.pending_file_work().unwrap().dirty.len(), 2);
+    let remaining = store.pending_file_work().unwrap();
+    assert_eq!(remaining.dirty.len(), 1);
+    assert_eq!(remaining.dirty[0].observation, InputVersion(2));
 }
 
 // ---- scan observation tables ----
@@ -343,13 +346,56 @@ fn acknowledgement_clears_settled_paths_and_keeps_paths_with_newer_work() {
         .unwrap();
 
     // The newer observation of one path is more work, not a failure: the
-    // settled path clears and the moving path keeps all its rows.
+    // captured rows clear and the moving path's newer row stays.
     assert!(!store.acknowledge_file_work(&captured).unwrap());
     let remaining = store.pending_file_work().unwrap();
-    assert_eq!(remaining.dirty.len(), 2);
-    assert!(remaining.dirty.iter().all(|entry| entry.path == "moving.txt"));
+    assert_eq!(remaining.dirty.len(), 1);
+    assert_eq!(remaining.dirty[0].path, "moving.txt");
+    assert_eq!(remaining.dirty[0].observation, InputVersion(2));
 
     // Once a pass captures the newest observation, it clears.
     assert!(store.acknowledge_file_work(&remaining).unwrap());
     assert!(store.pending_file_work().unwrap().dirty.is_empty());
+}
+
+#[test]
+fn work_queued_and_acknowledged_in_one_transaction_is_never_written() {
+    let (_directory, mut store) = store();
+    store.open_input().unwrap();
+    store
+        .input_transaction(|transaction| {
+            let root = transaction.intern_root("main")?;
+            let version = transaction.version();
+            transaction.push_dirty(root, "a.bundle", true, version)
+        })
+        .unwrap();
+    let work = store.pending_file_work().unwrap();
+    assert_eq!(work.dirty.len(), 1);
+    assert!(store.acknowledge_file_work(&work).unwrap());
+    // A step that rolls back takes the work it queued with it.
+    store
+        .input_transaction(|transaction| {
+            let root = transaction.intern_root("main")?;
+            let version = transaction.version();
+            transaction.push_dirty(root, "b.bundle", true, version)?;
+            Err::<(), _>(distill_store::StoreError::Rejected {
+                detail: "rolled back".to_owned(),
+            })
+        })
+        .unwrap_err();
+    store.finish_input(true).unwrap();
+    assert!(store.committed_file_work().unwrap().is_empty());
+    assert!(store.pending_file_work().unwrap().is_empty());
+
+    // Work no pass consumed is written when its transaction commits.
+    store
+        .input_transaction(|transaction| {
+            let root = transaction.intern_root("main")?;
+            let version = transaction.version();
+            transaction.push_dirty(root, "c.bundle", true, version)
+        })
+        .unwrap();
+    let committed = store.committed_file_work().unwrap();
+    assert_eq!(committed.dirty.len(), 1);
+    assert_eq!(committed.dirty[0].path, "c.bundle");
 }

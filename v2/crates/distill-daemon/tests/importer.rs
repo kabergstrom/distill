@@ -1104,7 +1104,7 @@ fn a_burst_across_bundles_publishes_one_version() {
     // The sources' work is acknowledged with the pass; the outputs it wrote
     // are the next pass's work.
     let mut pending = reader
-        .pending_file_work()
+        .committed_file_work()
         .unwrap()
         .dirty
         .into_iter()

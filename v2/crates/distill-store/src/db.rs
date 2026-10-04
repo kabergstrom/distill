@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 46;
+pub const SCHEMA_VERSION: u32 = 47;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -159,20 +159,19 @@ CREATE TABLE directory_rule_sources (
 );
 CREATE INDEX directory_rule_sources_by_source ON directory_rule_sources(root_id, path);
 CREATE INDEX directory_rule_sources_by_listing ON directory_rule_sources(listing_dir);
-CREATE TABLE dirty_files (
+-- The watcher work no pass has consumed yet, in order. kind 0: `path` was
+-- deleted, 1: `path` exists as observed at input version `observation`,
+-- 2: `path` was renamed to `to_path`. A pass acknowledges the rows it
+-- captured by `seq` range (see `files::QueuedWork`).
+CREATE TABLE file_work (
     seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        INTEGER NOT NULL CHECK (kind IN (0, 1, 2)),
     root_id     INTEGER NOT NULL,
     path        TEXT NOT NULL,
-    exists_flag INTEGER NOT NULL,
-    observation INTEGER NOT NULL
-);
--- Schema 39: acknowledging a pass's work deletes by path.
-CREATE INDEX dirty_files_by_path ON dirty_files(root_id, path);
-CREATE TABLE rename_events (
-    seq       INTEGER PRIMARY KEY AUTOINCREMENT,
-    root_id   INTEGER NOT NULL,
-    from_path TEXT NOT NULL,
-    to_path   TEXT NOT NULL
+    to_path     TEXT,
+    observation INTEGER,
+    CHECK ((kind = 2) = (to_path IS NOT NULL)),
+    CHECK ((kind = 2) = (observation IS NULL))
 );
 CREATE TABLE bundles (
     bundle_uuid    BLOB NOT NULL PRIMARY KEY,
@@ -532,6 +531,9 @@ pub struct Store {
     /// Tool package trees the open input staged, published right before it
     /// commits ([`crate::pipeline::StagedPackage`]); a rollback drops them.
     staged_packages: Vec<crate::pipeline::StagedPackage>,
+    /// The watcher work the open transaction queued
+    /// ([`crate::files::QueuedWork`]).
+    pub(crate) queued_work: crate::files::QueuedWork,
     /// Runs in `commit_build` between the append and the index transaction.
     #[cfg(test)]
     pub(crate) before_commit: Option<Box<dyn FnMut() + Send>>,
@@ -617,6 +619,7 @@ impl Store {
             config_source: None,
             _state_lock: state_lock,
             staged_packages: Vec::new(),
+            queued_work: Default::default(),
             #[cfg(test)]
             before_commit: None,
         };
@@ -663,6 +666,7 @@ impl Store {
             config_source: None,
             _state_lock: state_lock,
             staged_packages: Vec::new(),
+            queued_work: Default::default(),
             #[cfg(test)]
             before_commit: None,
         })
@@ -741,6 +745,7 @@ impl Store {
         let state_path = config.state_path.clone();
         let open = self.input;
         let staged = self.staged_packages.len();
+        let queued = self.queued_work.mark();
         let txn = self.read.conn.savepoint()?;
         let base = match open {
             InputState::Begun { base } => base,
@@ -759,6 +764,7 @@ impl Store {
             config,
             roots: std::collections::BTreeMap::new(),
                 staged_packages: &mut self.staged_packages,
+                queued_work: &mut self.queued_work,
             };
             f(&mut input_txn).and_then(|out| {
                 if keep {
@@ -769,8 +775,10 @@ impl Store {
             })
         };
         if out.is_err() || !keep {
-            // The savepoint rolled back: so do the packages it staged.
+            // The savepoint rolled back: so do the packages it staged and
+            // the work it queued or consumed.
             self.staged_packages.truncate(staged);
+            self.queued_work.restore(queued);
         }
         Ok((out?, version))
     }
@@ -828,6 +836,12 @@ impl Store {
         };
         let staged = std::mem::take(&mut self.staged_packages);
         if keep {
+            if let Err(error) = self.queued_work.flush(&self.read.conn) {
+                self.queued_work.reset();
+                let _ = self.read.conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+            self.queued_work.reset();
             // The input's tool packages are published right before its
             // commit, and removed again if the commit fails: a `tools` row
             // never names a missing package, and a rolled-back input leaves
@@ -856,6 +870,7 @@ impl Store {
             }
         }
         drop(staged);
+        self.queued_work.reset();
         self.read.conn.execute_batch("ROLLBACK")?;
         Ok(base)
     }
@@ -874,6 +889,7 @@ impl Store {
         f: impl FnOnce(&mut Store) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         if !self.read.conn.is_autocommit() {
+            let queued = self.queued_work.mark();
             self.read.conn.execute_batch("SAVEPOINT write_txn")?;
             let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
             let out = match out {
@@ -883,6 +899,7 @@ impl Store {
                 },
                 Ok(Err(error)) => Err(error),
                 Err(panic) => {
+                    self.queued_work.restore(queued);
                     let _ = self
                         .read
                         .conn
@@ -890,6 +907,7 @@ impl Store {
                     std::panic::resume_unwind(panic)
                 }
             };
+            self.queued_work.restore(queued);
             let _ = self
                 .read
                 .conn
@@ -900,16 +918,25 @@ impl Store {
         self.read.conn.execute_batch("BEGIN IMMEDIATE")?;
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
         let out = match out {
-            Ok(Ok(value)) => match self.read.conn.execute_batch("COMMIT") {
-                Ok(()) => return Ok(value),
-                Err(error) => Err(error.into()),
+            Ok(Ok(value)) => match self
+                .queued_work
+                .flush(&self.read.conn)
+                .and_then(|()| Ok(self.read.conn.execute_batch("COMMIT")?))
+            {
+                Ok(()) => {
+                    self.queued_work.reset();
+                    return Ok(value);
+                }
+                Err(error) => Err(error),
             },
             Ok(Err(error)) => Err(error),
             Err(panic) => {
+                self.queued_work.reset();
                 let _ = self.read.conn.execute_batch("ROLLBACK");
                 std::panic::resume_unwind(panic)
             }
         };
+        self.queued_work.reset();
         let _ = self.read.conn.execute_batch("ROLLBACK");
         out
     }
@@ -1170,6 +1197,8 @@ pub struct InputTxn<'a> {
     pub(crate) roots: std::collections::BTreeMap<String, crate::files::RootId>,
     /// The tool package trees this input staged so far.
     pub(crate) staged_packages: &'a mut Vec<crate::pipeline::StagedPackage>,
+    /// The watcher work the open transaction queued so far.
+    pub(crate) queued_work: &'a mut crate::files::QueuedWork,
 }
 
 impl InputTxn<'_> {

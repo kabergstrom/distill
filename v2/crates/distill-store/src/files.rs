@@ -1,6 +1,5 @@
-//! File-tracking metadata (§13): `files` (per-root physical rows),
-//! `dirty_files`, `rename_events`, root interning, and the derived
-//! logical path index.
+//! File-tracking metadata (§13): `files` (per-root physical rows), the
+//! `file_work` queue, root interning, and the derived logical path index.
 //!
 //! Physical tracking is per root: multiple roots form one *logical*
 //! namespace (§18), and a single-path key could hold only one of two
@@ -72,10 +71,9 @@ pub enum LogicalPathState {
     Ambiguous(Vec<RootId>),
 }
 
-/// One pending-work entry (§13's `dirty_files`).
+/// One changed path of the watcher work (§13's `file_work`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirtyEntry {
-    pub seq: i64,
     pub root: RootId,
     /// The name `root` was interned from.
     pub root_name: String,
@@ -86,10 +84,9 @@ pub struct DirtyEntry {
     pub observation: InputVersion,
 }
 
-/// One ordered rename event (§13's `rename_events`).
+/// One rename of the watcher work, in order (§13's `file_work`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenameEvent {
-    pub seq: i64,
     pub root: RootId,
     /// The name `root` was interned from.
     pub root_name: String,
@@ -99,18 +96,132 @@ pub struct RenameEvent {
 
 /// One stable snapshot of unacknowledged watcher work. A consumer may do
 /// fallible work without holding the store mutex, then acknowledge exactly
-/// this sequence prefix; rows appended meanwhile remain pending.
+/// this set; work queued meanwhile remains pending.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PendingFileWork {
     pub dirty: Vec<DirtyEntry>,
     pub renames: Vec<RenameEvent>,
+    /// The `file_work` rows this snapshot holds: every row with `seq` at
+    /// most this (0: none).
+    through: i64,
+    /// The work the open transaction queued that this snapshot holds:
+    /// `(generation, count)` of [`QueuedWork`].
+    queued: Option<(u64, usize)>,
 }
 
 impl PendingFileWork {
+    /// Work no queue holds (what a pass derives itself): acknowledging it
+    /// consumes nothing.
+    pub fn unqueued(dirty: Vec<DirtyEntry>, renames: Vec<RenameEvent>) -> Self {
+        Self {
+            dirty,
+            renames,
+            ..Self::default()
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.dirty.is_empty() && self.renames.is_empty()
     }
 }
+
+/// One entry of the work a transaction queues.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QueuedEntry {
+    Dirty {
+        root: RootId,
+        path: String,
+        exists: bool,
+        observation: InputVersion,
+    },
+    Rename {
+        root: RootId,
+        from: String,
+        to: String,
+    },
+}
+
+/// The watcher work the open write transaction queued, not yet written: a
+/// scratch list of that transaction only. Its outermost commit writes the
+/// entries no pass consumed to `file_work`, so work queued and
+/// acknowledged in one transaction never becomes a row; a rollback, or a
+/// savepoint's, drops what it queued and restores what it consumed.
+#[derive(Debug, Default)]
+pub(crate) struct QueuedWork {
+    /// Advances at each outermost commit or rollback: a snapshot taken in
+    /// an earlier transaction consumes nothing here.
+    generation: u64,
+    entries: Vec<QueuedEntry>,
+    /// The leading entries a pass consumed.
+    consumed: usize,
+}
+
+/// A [`QueuedWork`] state a savepoint returns to on rollback.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct QueuedMark {
+    len: usize,
+    consumed: usize,
+}
+
+impl QueuedWork {
+    pub(crate) fn mark(&self) -> QueuedMark {
+        QueuedMark {
+            len: self.entries.len(),
+            consumed: self.consumed,
+        }
+    }
+
+    pub(crate) fn restore(&mut self, mark: QueuedMark) {
+        self.entries.truncate(mark.len);
+        self.consumed = mark.consumed;
+    }
+
+    /// Forget everything: the outermost transaction ended.
+    pub(crate) fn reset(&mut self) {
+        self.generation += 1;
+        self.entries.clear();
+        self.consumed = 0;
+    }
+
+    /// Write the entries no pass consumed, in order, inside the outermost
+    /// transaction about to commit.
+    pub(crate) fn flush(&self, conn: &rusqlite::Connection) -> Result<(), StoreError> {
+        if self.consumed == self.entries.len() {
+            return Ok(());
+        }
+        let mut insert = conn.prepare_cached(
+            "INSERT INTO file_work(kind, root_id, path, to_path, observation)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for entry in &self.entries[self.consumed..] {
+            match entry {
+                QueuedEntry::Dirty {
+                    root,
+                    path,
+                    exists,
+                    observation,
+                } => insert.execute(rusqlite::params![
+                    *exists as i64,
+                    root.0,
+                    path,
+                    None::<String>,
+                    observation.0 as i64
+                ])?,
+                QueuedEntry::Rename { root, from, to } => insert.execute(rusqlite::params![
+                    WORK_RENAME,
+                    root.0,
+                    from,
+                    to,
+                    None::<i64>
+                ])?,
+            };
+        }
+        Ok(())
+    }
+}
+
+/// `file_work.kind` of a rename (0 and 1 are a dirty path's `exists`).
+const WORK_RENAME: i64 = 2;
 
 /// The scanner's complete record of one (root, path): its tree state plus
 /// the on-disk spelling and, for a symlink, its canonical target. Both paths
@@ -293,7 +404,8 @@ impl InputTxn<'_> {
         insert_diagnostics(&self.txn, &mut self.roots, diagnostics)
     }
 
-    /// Queue pending work (§13's `dirty_files`).
+    /// Queue pending work (§13's `file_work`): written when the
+    /// outermost transaction commits, unless a pass consumes it first.
     pub fn push_dirty(
         &mut self,
         root: RootId,
@@ -301,22 +413,22 @@ impl InputTxn<'_> {
         exists: bool,
         observation: InputVersion,
     ) -> Result<(), StoreError> {
-        self.txn
-            .prepare_cached(
-                "INSERT INTO dirty_files(root_id, path, exists_flag, observation)
-             VALUES (?1, ?2, ?3, ?4)",
-            )?
-            .execute(rusqlite::params![root.0, path, exists as i64, observation.0 as i64])?;
+        self.queued_work.entries.push(QueuedEntry::Dirty {
+            root,
+            path: path.to_owned(),
+            exists,
+            observation,
+        });
         Ok(())
     }
 
-    /// Append to the ordered rename log (§13's `rename_events`).
+    /// Queue a rename, in order with the rest of the work.
     pub fn push_rename(&mut self, root: RootId, from: &str, to: &str) -> Result<(), StoreError> {
-        self.txn
-            .prepare_cached(
-                "INSERT INTO rename_events(root_id, from_path, to_path) VALUES (?1, ?2, ?3)",
-            )?
-            .execute(rusqlite::params![root.0, from, to])?;
+        self.queued_work.entries.push(QueuedEntry::Rename {
+            root,
+            from: from.to_owned(),
+            to: to.to_owned(),
+        });
         Ok(())
     }
 }
@@ -435,97 +547,129 @@ impl Store {
     }
 
 
-    /// Clear the watcher work a pass has completed without fabricating a new
-    /// input snapshot. Each captured path is compared on its own: when the
-    /// stored observation still matches the newest captured entry for that
-    /// path, its rows up to that entry are cleared; when it does not, more
-    /// work arrived for the path and every row for it stays pending for the
-    /// next pass. Rows appended after the capture survive either way, and the
-    /// captured rename events, which the pass has applied, are cleared.
-    /// Returns whether every captured path was cleared.
+    /// Every unacknowledged piece of watcher work, in order: the queue's
+    /// rows, then what the open transaction queued.
+    pub fn pending_file_work(&self) -> Result<PendingFileWork, StoreError> {
+        let mut work = self.read.committed_file_work()?;
+        let queued = &self.queued_work;
+        let mut names = std::collections::BTreeMap::new();
+        let mut name = |root: RootId| -> Result<String, StoreError> {
+            if let Some(name) = names.get(&root) {
+                return Ok(String::clone(name));
+            }
+            let found = self.read.root_name(root)?.ok_or_else(|| StoreError::Rejected {
+                detail: format!("queued work names unknown root {}", root.0),
+            })?;
+            names.insert(root, found.clone());
+            Ok(found)
+        };
+        for entry in &queued.entries[queued.consumed..] {
+            match entry {
+                QueuedEntry::Dirty {
+                    root,
+                    path,
+                    exists,
+                    observation,
+                } => work.dirty.push(DirtyEntry {
+                    root: *root,
+                    root_name: name(*root)?,
+                    path: path.clone(),
+                    exists: *exists,
+                    observation: *observation,
+                }),
+                QueuedEntry::Rename { root, from, to } => work.renames.push(RenameEvent {
+                    root: *root,
+                    root_name: name(*root)?,
+                    from_path: from.clone(),
+                    to_path: to.clone(),
+                }),
+            }
+        }
+        work.queued = Some((queued.generation, queued.entries.len()));
+        Ok(work)
+    }
+
+    /// Clear the watcher work a pass has completed, exactly the set `work`
+    /// captured, without fabricating a new input snapshot. Returns whether
+    /// none of its paths has newer work queued behind it (work queued
+    /// meanwhile stays pending either way).
     pub fn acknowledge_file_work(&mut self, work: &PendingFileWork) -> Result<bool, StoreError> {
         self.write_txn(|store| {
-            let transaction = store.read.conn.savepoint()?;
-            let mut latest = std::collections::BTreeMap::new();
-            for entry in &work.dirty {
-                latest.insert((entry.root, entry.path.as_str()), entry);
+            let mut newer = std::collections::BTreeSet::new();
+            if work.through > 0 {
+                store
+                    .read
+                    .conn
+                    .prepare_cached("DELETE FROM file_work WHERE seq <= ?1")?
+                    .execute([work.through])?;
             }
-            let mut complete = true;
-            for ((root, path), entry) in latest {
-                let current = transaction
-                    .prepare_cached("SELECT observation FROM files WHERE root_id = ?1 AND path = ?2")?
-                    .query_row(rusqlite::params![root.0, path], |row| row.get::<_, i64>(0))
-                    .optional()?;
-                let matches = match (entry.exists, current) {
-                    (true, Some(observation)) => observation as u64 == entry.observation.0,
-                    (false, None) => true,
-                    _ => false,
-                };
-                if matches {
-                    transaction
-                        .prepare_cached(
-                            "DELETE FROM dirty_files WHERE root_id = ?1 AND path = ?2 AND seq <= ?3",
-                        )?
-                        .execute(rusqlite::params![root.0, path, entry.seq])?;
-                } else {
-                    complete = false;
+            {
+                let mut later = store.read.conn.prepare_cached(
+                    "SELECT root_id, path FROM file_work WHERE seq > ?1 AND kind != 2",
+                )?;
+                let rows = later.query_map([work.through], |row| {
+                    Ok((RootId(row.get(0)?), row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    newer.insert(row?);
                 }
             }
-            if let Some(last) = work.renames.last() {
-                transaction
-                    .prepare_cached("DELETE FROM rename_events WHERE seq <= ?1")?
-                    .execute([last.seq])?;
+            let queued = &mut store.queued_work;
+            let mut from = queued.consumed;
+            if let Some((generation, count)) = work.queued {
+                if generation == queued.generation && count > queued.consumed {
+                    queued.consumed = count;
+                    from = count;
+                }
             }
-            transaction.commit()?;
-            Ok(complete)
+            for entry in &queued.entries[from..] {
+                if let QueuedEntry::Dirty { root, path, .. } = entry {
+                    newer.insert((*root, path.clone()));
+                }
+            }
+            Ok(!work
+                .dirty
+                .iter()
+                .any(|entry| newer.contains(&(entry.root, entry.path.clone()))))
         })
     }
 }
 
 impl StoreReader {
-    /// Snapshot all pending watcher work without consuming it. Downstream
-    /// processing can fail or race a later publication without losing rows.
-    pub fn pending_file_work(&self) -> Result<PendingFileWork, StoreError> {
-        let mut dirty = Vec::new();
-        {
-            let mut statement = self.conn.prepare_cached(
-                "SELECT d.seq, d.root_id, r.name, d.path, d.exists_flag, d.observation
-                 FROM dirty_files d JOIN roots r USING (root_id) ORDER BY d.seq ASC",
-            )?;
-            let rows = statement.query_map([], |row| {
-                Ok(DirtyEntry {
-                    seq: row.get(0)?,
-                    root: RootId(row.get(1)?),
-                    root_name: row.get(2)?,
-                    path: row.get(3)?,
-                    exists: row.get::<_, i64>(4)? != 0,
-                    observation: InputVersion(row.get::<_, i64>(5)? as u64),
-                })
-            })?;
-            for row in rows {
-                dirty.push(row?);
+    /// The committed watcher work, in order, without consuming it.
+    /// Downstream processing can fail or race a later publication without
+    /// losing rows.
+    pub fn committed_file_work(&self) -> Result<PendingFileWork, StoreError> {
+        let mut work = PendingFileWork::default();
+        let mut statement = self.conn.prepare_cached(
+            "SELECT w.seq, w.kind, w.root_id, r.name, w.path, w.to_path, w.observation
+             FROM file_work w JOIN roots r USING (root_id) ORDER BY w.seq",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            work.through = row.get(0)?;
+            let kind: i64 = row.get(1)?;
+            let root = RootId(row.get(2)?);
+            let root_name: String = row.get(3)?;
+            let path: String = row.get(4)?;
+            if kind == WORK_RENAME {
+                work.renames.push(RenameEvent {
+                    root,
+                    root_name,
+                    from_path: path,
+                    to_path: row.get(5)?,
+                });
+            } else {
+                work.dirty.push(DirtyEntry {
+                    root,
+                    root_name,
+                    path,
+                    exists: kind != 0,
+                    observation: InputVersion(row.get::<_, i64>(6)? as u64),
+                });
             }
         }
-        let mut renames = Vec::new();
-        {
-            let mut statement = self.conn.prepare_cached(
-                "SELECT e.seq, e.root_id, r.name, e.from_path, e.to_path
-                 FROM rename_events e JOIN roots r USING (root_id) ORDER BY e.seq ASC",
-            )?;
-            let rows = statement.query_map([], |row| {
-                Ok(RenameEvent {
-                    seq: row.get(0)?,
-                    root: RootId(row.get(1)?),
-                    root_name: row.get(2)?,
-                    from_path: row.get(3)?,
-                    to_path: row.get(4)?,
-                })
-            })?;
-            for row in rows {
-                renames.push(row?);
-            }
-        }
-        Ok(PendingFileWork { dirty, renames })
+        Ok(work)
     }
 
     /// The id a root name was interned as, if it was.

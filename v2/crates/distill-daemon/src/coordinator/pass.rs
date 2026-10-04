@@ -1216,7 +1216,6 @@ fn published_paths_work(
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("import output root {root_name:?} is not interned"))?;
         dirty.push(distill_store::files::DirtyEntry {
-            seq: 0,
             root,
             root_name: root_name.clone(),
             path: path.clone(),
@@ -1224,10 +1223,7 @@ fn published_paths_work(
             observation: store.input_version().map_err(|error| error.to_string())?,
         });
     }
-    Ok(PendingFileWork {
-        dirty,
-        renames: Vec::new(),
-    })
+    Ok(PendingFileWork::unqueued(dirty, Vec::new()))
 }
 
 /// `root:path` of each output in a lineage, in order.

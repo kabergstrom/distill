@@ -69,8 +69,7 @@ fn every_section_13_table_exists() {
         "import_records",
         "import_reads",
         "directory_rule_sources",
-        "dirty_files",
-        "rename_events",
+        "file_work",
         "bundles",
         "bundle_path_refs",
         "assets",
@@ -334,15 +333,12 @@ fn derived_output_namespace_is_keyed_by_child() {
 }
 
 #[test]
-fn dirty_queue_and_rename_log_are_ordered() {
+fn the_work_queue_holds_changed_paths_and_renames_in_one_order() {
     let dir = tempfile::tempdir().unwrap();
     let conn = open_conn(&dir);
     assert_eq!(
-        columns(&conn, "dirty_files"),
-        ["seq", "root_id", "path", "exists_flag", "observation"]
+        columns(&conn, "file_work"),
+        ["seq", "kind", "root_id", "path", "to_path", "observation"]
     );
-    assert_eq!(
-        columns(&conn, "rename_events"),
-        ["seq", "root_id", "from_path", "to_path"]
-    );
+    assert_eq!(pk_columns(&conn, "file_work"), ["seq"]);
 }

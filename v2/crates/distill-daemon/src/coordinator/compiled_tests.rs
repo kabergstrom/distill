@@ -635,7 +635,7 @@ fn published_tables(store: &Store) -> BTreeMap<&'static str, Vec<String>> {
         "source_claims",
         "claim_collisions",
         "claim_pending",
-        "dirty_files",
+        "file_work",
         "bundles",
         "bundle_path_refs",
         "assets",

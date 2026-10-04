@@ -1450,7 +1450,7 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         "SEARCH source_claims USING INDEX source_claims_by_subject (kind=? AND subject=?)",
         "USE TEMP B-TREE FOR DISTINCT",
     ];
-    let cases: [(&str, &[&str]); 21] = [
+    let cases: [(&str, &[&str]); 20] = [
         (
             "SELECT root_id, path, canonical_path, physical_path FROM directories",
             &["SCAN directories"],
@@ -1472,15 +1472,15 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         ("SELECT COUNT(DISTINCT claimant) FROM source_claims WHERE kind IN (1, 2)", &counted),
         ("SELECT DISTINCT claimant FROM source_claims WHERE kind = 0", &distinct),
         // The pending work: a pass's whole queue.
-        ("SELECT d.seq", &["SCAN d", by_root]),
-        ("SELECT e.seq", &["SCAN e", by_root]),
+        ("SELECT w.seq", &["SCAN w", by_root]),
+        // Acknowledging it: the captured range, and what was queued since.
         (
-            "SELECT observation FROM files",
-            &["SEARCH files USING INDEX sqlite_autoindex_files_1 (root_id=? AND path=?)"],
+            "DELETE FROM file_work WHERE seq <=",
+            &["SEARCH file_work USING INTEGER PRIMARY KEY (rowid<?)"],
         ),
         (
-            "DELETE FROM dirty_files",
-            &["SEARCH dirty_files USING INDEX dirty_files_by_path (root_id=? AND path=? AND rowid<?)"],
+            "SELECT root_id, path FROM file_work WHERE seq >",
+            &["SEARCH file_work USING INTEGER PRIMARY KEY (rowid>?)"],
         ),
         (
             "SELECT root_id FROM roots",
