@@ -1020,7 +1020,7 @@ impl ConfigWatch {
             }
             Err(_) => {}
             Ok(authority) if input_changed => {
-                let staged = match candidate.stage_execution_candidate(authority) {
+                let staged = match candidate.configuration_candidate(authority) {
                     Ok(staged) => staged,
                     Err(errors) => {
                         let file_hash = match &config_state {
@@ -1048,17 +1048,7 @@ impl ConfigWatch {
                         return Ok(false);
                     }
                 };
-                let published = coordinator.publish_configuration_candidate(
-                    store,
-                    crate::coordinator::ConfigurationCandidate {
-                        roots: candidate.asset_roots(),
-                        targets: staged.targets,
-                        build_targets: staged.build_targets,
-                        pipeline_source: candidate.modules.pipeline_dylib.clone(),
-                        requirements: staged.requirements,
-                        schema_authority: Arc::clone(authority),
-                    },
-                );
+                let published = coordinator.publish_configuration_candidate(store, staged);
                 match published {
                     Err(CoordinatorError::PipelineAwaitingSchema(detail)) => {
                         // Not a failure: the Ready epoch keeps serving. The

@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use distill_build::keys::target_definition_hash;
@@ -15,6 +16,7 @@ use distill_store::StoreConfig;
 use serde::Deserialize;
 use unicode_normalization::{is_nfc, UnicodeNormalization};
 
+use crate::coordinator::ConfigurationCandidate;
 use crate::epoch::{CandidateRequirements, TargetDefinition as PipelineTarget};
 use crate::module_loader::host_module_abi_identity;
 use crate::scanner::AssetRoot;
@@ -150,12 +152,6 @@ pub enum DaemonConfigError {
     Target(String),
     Rebuild(String),
     Watch(String),
-}
-
-pub(crate) struct StagedExecutionCandidate {
-    pub requirements: CandidateRequirements,
-    pub targets: Vec<TargetDefinition>,
-    pub build_targets: BTreeMap<String, Target>,
 }
 
 impl std::fmt::Display for DaemonConfigError {
@@ -538,10 +534,13 @@ impl DaemonConfig {
         })
     }
 
-    pub(crate) fn stage_execution_candidate(
+    /// This configuration over `authority`, staged for publication
+    /// ([`crate::coordinator::DaemonCoordinator::publish_configuration_candidate`]),
+    /// or every defect that rejects it.
+    pub fn configuration_candidate(
         &self,
-        authority: &ProjectSchemaAuthority,
-    ) -> Result<StagedExecutionCandidate, Vec<DaemonConfigError>> {
+        authority: &Arc<ProjectSchemaAuthority>,
+    ) -> Result<ConfigurationCandidate, Vec<DaemonConfigError>> {
         let mut errors = Vec::new();
         let build_targets = match self.build_targets_staged(authority.identity()) {
             Ok(targets) => Some(targets),
@@ -581,10 +580,13 @@ impl DaemonConfig {
                 })
                 .collect(),
         };
-        Ok(StagedExecutionCandidate {
-            requirements,
+        Ok(ConfigurationCandidate {
+            roots: self.asset_roots(),
             targets,
             build_targets,
+            pipeline_source: self.modules.pipeline_dylib.clone(),
+            requirements,
+            schema_authority: Arc::clone(authority),
         })
     }
 }

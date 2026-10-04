@@ -76,13 +76,15 @@ struct LogicalRename {
     to_path: String,
 }
 
-pub(crate) struct ConfigurationCandidate {
-    pub roots: Vec<AssetRoot>,
-    pub targets: Vec<TargetDefinition>,
-    pub build_targets: BTreeMap<String, Target>,
-    pub pipeline_source: PathBuf,
-    pub requirements: CandidateRequirements,
-    pub schema_authority: Arc<ProjectSchemaAuthority>,
+/// A configuration staged for publication: its roots, targets, pipeline
+/// module and schema authority ([`crate::config::DaemonConfig::configuration_candidate`]).
+pub struct ConfigurationCandidate {
+    pub(crate) roots: Vec<AssetRoot>,
+    pub(crate) targets: Vec<TargetDefinition>,
+    pub(crate) build_targets: BTreeMap<String, Target>,
+    pub(crate) pipeline_source: PathBuf,
+    pub(crate) requirements: CandidateRequirements,
+    pub(crate) schema_authority: Arc<ProjectSchemaAuthority>,
 }
 
 pub struct DaemonCoordinator {
@@ -606,7 +608,7 @@ impl DaemonCoordinator {
     /// version and not before; the module host, the watcher's roots and the
     /// rest of this process's memory change only once the input committed.
     /// A publication that fails changes none of them.
-    pub(crate) fn publish_configuration_candidate(
+    pub fn publish_configuration_candidate(
         &self,
         store: &mut Store,
         candidate: ConfigurationCandidate,
