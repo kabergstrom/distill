@@ -338,6 +338,9 @@ impl RemoteSnapshot {
                         client: value.get_chunks()?,
                         total_bytes: value.get_total_bytes(),
                         load_edges,
+                        pending: std::collections::VecDeque::new(),
+                        received: 0,
+                        done: false,
                     },
                 }))
             }
@@ -686,10 +689,28 @@ impl RemoteMetadataAuthoringSnapshot {
     }
 }
 
+/// `next` calls a chunk stream keeps in flight. The daemon answers a
+/// stream's calls in order, so up to this many chunks (1 MiB at the default
+/// chunk size) cross the wire per round trip instead of one. A fetch is read
+/// only while the engine steps its IO, once per frame, so this is also how
+/// many chunks one frame can read.
+const CHUNK_PIPELINE: usize = 16;
+
+type NextChunk = capnp::capability::Promise<
+    capnp::capability::Response<schema::chunk_stream::next_results::Owned>,
+    capnp::Error,
+>;
+
 pub struct RemoteChunkStream {
     client: schema::chunk_stream::Client,
     total_bytes: u64,
     load_edges: Vec<ServedLoadEdge>,
+    /// `next` calls sent and not yet read, oldest first.
+    pending: std::collections::VecDeque<NextChunk>,
+    /// Payload bytes read so far.
+    received: u64,
+    /// The stream answered `done`: nothing more is requested.
+    done: bool,
 }
 
 impl std::fmt::Debug for RemoteChunkStream {
@@ -709,10 +730,27 @@ impl RemoteChunkStream {
         &self.load_edges
     }
 
+    /// The next chunk; `None` once the stream is done. Keeps up to
+    /// [`CHUNK_PIPELINE`] calls in flight, but no more than the unread bytes
+    /// can need (whole chunks plus the `done` answer), so a small payload
+    /// costs no extra calls. The reader checks the chunks are contiguous.
     pub async fn next_chunk(&mut self) -> Result<Option<ArtifactChunk>, capnp::Error> {
-        let response = self.client.next_request().send().promise.await?;
+        if self.done {
+            return Ok(None);
+        }
+        let unread = self.total_bytes.saturating_sub(self.received);
+        let needed = unread.div_ceil(crate::server::DEFAULT_CHUNK_SIZE as u64) + 1;
+        let window = usize::try_from(needed).map_or(CHUNK_PIPELINE, |n| n.min(CHUNK_PIPELINE));
+        while self.pending.len() < window {
+            self.pending
+                .push_back(self.client.next_request().send().promise);
+        }
+        let next = self.pending.pop_front().expect("one call is in flight");
+        let response = next.await?;
         let value = response.get()?;
         if value.get_done() {
+            self.done = true;
+            self.pending.clear();
             return Ok(None);
         }
         let kind = match value.get_kind() {
@@ -727,10 +765,12 @@ impl RemoteChunkStream {
                 )))
             }
         };
+        let bytes: Arc<[u8]> = Arc::from(value.get_bytes()?.to_vec());
+        self.received = self.received.saturating_add(bytes.len() as u64);
         Ok(Some(ArtifactChunk {
             kind,
             offset: value.get_offset(),
-            bytes: Arc::from(value.get_bytes()?.to_vec()),
+            bytes,
         }))
     }
 }

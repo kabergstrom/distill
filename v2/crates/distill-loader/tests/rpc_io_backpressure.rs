@@ -518,6 +518,38 @@ fn fetch_throughput_is_not_one_per_two_frames() {
     });
 }
 
+// A large payload is not read one chunk per frame. The IO reads only while
+// the engine steps it, once per frame, and a step returns as soon as nothing
+// is ready; with one chunk call in flight per stream, each frame read one
+// 64 KiB chunk, so a 36 MiB font took about 580 frames (minutes at the
+// throttled frame rate of an occluded window) and held back the sweep's
+// other assets meanwhile. With the calls pipelined, a frame reads every
+// chunk that arrived since the last one.
+#[test]
+fn a_large_payload_is_not_fetched_one_chunk_per_frame() {
+    watchdog(Duration::from_secs(30), || {
+        const BLOB: usize = 4 * 1024 * 1024; // 64 chunks.
+        let daemon = serve(1, BLOB);
+        let (mut io, basis) = bound(daemon.address, RpcIoConfig::default());
+        io.fetch(ReqId(1), daemon.assets[0].1, &basis);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut events = Vec::new();
+        let mut frames = 0;
+        while count(&events, is_fetched) == 0 {
+            assert!(Instant::now() < deadline, "not fetched after {frames} frames");
+            events.extend(io.poll());
+            frames += 1;
+            // The rest of the frame: the daemon's answers arrive meanwhile.
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_blobs(&events, BLOB);
+        assert!(
+            frames <= 16,
+            "a {BLOB} byte payload took {frames} frames: chunks are read one per frame"
+        );
+    });
+}
+
 // H7: ending a sweep cancels its queued and running requests: nothing more
 // is delivered for them and the payloads, admission waits, and reservations
 // they held are released.
