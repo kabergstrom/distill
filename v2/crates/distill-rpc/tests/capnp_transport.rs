@@ -8,6 +8,7 @@ use distill_rpc::capnp_transport::{
 };
 use distill_rpc::*;
 use distill_schema::ngp_schema::{node_hash, SchemaNode};
+use distill_test_project::{Asset, TestBuilds, TestProject, ROOT};
 use tokio::task::LocalSet;
 
 fn target() -> TargetDefinition {
@@ -22,8 +23,75 @@ fn request() -> ConnectRequest {
     ConnectRequest::new("dev", TargetDefinitionHash([7; 32]))
 }
 
-fn server() -> Server {
-    Server::new(StoreInstanceId([9; 16]), vec![target()]).unwrap()
+/// An empty project whose daemon serves the target "dev" (definition 7).
+fn project() -> TestProject {
+    TestProject::new(vec![target()])
+}
+
+/// `entry` (see [`authoring_entry`]) as an authored asset.
+fn asset_of(entry: &AuthoringEntry) -> Asset {
+    let asset = Asset::blob(
+        &entry.local_id,
+        entry.uuid,
+        entry.type_uuid,
+        &entry.value.blobs[0],
+    );
+    match entry.role {
+        AuthoringEntryRole::Runtime => asset,
+        AuthoringEntryRole::AuthoringOnly => asset.authoring_only(),
+    }
+}
+
+/// Author `entry` as its own bundle file, at its path; a runtime entry is
+/// the bundle's primary asset (its path resolves to it).
+fn write_entry(project: &mut TestProject, entry: &AuthoringEntry) {
+    let primary = (entry.role == AuthoringEntryRole::Runtime).then_some(entry.local_id.as_str());
+    project.write_bundle(
+        &entry.normalized_path,
+        entry.bundle,
+        primary,
+        &[asset_of(entry)],
+    );
+}
+
+/// [`write_entry`], published as one version.
+fn publish_entry(project: &mut TestProject, entry: &AuthoringEntry) -> SnapshotStamp {
+    write_entry(project, entry);
+    project.publish()
+}
+
+/// An input version that changes nothing these tests watch: an unrelated
+/// bundle file appears.
+fn publish_unrelated(project: &mut TestProject) -> SnapshotStamp {
+    let version = project.server().current_stamp().unwrap().version.0;
+    let entry = authoring_entry(
+        200u8.wrapping_add(version as u8),
+        AuthoringEntryRole::AuthoringOnly,
+    );
+    publish_entry(project, &entry)
+}
+
+/// The configuration error [`reject_configuration`] publishes.
+fn configuration_error(file_hash: [u8; 32]) -> ConfigurationError {
+    ConfigurationError::from_reason(
+        &DscpV1::MalformedConfiguration { file_hash },
+        "invalid staged configuration",
+    )
+}
+
+/// The daemon publishes a rejected configuration source (a malformed
+/// configuration file hashing to `file_hash`) as an input version, on a
+/// writer of its own.
+fn reject_configuration(project: &TestProject, file_hash: [u8; 32]) -> SnapshotStamp {
+    let mut writer = project.coordinator().open_writer().unwrap();
+    project
+        .coordinator()
+        .publish_configuration_rejection(
+            &mut writer,
+            DscpV1::MalformedConfiguration { file_hash },
+            "invalid staged configuration",
+        )
+        .unwrap()
 }
 
 fn canonical_artifact(
@@ -62,7 +130,8 @@ fn canonical_artifact(
 async fn remote_loader_client_preserves_typed_calls() {
     LocalSet::new()
         .run_until(async {
-            let server = server();
+            let mut project = project();
+            let server = project.server();
             let asset = AssetUuid([44; 16]);
             let path = "assets/remote.bundle";
             let wire = distill_wire::wire::WireNode::Unit { offset: 0 };
@@ -74,22 +143,15 @@ async fn remote_loader_client_preserves_typed_calls() {
             let (content_hash, artifact) =
                 canonical_artifact(asset, TypeUuid([1; 16]), layout_hash, &[7, 8, 9]);
             server.install_artifact(content_hash, artifact).unwrap();
-            let stamp = server
-                .commit(Commit {
-                    assets: vec![AssetMutation::Set {
-                        uuid: asset,
-                        resolution: StoredResolve::Drifted {
-                            input: DriftedInput::File("source.asset".into()),
-                        },
-                        delta: AssetDeltaState::Changed,
-                    }],
-                    paths: vec![PathMutation::Set {
-                        path: path.into(),
-                        candidates: std::collections::BTreeSet::from([asset]),
-                    }],
-                    ..Commit::default()
-                })
-                .unwrap();
+            // The bundle file at `path`: its primary asset is `asset`,
+            // drifted until something builds it.
+            project.write_bundle(
+                path,
+                BundleUuid([45; 16]),
+                Some("remote"),
+                &[Asset::blob("remote", asset, TypeUuid([1; 16]), &[1])],
+            );
+            let stamp = project.publish();
             let listener = Rc::new(
                 StagedListener::bind(server.root(), "127.0.0.1:0")
                     .await
@@ -114,9 +176,9 @@ async fn remote_loader_client_preserves_typed_calls() {
             assert!(matches!(
                 resolved.value,
                 ResolveResult::Drifted {
-                    input: DriftedInput::File(ref value),
+                    input: DriftedInput::Asset(input),
                     current,
-                } if value == "source.asset" && current == stamp
+                } if input == asset && current == stamp
             ));
             let path_result = match snapshot.resolve_path(path).await.unwrap() {
                 RemoteCall::Success(terminal) => terminal.value,
@@ -124,7 +186,7 @@ async fn remote_loader_client_preserves_typed_calls() {
             };
             assert_eq!(path_result, PathResolveResult::Resolved(asset));
 
-            let newer = server.commit(Commit::default()).unwrap();
+            let newer = publish_unrelated(&mut project);
             assert_ne!(newer, stamp);
             let mut fetched = match snapshot.fetch(content_hash).await.unwrap() {
                 RemoteCall::Success(terminal) => terminal,
@@ -181,7 +243,8 @@ async fn remote_loader_client_preserves_typed_calls() {
 async fn capnp_snapshots_hard_expire_and_a_closed_connection_releases_them() {
     LocalSet::new()
         .run_until(async {
-            let server = server();
+            let project = project();
+            let server = project.server();
             server
                 .install_snapshot_policy(SnapshotPolicy {
                     ttl: std::time::Duration::from_millis(200),
@@ -256,12 +319,45 @@ async fn capnp_snapshots_hard_expire_and_a_closed_connection_releases_them() {
 
 #[derive(Default)]
 struct RecordingAuthoringBackend {
+    writes: Mutex<Vec<(InputVersion, Vec<AuthoringOp>)>>,
     imports: Mutex<Vec<ImportRequest>>,
     reimports: Mutex<Vec<BundleUuid>>,
     operations: Mutex<Vec<LongRunningOp>>,
 }
 
+/// The receipt [`RecordingAuthoringBackend`] answers a write with: the
+/// file of each set entry, under [`ROOT`].
+fn receipt_of(operations: &[AuthoringOp]) -> WriteReceipt {
+    WriteReceipt {
+        files: operations
+            .iter()
+            .filter_map(|operation| match operation {
+                AuthoringOp::Set(entry) => Some(WrittenFile {
+                    root: ROOT.to_owned(),
+                    path: entry.normalized_path.clone(),
+                    content_hash: None,
+                }),
+                AuthoringOp::Remove { .. } => None,
+            })
+            .collect(),
+    }
+}
+
 impl AuthoringBackend for RecordingAuthoringBackend {
+    fn write_files(
+        &self,
+        _store: &mut distill_store::Store,
+        base: InputVersion,
+        operations: &[AuthoringOp],
+        _force_lossy: bool,
+    ) -> Result<Option<WriteReceipt>, RpcFailure> {
+        self.writes
+            .lock()
+            .unwrap()
+            .push((base, operations.to_vec()));
+        Ok(Some(receipt_of(operations)))
+    }
+
     fn prepare_import(
         &self,
         _store: &mut distill_store::Store,
@@ -441,22 +537,22 @@ fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
     assert!(source.contains("inputVersion @1 :UInt64"));
 }
 
+/// The authoring entry the daemon serves for the asset `byte`: one blob
+/// (`byte + 2`) in its own bundle file `bundle-{byte}.bundle`, the bundle's
+/// primary. The daemon tags nothing without a project schema.
 fn authoring_entry(byte: u8, role: AuthoringEntryRole) -> AuthoringEntry {
     let schema_hash = node_hash(&SchemaNode::Blob).unwrap();
     AuthoringEntry {
         uuid: AssetUuid([byte; 16]),
         bundle: BundleUuid([byte.wrapping_add(1); 16]),
         local_id: format!("entry-{byte}"),
-        normalized_path: format!("bundle-{byte}.asset"),
+        normalized_path: format!("bundle-{byte}.bundle"),
         type_uuid: TypeUuid([1; 16]),
         terminal_type: TypeUuid([1; 16]),
         schema_hash,
         logical_schema: Arc::from(&b"\"blob\""[..]),
         role,
-        tags: std::collections::BTreeMap::from([(
-            "group".to_owned(),
-            Some(format!("group-{byte}")),
-        )]),
+        tags: std::collections::BTreeMap::new(),
         value: AuthoringValue {
             canonical_value: Arc::from(&b"{\"$distill_blob\":0}"[..]),
             blobs: vec![Arc::from([byte.wrapping_add(2)])],
@@ -507,28 +603,23 @@ fn write_authoring_entry_value(
 async fn authoring_snapshot_round_trips_over_real_tcp_with_exact_stamp_and_role_fence() {
     LocalSet::new()
         .run_until(async {
-            let server = server();
+            let mut project = project();
+            let server = project.server();
             let entry = authoring_entry(3, AuthoringEntryRole::AuthoringOnly);
-            let derived_uuid = AssetUuid([5; 16]);
-            let hash = ContentHash([4; 32]);
-            let first_stamp = server
-                .commit(Commit {
-                    assets: vec![
-                        AssetMutation::Set {
-                            uuid: entry.uuid,
-                            resolution: StoredResolve::Built { content_hash: hash },
-                            delta: AssetDeltaState::Changed,
-                        },
-                        AssetMutation::Set {
-                            uuid: derived_uuid,
-                            resolution: StoredResolve::Built { content_hash: hash },
-                            delta: AssetDeltaState::Changed,
-                        },
-                    ],
-                    authoring: vec![AuthoringMutation::Set(entry.clone())],
-                    ..Commit::default()
-                })
-                .unwrap();
+            // A runtime asset with no authoring entry, for the authoring
+            // role fence: two bundle files claim its UUID, so the daemon
+            // withholds the entry and serves only its (failed) resolution.
+            let runtime_entry = authoring_entry(5, AuthoringEntryRole::Runtime);
+            let runtime_uuid = runtime_entry.uuid;
+            write_entry(&mut project, &entry);
+            write_entry(&mut project, &runtime_entry);
+            project.write_bundle(
+                "collision.bundle",
+                BundleUuid([60; 16]),
+                None,
+                &[asset_of(&runtime_entry)],
+            );
+            let first_stamp = project.publish();
 
             let listener = Rc::new(
                 StagedListener::bind(server.root(), "127.0.0.1:0")
@@ -642,7 +733,7 @@ async fn authoring_snapshot_round_trips_over_real_tcp_with_exact_stamp_and_role_
             }
 
             let mut wrong_role = snapshot.inspect_request();
-            wrong_role.get().set_uuid(&derived_uuid.0);
+            wrong_role.get().set_uuid(&runtime_uuid.0);
             let wrong_role_response = wrong_role.send().promise.await.unwrap();
             match wrong_role_response
                 .get()
@@ -700,13 +791,9 @@ async fn authoring_snapshot_round_trips_over_real_tcp_with_exact_stamp_and_role_
             ));
 
             let mut replacement = entry;
-            replacement.value.canonical_value = Arc::from(&b"{\"$distill_blob\":0}"[..]);
-            let second_stamp = server
-                .commit(Commit {
-                    authoring: vec![AuthoringMutation::Set(replacement)],
-                    ..Commit::default()
-                })
-                .unwrap();
+            replacement.value.blobs = vec![Arc::from([9u8])];
+            let second_stamp = publish_entry(&mut project, &replacement);
+            assert!(second_stamp.version > first_stamp.version);
             let refresh_response = snapshot.refresh_request().send().promise.await.unwrap();
             let refreshed = match refresh_response
                 .get()
@@ -734,16 +821,7 @@ async fn authoring_snapshot_round_trips_over_real_tcp_with_exact_stamp_and_role_
                 _ => panic!("expected refreshed version"),
             }
 
-            let error = ConfigurationError::from_reason(
-                &DscpV1::MalformedConfiguration { file_hash: [7; 32] },
-                "invalid staged configuration",
-            );
-            let failed_stamp = server
-                .commit(Commit {
-                    configuration: Some(ConfigurationStatus::Failed(error)),
-                    ..Commit::default()
-                })
-                .unwrap();
+            let failed_stamp = reject_configuration(&project, [7; 32]);
             let failed_refresh = refreshed.refresh_request().send().promise.await.unwrap();
             let failed = match failed_refresh
                 .get()
@@ -788,7 +866,8 @@ async fn authoring_snapshot_round_trips_over_real_tcp_with_exact_stamp_and_role_
 
 #[tokio::test(flavor = "current_thread")]
 async fn listener_staging_rejects_non_loopback_before_binding() {
-    let root = server().root();
+    let project = project();
+    let root = project.server().root();
     let error = match StagedListener::bind(root, "192.0.2.1:0").await {
         Ok(_) => panic!("non-loopback must fail staging"),
         Err(error) => error,
@@ -803,13 +882,14 @@ async fn listener_staging_rejects_non_loopback_before_binding() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn listener_staging_binds_ipv4_and_ipv6_loopback() {
-    let ipv4 = StagedListener::bind(server().root(), "127.0.0.1:0")
+    let project = project();
+    let ipv4 = StagedListener::bind(project.server().root(), "127.0.0.1:0")
         .await
         .unwrap();
     assert!(ipv4.local_addr().unwrap().ip().is_loopback());
 
     // Some CI hosts disable IPv6. When available, it must remain loopback.
-    if let Ok(ipv6) = StagedListener::bind(server().root(), "[::1]:0").await {
+    if let Ok(ipv6) = StagedListener::bind(project.server().root(), "[::1]:0").await {
         assert!(ipv6.local_addr().unwrap().ip().is_loopback());
     }
 }
@@ -818,29 +898,29 @@ async fn listener_staging_binds_ipv4_and_ipv6_loopback() {
 async fn unbound_metadata_bootstrap_round_trips_over_tcp_while_failed() {
     LocalSet::new()
         .run_until(async {
-            let server = server();
-            let error = ConfigurationError::from_reason(
-                &DscpV1::MalformedConfiguration { file_hash: [6; 32] },
-                "invalid staged configuration",
-            );
-            let namespace_error = NamespaceError::new(
-                NamespaceErrorV1::UnreadableScanSubtree {
-                    subject: ScanSubject::Subtree {
-                        root_name: "assets".to_owned(),
-                        raw_relative_path: PlatformPathBytes::Unix(b"unreadable".to_vec()),
-                    },
-                    failure: ScanFailureCode::PermissionDenied,
-                },
-                "unreadable scan subtree",
-            )
-            .unwrap();
-            let stamp = server
-                .commit(Commit {
-                    configuration: Some(ConfigurationStatus::Failed(error.clone())),
-                    namespace_errors: Some(vec![namespace_error.clone()]),
-                    ..Commit::default()
-                })
-                .unwrap();
+            let mut project = project();
+            let server = project.server();
+            // A malformed bundle file: a namespace error naming it.
+            project.write("broken.bundle", b"not a bundle");
+            project.publish();
+            let error = configuration_error([6; 32]);
+            let stamp = reject_configuration(&project, [6; 32]);
+            let namespace_errors = match server.root().metadata(PROTOCOL_VERSION) {
+                MetadataConnectOutcome::Connected(connected) => {
+                    let diagnostics = connected.hub.diagnostics().success().unwrap();
+                    assert_eq!(diagnostics.stamp, stamp);
+                    diagnostics.namespace_errors
+                }
+                _ => panic!("expected an in-process metadata bootstrap"),
+            };
+            let [namespace_error] = &namespace_errors[..] else {
+                panic!("expected one namespace error, got {namespace_errors:?}")
+            };
+            assert!(matches!(
+                &namespace_error.detail,
+                NamespaceErrorV1::IncompleteSkeleton { source, .. }
+                    if source.root_name == ROOT && source.normalized_path == "broken.bundle"
+            ));
             let listener = Rc::new(
                 StagedListener::bind(server.root(), "127.0.0.1:0")
                     .await
@@ -903,7 +983,7 @@ async fn unbound_metadata_bootstrap_round_trips_over_tcp_while_failed() {
             let errors = diagnostics.get_namespace_errors().unwrap();
             assert_eq!(errors.len(), 1);
             assert_eq!(
-                distill_rpc::capnp_transport::decode_namespace_error(errors.get(0)).unwrap(),
+                &distill_rpc::capnp_transport::decode_namespace_error(errors.get(0)).unwrap(),
                 namespace_error
             );
             let mut query = snapshot.query_request();
@@ -954,22 +1034,25 @@ async fn unbound_metadata_bootstrap_round_trips_over_tcp_while_failed() {
 async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_delta() {
     LocalSet::new()
         .run_until(async {
-            let server = server();
+            let mut project = project();
+            let server = project.server();
+            let builds = TestBuilds::install(&server);
             let uuid = AssetUuid([3; 16]);
             let (hash, payload) =
                 canonical_artifact(uuid, TypeUuid([1; 16]), LayoutHash([4; 32]), &[10, 11, 12]);
             let expected_structural = payload.structural.clone();
             server.install_artifact(hash, payload).unwrap();
-            server
-                .commit(Commit {
-                    assets: vec![AssetMutation::Set {
-                        uuid,
-                        resolution: StoredResolve::Built { content_hash: hash },
-                        delta: AssetDeltaState::Changed,
-                    }],
-                    ..Commit::default()
-                })
-                .unwrap();
+            builds.answer(uuid, Ok(BuildAnswer::Built { content_hash: hash }));
+            let asset_bundle = |value: u8| {
+                (
+                    BundleUuid([30; 16]),
+                    [Asset::blob("asset", uuid, TypeUuid([1; 16]), &[value])],
+                )
+            };
+            let (bundle, assets) = asset_bundle(1);
+            project.write_bundle("asset.bundle", bundle, Some("asset"), &assets);
+            let stamp = project.publish();
+            assert_eq!(stamp.version, InputVersion(1));
 
             let listener = Rc::new(
                 StagedListener::bind(server.root(), "127.0.0.1:0")
@@ -983,7 +1066,7 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
             let client = CapnpClient::connect_local(address).await.unwrap();
             let hub = match client.connect(&request()).await.unwrap() {
                 RemoteConnectOutcome::Connected { hub, instance } => {
-                    assert_eq!(instance, StoreInstanceId([9; 16]));
+                    assert_eq!(instance, stamp.instance);
                     hub
                 }
                 other => panic!("expected connected, got {other:?}"),
@@ -1085,16 +1168,9 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
             // `DeltaStream.next` is a long-polling capability call. A commit
             // after the call is in flight wakes it without a polling gap.
             let pending_live = deltas.next_request().send().promise;
-            server
-                .commit(Commit {
-                    assets: vec![AssetMutation::Set {
-                        uuid,
-                        resolution: StoredResolve::Built { content_hash: hash },
-                        delta: AssetDeltaState::Restored,
-                    }],
-                    ..Commit::default()
-                })
-                .unwrap();
+            let (bundle, assets) = asset_bundle(2);
+            project.write_bundle("asset.bundle", bundle, Some("asset"), &assets);
+            project.publish();
             let live_response =
                 tokio::time::timeout(std::time::Duration::from_secs(2), pending_live)
                     .await
@@ -1117,16 +1193,8 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
 
             // A configuration error remains a typed result union over the
             // generated transport; refresh itself remains safe.
-            let error = ConfigurationError::from_reason(
-                &DscpV1::MalformedConfiguration { file_hash: [8; 32] },
-                "invalid staged configuration",
-            );
-            server
-                .commit(Commit {
-                    configuration: Some(ConfigurationStatus::Failed(error.clone())),
-                    ..Commit::default()
-                })
-                .unwrap();
+            let error = configuration_error([8; 32]);
+            reject_configuration(&project, [8; 32]);
             let refresh_response = snapshot.refresh_request().send().promise.await.unwrap();
             let refresh_result = refresh_response.get().unwrap().get_result().unwrap();
             let failed_snapshot = match refresh_result.which().unwrap() {
@@ -1209,25 +1277,14 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
 async fn a_slow_snapshot_build_does_not_stall_the_rpc_io_thread() {
     let started = Arc::new(AtomicBool::new(false));
     let release = Arc::new((Mutex::new(false), Condvar::new()));
-    let server = server();
+    let mut project = project();
+    let server = project.server();
     server.install_build_backend(Arc::new(BlockingBuildBackend {
         started: Arc::clone(&started),
         release: Arc::clone(&release),
     }));
     let entry = authoring_entry(41, AuthoringEntryRole::Runtime);
-    let drift_stamp = server
-        .commit(Commit {
-            assets: vec![AssetMutation::Set {
-                uuid: entry.uuid,
-                resolution: StoredResolve::Drifted {
-                    input: DriftedInput::Asset(entry.uuid),
-                },
-                delta: AssetDeltaState::Changed,
-            }],
-            authoring: vec![AuthoringMutation::Set(entry.clone())],
-            ..Commit::default()
-        })
-        .unwrap();
+    let drift_stamp = publish_entry(&mut project, &entry);
 
     let (address_tx, address_rx) = std::sync::mpsc::sync_channel(1);
     let root = server.root();
@@ -1323,8 +1380,9 @@ async fn a_slow_snapshot_build_does_not_stall_the_rpc_io_thread() {
 async fn wire_rejects_wrong_hash_and_uuid_widths_as_typed_results() {
     LocalSet::new()
         .run_until(async {
+            let project = project();
             let listener = Rc::new(
-                StagedListener::bind(server().root(), "127.0.0.1:0")
+                StagedListener::bind(project.server().root(), "127.0.0.1:0")
                     .await
                     .unwrap(),
             );
@@ -1417,13 +1475,8 @@ async fn wire_rejects_wrong_hash_and_uuid_widths_as_typed_results() {
 async fn wire_connect_returns_closed_pipeline_unavailable_diagnostic() {
     LocalSet::new()
         .run_until(async {
-            let backend = Arc::new(RecordingAuthoringBackend::default());
-            let server = Server::new_with_authoring_backend(
-                StoreInstanceId([9; 16]),
-                vec![target()],
-                backend.clone(),
-            )
-            .unwrap();
+            let project = project();
+            let server = project.server();
             let failure = PipelineFailure::new(
                 PipelineFailureCode::PublishedCallbackPanic,
                 PipelineFailureOrigin::PublishedRuntime,
@@ -1432,10 +1485,7 @@ async fn wire_connect_returns_closed_pipeline_unavailable_diagnostic() {
             )
             .unwrap();
             server
-                .commit(Commit {
-                    pipeline: Some(PipelineDiagnostic::Failed(failure.clone())),
-                    ..Commit::default()
-                })
+                .coordinated_runtime_pipeline_failure(failure.clone(), |_| Ok(()))
                 .unwrap();
             let listener = Rc::new(
                 StagedListener::bind(server.root(), "127.0.0.1:0")
@@ -1469,13 +1519,15 @@ async fn wire_connect_returns_closed_pipeline_unavailable_diagnostic() {
 async fn hub_authoring_operation_and_wire_tree_methods_are_live_and_generation_first() {
     LocalSet::new()
         .run_until(async {
+            // The subject is the hub's handling of a custom authoring
+            // backend: a second server over the daemon's store serves it.
+            let project = project();
             let backend = Arc::new(RecordingAuthoringBackend::default());
-            let server = Server::new_with_authoring_backend(
-                StoreInstanceId([9; 16]),
-                vec![target()],
+            let handle = ServerHandle::open(
                 backend.clone(),
-            )
-            .unwrap();
+                Arc::clone(project.coordinator().opener()),
+            );
+            let server = Server::open(&handle);
             let entry = authoring_entry(31, AuthoringEntryRole::Runtime);
             let wire_node = distill_wire::wire::WireNode::Unit { offset: 0 };
             let tree: Arc<[u8]> = Arc::from(distill_wire::dswl::dswl_bytes(&wire_node).unwrap());
@@ -1504,20 +1556,26 @@ async fn hub_authoring_operation_and_wire_tree_methods_are_live_and_generation_f
                 write_authoring_entry_value(ops.reborrow().get(0).init_set(), &entry);
             }
             let write = write.send().promise.await.unwrap();
-            // An embedded server publishes the write itself: no file, an
-            // empty receipt.
+            // The backend writes the files and answers their receipt; the
+            // version moves only when the watcher publishes them.
+            let expected_ops = vec![AuthoringOp::Set(entry.clone())];
             match write.get().unwrap().get_result().unwrap().which().unwrap() {
                 schema::data_call::Which::Success(receipt) => assert_eq!(
                     WriteReceipt::decode(receipt.unwrap()).unwrap(),
-                    WriteReceipt::default()
+                    receipt_of(&expected_ops)
                 ),
                 _ => panic!("expected a write receipt"),
             }
+            assert_eq!(
+                *backend.writes.lock().unwrap(),
+                vec![(InputVersion(0), expected_ops)]
+            );
+            assert_eq!(server.current_stamp().unwrap().version, InputVersion(0));
 
             let mut import = hub.import_request();
             {
                 let mut params = import.get();
-                params.set_base(1);
+                params.set_base(0);
                 let mut request = params.init_request();
                 request.set_importer("image-importer");
                 let mut sources = request.reborrow().init_sources(1);
@@ -1538,7 +1596,7 @@ async fn hub_authoring_operation_and_wire_tree_methods_are_live_and_generation_f
             }
 
             let mut reimport = hub.reimport_request();
-            reimport.get().set_base(2);
+            reimport.get().set_base(1);
             reimport.get().reborrow().init_bundle().set_bytes(&[70; 16]);
             let reimport = reimport.send().promise.await.unwrap();
             assert!(matches!(
@@ -1553,7 +1611,7 @@ async fn hub_authoring_operation_and_wire_tree_methods_are_live_and_generation_f
             ));
 
             let mut operation = hub.operation_request();
-            operation.get().set_base(3);
+            operation.get().set_base(2);
             operation
                 .get()
                 .reborrow()
@@ -1605,7 +1663,7 @@ async fn hub_authoring_operation_and_wire_tree_methods_are_live_and_generation_f
             assert!(!cancel.get().unwrap().get_cancelled());
 
             let mut cancellable = hub.operation_request();
-            cancellable.get().set_base(4);
+            cancellable.get().set_base(3);
             cancellable
                 .get()
                 .reborrow()
@@ -1653,24 +1711,6 @@ async fn hub_authoring_operation_and_wire_tree_methods_are_live_and_generation_f
                     LongRunningOp::Doctor(Arc::from(&b"cancel-me"[..])),
                 ]
             );
-
-            let (wire_artifact_hash, wire_artifact) =
-                canonical_artifact(entry.uuid, TypeUuid([1; 16]), layout_hash, &[31]);
-            server
-                .install_artifact(wire_artifact_hash, wire_artifact)
-                .unwrap();
-            server
-                .commit(Commit {
-                    assets: vec![AssetMutation::Set {
-                        uuid: entry.uuid,
-                        resolution: StoredResolve::Built {
-                            content_hash: wire_artifact_hash,
-                        },
-                        delta: AssetDeltaState::Changed,
-                    }],
-                    ..Commit::default()
-                })
-                .unwrap();
 
             let mut wire_tree = hub.wire_tree_request();
             wire_tree.get().set_layout_hash(&layout_hash.0);
@@ -1993,27 +2033,15 @@ impl BuildBackend for PackBackend {
 async fn remote_snapshot_serves_the_pack_surface() {
     LocalSet::new()
         .run_until(async {
-            let server = server();
+            let mut project = project();
+            let server = project.server();
             let backend = Arc::new(PackBackend::default());
             server.install_build_backend(backend.clone());
             let entry = authoring_entry(5, AuthoringEntryRole::Runtime);
             let definition = authoring_entry(6, AuthoringEntryRole::AuthoringOnly);
-            server
-                .commit(Commit {
-                    assets: vec![AssetMutation::Set {
-                        uuid: entry.uuid,
-                        resolution: StoredResolve::Drifted {
-                            input: DriftedInput::Asset(entry.uuid),
-                        },
-                        delta: AssetDeltaState::Changed,
-                    }],
-                    authoring: vec![
-                        AuthoringMutation::Set(entry.clone()),
-                        AuthoringMutation::Set(definition.clone()),
-                    ],
-                    ..Commit::default()
-                })
-                .unwrap();
+            write_entry(&mut project, &entry);
+            write_entry(&mut project, &definition);
+            project.publish();
             let listener = Rc::new(
                 StagedListener::bind(server.root(), "127.0.0.1:0")
                     .await
@@ -2029,6 +2057,18 @@ async fn remote_snapshot_serves_the_pack_surface() {
             // query and entry carry the runtime namespace.
             let selected = snapshot
                 .query(&AssetQuery {
+                    bundle_uuid: Some(entry.bundle),
+                    ..AssetQuery::default()
+                })
+                .await
+                .unwrap()
+                .success()
+                .unwrap();
+            assert_eq!(selected, vec![entry.uuid]);
+            // Without a project schema the daemon's tag index stays
+            // pending: a tag selector is a typed failure, not an empty set.
+            match snapshot
+                .query(&AssetQuery {
                     tag: Some(TagSelector {
                         tag: "group".into(),
                         value: Some("group-5".into()),
@@ -2037,9 +2077,18 @@ async fn remote_snapshot_serves_the_pack_surface() {
                 })
                 .await
                 .unwrap()
-                .success()
-                .unwrap();
-            assert_eq!(selected, vec![entry.uuid]);
+            {
+                RemoteCall::Error(error) => assert_eq!(
+                    error.message,
+                    format!(
+                        "{:?}",
+                        RpcFailure::TagIndexPoisoned {
+                            bundles: vec![entry.bundle]
+                        }
+                    )
+                ),
+                other => panic!("a pending tag index fails a tag query: {other:?}"),
+            }
             let meta = snapshot.entry(entry.uuid).await.unwrap().success().unwrap();
             assert_eq!(meta.normalized_path, entry.normalized_path);
             assert_eq!(meta.tags, entry.tags);
