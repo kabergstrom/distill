@@ -275,6 +275,7 @@ impl StagedListener {
     }
 
     /// Accept and drive one connection to completion.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub async fn serve_one(&self) -> Result<(), TransportError> {
         match self.accept_one().await?.await {
             Ok(result) => result.map_err(TransportError::Capnp),

@@ -34,7 +34,7 @@ use std::fmt;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::{watch, Notify};
 use unicode_normalization::UnicodeNormalization;
@@ -125,11 +125,12 @@ impl Default for SnapshotPolicy {
 }
 
 impl SnapshotPolicy {
+    #[cfg(any(test, feature = "test-hooks"))]
     fn validate(self) -> Result<Self, &'static str> {
         if self.ttl.is_zero() {
             return Err("RPC snapshot TTL must be nonzero");
         }
-        if Instant::now().checked_add(self.ttl).is_none() {
+        if std::time::Instant::now().checked_add(self.ttl).is_none() {
             return Err("RPC snapshot TTL is too large");
         }
         if self.max_snapshots == 0 {
@@ -267,6 +268,7 @@ impl ServerHandle {
         self.policy.get()
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     fn set_snapshot_policy(&self, policy: SnapshotPolicy) {
         self.policy.set(policy);
     }
@@ -570,6 +572,7 @@ impl Server {
 
     /// Replace the snapshot policy. It applies to snapshots and connections
     /// opened afterwards; what is open keeps its TTL and is not released.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn install_snapshot_policy(&self, policy: SnapshotPolicy) -> Result<(), &'static str> {
         self.inner.handle.set_snapshot_policy(policy.validate()?);
         Ok(())

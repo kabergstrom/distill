@@ -23,7 +23,16 @@ unicode-normalization.workspace = true
 [build-dependencies]
 capnpc = "0.26.0"
 
+[features]
+# Test instruments and setup drivers: `Server::install_snapshot_policy`,
+# `StagedListener::serve_one`.
+test-hooks = []
+
 [dev-dependencies]
+# The integration tests use the test hooks.
+distill-rpc = { path = ".", features = ["test-hooks"] }
+# The unit tests read the store through its test hooks.
+distill-store = { path = "../distill-store", features = ["test-hooks"] }
 distill-test-project = { path = "../distill-daemon/tests/fixtures/test-project" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
