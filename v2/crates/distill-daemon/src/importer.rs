@@ -860,8 +860,7 @@ impl AuthoringService {
         let Ok(id) = normalize_identifier(id) else {
             return false;
         };
-        self.builtin_importers().contains_key(&id)
-            || compiled.pipeline_importers().contains_key(&id)
+        compiled.pipeline_importers().contains_key(&id)
     }
 
     /// A read snapshot of the store's committed state, for a run that
@@ -1695,37 +1694,30 @@ impl AuthoringService {
         Ok(Some(true))
     }
 
-    /// The importer `id` at `compiled`: a built-in id is the built-in's.
+    /// The importer `id` at `compiled`.
     fn registered_importer(
         &self,
         compiled: &Compiled,
         id: &str,
     ) -> Result<RegisteredImporter, RpcFailure> {
         let id = normalize_identifier(id).map_err(invalid)?;
-        self.builtin_importers()
+        compiled
+            .pipeline_importers()
             .get(&id)
-            .or_else(|| compiled.pipeline_importers().get(&id))
             .cloned()
             .ok_or_else(|| invalid(format!("importer {id:?} is not registered")))
     }
 
-    /// Every importer's capability at `compiled`: a built-in id is the
-    /// built-in's.
+    /// Every importer's capability at `compiled`.
     fn importer_capabilities(
         &self,
         compiled: &Compiled,
     ) -> Result<BTreeMap<String, [u8; 32]>, RpcFailure> {
-        let mut capabilities = self
-            .builtin_importers()
+        Ok(compiled
+            .pipeline_importers()
             .iter()
             .map(|(id, importer)| (id.clone(), importer.capability_hash))
-            .collect::<BTreeMap<_, _>>();
-        for (id, importer) in compiled.pipeline_importers() {
-            capabilities
-                .entry(id.clone())
-                .or_insert(importer.capability_hash);
-        }
-        Ok(capabilities)
+            .collect())
     }
 
     fn resolve_explicit_destination(

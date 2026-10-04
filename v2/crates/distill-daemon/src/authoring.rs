@@ -22,7 +22,7 @@ use distill_rpc::{
     PreparedOperationCommit, RpcFailure, WriteReceipt, WrittenFile,
 };
 use distill_store::state::{PipelineFailure, PipelineFailureOrigin};
-use distill_store::{Current, Store, StoreOpener, StoreReader};
+use distill_store::{Store, StoreOpener, StoreReader};
 
 use distill_store::atomic_file;
 use crate::compiled::{Compiled, CompiledRegistry};
@@ -34,8 +34,6 @@ pub struct AuthoringService {
     /// Opens the reader an import run reads through when it runs outside
     /// any write.
     pub(crate) opener: Arc<StoreOpener>,
-    /// The daemon's own importers. The pipeline's are compiled state.
-    builtin_importers: Current<RegisteredImporters>,
     /// The compiled configuration state of each live store version: every
     /// operation reads the roots, importers, schema and pipeline of the
     /// version its own transaction sees (`crate::compiled`).
@@ -50,7 +48,6 @@ impl AuthoringService {
     ) -> Self {
         Self {
             opener,
-            builtin_importers: Current::new(RegisteredImporters::new()),
             compiled,
             tag_index_coordinator: OnceLock::new(),
         }
@@ -84,40 +81,8 @@ impl AuthoringService {
         Arc::clone(&self.compiled)
     }
 
-    /// The daemon's own importers.
-    pub(crate) fn builtin_importers(&self) -> Arc<RegisteredImporters> {
-        self.builtin_importers.load()
-    }
-
-    pub fn register_importer(
-        &self,
-        importer: Arc<dyn crate::importer::AuthoringImporter>,
-    ) -> Result<(), RpcFailure> {
-        let registered = RegisteredImporter::validate(importer)?;
-        let pipeline_has = self
-            .compiled
-            .latest()
-            .is_some_and(|compiled| compiled.pipeline_importers().contains_key(&registered.id));
-        let mut duplicate = pipeline_has;
-        self.builtin_importers.update(|current| {
-            duplicate |= current.contains_key(&registered.id);
-            let mut next = RegisteredImporters::clone(current);
-            if !duplicate {
-                next.insert(registered.id.clone(), registered.clone());
-            }
-            next
-        });
-        if duplicate {
-            return Err(invalid(format!(
-                "importer {:?} is already registered",
-                registered.id
-            )));
-        }
-        Ok(())
-    }
-
     /// Validate a pipeline epoch's importers as its compiled state holds
-    /// them: a built-in id is the built-in's.
+    /// them.
     pub(crate) fn prepare_pipeline_importers(
         &self,
         importers: Vec<Arc<dyn crate::importer::AuthoringImporter>>,
@@ -128,12 +93,6 @@ impl AuthoringService {
             if next.insert(registered.id.clone(), registered).is_some() {
                 return Err(invalid("pipeline epoch contains a duplicate importer id"));
             }
-        }
-        let builtins = self.builtin_importers.load();
-        if let Some(id) = next.keys().find(|id| builtins.contains_key(*id)) {
-            return Err(invalid(format!(
-                "pipeline importer {id:?} conflicts with a built-in importer"
-            )));
         }
         Ok(next)
     }

@@ -49,8 +49,7 @@ pub struct Compiled {
     authority: Option<Arc<ProjectSchemaAuthority>>,
     targets: Arc<BTreeMap<String, Target>>,
     projection: Arc<PipelineProjection>,
-    /// The pipeline epoch's importers (the daemon's built-in ones are not
-    /// compiled state).
+    /// The pipeline epoch's importers: the only importers there are.
     importers: Arc<RegisteredImporters>,
     pipeline: PipelineSnapshot,
     /// Resolves rooted paths against `roots`; its roots never change.
