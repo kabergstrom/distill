@@ -407,7 +407,7 @@ impl AuthoringService {
         let work = affected.map(|(work, _)| work);
         let capabilities_changed = affected.is_some_and(|(_, changed)| changed);
         let compiled = self.compiled(store)?;
-        let capabilities = self.importer_capabilities(&compiled)?;
+        let capabilities = self.importer_capabilities(&compiled);
         let watched = match work {
             Some((dirty, renames)) => {
                 let paths = dirty.iter().map(|entry| entry.path.as_str()).chain(
@@ -466,7 +466,7 @@ impl AuthoringService {
         let work = affected.map(|(work, _)| work);
         let capabilities_changed = affected.is_some_and(|(_, changed)| changed);
         let compiled = self.compiled(store)?;
-        let capabilities = self.importer_capabilities(&compiled)?;
+        let capabilities = self.importer_capabilities(&compiled);
         let (changed, previous) = (&refreshed.changed, &refreshed.previous);
         let mut paths = Vec::new();
         if let Some((dirty, renames)) = work {
@@ -1111,7 +1111,7 @@ impl AuthoringService {
             .map(|meta| self.read_prior_import(store, meta))
             .transpose()?;
 
-        let capabilities = self.importer_capabilities(&compiled)?;
+        let capabilities = self.importer_capabilities(&compiled);
         let mut backend =
             RootedImportBackend::open(compiled.scanner(), &self.opener, &capabilities, None)?;
         let sources = root_explicit_sources(&mut backend, &destination.root, &request.sources)?;
@@ -1313,9 +1313,7 @@ impl AuthoringService {
             origin,
             basis_deps,
         } = invocation;
-        let capabilities = self
-            .importer_capabilities(&compiled)
-            .map_err(ImportExecutionError::unmemoized)?;
+        let capabilities = self.importer_capabilities(&compiled);
         let mut backend =
             RootedImportBackend::open(compiled.scanner(), &self.opener, &capabilities, overlay)
                 .map_err(ImportExecutionError::unmemoized)?;
@@ -1539,9 +1537,7 @@ impl AuthoringService {
         let compiled = self
             .compiled(store)
             .map_err(ImportExecutionError::unmemoized)?;
-        let capabilities = self
-            .importer_capabilities(&compiled)
-            .map_err(ImportExecutionError::unmemoized)?;
+        let capabilities = self.importer_capabilities(&compiled);
         let mut recheck = RootedImportBackend::new(compiled.scanner(), store, &capabilities);
         if !revalidate_read_set(&request.read_set, &mut recheck) {
             return Err(ImportExecutionError::drifted(invalid(
@@ -1692,7 +1688,7 @@ impl AuthoringService {
         };
         let basis = encode_attempt_basis(read_set)?;
         let compiled = self.compiled(store)?;
-        let capabilities = self.importer_capabilities(&compiled)?;
+        let capabilities = self.importer_capabilities(&compiled);
         // Revalidated against the store as this input sees it: a pass's own
         // uncommitted observation is the current one.
         let mut backend = RootedImportBackend::new(compiled.scanner(), store, &capabilities);
@@ -1733,15 +1729,12 @@ impl AuthoringService {
     }
 
     /// Every importer's capability at `compiled`.
-    fn importer_capabilities(
-        &self,
-        compiled: &Compiled,
-    ) -> Result<BTreeMap<String, [u8; 32]>, RpcFailure> {
-        Ok(compiled
+    fn importer_capabilities(&self, compiled: &Compiled) -> BTreeMap<String, [u8; 32]> {
+        compiled
             .pipeline_importers()
             .iter()
             .map(|(id, importer)| (id.clone(), importer.capability_hash))
-            .collect())
+            .collect()
     }
 
     fn resolve_explicit_destination(
