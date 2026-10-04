@@ -19,13 +19,16 @@
 //!   element bytes; fixed arrays length-checked.
 //! - `BackRef(n)` resolves to the struct/enum expansion frame `n` levels up
 //!   the walk path (0 = innermost) — an explicit frame stack, pushed on
-//!   every struct/enum entry, so recursion expands naturally.
+//!   every struct/enum entry, so recursion expands naturally. The target
+//!   is walked under its own ancestors (`distill_core::frames`), not under
+//!   the frames between it and the back-reference.
 //! - Blobs are barred beneath map keys and set elements (§5): their
 //!   canonical order is by encoded bytes, which a blob's offset-bearing
 //!   encoding would circularly depend on.
 
 use std::collections::BTreeMap;
 
+use distill_core::frames::reenter;
 use distill_json::AuthoredValue;
 use ngp_schema::{PrimitiveKind, SchemaNode};
 
@@ -265,17 +268,17 @@ impl<'w, 's> Walker<'w, 's> {
                 r
             }
             SchemaNode::BackRef(distance) => {
-                let frames = self.frames.len();
-                let Some(index) = frames.checked_sub(1 + *distance as usize) else {
+                let Some((target, reentry)) = reenter(&mut self.frames, *distance) else {
                     return Err(BundleError::BadBackRef {
                         local_id: self.local_id.to_string(),
                         path: self.path_str(),
                         distance: *distance,
-                        frames,
+                        frames: self.frames.len(),
                     });
                 };
-                let target = self.frames[index];
-                self.walk(target, value)
+                let out = self.walk(target, value);
+                reentry.restore(&mut self.frames);
+                out
             }
         }
     }

@@ -280,6 +280,64 @@ fn backref_inside_a_variant_payload_reenters_the_enum() {
     write_bundle(&b).unwrap_err();
 }
 
+fn opt(inner: N) -> N {
+    N::Option(Box::new(inner))
+}
+
+#[test]
+fn backref_reentry_resolves_under_the_targets_own_ancestors() {
+    // A { b: Option<B> }, B { a: Option<A>, b: Option<B> }. B.b re-enters
+    // B as BackRef(0); inside that B, `a` is BackRef(1) and must name A —
+    // the frame above B — not the B the re-entry came from.
+    let sc = schema(st(&[(
+        "b",
+        opt(st(&[("a", opt(N::BackRef(1))), ("b", opt(N::BackRef(0)))])),
+    )]));
+    let a = |b| obj(&[("b", b)]);
+    let b = |a, b| obj(&[("a", a), ("b", b)]);
+    let data = a(b(V::Null, b(a(V::Null), V::Null)));
+    let bundled = bundle(&[&sc], vec![("x", entry(UUID_A, &sc, data))], None);
+    let bytes = write_bundle(&bundled).unwrap();
+    assert_eq!(parse_bundle(&bytes).unwrap(), bundled);
+
+    // A B where `a` names A is refused.
+    let data = a(b(V::Null, b(b(V::Null, V::Null), V::Null)));
+    let bundled = bundle(&[&sc], vec![("x", entry(UUID_A, &sc, data))], None);
+    write_bundle(&bundled).unwrap_err();
+}
+
+#[test]
+fn backref_reentry_resolves_under_the_targets_own_ancestors_three_deep() {
+    // A { b: Option<B> }, B { c: Option<C> },
+    // C { a: Option<A>, b: Option<B>, c: Option<C> }: re-entering C, then B
+    // from inside it, then C and A from inside that.
+    let sc = schema(st(&[(
+        "b",
+        opt(st(&[(
+            "c",
+            opt(st(&[
+                ("a", opt(N::BackRef(2))),
+                ("b", opt(N::BackRef(1))),
+                ("c", opt(N::BackRef(0))),
+            ])),
+        )])),
+    )]));
+    let a = |b| obj(&[("b", b)]);
+    let b = |c| obj(&[("c", c)]);
+    let c = |a, b, c| obj(&[("a", a), ("b", b), ("c", c)]);
+    let n = || V::Null;
+    let inner = b(c(a(b(n())), n(), c(n(), n(), n())));
+    let data = a(b(c(n(), n(), c(n(), inner, n()))));
+    let bundled = bundle(&[&sc], vec![("x", entry(UUID_A, &sc, data))], None);
+    let bytes = write_bundle(&bundled).unwrap();
+    assert_eq!(parse_bundle(&bytes).unwrap(), bundled);
+
+    // Inside the re-entered C, `b` names B: a C there is refused.
+    let data = a(b(c(n(), n(), c(n(), c(n(), n(), n()), n()))));
+    let bundled = bundle(&[&sc], vec![("x", entry(UUID_A, &sc, data))], None);
+    write_bundle(&bundled).unwrap_err();
+}
+
 #[test]
 fn string_key_map_blobs_ordered_by_encoded_key() {
     let sc = schema(st(&[(
