@@ -553,8 +553,7 @@ impl Store {
         Ok(layout_hash)
     }
 
-    /// Store raw artifact bytes outside a build (embedded RPC stores and
-    /// explicit installs), indexed by their blake3 content hash, together
+    /// Store raw artifact bytes outside a build (explicit installs), indexed by their blake3 content hash, together
     /// with the artifact's typed direct load edges. Idempotent. The install
     /// also holds the artifact's wire tree when the CAS has it.
     pub fn put_artifact(

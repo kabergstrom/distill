@@ -1894,7 +1894,6 @@ fn cas_and_served_point_statements_search_their_keys() {
     store.served_derived_output(asset).unwrap();
     store.served_path_candidates(&bundle_path(42)).unwrap();
     store.served_named_candidates(&bundle_path(42), "main").unwrap();
-    store.served_paths_of(asset).unwrap();
     store.rpc_target("pc").unwrap();
     store.rpc_targets().unwrap();
     store.change_log_head().unwrap();
@@ -2012,10 +2011,6 @@ fn cas_and_served_point_statements_search_their_keys() {
         (
             "SELECT parent_uuid, output_key, terminal_type FROM derived_outputs WHERE child_uuid = ? AND terminal_type IS NOT NULL",
             &["SEARCH derived_outputs USING INDEX sqlite_autoindex_derived_outputs_1 (child_uuid=?)"],
-        ),
-        (
-            "SELECT path FROM path_index WHERE asset_uuid = ?",
-            &["SEARCH path_index USING INDEX path_index_by_asset (asset_uuid=?)"],
         ),
         (
             "SELECT s.schema_json, a.authored_value FROM assets a JOIN schemas s ON s.logical_hash = a.logical_hash WHERE a.asset_uuid = ?",

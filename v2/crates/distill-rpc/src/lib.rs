@@ -23,8 +23,8 @@ mod target;
 pub use bind::{validate_bind_address, BindStageError};
 pub use protocol::*;
 pub use apply::{
-    apply_commit, apply_commit_served, publish_protocol_epoch, publish_restart_required, publish_runtime_pipeline_failure,
-    publish_target, publish_target_set, ApplyError, ApplyMode, RETAINED_HISTORY_VERSIONS,
+    apply_commit, publish_protocol_epoch, publish_restart_required, publish_runtime_pipeline_failure,
+    publish_target, publish_target_set, ApplyError, RETAINED_HISTORY_VERSIONS,
 };
 pub use capability::{
     AuthoringSnapshot, DeltaStream, FinishedBuild, Hub, MetadataAuthoringSnapshot, MetadataHub,

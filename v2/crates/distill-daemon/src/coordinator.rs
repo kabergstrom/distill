@@ -244,8 +244,8 @@ impl DaemonCoordinator {
         self.server.coordinated_commit(store, base, publish)
     }
 
-    /// An RPC front end of the caller's own (reads, `root`, embedded-style
-    /// admin calls on a writer of its own).
+    /// An RPC front end of the caller's own (reads, `root`, admin calls
+    /// on a writer of its own).
     pub fn server(&self) -> Server {
         Server::open(&self.server)
     }

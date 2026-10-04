@@ -6,7 +6,7 @@ use distill_core::id::{AssetUuid, TypeUuid};
 use distill_store::served::{
     decode_authored_value, encode_authored_value, Change, ResolutionRow, ServedWrite,
 };
-use distill_store::state::{InputVersion, StoreInstanceId};
+use distill_store::state::InputVersion;
 use distill_store::{Store, StoreConfig};
 
 fn store() -> (tempfile::TempDir, Store) {
@@ -99,20 +99,6 @@ fn rpc_targets_advance_generation_only_on_change() {
         .served_transaction(|txn| txn.bump_rpc_pipeline_generation())
         .unwrap();
     assert_eq!(store.rpc_fences().unwrap().pipeline_generation, 1);
-}
-
-#[test]
-fn embedded_identity_applies_only_to_fresh_stores() {
-    let (_dir, mut store) = store();
-    let instance = StoreInstanceId([5; 16]);
-    store
-        .adopt_embedded_identity(instance, InputVersion(40))
-        .unwrap();
-    assert_eq!(store.stamp().unwrap().instance, instance);
-    assert_eq!(store.reader().unwrap().stamp().unwrap().version, InputVersion(40));
-    assert!(store
-        .adopt_embedded_identity(instance, InputVersion(41))
-        .is_err());
 }
 
 #[test]

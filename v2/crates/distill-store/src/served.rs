@@ -485,16 +485,6 @@ impl StoreReader {
             .map_err(StoreError::from)
     }
 
-    /// Every logical path that names `asset`.
-    pub fn served_paths_of(&self, asset: AssetUuid) -> Result<BTreeSet<String>, StoreError> {
-        let mut statement = self
-            .conn
-            .prepare_cached("SELECT path FROM path_index WHERE asset_uuid = ?1")?;
-        let rows = statement.query_map([asset.0.as_slice()], |row| row.get::<_, String>(0))?;
-        rows.collect::<Result<BTreeSet<_>, _>>()
-            .map_err(StoreError::from)
-    }
-
     /// Served assets whose tag index is poisoned (pending or failed), with
     /// the owning bundle.
     pub fn tag_poisoned_assets(&self) -> Result<Vec<(AssetUuid, BundleUuid)>, StoreError> {
@@ -758,28 +748,6 @@ pub trait ServedWrite {
         rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
     }
 
-    /// Whether `asset` carries a served authoring value.
-    fn txn_is_served_asset(&self, asset: AssetUuid) -> Result<bool, StoreError> {
-        Ok(self.served_conn().query_row(
-            "SELECT EXISTS(SELECT 1 FROM assets WHERE asset_uuid = ?1 AND authored_value IS NOT NULL)",
-            [asset.0.as_slice()],
-            |row| row.get(0),
-        )?)
-    }
-
-    /// The tag-index poison text of `asset`, if any.
-    fn txn_tag_poison(&self, asset: AssetUuid) -> Result<Option<String>, StoreError> {
-        Ok(self
-            .served_conn()
-            .query_row(
-                "SELECT poison FROM asset_tag_index WHERE asset_uuid = ?1",
-                [asset.0.as_slice()],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .flatten())
-    }
-
     /// Whether `asset` has a resolution row other than `Deleted`: a runtime
     /// entry the served namespace already announced.
     fn txn_has_live_resolution(&self, asset: AssetUuid) -> Result<bool, StoreError> {
@@ -984,122 +952,6 @@ pub trait ServedWrite {
                 terminal.0.as_slice()
             ])?;
         }
-        Ok(())
-    }
-
-    /// Remove one served asset row and its tags. Its tag-index poison and
-    /// path rows are separate served state and stay.
-    fn remove_served_asset(&mut self, asset: AssetUuid) -> Result<(), StoreError> {
-        let conn = self.served_conn();
-        for table in ["asset_tags", "assets"] {
-            conn.execute(
-                &format!("DELETE FROM {table} WHERE asset_uuid = ?1"),
-                [asset.0.as_slice()],
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Replace the candidates of one logical path. Each candidate gets its
-    /// own synthetic root row; no roles are checked (embedded RPC stores).
-    fn set_served_path(&mut self, path: &str, candidates: &BTreeSet<AssetUuid>) -> Result<(), StoreError> {
-        let conn = self.served_conn();
-        conn
-            .prepare_cached("DELETE FROM path_index WHERE path = ?1")?
-            .execute([path])?;
-        for (root, asset) in candidates.iter().enumerate() {
-            conn
-                .prepare_cached(
-                    "INSERT INTO path_index(path, root_id, asset_uuid) VALUES (?1, ?2, ?3)",
-                )?
-                .execute(rusqlite::params![path, root as i64, asset.0.as_slice()])?;
-        }
-        Ok(())
-    }
-
-    /// Replace (`Some`) or remove (`None`) one served derived output.
-    fn set_served_derived_output(
-        &mut self,
-        child: AssetUuid,
-        row: Option<&DerivedOutputRow>,
-    ) -> Result<(), StoreError> {
-        let conn = self.served_conn();
-        match row {
-            Some(row) => conn
-                .prepare_cached(
-                    "INSERT INTO derived_outputs(child_uuid, parent_uuid, output_key, terminal_type)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(child_uuid) DO UPDATE SET
-                   parent_uuid = excluded.parent_uuid, output_key = excluded.output_key,
-                   terminal_type = excluded.terminal_type",
-                )?
-                .execute(
-                    rusqlite::params![
-                        child.0.as_slice(),
-                        row.parent.0.as_slice(),
-                        row.output_key,
-                        row.terminal_type.0.as_slice()
-                    ],
-                )?,
-            None => conn
-                .prepare_cached("DELETE FROM derived_outputs WHERE child_uuid = ?1")?
-                .execute([child.0.as_slice()])?,
-        };
-        Ok(())
-    }
-
-    fn clear_served_derived_outputs(&mut self) -> Result<(), StoreError> {
-        self.served_conn().execute("DELETE FROM derived_outputs", [])?;
-        Ok(())
-    }
-
-    /// Replace an asset's tags without touching its tag index.
-    fn set_served_tags(
-        &mut self,
-        asset: AssetUuid,
-        tags: &BTreeMap<String, Option<String>>,
-    ) -> Result<(), StoreError> {
-        let conn = self.served_conn();
-        conn
-            .prepare_cached("DELETE FROM asset_tags WHERE asset_uuid = ?1")?
-            .execute([asset.0.as_slice()])?;
-        for (tag, value) in tags {
-            conn
-                .prepare_cached(
-                    "INSERT INTO asset_tags(asset_uuid, tag, value) VALUES (?1, ?2, ?3)",
-                )?
-                .execute(rusqlite::params![asset.0.as_slice(), tag, value])?;
-        }
-        Ok(())
-    }
-
-    /// Mark (`Some(reason)`) or clear (`None`) an asset's tag-index poison.
-    fn set_served_tag_poison(
-        &mut self,
-        asset: AssetUuid,
-        poison: Option<&str>,
-    ) -> Result<(), StoreError> {
-        let conn = self.served_conn();
-        match poison {
-            Some(poison) => conn
-                .prepare_cached(
-                    "INSERT INTO asset_tag_index(asset_uuid, type_uuid, tag_epoch, trace, poison)
-                 VALUES (?1, (SELECT type_uuid FROM assets WHERE asset_uuid = ?1), zeroblob(32),
-                         X'', ?2)
-                 ON CONFLICT(asset_uuid) DO UPDATE SET
-                   type_uuid = excluded.type_uuid, poison = excluded.poison",
-                )?
-                .execute(rusqlite::params![asset.0.as_slice(), poison])?,
-            None => conn
-                .prepare_cached("UPDATE asset_tag_index SET poison = NULL WHERE asset_uuid = ?1")?
-                .execute([asset.0.as_slice()])?,
-        };
-        Ok(())
-    }
-
-    fn clear_served_tag_poisons(&mut self) -> Result<(), StoreError> {
-        self.served_conn()
-            .execute("UPDATE asset_tag_index SET poison = NULL", [])?;
         Ok(())
     }
 }

@@ -702,31 +702,6 @@ impl Store {
         StoreReader::open((*self.config).clone())
     }
 
-    /// Give a fresh, never-published store a caller-chosen instance id and
-    /// starting input version. Embedded RPC stores use this so their stamps
-    /// match the identity their callers were built against; readers opened
-    /// afterwards see it.
-    pub fn adopt_embedded_identity(
-        &mut self,
-        instance: StoreInstanceId,
-        version: InputVersion,
-    ) -> Result<(), StoreError> {
-        self.write_txn(|store| {
-            let txn = &*store.read.conn;
-            if meta_get_u64(txn, "input_version")?.unwrap_or(0) != 0 {
-                return Err(StoreError::InvalidConfiguration {
-                    error: "only a never-published store can adopt an embedded identity"
-                        .to_owned(),
-                });
-            }
-            meta_set_blob(txn, "instance_id", &instance.0)?;
-            meta_set_u64(txn, "input_version", version.0)?;
-            meta_set_u64(txn, "change_log_oldest", version.0)
-        })?;
-        self.read.instance_id = instance;
-        Ok(())
-    }
-
     /// Wipe the daemon state and start over: state is disposable (§2).
     /// Re-mints the instance id, so stale version comparisons can never
     /// alias (§13).

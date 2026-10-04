@@ -528,8 +528,7 @@ pub struct WrittenFile {
 /// did: the files it had atomically changed on disk when it answered. The
 /// store follows them through the daemon's watcher like any other edit;
 /// a client that needs the result waits for a version reflecting every
-/// file. Empty when the write needed no file (an embedded server publishes
-/// it in the call's own input).
+/// file. Empty when the write needed no file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WriteReceipt {
     pub files: Vec<WrittenFile>,
@@ -815,8 +814,8 @@ pub trait AuthoringBackend: Send + Sync + 'static {
     /// files it changes, and return what it wrote. The write is complete
     /// once the files are atomically on disk: the store follows through the
     /// watcher, as for any other edit. An error means no file changed.
-    /// `Ok(None)`: the backend has no filesystem authority, and an embedded
-    /// server publishes the batch itself (embedders and tests).
+    /// `Ok(None)`: the backend has no filesystem authority, and the write
+    /// fails as [`RpcFailure::AuthoringBackendUnavailable`].
     ///
     /// The RPC server invokes this inside an input open on `store` at
     /// `base`, which it then rolls back: the input holds the write lock, so

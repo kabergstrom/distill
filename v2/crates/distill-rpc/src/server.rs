@@ -31,7 +31,6 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
-use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -46,9 +45,9 @@ use distill_store::served::{
 use distill_store::{Store, StoreConfig, StoreError, StoreOpener, StoreReader, StoreWriter};
 
 use crate::apply::{
-    apply_commit, apply_commit_served, configuration_status, publish_protocol_epoch, publish_restart_required,
+    apply_commit, configuration_status, publish_protocol_epoch, publish_restart_required,
     publish_runtime_pipeline_failure, publish_target, publish_target_set,
-    read_served_pipeline, ApplyError, ApplyMode,
+    read_served_pipeline, ApplyError,
 };
 use crate::persist::{delta_state, reconnect_reason};
 use crate::*;
@@ -199,23 +198,13 @@ pub struct ServerHandle {
     next_connection_id: AtomicU64,
     /// Opens each owner's own reader and writer.
     opener: Arc<StoreOpener>,
-    embedded_dir: Option<PathBuf>,
 }
 
 impl fmt::Debug for ServerHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ServerHandle")
             .field("instance", &self.instance)
-            .field("embedded", &self.embedded())
             .finish_non_exhaustive()
-    }
-}
-
-impl Drop for ServerHandle {
-    fn drop(&mut self) {
-        if let Some(dir) = self.embedded_dir.take() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
     }
 }
 
@@ -225,7 +214,6 @@ impl ServerHandle {
         config: StoreConfig,
         authoring_backend: Arc<dyn AuthoringBackend>,
         opener: Arc<StoreOpener>,
-        embedded_dir: Option<PathBuf>,
     ) -> Arc<Self> {
         Arc::new(Self {
             instance,
@@ -239,7 +227,6 @@ impl ServerHandle {
             open_connections: AtomicUsize::new(0),
             next_connection_id: AtomicU64::new(1),
             opener,
-            embedded_dir,
         })
     }
 
@@ -250,7 +237,7 @@ impl ServerHandle {
         opener: Arc<StoreOpener>,
     ) -> Arc<Self> {
         let config = StoreConfig::clone(&opener.config());
-        Self::new(opener.instance_id(), config, authoring_backend, opener, None)
+        Self::new(opener.instance_id(), config, authoring_backend, opener)
     }
 
     /// Opens readers and writers on the served store.
@@ -260,10 +247,6 @@ impl ServerHandle {
 
     pub fn instance(&self) -> StoreInstanceId {
         self.instance
-    }
-
-    pub(crate) fn embedded(&self) -> bool {
-        self.embedded_dir.is_some()
     }
 
     /// Wake every front end: the store published a new version or fence.
@@ -354,10 +337,9 @@ impl ServerHandle {
 
     /// Publish `commit` as the version after `base` (when given).
     ///
-    /// Embedded: one input transaction checks the base and applies the whole
-    /// commit. Daemon: the caller's durable step has already committed the
-    /// namespace as `base + 1` (or published nothing, and this transaction
-    /// becomes that version); the served projection is applied on top.
+    /// The caller's durable step has already committed the namespace as
+    /// `base + 1` (or published nothing, and this transaction becomes that
+    /// version); the served projection is applied on top.
     fn publish(
         &self,
         store: &mut Store,
@@ -365,7 +347,6 @@ impl ServerHandle {
         commit: Commit,
         targets: Option<BTreeMap<String, TargetDefinitionHash>>,
     ) -> Result<SnapshotStamp, PublishError> {
-        let full = self.embedded();
         let result = (|| {
             let mut rejection = None;
             let mut stale = None;
@@ -379,8 +360,7 @@ impl ServerHandle {
             };
             let observed = store.input_version().map_err(PublishError::Store)?;
             let base = base.unwrap_or(observed);
-            let result = if full || observed == base {
-                let mode = if full { ApplyMode::Full } else { ApplyMode::Delta };
+            let result = if observed == base {
                 store
                     .input_transaction(|txn| {
                         let observed = txn.base_stamp().version;
@@ -390,7 +370,7 @@ impl ServerHandle {
                                 detail: "stale publication base".to_owned(),
                             });
                         }
-                        apply_commit(txn, &commit, mode).map_err(&mut reject)?;
+                        apply_commit(txn, &commit).map_err(&mut reject)?;
                         if let Some(targets) = &targets {
                             publish_target_set(txn, targets)?;
                         }
@@ -400,7 +380,7 @@ impl ServerHandle {
             } else if observed.0 == base.0 + 1 {
                 store
                     .served_transaction(|txn| {
-                        apply_commit_served(txn, &commit).map_err(&mut reject)?;
+                        apply_commit(txn, &commit).map_err(&mut reject)?;
                         if let Some(targets) = &targets {
                             publish_target_set(txn, targets)?;
                         }
@@ -497,6 +477,7 @@ impl<W: ServedWrite> ServedWriteObj for W {
 
 struct UnavailableBuildBackend;
 
+#[cfg(test)]
 struct UnavailableAuthoringBackend;
 
 impl BuildBackend for UnavailableBuildBackend {
@@ -507,6 +488,7 @@ impl BuildBackend for UnavailableBuildBackend {
     }
 }
 
+#[cfg(test)]
 impl AuthoringBackend for UnavailableAuthoringBackend {
     fn prepare_import(
         &self,
@@ -540,18 +522,6 @@ impl AuthoringBackend for UnavailableAuthoringBackend {
             operation: "operation".to_owned(),
         })
     }
-}
-
-fn embedded_state_dir() -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    std::env::temp_dir().join(format!(
-        "distill-rpc-embedded-{}-{}-{nanos}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -628,51 +598,6 @@ impl fmt::Debug for Root {
 }
 
 impl Server {
-    pub fn new(
-        instance: StoreInstanceId,
-        targets: Vec<TargetDefinition>,
-    ) -> Result<Self, TargetSetError> {
-        Self::new_with_authoring_backend(instance, targets, Arc::new(UnavailableAuthoringBackend))
-    }
-
-    pub fn new_with_authoring_backend(
-        instance: StoreInstanceId,
-        targets: Vec<TargetDefinition>,
-        authoring_backend: Arc<dyn AuthoringBackend>,
-    ) -> Result<Self, TargetSetError> {
-        Self::new_at_version_with_authoring_backend(
-            instance,
-            InputVersion(0),
-            targets,
-            authoring_backend,
-        )
-    }
-
-    /// An embedded server over a fresh private store whose identity is
-    /// `instance` at `version`.
-    pub fn new_at_version_with_authoring_backend(
-        instance: StoreInstanceId,
-        version: InputVersion,
-        targets: Vec<TargetDefinition>,
-        authoring_backend: Arc<dyn AuthoringBackend>,
-    ) -> Result<Self, TargetSetError> {
-        let target_map = target_map(targets)?;
-        let dir = embedded_state_dir();
-        let config = StoreConfig::new(dir.join(".distill"));
-        let mut store = Store::open(config.clone()).expect("embedded RPC store opens");
-        store
-            .adopt_embedded_identity(instance, version)
-            .expect("embedded RPC store is fresh");
-        store
-            .served_transaction(|txn| publish_target_set(txn, &target_map))
-            .expect("embedded RPC store records its targets");
-        let (opener, writer) = StoreOpener::new(store);
-        let handle = ServerHandle::new(instance, config, authoring_backend, opener, Some(dir));
-        let server = Self::open(&handle);
-        *server.inner.writer.borrow_mut() = Some(writer);
-        Ok(server)
-    }
-
     /// An admin front end of `handle` of the caller's own: commits,
     /// installs and current-state reads on its own reader and writer. It
     /// holds no connection state; every connection gets a front end of its
@@ -983,7 +908,7 @@ impl ServerHandle {
 
     /// Publish a build's artifacts and wire trees on `store`, validated as
     /// an admin install is; return its root hash. For build backends that
-    /// publish outside the daemon (embedded stores, tests).
+    /// publish outside the daemon's build path (tests).
     pub fn install_build_publication(
         &self,
         store: &mut Store,
@@ -1202,7 +1127,7 @@ impl ServerHandle {
     }
 }
 
-/// Admin calls on a front end's own writer: embedded servers and tests.
+/// Admin calls on a front end's own writer.
 impl Server {
     /// Run `job` on this front end's writer, opening it on first use.
     pub fn with_writer<T>(&self, job: impl FnOnce(&mut Store) -> T) -> T {
@@ -1235,22 +1160,6 @@ impl Server {
 
     pub fn install_wire_tree(&self, hash: LayoutHash, bytes: Arc<[u8]>) -> Result<(), AdminError> {
         self.with_writer(|store| self.inner.handle.install_wire_tree(store, hash, bytes))
-    }
-
-    /// Embedded: publish an input-version commit.
-    pub fn commit(&self, commit: Commit) -> Result<SnapshotStamp, AdminError> {
-        assert!(
-            self.inner.handle.embedded(),
-            "the daemon publishes through coordinated commits"
-        );
-        match self
-            .with_writer(|store| self.inner.handle.publish(store, None, commit, None))
-        {
-            Ok(stamp) => Ok(stamp),
-            Err(PublishError::Invalid(error)) => Err(error),
-            Err(PublishError::Stale { .. }) => unreachable!("an unconditioned commit is never stale"),
-            Err(PublishError::Store(error)) => panic!("embedded RPC store write failed: {error}"),
-        }
     }
 
     pub fn coordinated_commit(
@@ -2026,36 +1935,6 @@ impl Inner {
     }
 }
 
-/// Publish an authoring-backend commit as the version after `base`. The
-/// caller holds the input open across the backend's prepare step and
-/// this.
-pub(crate) fn publish_backend_commit(
-    server: &Server,
-    base: InputVersion,
-    commit: Commit,
-) -> Result<SnapshotStamp, RpcFailure> {
-    server
-        .with_writer(|store| server.inner.handle.publish_locked(store, base, commit, None))
-        .map_err(|error| match error {
-            CoordinatedCommitError::Stale { expected, observed } => {
-                RpcFailure::StaleInputVersion {
-                    expected: observed,
-                    got: expected,
-                }
-            }
-            CoordinatedCommitError::Invalid(error) => RpcFailure::InvalidAuthoringRequest {
-                detail: format!("authoring backend produced an invalid commit: {error:?}"),
-            },
-            CoordinatedCommitError::Publication(detail) => RpcFailure::InvalidAuthoringRequest {
-                detail,
-            },
-        })
-}
-
-pub(crate) fn is_embedded(server: &Server) -> bool {
-    server.inner.handle.embedded()
-}
-
 #[cfg(test)]
 mod bound_tests {
     use super::*;
@@ -2073,11 +1952,7 @@ mod bound_tests {
     /// first snapshot opens none.
     #[test]
     fn a_connection_reads_its_handshake_on_the_reader_it_keeps() {
-        let server = Server::new(
-            StoreInstanceId([9; 16]),
-            vec![TargetDefinition::new("dev", TargetDefinitionHash([7; 32]))],
-        )
-        .unwrap();
+        let server = test_server();
         HANDSHAKE_READERS.with(|opens| opens.set(0));
         READER_OPENS.with(|opens| opens.set(0));
         let ConnectOutcome::Connected(connected) = connect(&server) else {
@@ -2097,11 +1972,7 @@ mod bound_tests {
 
     #[test]
     fn a_front_end_reads_each_version_on_the_connection_it_has() {
-        let server = Server::new(
-            StoreInstanceId([9; 16]),
-            vec![TargetDefinition::new("dev", TargetDefinitionHash([7; 32]))],
-        )
-        .unwrap();
+        let server = test_server();
         let ConnectOutcome::Connected(connected) = connect(&server) else {
             panic!("the connection is admitted");
         };
@@ -2130,6 +2001,22 @@ mod bound_tests {
         assert_eq!(READER_OPENS.with(|opens| opens.get()), 2);
     }
 
+    /// A front end of a fresh daemon store serving target `dev`. The
+    /// store directory lives as long as the returned server's handle.
+    fn test_server() -> Server {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let mut store = Store::open(StoreConfig::new(dir.join(".distill"))).unwrap();
+        let targets = target_map(vec![TargetDefinition::new("dev", TargetDefinitionHash([7; 32]))]).unwrap();
+        store
+            .served_transaction(|txn| publish_target_set(txn, &targets))
+            .unwrap();
+        let (opener, writer) = StoreOpener::new(store);
+        let handle = ServerHandle::open(Arc::new(UnavailableAuthoringBackend), opener);
+        let server = Server::open(&handle);
+        *server.inner.writer.borrow_mut() = Some(writer);
+        server
+    }
+
     fn connect(server: &Server) -> ConnectOutcome {
         let request = ConnectRequest::new("dev", TargetDefinitionHash([7; 32]));
         server.root().connect(request)
@@ -2137,11 +2024,7 @@ mod bound_tests {
 
     #[test]
     fn capability_churn_keeps_bookkeeping_within_active_bounds() {
-        let server = Server::new(
-            StoreInstanceId([9; 16]),
-            vec![TargetDefinition::new("dev", TargetDefinitionHash([7; 32]))],
-        )
-        .unwrap();
+        let server = test_server();
         server
             .install_snapshot_policy(SnapshotPolicy {
                 ttl: Duration::from_secs(60 * 60),

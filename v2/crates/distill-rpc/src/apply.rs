@@ -6,12 +6,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use distill_store::bundles::{AssetRecord, BundleMeta, ServedAuthoring};
 use distill_store::served::{
-    encode_authored_value, Change, DerivedOutputRow, ResolutionRow, ServedWrite,
+    Change, ResolutionRow, ServedWrite,
     SERVED_PIPELINE, SERVED_RESTART_KEYS,
 };
-use distill_store::{InputTxn, StoreError};
+use distill_store::StoreError;
 
 use crate::persist::{
     decode_served_pipeline, delta_state_code, encode_drifted_input, encode_served_pipeline,
@@ -22,21 +21,6 @@ use crate::*;
 
 /// Input versions of subscription history kept in the change log.
 pub const RETAINED_HISTORY_VERSIONS: u64 = 4096;
-
-/// The root name embedded stores file RPC-authored bundles under.
-const EMBEDDED_ROOT: &str = "rpc";
-
-/// What [`apply_commit`] writes besides the served-only state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApplyMode {
-    /// The embedded server owns the namespace: authoring entries, paths,
-    /// derived outputs, tags, configuration and namespace errors are written
-    /// from the commit.
-    Full,
-    /// The daemon already wrote the namespace in the same transaction; only
-    /// resolutions, diagnostics, fences and the change log are written.
-    Delta,
-}
 
 /// Why a commit could not be applied. `Invalid` rejects the commit itself;
 /// either way the caller's transaction must roll back.
@@ -98,29 +82,11 @@ pub(crate) fn configuration_status(
     }
 }
 
-/// Apply `commit` as the version `txn` publishes.
-pub fn apply_commit(
-    txn: &mut InputTxn<'_>,
-    commit: &Commit,
-    mode: ApplyMode,
-) -> Result<(), ApplyError> {
-    apply(txn, commit, |txn| match mode {
-        ApplyMode::Full => write_namespace(txn, commit),
-        ApplyMode::Delta => Ok(()),
-    })
-}
-
-/// Apply `commit`'s served projection ([`ApplyMode::Delta`]) on top of the
-/// version the store already published, in a later transaction.
-pub fn apply_commit_served<W: ServedWrite>(txn: &mut W, commit: &Commit) -> Result<(), ApplyError> {
-    apply(txn, commit, |_| Ok(()))
-}
-
-fn apply<W: ServedWrite>(
-    txn: &mut W,
-    commit: &Commit,
-    namespace: impl FnOnce(&mut W) -> Result<(), ApplyError>,
-) -> Result<(), ApplyError> {
+/// Apply `commit`'s served projection: the version the daemon publishes in
+/// `txn` (or published just before it) already holds the namespace the
+/// commit describes; this writes the resolutions, diagnostics, fences and
+/// change log that go with it.
+pub fn apply_commit<W: ServedWrite>(txn: &mut W, commit: &Commit) -> Result<(), ApplyError> {
     validate_commit(commit)?;
     for error in commit.namespace_errors.iter().flatten() {
         error
@@ -146,8 +112,6 @@ fn apply<W: ServedWrite>(
             },
         )?;
     }
-    namespace(txn)?;
-
     // A runtime entry the namespace has not announced yet can be the target
     // of a named reference (path and local id) still waiting for it: its
     // bundle's path changes too. Entries keep their identity per local id,
@@ -218,126 +182,6 @@ fn apply<W: ServedWrite>(
     }
     txn.trim_change_log(version, RETAINED_HISTORY_VERSIONS)?;
     Ok(())
-}
-
-/// The embedded server's namespace: every authoring entry is its own
-/// bundle row under one synthetic root.
-fn write_namespace(txn: &mut InputTxn<'_>, commit: &Commit) -> Result<(), ApplyError> {
-    let root = txn.intern_root(EMBEDDED_ROOT)?;
-    for mutation in &commit.authoring {
-        match mutation {
-            AuthoringMutation::Set(entry) => {
-                // `upsert_asset` resets the tag index; RPC tag poison is
-                // separate state and survives a value change.
-                let poison = txn.txn_tag_poison(entry.uuid)?;
-                txn.upsert_bundle(&BundleMeta {
-                    bundle: entry.bundle,
-                    root,
-                    path: entry.normalized_path.clone(),
-                    format_version: 1,
-                    content_hash: ContentHash([0; 32]),
-                    origin: None,
-                    import_watched: false,
-                })?;
-                let schema = std::str::from_utf8(&entry.logical_schema).map_err(|_| {
-                    AdminError::InvalidAuthoringValue {
-                        uuid: entry.uuid,
-                        error: AuthoringValueError::LogicalSchemaUtf8,
-                    }
-                })?;
-                txn.put_schema(entry.schema_hash, schema)?;
-                let blobs = entry
-                    .value
-                    .blobs
-                    .iter()
-                    .map(|blob| &blob[..])
-                    .collect::<Vec<_>>();
-                txn.upsert_asset(&AssetRecord {
-                    asset: entry.uuid,
-                    bundle: entry.bundle,
-                    local_id: entry.local_id.clone(),
-                    type_uuid: entry.type_uuid,
-                    logical_hash: entry.schema_hash,
-                    authoring_only: entry.role == AuthoringEntryRole::AuthoringOnly,
-                    tags: entry.tags.clone(),
-                    served: Some(ServedAuthoring {
-                        authored_value: encode_authored_value(&entry.value.canonical_value, &blobs),
-                        terminal_type: entry.terminal_type,
-                    }),
-                })?;
-                if let Some(poison) = poison {
-                    txn.set_served_tag_poison(entry.uuid, Some(&poison))?;
-                }
-            }
-            AuthoringMutation::Remove { uuid } => txn.remove_served_asset(*uuid)?,
-        }
-    }
-    for mutation in &commit.paths {
-        match mutation {
-            PathMutation::Set { path, candidates } => txn.set_served_path(path, candidates)?,
-            PathMutation::Remove { path } => txn.set_served_path(path, &BTreeSet::new())?,
-        }
-    }
-    if let Some(outputs) = &commit.derived_outputs {
-        txn.clear_served_derived_outputs()?;
-        for (child, entry) in outputs {
-            txn.set_served_derived_output(*child, Some(&derived_row(entry)))?;
-        }
-    }
-    for mutation in &commit.derived_output_mutations {
-        match mutation {
-            DerivedOutputMutation::Set { child, entry } => {
-                txn.set_served_derived_output(*child, Some(&derived_row(entry)))?
-            }
-            DerivedOutputMutation::Remove { child } => {
-                txn.set_served_derived_output(*child, None)?
-            }
-        }
-    }
-    if let Some(poisons) = &commit.tag_poisons {
-        txn.clear_served_tag_poisons()?;
-        for asset in poisons.keys() {
-            txn.set_served_tag_poison(*asset, Some(TAG_POISON))?;
-        }
-    }
-    for mutation in &commit.tag_poison_mutations {
-        match mutation {
-            TagPoisonMutation::Set { asset, .. } => {
-                txn.set_served_tag_poison(*asset, Some(TAG_POISON))?
-            }
-            TagPoisonMutation::Remove { asset } => txn.set_served_tag_poison(*asset, None)?,
-        }
-    }
-    for mutation in &commit.tag_projection_mutations {
-        let (asset, tags) = match mutation {
-            TagProjectionMutation::Set { asset, tags } => (*asset, tags.clone()),
-            TagProjectionMutation::Remove { asset } => (*asset, BTreeMap::new()),
-        };
-        if txn.txn_is_served_asset(asset)? {
-            txn.set_served_tags(asset, &tags)?;
-        }
-    }
-    match &commit.configuration {
-        Some(ConfigurationStatus::Ready) => txn.publish_configuration_ready(0)?,
-        Some(ConfigurationStatus::Failed(error)) => {
-            txn.publish_configuration_error(&error.detail, &error.message)?
-        }
-        None => {}
-    }
-    if let Some(errors) = &commit.namespace_errors {
-        txn.set_namespace_errors(errors.iter().cloned())?;
-    }
-    Ok(())
-}
-
-const TAG_POISON: &str = "rpc tag poison";
-
-fn derived_row(entry: &DerivedOutputEntry) -> DerivedOutputRow {
-    DerivedOutputRow {
-        parent: entry.parent,
-        output_key: entry.output_key.clone(),
-        terminal_type: entry.terminal_type,
-    }
 }
 
 /// Publish a runtime failure of the current pipeline epoch. The diagnostic

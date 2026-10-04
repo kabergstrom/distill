@@ -8,7 +8,7 @@
 //! cache miss for the client to retry.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -23,8 +23,8 @@ use distill_store::{Store, StoreError, StoreReader};
 
 use crate::persist::decode_drifted_input;
 use crate::server::{
-    authoring_entry, entry_role, history_deltas, is_embedded, pipeline_failure,
-    publish_backend_commit, store_failure, ConnectionState,
+    authoring_entry, entry_role, history_deltas, pipeline_failure,
+    store_failure, ConnectionState,
     MetadataBinding, SnapshotHold, SnapshotTxn, DEFAULT_CHUNK_SIZE,
 };
 use crate::validate::{
@@ -451,7 +451,7 @@ fn query_assets_scan(
         let by_asset = entries
             .iter()
             .map(|entry| (entry.asset, entry))
-            .collect::<BTreeMap<_, _>>();
+            .collect::<std::collections::BTreeMap<_, _>>();
         let bundles = snapshot
             .tag_poisoned_assets()?
             .into_iter()
@@ -1095,13 +1095,6 @@ impl Hub {
             .map(AuthoringGate::into_result)
     }
 
-    fn publish<T>(&self, base: InputVersion, commit: Commit, value: T) -> RpcResult<T> {
-        match publish_backend_commit(&self.server, base, commit) {
-            Ok(_) => RpcResult::Success(value),
-            Err(error) => RpcResult::Failure(error),
-        }
-    }
-
     /// Run the backend's `prepare` on this connection's writer and publish
     /// its commit as one input, still at `base`. `None` when the backend
     /// declined: what it wrote then commits as durable state with no new
@@ -1170,13 +1163,9 @@ impl Hub {
         if let Some(result) = self.write_files(base, &ops, force_lossy) {
             return result;
         }
-        if !is_embedded(&self.server) {
-            return RpcResult::Failure(RpcFailure::AuthoringBackendUnavailable {
-                operation: "write".to_owned(),
-            });
-        }
-        let commit = rpc_try!(self.embedded_write_commit(ops));
-        self.publish(base, commit, WriteReceipt::default())
+        RpcResult::Failure(RpcFailure::AuthoringBackendUnavailable {
+            operation: "write".to_owned(),
+        })
     }
 
     /// Run the backend's file write on this connection's writer, inside an
@@ -1211,89 +1200,6 @@ impl Hub {
                 Ok(Err(error)) => Some(RpcResult::Failure(error)),
                 Err(panic) => std::panic::resume_unwind(panic),
             }
-        })
-    }
-
-    /// The commit an embedded server publishes for a raw authoring batch.
-    fn embedded_write_commit(&self, ops: Vec<AuthoringOp>) -> Result<Commit, StoreError> {
-        let reader = &self.server.inner.reader;
-        let mut touched = BTreeSet::new();
-        let mut final_paths = BTreeMap::new();
-        let mut affected = BTreeSet::new();
-        for op in &ops {
-            let uuid = match op {
-                AuthoringOp::Set(entry) => entry.uuid,
-                AuthoringOp::Remove { uuid } => *uuid,
-            };
-            if touched.insert(uuid) {
-                affected.extend(reader.served_paths_of(uuid)?);
-            }
-            match op {
-                AuthoringOp::Set(entry) => {
-                    affected.insert(entry.normalized_path.clone());
-                    final_paths.insert(uuid, Some(entry.normalized_path.clone()));
-                }
-                AuthoringOp::Remove { .. } => {
-                    final_paths.insert(uuid, None);
-                }
-            }
-        }
-        let mut paths = Vec::new();
-        for path in affected {
-            let before = reader.served_path_candidates(&path)?;
-            let mut after = before
-                .iter()
-                .filter(|uuid| !touched.contains(uuid))
-                .copied()
-                .collect::<BTreeSet<_>>();
-            after.extend(
-                final_paths
-                    .iter()
-                    .filter(|(_, final_path)| final_path.as_deref() == Some(path.as_str()))
-                    .map(|(uuid, _)| *uuid),
-            );
-            if before == after {
-                continue;
-            }
-            paths.push(if after.is_empty() {
-                PathMutation::Remove { path }
-            } else {
-                PathMutation::Set {
-                    path,
-                    candidates: after,
-                }
-            });
-        }
-        let mut authoring = Vec::with_capacity(ops.len());
-        let mut assets = Vec::with_capacity(ops.len());
-        for op in ops {
-            match op {
-                AuthoringOp::Set(entry) => {
-                    let uuid = entry.uuid;
-                    authoring.push(AuthoringMutation::Set(entry));
-                    assets.push(AssetMutation::Set {
-                        uuid,
-                        resolution: StoredResolve::Drifted {
-                            input: DriftedInput::Asset(uuid),
-                        },
-                        delta: AssetDeltaState::Changed,
-                    });
-                }
-                AuthoringOp::Remove { uuid } => {
-                    authoring.push(AuthoringMutation::Remove { uuid });
-                    assets.push(AssetMutation::Set {
-                        uuid,
-                        resolution: StoredResolve::Deleted,
-                        delta: AssetDeltaState::Deleted,
-                    });
-                }
-            }
-        }
-        Ok(Commit {
-            assets,
-            authoring,
-            paths,
-            ..Commit::default()
         })
     }
 
