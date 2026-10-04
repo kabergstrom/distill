@@ -3784,7 +3784,6 @@ fn write_reconnect(mut output: schema::reconnect_required::Builder<'_>, reason: 
 
 fn wire_reconnect(reason: ReconnectReason) -> schema::ReconnectReason {
     match reason {
-        ReconnectReason::StoreInstanceChanged => schema::ReconnectReason::StoreInstanceChanged,
         ReconnectReason::PipelineEpochChanged => schema::ReconnectReason::PipelineEpochChanged,
     }
 }

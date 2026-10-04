@@ -128,7 +128,6 @@ pub enum AssetDeltaState {
 pub enum ReconnectReason {
     /// The connection to the daemon closed.
     ConnectionLost,
-    StoreInstanceChanged,
     PipelineEpochChanged,
 }
 

@@ -1408,7 +1408,7 @@ fn reconnect_missing_detaches_loaded_indirect_uuid_and_subscription() {
         .filter(|command| matches!(command, Command::Resolve(_, uuid, _) if *uuid == old_uuid))
         .count();
     loader.io_mut().push(IoEvent::ReconnectRequired {
-        reason: distill_loader::ReconnectReason::StoreInstanceChanged,
+        reason: distill_loader::ReconnectReason::ConnectionLost,
     });
     loader.process(&mut storage).unwrap();
     loader.process(&mut storage).unwrap();

@@ -1317,6 +1317,10 @@ Final cleanup (schema 56, protocol 15):
   metadata connection never outlives its store (the state directory is
   locked to the daemon process), so nothing could produce
   `StoreInstanceChanged` there.
+- Protocol 17: the one reconnect reason is `PipelineEpochChanged`. A hub
+  connection never outlives its store either, so nothing could produce
+  `StoreInstanceChanged`; the hub reported it when reading the pipeline
+  fence failed, which is now the call's error arm.
 - An edit reads nothing twice:
   - the scan's baseline subtree read serves the echo check;
   - a claims replacement returns each pending bundle's claimants;

@@ -1553,7 +1553,6 @@ fn stream_events(
 
 fn reconnect_reason(reason: distill_rpc::ReconnectReason) -> ReconnectReason {
     match reason {
-        distill_rpc::ReconnectReason::StoreInstanceChanged => ReconnectReason::StoreInstanceChanged,
         distill_rpc::ReconnectReason::PipelineEpochChanged => ReconnectReason::PipelineEpochChanged,
     }
 }

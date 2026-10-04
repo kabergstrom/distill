@@ -1001,7 +1001,6 @@ fn decode_stamp(value: schema::snapshot_stamp::Reader<'_>) -> Result<SnapshotSta
 
 fn decode_reconnect(value: schema::ReconnectReason) -> ReconnectReason {
     match value {
-        schema::ReconnectReason::StoreInstanceChanged => ReconnectReason::StoreInstanceChanged,
         schema::ReconnectReason::PipelineEpochChanged => ReconnectReason::PipelineEpochChanged,
     }
 }

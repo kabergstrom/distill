@@ -24,8 +24,11 @@ pub use distill_store::state::{
 /// `changed` or `deleted` (`targetDefinitionChanged`, `protocolEpochChanged`
 /// and `restored` were never produced). 16: the metadata calls have no
 /// `reconnectRequired` arm (a metadata connection never outlives its
-/// store: the state directory is locked to the daemon process).
-pub const PROTOCOL_VERSION: u32 = 16;
+/// store: the state directory is locked to the daemon process). 17: the
+/// one reconnect reason is `pipelineEpochChanged` (a hub connection never
+/// outlives its store either, so nothing could produce
+/// `storeInstanceChanged`).
+pub const PROTOCOL_VERSION: u32 = 17;
 
 /// A watched import whose latest attempt failed. The bundle keeps serving its
 /// last good contents; the failure clears when a later import succeeds.
@@ -169,7 +172,6 @@ pub type ConfigurationState = ConfigurationStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconnectReason {
-    StoreInstanceChanged,
     /// The pipeline changed: an epoch installed, retired or failed. A
     /// target definition changes only with it (a configuration
     /// publication), and a reconnect under the old definition is rejected.

@@ -602,6 +602,22 @@ fn schema_metadata_calls_have_no_reconnect_arm() {
     }
 }
 
+/// A hub connection never outlives its store either: the one reason to
+/// reconnect is a pipeline change.
+#[test]
+fn schema_reconnect_reason_is_the_pipeline_epoch_alone() {
+    let source = include_str!("../schema/distill_rpc.capnp").replace("\r\n", "\n");
+    assert!(
+        source.contains("enum ReconnectReason {\n  pipelineEpochChanged @0;\n}\n"),
+        "ReconnectReason has one arm"
+    );
+    assert!(!source.contains("storeInstanceChanged"));
+    assert_eq!(
+        schema::ReconnectReason::PipelineEpochChanged as u16,
+        0
+    );
+}
+
 /// The authoring entry the daemon serves for the asset `byte`: one blob
 /// (`byte + 2`) in its own bundle file `bundle-{byte}.bundle`, the bundle's
 /// primary. The daemon tags nothing without a project schema.

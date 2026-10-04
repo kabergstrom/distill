@@ -9360,6 +9360,10 @@ put production image codecs, mesh optimization, or shader compilers in core.
   the metadata hub no reason: its connection never outlives its store, whose
   state directory is locked to the daemon process, so a recreated store is a
   new process and a new connection.)
+  (schema-min, protocol 17: the one reason is `PipelineEpochChanged=0`. A hub
+  connection never outlives its store either, so `StoreInstanceChanged` had
+  no producer; it was reported when reading the pipeline fence failed, and
+  that is now the call's error.)
   (Refined in R25: bootstrap connect is also generated-binding-safe through a
   dedicated typed ConnectResult, and authoring reads move to a pinned
   AuthoringSnapshot capability.)

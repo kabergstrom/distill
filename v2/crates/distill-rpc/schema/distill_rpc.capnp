@@ -21,8 +21,7 @@ struct ConfigurationError {
 }
 
 enum ReconnectReason {
-  storeInstanceChanged @0;
-  pipelineEpochChanged @1;
+  pipelineEpochChanged @0;
 }
 
 struct ReconnectRequired {
