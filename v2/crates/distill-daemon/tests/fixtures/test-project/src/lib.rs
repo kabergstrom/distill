@@ -323,7 +323,15 @@ impl TestProject {
     /// watcher's batch for them: one input version when they change what
     /// the daemon serves. Returns the current stamp either way.
     pub fn publish(&mut self) -> SnapshotStamp {
-        let paths = std::mem::take(&mut self.touched).into_iter().collect();
+        // The watcher reports events under the canonicalized directory it
+        // watches, as a configuration spells its roots (on Windows a `\\?\`
+        // verbatim path, which a plain path under the same directory does
+        // not match).
+        let dir = std::fs::canonicalize(self.dir.path()).unwrap();
+        let paths = std::mem::take(&mut self.touched)
+            .into_iter()
+            .map(|path| dir.join(path.strip_prefix(self.dir.path()).unwrap()))
+            .collect();
         self.coordinator
             .reconcile_incremental(
                 &mut self.writer,
