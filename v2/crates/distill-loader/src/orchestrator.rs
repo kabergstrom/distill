@@ -113,9 +113,6 @@ pub enum LoaderDiagnostic {
         error: StorageError,
     },
     ReconnectRequired(ReconnectReason),
-    ManifestTransition {
-        uuid: AssetUuid,
-    },
 }
 
 struct HandleLease;
@@ -1203,10 +1200,7 @@ impl<I: LoaderIO> Loader<I> {
                         state: ManifestState::Missing,
                         adopted_at: AdoptionId(0),
                     });
-                    if entry.apply_delta(delta).is_err() {
-                        self.diagnostics
-                            .push(LoaderDiagnostic::ManifestTransition { uuid });
-                    }
+                    entry.apply_delta(delta);
                     self.dirty.insert(uuid);
                     if delta == crate::AssetDeltaState::Deleted {
                         for handle in self.handles_for_uuid(uuid) {

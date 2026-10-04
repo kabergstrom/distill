@@ -506,7 +506,7 @@ fn begin_deletion(loader: &mut Loader<MockIo>, storage: &mut Storage, root: Asse
 }
 
 /// A deleted asset that comes back is published as `Changed`: the loader
-/// takes it as a valid transition (no diagnostic) and re-resolves it.
+/// takes it without a diagnostic and re-resolves it.
 #[test]
 fn a_returning_asset_is_a_valid_transition_and_reloads() {
     let token = ModuleEpochToken::new(1);
@@ -523,6 +523,7 @@ fn a_returning_asset_is_a_valid_transition_and_reloads() {
     loader.process(&mut storage).unwrap();
     begin_deletion(&mut loader, &mut storage, asset_uuid);
     assert_eq!(loader.status(&handle), LoadStatus::Dead);
+    let _ = loader.take_diagnostics();
     let (deleted_req, _) = loader.io().resolve_for(asset_uuid);
 
     loader.io_mut().push(IoEvent::Delta {
@@ -531,10 +532,7 @@ fn a_returning_asset_is_a_valid_transition_and_reloads() {
         paths: Vec::new(),
     });
     loader.process(&mut storage).unwrap();
-    assert!(!loader.take_diagnostics().iter().any(|diagnostic| matches!(
-        diagnostic,
-        LoaderDiagnostic::ManifestTransition { .. }
-    )));
+    assert_eq!(loader.take_diagnostics(), Vec::new());
     let (req, _) = loader.io().resolve_for(asset_uuid);
     assert_ne!(req, deleted_req, "the returning asset is resolved again");
     resolve(&mut loader, asset_uuid, hash);

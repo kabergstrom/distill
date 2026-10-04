@@ -108,27 +108,23 @@ fn successful_completion_is_consumed_exactly_once() {
 }
 
 #[test]
-fn typed_deletion_and_restoration_preserve_client_relative_semantics() {
+fn typed_deletion_and_return_preserve_client_relative_semantics() {
     let hash = ContentHash([1; 32]);
     let mut live = ManifestEntry {
         state: ManifestState::Current { content_hash: hash },
         adopted_at: AdoptionId(1),
     };
-    live.apply_delta(AssetDeltaState::Deleted).unwrap();
+    live.apply_delta(AssetDeltaState::Deleted);
     assert_eq!(live.state, ManifestState::Dead);
-    let mut returning = live.clone();
-    returning.apply_delta(AssetDeltaState::Changed).unwrap();
-    assert_eq!(returning.state, ManifestState::Missing);
-    live.apply_delta(AssetDeltaState::Restored).unwrap();
+    // A returning asset is published as Changed.
+    live.apply_delta(AssetDeltaState::Changed);
     assert_eq!(live.state, ManifestState::Missing);
 
     let mut never_resolved = ManifestEntry {
         state: ManifestState::Missing,
         adopted_at: AdoptionId(0),
     };
-    never_resolved
-        .apply_delta(AssetDeltaState::Deleted)
-        .unwrap();
+    never_resolved.apply_delta(AssetDeltaState::Deleted);
     assert_eq!(never_resolved.state, ManifestState::Missing);
     never_resolved.observe_absence();
     assert_eq!(never_resolved.state, ManifestState::Missing);

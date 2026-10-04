@@ -6498,7 +6498,8 @@ pub enum IoEvent {
     ConnectionError { message: String }, // not a request-terminal outcome
 }
 
-pub enum AssetDeltaState { Changed, Deleted, Restored }
+// schema-min, protocol 15: no `Restored`; a returning asset is `Changed`.
+pub enum AssetDeltaState { Changed, Deleted }
 
 pub enum PathResolveResult {
     Resolved(AssetUuid),

@@ -20,8 +20,9 @@ pub use distill_store::state::{
 /// Completed event answer a [`WriteReceipt`] (the files changed on disk)
 /// instead of a version, and `AuthoringSnapshot.file` reads a file's
 /// published content hash. 15: the reconnect reasons are
-/// `storeInstanceChanged` and `pipelineEpochChanged` (`targetDefinitionChanged`
-/// and `protocolEpochChanged` were never produced).
+/// `storeInstanceChanged` and `pipelineEpochChanged`, and an asset delta is
+/// `changed` or `deleted` (`targetDefinitionChanged`, `protocolEpochChanged`
+/// and `restored` were never produced).
 pub const PROTOCOL_VERSION: u32 = 15;
 
 /// A watched import whose latest attempt failed. The bundle keeps serving its
@@ -1280,7 +1281,6 @@ impl ChunkStream {
 pub enum AssetDeltaState {
     Changed,
     Deleted,
-    Restored,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

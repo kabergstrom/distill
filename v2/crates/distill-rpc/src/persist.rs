@@ -25,7 +25,6 @@ pub(crate) fn delta_state_code(state: AssetDeltaState) -> u8 {
     match state {
         AssetDeltaState::Changed => 0,
         AssetDeltaState::Deleted => 1,
-        AssetDeltaState::Restored => 2,
     }
 }
 
@@ -33,7 +32,6 @@ pub(crate) fn delta_state(code: u8) -> Result<AssetDeltaState, PersistError> {
     Ok(match code {
         0 => AssetDeltaState::Changed,
         1 => AssetDeltaState::Deleted,
-        2 => AssetDeltaState::Restored,
         tag => return Err(bad_tag("asset delta state", tag)),
     })
 }

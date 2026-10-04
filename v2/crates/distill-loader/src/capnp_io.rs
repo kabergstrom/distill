@@ -1533,7 +1533,6 @@ fn delta_state(state: distill_rpc::AssetDeltaState) -> AssetDeltaState {
     match state {
         distill_rpc::AssetDeltaState::Changed => AssetDeltaState::Changed,
         distill_rpc::AssetDeltaState::Deleted => AssetDeltaState::Deleted,
-        distill_rpc::AssetDeltaState::Restored => AssetDeltaState::Restored,
     }
 }
 

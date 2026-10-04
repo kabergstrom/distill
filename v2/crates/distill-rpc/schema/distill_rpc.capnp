@@ -856,7 +856,6 @@ struct AssetDelta {
 enum AssetDeltaState {
   changed @0;
   deleted @1;
-  restored @2;
 }
 
 struct Delta {

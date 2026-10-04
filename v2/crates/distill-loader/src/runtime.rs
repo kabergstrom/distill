@@ -37,15 +37,10 @@ pub enum ManifestState {
     Dead,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ManifestTransitionError {
-    RestoredLiveAsset,
-}
-
 impl ManifestEntry {
     /// Apply a typed watch transition. A `Missing` entry has never resolved,
     /// so deletion cannot turn it into `Dead`; that state is client-relative.
-    pub fn apply_delta(&mut self, delta: AssetDeltaState) -> Result<(), ManifestTransitionError> {
+    pub fn apply_delta(&mut self, delta: AssetDeltaState) {
         match delta {
             AssetDeltaState::Changed => match &self.state {
                 ManifestState::Current { content_hash } => {
@@ -68,14 +63,7 @@ impl ManifestEntry {
                     self.state = ManifestState::Dead;
                 }
             }
-            AssetDeltaState::Restored => {
-                if !matches!(self.state, ManifestState::Dead) {
-                    return Err(ManifestTransitionError::RestoredLiveAsset);
-                }
-                self.state = ManifestState::Missing;
-            }
         }
-        Ok(())
     }
 
     /// Map an absent resolve using client history. An entry that ever held a

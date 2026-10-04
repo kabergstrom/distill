@@ -3517,7 +3517,6 @@ fn write_delta(mut output: schema::delta::Builder<'_>, delta: &Delta) {
             asset.set_state(match state {
                 AssetDeltaState::Changed => schema::AssetDeltaState::Changed,
                 AssetDeltaState::Deleted => schema::AssetDeltaState::Deleted,
-                AssetDeltaState::Restored => schema::AssetDeltaState::Restored,
             });
         }
     }

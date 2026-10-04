@@ -122,7 +122,6 @@ pub struct FetchedArtifact {
 pub enum AssetDeltaState {
     Changed,
     Deleted,
-    Restored,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

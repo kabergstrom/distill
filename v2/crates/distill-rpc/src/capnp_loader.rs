@@ -941,7 +941,6 @@ fn decode_delta(
         let state = match asset.get_state()? {
             schema::AssetDeltaState::Changed => AssetDeltaState::Changed,
             schema::AssetDeltaState::Deleted => AssetDeltaState::Deleted,
-            schema::AssetDeltaState::Restored => AssetDeltaState::Restored,
         };
         assets.push((uuid, state));
     }
