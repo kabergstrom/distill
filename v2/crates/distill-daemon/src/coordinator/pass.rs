@@ -1128,7 +1128,6 @@ impl DaemonCoordinator {
                     store,
                     store.input_version().map_err(|error| error.to_string())?,
                     step.candidate.clone(),
-                    false,
                     None,
                     tags.compiled.projection(),
                     &BTreeSet::new(),
@@ -1164,14 +1163,11 @@ impl DaemonCoordinator {
                         subjects,
                     }
                 };
-                let generation = store
-                    .configuration_generation()
-                    .map_err(|error| error.to_string())?;
                 let (configuration, _) = store
                     .input_transaction(|transaction| {
                         transaction.publish_claims_namespace_errors()?;
                         transaction.set_scan_rejection(Some(&pending.record()))?;
-                        transaction.publish_configuration_status(generation)
+                        transaction.publish_configuration_status()
                     })
                     .map_err(|error| error.to_string())?;
                 let namespace_errors = store

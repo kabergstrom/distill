@@ -30,7 +30,7 @@ use distill_store::bundles::{
     AssetRecord, BundleMeta, NamespaceSkeleton as StoreNamespaceSkeleton, SkeletonEntry,
 };
 use distill_store::claims::{DerivedOutputClaim, PendingClaims, SourceClaim, SourceClaims};
-use distill_store::config::{PendingRestart, RestartOnlyChange};
+use distill_store::config::RestartOnlyChange;
 use distill_store::errors::ScanRejectionRecord;
 use distill_store::files::{FileObservation, PendingFileWork};
 use distill_store::pipeline::ValidatedPipelineEpoch;
@@ -174,10 +174,6 @@ impl DaemonCoordinator {
             &module_state_path,
         )?;
         let target_set = distill_rpc::target_map(targets)?;
-        if opened_store.pending_restart()?.is_some() {
-            opened_store
-                .input_transaction(|transaction| transaction.adopt_pending_restart().map(|_| ()))?;
-        }
         let version = opened_store.input_version()?;
         opened_store.served_transaction(|transaction| {
             use distill_store::served::ServedWrite;
@@ -528,33 +524,18 @@ impl DaemonCoordinator {
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
     }
 
-    pub fn stage_restart_configuration(
-        &self,
-        store: &mut Store,
-        changes: &[RestartOnlyChange],
-    ) -> Result<PendingRestart, CoordinatorError> {
-        let mut pending = None;
-        self.server
-            .restart_required(store, |store| {
-                let staged = store
-                    .stage_pending_restart(changes)
-                    .map_err(|error| error.to_string())?;
-                pending = Some(staged);
-                Ok(())
-            })
-            .map_err(CoordinatorError::InvalidManifest)?;
-        Ok(pending.expect("a staged restart has keys"))
+    /// The configuration status RPC clients are served now.
+    pub fn configuration_status(&self) -> Result<ConfigurationStatus, CoordinatorError> {
+        Ok(configuration_status(self.open_reader()?.configuration_error()?))
     }
 
-    pub fn clear_restart_configuration(&self, store: &mut Store) -> Result<(), CoordinatorError> {
+    /// The restart-only changes the configuration file asks for, against
+    /// the values this process runs (none clears them): what every RPC
+    /// stream is told requires a restart.
+    pub fn set_restart_required(&self, changes: &[RestartOnlyChange]) -> Result<(), CoordinatorError> {
         self.server
-            .restart_required(store, |store| {
-                store
-                    .clear_pending_restart()
-                    .map_err(|error| error.to_string())
-            })
-            .map_err(CoordinatorError::InvalidManifest)?;
-        Ok(())
+            .set_restart_required(changes)
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
     }
 
     /// Publish a rejected configuration source as an ordinary input version.
@@ -590,13 +571,10 @@ impl DaemonCoordinator {
         let base = self.server.stamp_of(store)?.version;
         self.server
             .coordinated_commit(store, base, |store| {
-                let generation = store
-                    .configuration_generation()
-                    .map_err(|error| error.to_string())?;
                 let (configuration, _) = store
                     .input_transaction(|transaction| {
                         transaction.set_configuration_source_error(error.as_ref())?;
-                        transaction.publish_configuration_status(generation)
+                        transaction.publish_configuration_status()
                     })
                     .map_err(|error| error.to_string())?;
                 Ok(Commit {
@@ -812,7 +790,6 @@ impl DaemonCoordinator {
                         store,
                         store.input_version().map_err(|error| error.to_string())?,
                         candidate,
-                        true,
                         Some(&pipeline),
                         &projection,
                         &retyped,
@@ -994,9 +971,6 @@ impl DaemonCoordinator {
                     return Ok(None);
                 }
                 changed = !unchanged;
-                let generation = store
-                    .configuration_generation()
-                    .map_err(|error| error.to_string())?;
                 let ((configuration, version), _) = store
                     .input_transaction(|transaction| {
                         if !unchanged {
@@ -1005,7 +979,7 @@ impl DaemonCoordinator {
                         transaction.mark_compiled()?;
                         let configuration = if heal_configuration {
                             transaction.set_configuration_source_error(None)?;
-                            Some(transaction.publish_configuration_status(generation)?)
+                            Some(transaction.publish_configuration_status()?)
                         } else {
                             None
                         };
@@ -2352,7 +2326,6 @@ fn publish_scan(
     store: &mut Store,
     base: InputVersion,
     mut candidate: ScanCandidate,
-    advance_configuration: bool,
     pipeline: Option<&ConfigurationPipelinePublication>,
     projection: &PipelineProjection,
     retyped: &BTreeSet<TypeUuid>,
@@ -2474,14 +2447,6 @@ fn publish_scan(
         .copied()
         .collect::<BTreeSet<_>>();
     let withheld_before = store.withheld_assets()?;
-    let mut generation = store.configuration_generation()?;
-    if advance_configuration {
-        generation = generation
-            .checked_add(1)
-            .ok_or_else(|| StoreError::InvalidConfiguration {
-                error: "configuration generation exhausted".to_owned(),
-            })?;
-    }
 
     let publishable_changed_bundles = changed_bundles;
     let rpc_publishable_bundles = rpc_changed_bundles;
@@ -2525,7 +2490,7 @@ fn publish_scan(
         }
         transaction.set_namespace_errors(candidate.namespace_errors.iter().cloned())?;
 
-        configuration = transaction.publish_configuration_status(generation)?;
+        configuration = transaction.publish_configuration_status()?;
         match pipeline {
             Some(ConfigurationPipelinePublication::Epoch { epoch, tools }) => {
                 transaction.publish_pipeline_epoch(epoch)?;
@@ -2772,7 +2737,6 @@ fn publish_reconfiguration(
             },
             projection,
             &forced,
-            true,
             &mut BTreeMap::new(),
         )
         .map(|(commit, _)| commit)
@@ -2885,7 +2849,6 @@ fn publish_incremental_scan(
             inputs,
             projection,
             &BTreeSet::new(),
-            false,
             &mut root_ids,
         )?;
         for rename in renames {
@@ -2900,8 +2863,7 @@ fn publish_incremental_scan(
 }
 
 /// Publish the plan of the claims an input just replaced, inside that
-/// input: the namespace errors, the configuration status (its generation
-/// advanced when `advance_configuration`), the bundles whose rows change
+/// input: the namespace errors, the configuration status, the bundles whose rows change
 /// (and every bundle of `forced`, whose rows change without its summary or
 /// assets: a retype, a new skeleton), and the derived outputs, of the
 /// subjects `pending` names. Returns the commit and the sources whose
@@ -2913,7 +2875,6 @@ fn publish_claimed(
     inputs: &PlanInputs<'_>,
     projection: &PipelineProjection,
     forced: &BTreeSet<BundleUuid>,
-    advance_configuration: bool,
     root_ids: &mut BTreeMap<String, distill_store::files::RootId>,
 ) -> Result<(Commit, BTreeSet<ScanKey>), StoreError> {
     // The claims' namespace errors, which the plan withholds by.
@@ -2923,7 +2884,6 @@ fn publish_claimed(
         mut commit,
         changed_bundles,
         held,
-        configuration_generation,
     } = prepare_incremental_publication(
         &transaction.reader(),
         inputs,
@@ -2932,16 +2892,7 @@ fn publish_claimed(
         projection,
         forced,
     )?;
-    let generation = if advance_configuration {
-        configuration_generation
-            .checked_add(1)
-            .ok_or_else(|| StoreError::InvalidConfiguration {
-                error: "configuration generation exhausted".to_owned(),
-            })?
-    } else {
-        configuration_generation
-    };
-    let configuration = transaction.publish_configuration_status(generation)?;
+    let configuration = transaction.publish_configuration_status()?;
     commit.configuration = Some(configuration_status(configuration));
     let mut written = BTreeSet::new();
     for bundle_uuid in &changed_bundles {
@@ -3021,7 +2972,6 @@ struct IncrementalPublication {
     changed_bundles: BTreeSet<BundleUuid>,
     /// The asset rows each planned bundle had.
     held: BTreeMap<BundleUuid, BTreeSet<AssetUuid>>,
-    configuration_generation: u64,
 }
 
 /// Plan an incremental publication from the transaction's claims and read
@@ -3043,7 +2993,6 @@ fn prepare_incremental_publication(
                 },
             },
         )?;
-    let configuration_generation = store.configuration_generation()?;
     let mut durable_bundles = BTreeMap::new();
     for bundle in plan.bundles.keys() {
         let meta = store.bundle(*bundle)?;
@@ -3190,7 +3139,6 @@ fn prepare_incremental_publication(
         commit,
         changed_bundles,
         held,
-        configuration_generation,
     })
 }
 
@@ -4050,7 +3998,7 @@ mod projection_tests {
         let claims = bundle_claims(candidate.scan.bundle_rows(), projection, None).unwrap();
         let base = store.input_version().unwrap();
         publish_scan(
-            store, base, candidate, false, None, projection, retyped, None, &claims,
+            store, base, candidate, None, projection, retyped, None, &claims,
         )
         .unwrap();
     }

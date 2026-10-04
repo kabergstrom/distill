@@ -170,6 +170,11 @@ pub enum IoEvent {
     ConnectionError {
         message: String,
     },
+    /// The daemon needs a restart to apply these configuration keys; empty
+    /// once the file again matches what the daemon runs with.
+    RestartRequired {
+        keys: Vec<String>,
+    },
     ReconnectRequired {
         reason: ReconnectReason,
     },

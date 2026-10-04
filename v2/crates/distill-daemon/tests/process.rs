@@ -9,7 +9,8 @@ use distill_daemon::config::DaemonConfig;
 use distill_daemon::process::DaemonProcess;
 use distill_daemon::scanner::{DaemonOwnedDirectoryKind, ScanDiagnostic};
 use distill_schema::ngp_schema::{LayoutIdentity, Schema, SchemaLayouts};
-use distill_store::state::{ConfigurationState, DscpV1};
+use distill_rpc::ConfigurationStatus;
+use distill_store::state::DscpV1;
 
 fn test_layout_identity() -> LayoutIdentity {
     LayoutIdentity {
@@ -429,11 +430,9 @@ fn malformed_configuration_publishes_once_and_a_valid_edit_heals_it() {
             matches!(
                 process
                     .coordinator()
-                    .open_reader()
-                    .unwrap()
-                    .configuration_state()
+                    .configuration_status()
                     .unwrap(),
-                ConfigurationState::Failed { reason, .. }
+                ConfigurationStatus::Failed(reason)
                     if matches!(reason.detail.as_ref(), DscpV1::MalformedConfiguration { .. })
             )
         },
@@ -470,11 +469,9 @@ fn malformed_configuration_publishes_once_and_a_valid_edit_heals_it() {
                 .version;
             let state = process
                 .coordinator()
-                .open_reader()
-                .unwrap()
-                .configuration_state()
+                .configuration_status()
                 .unwrap();
-            version > failed && matches!(state, ConfigurationState::Ready(_))
+            version > failed && matches!(state, ConfigurationStatus::Ready)
         },
         "valid configuration did not clear its malformed-source error",
     );
@@ -491,11 +488,9 @@ fn valid_configuration_with_malformed_schema_fails_only_the_pipeline() {
             matches!(
                 process
                     .coordinator()
-                    .open_reader()
-                    .unwrap()
-                    .configuration_state()
+                    .configuration_status()
                     .unwrap(),
-                ConfigurationState::Failed { reason, .. }
+                ConfigurationStatus::Failed(reason)
                     if matches!(reason.detail.as_ref(), DscpV1::MalformedConfiguration { .. })
             )
         },
@@ -508,8 +503,8 @@ fn valid_configuration_with_malformed_schema_fails_only_the_pipeline() {
         || {
             let store = process.coordinator().open_reader().unwrap();
             matches!(
-                store.configuration_state().unwrap(),
-                ConfigurationState::Ready(_)
+                process.coordinator().configuration_status().unwrap(),
+                ConfigurationStatus::Ready
             ) && matches!(
                 store.pipeline_failure().unwrap(),
                 Some(error) if error.message.contains("schema authority")
@@ -538,11 +533,9 @@ fn simultaneous_configuration_defects_choose_canonical_authority() {
             matches!(
                 process
                     .coordinator()
-                    .open_reader()
-                    .unwrap()
-                    .configuration_state()
+                    .configuration_status()
                     .unwrap(),
-                ConfigurationState::Failed { reason, .. }
+                ConfigurationStatus::Failed(reason)
                     if matches!(
                         reason.detail.as_ref(),
                         DscpV1::EmptyTargetApis { target } if target == "dev"
@@ -567,11 +560,9 @@ fn schema_bound_target_mismatches_publish_configuration_error() {
             matches!(
                 process
                     .coordinator()
-                    .open_reader()
-                    .unwrap()
-                    .configuration_state()
+                    .configuration_status()
                     .unwrap(),
-                ConfigurationState::Failed { reason, .. }
+                ConfigurationStatus::Failed(reason)
                     if matches!(
                         reason.detail.as_ref(),
                         DscpV1::UnsupportedTargetIdentity { target, .. } if target == "dev"
@@ -627,7 +618,7 @@ fn operational_configuration_applies_live_without_an_input_version() {
 }
 
 #[test]
-fn restart_only_configuration_is_staged_without_an_input_version() {
+fn restart_only_configuration_is_announced_without_an_input_version() {
     let temp = tempfile::tempdir().unwrap();
     let process = DaemonProcess::start(config(&temp)).unwrap();
     let before = process
@@ -641,15 +632,9 @@ fn restart_only_configuration_is_staged_without_an_input_version() {
 
     wait_until(
         || {
-            process
-                .coordinator()
-                .open_reader()
-                .unwrap()
-                .pending_restart()
-                .unwrap()
-                .is_some_and(|pending| pending.keys == ["codegen.auto_codegen"])
+            process.coordinator().server_handle().restart_required().1 == ["codegen.auto_codegen"]
         },
-        "restart-only edit was not staged",
+        "restart-only edit was not announced",
     );
     assert_eq!(
         process
@@ -662,7 +647,7 @@ fn restart_only_configuration_is_staged_without_an_input_version() {
     );
     assert!(
         !temp.path().join("generated").exists(),
-        "a staged restart-only edit must not activate codegen in this process"
+        "a restart-only edit must not activate codegen in this process"
     );
 }
 

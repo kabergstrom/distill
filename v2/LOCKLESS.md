@@ -103,7 +103,7 @@ read transaction:
 
 | Field | Destination |
 |---|---|
-| `current` | `store_meta.input_version`. `advance_empty_version` also becomes a real transaction. (schema-min: a transaction reads each counter, `input_version`, `compiled_version` and `configuration_generation`, once; the value lives from its `BEGIN` to its end and is never kept across transactions.) |
+| `current` | `store_meta.input_version`. `advance_empty_version` also becomes a real transaction. (schema-min: a transaction reads each counter, `input_version` and `compiled_version`, once; the value lives from its `BEGIN` to its end and is never kept across transactions.) |
 | `views[*].assets` (Built/Drifted/Failed/Deleted{at}) | An `assets` row → `Drifted{Asset}`; a derived output → `Drifted{Asset(parent)}`; otherwise its namespace error (own UUID collision, else its bundle UUID's) → Failed; nothing → Missing, deleted or never published (schema-min: no `asset_resolutions` table). |
 | `views[*].authoring` | `bundles` / `assets` / `asset_tags` / `schemas`. New `assets` columns hold the encoded authored value (canonical JSON + blobs) and `terminal_type`, so a snapshot never reads a file. |
 | `views[*].paths` | `bundles.primary_asset` by path (schema 49; was `path_index`); several roots at one path is the ambiguity. |
@@ -115,7 +115,7 @@ read transaction:
 | `artifacts` (hash → asset, layout, load edges) | The DSTL bytes in the CAS already carry everything but `ServedLoadEdge.expected_terminal`, which goes in `artifact_load_edges(content_hash, asset, expected_terminal)`, written in the CAS index transaction. |
 | `wire_trees` | presence in `cas_extents` |
 | `pipeline_generation`, `targets[*].target_generation`, `protocol_epoch` | `store_meta.rpc_pipeline_generation` and `rpc_targets`. (schema-min: no target generation; a target changes only with the configuration's pipeline fence, and the protocol epoch is `PROTOCOL_VERSION`, checked at connect.) |
-| `restart_required_keys` | `pending_restart` |
+| `restart_required_keys` | process state on the RPC hub: the started-with values against the file, told to installed streams as they change (no table) |
 | `connections`, subscriptions, queues, `ViewLease`, pack sessions | ephemeral, owned by the RPC front end. Durable pins stay in `pins`. |
 
 `Commit` survives for now as the typed publication delta. It is applied to
@@ -1262,8 +1262,8 @@ What went:
   Nothing about the module stays in `store_meta`: its hash is the loaded
   epoch's, which nothing read from the store. A runtime failure lives on the
   loaded epoch.
-- Configuration state and served restart keys. These are `errors` rows
-  and `pending_restart`.
+- Configuration state, now an `errors` row, and the served restart
+  keys, now process state: the started-with values against the file.
 - `result_candidates`, replaced by `results` and `result_outputs`.
   Segments now hold only raw extents.
 - `asset_tag_index`, replaced by two columns of `assets`.

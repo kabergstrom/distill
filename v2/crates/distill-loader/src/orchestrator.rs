@@ -113,6 +113,9 @@ pub enum LoaderDiagnostic {
         error: StorageError,
     },
     ReconnectRequired(ReconnectReason),
+    /// Configuration keys the daemon needs a restart to apply; empty when a
+    /// restart is no longer needed.
+    RestartRequired(Vec<String>),
 }
 
 struct HandleLease;
@@ -1375,6 +1378,9 @@ impl<I: LoaderIO> Loader<I> {
             }
             IoEvent::ConnectionError { message } => {
                 self.diagnostics.push(LoaderDiagnostic::Io(message));
+            }
+            IoEvent::RestartRequired { keys } => {
+                self.diagnostics.push(LoaderDiagnostic::RestartRequired(keys));
             }
         }
         Ok(())

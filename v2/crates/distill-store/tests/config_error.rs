@@ -1,9 +1,8 @@
 //! DSCP v1 configuration-error grammar and persistence pinning.
 
-use distill_store::config::RestartOnlyChange;
 use distill_store::state::{
     ConfigurationError, ConfigurationErrorCode, ConfigurationPathKey,
-    ConfigurationSourceFailureCode, ConfigurationSourcePath, ConfigurationState,
+    ConfigurationSourceFailureCode, ConfigurationSourcePath,
     DirectoryAliasSide, DscpV1, OwnedPathKind, OwnedPathSide,
 };
 use distill_store::{Store, StoreConfig, StoreError};
@@ -338,8 +337,7 @@ fn typed_configuration_error_roundtrips_and_message_is_not_hashed() {
         })
         .unwrap();
 
-    let state = store.configuration_state().unwrap();
-    let ConfigurationState::Failed { reason: error, .. } = state else {
+    let Some(error) = store.configuration_error().unwrap() else {
         panic!("typed error must be persisted");
     };
     assert_eq!(error.code, ConfigurationErrorCode::NonLoopbackAddress);
@@ -356,9 +354,7 @@ fn typed_configuration_error_roundtrips_and_message_is_not_hashed() {
     );
 }
 
-/// The configuration status is the source's error: adopting a restart
-/// changes the generation but not the error, and healing the error makes
-/// the adopted generation ready.
+/// The configuration status is the source's error until the source heals it.
 #[test]
 fn only_its_source_heals_a_configuration_error() {
     let (_dir, mut store) = open();
@@ -370,23 +366,11 @@ fn only_its_source_heals_a_configuration_error() {
             )))
         })
         .unwrap();
-    store
-        .stage_pending_restart(&[RestartOnlyChange::AutoCodegen(false)])
-        .unwrap();
-    store
-        .input_transaction(|txn| txn.adopt_pending_restart())
-        .unwrap();
-    assert!(matches!(
-        store.configuration_state().unwrap(),
-        ConfigurationState::Failed { last_good: Some(ref epoch), .. } if epoch.generation == 1
-    ));
+    assert!(store.configuration_error().unwrap().is_some());
     store
         .input_transaction(|txn| txn.set_configuration_source_error(None))
         .unwrap();
-    assert!(matches!(
-        store.configuration_state().unwrap(),
-        ConfigurationState::Ready(ref epoch) if epoch.generation == 1
-    ));
+    assert!(store.configuration_error().unwrap().is_none());
 }
 
 #[test]
@@ -407,7 +391,7 @@ fn unknown_persisted_code_is_rejected_instead_of_becoming_an_other_variant() {
 
     let reopened = Store::open(StoreConfig::new(state_path)).unwrap();
     assert!(matches!(
-        reopened.configuration_state(),
+        reopened.configuration_error(),
         Err(StoreError::InvalidConfiguration { .. })
     ));
 }
@@ -436,7 +420,7 @@ fn noncanonical_persisted_error_shape_is_rejected() {
 
     let reopened = Store::open(StoreConfig::new(state_path)).unwrap();
     assert!(matches!(
-        reopened.configuration_state(),
+        reopened.configuration_error(),
         Err(StoreError::InvalidConfiguration { .. })
     ));
 }
@@ -489,7 +473,7 @@ fn persisted_configuration_error_recomputes_detail_authority() {
         drop(conn);
 
         let reopened = Store::open(StoreConfig::new(&state_path)).unwrap();
-        let state = reopened.configuration_state();
+        let state = reopened.configuration_error();
         assert!(
             matches!(state, Err(StoreError::InvalidConfiguration { .. })),
             "{case}: {state:?}"

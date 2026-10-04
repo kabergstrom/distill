@@ -47,16 +47,9 @@ impl From<ApplyError> for StoreError {
     }
 }
 
-/// The RPC view of the store's configuration state.
-pub(crate) fn configuration_status(
-    state: &distill_store::state::ConfigurationState,
-) -> ConfigurationStatus {
-    match state {
-        distill_store::state::ConfigurationState::Ready(_) => ConfigurationStatus::Ready,
-        distill_store::state::ConfigurationState::Failed { reason, .. } => {
-            ConfigurationStatus::Failed(reason.clone())
-        }
-    }
+/// The RPC view of the configuration error the store selects, if any.
+pub(crate) fn configuration_status(error: Option<ConfigurationError>) -> ConfigurationStatus {
+    error.map_or(ConfigurationStatus::Ready, ConfigurationStatus::Failed)
 }
 
 /// Apply `commit`'s served projection: the version the daemon publishes in
@@ -118,29 +111,6 @@ pub fn publish_pipeline_fence<W: ServedWrite>(txn: &mut W) -> Result<(), StoreEr
     txn.bump_rpc_pipeline_generation()?;
     let version = txn.change_version();
     txn.append_change(version, &Change::ReconnectAll)
-}
-
-/// Announce a changed restart-required key set: the keys the store's
-/// pending restart (its only source) holds now, after `before`. Returns
-/// whether it changed.
-pub(crate) fn publish_restart_required<W: ServedWrite>(
-    txn: &mut W,
-    before: &[String],
-    keys: &[String],
-) -> Result<bool, StoreError> {
-    if before == keys {
-        return Ok(false);
-    }
-    if !keys.is_empty() {
-        let version = txn.change_version();
-        txn.append_change(
-            version,
-            &Change::RestartRequired {
-                keys: keys.to_vec(),
-            },
-        )?;
-    }
-    Ok(true)
 }
 
 /// Replace the complete RPC target set. It fences nothing itself: a target

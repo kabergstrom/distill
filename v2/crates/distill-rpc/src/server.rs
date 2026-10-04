@@ -33,7 +33,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::{watch, Notify};
@@ -43,8 +43,7 @@ use distill_store::served::{Change, ChangeEntry};
 use distill_store::{Store, StoreConfig, StoreError, StoreOpener, StoreReader, StoreWriter};
 
 use crate::apply::{
-    apply_commit, configuration_status, publish_pipeline_fence, publish_restart_required,
-    publish_target_set, ApplyError,
+    apply_commit, configuration_status, publish_pipeline_fence, publish_target_set, ApplyError,
 };
 use crate::persist::delta_state;
 use crate::*;
@@ -185,6 +184,19 @@ pub struct ServerHandle {
     next_connection_id: AtomicU64,
     /// Opens each owner's own reader and writer.
     opener: Arc<StoreOpener>,
+    /// The restart-only values the configuration file asks for that this
+    /// process does not use ([`Self::set_restart_required`]).
+    restart: Mutex<RestartRequired>,
+}
+
+/// Process state, in no store row: the process compares the values it
+/// started with against its configuration file, and a restart starts with
+/// the file's. `serial` counts the changes, so a connection delivers each
+/// once.
+#[derive(Default)]
+struct RestartRequired {
+    serial: u64,
+    values: Vec<(&'static str, String)>,
 }
 
 impl fmt::Debug for ServerHandle {
@@ -214,6 +226,7 @@ impl ServerHandle {
             open_connections: AtomicUsize::new(0),
             next_connection_id: AtomicU64::new(1),
             opener,
+            restart: Mutex::default(),
         })
     }
 
@@ -804,37 +817,43 @@ impl ServerHandle {
             .map(|stamp| stamp.expect("a coordinated commit always publishes"))
     }
 
-    /// Stage a restart-only edit (`stage` replaces the store's pending
-    /// restart) and announce its RestartRequired keys, in one transaction.
-    /// This does not advance the input version or mutate active
-    /// configuration values.
-    pub fn restart_required(
+    /// Replace the restart-only changes the configuration file asks for
+    /// (none: the file holds the values this process runs). Each change to
+    /// their keys or values is announced to every installed stream, the
+    /// empty set included. No input version is published: the values
+    /// apply only once the process restarts, reading the file.
+    pub fn set_restart_required(
         &self,
-        store: &mut Store,
-        stage: impl FnOnce(&mut Store) -> Result<(), String>,
-    ) -> Result<SnapshotStamp, String> {
-        let pending_keys = |store: &Store| {
-            store
-                .pending_restart()
-                .map(|pending| pending.map(|pending| pending.keys).unwrap_or_default())
-                .map_err(|error| error.to_string())
+        changes: &[distill_store::config::RestartOnlyChange],
+    ) -> Result<(), distill_store::config::ConfigValidationError> {
+        let values = distill_store::config::RestartOnlyChange::key_values(changes)?;
+        let changed = {
+            let mut restart = self.restart.lock().expect("restart state lock");
+            let changed = restart.values != values;
+            if changed {
+                restart.values = values;
+                restart.serial += 1;
+            }
+            changed
         };
-        let changed = store.write_transaction_with(
-            |error| error.to_string(),
-            |store| {
-                let before = pending_keys(store)?;
-                stage(store)?;
-                let keys = pending_keys(store)?;
-                store
-                    .served_transaction(|txn| publish_restart_required(txn, &before, &keys))
-                    .map_err(|error| error.to_string())
-            },
-        )?;
-        // Inside an open input, readers are told once it commits.
-        if changed && !store.input_open() {
+        if changed {
             self.notify_published();
         }
-        self.stamp_of(store).map_err(|error| error.to_string())
+        Ok(())
+    }
+
+    /// The restart-required keys, by key, and the serial of their last
+    /// change.
+    pub fn restart_required(&self) -> (u64, Vec<String>) {
+        let restart = self.restart.lock().expect("restart state lock");
+        (
+            restart.serial,
+            restart
+                .values
+                .iter()
+                .map(|(key, _)| (*key).to_owned())
+                .collect(),
+        )
     }
 }
 
@@ -1010,9 +1029,7 @@ impl SnapshotTxn {
 
     /// The configuration status this snapshot pins.
     pub(crate) fn configuration(&self) -> Result<ConfigurationStatus, StoreError> {
-        Ok(configuration_status(
-            &self.snapshot().configuration_state()?,
-        ))
+        Ok(configuration_status(self.snapshot().configuration_error()?))
     }
 }
 
@@ -1108,6 +1125,9 @@ pub(crate) struct ConnectionState {
     /// prompt survives on its own).
     pub(crate) queue: VecDeque<StreamEvent>,
     pub(crate) stream_installed: bool,
+    /// The serial of the restart-required keys the stream was last told
+    /// (`ServerHandle::restart_required`).
+    pub(crate) restart_serial: u64,
     pub(crate) notify: Rc<Notify>,
 }
 
@@ -1376,6 +1396,7 @@ impl Inner {
             subscribed_paths: BTreeSet::new(),
             queue: VecDeque::new(),
             stream_installed: false,
+            restart_serial: 0,
             notify: Rc::new(Notify::new()),
         }))
     }
@@ -1400,6 +1421,34 @@ impl Inner {
     /// cursor.
     pub(crate) fn pump(&self, connection: &RefCell<ConnectionState>) {
         self.pump_until(connection, None);
+        self.pump_restart(connection);
+    }
+
+    /// Tell `connection`'s installed stream the restart-required keys, if
+    /// they changed since it was last told.
+    fn pump_restart(&self, connection: &RefCell<ConnectionState>) {
+        let (serial, keys) = self.handle.restart_required();
+        let mut connection = connection.borrow_mut();
+        if !connection.stream_installed || connection.restart_serial == serial {
+            return;
+        }
+        let version = match self.reader.input_version() {
+            Ok(version) => version,
+            Err(error) => {
+                tracing::error!(%error, "cannot read the input version");
+                return;
+            }
+        };
+        connection.restart_serial = serial;
+        connection.enqueue(StreamEvent::Asset {
+            basis: RpcBasis {
+                snapshot: SnapshotStamp {
+                    instance: self.handle.instance,
+                    version,
+                },
+            },
+            event: AssetEvent::RestartRequired { keys },
+        });
     }
 
     /// Deliver to `connection` the change-log rows after its cursor, up to
@@ -1468,14 +1517,6 @@ impl Inner {
                         },
                     });
                 }
-                Change::RestartRequired { keys } => {
-                    if !keys.is_empty() && connection.stream_installed {
-                        connection.enqueue(StreamEvent::Asset {
-                            basis: RpcBasis { snapshot: stamp },
-                            event: AssetEvent::RestartRequired { keys: keys.clone() },
-                        });
-                    }
-                }
             }
             index += 1;
         }
@@ -1525,7 +1566,7 @@ impl Root {
             Ok((
                 reader.rpc_pipeline_generation()?,
                 reader.rpc_target(&target_name)?,
-                reader.configuration_state()?,
+                reader.configuration_error()?,
                 pipeline_at(&*handle.authoring_backend(), reader),
                 reader.change_log_head()?,
             ))
@@ -1551,7 +1592,7 @@ impl Root {
                 got: request.target_definition_hash,
             });
         }
-        if let ConfigurationStatus::Failed(error) = configuration_status(&configuration) {
+        if let ConfigurationStatus::Failed(error) = configuration_status(configuration) {
             return ConnectOutcome::ConfigurationFailed(error);
         }
         let pipeline = match pipeline {

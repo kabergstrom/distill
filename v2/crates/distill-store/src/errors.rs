@@ -88,17 +88,11 @@ impl InputTxn<'_> {
     }
 
     /// The configuration status the stored errors select (see
-    /// [`StoreReader::configuration_error`]); with none, `generation`
-    /// becomes the active one. Returns the selected error.
+    /// [`StoreReader::configuration_error`]).
     pub fn publish_configuration_status(
         &mut self,
-        generation: u64,
     ) -> Result<Option<ConfigurationError>, StoreError> {
-        let selected = self.reader().configuration_error()?;
-        if selected.is_none() {
-            self.set_configuration_generation(generation)?;
-        }
-        Ok(selected)
+        self.reader().configuration_error()
     }
 
     /// Replace the version's pipeline failure; `None` heals it.

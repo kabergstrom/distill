@@ -1080,12 +1080,7 @@ impl ConfigWatch {
             )?;
         }
 
-        let restart = restart_changes(&self.active, &candidate);
-        if !restart.is_empty() {
-            coordinator.stage_restart_configuration(store, &restart)?;
-        } else {
-            coordinator.clear_restart_configuration(store)?;
-        }
+        coordinator.set_restart_required(&restart_changes(&self.active, &candidate))?;
 
         apply_live_values(&mut self.active, &candidate);
         self.staged = candidate;

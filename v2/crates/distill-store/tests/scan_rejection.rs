@@ -5,7 +5,7 @@
 
 use distill_store::errors::ScanRejectionRecord;
 use distill_store::state::{
-    ConfigurationError, ConfigurationState, DirectoryAliasSide, DscpV1, NamespaceError,
+    ConfigurationError, DirectoryAliasSide, DscpV1, NamespaceError,
     NamespaceErrorV1, ScanFailureCode, ScanSubject,
 };
 use distill_store::{Store, StoreConfig};
@@ -96,7 +96,7 @@ fn the_configuration_status_selects_from_the_stored_errors() {
                 ..ScanRejectionRecord::default()
             }))?;
             txn.set_configuration_source_error(Some(&malformed()))?;
-            txn.publish_configuration_status(3).map(|_| ())
+            txn.publish_configuration_status().map(|_| ())
         })
         .unwrap();
     // Malformed (code 1) orders before the alias (code 9).
@@ -105,15 +105,11 @@ fn the_configuration_status_selects_from_the_stored_errors() {
         Some(malformed())
     );
     assert_eq!(store.configuration_error().unwrap(), Some(malformed()));
-    match store.configuration_state().unwrap() {
-        ConfigurationState::Failed { reason, .. } => assert_eq!(reason, malformed()),
-        state => panic!("expected the source error, got {state:?}"),
-    }
 
     store
         .input_transaction(|txn| {
             txn.set_configuration_source_error(None)?;
-            txn.publish_configuration_status(3).map(|_| ())
+            txn.publish_configuration_status().map(|_| ())
         })
         .unwrap();
     assert_eq!(store.configuration_error().unwrap(), Some(alias()));
@@ -121,14 +117,10 @@ fn the_configuration_status_selects_from_the_stored_errors() {
     store
         .input_transaction(|txn| {
             txn.set_scan_rejection(None)?;
-            txn.publish_configuration_status(3).map(|_| ())
+            txn.publish_configuration_status().map(|_| ())
         })
         .unwrap();
     assert_eq!(store.configuration_error().unwrap(), None);
-    match store.configuration_state().unwrap() {
-        ConfigurationState::Ready(epoch) => assert_eq!(epoch.generation, 3),
-        state => panic!("expected ready, got {state:?}"),
-    }
 }
 
 #[test]

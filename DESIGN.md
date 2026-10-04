@@ -4954,7 +4954,6 @@ that published it, never copied into a table.
 | `cas_extents` | ContentHash → segment, offset, length: the CAS extent index. Segments hold raw bytes; an extent is its row, and live bytes are covering-index sums |
 | `cas_refs` | what an install holds: an installed artifact or wire tree holds itself and the wire tree an artifact names. Releasing a holder (or a result) deletes in its transaction each extent nothing else references; a foreign key refuses to drop one still referenced |
 | `cas_segments` | every segment file and its state (open, sealed, dead); a writer's one open segment is unique, and a dead file is deleted only once no read can reach it |
-| `pending_restart` | the staged restart-only configuration (generation → key, value), adopted at the next start |
 | `tools` | **ToolEpoch** state (§9): tool key → (`ToolExecutionIdentityV2`, DSCT hash, optional staged package root) — input-versioned. Package registrations snapshot and stage their complete directory no-replace; ambient registrations retain an explicit absolute launcher and toolchain identity, and are nonmemoizable unless they carry a trusted fingerprint. No row resolves to a library handle: runtime `dlopen` in pipeline code and a staged-library API are banned (§3, §9) |
 | `codegen_outputs` | daemon-owned Rust codegen namespace → the exact `ContentHash` of each previously published file. This memo-side table is the expected-preimage authority for §20 publication and recovery; replacing the complete map never advances the input version |
 | `watched_import_failures` | bundle uuid → a watched import's last failure: the attempted version, the basis it read and the terminal error. The basis is what decides whether the import is due again |
@@ -5199,10 +5198,9 @@ version it attaches to is. Code and configuration are inputs like any
 other: a module or schema swap — or an edit to the daemon's own
 configuration (§18) — lands as a watcher event, advances the input
 version, and rotates the `PipelineEpoch` (§3) or configuration epoch
-(§18) — restart-only keys excepted: a valid restart-only edit records
-a pending-restart configuration generation and surfaces
-`RestartRequired`, and the input version advances at restart, when the
-value takes effect (§18); module, schemas, and target configuration validate as **one
+(§18) — restart-only keys excepted: a valid restart-only edit surfaces
+`RestartRequired` and changes no version; the edited value is read at
+the next start, like every other input (§18); module, schemas, and target configuration validate as **one
 candidate** (§3, §18), the candidate's pipeline map constructed against
 the candidate's target set, so no published version pairs a target
 definition with a map built for a different one — each snapshot pins
@@ -7487,15 +7485,15 @@ ships; an unclassified key is a spec defect:
 restart-only key follows the same staged-candidate validation as every
 configuration edit — an invalid value poisons staging exactly as
 above. A *valid* edit does not touch active values and does **not**
-advance the input version: the coordinator records a **pending-restart
-configuration generation** and the daemon enters a defined
-**`RestartRequired`** state — surfaced by `doctor` and status, and as
-the `RestartRequired` event on the subscription stream (§17), naming
-the pending keys — while every active value keeps serving unchanged.
-The input version advances only when the values actually take effect,
-at restart: startup adopts the pending generation and publishes it as
-an ordinary input event, so no snapshot ever observes a version whose
-recorded configuration disagrees with the values that served it.
+advance the input version. Nothing records it: the running process
+compares the values it started with against the file, and the keys
+that differ are its **`RestartRequired`** state — process state, not
+store state — told to every subscription stream (§17) as the
+`RestartRequired` event whenever the key set or a value changes,
+including to the empty set when the file returns to the running values.
+A stream installed later is told the current keys once. Every active
+value keeps serving unchanged; at restart the file is simply the
+configuration, read like any other input.
 
 ```rust
 #[asset(uuid = "…")]              // schema-described (§22): editors get UI for free
@@ -9036,11 +9034,10 @@ put production image codecs, mesh optimization, or shader compilers in core.
 - **Restart-only edits have a defined transition** (§13, §17, §18):
   whether a valid restart-only edit advanced the input version,
   was ignored, or poisoned was undefined. Staging validates it like
-  every edit (invalid values poison staging); a valid edit records a
-  pending-restart configuration generation, leaves active values
-  untouched, and surfaces the defined `RestartRequired` state/event
-  (doctor/status plus the subscription stream); the input version
-  advances only at restart, when the values take effect.
+  every edit (invalid values poison staging); a valid edit leaves active values untouched and
+  surfaces the defined `RestartRequired` state/event (the process's
+  started-with values against the file, told on the subscription
+  stream); no version advances.
 - **Variant revisions have one declared carrier** (§4, §5, §11): the
   grammar hashed variant revs while the attribute table permitted
   `#[asset(rev)]` only on structs and fields and the model declared no

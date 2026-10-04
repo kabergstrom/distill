@@ -11,12 +11,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use crate::db::{InputTxn, Store, StoreReader};
-use crate::error::StoreError;
-use crate::state::{ConfigurationEpoch, ConfigurationState};
-
-/// `store_meta` key of the active configuration generation: the last ready
-/// configuration's, or the adopted restart's.
+use crate::db::Store;
 
 /// Store-side configuration. Defaults match §18's example config.
 #[derive(Debug, Clone)]
@@ -50,13 +45,12 @@ impl StoreConfig {
     }
 }
 
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigValidationError {
     ParallelismZero,
     BatchReservationOutOfBounds { got: usize, max: usize },
     NonLoopbackAddress(SocketAddr),
-    EmptyRestartChangeSet,
-    Persistence(String),
 }
 
 impl std::fmt::Display for ConfigValidationError {
@@ -70,17 +64,11 @@ impl std::fmt::Display for ConfigValidationError {
             Self::NonLoopbackAddress(addr) => {
                 write!(f, "daemon.address must be loopback, got {addr}")
             }
-            Self::EmptyRestartChangeSet => f.write_str("restart-only change set is empty"),
-            Self::Persistence(error) => write!(f, "configuration state persistence: {error}"),
         }
     }
 }
 
 impl std::error::Error for ConfigValidationError {}
-
-fn persistence(error: impl std::fmt::Display) -> ConfigValidationError {
-    ConfigValidationError::Persistence(error.to_string())
-}
 
 fn validate_scheduler(parallelism: usize, reserved: usize) -> Result<(), ConfigValidationError> {
     if parallelism == 0 {
@@ -93,8 +81,9 @@ fn validate_scheduler(parallelism: usize, reserved: usize) -> Result<(), ConfigV
     Ok(())
 }
 
-/// Typed restart-only edits. Values validate before any pending generation
-/// is recorded; active configuration and input version remain unchanged.
+/// Typed restart-only edits: values of the configuration file the running
+/// process does not apply until it restarts. Nothing records them: the
+/// process compares the values it started with against the file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestartOnlyChange {
     StatePath(PathBuf),
@@ -104,6 +93,20 @@ pub enum RestartOnlyChange {
 }
 
 impl RestartOnlyChange {
+    /// The validated `(key, value)` of each of `changes`, by key, one per
+    /// key.
+    pub fn key_values(
+        changes: &[RestartOnlyChange],
+    ) -> Result<Vec<(&'static str, String)>, ConfigValidationError> {
+        let mut rows = changes
+            .iter()
+            .map(RestartOnlyChange::key_value)
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.sort_by(|a, b| a.0.cmp(b.0));
+        rows.dedup_by(|a, b| a.0 == b.0);
+        Ok(rows)
+    }
+
     fn key_value(&self) -> Result<(&'static str, String), ConfigValidationError> {
         Ok(match self {
             Self::StatePath(path) => ("daemon.state_path", path.to_string_lossy().into_owned()),
@@ -117,12 +120,6 @@ impl RestartOnlyChange {
             Self::AutoCodegen(value) => ("codegen.auto_codegen", value.to_string()),
         })
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingRestart {
-    pub generation: u64,
-    pub keys: Vec<String>,
 }
 
 impl Store {
@@ -139,145 +136,6 @@ impl Store {
         config.parallelism = candidate.parallelism;
         config.batch_reserved_workers = candidate.batch_reserved_workers;
         Ok(())
-    }
-
-    /// Stage and validate restart-only changes without advancing the input
-    /// version or replacing the active configuration generation.
-    pub fn stage_pending_restart(
-        &mut self,
-        changes: &[RestartOnlyChange],
-    ) -> Result<PendingRestart, ConfigValidationError> {
-        if changes.is_empty() {
-            return Err(ConfigValidationError::EmptyRestartChangeSet);
-        }
-        let mut rows = changes
-            .iter()
-            .map(RestartOnlyChange::key_value)
-            .collect::<Result<Vec<_>, _>>()?;
-        rows.sort_by(|a, b| a.0.cmp(b.0));
-        rows.dedup_by(|a, b| a.0 == b.0);
-        let generation = self
-            .write_txn(|store| {
-                let active = store.configuration_generation()?;
-                let prior = store
-                    .conn
-                    .prepare_cached("SELECT COALESCE(MAX(generation), 0) FROM pending_restart")?
-                    .query_row([], |r| r.get::<_, i64>(0))? as u64;
-                let generation = active.max(prior) + 1;
-                store
-                    .conn
-                    .prepare_cached("DELETE FROM pending_restart")?
-                    .execute([])?;
-                for (key, value) in &rows {
-                    store
-                        .conn
-                        .prepare_cached(
-                            "INSERT INTO pending_restart(generation, config_key, config_value)
-                         VALUES (?1, ?2, ?3)",
-                        )?
-                        .execute(rusqlite::params![generation as i64, key, value])?;
-                }
-                Ok(generation)
-            })
-            .map_err(persistence)?;
-        Ok(PendingRestart {
-            generation,
-            keys: rows.into_iter().map(|(key, _)| key.to_owned()).collect(),
-        })
-    }
-
-    /// Clear a staged restart candidate that has been edited back to the
-    /// active startup values. This is not an input event.
-    pub fn clear_pending_restart(&mut self) -> Result<(), StoreError> {
-        self.write_txn(|store| {
-            store
-                .conn
-                .prepare_cached("DELETE FROM pending_restart")?
-                .execute([])?;
-            Ok(())
-        })
-    }
-}
-
-impl StoreReader {
-    pub fn pending_restart(&self) -> Result<Option<PendingRestart>, StoreError> {
-        let generation: Option<i64> =
-            self.conn
-                .query_row("SELECT MAX(generation) FROM pending_restart", [], |r| {
-                    r.get(0)
-                })?;
-        let Some(generation) = generation else {
-            return Ok(None);
-        };
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT config_key FROM pending_restart WHERE generation = ?1 ORDER BY config_key",
-        )?;
-        let keys = stmt
-            .query_map([generation], |r| r.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Some(PendingRestart {
-            generation: generation as u64,
-            keys,
-        }))
-    }
-
-    /// The configuration status: the error the stored errors select (see
-    /// [`StoreReader::configuration_error`]) over the active generation.
-    pub fn configuration_state(&self) -> Result<ConfigurationState, StoreError> {
-        let epoch = std::sync::Arc::new(ConfigurationEpoch {
-            generation: self.configuration_generation()?,
-        });
-        Ok(match self.configuration_error()? {
-            None => ConfigurationState::Ready(epoch),
-            Some(reason) => ConfigurationState::Failed {
-                reason,
-                last_good: Some(epoch),
-            },
-        })
-    }
-
-    /// The active configuration generation (0 before any).
-    pub fn configuration_generation(&self) -> Result<u64, StoreError> {
-        Ok(self
-            .counters
-            .get(&self.conn, crate::db::Counter::ConfigurationGeneration)?
-            .unwrap_or(0))
-    }
-}
-
-impl InputTxn<'_> {
-    /// Make `generation` the active configuration generation: written only
-    /// when it changes.
-    pub(crate) fn set_configuration_generation(
-        &mut self,
-        generation: u64,
-    ) -> Result<(), StoreError> {
-        if self.reader().configuration_generation()? != generation {
-            self.counters.set(
-                self.txn,
-                crate::db::Counter::ConfigurationGeneration,
-                generation,
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Startup adoption: pending values take effect and only now advance
-    /// the input version.
-    pub fn adopt_pending_restart(&mut self) -> Result<u64, StoreError> {
-        let generation: Option<i64> =
-            self.txn
-                .query_row("SELECT MAX(generation) FROM pending_restart", [], |r| {
-                    r.get(0)
-                })?;
-        let generation = generation.ok_or_else(|| StoreError::InvalidConfiguration {
-            error: "no pending-restart generation to adopt".to_owned(),
-        })?;
-        self.set_configuration_generation(generation as u64)?;
-        self.txn
-            .prepare_cached("DELETE FROM pending_restart")?
-            .execute([])?;
-        Ok(generation as u64)
     }
 }
 

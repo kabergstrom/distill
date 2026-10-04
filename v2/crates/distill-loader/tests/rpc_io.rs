@@ -7,6 +7,7 @@ use distill_loader::{
     RuntimeTarget,
 };
 use distill_rpc::capnp_transport::StagedListener;
+use distill_store::config::RestartOnlyChange;
 use distill_rpc::{
     ArtifactPayload, BuildAnswer, ConnectRequest, Server, SnapshotPolicy, TargetDefinition,
     TargetDefinitionHash,
@@ -679,6 +680,51 @@ fn rpc_io_polls_import_failures_and_reports_only_changes() {
     // The next poll returns the same list: not a change.
     poll_for(&mut io, Duration::from_millis(1200));
     assert_eq!(io.take_import_failures(), None);
+    drop(io);
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn rpc_io_reports_a_restart_requirement_and_its_clearing() {
+    let Fixture {
+        project,
+        server,
+        request,
+        asset,
+        ..
+    } = fixture();
+    let (address_tx, address_rx) = std::sync::mpsc::sync_channel(1);
+    let root = server.root();
+    let server_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&runtime, async move {
+            let listener = StagedListener::bind(root, "127.0.0.1:0").await.unwrap();
+            address_tx.send(listener.local_addr().unwrap()).unwrap();
+            listener.accept_one().await.unwrap().await.unwrap().unwrap();
+        });
+    });
+    let mut io = RpcIo::connect(address_rx.recv().unwrap(), request).unwrap();
+    io.subscribe(asset);
+    poll_while(&mut io, |io| io.stats().control_tasks > 2);
+
+    project
+        .coordinator()
+        .set_restart_required(&[RestartOnlyChange::AutoCodegen(true)])
+        .unwrap();
+    assert!(matches!(
+        poll_until(&mut io, 1).as_slice(),
+        [IoEvent::RestartRequired { keys }] if keys == &["codegen.auto_codegen"]
+    ));
+    // The file again matches what the daemon runs with: the requirement
+    // clears with an empty key set.
+    project.coordinator().set_restart_required(&[]).unwrap();
+    assert!(matches!(
+        poll_until(&mut io, 1).as_slice(),
+        [IoEvent::RestartRequired { keys }] if keys.is_empty()
+    ));
     drop(io);
     server_thread.join().unwrap();
 }

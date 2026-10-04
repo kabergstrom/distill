@@ -11,14 +11,14 @@ use distill_rpc::{
     AuthoringBackend, AuthoringEntry, AuthoringEntryRole, AuthoringInspectResult, AuthoringOp,
     AuthoringProgressState, AuthoringValue as RpcAuthoringValue, ConnectOutcome, ConnectRequest,
     ContentHash, Delta, DoctorRequest, LongRunningOp, MetadataCall, MetadataNamespaceCall,
-    RpcFailure, StreamEvent, TargetDefinition, TargetDefinitionHash, WriteReceipt, WrittenFile,
+    ConfigurationStatus, RpcFailure, StreamEvent, TargetDefinition, TargetDefinitionHash, WriteReceipt, WrittenFile,
 };
 use distill_schema::ngp_schema::{
     node_hash, snapshot_to_json, LogicalSchema, PrimitiveKind, SchemaNode,
 };
 use distill_store::config::RestartOnlyChange;
 use distill_store::served::AssetResolution;
-use distill_store::state::{ConfigurationState, DscpV1, InputVersion, NamespaceErrorV1};
+use distill_store::state::{DscpV1, InputVersion, NamespaceErrorV1};
 use distill_store::{Store, StoreConfig, StoreReader};
 
 fn ordinary_bundle() -> (Vec<u8>, BundleUuid, AssetUuid) {
@@ -434,32 +434,6 @@ fn write_and_publish(
 }
 
 #[test]
-fn startup_adopts_the_pending_restart_generation_before_rpc_construction() {
-    let temp = tempfile::tempdir().unwrap();
-    let state = temp.path().join(".distill");
-    let pending_generation = {
-        let mut store = Store::open(StoreConfig::new(&state)).unwrap();
-        store
-            .stage_pending_restart(&[RestartOnlyChange::AutoCodegen(true)])
-            .unwrap()
-            .generation
-    };
-
-    let coordinator = coordinator(&temp);
-    let store = coordinator.open_reader().unwrap();
-    assert_eq!(store.input_version().unwrap(), InputVersion(1));
-    assert!(store.pending_restart().unwrap().is_none());
-    assert!(matches!(
-        store.configuration_state().unwrap(),
-        ConfigurationState::Ready(epoch) if epoch.generation == pending_generation
-    ));
-    assert_eq!(
-        coordinator.server().current_stamp().unwrap().version,
-        InputVersion(1)
-    );
-}
-
-#[test]
 fn full_scan_publishes_one_store_and_rpc_version() {
     let temp = tempfile::tempdir().unwrap();
     let (bytes, bundle, asset) = ordinary_bundle();
@@ -475,8 +449,8 @@ fn full_scan_publishes_one_store_and_rpc_version() {
     assert!(store.bundle(bundle).unwrap().is_some());
     assert_eq!(store.entry(asset).unwrap().unwrap().local_id, "entry");
     assert!(matches!(
-        store.configuration_state().unwrap(),
-        ConfigurationState::Ready(_)
+        coordinator.configuration_status().unwrap(),
+        ConfigurationStatus::Ready
     ));
     drop(store);
 
@@ -857,10 +831,9 @@ fn directory_alias_publishes_configuration_error_without_aborting_the_version() 
             .version,
         InputVersion(1)
     );
-    let store = coordinator.open_reader().unwrap();
     assert!(matches!(
-        store.configuration_state().unwrap(),
-        ConfigurationState::Failed { reason, .. }
+        coordinator.configuration_status().unwrap(),
+        ConfigurationStatus::Failed(reason)
             if matches!(reason.detail.as_ref(), DscpV1::DirectoryAlias { .. })
     ));
 }
@@ -905,8 +878,8 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
     ));
     let store = coordinator.open_reader().unwrap();
     assert!(matches!(
-        store.configuration_state().unwrap(),
-        ConfigurationState::Ready(_)
+        coordinator.configuration_status().unwrap(),
+        ConfigurationStatus::Ready
     ));
     assert!(store.entry(ordinary_asset).unwrap().is_some());
     assert!(store
@@ -1368,7 +1341,7 @@ fn configuration_error_pages(filler: usize) -> u64 {
     let coordinator = coordinator(&temp);
     let mut writer = coordinator.open_writer().unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
-    let ready = writer.configuration_state().unwrap();
+    let ready = coordinator.configuration_status().unwrap();
 
     let before = writer.pages_fetched().unwrap();
     let base = writer.input_version().unwrap();
@@ -1381,15 +1354,15 @@ fn configuration_error_pages(filler: usize) -> u64 {
         .unwrap();
     assert_eq!(rejected.version.0, base.0 + 1);
     assert!(matches!(
-        writer.configuration_state().unwrap(),
-        ConfigurationState::Failed { .. }
+        coordinator.configuration_status().unwrap(),
+        ConfigurationStatus::Failed(_)
     ));
     let healed = coordinator
         .heal_configuration_rejection(&mut writer)
         .unwrap();
     assert_eq!(healed.version.0, base.0 + 2);
     assert_eq!(
-        format!("{:?}", writer.configuration_state().unwrap()),
+        format!("{:?}", coordinator.configuration_status().unwrap()),
         format!("{ready:?}")
     );
     writer.pages_fetched().unwrap() - before
@@ -1493,36 +1466,14 @@ fn an_edit_pass_runs_the_same_statements_at_any_namespace_size() {
     );
 }
 
-/// A staged restart and its RestartRequired announcement are one
-/// transaction: when the change-log write fails, nothing is staged.
+/// The restart-only changes are the process's own state: a subscriber is
+/// told the keys when its stream installs, again whenever their keys or
+/// values change, and an empty set once they clear. A restart starts with
+/// the file's values, so nothing is required of it.
 #[test]
-fn a_staged_restart_commits_with_its_announcement_or_not_at_all() {
+fn restart_required_is_told_as_it_changes_and_clears() {
     let temp = tempfile::tempdir().unwrap();
-    let coordinator = coordinator(&temp);
-    let mut writer = coordinator.open_writer().unwrap();
-    rusqlite::Connection::open(temp.path().join(".distill/meta.sqlite"))
-        .unwrap()
-        .execute_batch(
-            "CREATE TRIGGER fail_restart_announcement BEFORE INSERT ON change_log
-             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
-        )
-        .unwrap();
-    let staged = coordinator
-        .stage_restart_configuration(&mut writer, &[RestartOnlyChange::AutoCodegen(true)]);
-    assert!(staged.is_err());
-    assert!(
-        writer.pending_restart().unwrap().is_none(),
-        "the staging committed alone"
-    );
-}
-
-/// The RestartRequired keys a new subscription is told are the store's
-/// pending restart: staged, a subscriber hears them; once a restart adopts
-/// them, a subscriber hears none.
-#[test]
-fn restart_required_clears_once_a_restart_adopts_the_staged_values() {
-    let temp = tempfile::tempdir().unwrap();
-    let restart_events = |coordinator: &DaemonCoordinator| {
+    let connect = |coordinator: &DaemonCoordinator| {
         let hub = match coordinator
             .server()
             .root()
@@ -1531,10 +1482,11 @@ fn restart_required_clears_once_a_restart_adopts_the_staged_values() {
             ConnectOutcome::Connected(connected) => connected.hub,
             outcome => panic!("target connection failed: {outcome:?}"),
         };
-        let subscription = hub
-            .subscribe(InputVersion(0), vec![], vec![])
+        hub.subscribe(InputVersion(0), vec![], vec![])
             .success()
-            .unwrap();
+            .unwrap()
+    };
+    let restart_events = |subscription: &distill_rpc::SubscriptionInstall| {
         let mut keys = Vec::new();
         while let Some(event) = subscription.deltas.next() {
             if let StreamEvent::Asset {
@@ -1547,26 +1499,57 @@ fn restart_required_clears_once_a_restart_adopts_the_staged_values() {
         }
         keys
     };
+    let auto_codegen = vec!["codegen.auto_codegen".to_owned()];
     {
         let coordinator = coordinator(&temp);
         let mut writer = coordinator.open_writer().unwrap();
-        coordinator.reconcile_full_scan(&mut writer).unwrap();
+        let version = coordinator.reconcile_full_scan(&mut writer).unwrap().version;
+        let installed = connect(&coordinator);
+        assert_eq!(restart_events(&installed), Vec::<Vec<String>>::new());
         coordinator
-            .stage_restart_configuration(&mut writer, &[RestartOnlyChange::AutoCodegen(true)])
+            .set_restart_required(&[RestartOnlyChange::AutoCodegen(true)])
             .unwrap();
+        assert_eq!(restart_events(&installed), vec![auto_codegen.clone()]);
+        // The same values again are no change.
+        coordinator
+            .set_restart_required(&[RestartOnlyChange::AutoCodegen(true)])
+            .unwrap();
+        assert_eq!(restart_events(&installed), Vec::<Vec<String>>::new());
+        // A stream installed now is told the keys as they are.
+        let late = connect(&coordinator);
+        assert_eq!(restart_events(&late), vec![auto_codegen.clone()]);
+        // Another value of the same key is a change.
+        coordinator
+            .set_restart_required(&[RestartOnlyChange::AutoCodegen(false)])
+            .unwrap();
+        assert_eq!(restart_events(&installed), vec![auto_codegen]);
+        // The file back at the running values clears it.
+        coordinator.set_restart_required(&[]).unwrap();
+        assert_eq!(restart_events(&installed), vec![Vec::<String>::new()]);
+        // A stream that missed changes is told only where they ended.
+        assert_eq!(restart_events(&late), vec![Vec::<String>::new()]);
+        // A non-loopback address is rejected and changes nothing.
+        let non_loopback = "10.0.0.5:9999".parse().unwrap();
+        assert!(coordinator
+            .set_restart_required(&[RestartOnlyChange::Address(non_loopback)])
+            .is_err());
+        assert_eq!(restart_events(&installed), Vec::<Vec<String>>::new());
         assert_eq!(
-            restart_events(&coordinator),
-            vec![vec!["codegen.auto_codegen".to_owned()]]
+            writer.input_version().unwrap(),
+            version,
+            "restart-only changes publish nothing"
         );
+        coordinator
+            .set_restart_required(&[RestartOnlyChange::AutoCodegen(true)])
+            .unwrap();
     }
     let coordinator = coordinator(&temp);
     let mut writer = coordinator.open_writer().unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
-    assert!(
-        writer.pending_restart().unwrap().is_none(),
-        "the restart adopted the values"
+    assert_eq!(
+        restart_events(&connect(&coordinator)),
+        Vec::<Vec<String>>::new()
     );
-    assert_eq!(restart_events(&coordinator), Vec::<Vec<String>>::new());
 }
 
 /// The change log holds only real changes: the first publication on an

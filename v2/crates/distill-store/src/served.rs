@@ -91,24 +91,21 @@ pub enum Change {
     Path { path: String },
     /// The pipeline changed: every connection must reconnect.
     ReconnectAll,
-    /// The staged restart-required key set changed.
-    RestartRequired { keys: Vec<String> },
 }
 
 const CHANGE_ASSET: i64 = 1;
 const CHANGE_PATH: i64 = 2;
 const CHANGE_RECONNECT_ALL: i64 = 3;
-const CHANGE_RESTART: i64 = 5;
 
 /// Asset `?1`'s published deltas with `?2 < version <= ?3`, on the asset
 /// deltas' partial index (kind literal: [`CHANGE_ASSET`]).
 pub(crate) const ASSET_HISTORY: &str =
-    "SELECT seq, version, kind, asset_uuid, state, subject, detail
+    "SELECT seq, version, kind, asset_uuid, state, subject
      FROM change_log WHERE kind = 1 AND asset_uuid = ?1 AND version > ?2 AND version <= ?3";
 /// Path `?1`'s published deltas with `?2 < version <= ?3`, on the path
 /// deltas' partial index (kind literal: [`CHANGE_PATH`]).
 pub(crate) const PATH_HISTORY: &str =
-    "SELECT seq, version, kind, asset_uuid, state, subject, detail
+    "SELECT seq, version, kind, asset_uuid, state, subject
      FROM change_log WHERE kind = 2 AND subject = ?1 AND version > ?2 AND version <= ?3";
 const _: () = assert!(CHANGE_ASSET == 1 && CHANGE_PATH == 2);
 
@@ -452,7 +449,7 @@ impl StoreReader {
     /// Change-log rows after `seq`, oldest first.
     pub fn change_log_after(&self, seq: i64) -> Result<Vec<ChangeEntry>, StoreError> {
         let mut statement = self.conn.prepare_cached(
-            "SELECT seq, version, kind, asset_uuid, state, subject, detail
+            "SELECT seq, version, kind, asset_uuid, state, subject
              FROM change_log WHERE seq > ?1 ORDER BY seq",
         )?;
         let rows = statement.query_map([seq], change_entry_row)?;
@@ -540,7 +537,6 @@ fn change_entry_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ChangeEn
     let asset: Option<Vec<u8>> = row.get(3)?;
     let state: Option<i64> = row.get(4)?;
     let subject: Option<String> = row.get(5)?;
-    let detail: Option<Vec<u8>> = row.get(6)?;
     let corrupt = || {
         StoreError::Sqlite(rusqlite::Error::InvalidColumnType(
             2,
@@ -555,16 +551,6 @@ fn change_entry_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ChangeEn
         },
         (CHANGE_PATH, _, _, Some(path)) => Change::Path { path },
         (CHANGE_RECONNECT_ALL, _, _, _) => Change::ReconnectAll,
-        (CHANGE_RESTART, _, _, _) => {
-            let keys = match detail {
-                Some(bytes) => match decode_keys(&bytes) {
-                    Some(keys) => keys,
-                    None => return Ok(Err(corrupt())),
-                },
-                None => Vec::new(),
-            };
-            Change::RestartRequired { keys }
-        }
         _ => return Ok(Err(corrupt())),
     };
     Ok(Ok(ChangeEntry {
@@ -572,20 +558,6 @@ fn change_entry_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ChangeEn
         version,
         change,
     }))
-}
-
-/// Encode a sorted key list (restart-required keys) as NUL-separated UTF-8.
-pub(crate) fn encode_keys(keys: &[String]) -> Vec<u8> {
-    keys.join("\0").into_bytes()
-}
-
-/// Inverse of [`encode_keys`].
-pub(crate) fn decode_keys(bytes: &[u8]) -> Option<Vec<String>> {
-    if bytes.is_empty() {
-        return Some(Vec::new());
-    }
-    let text = std::str::from_utf8(bytes).ok()?;
-    Some(text.split('\0').map(str::to_owned).collect())
 }
 
 /// Served-state writes shared by input transactions and served-only
@@ -626,11 +598,6 @@ pub trait ServedWrite {
             Change::ReconnectAll => conn
                 .prepare_cached(APPEND_RECONNECT_ALL)?
                 .execute(rusqlite::params![version, CHANGE_RECONNECT_ALL])?,
-            Change::RestartRequired { keys } => conn
-                .prepare_cached(
-                    "INSERT INTO change_log(version, kind, detail) VALUES (?1, ?2, ?3)",
-                )?
-                .execute(rusqlite::params![version, CHANGE_RESTART, encode_keys(keys)])?,
         };
         Ok(())
     }

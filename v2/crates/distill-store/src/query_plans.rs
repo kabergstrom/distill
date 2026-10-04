@@ -774,7 +774,6 @@ fn a_transaction_reads_each_counter_once() {
             for _ in 0..3 {
                 txn.reader().input_version()?;
                 txn.reader().compiled_version()?;
-                txn.reader().configuration_generation()?;
             }
             txn.mark_compiled()?;
             assert_eq!(txn.reader().compiled_version()?, Some(txn.version()));
@@ -783,11 +782,7 @@ fn a_transaction_reads_each_counter_once() {
         .unwrap();
     store.read.conn.trace(None);
     let statements = std::mem::take(&mut *TRACED.lock().unwrap());
-    for key in [
-        "input_version",
-        "compiled_version",
-        "configuration_generation",
-    ] {
+    for key in ["input_version", "compiled_version"] {
         let reads = statements
             .iter()
             .filter(|sql| sql.contains(&format!("FROM store_meta WHERE key = '{key}'")))
@@ -1994,7 +1989,7 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         store
             .input_transaction(|txn| txn.publish_pipeline_failure(&failure))
             .unwrap();
-        store.configuration_state().unwrap();
+        store.configuration_error().unwrap();
         store
             .input_transaction(|txn| {
                 txn.intern_root("main")?;
@@ -2473,9 +2468,6 @@ fn cas_and_served_point_statements_search_their_keys() {
     populate(&mut store, 50);
     let asset = asset_uuid(42, 1);
     let edges = [(asset_uuid(43, 1), RUNTIME_TYPE)];
-    store
-        .stage_pending_restart(&[crate::config::RestartOnlyChange::AutoCodegen(true)])
-        .unwrap();
     store.read.conn.trace(Some(trace));
     let installed = (0..12u8)
         .map(|index| store.put_artifact(&[index; 1000], &edges).unwrap())
@@ -2521,8 +2513,6 @@ fn cas_and_served_point_statements_search_their_keys() {
     store.rpc_targets().unwrap();
     store.change_log_head().unwrap();
     store.change_log_after(0).unwrap();
-    // A subscription's RestartRequired keys: the pending restart.
-    store.pending_restart().unwrap();
     store.resolve_child(asset).unwrap();
     store
         .evict_result(
@@ -2572,14 +2562,6 @@ fn cas_and_served_point_statements_search_their_keys() {
         (
             "SELECT name FROM roots WHERE root_id = ?",
             &["SEARCH roots USING INTEGER PRIMARY KEY (rowid=?)"],
-        ),
-        (
-            "SELECT MAX(generation) FROM pending_restart",
-            &["SEARCH pending_restart USING COVERING INDEX sqlite_autoindex_pending_restart_1"],
-        ),
-        (
-            "SELECT config_key FROM pending_restart WHERE generation = ? ORDER BY config_key",
-            &["SEARCH pending_restart USING COVERING INDEX sqlite_autoindex_pending_restart_1 (generation=?)"],
         ),
         (
             "SELECT a.asset_uuid FROM assets a JOIN bundles b ON b.bundle_uuid = a.bundle_uuid WHERE a.terminal_type IS NOT NULL AND a.logical_hash IS NOT NULL AND b.poison IS NULL AND b.path = ? AND a.local_id = ? AND a.authoring_only = ?",
@@ -2645,7 +2627,7 @@ fn cas_and_served_point_statements_search_their_keys() {
             &["SEARCH cas_segments USING COVERING INDEX cas_segments_open (owner=?)"],
         ),
         (
-            "SELECT seq, version, kind, asset_uuid, state, subject, detail FROM change_log WHERE seq > ? ORDER BY seq",
+            "SELECT seq, version, kind, asset_uuid, state, subject FROM change_log WHERE seq > ? ORDER BY seq",
             &["SEARCH change_log USING INTEGER PRIMARY KEY (rowid>?)"],
         ),
         (

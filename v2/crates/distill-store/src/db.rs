@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 57;
+pub const SCHEMA_VERSION: u32 = 58;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -318,12 +318,6 @@ CREATE UNIQUE INDEX cas_segments_open ON cas_segments(owner)
 -- Segments by state: the dead ones the sweeper deletes, and the sealed ones
 -- compaction considers.
 CREATE INDEX cas_segments_by_state ON cas_segments(state);
-CREATE TABLE pending_restart (
-    generation   INTEGER NOT NULL,
-    config_key   TEXT NOT NULL,
-    config_value TEXT NOT NULL,
-    PRIMARY KEY (generation, config_key)
-);
 CREATE TABLE tools (
     tool_key       TEXT NOT NULL,
     present        INTEGER NOT NULL CHECK (present IN (0, 1)),
@@ -361,8 +355,7 @@ CREATE TABLE change_log (
     kind       INTEGER NOT NULL,
     asset_uuid BLOB,
     state      INTEGER,
-    subject    TEXT,
-    detail     BLOB
+    subject    TEXT
 );
 CREATE INDEX change_log_by_version ON change_log(version);
 -- Schema 39 (fix-cas): a subscriber's history, one subject at a time.
@@ -403,7 +396,6 @@ pub struct StoreReader {
 pub(crate) enum Counter {
     InputVersion,
     CompiledVersion,
-    ConfigurationGeneration,
 }
 
 impl Counter {
@@ -411,7 +403,6 @@ impl Counter {
         match self {
             Self::InputVersion => "input_version",
             Self::CompiledVersion => "compiled_version",
-            Self::ConfigurationGeneration => "configuration_generation",
         }
     }
 }
@@ -423,7 +414,7 @@ impl Counter {
 #[derive(Debug, Default)]
 pub(crate) struct Counters {
     active: std::sync::atomic::AtomicBool,
-    values: [std::sync::atomic::AtomicU64; 3],
+    values: [std::sync::atomic::AtomicU64; 2],
 }
 
 /// Not read in this transaction.

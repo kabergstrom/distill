@@ -18,7 +18,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
 
 use distill_core::canonical::{domain_digest, CanonicalEncoder, DSCP, DSPP, DSVP};
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, LogicalHash, TypeUuid};
@@ -265,14 +264,6 @@ pipeline_failure_try_from!(CleanupDisposition, UnknownCleanup, {
     3 => ModuleUnloadFailed, 4 => TokenPoisoned, 5 => TokenPinned,
     6 => DlcloseFailed, 7 => PublishedEpochLeaked,
 });
-
-/// Snapshot-pinned identity of a validated configuration generation.
-/// Full values are owned by the daemon configuration layer; the store
-/// persists the generation that served a snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfigurationEpoch {
-    pub generation: u64,
-}
 
 /// Closed DSCP v1 discriminants. Persisted/wire values outside this set
 /// reject; there is deliberately no extensible `Other` arm.
@@ -1864,28 +1855,6 @@ impl NamespaceError {
                     raw_relative_path,
                 } => file(root_name, lossy_path(raw_relative_path)),
             },
-        }
-    }
-}
-
-/// The configuration state pinned by a snapshot. A rejected candidate
-/// is representable independently from a pipeline failure: the prior valid
-/// configuration is residency/bookkeeping only and is never served as
-/// the failed version's active values.
-#[derive(Debug, Clone)]
-pub enum ConfigurationState {
-    Ready(Arc<ConfigurationEpoch>),
-    Failed {
-        reason: ConfigurationError,
-        last_good: Option<Arc<ConfigurationEpoch>>,
-    },
-}
-
-impl ConfigurationState {
-    pub fn epoch(&self) -> Result<&Arc<ConfigurationEpoch>, &ConfigurationError> {
-        match self {
-            ConfigurationState::Ready(epoch) => Ok(epoch),
-            ConfigurationState::Failed { reason, .. } => Err(reason),
         }
     }
 }

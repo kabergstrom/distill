@@ -2323,7 +2323,7 @@ fn restart_required_names_sorted_unique_keys_without_advancing_version() {
         .unwrap();
     install.deltas.next().unwrap();
     let before = server.current_stamp().unwrap();
-    stage_restart(
+    announce_restart(
         &project,
         &[
             RestartOnlyChange::StatePath("state".into()),
@@ -2347,11 +2347,11 @@ fn restart_required_names_sorted_unique_keys_without_advancing_version() {
 }
 
 #[test]
-fn pending_restart_state_is_queued_after_the_cursor_bound_first_message() {
+fn restart_required_is_queued_after_the_cursor_bound_first_message() {
     let project = project();
     let server = project.server();
     let hub = connect(&server, &[(1, false)]);
-    stage_restart(
+    announce_restart(
         &project,
         &[RestartOnlyChange::Address(([127, 0, 0, 1], 9000).into())],
     );
@@ -2373,15 +2373,15 @@ fn pending_restart_state_is_queued_after_the_cursor_bound_first_message() {
 }
 
 #[test]
-fn restart_required_replaces_the_prior_pending_key_set() {
+fn restart_required_replaces_the_prior_key_set() {
     let project = project();
     let server = project.server();
     let hub = connect(&server, &[(1, false)]);
-    stage_restart(
+    announce_restart(
         &project,
         &[RestartOnlyChange::Address(([127, 0, 0, 1], 9000).into())],
     );
-    stage_restart(&project, &[RestartOnlyChange::AutoCodegen(true)]);
+    announce_restart(&project, &[RestartOnlyChange::AutoCodegen(true)]);
     let install = hub
         .subscribe(InputVersion(0), vec![], vec![])
         .success()
@@ -3137,12 +3137,8 @@ fn coordinated<T>(
     publish(&handle, &mut writer)
 }
 
-/// The daemon stages `changes` as its pending restart, as the process
+/// The daemon announces `changes` as the restart it needs, as the process
 /// loop does for a restart-only configuration edit.
-fn stage_restart(project: &TestProject, changes: &[RestartOnlyChange]) {
-    let mut writer = project.coordinator().open_writer().unwrap();
-    project
-        .coordinator()
-        .stage_restart_configuration(&mut writer, changes)
-        .unwrap();
+fn announce_restart(project: &TestProject, changes: &[RestartOnlyChange]) {
+    project.coordinator().set_restart_required(changes).unwrap();
 }

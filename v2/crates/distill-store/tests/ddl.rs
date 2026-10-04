@@ -74,7 +74,6 @@ fn every_section_13_table_exists() {
         "cas_extents",
         "cas_segments",
         "cas_refs",
-        "pending_restart",
         "tools",
         "roots",
         "store_meta",
@@ -217,20 +216,6 @@ fn tools_table_is_the_tool_epoch() {
         ]
     );
     assert_eq!(pk_columns(&conn, "tools"), ["tool_key", "input_version"]);
-}
-
-#[test]
-fn pending_restart_is_representable() {
-    let dir = tempfile::tempdir().unwrap();
-    let conn = open_conn(&dir);
-    assert_eq!(
-        columns(&conn, "pending_restart"),
-        ["generation", "config_key", "config_value"]
-    );
-    assert_eq!(
-        pk_columns(&conn, "pending_restart"),
-        ["generation", "config_key"]
-    );
 }
 
 #[test]

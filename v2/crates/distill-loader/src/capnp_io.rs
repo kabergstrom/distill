@@ -1100,7 +1100,9 @@ async fn run_request(
         }
     }
     match event {
-        IoEvent::ReconnectRequired { .. } | IoEvent::ConnectionError { .. } => {
+        IoEvent::ReconnectRequired { .. }
+        | IoEvent::ConnectionError { .. }
+        | IoEvent::RestartRequired { .. } => {
             shared.push_connection(&connection, event)
         }
         event => shared.push_request(Some(stamp), event, reservation),
@@ -1542,9 +1544,7 @@ fn stream_events(
             AssetEvent::ReconnectRequired { reason } => vec![IoEvent::ReconnectRequired {
                 reason: reconnect_reason(reason),
             }],
-            AssetEvent::RestartRequired { keys } => vec![IoEvent::ConnectionError {
-                message: format!("daemon restart required for {}", keys.join(", ")),
-            }],
+            AssetEvent::RestartRequired { keys } => vec![IoEvent::RestartRequired { keys }],
             AssetEvent::Error { message, .. } => vec![IoEvent::ConnectionError { message }],
             _ => Vec::new(),
         },

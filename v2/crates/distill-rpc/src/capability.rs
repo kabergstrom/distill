@@ -1432,7 +1432,7 @@ impl Hub {
             (assets, paths)
         };
         let inner = &self.server.inner;
-        let (stamp, head, oldest, history, restart) = rpc_try!(inner.read_consistent(|reader| {
+        let (stamp, head, oldest, history) = rpc_try!(inner.read_consistent(|reader| {
             let stamp = reader.stamp()?;
             let oldest = reader.change_log_oldest()?;
             let history = if oldest <= since && since < stamp.version {
@@ -1440,13 +1440,7 @@ impl Hub {
             } else {
                 Vec::new()
             };
-            Ok((
-                stamp,
-                reader.change_log_head()?,
-                oldest,
-                history,
-                reader.pending_restart()?,
-            ))
+            Ok((stamp, reader.change_log_head()?, oldest, history))
         }));
         let installed = stamp.version;
         if since > installed {
@@ -1511,12 +1505,17 @@ impl Hub {
             }
         }
         connection.stream_installed = true;
-        let restart = restart.map(|pending| pending.keys).unwrap_or_default();
-        if first_install && !restart.is_empty() {
-            connection.enqueue(StreamEvent::Asset {
-                basis: RpcBasis { snapshot: stamp },
-                event: AssetEvent::RestartRequired { keys: restart },
-            });
+        if first_install {
+            // The keys as they are now; a later change reaches the stream
+            // through `pump`.
+            let (serial, keys) = inner.handle.restart_required();
+            connection.restart_serial = serial;
+            if !keys.is_empty() {
+                connection.enqueue(StreamEvent::Asset {
+                    basis: RpcBasis { snapshot: stamp },
+                    event: AssetEvent::RestartRequired { keys },
+                });
+            }
         }
         drop(connection);
         RpcResult::Success(SubscriptionInstall {
