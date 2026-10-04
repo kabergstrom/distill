@@ -74,7 +74,6 @@ fn every_section_13_table_exists() {
         "bundle_path_refs",
         "assets",
         "asset_tags",
-        "asset_tag_index",
         "tag_epochs",
         "path_index",
         "results",
@@ -201,22 +200,12 @@ fn assets_row_shape() {
             "type_uuid",
             "authoring_only",
             "logical_hash",
-            "terminal_type"
+            "terminal_type",
+            "tag_poison",
+            "tag_module"
         ]
     );
     assert_eq!(columns(&conn, "asset_tags"), ["asset_uuid", "tag", "value"]);
-    assert_eq!(
-        columns(&conn, "asset_tag_index"),
-        [
-            "asset_uuid",
-            "type_uuid",
-            "tag_epoch",
-            "planner_version",
-            "dylib_hash",
-            "trace",
-            "poison"
-        ]
-    );
 }
 
 #[test]

@@ -134,27 +134,25 @@ pub struct EntryMeta {
     pub tags: BTreeMap<String, Option<String>>,
 }
 
-/// Complete §10 tag-index publication for one asset. The current-schema tags
-/// and every input that could change `load_current` are replaced atomically.
+/// Complete §10 tag-index publication for one asset: its current-schema
+/// tags, or why it has none, and the module whose migration produced them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagIndexUpdate {
     pub asset: AssetUuid,
     pub tags: BTreeMap<String, Option<String>>,
-    pub tag_epoch: [u8; 32],
-    pub planner_version: Option<u32>,
     pub dylib_hash: Option<[u8; 32]>,
-    pub trace: Vec<u8>,
     pub poison: Option<String>,
 }
 
+/// An asset's tag state (its `tag_module` and `tag_poison`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagIndexState {
-    pub tag_epoch: [u8; 32],
-    pub planner_version: Option<u32>,
     pub dylib_hash: Option<[u8; 32]>,
-    pub trace: Vec<u8>,
     pub poison: Option<String>,
 }
+
+/// The tag poison of an asset whose tags a refinement has yet to compute.
+const TAG_PENDING: &str = "tag indexing pending";
 
 impl InputTxn<'_> {
     /// Publish (or republish) a bundle row. Clears any poison: fixing
@@ -262,30 +260,37 @@ impl InputTxn<'_> {
             )?
             .execute([bundle.0.as_slice()])?;
         self.txn
-            .prepare_cached(
-                "DELETE FROM asset_tag_index WHERE asset_uuid IN
-               (SELECT asset_uuid FROM assets WHERE bundle_uuid = ?1)",
-            )?
-            .execute([bundle.0.as_slice()])?;
-        self.txn
             .prepare_cached("DELETE FROM assets WHERE bundle_uuid = ?1")?
             .execute([bundle.0.as_slice()])?;
         Ok(())
     }
 
-    /// Publish (or republish) an asset row; tags replace wholesale.
+    /// Publish (or republish) an asset row whose tags are `rec.tags`;
+    /// tags replace wholesale.
     pub fn upsert_asset(&mut self, rec: &AssetRecord) -> Result<(), StoreError> {
+        self.write_asset(rec, None)
+    }
+
+    /// Publish (or republish) an asset row whose tags a refinement in the
+    /// same input computes (§10's two-phase publication): until then a tag
+    /// query that could select it fails, never answers from no tags.
+    pub fn upsert_pending_asset(&mut self, rec: &AssetRecord) -> Result<(), StoreError> {
+        self.write_asset(rec, Some(TAG_PENDING))
+    }
+
+    fn write_asset(&mut self, rec: &AssetRecord, tag_poison: Option<&str>) -> Result<(), StoreError> {
         self.txn
             .prepare_cached(
                 "INSERT INTO assets(
                  asset_uuid, bundle_uuid, local_id, type_uuid, logical_hash, authoring_only,
-                 terminal_type
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 terminal_type, tag_poison
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(asset_uuid) DO UPDATE SET
                bundle_uuid = excluded.bundle_uuid, local_id = excluded.local_id,
                type_uuid = excluded.type_uuid, logical_hash = excluded.logical_hash,
                authoring_only = excluded.authoring_only,
-               terminal_type = excluded.terminal_type",
+               terminal_type = excluded.terminal_type,
+               tag_poison = excluded.tag_poison, tag_module = NULL",
             )?
             .execute(
                 rusqlite::params![
@@ -296,6 +301,7 @@ impl InputTxn<'_> {
                     rec.logical_hash.0.as_slice(),
                     i64::from(rec.authoring_only),
                     rec.terminal_type.map(|terminal| terminal.0.to_vec()),
+                    tag_poison,
                 ],
             )?;
         self.txn
@@ -308,37 +314,17 @@ impl InputTxn<'_> {
                 )?
                 .execute(rusqlite::params![rec.asset.0.as_slice(), tag, value])?;
         }
-        self.txn
-            .prepare_cached("DELETE FROM asset_tag_index WHERE asset_uuid = ?1")?
-            .execute([rec.asset.0.as_slice()])?;
         Ok(())
     }
 
-    /// Install the conservative half of a two-phase tag publication in the
-    /// same transaction as the asset identity. A crash before refinement is
-    /// therefore a query failure, never an empty successful index.
-    pub fn set_tag_index_pending(
-        &mut self,
-        asset: AssetUuid,
-        tag_epoch: [u8; 32],
-    ) -> Result<(), StoreError> {
+    /// Mark an asset's tags pending a refinement (the conservative half of
+    /// a two-phase tag publication, see [`Self::upsert_pending_asset`]).
+    pub fn set_tag_index_pending(&mut self, asset: AssetUuid) -> Result<(), StoreError> {
         self.txn
             .prepare_cached(
-                "INSERT INTO asset_tag_index(
-                asset_uuid, type_uuid, tag_epoch, planner_version, dylib_hash, trace, poison
-             ) VALUES (
-                ?1, (SELECT type_uuid FROM assets WHERE asset_uuid = ?1), ?2, NULL, NULL, X'',
-                'tag indexing pending'
-             )
-             ON CONFLICT(asset_uuid) DO UPDATE SET
-                type_uuid = excluded.type_uuid,
-                tag_epoch = excluded.tag_epoch,
-                planner_version = NULL,
-                dylib_hash = NULL,
-                trace = X'',
-                poison = excluded.poison",
+                "UPDATE assets SET tag_poison = ?2, tag_module = NULL WHERE asset_uuid = ?1",
             )?
-            .execute(rusqlite::params![asset.0.as_slice(), tag_epoch.as_slice()])?;
+            .execute(rusqlite::params![asset.0.as_slice(), TAG_PENDING])?;
         Ok(())
     }
 
@@ -462,17 +448,6 @@ impl Store {
                         error: format!("duplicate tag-index update for {}", update.asset),
                     });
                 }
-                let exists: bool = txn
-                    .prepare_cached("SELECT EXISTS(SELECT 1 FROM assets WHERE asset_uuid = ?1)")?
-                    .query_row(
-                        [update.asset.0.as_slice()],
-                        |row| row.get(0),
-                    )?;
-                if !exists {
-                    return Err(StoreError::InvalidConfiguration {
-                        error: format!("tag-index update names missing asset {}", update.asset),
-                    });
-                }
                 if update.poison.is_some() && !update.tags.is_empty() {
                     return Err(StoreError::InvalidConfiguration {
                         error: format!("poisoned tag-index update {} carried tags", update.asset),
@@ -488,33 +463,20 @@ impl Store {
                         )?
                         .execute(rusqlite::params![update.asset.0.as_slice(), tag, value])?;
                 }
-                txn
+                let updated = txn
                     .prepare_cached(
-                        "INSERT INTO asset_tag_index(
-                        asset_uuid, type_uuid, tag_epoch, planner_version, dylib_hash, trace,
-                        poison
-                     ) VALUES (
-                        ?1, (SELECT type_uuid FROM assets WHERE asset_uuid = ?1), ?2, ?3, ?4, ?5,
-                        ?6
-                     )
-                     ON CONFLICT(asset_uuid) DO UPDATE SET
-                        type_uuid = excluded.type_uuid,
-                        tag_epoch = excluded.tag_epoch,
-                        planner_version = excluded.planner_version,
-                        dylib_hash = excluded.dylib_hash,
-                        trace = excluded.trace,
-                        poison = excluded.poison",
+                        "UPDATE assets SET tag_poison = ?2, tag_module = ?3 WHERE asset_uuid = ?1",
                     )?
-                    .execute(
-                        rusqlite::params![
-                            update.asset.0.as_slice(),
-                            update.tag_epoch.as_slice(),
-                            update.planner_version.map(i64::from),
-                            update.dylib_hash.map(|hash| hash.to_vec()),
-                            update.trace,
-                            update.poison,
-                        ],
-                    )?;
+                    .execute(rusqlite::params![
+                        update.asset.0.as_slice(),
+                        update.poison,
+                        update.dylib_hash.map(|hash| hash.to_vec()),
+                    ])?;
+                if updated == 0 {
+                    return Err(StoreError::InvalidConfiguration {
+                        error: format!("tag-index update names missing asset {}", update.asset),
+                    });
+                }
             }
             txn.commit()?;
             Ok(())
@@ -540,12 +502,9 @@ impl Store {
                 let type_uuid_bytes = type_uuid.0.as_slice();
                 txn
                     .prepare_cached(
-                        "UPDATE asset_tag_index
-                     SET planner_version = NULL, dylib_hash = NULL, trace = X'',
-                         poison = 'tag indexing pending'
-                     WHERE asset_uuid IN (SELECT asset_uuid FROM assets WHERE type_uuid = ?1)",
+                        "UPDATE assets SET tag_poison = ?2, tag_module = NULL WHERE type_uuid = ?1",
                     )?
-                    .execute([type_uuid_bytes])?;
+                    .execute(rusqlite::params![type_uuid_bytes, TAG_PENDING])?;
                 txn
                     .prepare_cached("DELETE FROM tag_epochs WHERE type_uuid = ?1")?
                     .execute([type_uuid_bytes])?;
@@ -563,26 +522,17 @@ impl Store {
 }
 
 impl StoreReader {
+    /// `asset`'s tag state; `None` when it has no row.
     pub fn tag_index_state(&self, asset: AssetUuid) -> Result<Option<TagIndexState>, StoreError> {
         Ok(self
             .conn
-            .query_row(
-                "SELECT tag_epoch, planner_version, dylib_hash, trace, poison
-                 FROM asset_tag_index WHERE asset_uuid = ?1",
-                [asset.0.as_slice()],
-                |row| {
-                    let planner = row
-                        .get::<_, Option<i64>>(1)?
-                        .map(|value| u32::try_from(value).unwrap_or(u32::MAX));
-                    Ok(TagIndexState {
-                        tag_epoch: blob32(row.get(0)?),
-                        planner_version: planner,
-                        dylib_hash: row.get::<_, Option<Vec<u8>>>(2)?.map(blob32),
-                        trace: row.get(3)?,
-                        poison: row.get(4)?,
-                    })
-                },
-            )
+            .prepare_cached("SELECT tag_module, tag_poison FROM assets WHERE asset_uuid = ?1")?
+            .query_row([asset.0.as_slice()], |row| {
+                Ok(TagIndexState {
+                    dylib_hash: row.get::<_, Option<Vec<u8>>>(0)?.map(blob32),
+                    poison: row.get(1)?,
+                })
+            })
             .optional()?)
     }
 
@@ -798,15 +748,12 @@ impl StoreReader {
         // after the empty one.
         let module = dylib_hash.map_or_else(Vec::new, |hash| hash.to_vec());
         let mut statement = self.conn.prepare_cached(
-            "SELECT i.asset_uuid, a.bundle_uuid
-             FROM asset_tag_index i INDEXED BY asset_tag_index_poisoned JOIN assets a USING (asset_uuid)
-             WHERE i.poison IS NOT NULL
-             UNION SELECT i.asset_uuid, a.bundle_uuid
-             FROM asset_tag_index i JOIN assets a USING (asset_uuid)
-             WHERE i.dylib_hash < ?1
-             UNION SELECT i.asset_uuid, a.bundle_uuid
-             FROM asset_tag_index i JOIN assets a USING (asset_uuid)
-             WHERE i.dylib_hash > ?1",
+            "SELECT asset_uuid, bundle_uuid FROM assets INDEXED BY assets_tag_poisoned
+             WHERE tag_poison IS NOT NULL
+             UNION SELECT asset_uuid, bundle_uuid FROM assets INDEXED BY assets_tag_migrated
+             WHERE tag_module < ?1
+             UNION SELECT asset_uuid, bundle_uuid FROM assets INDEXED BY assets_tag_migrated
+             WHERE tag_module > ?1",
         )?;
         let rows = statement.query_map(rusqlite::params![module], |row| {
             Ok((
@@ -1126,6 +1073,7 @@ enum Driver {
     BundleName,
     LocalId,
     TagPoisoned,
+    TagPoisonedTypes,
     Tag,
     AuthoredType,
     PathPrefix,
@@ -1184,6 +1132,9 @@ impl AssetFilter {
             Driver::BundleName
         } else if self.local_id.is_some() {
             Driver::LocalId
+        } else if tag_poisoned && (self.authored_type.is_some() || self.authored_type_in.is_some()) {
+            // A typed query walks the poisoned rows of its types only.
+            Driver::TagPoisonedTypes
         } else if tag_poisoned {
             Driver::TagPoisoned
         } else if tag_value {
@@ -1211,7 +1162,15 @@ impl AssetFilter {
         const BY_ASSET: &str = "assets a INDEXED BY sqlite_autoindex_assets_1
              CROSS JOIN bundles b ON b.bundle_uuid = a.bundle_uuid";
         match driver {
-            Driver::Asset | Driver::TagPoisoned | Driver::Tag | Driver::Everything => BY_ASSET,
+            Driver::Asset | Driver::Tag | Driver::Everything => BY_ASSET,
+            Driver::TagPoisoned => {
+                "assets a INDEXED BY assets_tag_poisoned
+                 CROSS JOIN bundles b ON b.bundle_uuid = a.bundle_uuid"
+            }
+            Driver::TagPoisonedTypes => {
+                "assets a INDEXED BY assets_tag_poisoned_by_type
+                 CROSS JOIN bundles b ON b.bundle_uuid = a.bundle_uuid"
+            }
             Driver::Bundle => {
                 "assets a INDEXED BY assets_by_bundle
                  CROSS JOIN bundles b ON b.bundle_uuid = a.bundle_uuid"
@@ -1331,24 +1290,7 @@ impl AssetFilter {
             conditions.push(format!("a.authoring_only = {}", i64::from(authoring_only)));
         }
         if tag_poisoned {
-            conditions.push(if driver == Driver::TagPoisoned {
-                // A typed query walks the poisoned rows of its types only.
-                match types_condition.first() {
-                    Some(types) => format!(
-                        "a.asset_uuid IN (SELECT i.asset_uuid
-                                          FROM asset_tag_index i INDEXED BY asset_tag_index_poisoned_by_type
-                                          WHERE i.poison IS NOT NULL AND i.type_uuid {types})"
-                    ),
-                    None => "a.asset_uuid IN (SELECT i.asset_uuid
-                                              FROM asset_tag_index i INDEXED BY asset_tag_index_poisoned
-                                              WHERE i.poison IS NOT NULL)"
-                        .to_owned(),
-                }
-            } else {
-                "EXISTS (SELECT 1 FROM asset_tag_index i
-                         WHERE i.asset_uuid = a.asset_uuid AND i.poison IS NOT NULL)"
-                    .to_owned()
-            });
+            conditions.push("a.tag_poison IS NOT NULL".to_owned());
         }
         conditions
             .iter()

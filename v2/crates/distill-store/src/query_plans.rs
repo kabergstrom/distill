@@ -248,12 +248,11 @@ fn explain(conn: &Connection, sql: &str) -> Vec<String> {
 }
 
 /// The tables a selective read must never scan.
-const NAMESPACE_TABLES: [&str; 8] = [
+const NAMESPACE_TABLES: [&str; 7] = [
     "assets",
     "bundles",
     "files",
     "asset_tags",
-    "asset_tag_index",
     "bundle_path_refs",
     "path_index",
     "directories",
@@ -265,8 +264,8 @@ const PARTIAL_INDEXES: [&str; 7] = [
     "bundles_import_watched",
     "assets_authoring",
     "files_by_ext",
-    "asset_tag_index_poisoned",
-    "asset_tag_index_poisoned_by_type",
+    "assets_tag_poisoned",
+    "assets_tag_poisoned_by_type",
     "assets_by_terminal_type",
 ];
 
@@ -341,8 +340,6 @@ fn filter_shapes() -> Vec<(AssetFilter, &'static [&'static str], &'static [&'sta
             ],
             &[
                 "SEARCH a USING INDEX assets_by_bundle (bundle_uuid=? AND local_id=?)",
-                "CORRELATED SCALAR SUBQUERY 1",
-                "SEARCH i USING INDEX sqlite_autoindex_asset_tag_index_1 (asset_uuid=?)",
                 "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)",
             ],
         ),
@@ -377,8 +374,6 @@ fn filter_shapes() -> Vec<(AssetFilter, &'static [&'static str], &'static [&'sta
             &[
                 "SEARCH b USING INDEX bundles_by_name (name=?)",
                 "SEARCH a USING INDEX assets_by_bundle (bundle_uuid=?)",
-                "CORRELATED SCALAR SUBQUERY 1",
-                "SEARCH i USING INDEX sqlite_autoindex_asset_tag_index_1 (asset_uuid=?)",
             ],
         ),
         (
@@ -409,9 +404,7 @@ fn filter_shapes() -> Vec<(AssetFilter, &'static [&'static str], &'static [&'sta
                 "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)",
             ],
             &[
-                "SEARCH a USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)",
-                "LIST SUBQUERY 1",
-                "SEARCH i USING INDEX asset_tag_index_poisoned_by_type (type_uuid=?)",
+                "SEARCH a USING INDEX assets_tag_poisoned_by_type (type_uuid=?)",
                 "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)",
             ],
         ),
@@ -431,9 +424,7 @@ fn filter_shapes() -> Vec<(AssetFilter, &'static [&'static str], &'static [&'sta
                 "USE TEMP B-TREE FOR ORDER BY",
             ],
             &[
-                "SEARCH a USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)",
-                "LIST SUBQUERY 1",
-                "SEARCH i USING INDEX asset_tag_index_poisoned_by_type (type_uuid=?)",
+                "SEARCH a USING INDEX assets_tag_poisoned_by_type (type_uuid=?)",
                 "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)",
             ],
         ),
@@ -453,9 +444,7 @@ fn filter_shapes() -> Vec<(AssetFilter, &'static [&'static str], &'static [&'sta
                 "USE TEMP B-TREE FOR ORDER BY",
             ],
             &[
-                "SEARCH a USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)",
-                "LIST SUBQUERY 1",
-                "SCAN i USING INDEX asset_tag_index_poisoned",
+                "SCAN a USING INDEX assets_tag_poisoned",
                 "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)",
             ],
         ),
@@ -475,9 +464,7 @@ fn filter_shapes() -> Vec<(AssetFilter, &'static [&'static str], &'static [&'sta
                 "USE TEMP B-TREE FOR ORDER BY",
             ],
             &[
-                "SEARCH a USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)",
-                "LIST SUBQUERY 1",
-                "SEARCH i USING INDEX asset_tag_index_poisoned_by_type (type_uuid=?)",
+                "SEARCH a USING INDEX assets_tag_poisoned_by_type (type_uuid=?)",
                 "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)",
             ],
         ),
@@ -495,9 +482,7 @@ fn filter_shapes() -> Vec<(AssetFilter, &'static [&'static str], &'static [&'sta
                 "USE TEMP B-TREE FOR ORDER BY",
             ],
             &[
-                "SEARCH a USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)",
-                "LIST SUBQUERY 1",
-                "SCAN i USING INDEX asset_tag_index_poisoned",
+                "SCAN a USING INDEX assets_tag_poisoned",
                 "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)",
             ],
         ),
@@ -514,9 +499,7 @@ fn filter_shapes() -> Vec<(AssetFilter, &'static [&'static str], &'static [&'sta
                 "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)",
             ],
             &[
-                "SEARCH a USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)",
-                "LIST SUBQUERY 1",
-                "SCAN i USING INDEX asset_tag_index_poisoned",
+                "SCAN a USING INDEX assets_tag_poisoned",
                 "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)",
             ],
         ),
@@ -600,7 +583,7 @@ fn typed_tag_query_pages(count: u32, pending: bool) -> u64 {
         store
             .input_transaction(|txn| {
                 for index in (0..count).filter(|index| index % 500 != 199) {
-                    txn.set_tag_index_pending(asset_uuid(index, 1), [1; 32])?;
+                    txn.set_tag_index_pending(asset_uuid(index, 1))?;
                 }
                 Ok(())
             })
@@ -620,7 +603,7 @@ fn typed_tag_query_pages(count: u32, pending: bool) -> u64 {
 }
 
 /// A typed query's tag-poison check walks the poisoned rows of its own
-/// types (`asset_tag_index_poisoned_by_type`): thousands of pending rows of
+/// types (`assets_tag_poisoned_by_type`): thousands of pending rows of
 /// another type cost it nothing.
 #[test]
 fn a_typed_tag_query_checks_only_its_types_poisons() {
@@ -1059,10 +1042,7 @@ fn stale_tag_rows_are_index_searches() {
             TagIndexUpdate {
                 asset: asset_uuid(index, 1),
                 tags: BTreeMap::new(),
-                tag_epoch: [7; 32],
-                planner_version: None,
                 dylib_hash,
-                trace: Vec::new(),
                 poison,
             }
         })
@@ -1093,23 +1073,19 @@ fn stale_tag_rows_are_index_searches() {
     let statements = std::mem::take(&mut *TRACED.lock().unwrap());
     let sql = statements
         .iter()
-        .find(|sql| sql.contains("asset_tag_index i"))
+        .find(|sql| sql.contains("INDEXED BY assets_tag_poisoned"))
         .unwrap();
     let plan = explain(&store.read.conn, sql);
-    let assets = "SEARCH a USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)";
     assert_eq!(
         plan,
         [
             "COMPOUND QUERY",
             "LEFT-MOST SUBQUERY",
-            "SCAN i USING INDEX asset_tag_index_poisoned",
-            assets,
+            "SCAN assets USING INDEX assets_tag_poisoned",
             "UNION USING TEMP B-TREE",
-            "SEARCH i USING INDEX asset_tag_index_migrated (dylib_hash<?)",
-            assets,
+            "SEARCH assets USING INDEX assets_tag_migrated (tag_module<?)",
             "UNION USING TEMP B-TREE",
-            "SEARCH i USING INDEX asset_tag_index_migrated (dylib_hash>?)",
-            assets,
+            "SEARCH assets USING INDEX assets_tag_migrated (tag_module>?)",
         ],
         "{sql}"
     );
@@ -1132,6 +1108,50 @@ fn configuration_plans(store: &mut Store, run: impl FnOnce(&mut Store)) -> Vec<(
         .collect()
 }
 
+/// An asset's tag state is two columns of its row: marking it pending,
+/// refining it and reading it are searches of the asset's primary key, and
+/// the poisoned rows are a walk of their partial index.
+#[test]
+fn tag_state_statements_search_the_asset_key() {
+    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, mut store) = store_with(20);
+    let asset = asset_uuid(3, 1);
+    let plans = configuration_plans(&mut store, |store| {
+        store
+            .input_transaction(|txn| txn.set_tag_index_pending(asset))
+            .unwrap();
+        store
+            .refine_unpublished_tag_index(&[TagIndexUpdate {
+                asset,
+                tags: BTreeMap::new(),
+                dylib_hash: Some([9; 32]),
+                poison: None,
+            }])
+            .unwrap();
+        store.tag_index_state(asset).unwrap();
+        store.tag_poisoned_assets().unwrap();
+    });
+    let by_key = "SEARCH assets USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)";
+    let plans = plans
+        .iter()
+        .filter(|(sql, _)| !sql.contains("store_meta") && !sql.contains("asset_tags"))
+        .map(|(sql, plan)| (sql.split_whitespace().take(4).collect::<Vec<_>>().join(" "), plan.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        plans,
+        [
+            ("UPDATE assets SET tag_poison".to_owned(), vec![by_key.to_owned()]),
+            ("UPDATE assets SET tag_poison".to_owned(), vec![by_key.to_owned()]),
+            ("SELECT tag_module, tag_poison FROM".to_owned(), vec![by_key.to_owned()]),
+            (
+                "SELECT asset_uuid, bundle_uuid FROM".to_owned(),
+                vec!["SCAN assets USING INDEX assets_tag_poisoned".to_owned()],
+            ),
+        ],
+        "{plans:#?}"
+    );
+}
+
 /// A type whose tag epoch changes has exactly its rows marked pending, by
 /// one search of `assets_by_type`; an unchanged epoch marks nothing; the
 /// epochs are one read of the per-type table.
@@ -1145,10 +1165,7 @@ fn a_changed_tag_epoch_marks_only_its_types_rows() {
             .map(|asset| TagIndexUpdate {
                 asset,
                 tags: BTreeMap::new(),
-                tag_epoch: [7; 32],
-                planner_version: None,
                 dylib_hash: None,
-                trace: Vec::new(),
                 poison: None,
             })
             .collect::<Vec<_>>();
@@ -1188,12 +1205,7 @@ fn a_changed_tag_epoch_marks_only_its_types_rows() {
         plans,
         [
             vec!["SCAN tag_epochs".to_owned()],
-            vec![
-                "SEARCH asset_tag_index USING COVERING INDEX sqlite_autoindex_asset_tag_index_1 (asset_uuid=?)"
-                    .to_owned(),
-                "LIST SUBQUERY 1".to_owned(),
-                "SEARCH assets USING INDEX assets_by_type (type_uuid=?)".to_owned(),
-            ],
+            vec!["SEARCH assets USING INDEX assets_by_type (type_uuid=?)".to_owned()],
             vec!["SEARCH tag_epochs USING PRIMARY KEY (type_uuid=?)".to_owned()],
         ],
         "{plans:#?}"

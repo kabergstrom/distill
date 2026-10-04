@@ -3909,9 +3909,10 @@ under; a complete step or a configuration candidate records the current
 epochs, and each type whose epoch changed has its rows marked pending, by
 one search of `assets_by_type`, in that input. Refinement then redoes
 exactly the stale rows: those a publication or an epoch change marked
-pending (a search of the partial `asset_tag_index_poisoned`), and the rows
-whose recorded `dylib_hash` differs from the current module's (a search of
-the partial `asset_tag_index_migrated` over the rows where code ran), never
+pending (a search of the partial `assets_tag_poisoned`), and the rows
+whose recorded module hash (`assets.tag_module`) differs from the current
+module's (a search of the partial `assets_tag_migrated` over the rows where
+code ran), never
 a walk of every asset. Each bundle is read and parsed once per refinement,
 however many of its entries it refines. A refinement that fails writes
 poison rows for exactly the entries it was refining, in the same input; the
@@ -4933,7 +4934,7 @@ All daemon state is disposable (§2) and lives under `.distill/` (gitignored).
 | `directories` | **(root id, path)** → the directory's canonical path, unique across roots (`directories_by_canonical`): two observed directories with one canonical path are an inconsistent table, not an alias to choose between |
 | `bundles` | bundle uuid → **(root id, normalized path)**, format version, content hash — the physical key, matching `files`: UUID-based access must reach the owning file without a logical-index round trip that could turn ambiguous under a same-path file in a second root; path-query ambiguity is derived separately. Directory-import ownership derives at scan from generated bundles' `DirectoryOrigin` records (§8), whose `rule` is the authored stable `ImportRuleId`, never a vector index; deleting that id re-derives the orphan state, never reassigns ownership |
 | `bundle_path_refs` | bundle uuid → each logical path its entries' asset/weak reference fields name, written with the bundle's rows at publication. Rename-with-fixups (§4) reads only the bundles that reference the moving path, plus the poisoned ones, whose references are unknown |
-| `assets` | asset uuid → bundle uuid, local_id, type_uuid, logical hash, search tags, terminal type. A pipeline-map change republishes the rows of every bundle holding an asset whose terminal type it changes, whether or not the bundle changed |
+| `assets` | asset uuid → bundle uuid, local_id, type_uuid, logical hash, search tags, terminal type, and tag state: `tag_poison` (pending or the refinement's error) and `tag_module` (the module hash when code ran). A pipeline-map change republishes the rows of every bundle holding an asset whose terminal type it changes, whether or not the bundle changed |
 | `path_index` | path/primary resolution index |
 | `schemas` | logical hash → schema JSON (cache, rebuilt from bundle snapshots) |
 | `artifacts` | `results` + `result_outputs`: static-input-key digest → candidate bucket: (trace digest → trace + output table, whose rows are the pins), revalidated most-recent-first on lookup (§9 — the build-cache lookup; the full input hash is never stored, and commits append candidates, never overwrite); derived-output: child uuid → (parent uuid, output key) — input-versioned, derived per published version from its assets × pinned pipeline map (§9), the only authority for child resolution, commit rows verified against it; ContentHash → segment, offset, len (the CAS extent index) |
@@ -5023,8 +5024,8 @@ non-poisoned rows of its role that match every selector, glob included. It
   the skeleton carries — tag included; a skeleton has no served terminal
   type, so a served `terminal_type` selector never reaches one; or
 - for a tag query, when a non-poisoned row matching every selector but the
-  tag has a poisoned tag index (§10): its `asset_tag_index` row carries
-  a poison, written by the failed refinement of exactly that row.
+  tag has a poisoned tag index (§10): its asset row's `tag_poison` is set,
+  by publication (pending) or by the failed refinement of exactly that row.
 
 A query that cannot reach a poison answers normally: one malformed file
 fails only the questions whose selectors could match its entries. The trace

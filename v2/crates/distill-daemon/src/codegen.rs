@@ -1282,7 +1282,7 @@ mod query_tests {
                     }
                 }
                 if let Damage::PendingTagIndex = damage {
-                    txn.set_tag_index_pending(AssetUuid(uuid(0x21, 11)), [7; 32])?;
+                    txn.set_tag_index_pending(AssetUuid(uuid(0x21, 11)))?;
                 }
                 for (bundle, path, entry) in skeletons(damage) {
                     txn.poison_bundle(

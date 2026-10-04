@@ -258,7 +258,7 @@ fn tag_index_refinement_is_value_aware_and_pending_state_never_underapproximates
     let (_d, mut store) = store();
     seed(&mut store);
     store
-        .input_transaction(|txn| txn.set_tag_index_pending(AssetUuid([10; 16]), [7; 32]))
+        .input_transaction(|txn| txn.set_tag_index_pending(AssetUuid([10; 16])))
         .unwrap();
     assert!(matches!(
         tagged(&store, "anything", None, false),
@@ -270,10 +270,7 @@ fn tag_index_refinement_is_value_aware_and_pending_state_never_underapproximates
             &[TagIndexUpdate {
                 asset: AssetUuid([10; 16]),
                 tags: BTreeMap::from([("category".to_owned(), Some("enemy".to_owned()))]),
-                tag_epoch: [7; 32],
-                planner_version: Some(1),
                 dylib_hash: Some([8; 32]),
-                trace: vec![1, 2, 3],
                 poison: None,
             }],
         )
@@ -287,10 +284,7 @@ fn tag_index_refinement_is_value_aware_and_pending_state_never_underapproximates
         .unwrap()
         .is_empty());
     let state = store.tag_index_state(AssetUuid([10; 16])).unwrap().unwrap();
-    assert_eq!(state.tag_epoch, [7; 32]);
-    assert_eq!(state.planner_version, Some(1));
     assert_eq!(state.dylib_hash, Some([8; 32]));
-    assert_eq!(state.trace, [1, 2, 3]);
     assert_eq!(state.poison, None);
 }
 

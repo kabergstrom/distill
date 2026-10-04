@@ -108,7 +108,7 @@ read transaction:
 | `views[*].authoring` | `bundles` / `assets` / `asset_tags` / `schemas`. New `assets` columns hold the encoded authored value (canonical JSON + blobs) and `terminal_type`, so a snapshot never reads a file. |
 | `views[*].paths` | `path_index`; several roots at one path is the ambiguity. |
 | `views[*].derived_outputs` | `derived_outputs` (+ `terminal_type` column) |
-| `tag_poisons`, `version_poison`, `configuration`, `pipeline` | `asset_tag_index.poison`, the persisted version poison, `configuration_state`, `pipeline_state` (then §4's `errors`) |
+| `tag_poisons`, `version_poison`, `configuration`, `pipeline` | `assets.tag_poison`, the persisted version poison, `configuration_state`, `pipeline_state` (then §4's `errors`) |
 | `lineage_repair` | new persisted repair-state columns next to `configuration_state` |
 | `history`, `oldest_available_cursor` | `change_log(seq, version, kind, subject)` trimmed to 4096 rows; the oldest cursor in `store_meta` |
 | `build_results` (cleared on every commit) | `resolutions(version, target, asset, outcome)`, written by the authority after a build, pruned on publication |
@@ -1201,7 +1201,10 @@ should reach zero by the end of phase 6.
   tag row is written (every asset-row write deletes it), and the partial
   index `asset_tag_index_poisoned_by_type` lets a typed query's poison
   check walk only its types' poisoned rows: 31 pages instead of 8,164 with
-  8,000 pending rows of another type.
+  8,000 pending rows of another type. (Schema 48: the tag state is two
+  columns of the asset row, `tag_poison` and `tag_module`, with the
+  partial indexes `assets_tag_poisoned`, `assets_tag_poisoned_by_type`
+  and `assets_tag_migrated`; there is no copy of `type_uuid` to keep.)
 - **Every file write is atomic; authoring writes are file writes.**
   - One primitive, `distill_store::atomic_file`, writes every non-CAS
     file (§5.7): asset roots (RPC writes, imports, renames), the codegen

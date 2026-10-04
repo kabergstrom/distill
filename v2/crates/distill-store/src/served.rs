@@ -403,10 +403,8 @@ impl StoreReader {
     /// the owning bundle.
     pub fn tag_poisoned_assets(&self) -> Result<Vec<(AssetUuid, BundleUuid)>, StoreError> {
         let mut statement = self.conn.prepare_cached(
-            "SELECT i.asset_uuid, a.bundle_uuid
-             FROM asset_tag_index i INDEXED BY asset_tag_index_poisoned
-             JOIN assets a ON a.asset_uuid = i.asset_uuid
-             WHERE i.poison IS NOT NULL ORDER BY i.asset_uuid",
+            "SELECT asset_uuid, bundle_uuid FROM assets INDEXED BY assets_tag_poisoned
+             WHERE tag_poison IS NOT NULL ORDER BY asset_uuid",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((

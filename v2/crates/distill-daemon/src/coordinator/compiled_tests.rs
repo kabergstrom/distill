@@ -493,9 +493,12 @@ fn schema_edit_pages(filler: u32) -> (u64, u64) {
         let mut candidate = fixture.candidate(false, false);
         candidate.schema_authority = typed_authority(edited);
         let before = fixture.writer.pages_fetched().unwrap();
+        REFINED.lock().unwrap().clear();
+        fixture.writer.trace_statements(Some(record_refined));
         coordinator
             .publish_configuration_candidate(&mut fixture.writer, candidate)
             .unwrap();
+        fixture.writer.trace_statements(None);
         fixture.writer.pages_fetched().unwrap() - before
     };
     publish(&mut fixture, false);
@@ -504,19 +507,30 @@ fn schema_edit_pages(filler: u32) -> (u64, u64) {
         uuid[..4].copy_from_slice(&index.to_le_bytes());
         AssetUuid(uuid)
     };
-    // The refined row's epoch column is the source of the authority it
-    // was refined under.
-    let refined_under = |asset| {
+    // Whether the last publication refined `asset`'s tags (wrote its tag
+    // state), leaving no row stale.
+    let refined = |asset: AssetUuid| {
         let reader = coordinator.open_reader().unwrap();
         assert!(reader.stale_tag_index_assets(None).unwrap().is_empty());
-        reader.tag_index_state(asset).unwrap().unwrap().tag_epoch[0]
+        let key: String = asset.0.iter().map(|byte| format!("{byte:02X}")).collect();
+        REFINED
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|sql| sql.starts_with("UPDATE assets SET tag_poison") && sql.contains(&key))
     };
-    assert_eq!(refined_under(asset(EDITED_TYPE, 2)), 10);
     let edit = publish(&mut fixture, true);
-    assert_eq!(refined_under(asset(EDITED_TYPE, 2)), 11, "the edited type's rows were refined again");
-    assert_eq!(refined_under(asset(BYTES_TYPE, 0)), 10, "the other type's rows were kept");
+    assert!(refined(asset(EDITED_TYPE, 2)), "the edited type's rows were refined again");
+    assert!(!refined(asset(BYTES_TYPE, 0)), "the other type's rows were kept");
     let unchanged = publish(&mut fixture, true);
     (edit, unchanged)
+}
+
+/// The statements of the publication `schema_edit_pages` traces.
+static REFINED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn record_refined(sql: &str) {
+    REFINED.lock().unwrap().push(sql.to_owned());
 }
 
 /// A schema edit to one type republishes that type's rows; a candidate
@@ -618,7 +632,6 @@ fn publish_completely(
         &configuration.projection,
         retyped,
         Some(authority),
-        authority.source_hash(),
         &claims,
     )
     .unwrap();
@@ -710,7 +723,6 @@ fn assert_reconfiguration_matches_oracle(before: &Configuration, after: &Configu
         &after.projection,
         &retyped,
         &after.authority,
-        after.authority.source_hash(),
     )
     .unwrap();
     store
@@ -945,7 +957,6 @@ fn a_complete_publication_revalidates_a_poisoned_skeleton_after_a_schema_edit() 
         &after.projection,
         &BTreeSet::new(),
         &after.authority,
-        after.authority.source_hash(),
     )
     .unwrap();
     reconfigured

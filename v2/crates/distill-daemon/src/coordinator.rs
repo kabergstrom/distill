@@ -754,7 +754,6 @@ impl DaemonCoordinator {
                 return Err(error);
             }
         };
-        let tag_epoch = schema_authority.source_hash();
         let max_dependency_depth = self.operational_configuration().max_dependency_depth;
         let mut staged: Option<StagedCompiled<'_>> = None;
         let mut published_pipeline = None;
@@ -791,7 +790,6 @@ impl DaemonCoordinator {
                         &projection,
                         &retyped,
                         Some(&schema_authority),
-                        tag_epoch,
                         claims,
                     ),
                     _ => publish_reconfiguration(
@@ -801,7 +799,6 @@ impl DaemonCoordinator {
                         &projection,
                         &retyped,
                         &schema_authority,
-                        tag_epoch,
                     ),
                 }
                 .map_err(|error| error.to_string())?;
@@ -2275,7 +2272,6 @@ fn publish_scan(
     projection: &PipelineProjection,
     retyped: &BTreeSet<TypeUuid>,
     authority: Option<&ProjectSchemaAuthority>,
-    tag_epoch: [u8; 32],
     claims: &[SourceClaims],
 ) -> Result<Commit, StoreError> {
     let (derived_outputs, derived_errors) = projected_derived_outputs(&candidate, projection)?;
@@ -2487,7 +2483,7 @@ fn publish_scan(
                     .map(String::as_str),
             )?;
             for (local_id, entry) in &bundle.assets {
-                transaction.upsert_asset(&AssetRecord {
+                transaction.upsert_pending_asset(&AssetRecord {
                     asset: entry.uuid,
                     bundle: bundle.uuid,
                     local_id: local_id.clone(),
@@ -2497,7 +2493,6 @@ fn publish_scan(
                     tags: BTreeMap::new(),
                     terminal_type: Some(projection.interface(entry.type_uuid).terminal),
                 })?;
-                transaction.set_tag_index_pending(entry.uuid, tag_epoch)?;
             }
             if let Some(primary) = &bundle.primary {
                 transaction.set_path_entry(
@@ -2581,7 +2576,6 @@ fn publish_reconfiguration(
     projection: &PipelineProjection,
     retyped: &BTreeSet<TypeUuid>,
     authority: &ProjectSchemaAuthority,
-    tag_epoch: [u8; 32],
 ) -> Result<Commit, StoreError> {
     let reschemaed = store.tag_epoch_changes(&crate::build::type_tag_epochs(authority))?;
     let mut keys = BTreeSet::new();
@@ -2637,7 +2631,6 @@ fn publish_reconfiguration(
                 scanner,
             },
             projection,
-            tag_epoch,
             &forced,
             true,
             &mut BTreeMap::new(),
@@ -2697,7 +2690,6 @@ fn publish_incremental_scan(
     inputs: &PlanInputs<'_>,
     renames: &[LogicalRename],
     projection: &PipelineProjection,
-    tag_epoch: [u8; 32],
 ) -> Result<Commit, StoreError> {
     if store.input_version()? != base {
         return Err(StoreError::InvalidConfiguration {
@@ -2740,7 +2732,6 @@ fn publish_incremental_scan(
             transaction,
             inputs,
             projection,
-            tag_epoch,
             &BTreeSet::new(),
             false,
             &mut root_ids,
@@ -2767,7 +2758,6 @@ fn publish_claimed(
     transaction: &mut distill_store::InputTxn<'_>,
     inputs: &PlanInputs<'_>,
     projection: &PipelineProjection,
-    tag_epoch: [u8; 32],
     forced: &BTreeSet<BundleUuid>,
     advance_configuration: bool,
     root_ids: &mut BTreeMap<String, distill_store::files::RootId>,
@@ -2836,7 +2826,7 @@ fn publish_claimed(
                 .map(String::as_str),
         )?;
         for (local_id, entry) in &bundle.assets {
-            transaction.upsert_asset(&AssetRecord {
+            transaction.upsert_pending_asset(&AssetRecord {
                 asset: entry.uuid,
                 bundle: bundle.uuid,
                 local_id: local_id.clone(),
@@ -2846,7 +2836,6 @@ fn publish_claimed(
                 tags: BTreeMap::new(),
                 terminal_type: Some(projection.interface(entry.type_uuid).terminal),
             })?;
-            transaction.set_tag_index_pending(entry.uuid, tag_epoch)?;
         }
         if let Some(primary) = &bundle.primary {
             transaction.set_path_entry(
@@ -3147,9 +3136,6 @@ pub(crate) fn publish_incremental_paths(
     // The tag index is refined only beside a coordinator, which knows the
     // dependency depth; without one the publication leaves it pending.
     let authority = coordinator.and_then(|_| compiled.schema_authority());
-    let tag_epoch = authority
-        .as_ref()
-        .map_or([0; 32], |authority| authority.source_hash());
     let claims = bundle_claims(
         delta
             .observed_bundle_entries()
@@ -3171,7 +3157,6 @@ pub(crate) fn publish_incremental_paths(
         &inputs,
         &[],
         projection,
-        tag_epoch,
     )
     .map_err(|error| error.to_string())?;
     if let (Some(coordinator), Some(authority)) = (coordinator, authority) {
@@ -3891,7 +3876,7 @@ mod projection_tests {
         let candidate = ScanCandidate::build(scanner.scan().unwrap(), None).unwrap();
         let claims = bundle_claims(candidate.scan.bundle_rows(), projection, None).unwrap();
         let base = store.input_version().unwrap();
-        publish_scan(store, base, candidate, false, None, projection, retyped, None, [0; 32], &claims).unwrap();
+        publish_scan(store, base, candidate, false, None, projection, retyped, None, &claims).unwrap();
     }
 
     #[test]

@@ -252,7 +252,7 @@ fn fixture() -> (Project, InputVersion) {
             &[("flag", None)],
         )?;
         for poisoned in [asset(2), asset(4), asset(3), asset(8)] {
-            txn.set_tag_index_pending(poisoned, [3; 32])?;
+            txn.set_tag_index_pending(poisoned)?;
         }
         txn.set_path_entry("textures/a.bundle", RootId(1), asset(1))?;
         txn.set_path_entry("textures/a.bundle", RootId(2), asset(10))?;
@@ -284,7 +284,7 @@ fn mutate(project: &mut Project) {
             &[("kind", Some("normal"))],
         )?;
         put_bundle(txn, bundle(2), 1, "textures/b.bundle", 22)?;
-        txn.set_tag_index_pending(asset(5), [3; 32])?;
+        txn.set_tag_index_pending(asset(5))?;
         put_asset(
             txn,
             asset(11),

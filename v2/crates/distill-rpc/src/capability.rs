@@ -2313,7 +2313,7 @@ mod query_tests {
                 }
                 // `z`'s tag index is pending: its tag queries must fail.
                 let z = PATHS.iter().position(|path| *path == "z").unwrap() as u32;
-                txn.set_tag_index_pending(AssetUuid(uuid(0x21, z)), [7; 32])?;
+                txn.set_tag_index_pending(AssetUuid(uuid(0x21, z)))?;
                 // `dir0` is poisoned: it serves nothing.
                 let dir0 = PATHS.iter().position(|path| *path == "dir0").unwrap() as u32;
                 txn.poison_bundle(

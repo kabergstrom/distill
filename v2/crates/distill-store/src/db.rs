@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 47;
+pub const SCHEMA_VERSION: u32 = 48;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -229,7 +229,15 @@ CREATE TABLE assets (
     -- The RPC-served terminal type. NULL for rows the RPC namespace does
     -- not serve (skeleton rows, daemon-private rows). The authored value
     -- is read from the bundle file, verified against its published hash.
-    terminal_type  BLOB
+    terminal_type  BLOB,
+    -- The asset's search tags (§10) as `asset_tags` holds them: NULL when
+    -- they are its current-schema tags; otherwise why a tag query cannot
+    -- answer from them ('tag indexing pending' until a refinement in the
+    -- publishing input computes them, or the refinement's failure).
+    tag_poison     TEXT,
+    -- The pipeline module whose migration produced the tags (NULL: none
+    -- ran): a refinement under another module redoes them.
+    tag_module     BLOB
 );
 -- A bundle's assets, and an asset by bundle and local id (a reference a
 -- build traces, §9). Covering for (bundle, asset): local ids are unique
@@ -251,30 +259,13 @@ CREATE TABLE asset_tags (
     PRIMARY KEY (asset_uuid, tag)
 );
 CREATE INDEX asset_tags_by_tag ON asset_tags(tag, value);
-CREATE TABLE asset_tag_index (
-    asset_uuid       BLOB NOT NULL PRIMARY KEY,
-    -- The asset's authored type, copied from its row when this one is
-    -- written. Every write of the asset row deletes this one in the same
-    -- transaction (`upsert_asset`, `remove_owned_asset_rows`), so the copy
-    -- cannot outlive the type it copied.
-    type_uuid        BLOB,
-    tag_epoch        BLOB NOT NULL,
-    planner_version  INTEGER,
-    dylib_hash       BLOB,
-    trace             BLOB NOT NULL,
-    poison            TEXT
-);
 -- A tag query fails naming the least poisoned bundle among its
--- candidates; this lists exactly the poisoned rows.
-CREATE INDEX asset_tag_index_poisoned ON asset_tag_index(asset_uuid)
-    WHERE poison IS NOT NULL;
+-- candidates; this lists exactly the tag-poisoned rows.
+CREATE INDEX assets_tag_poisoned ON assets(asset_uuid) WHERE tag_poison IS NOT NULL;
 -- A typed query's poison check walks the poisoned rows of its types only.
-CREATE INDEX asset_tag_index_poisoned_by_type ON asset_tag_index(type_uuid)
-    WHERE poison IS NOT NULL;
--- A refinement redoes the migrated rows (those a pipeline module's
--- migration produced) of another module.
-CREATE INDEX asset_tag_index_migrated ON asset_tag_index(dylib_hash)
-    WHERE dylib_hash IS NOT NULL;
+CREATE INDEX assets_tag_poisoned_by_type ON assets(type_uuid) WHERE tag_poison IS NOT NULL;
+-- A refinement redoes the migrated rows of another module.
+CREATE INDEX assets_tag_migrated ON assets(tag_module) WHERE tag_module IS NOT NULL;
 -- Per authored type, the tag epoch its tag rows were refined under: a
 -- digest of what the schema authority says about the type (see the
 -- daemon's `type_tag_epochs`). A type whose epoch changes has every row

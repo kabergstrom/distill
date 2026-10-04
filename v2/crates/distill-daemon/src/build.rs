@@ -1606,7 +1606,6 @@ pub(crate) fn refine_tag_index(
     stale: bool,
 ) -> Result<(), String> {
     let store = input.0;
-    let tag_epoch = authority.source_hash();
     let mut assets = BTreeMap::new();
     for mutation in &commit.authoring {
         if let AuthoringMutation::Set(entry) = mutation {
@@ -1641,18 +1640,16 @@ pub(crate) fn refine_tag_index(
     ) {
         Ok(()) => Ok(()),
         Err(error) if error.is_transient() => Err(format!("refine the tag index: {error:?}")),
-        Err(BuildError::Failed(error)) => poison_tag_index(store, &assets, tag_epoch, &error),
-        Err(error) => poison_tag_index(store, &assets, tag_epoch, &format!("{error:?}")),
+        Err(BuildError::Failed(error)) => poison_tag_index(store, &assets, &error),
+        Err(error) => poison_tag_index(store, &assets, &format!("{error:?}")),
     }
 }
 
 /// The conservative half of a failed refinement: every asset of `assets`
-/// loses its tags and carries the failure as its tag poison, under
-/// `tag_epoch`.
+/// loses its tags and carries the failure as its tag poison.
 fn poison_tag_index(
     store: &mut Store,
     assets: &BTreeMap<AssetUuid, BundleUuid>,
-    tag_epoch: [u8; 32],
     error: &str,
 ) -> Result<(), String> {
     let updates = assets
@@ -1660,10 +1657,7 @@ fn poison_tag_index(
         .map(|asset| TagIndexUpdate {
             asset: *asset,
             tags: BTreeMap::new(),
-            tag_epoch,
-            planner_version: None,
             dylib_hash: None,
-            trace: Vec::new(),
             poison: Some(format!("tag indexing failed: {error}")),
         })
         .collect::<Vec<_>>();
@@ -1751,7 +1745,6 @@ fn try_refine_tag_index(
     max_depth: usize,
     assets: &BTreeMap<AssetUuid, BundleUuid>,
 ) -> Result<(), BuildError> {
-    let tag_epoch = authority.source_hash();
     #[cfg(test)]
     if tests::FAIL_TAG_REFINEMENT.with(|fail| fail.replace(false)) {
         return Err(BuildError::Failed("injected tag-index refinement failure".to_owned()));
@@ -1796,16 +1789,13 @@ fn try_refine_tag_index(
             error => BuildError::Failed(format!("pin tag-index tools: {error:?}")),
         })?;
         for (_, asset) in order {
-            match index_one_tag_entry(&mut context, &mut loaded, asset, tag_epoch)? {
+            match index_one_tag_entry(&mut context, &mut loaded, asset)? {
                 Ok(update) => updates.push(update),
-                Err((error, trace, migrated)) => {
+                Err((error, migrated)) => {
                     updates.push(TagIndexUpdate {
                         asset,
                         tags: BTreeMap::new(),
-                        tag_epoch,
-                        planner_version: migrated.then_some(MIGRATION_PLANNER_VERSION),
                         dylib_hash: migrated.then_some(dylib_hash),
-                        trace,
                         poison: Some(error),
                     });
                 }
@@ -1822,18 +1812,15 @@ fn try_refine_tag_index(
                 loaded => loaded,
             };
             let direct = (|| {
-                let (_, _, entry) = loaded.map_err(|error| (format!("{error:?}"), false))?;
+                let (_, _, entry) = loaded.map_err(|error| format!("{error:?}"))?;
                 let project = authority.project_type(entry.type_uuid).ok_or_else(|| {
-                    (
-                        format!("type {} has no project schema authority", entry.type_uuid),
-                        false,
-                    )
+                    format!("type {} has no project schema authority", entry.type_uuid)
                 })?;
                 if entry.schema_hash != project.logical_hash {
-                    return Err((format!("tag load unavailable: {unavailable}"), true));
+                    return Err(format!("tag load unavailable: {unavailable}"));
                 }
                 distill_schema::extract_search_tags(authority.schema(), project.schema_type, &entry.data)
-                    .map_err(|error| (error.to_string(), false))
+                    .map_err(|error| error.to_string())
             })();
             match direct {
                 Ok(extracted) => {
@@ -1844,21 +1831,15 @@ fn try_refine_tag_index(
                     updates.push(TagIndexUpdate {
                         asset,
                         tags: extracted,
-                        tag_epoch,
-                        planner_version: None,
                         dylib_hash: None,
-                        trace: Vec::new(),
                         poison: None,
                     });
                 }
-                Err((error, migrated)) => {
+                Err(error) => {
                     updates.push(TagIndexUpdate {
                         asset,
                         tags: BTreeMap::new(),
-                        tag_epoch,
-                        planner_version: migrated.then_some(MIGRATION_PLANNER_VERSION),
                         dylib_hash: None,
-                        trace: Vec::new(),
                         poison: Some(error),
                     });
                 }
@@ -1874,16 +1855,15 @@ fn index_one_tag_entry(
     context: &mut BuildContext,
     loaded: &mut TagBundle,
     asset: AssetUuid,
-    tag_epoch: [u8; 32],
-) -> Result<Result<TagIndexUpdate, (String, Vec<u8>, bool)>, BuildError> {
+) -> Result<Result<TagIndexUpdate, (String, bool)>, BuildError> {
     let store = lock_build_store(context)?;
     let (_, bundle, entry) = match loaded.load(&store, &context.scanner, asset) {
         Ok(loaded) => loaded,
         Err(error) if error.is_transient() => return Err(error),
-        Err(error) => return Ok(Err((format!("{error:?}"), Vec::new(), false))),
+        Err(error) => return Ok(Err((format!("{error:?}"), false))),
     };
     drop(store);
-    Ok(index_loaded_tag_entry(context, asset, tag_epoch, bundle, entry))
+    Ok(index_loaded_tag_entry(context, asset, bundle, entry))
 }
 
 /// [`index_one_tag_entry`] past its load: every failure here is the
@@ -1891,14 +1871,12 @@ fn index_one_tag_entry(
 fn index_loaded_tag_entry(
     context: &mut BuildContext,
     asset: AssetUuid,
-    tag_epoch: [u8; 32],
     bundle: Arc<Bundle>,
     entry: AssetEntry,
-) -> Result<TagIndexUpdate, (String, Vec<u8>, bool)> {
+) -> Result<TagIndexUpdate, (String, bool)> {
     let Some(project) = context.env.authority.project_type(entry.type_uuid).cloned() else {
         return Err((
             format!("type {} has no project schema authority", entry.type_uuid),
-            Vec::new(),
             false,
         ));
     };
@@ -1915,23 +1893,20 @@ fn index_loaded_tag_entry(
         current_load,
         &mut trace,
     )
-    .map_err(|error| (format!("{error:?}"), trace_payload_bytes(&trace), migrated))?;
+    .map_err(|error| (format!("{error:?}"), migrated))?;
     let extracted = distill_schema::extract_search_tags(
         context.env.authority.schema(),
         project.schema_type,
         &current,
     )
-    .map_err(|error| (error.to_string(), trace_payload_bytes(&trace), migrated))?
+    .map_err(|error| (error.to_string(), migrated))?
     .into_iter()
     .map(|(name, value)| (name, Some(value)))
     .collect();
     Ok(TagIndexUpdate {
         asset,
         tags: extracted,
-        tag_epoch,
-        planner_version: migrated.then_some(MIGRATION_PLANNER_VERSION),
         dylib_hash: migrated.then_some(context.env.dylib_hash),
-        trace: trace_payload_bytes(&trace),
         poison: None,
     })
 }
@@ -4873,7 +4848,6 @@ mod tests {
             .tag_index_state(ASSET)
             .unwrap()
             .unwrap();
-        assert_eq!(indexed.planner_version, Some(MIGRATION_PLANNER_VERSION));
         assert!(indexed.dylib_hash.is_some());
         assert!(indexed.poison.is_none());
         let request = BuildRequest {
@@ -5135,9 +5109,8 @@ mod tests {
         assert_eq!(loads, 0, "nothing was stale");
 
         // A publication marks the row pending; its refinement fails.
-        let epoch = compiled.schema_authority().unwrap().source_hash();
         writer
-            .input_transaction(|txn| txn.set_tag_index_pending(ASSET, epoch))
+            .input_transaction(|txn| txn.set_tag_index_pending(ASSET))
             .unwrap();
         FAIL_TAG_REFINEMENT.with(|fail| fail.set(true));
         let (_, after) = refine(&mut writer);
@@ -5152,7 +5125,7 @@ mod tests {
         // nothing: the refinement fails and its input rolls back, leaving
         // the row pending for the next one.
         writer
-            .input_transaction(|txn| txn.set_tag_index_pending(ASSET, epoch))
+            .input_transaction(|txn| txn.set_tag_index_pending(ASSET))
             .unwrap();
         FAIL_TAG_REFINEMENT_TRANSIENT.with(|fail| fail.set(true));
         writer.open_input().unwrap();

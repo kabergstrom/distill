@@ -186,7 +186,6 @@ pub(super) struct RejectionStep {
 /// compiled state of the version the pass starts from.
 struct TagInputs {
     compiled: Arc<Compiled>,
-    tag_epoch: [u8; 32],
     max_dependency_depth: usize,
 }
 
@@ -1025,9 +1024,6 @@ impl DaemonCoordinator {
 
     fn tag_inputs(&self, compiled: &Arc<Compiled>) -> TagInputs {
         TagInputs {
-            tag_epoch: compiled
-                .schema_authority()
-                .map_or([0; 32], |authority| authority.source_hash()),
             compiled: Arc::clone(compiled),
             max_dependency_depth: self.operational_configuration().max_dependency_depth,
         }
@@ -1099,7 +1095,6 @@ impl DaemonCoordinator {
                     &inputs,
                     &step.renames,
                     tags.compiled.projection(),
-                    tags.tag_epoch,
                 )
                 ?;
                 Ok(Some(commit))
@@ -1118,7 +1113,6 @@ impl DaemonCoordinator {
                     tags.compiled.projection(),
                     &BTreeSet::new(),
                     tags.authority().as_deref(),
-                    tags.tag_epoch,
                     &step.claims,
                 )
                 .map_err(|error| error.to_string())?;
