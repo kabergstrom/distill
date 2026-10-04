@@ -1,7 +1,8 @@
 //! The import index: watched read sets joined by path, directory rule
-//! sources, and per-source replacement.
+//! sources, and per-source replacement. Rows belong to published bundles.
 
-use distill_core::id::{AssetUuid, BundleUuid};
+use distill_core::id::{AssetUuid, BundleUuid, ContentHash};
+use distill_store::bundles::BundleMeta;
 use distill_store::imports::{ImportIndexSource, ImportReadKey, WatchedImport};
 use distill_store::{Store, StoreConfig};
 
@@ -11,20 +12,34 @@ fn store() -> (tempfile::TempDir, Store) {
     (dir, s)
 }
 
+/// Publish bundle `bundle` at `path` in the root "main".
+fn publish(store: &mut Store, path: &str, bundle: u8) {
+    store
+        .input_transaction(|txn| {
+            let root = txn.intern_root("main")?;
+            txn.upsert_bundle(&BundleMeta {
+                bundle: BundleUuid([bundle; 16]),
+                root,
+                path: path.to_owned(),
+                format_version: 1,
+                content_hash: ContentHash([bundle; 32]),
+                origin: None,
+                import_watched: true,
+            })
+        })
+        .unwrap();
+}
+
 fn source(path: &str, bundle: u8, reads: Vec<ImportReadKey>) -> ImportIndexSource {
     ImportIndexSource {
         root_name: "main".to_owned(),
         path: path.to_owned(),
-        watched: Some(WatchedImport {
-            bundle: BundleUuid([bundle; 16]),
-            basis: vec![bundle],
+        bundle: BundleUuid([bundle; 16]),
+        watched: (!reads.is_empty()).then(|| WatchedImport {
+            record: AssetUuid([bundle + 100; 16]),
             reads,
         }),
-        directory_rules: vec![(
-            BundleUuid([bundle; 16]),
-            AssetUuid([bundle; 16]),
-            format!("dir{bundle}/"),
-        )],
+        directory_rules: vec![(AssetUuid([bundle; 16]), format!("dir{bundle}/"))],
     }
 }
 
@@ -35,13 +50,16 @@ fn sources(paths: &[&str]) -> Vec<(String, String)> {
         .collect()
 }
 
-fn bundles(rows: Vec<WatchedImport>) -> Vec<u8> {
-    rows.into_iter().map(|row| row.bundle.0[0]).collect()
+fn bundles(rows: Vec<BundleUuid>) -> Vec<u8> {
+    rows.into_iter().map(|row| row.0[0]).collect()
 }
 
 #[test]
 fn dirty_paths_join_the_read_sets_that_observed_them() {
     let (_d, mut store) = store();
+    for (path, bundle) in [("a.bundle", 1), ("b.bundle", 2), ("c.bundle", 3)] {
+        publish(&mut store, path, bundle);
+    }
     store
         .replace_import_index(
             &sources(&["a.bundle", "b.bundle", "c.bundle"]),
@@ -72,6 +90,8 @@ fn dirty_paths_join_the_read_sets_that_observed_them() {
 #[test]
 fn a_source_replacement_drops_only_that_source() {
     let (_d, mut store) = store();
+    publish(&mut store, "a.bundle", 1);
+    publish(&mut store, "b.bundle", 2);
     store
         .replace_import_index(
             &sources(&["a.bundle", "b.bundle"]),
@@ -81,30 +101,52 @@ fn a_source_replacement_drops_only_that_source() {
             ],
         )
         .unwrap();
-    let previous = store
+    store
         .replace_import_index(&[("main".to_owned(), "a.bundle".to_owned())], &[])
         .unwrap();
-    // The rules the replaced source held come back.
-    assert_eq!(previous.len(), 1);
-    assert_eq!(previous[0].rules_bundle, BundleUuid([1; 16]));
     assert_eq!(bundles(store.watched_imports_reading(["x"], false).unwrap()), [2]);
     assert!(store.directory_rule_sources_at("main", "a.bundle").unwrap().is_empty());
-    // A bundle that moved replaces its old row.
+    // A bundle that moved is reindexed at its new source; its old rows go.
+    publish(&mut store, "c.bundle", 2);
     store
         .replace_import_index(
-            &[("main".to_owned(), "c.bundle".to_owned())],
+            &sources(&["b.bundle", "c.bundle"]),
             &[source("c.bundle", 2, vec![ImportReadKey::Path("y".to_owned())])],
         )
         .unwrap();
     assert!(store.watched_imports_reading(["x"], false).unwrap().is_empty());
     assert_eq!(bundles(store.watched_imports_reading(["y"], false).unwrap()), [2]);
+    assert_eq!(
+        store.directory_rule_sources_at("main", "c.bundle").unwrap()[0].rules_bundle,
+        BundleUuid([2; 16])
+    );
+}
+
+#[test]
+fn a_removed_bundle_takes_its_rows_with_it() {
+    let (_d, mut store) = store();
+    publish(&mut store, "a.bundle", 1);
+    store
+        .replace_import_index(
+            &sources(&["a.bundle"]),
+            &[source("a.bundle", 1, vec![ImportReadKey::Path("x".to_owned())])],
+        )
+        .unwrap();
+    store
+        .input_transaction(|txn| txn.remove_bundle(BundleUuid([1; 16])))
+        .unwrap();
+    assert!(store.watched_imports().unwrap().is_empty());
+    assert!(store.directory_rule_sources().unwrap().is_empty());
 }
 
 #[test]
 fn rules_are_found_by_the_directories_a_path_is_under() {
     let (_d, mut store) = store();
+    for (path, bundle) in [("a.bundle", 1), ("b.bundle", 2), ("r.bundle", 3)] {
+        publish(&mut store, path, bundle);
+    }
     let mut whole_root = source("r.bundle", 3, Vec::new());
-    whole_root.directory_rules[0].2 = String::new();
+    whole_root.directory_rules[0].1 = String::new();
     store
         .replace_import_index(
             &sources(&["a.bundle", "b.bundle", "r.bundle"]),

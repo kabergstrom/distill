@@ -652,6 +652,69 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
         .is_none());
 }
 
+/// Deleting a rules source orphans what its rules generated, found from
+/// the work alone: the removed rules bundle no longer has a row, and the
+/// bundles it generated still name it.
+#[test]
+fn removing_a_rules_source_orphans_its_outputs_incrementally() {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    let (ordinary, _, schema_hash) = ordinary_bundle();
+    std::fs::write(assets.join("ordinary.bundle"), ordinary).unwrap();
+    std::fs::write(assets.join("rules.bundle"), directory_rules_bundle()).unwrap();
+    std::fs::write(assets.join("foo.src"), b"9").unwrap();
+    let coordinator = DaemonCoordinator::open(
+        StoreConfig::new(temp.path().join(".distill")),
+        vec![AssetRoot::new("main", &assets)],
+        vec![target()],
+        64,
+    )
+    .unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    publish_schema_registry(&coordinator, schema_hash);
+    coordinator
+        .authoring_service()
+        .register_importer(Arc::new(ByteImporter {
+            schema: settings_schema(),
+        }))
+        .unwrap();
+    assert_eq!(coordinator.reconcile_directory_imports(&mut writer).unwrap().len(), 1);
+    let generated =
+        distill_bundle::parse_bundle(&std::fs::read(assets.join("foo.bundle")).unwrap()).unwrap();
+    // The generated bundle's own publication is work of its own.
+    let work = coordinator.pending_file_work(&mut writer).unwrap();
+    coordinator
+        .reconcile_directory_imports_affected(&mut writer, &work, false)
+        .unwrap();
+    coordinator.acknowledge_file_work(&mut writer, &work).unwrap();
+
+    std::fs::remove_file(assets.join("rules.bundle")).unwrap();
+    coordinator
+        .reconcile_incremental(&mut writer, &WatcherBatch {
+            paths: vec![assets.join("rules.bundle")],
+            renames: Vec::new(),
+        })
+        .unwrap();
+    let work = coordinator.pending_file_work(&mut writer).unwrap();
+    assert!(coordinator
+        .reconcile_directory_imports_affected(&mut writer, &work, false)
+        .unwrap()
+        .is_empty());
+    coordinator.acknowledge_file_work(&mut writer, &work).unwrap();
+    assert_eq!(
+        coordinator
+            .open_reader()
+            .unwrap()
+            .watched_import_failure(generated.uuid)
+            .unwrap()
+            .expect("a removed rules source orphans its outputs")
+            .terminal,
+        distill_store::imports::WatchedImportTerminal::DirectoryOrphan
+    );
+}
+
 /// A restart whose pipeline has not installed (or was rejected) finds its
 /// watched imports' importer unregistered. Reconciliation defers them instead
 /// of failing the startup pass, and runs them once the importer registers.

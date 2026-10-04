@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 49;
+pub const SCHEMA_VERSION: u32 = 50;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -129,36 +129,6 @@ CREATE TABLE claim_pending (
     subject BLOB NOT NULL,
     PRIMARY KEY (kind, subject)
 );
--- The import index, derived from each bundle source's import record and
--- directory rules (see `imports`). `basis` is the daemon's read-set
--- encoding; `import_reads` names what it observed: kind 0 a path (key),
--- 1 a listing, 2 an importer capability.
-CREATE TABLE import_records (
-    bundle_uuid BLOB NOT NULL PRIMARY KEY,
-    root_id     INTEGER NOT NULL,
-    path        TEXT NOT NULL,
-    basis       BLOB NOT NULL
-);
-CREATE INDEX import_records_by_source ON import_records(root_id, path);
-CREATE TABLE import_reads (
-    bundle_uuid BLOB NOT NULL,
-    kind        INTEGER NOT NULL,
-    key         TEXT NOT NULL,
-    PRIMARY KEY (bundle_uuid, kind, key)
-);
-CREATE INDEX import_reads_by_key ON import_reads(kind, key);
-CREATE TABLE directory_rule_sources (
-    rules_bundle BLOB NOT NULL,
-    rules_asset  BLOB NOT NULL,
-    root_id      INTEGER NOT NULL,
-    path         TEXT NOT NULL,
-    -- The directory, ending in `/` (`''` for the whole root), that every
-    -- path the rules' listing matches is under.
-    listing_dir  TEXT NOT NULL,
-    PRIMARY KEY (rules_bundle, rules_asset)
-);
-CREATE INDEX directory_rule_sources_by_source ON directory_rule_sources(root_id, path);
-CREATE INDEX directory_rule_sources_by_listing ON directory_rule_sources(listing_dir);
 -- The watcher work no pass has consumed yet, in order. kind 0: `path` was
 -- deleted, 1: `path` exists as observed at input version `observation`,
 -- 2: `path` was renamed to `to_path`. A pass acknowledges the rows it
@@ -221,6 +191,22 @@ CREATE TABLE bundle_path_refs (
     PRIMARY KEY (bundle_uuid, target)
 ) WITHOUT ROWID;
 CREATE INDEX bundle_path_refs_by_target ON bundle_path_refs(target);
+-- The import index (§8), derived from each published bundle's import
+-- record and directory rules when the import pass reindexes its source
+-- (see `imports`). Under the bundle's `$record` entry, what the basis its
+-- watched import is revalidated against reads: kind 0 a path (`key`), 1 a
+-- listing, 2 an importer capability. Kind 3: a directory-import rules
+-- asset whose listing is under the directory `key` (ending in `/`, `''`
+-- for the whole root). The source is the bundle's; the basis is the
+-- failure memo's or the record's. A bundle's rows go with its row.
+CREATE TABLE import_keys (
+    bundle_uuid BLOB NOT NULL REFERENCES bundles(bundle_uuid) ON DELETE CASCADE,
+    asset_uuid  BLOB NOT NULL,
+    kind        INTEGER NOT NULL CHECK (kind IN (0, 1, 2, 3)),
+    key         TEXT NOT NULL,
+    PRIMARY KEY (bundle_uuid, kind, asset_uuid, key)
+) WITHOUT ROWID;
+CREATE INDEX import_keys_by_key ON import_keys(kind, key);
 CREATE TABLE assets (
     asset_uuid   BLOB NOT NULL PRIMARY KEY,
     bundle_uuid  BLOB NOT NULL,

@@ -103,10 +103,12 @@ pub(crate) type PassWork<'a> = (
 );
 
 /// What refreshing the import index found: the bundle sources it reindexed,
-/// by (root, path), and the directory rules they held before.
+/// by (root, path), and the rules bundles whose generated bundles they may
+/// orphan: those a generated bundle names that are at one of those sources
+/// or no longer exist.
 pub(crate) struct IndexRefresh {
     changed: BTreeSet<(String, String)>,
-    previous: Vec<DirectoryRuleSource>,
+    previous: Vec<BundleUuid>,
 }
 
 /// A rules listing's sources by (rule index, group).
@@ -172,7 +174,7 @@ impl AuthoringService {
         store: &mut Store,
         dirty: &[distill_store::files::DirtyEntry],
         fresh: impl Fn(&str, &str) -> Option<Arc<ScannedBundle>>,
-    ) -> Result<(BTreeSet<(String, String)>, Vec<DirectoryRuleSource>), RpcFailure> {
+    ) -> Result<(BTreeSet<(String, String)>, Vec<BundleUuid>), RpcFailure> {
         store.write_transaction_with(invalid, |store| {
             let compiled = self.compiled(store)?;
             let keys = dirty
@@ -214,16 +216,31 @@ impl AuthoringService {
                 };
                 rows.push(self.index_import_bundle(store, &meta, root_name, bundle)?);
             }
-            let keys = keys.into_keys().collect::<BTreeSet<_>>();
-            let previous = if keys.is_empty() {
-                Vec::new()
-            } else {
-                let sources = keys.iter().cloned().collect::<Vec<_>>();
-                store
-                    .replace_import_index(&sources, &rows)
-                    .map_err(invalid)?
-            };
-            Ok((keys, previous))
+            if keys.is_empty() {
+                return Ok((BTreeSet::new(), Vec::new()));
+            }
+            let sources = keys.keys().cloned().collect::<Vec<_>>();
+            store
+                .replace_import_index(&sources, &rows)
+                .map_err(invalid)?;
+            // A changed rules source may have dropped rules, or the rules
+            // bundle itself may be gone.
+            let changed_ids = keys
+                .iter()
+                .map(|((_, path), root)| (*root, path.as_str()))
+                .collect::<BTreeSet<_>>();
+            let previous = store
+                .generating_rules_bundles()
+                .map_err(invalid)?
+                .into_iter()
+                .filter(|(_, source)| {
+                    source.as_ref().is_none_or(|(root, path)| {
+                        changed_ids.contains(&(*root, path.as_str()))
+                    })
+                })
+                .map(|(rules, _)| rules)
+                .collect();
+            Ok((keys.into_keys().collect(), previous))
         })
     }
 
@@ -243,10 +260,11 @@ impl AuthoringService {
             .filter(|entry| entry.type_uuid == DIRECTORY_IMPORT_RULES_TYPE_UUID)
         {
             let rules = decode_directory_rules(&entry.data)?;
-            directory_rules.push((bundle.uuid, entry.uuid, listing_dir(&rules.listing)));
+            directory_rules.push((entry.uuid, listing_dir(&rules.listing)));
         }
+        let record = bundle.assets.get("$record").map(|entry| entry.uuid);
         let mut watched = None;
-        if let Ok(prior) = decode_prior_import(bundle) {
+        if let (Ok(prior), Some(record)) = (decode_prior_import(bundle), record) {
             if prior.model.record.watch {
                 let basis = match store.watched_import_failure(meta.bundle).map_err(invalid)? {
                     Some(failure) if failure.terminal == WatchedImportTerminal::DirectoryOrphan => {
@@ -257,8 +275,7 @@ impl AuthoringService {
                 };
                 if !basis.is_empty() {
                     watched = Some(WatchedImport {
-                        bundle: meta.bundle,
-                        basis: encode_attempt_basis(&basis)?,
+                        record,
                         reads: import_read_keys(&basis),
                     });
                 }
@@ -267,6 +284,7 @@ impl AuthoringService {
         Ok(ImportIndexSource {
             root_name,
             path: meta.path.clone(),
+            bundle: meta.bundle,
             watched,
             directory_rules,
         })
@@ -372,11 +390,19 @@ impl AuthoringService {
             None => store.watched_imports().map_err(invalid)?,
         };
         let mut pending = Vec::new();
-        for indexed in &watched {
-            let Some(meta) = store.bundle(indexed.bundle).map_err(invalid)? else {
+        for bundle in &watched {
+            let Some(meta) = store.bundle(*bundle).map_err(invalid)? else {
                 continue;
             };
-            let basis = decode_attempt_basis(&indexed.basis)?;
+            // A basis that no longer reads as published is due: what
+            // changed it is queued, and the reimport finds the drift.
+            let Some(basis) = self.watched_basis(store, &meta)? else {
+                pending.push(meta.bundle);
+                continue;
+            };
+            if basis.is_empty() {
+                continue;
+            }
             if work.is_some_and(|(dirty, renames)| {
                 !read_set_intersects_work(&basis, dirty, renames, capabilities_changed)
             }) {
@@ -445,7 +471,7 @@ impl AuthoringService {
             // previous rules generated is rechecked for orphaning.
             for rules in previous {
                 for bundle in store
-                    .bundles_owned_by(rules.rules_bundle)
+                    .bundles_owned_by(*rules)
                     .map_err(invalid)?
                 {
                     if let Some(origin) = store.bundle(bundle).map_err(invalid)?.and_then(|meta| meta.origin)
@@ -716,11 +742,18 @@ impl AuthoringService {
             .iter()
             .map(|(_, path)| path.as_str())
             .collect::<Vec<_>>();
-        for indexed in store
+        for bundle in store
             .watched_imports_reading(paths.iter().copied(), false)
             .map_err(invalid)?
         {
-            let reads = decode_attempt_basis(&indexed.basis)?
+            let Some(meta) = store.bundle(bundle).map_err(invalid)? else {
+                continue;
+            };
+            // A basis that no longer reads as published may read anything.
+            let Some(basis) = self.watched_basis(store, &meta)? else {
+                return Ok(true);
+            };
+            let reads = basis
                 .iter()
                 .any(|dependency| match dependency {
                     FileDep::Read { path, .. } | FileDep::Probe { path, .. } => {
@@ -1764,6 +1797,42 @@ impl AuthoringService {
             target,
             meta,
         })
+    }
+
+    /// The basis `meta`'s watched import is revalidated against (§8): its
+    /// failure memo's attempt basis, else its `$record`'s read set, read
+    /// from the published bundle. Empty when it is not watched or is a
+    /// directory orphan; `None` when the bundle no longer reads as
+    /// published (the work that changed it is queued).
+    fn watched_basis(
+        &self,
+        store: &StoreReader,
+        meta: &BundleMeta,
+    ) -> Result<Option<Vec<FileDep>>, RpcFailure> {
+        match store.watched_import_failure(meta.bundle).map_err(invalid)? {
+            Some(failure) if failure.terminal == WatchedImportTerminal::DirectoryOrphan => {
+                return Ok(Some(Vec::new()));
+            }
+            Some(failure) => return decode_attempt_basis(&failure.basis).map(Some),
+            None => {}
+        }
+        let root = store
+            .root_name(meta.root)
+            .map_err(invalid)?
+            .ok_or_else(|| invalid("bundle root identity is missing"))?;
+        let source = match self
+            .compiled(store)?
+            .scanner()
+            .read_published_bundle(store, &root, &meta.path)
+        {
+            Ok(source) if source.file_hash.0 == meta.content_hash.0 => source,
+            Ok(_) | Err(StoreError::Drifted { .. }) => return Ok(None),
+            Err(error) => return Err(invalid(error)),
+        };
+        Ok(Some(match source.parsed.map(decode_prior_import) {
+            Ok(Ok(prior)) if prior.model.record.watch => prior.model.record.read_set,
+            _ => Vec::new(),
+        }))
     }
 
     /// The published bundle `meta`, read from the scan and parsed, with its

@@ -914,6 +914,35 @@ impl StoreReader {
         Ok(out)
     }
 
+    /// Every rules bundle a generated bundle names (§8), in order, with
+    /// its own (root, path) while it has a row: one seek of
+    /// `bundles_by_origin` per rules bundle, however many bundles each
+    /// generated.
+    pub fn generating_rules_bundles(
+        &self,
+    ) -> Result<Vec<(BundleUuid, Option<(RootId, String)>)>, StoreError> {
+        let mut next = self.conn.prepare_cached(NEXT_RULES_BUNDLE)?;
+        let mut found = Vec::new();
+        let mut after = Vec::new();
+        loop {
+            let row = next
+                .query_row([&after], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .optional()?;
+            let Some((rules, root, path)) = row else {
+                return Ok(found);
+            };
+            let source = root.zip(path).map(|(root, path)| (RootId(root), path));
+            found.push((BundleUuid(blob16(rules.clone())), source));
+            after = rules;
+        }
+    }
+
     /// §13 `MetadataSnapshot::entry` semantics: `Ok(None)` is a
     /// recordable miss; a namespace error or a poisoned owning bundle is
     /// `Err`, never last-good metadata.
@@ -992,6 +1021,13 @@ macro_rules! bundle_columns {
     };
 }
 const BUNDLE_COLUMNS: &str = bundle_columns!();
+/// The least rules bundle a generated bundle names after `?1`, with its
+/// row's source if it has one.
+const NEXT_RULES_BUNDLE: &str = "SELECT g.origin_rules_bundle, r.root_id, r.path
+     FROM bundles g INDEXED BY bundles_by_origin
+     LEFT JOIN bundles r ON r.bundle_uuid = g.origin_rules_bundle
+     WHERE g.origin_rules_bundle IS NOT NULL AND g.origin_rules_bundle > ?1
+     ORDER BY g.origin_rules_bundle LIMIT 1";
 /// Every bundle's primary asset by (path, root): a walk of `bundles_by_path`.
 const PRIMARY_ASSETS: &str = "SELECT path, root_id, primary_asset FROM bundles INDEXED BY bundles_by_path
      WHERE primary_asset IS NOT NULL ORDER BY path, root_id";
