@@ -414,6 +414,10 @@ impl BuildBackend for UnavailableBuildBackend {
 
 #[cfg(test)]
 impl AuthoringBackend for UnavailableAuthoringBackend {
+    fn read_file(&self, _: &distill_store::StoreReader, _: &str, _: &str) -> Result<Vec<u8>, String> {
+        unreachable!("never inspects")
+    }
+
     fn write_files(
         &self,
         _store: &mut Store,

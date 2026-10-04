@@ -806,17 +806,15 @@ pub type ImportJob = Box<
 /// commit; publication remains an atomic RPC-server CAS step.
 pub trait AuthoringBackend: Send + Sync + 'static {
     /// The bytes of file `path` under root `root` as they are on disk now,
-    /// read through the daemon's root identity checks. `None`: the backend
-    /// has no filesystem authority. An `Err` is a file that cannot be read
-    /// now, which a reader verifying a published hash treats as drift.
+    /// read through the daemon's root identity checks. An `Err` is a file
+    /// that cannot be read now, which a reader verifying a published hash
+    /// treats as drift.
     fn read_file(
         &self,
-        _snapshot: &distill_store::StoreReader,
-        _root: &str,
-        _path: &str,
-    ) -> Option<Result<Vec<u8>, String>> {
-        None
-    }
+        snapshot: &distill_store::StoreReader,
+        root: &str,
+        path: &str,
+    ) -> Result<Vec<u8>, String>;
 
     /// The runtime failure of the pipeline epoch `snapshot` serves, if its
     /// module has failed since it was published. It lives on the loaded

@@ -509,16 +509,13 @@ impl AuthoringBackend for AuthoringService {
         snapshot: &StoreReader,
         root: &str,
         path: &str,
-    ) -> Option<Result<Vec<u8>, String>> {
-        let read = || {
-            let scanner = self.compiled(snapshot).map_err(|error| format!("{error:?}"))?;
-            let scanner = scanner.scanner();
-            let physical = scanner.physical_path(root, path).map_err(|error| error.to_string())?;
-            scanner
-                .read_identity_checked(&physical)
-                .map_err(|error| error.to_string())
-        };
-        Some(read())
+    ) -> Result<Vec<u8>, String> {
+        let compiled = self.compiled(snapshot).map_err(|error| format!("{error:?}"))?;
+        let scanner = compiled.scanner();
+        let physical = scanner.physical_path(root, path).map_err(|error| error.to_string())?;
+        scanner
+            .read_identity_checked(&physical)
+            .map_err(|error| error.to_string())
     }
 
     fn pipeline_runtime_failure(

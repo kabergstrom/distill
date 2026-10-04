@@ -1110,6 +1110,10 @@ fn ledger_root(version: InputVersion) -> String {
 }
 
 impl AuthoringBackend for LedgerBackend {
+    fn read_file(&self, _: &distill_store::StoreReader, _: &str, _: &str) -> Result<Vec<u8>, String> {
+        unreachable!("never inspects")
+    }
+
     fn write_files(
         &self,
         store: &mut distill_store::Store,

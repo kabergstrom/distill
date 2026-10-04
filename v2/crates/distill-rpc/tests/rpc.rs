@@ -399,6 +399,10 @@ struct RecordingAuthoringBackend {
 }
 
 impl AuthoringBackend for RecordingAuthoringBackend {
+    fn read_file(&self, _: &distill_store::StoreReader, _: &str, _: &str) -> Result<Vec<u8>, String> {
+        unreachable!("never inspects")
+    }
+
     fn write_files(
         &self,
         _: &mut distill_store::Store,
@@ -1690,6 +1694,10 @@ fn published_runtime_failure_fences_shared_epoch_without_minting_a_version() {
 struct RuntimeFailedBackend(PipelineFailure);
 
 impl AuthoringBackend for RuntimeFailedBackend {
+    fn read_file(&self, _: &distill_store::StoreReader, _: &str, _: &str) -> Result<Vec<u8>, String> {
+        unreachable!("never inspects")
+    }
+
     fn write_files(
         &self,
         _: &mut distill_store::Store,
@@ -2672,6 +2680,10 @@ impl DeferredOperation for PartialFailOperation {
 }
 
 impl AuthoringBackend for PartialFailBackend {
+    fn read_file(&self, _: &distill_store::StoreReader, _: &str, _: &str) -> Result<Vec<u8>, String> {
+        unreachable!("never inspects")
+    }
+
     fn write_files(
         &self,
         store: &mut distill_store::Store,

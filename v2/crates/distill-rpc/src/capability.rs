@@ -569,10 +569,7 @@ fn inspect_authoring(
         .inner
         .handle
         .authoring_backend()
-        .read_file(snapshot, &root, &bundle.path)
-        .ok_or_else(|| RpcFailure::AuthoringBackendUnavailable {
-            operation: "inspect".to_owned(),
-        })?;
+        .read_file(snapshot, &root, &bundle.path);
     let bytes = match read {
         Ok(bytes) if ContentHash(*blake3::hash(&bytes).as_bytes()) == bundle.content_hash => bytes,
         _ => {

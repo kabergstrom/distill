@@ -347,6 +347,10 @@ fn receipt_of(operations: &[AuthoringOp]) -> WriteReceipt {
 }
 
 impl AuthoringBackend for RecordingAuthoringBackend {
+    fn read_file(&self, _: &distill_store::StoreReader, _: &str, _: &str) -> Result<Vec<u8>, String> {
+        unreachable!("never inspects")
+    }
+
     fn write_files(
         &self,
         _store: &mut distill_store::Store,
