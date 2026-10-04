@@ -741,6 +741,41 @@ fn directory_rule_settings_leaving_out_fields_take_the_defaults() {
         .is_empty());
 }
 
+
+/// Editing a rules source's settings while the daemon watches re-imports
+/// what the rule generated with the new settings, through the watcher
+/// pass the daemon runs (`reconcile_batch`).
+#[test]
+fn editing_a_rules_settings_reimports_its_outputs_in_a_watcher_pass() {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("rules.bundle"), directory_rules_bundle_with(true, &settings([0, 0], 2))).unwrap();
+    std::fs::write(assets.join("foo.src"), b"4").unwrap();
+    let coordinator = DaemonCoordinator::open(
+        StoreConfig::new(temp.path().join(".distill")),
+        vec![AssetRoot::new("main", &assets)],
+        vec![target()],
+        64,
+    )
+    .unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    configure(&coordinator, temp.path(), &assets);
+    coordinator.reconcile_directory_imports(&mut writer).unwrap();
+    let read = || distill_bundle::parse_bundle(&std::fs::read(assets.join("foo.bundle")).unwrap()).unwrap();
+    assert_eq!(read().assets["asset"].data, byte(8));
+    // The generated bundle's publication settles first, as in the daemon.
+    coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["foo.bundle"]), false)
+        .unwrap();
+
+    std::fs::write(assets.join("rules.bundle"), directory_rules_bundle_with(true, &settings([0, 0], 3))).unwrap();
+    coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["rules.bundle"]), false)
+        .unwrap();
+    assert_eq!(read().assets["asset"].data, byte(12));
+}
 /// Deleting a rules source orphans what its rules generated, found from
 /// the work alone: the removed rules bundle no longer has a row, and the
 /// bundles it generated still name it.

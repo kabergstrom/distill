@@ -112,7 +112,15 @@ pub(crate) struct IndexRefresh {
     changed: BTreeSet<(String, String)>,
     changed_rules: bool,
     previous: Vec<BundleUuid>,
+    /// The rules bundles this refresh parsed from the pass's scan. A rules
+    /// source the pass is publishing holds other bytes than its published
+    /// version (`read_published_bundle` would report it drifted), so the
+    /// pass reads its rules from here.
+    rules: FreshRules,
 }
+
+/// Rules bundles by UUID, as the pass's scan read them.
+pub(crate) type FreshRules = BTreeMap<BundleUuid, Bundle>;
 
 /// A rules listing's sources by (rule index, group).
 type DirectoryGroups = BTreeMap<(usize, RootedPath), BTreeSet<RootedPath>>;
@@ -187,6 +195,7 @@ impl AuthoringService {
                 .map(|entry| ((entry.root_name.clone(), entry.path.clone()), entry.root))
                 .collect::<BTreeMap<_, _>>();
             let mut rows = Vec::new();
+            let mut rules = FreshRules::new();
             for ((root, path), root_id) in &keys {
                 // The bytes the pass's scan read, else the file as this
                 // input observed it. A removed source has no row; one that
@@ -213,6 +222,13 @@ impl AuthoringService {
                 let Ok(bundle) = source.parsed.clone() else {
                     continue;
                 };
+                if bundle
+                    .assets
+                    .values()
+                    .any(|entry| entry.type_uuid == DIRECTORY_IMPORT_RULES_TYPE_UUID)
+                {
+                    rules.insert(bundle.uuid, bundle.clone());
+                }
                 // A row the input just wrote from this source is its own.
                 if written.contains(&(root.clone(), path.clone())) {
                     rows.push(self.index_import_bundle(
@@ -239,6 +255,7 @@ impl AuthoringService {
                     changed: BTreeSet::new(),
                     changed_rules: false,
                     previous: Vec::new(),
+                    rules,
                 });
             }
             // The rows replace every row of these sources: one of them
@@ -272,6 +289,7 @@ impl AuthoringService {
                 changed: keys.into_keys().collect(),
                 changed_rules,
                 previous,
+                rules,
             })
         })
     }
@@ -325,20 +343,41 @@ impl AuthoringService {
 
     /// The indexed directory-import rules assets `sources` names, decoded,
     /// in (bundle, asset) order. Each rules bundle is parsed once per call.
+    /// A bundle in `fresh` (the pass's scan) is read from there, not the store.
     fn directory_rule_entries(
         &self,
         store: &StoreReader,
         sources: Vec<DirectoryRuleSource>,
+        fresh: &FreshRules,
     ) -> Result<Vec<DirectoryRuleEntry>, RpcFailure> {
+        self.published_rule_entries(store, sources, fresh)?
+            .ok_or_else(|| invalid("a rules bundle changed on disk since it was published"))
+    }
+
+    /// `directory_rule_entries`, or `None` when a rules bundle not in
+    /// `fresh` no longer reads as published (the work that changed it is
+    /// queued).
+    fn published_rule_entries(
+        &self,
+        store: &StoreReader,
+        sources: Vec<DirectoryRuleSource>,
+        fresh: &FreshRules,
+    ) -> Result<Option<Vec<DirectoryRuleEntry>>, RpcFailure> {
         let mut parsed = BTreeMap::<BundleUuid, Option<Bundle>>::new();
         let mut entries = Vec::new();
         for source in sources {
             let bundle = match parsed.entry(source.rules_bundle) {
                 std::collections::btree_map::Entry::Occupied(slot) => slot.into_mut(),
                 std::collections::btree_map::Entry::Vacant(slot) => {
-                    let bundle = match store.bundle(source.rules_bundle).map_err(invalid)? {
-                        Some(meta) => Some(self.published_bundle(store, &meta)?.1),
-                        None => None,
+                    let bundle = match fresh.get(&source.rules_bundle) {
+                        Some(bundle) => Some(bundle.clone()),
+                        None => match store.bundle(source.rules_bundle).map_err(invalid)? {
+                            Some(meta) => match self.published_rules_bundle(store, &meta)? {
+                                Some(bundle) => Some(bundle),
+                                None => return Ok(None),
+                            },
+                            None => None,
+                        },
                     };
                     slot.insert(bundle)
                 }
@@ -361,7 +400,7 @@ impl AuthoringService {
         }
         entries.sort_by_key(|entry| (entry.rules_bundle, entry.rules_asset));
         validate_directory_rule_ids(&entries)?;
-        Ok(entries)
+        Ok(Some(entries))
     }
 
     /// The directory rules whose listing may match one of `paths`, found by
@@ -370,6 +409,7 @@ impl AuthoringService {
         &self,
         store: &StoreReader,
         paths: impl IntoIterator<Item = &'a str>,
+        fresh: &FreshRules,
     ) -> Result<Vec<DirectoryRuleEntry>, RpcFailure> {
         let dirs = paths
             .into_iter()
@@ -378,7 +418,7 @@ impl AuthoringService {
         let sources = store
             .directory_rule_sources_listing(dirs)
             .map_err(invalid)?;
-        self.directory_rule_entries(store, sources)
+        self.directory_rule_entries(store, sources, fresh)
     }
 
     /// Return every watched bundle whose complete committed read-set no longer
@@ -486,9 +526,13 @@ impl AuthoringService {
         // be in are read.
         let entries = if work.is_none() || capabilities_changed || refreshed.changed_rules {
             let sources = store.directory_rule_sources().map_err(invalid)?;
-            self.directory_rule_entries(&store, sources)?
+            self.directory_rule_entries(&store, sources, &refreshed.rules)?
         } else {
-            self.directory_rules_listing(&store, paths.iter().map(|(_, path)| path.as_str()))?
+            self.directory_rules_listing(
+                &store,
+                paths.iter().map(|(_, path)| path.as_str()),
+                &refreshed.rules,
+            )?
         };
         let mut backend =
             RootedImportBackend::over(compiled.scanner(), &store, &capabilities, overlay);
@@ -809,14 +853,24 @@ impl AuthoringService {
                 return Ok(true);
             }
         }
-        Ok(self
-            .directory_rules_listing(store, paths.iter().copied())?
+        let dirs = paths
             .iter()
-            .any(|entry| {
-                paths
-                    .iter()
-                    .any(|path| query_matches(&entry.rules.listing, path))
-            }))
+            .copied()
+            .flat_map(ancestor_dirs)
+            .collect::<BTreeSet<_>>();
+        let sources = store
+            .directory_rule_sources_listing(dirs)
+            .map_err(invalid)?;
+        // Rules that no longer read as published (a pass publishing them
+        // is running) may match anything.
+        let Some(entries) = self.published_rule_entries(store, sources, &FreshRules::new())? else {
+            return Ok(true);
+        };
+        Ok(entries.iter().any(|entry| {
+            paths
+                .iter()
+                .any(|path| query_matches(&entry.rules.listing, path))
+        }))
     }
 
     /// The (root, path) a pass import writes, as `store` holds it: what the
@@ -1918,6 +1972,19 @@ impl AuthoringService {
         }))
     }
 
+    /// `published_bundle` without its root, or `None` when its file changed
+    /// since it was published.
+    fn published_rules_bundle(
+        &self,
+        store: &StoreReader,
+        meta: &BundleMeta,
+    ) -> Result<Option<Bundle>, RpcFailure> {
+        match self.published_bundle_or_drift(store, meta)? {
+            Ok((_, bundle)) => Ok(Some(bundle)),
+            Err(_) => Ok(None),
+        }
+    }
+
     /// The published bundle `meta`, read from the scan and parsed, with its
     /// root's name. Every call reads and parses it.
     fn published_bundle(
@@ -1925,22 +1992,36 @@ impl AuthoringService {
         store: &StoreReader,
         meta: &BundleMeta,
     ) -> Result<(String, Bundle), RpcFailure> {
+        self.published_bundle_or_drift(store, meta)?.map_err(invalid)
+    }
+
+    /// `published_bundle`, with a file changed since it was published as
+    /// the inner `StoreError::Drifted`.
+    fn published_bundle_or_drift(
+        &self,
+        store: &StoreReader,
+        meta: &BundleMeta,
+    ) -> Result<Result<(String, Bundle), StoreError>, RpcFailure> {
         let root = store
             .root_name(meta.root)
             .map_err(invalid)?
             .ok_or_else(|| invalid("bundle root identity is missing"))?;
-        let source = self
+        let source = match self
             .compiled(store)?
             .scanner()
             .read_published_bundle(store, &root, &meta.path)
-            .map_err(invalid)?;
+        {
+            Ok(source) => source,
+            Err(drift @ StoreError::Drifted { .. }) => return Ok(Err(drift)),
+            Err(error) => return Err(invalid(error)),
+        };
         if source.file_hash.0 != meta.content_hash.0 {
             return Err(invalid(
                 "published scan does not match durable bundle metadata",
             ));
         }
         let bundle = source.parsed.map_err(invalid)?;
-        Ok((root, bundle))
+        Ok(Ok((root, bundle)))
     }
 
     /// `meta`'s import record, from the published scan.
