@@ -369,18 +369,6 @@ impl InputTxn<'_> {
         Ok(())
     }
 
-    /// Cache a schema by logical hash (§13's `schemas` — rebuilt from
-    /// bundle snapshots, never precious).
-    pub fn put_schema(&mut self, hash: LogicalHash, json: &str) -> Result<(), StoreError> {
-        self.txn
-            .prepare_cached(
-                "INSERT INTO schemas(logical_hash, schema_json) VALUES (?1, ?2)
-             ON CONFLICT(logical_hash) DO UPDATE SET schema_json = excluded.schema_json",
-            )?
-            .execute(rusqlite::params![hash.0.as_slice(), json])?;
-        Ok(())
-    }
-
     /// Publish the bundle-scoped poison row (§7, §13). Scope is decided
     /// by the caller-supplied **validated skeleton** parsed from the
     /// CURRENT malformed bytes — never by prior metadata: the skeleton's
@@ -1037,17 +1025,6 @@ impl StoreReader {
         )))
     }
 
-    /// Cached schema JSON by logical hash.
-    pub fn schema(&self, hash: LogicalHash) -> Result<Option<String>, StoreError> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT schema_json FROM schemas WHERE logical_hash = ?1",
-                [hash.0.as_slice()],
-                |r| r.get(0),
-            )
-            .optional()?)
-    }
 }
 
 macro_rules! bundle_columns {

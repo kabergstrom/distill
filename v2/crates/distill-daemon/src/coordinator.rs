@@ -434,15 +434,17 @@ impl DaemonCoordinator {
 
     /// Replace the compiled state the store's current version serves with
     /// `with` of it: tests install state no publication compiled.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     fn replace_compiled_for_test(&self, with: impl FnOnce(&Compiled) -> Compiled) {
         let reader = self.open_reader().expect("test reader");
         let current = self.compiled.at(&reader).expect("test compiled state");
         self.compiled.replace_for_test(with(&current));
     }
 
-    #[cfg(test)]
-    pub(crate) fn install_schema_authority_for_test(&self, authority: Arc<ProjectSchemaAuthority>) {
+    /// Test hook: serve `authority` as the compiled schema authority of the
+    /// current version, as a configuration with that schema would.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn install_schema_authority_for_test(&self, authority: Arc<ProjectSchemaAuthority>) {
         self.replace_compiled_for_test(|current| current.with_test_state(Some(authority), None, None));
     }
 
@@ -2512,15 +2514,6 @@ fn publish_scan(
                     .iter()
                     .map(String::as_str),
             )?;
-            for (hash, schema) in &bundle.schemas {
-                let snapshot =
-                    distill_schema::ngp_schema::snapshot_to_json(schema).map_err(|error| {
-                        StoreError::InvalidConfiguration {
-                            error: format!("cannot serialize verified schema {hash}: {error}"),
-                        }
-                    })?;
-                transaction.put_schema(*hash, &snapshot)?;
-            }
             for (local_id, entry) in &bundle.assets {
                 transaction.upsert_asset(&AssetRecord {
                     asset: entry.uuid,
@@ -2875,15 +2868,6 @@ fn publish_claimed(
                 .iter()
                 .map(String::as_str),
         )?;
-        for (hash, schema) in &bundle.schemas {
-            let snapshot =
-                distill_schema::ngp_schema::snapshot_to_json(schema).map_err(|error| {
-                    StoreError::InvalidConfiguration {
-                        error: format!("cannot serialize verified schema {hash}: {error}"),
-                    }
-                })?;
-            transaction.put_schema(*hash, &snapshot)?;
-        }
         for (local_id, entry) in &bundle.assets {
             transaction.upsert_asset(&AssetRecord {
                 asset: entry.uuid,

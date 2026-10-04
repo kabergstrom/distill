@@ -51,7 +51,6 @@ fn populate(store: &mut Store, count: u32) {
         .input_transaction(|txn| {
             let version = txn.version();
             let roots = [txn.intern_root("main")?, txn.intern_root("alt")?];
-            txn.put_schema(SCHEMA, "{}")?;
             for index in 0..count {
                 let root = roots[(index % 2) as usize];
                 let path = bundle_path(index);

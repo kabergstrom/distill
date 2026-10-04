@@ -2276,7 +2276,6 @@ mod query_tests {
         store
             .input_transaction(|txn| {
                 let root = txn.intern_root("main")?;
-                txn.put_schema(SCHEMA, "{}")?;
                 let paths = PATHS
                     .iter()
                     .map(|path| (*path).to_owned())

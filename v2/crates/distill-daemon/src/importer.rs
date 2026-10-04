@@ -27,7 +27,7 @@ use distill_json::AuthoredValue;
 use distill_rpc::{
     decode_authoring_payload, ImportRequest, InputVersion, PreparedImportCommit, RpcFailure,
 };
-use distill_schema::ngp_schema::{node_hash, snapshot_to_json, verify_snapshot, LogicalSchema};
+use distill_schema::ngp_schema::{node_hash, snapshot_to_json, LogicalSchema};
 use distill_store::bundles::{BundleMeta, DirectoryOrigin as StoredDirectoryOrigin};
 use distill_store::imports::{
     DirectoryRuleSource, ImportIndexSource, ImportReadKey, WatchedImport, WatchedImportFailure,
@@ -1483,7 +1483,7 @@ impl AuthoringService {
             )));
         }
         let (bundle, bytes) = self
-            .folded_bundle(store, &compiled, run_base, importer, destination, prior, request)
+            .folded_bundle(&compiled, run_base, importer, destination, prior, request)
             .map_err(ImportExecutionError::unmemoized)?;
         if store
             .bundle(bundle)
@@ -1516,13 +1516,12 @@ impl AuthoringService {
         Ok((compiled, bundle, bytes))
     }
 
-    /// The bundle a successful run folds to at `store`: its identity and
+    /// The bundle a successful run folds to: its identity and
     /// bytes. New identities are seeded by the run's base, so the fold is
     /// the same wherever the run publishes.
     #[allow(clippy::too_many_arguments)]
     fn folded_bundle(
         &self,
-        store: &StoreReader,
         compiled: &Compiled,
         run_base: InputVersion,
         importer: &RegisteredImporter,
@@ -1542,11 +1541,8 @@ impl AuthoringService {
             .or_else(|| prior.and_then(|prior| prior.model.record.origin.clone()));
         let folded = fold_import(prior.map(|prior| &prior.model), request, &mut ids)
             .map_err(|error| invalid(format!("import fold failed: {error:?}")))?;
-        let authority = self
-            .tag_index_coordinator()
-            .and_then(|_| compiled.schema_authority());
+        let authority = compiled.schema_authority();
         let bytes = build_import_bundle(
-            store,
             authority.as_deref(),
             importer,
             &folded,
@@ -1569,7 +1565,6 @@ impl AuthoringService {
         };
         let compiled = self.compiled(store)?;
         let (_, bytes) = self.folded_bundle(
-            store,
             &compiled,
             run.base,
             &run.importer,
@@ -2641,7 +2636,6 @@ fn dep_failure(dep: &FileDep) -> Option<&distill_build::trace::StableFailureFing
 }
 
 fn build_import_bundle(
-    store: &StoreReader,
     authority: Option<&distill_schema::ProjectSchemaAuthority>,
     importer: &RegisteredImporter,
     imported: &ImportedBundle,
@@ -2651,7 +2645,7 @@ fn build_import_bundle(
     let mut schemas = BTreeMap::new();
     let mut assets = BTreeMap::new();
     for (local_id, entry) in &imported.entries {
-        let (hash, schema) = current_type_schema(store, authority, entry.type_uuid)?;
+        let (hash, schema) = current_type_schema(authority, entry.type_uuid)?;
         assets.insert(
             local_id.clone(),
             AssetEntry {
@@ -2710,10 +2704,10 @@ fn build_import_bundle(
     distill_bundle::write_bundle(&bundle).map_err(invalid)
 }
 
-/// The current schema of an importer output type: the project schema's, else
-/// the published registry's hash with its cached snapshot.
+/// The current schema of an importer output type: the project schema's.
+/// The pipeline registers no schema of its own (its registry is the
+/// bootstrap control types and the project's), so any other type has none.
 fn current_type_schema(
-    store: &StoreReader,
     authority: Option<&distill_schema::ProjectSchemaAuthority>,
     type_uuid: TypeUuid,
 ) -> Result<(LogicalHash, LogicalSchema), RpcFailure> {
@@ -2722,19 +2716,10 @@ fn current_type_schema(
             "importer output cannot mint bootstrap control entries",
         ));
     }
-    if let Some(project) = authority.and_then(|authority| authority.project_type(type_uuid)) {
-        return Ok((project.logical_hash, project.logical_schema.clone()));
-    }
-    let hash = store
-        .ready_schema_hash(type_uuid)
-        .map_err(invalid)?
-        .ok_or_else(|| invalid(format!("output type {type_uuid} has no current schema")))?;
-    let snapshot = store
-        .schema(hash)
-        .map_err(invalid)?
-        .ok_or_else(|| invalid(format!("current schema {hash} is not cached")))?;
-    let schema = verify_snapshot(&snapshot, hash).map_err(invalid)?;
-    Ok((hash, schema))
+    authority
+        .and_then(|authority| authority.project_type(type_uuid))
+        .map(|project| (project.logical_hash, project.logical_schema.clone()))
+        .ok_or_else(|| invalid(format!("output type {type_uuid} has no current schema")))
 }
 
 fn validate_default_settings(

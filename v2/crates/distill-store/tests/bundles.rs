@@ -337,25 +337,6 @@ fn remove_bundle_cascades_to_assets_and_tags() {
     assert!(tagged(&store, "hero", None, false).unwrap().is_empty());
 }
 
-// ---- schema cache ----
-
-#[test]
-fn schema_cache_roundtrips() {
-    let (_d, mut store) = store();
-    let hash = LogicalHash([5u8; 32]);
-    store
-        .input_transaction(|txn| {
-            txn.put_schema(hash, "{\"kind\":\"struct\"}")?;
-            txn.put_schema(LogicalHash([4u8; 32]), "\"unit\"")
-        })
-        .unwrap();
-    assert_eq!(
-        store.schema(hash).unwrap().as_deref(),
-        Some("{\"kind\":\"struct\"}")
-    );
-    assert!(store.schema(LogicalHash([6u8; 32])).unwrap().is_none());
-}
-
 // ---- bundle-scoped poison rows (§7, §13) ----
 
 fn skeleton(root: RootId, entries: Vec<SkeletonEntry>) -> NamespaceSkeleton {

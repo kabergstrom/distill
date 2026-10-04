@@ -3,11 +3,9 @@ use std::sync::Arc;
 
 use distill_bundle::{AssetEntry, Bundle};
 use distill_core::bootstrap::{
-    bootstrap_control_logical_registry_v1, BootstrapControlSpecV1, BootstrapControlSymbol,
-    DIRECTORY_IMPORT_RULES_TYPE_UUID,
+    BootstrapControlSpecV1, BootstrapControlSymbol, DIRECTORY_IMPORT_RULES_TYPE_UUID,
 };
 use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
-use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
 use distill_daemon::coordinator::DaemonCoordinator;
 use distill_daemon::importer::{AuthoringImportContext, AuthoringImporter, AuthoringImporterError};
 use distill_daemon::scanner::AssetRoot;
@@ -17,12 +15,39 @@ use distill_rpc::{
     AuthoringBackend, AuthoringValue, Commit, ImportRequest, InputVersion, TargetDefinition,
     TargetDefinitionHash,
 };
-use distill_schema::ngp_schema::{node_hash, LogicalSchema, PrimitiveKind, SchemaNode};
-use distill_store::pipeline::ValidatedPipelineEpoch;
-use distill_store::state::PipelineEpoch;
+use distill_schema::ngp_schema::{
+    Field, FieldAttrs, FieldIdentifier, FieldLayout, LayoutIdentity, LogicalSchema, PrimitiveKind,
+    PrimitiveType, Schema, SchemaLayouts, SchemaNode, SchemaTypeId, TypeAttrs, TypeDef, TypeLayout,
+    TypePath,
+};
+use distill_schema::ProjectSchemaAuthority;
 use distill_store::StoreConfig;
 
 const TYPE_UUID: TypeUuid = TypeUuid([71; 16]);
+/// The importers' settings type: a `u8` the importer registers itself.
+const SETTINGS_TYPE_UUID: TypeUuid = TypeUuid([70; 16]);
+
+fn settings_schema() -> LogicalSchema {
+    LogicalSchema {
+        root: SchemaNode::Primitive(PrimitiveKind::U8),
+    }
+}
+
+/// The importers' output value: a `TYPE_UUID` struct of one `u8`.
+fn byte(value: u128) -> AuthoredValue {
+    AuthoredValue::Object(BTreeMap::from([("value".to_owned(), AuthoredValue::UInt(value))]))
+}
+
+/// The `u8` of an importer output value.
+fn byte_of(value: &AuthoredValue) -> Option<u128> {
+    match value {
+        AuthoredValue::Object(fields) => match fields.get("value") {
+            Some(AuthoredValue::UInt(value)) => Some(*value),
+            _ => None,
+        },
+        _ => None,
+    }
+}
 
 struct ByteImporter {
     schema: LogicalSchema,
@@ -38,7 +63,7 @@ impl AuthoringImporter for ByteImporter {
     }
 
     fn settings_type_uuid(&self) -> TypeUuid {
-        TYPE_UUID
+        SETTINGS_TYPE_UUID
     }
 
     fn settings_schema(&self) -> &LogicalSchema {
@@ -67,23 +92,23 @@ impl AuthoringImporter for ByteImporter {
             .map_err(|error| AuthoringImporterError::rejected(3, error.to_string()))?;
         let mut output = distill_build::import::ImportOutput::new();
         output
-            .entry("asset", TYPE_UUID, AuthoredValue::UInt(value.into()))
+            .entry("asset", TYPE_UUID, byte(value.into()))
             .map_err(|error| AuthoringImporterError::rejected(4, format!("{error:?}")))?;
         Ok(output)
     }
 }
 
 fn ordinary_bundle() -> (Vec<u8>, LogicalSchema, distill_core::id::LogicalHash) {
-    let schema = LogicalSchema {
-        root: SchemaNode::Primitive(PrimitiveKind::U8),
-    };
-    let schema_hash = node_hash(&schema.root).unwrap();
+    let authority = byte_authority();
+    let project = authority.project_type(TYPE_UUID).unwrap();
+    let schema = project.logical_schema.clone();
+    let schema_hash = project.logical_hash;
     let entry = AssetEntry {
         uuid: AssetUuid([72; 16]),
         type_uuid: TYPE_UUID,
         schema_hash,
         authoring_only: false,
-        data: AuthoredValue::UInt(1),
+        data: byte(1),
     };
     (
         distill_bundle::write_bundle(&Bundle {
@@ -103,32 +128,111 @@ fn target() -> TargetDefinition {
     TargetDefinition::new("dev", TargetDefinitionHash([4; 32]))
 }
 
-/// Publish a Ready pipeline epoch whose registry names `schema_hash` as the
-/// current schema of `TYPE_UUID`: importer outputs are written at it.
+/// Publish a version whose compiled schema authority names `schema_hash` as
+/// the current schema of `TYPE_UUID` (a project type of one byte), as a
+/// configuration with that schema would: importer outputs are written at
+/// it.
 fn publish_schema_registry(coordinator: &DaemonCoordinator, schema_hash: LogicalHash) {
     let mut writer = coordinator.open_writer().unwrap();
-    let mut schema_registry = bootstrap_control_logical_registry_v1().unwrap();
-    schema_registry.insert(TYPE_UUID, schema_hash);
-    let epoch = ValidatedPipelineEpoch::validate(PipelineEpoch {
-        dylib_hash: [9; 32],
-        target_set: CanonicalTargetSet::canonical(vec![TargetSetRow {
-            name: "dev".into(),
-            target_definition_hash: [4; 32],
-        }])
-        .unwrap(),
-        schema_registry,
-        registrations: Vec::new(),
-    })
-    .unwrap();
     let base = coordinator.server().current_stamp().unwrap().version;
     coordinator
         .coordinated_commit(&mut writer, base, |store| {
             store
-                .input_transaction(|transaction| transaction.publish_pipeline_epoch(&epoch))
+                .input_transaction(|_| Ok(()))
                 .map_err(|error| error.to_string())?;
             Ok(Commit::default())
         })
         .unwrap();
+    let authority = byte_authority();
+    assert_eq!(
+        authority.project_type(TYPE_UUID).unwrap().logical_hash,
+        schema_hash
+    );
+    coordinator.install_schema_authority_for_test(Arc::new(authority));
+}
+
+/// A project schema whose one asset type, `TYPE_UUID`, is a struct of one
+/// `u8` field `value`.
+fn type_def(
+    id: usize,
+    kind: PrimitiveType,
+    krate: &str,
+    name: &str,
+    uuid: Option<TypeUuid>,
+    fields: Vec<Field>,
+) -> TypeDef {
+    TypeDef {
+        id: SchemaTypeId(id),
+        kind,
+        path: TypePath {
+            name: Some(name.to_owned()),
+            containing_type: None,
+            modules: Vec::new(),
+            krate: krate.to_owned(),
+        },
+        uuid,
+        attrs: TypeAttrs::default(),
+        fields,
+        generic_parameters: Vec::new(),
+        generic_argument_ids: Vec::new(),
+        has_default: true,
+        generic_const_arguments: Vec::new(),
+        has_explicit_discriminants: false,
+    }
+}
+
+fn byte_authority() -> ProjectSchemaAuthority {
+    ProjectSchemaAuthority::from_schema(
+        Schema {
+            source_hashes: BTreeMap::new(),
+            type_ops_hash: String::new(),
+            layout_hashes: Default::default(),
+            rustc_version: String::new(),
+            types: vec![
+                type_def(
+                    0,
+                    PrimitiveType::Struct,
+                    "game",
+                    "Byte",
+                    Some(TYPE_UUID),
+                    vec![Field {
+                        id: FieldIdentifier::Name("value".to_owned()),
+                        type_id: SchemaTypeId(1),
+                        attrs: FieldAttrs::default(),
+                    }],
+                ),
+                type_def(1, PrimitiveType::U8, "core", "u8", None, Vec::new()),
+            ],
+            layouts: vec![SchemaLayouts {
+                identity: LayoutIdentity {
+                    target_triple: "x86_64-unknown-linux-gnu".into(),
+                    rustc: "rustc test".into(),
+                    algorithm_version: 1,
+                },
+                layouts: vec![
+                    TypeLayout {
+                        size: Some(1),
+                        align: Some(1),
+                        layout_complete: true,
+                        tag_encoding: None,
+                        fields: vec![FieldLayout {
+                            offset: Some(0),
+                            field_size: Some(1),
+                        }],
+                    },
+                    TypeLayout {
+                        size: Some(1),
+                        align: Some(1),
+                        layout_complete: true,
+                        tag_encoding: None,
+                        fields: Vec::new(),
+                    },
+                ],
+            }],
+        },
+        [10; 32],
+    )
+    .unwrap()
 }
 
 /// The watched-import failures a runtime client polls, as (path, message).
@@ -233,7 +337,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     let temp = tempfile::tempdir().unwrap();
     let assets = temp.path().join("assets");
     std::fs::create_dir_all(&assets).unwrap();
-    let (ordinary, schema, schema_hash) = ordinary_bundle();
+    let (ordinary, _, schema_hash) = ordinary_bundle();
     std::fs::write(assets.join("ordinary.bundle"), ordinary).unwrap();
     std::fs::write(assets.join("source.txt"), b"7").unwrap();
     let coordinator = DaemonCoordinator::open(
@@ -250,7 +354,9 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
 
     coordinator
         .authoring_service()
-        .register_importer(Arc::new(ByteImporter { schema }))
+        .register_importer(Arc::new(ByteImporter {
+            schema: settings_schema(),
+        }))
         .unwrap();
     let backend = Arc::clone(coordinator.authoring_service());
     let imported_bundle = Arc::new(std::sync::Mutex::new(None));
@@ -281,7 +387,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     let path = assets.join("imported.bundle");
     let first = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
     let first_asset = first.assets["asset"].uuid;
-    assert_eq!(first.assets["asset"].data, AuthoredValue::UInt(7));
+    assert_eq!(first.assets["asset"].data, byte(7));
     assert_eq!(first.assets["$settings"].data, AuthoredValue::UInt(3));
     assert!(first.assets.contains_key("$record"));
     assert!(coordinator.authoring_service().watched_imports_needing_reimport(&mut writer)
@@ -307,7 +413,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     let second = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(second.uuid, imported_bundle);
     assert_eq!(second.assets["asset"].uuid, first_asset);
-    assert_eq!(second.assets["asset"].data, AuthoredValue::UInt(8));
+    assert_eq!(second.assets["asset"].data, byte(8));
     assert_eq!(second.assets["$settings"].data, AuthoredValue::UInt(3));
     assert_eq!(
         coordinator.open_reader().unwrap().input_version().unwrap(),
@@ -370,7 +476,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
         .unwrap()
         .is_none());
     let healed = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
-    assert_eq!(healed.assets["asset"].data, AuthoredValue::UInt(9));
+    assert_eq!(healed.assets["asset"].data, byte(9));
     assert!(import_failures(&coordinator).is_empty());
     assert_eq!(
         coordinator.open_reader().unwrap().input_version().unwrap(),
@@ -410,7 +516,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
         vec![imported_bundle]
     );
     let healed = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
-    assert_eq!(healed.assets["asset"].data, AuthoredValue::UInt(10));
+    assert_eq!(healed.assets["asset"].data, byte(10));
     assert_eq!(
         coordinator.open_reader().unwrap().input_version().unwrap(),
         InputVersion(11)
@@ -422,7 +528,7 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
     let temp = tempfile::tempdir().unwrap();
     let assets = temp.path().join("assets");
     std::fs::create_dir_all(&assets).unwrap();
-    let (ordinary, schema, schema_hash) = ordinary_bundle();
+    let (ordinary, _, schema_hash) = ordinary_bundle();
     std::fs::write(assets.join("ordinary.bundle"), ordinary).unwrap();
     std::fs::write(assets.join("rules.bundle"), directory_rules_bundle()).unwrap();
     std::fs::write(assets.join("foo.src"), b"9").unwrap();
@@ -438,14 +544,16 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
     publish_schema_registry(&coordinator, schema_hash);
     coordinator
         .authoring_service()
-        .register_importer(Arc::new(ByteImporter { schema }))
+        .register_importer(Arc::new(ByteImporter {
+            schema: settings_schema(),
+        }))
         .unwrap();
 
     let imported = coordinator.reconcile_directory_imports(&mut writer).unwrap();
     assert_eq!(imported.len(), 1);
     let generated_path = assets.join("foo.bundle");
     let generated = distill_bundle::parse_bundle(&std::fs::read(&generated_path).unwrap()).unwrap();
-    assert_eq!(generated.assets["asset"].data, AuthoredValue::UInt(9));
+    assert_eq!(generated.assets["asset"].data, byte(9));
     assert_eq!(generated.assets["$settings"].data, AuthoredValue::UInt(5));
     let meta = coordinator
         .open_reader()
@@ -552,7 +660,7 @@ fn watched_imports_defer_while_their_importer_is_unregistered() {
     let temp = tempfile::tempdir().unwrap();
     let assets = temp.path().join("assets");
     std::fs::create_dir_all(&assets).unwrap();
-    let (ordinary, schema, schema_hash) = ordinary_bundle();
+    let (ordinary, _, schema_hash) = ordinary_bundle();
     std::fs::write(assets.join("ordinary.bundle"), ordinary).unwrap();
     std::fs::write(assets.join("source.txt"), b"7").unwrap();
     let open = || {
@@ -572,7 +680,7 @@ fn watched_imports_defer_while_their_importer_is_unregistered() {
         coordinator
             .authoring_service()
             .register_importer(Arc::new(ByteImporter {
-                schema: schema.clone(),
+                schema: settings_schema(),
             }))
             .unwrap();
         let backend = Arc::clone(coordinator.authoring_service());
@@ -609,6 +717,8 @@ fn watched_imports_defer_while_their_importer_is_unregistered() {
     // Restart with the source edited and no importer registered.
     std::fs::write(assets.join("source.txt"), b"8").unwrap();
     let coordinator = open();
+    // The schema authority is the configuration's, compiled again on open.
+    coordinator.install_schema_authority_for_test(Arc::new(byte_authority()));
     let mut writer = coordinator.open_writer().unwrap();
     coordinator.reconcile_full_scan(&mut writer).unwrap();
     assert_eq!(
@@ -620,7 +730,7 @@ fn watched_imports_defer_while_their_importer_is_unregistered() {
     );
     assert!(coordinator.reconcile_watched_imports(&mut writer).unwrap().is_empty());
     let unchanged = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
-    assert_eq!(unchanged.assets["asset"].data, AuthoredValue::UInt(7));
+    assert_eq!(unchanged.assets["asset"].data, byte(7));
     assert!(
         coordinator
             .open_reader()
@@ -633,14 +743,16 @@ fn watched_imports_defer_while_their_importer_is_unregistered() {
 
     coordinator
         .authoring_service()
-        .register_importer(Arc::new(ByteImporter { schema }))
+        .register_importer(Arc::new(ByteImporter {
+            schema: settings_schema(),
+        }))
         .unwrap();
     assert_eq!(
         coordinator.reconcile_watched_imports(&mut writer).unwrap(),
         vec![imported_bundle]
     );
     let healed = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
-    assert_eq!(healed.assets["asset"].data, AuthoredValue::UInt(8));
+    assert_eq!(healed.assets["asset"].data, byte(8));
 }
 
 /// Reverting a broken source to its last good content retries the import on
@@ -651,7 +763,7 @@ fn reverting_a_failed_watched_import_clears_its_failure_incrementally() {
     let temp = tempfile::tempdir().unwrap();
     let assets = temp.path().join("assets");
     std::fs::create_dir_all(&assets).unwrap();
-    let (ordinary, schema, schema_hash) = ordinary_bundle();
+    let (ordinary, _, schema_hash) = ordinary_bundle();
     std::fs::write(assets.join("ordinary.bundle"), ordinary).unwrap();
     std::fs::write(assets.join("source.txt"), b"7").unwrap();
     let coordinator = DaemonCoordinator::open(
@@ -666,7 +778,9 @@ fn reverting_a_failed_watched_import_clears_its_failure_incrementally() {
     publish_schema_registry(&coordinator, schema_hash);
     coordinator
         .authoring_service()
-        .register_importer(Arc::new(ByteImporter { schema }))
+        .register_importer(Arc::new(ByteImporter {
+            schema: settings_schema(),
+        }))
         .unwrap();
     let backend = Arc::clone(coordinator.authoring_service());
     let base = coordinator.server().current_stamp().unwrap().version;
@@ -765,7 +879,7 @@ impl AuthoringImporter for PacedImporter {
     }
 
     fn settings_type_uuid(&self) -> TypeUuid {
-        TYPE_UUID
+        SETTINGS_TYPE_UUID
     }
 
     fn settings_schema(&self) -> &LogicalSchema {
@@ -811,7 +925,7 @@ fn imported_sources(
     let temp = tempfile::tempdir().unwrap();
     let assets = temp.path().join("assets");
     std::fs::create_dir_all(&assets).unwrap();
-    let (ordinary, schema, schema_hash) = ordinary_bundle();
+    let (ordinary, _, schema_hash) = ordinary_bundle();
     std::fs::write(assets.join("ordinary.bundle"), ordinary).unwrap();
     std::fs::write(assets.join("rules.bundle"), directory_rules_bundle()).unwrap();
     std::fs::write(assets.join("other.txt"), b"7").unwrap();
@@ -830,7 +944,7 @@ fn imported_sources(
     publish_schema_registry(&coordinator, schema_hash);
     coordinator
         .authoring_service()
-        .register_importer(Arc::new(importer(schema)))
+        .register_importer(Arc::new(importer(settings_schema())))
         .unwrap();
     assert_eq!(
         coordinator.reconcile_directory_imports(&mut writer).unwrap().len(),
@@ -869,10 +983,8 @@ fn generated_values(
             let hash = hash?;
             let bytes = std::fs::read(assets.join(format!("{stem}.bundle"))).unwrap();
             assert_eq!(*blake3::hash(&bytes).as_bytes(), hash.0, "{stem}.bundle is the published file");
-            match distill_bundle::parse_bundle(&bytes).unwrap().assets["asset"].data {
-                AuthoredValue::UInt(value) => Some(value),
-                ref other => panic!("unexpected value {other:?}"),
-            }
+            let data = &distill_bundle::parse_bundle(&bytes).unwrap().assets["asset"].data;
+            Some(byte_of(data).unwrap_or_else(|| panic!("unexpected value {data:?}")))
         })
         .collect()
 }
@@ -1150,7 +1262,7 @@ impl AuthoringImporter for ChainImporter {
     }
 
     fn settings_type_uuid(&self) -> TypeUuid {
-        TYPE_UUID
+        SETTINGS_TYPE_UUID
     }
 
     fn settings_schema(&self) -> &LogicalSchema {
@@ -1173,16 +1285,11 @@ impl AuthoringImporter for ChainImporter {
             }
             let bytes = context.read(&source.path)?;
             let source_value = if source.path.ends_with(".bundle") {
-                match distill_bundle::parse_bundle(&bytes)
-                    .map_err(|error| AuthoringImporterError::rejected(5, format!("{error:?}")))?
-                    .assets["asset"]
-                    .data
-                {
-                    AuthoredValue::UInt(value) => value,
-                    ref other => {
-                        return Err(AuthoringImporterError::rejected(6, format!("{other:?}")))
-                    }
-                }
+                let bundle = distill_bundle::parse_bundle(&bytes)
+                    .map_err(|error| AuthoringImporterError::rejected(5, format!("{error:?}")))?;
+                let data = &bundle.assets["asset"].data;
+                byte_of(data)
+                    .ok_or_else(|| AuthoringImporterError::rejected(6, format!("{data:?}")))?
             } else {
                 std::str::from_utf8(&bytes)
                     .ok()
@@ -1193,7 +1300,7 @@ impl AuthoringImporter for ChainImporter {
         }
         let mut output = distill_build::import::ImportOutput::new();
         output
-            .entry("asset", TYPE_UUID, AuthoredValue::UInt(value + 1))
+            .entry("asset", TYPE_UUID, byte(value + 1))
             .map_err(|error| AuthoringImporterError::rejected(4, format!("{error:?}")))?;
         Ok(output)
     }
@@ -1240,10 +1347,9 @@ fn chain_import(coordinator: &DaemonCoordinator, assets: &std::path::Path, dest:
 /// every level reads the output of the one before.
 fn chained_imports(stems: &[&str]) -> (tempfile::TempDir, std::path::PathBuf, DaemonCoordinator) {
     let (temp, assets, coordinator) = imported_sources(&[("a", "1")], PacedImporter::new);
-    let (_, schema, _) = ordinary_bundle();
     coordinator
         .authoring_service()
-        .register_importer(Arc::new(ChainImporter { schema }))
+        .register_importer(Arc::new(ChainImporter { schema: settings_schema() }))
         .unwrap();
     let mut previous = "a".to_owned();
     for stem in stems {
@@ -1416,7 +1522,7 @@ fn import_index_pages(filler: usize) -> u64 {
             type_uuid: TYPE_UUID,
             schema_hash,
             authoring_only: false,
-            data: AuthoredValue::UInt(1),
+            data: byte(1),
         };
         let bytes = distill_bundle::write_bundle(&Bundle {
             format_version: 1,
@@ -1466,7 +1572,7 @@ fn a_failed_rpc_reimport_commits_only_its_memo() {
     let temp = tempfile::tempdir().unwrap();
     let assets = temp.path().join("assets");
     std::fs::create_dir_all(&assets).unwrap();
-    let (ordinary, schema, schema_hash) = ordinary_bundle();
+    let (ordinary, _, schema_hash) = ordinary_bundle();
     std::fs::write(assets.join("ordinary.bundle"), ordinary).unwrap();
     std::fs::write(assets.join("source.txt"), b"7").unwrap();
     let coordinator = DaemonCoordinator::open(
@@ -1481,7 +1587,9 @@ fn a_failed_rpc_reimport_commits_only_its_memo() {
     publish_schema_registry(&coordinator, schema_hash);
     coordinator
         .authoring_service()
-        .register_importer(Arc::new(ByteImporter { schema }))
+        .register_importer(Arc::new(ByteImporter {
+            schema: settings_schema(),
+        }))
         .unwrap();
     let backend = Arc::clone(coordinator.authoring_service());
     let base = coordinator.server().current_stamp().unwrap().version;

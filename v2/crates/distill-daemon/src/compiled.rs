@@ -149,7 +149,7 @@ impl Compiled {
         &self.roots
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn with_test_state(
         &self,
         authority: Option<Arc<ProjectSchemaAuthority>>,
@@ -303,7 +303,7 @@ impl CompiledRegistry {
 
     /// Replace the entry of `entry`'s key in place: tests install state no
     /// publication compiled.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn replace_for_test(&self, entry: Compiled) {
         let entry = Arc::new(entry);
         self.entries().slots.insert(
