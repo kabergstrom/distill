@@ -13,7 +13,7 @@ use distill_bundle::Bundle;
 use distill_core::id::ContentHash;
 use distill_json::AuthoredValue;
 use distill_rpc::{
-    AuthoringProgressEvent, AuthoringProgressState, Commit, DeferredOperation,
+    AuthoringProgressEvent, AuthoringProgressState, DeferredOperation,
     DeferredOperationResult, DoctorRequest, InputVersion, LongRunningOp, PreparedOperationCommit,
     RenameWithFixupsRequest, ReportOperation, ReportSnapshot, RpcFailure, WriteReceipt, WrittenFile,
 };
