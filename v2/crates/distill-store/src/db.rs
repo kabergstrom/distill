@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 54;
+pub const SCHEMA_VERSION: u32 = 55;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -68,7 +68,8 @@ CREATE UNIQUE INDEX files_by_canonical ON files(canonical_path)
     WHERE canonical_path IS NOT NULL;
 -- What each scanned bundle claims (bundle and asset UUIDs, derived
 -- outputs, primary paths, malformed skeletons), keyed
--- by the claiming source. See `claims`.
+-- by the claiming source. See `claims`. A derived output is its one
+-- claim (kind 2) while neither it nor its parent is withheld.
 CREATE TABLE source_claims (
     root_id  INTEGER NOT NULL,
     path     TEXT NOT NULL,
@@ -277,12 +278,6 @@ CREATE TABLE result_outputs (
         REFERENCES results(key_kind, static_key, trace_digest) ON DELETE CASCADE
 ) WITHOUT ROWID;
 CREATE INDEX result_outputs_by_hash ON result_outputs(content_hash);
-CREATE TABLE derived_outputs (
-    child_uuid  BLOB NOT NULL PRIMARY KEY,
-    parent_uuid BLOB NOT NULL,
-    output_key  TEXT NOT NULL,
-    terminal_type BLOB
-);
 CREATE TABLE cas_extents (
     content_hash BLOB NOT NULL PRIMARY KEY,
     segment      INTEGER NOT NULL,

@@ -1863,7 +1863,7 @@ impl Snapshot {
             return done(RpcResult::ConfigurationFailed(error));
         }
         let snapshot = txn.snapshot();
-        let derived = snapshot.served_derived_output(uuid)?;
+        let derived = snapshot.derived_output(uuid)?;
         let authoring_uuid = derived.as_ref().map_or(uuid, |output| output.parent);
         let meta = snapshot.served_entry_meta(authoring_uuid)?;
         if meta.as_ref().is_some_and(|meta| meta.authoring_only) {

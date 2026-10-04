@@ -23,7 +23,7 @@ use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, TypeU
 use distill_rpc::{
     AssetDeltaState, AssetMutation, AuthoringEntry, AuthoringEntryRole, AuthoringMutation,
     Commit, ConfigurationError, ConfigurationStatus, CoordinatedCommitError,
-    DerivedOutputEntry, DerivedOutputMutation, PathMutation, PipelineDiagnostic,
+    PathMutation, PipelineDiagnostic,
     Server, ServerHandle, SnapshotStamp, TargetDefinition, NamespaceError,
     RpcFailure, NamespaceErrorV1,
 };
@@ -1846,18 +1846,6 @@ fn incremental_plan(
         }
         bundles.insert(bundle, source);
     }
-    let mut derived_outputs = BTreeMap::new();
-    for child in pending.derived {
-        let output = match reader.derived_output_claims(child)?.as_slice() {
-            [output] if !withheld.asset(&child) && !withheld.asset(&output.parent) => Some(DerivedOutputEntry {
-                parent: output.parent,
-                output_key: output.output_key.clone(),
-                terminal_type: output.terminal_type,
-            }),
-            _ => None,
-        };
-        derived_outputs.insert(child, output);
-    }
     let paths = pending
         .paths
         .into_iter()
@@ -1872,7 +1860,6 @@ fn incremental_plan(
         withheld,
         bundles,
         bundle_poisons,
-        derived_outputs,
         paths,
     })
 }
@@ -1882,7 +1869,6 @@ struct IncrementalScanPlan {
     withheld: Withheld,
     bundles: BTreeMap<BundleUuid, Option<Arc<ScannedBundle>>>,
     bundle_poisons: BTreeMap<BundleUuid, ScopedBundlePoison>,
-    derived_outputs: BTreeMap<AssetUuid, Option<DerivedOutputEntry>>,
     paths: BTreeMap<String, BTreeSet<AssetUuid>>,
 }
 
@@ -2001,18 +1987,13 @@ impl ScanCandidate {
     }
 }
 
-fn projected_derived_outputs(
+/// The asset UUID collisions among `candidate`'s authored assets and
+/// their derived outputs.
+fn derived_collisions(
     candidate: &ScanCandidate,
     projection: &PipelineProjection,
-) -> Result<
-    (
-        BTreeMap<AssetUuid, DerivedOutputEntry>,
-        Vec<NamespaceError>,
-    ),
-    StoreError,
-> {
+) -> Result<Vec<NamespaceError>, StoreError> {
     let mut claims = BTreeMap::<AssetUuid, Vec<AssetClaimant>>::new();
-    let mut outputs = BTreeMap::<AssetUuid, DerivedOutputEntry>::new();
     for source in candidate.scan.bundle_rows() {
         let Ok(bundle) = &source.parsed else {
             continue;
@@ -2032,12 +2013,6 @@ fn projected_derived_outputs(
                     output_key: output.output_key.clone(),
                 };
                 claims.entry(child).or_default().push(claimant);
-                if let Some(existing) = outputs.insert(child, output.clone()) {
-                    if existing != output {
-                        // The claimant table below publishes the collision,
-                        // which withholds the child.
-                    }
-                }
             }
         }
     }
@@ -2062,7 +2037,6 @@ fn projected_derived_outputs(
                     output_key: output.output_key.clone(),
                 };
                 claims.entry(child).or_default().push(claimant);
-                outputs.insert(child, output);
             }
         }
     }
@@ -2083,7 +2057,7 @@ fn projected_derived_outputs(
             );
         }
     }
-    Ok((outputs, errors))
+    Ok(errors)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2266,7 +2240,7 @@ fn publish_scan(
     authority: Option<&ProjectSchemaAuthority>,
     claims: &[SourceClaims],
 ) -> Result<Commit, StoreError> {
-    let (derived_outputs, derived_errors) = projected_derived_outputs(&candidate, projection)?;
+    let derived_errors = derived_collisions(&candidate, projection)?;
     candidate.namespace_errors = NamespaceError::canonical_set(
         std::mem::take(&mut candidate.namespace_errors)
             .into_iter()
@@ -2276,10 +2250,6 @@ fn publish_scan(
         error: format!("invalid namespace error: {error}"),
     })?;
     let withheld = Withheld::new(&candidate.namespace_errors, candidate.scan.bundle_rows());
-    let derived_outputs = derived_outputs
-        .into_iter()
-        .filter(|(child, output)| !withheld.asset(child) && !withheld.asset(&output.parent))
-        .collect::<BTreeMap<_, _>>();
     let published = candidate
         .scan
         .bundles
@@ -2416,15 +2386,6 @@ fn publish_scan(
             }
         }
         transaction.set_namespace_errors(candidate.namespace_errors.iter().cloned())?;
-        transaction.clear_derived_outputs()?;
-        for (child, output) in &derived_outputs {
-            transaction.set_derived_output(
-                *child,
-                output.parent,
-                &output.output_key,
-                output.terminal_type,
-            )?;
-        }
 
         configuration = transaction.publish_configuration_status(generation)?;
         match pipeline {
@@ -2836,21 +2797,6 @@ fn publish_claimed(
         }
         if let Some(primary) = &bundle.primary {
             transaction.set_primary_asset(bundle.uuid, bundle.assets[primary].uuid)?;
-        }
-    }
-    for (child, current) in &plan.derived_outputs {
-        match current {
-            Some(entry) => {
-                transaction.set_derived_output(
-                    *child,
-                    entry.parent,
-                    &entry.output_key,
-                    entry.terminal_type,
-                )?
-            }
-            None => {
-                transaction.remove_derived_output(*child)?;
-            }
         }
     }
     Ok(commit)

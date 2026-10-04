@@ -80,7 +80,6 @@ pub struct SourceClaims {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PendingClaims {
     pub bundles: BTreeSet<BundleUuid>,
-    pub derived: BTreeSet<AssetUuid>,
     pub paths: BTreeSet<String>,
 }
 
@@ -276,12 +275,6 @@ fn asset_dependents_pending(
             pending.bundles.insert(bundle);
         }
     }
-    let derived = conn
-        .prepare_cached("SELECT 1 FROM source_claims WHERE kind = ?1 AND subject = ?2 LIMIT 1")?
-        .exists(rusqlite::params![DERIVED, asset])?;
-    if derived {
-        pending.derived.insert(AssetUuid(uuid16(asset)?));
-    }
     let mut paths = conn.prepare_cached(
         "SELECT subject FROM source_claims WHERE kind = ?1 AND claimant = ?2",
     )?;
@@ -365,9 +358,6 @@ impl InputTxn<'_> {
             match *kind {
                 BUNDLE => {
                     pending.bundles.insert(BundleUuid(uuid16(subject)?));
-                }
-                DERIVED => {
-                    pending.derived.insert(AssetUuid(uuid16(subject)?));
                 }
                 PRIMARY_PATH => {
                     pending.paths.insert(path_subject(subject.clone())?);

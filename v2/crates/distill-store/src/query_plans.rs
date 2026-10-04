@@ -646,6 +646,76 @@ fn generating_rules_pages(generated: u32) -> u64 {
     })
 }
 
+/// Pages a derived child's and a missing asset's resolution fetch over
+/// `count` claiming sources, each authoring one asset with one derived
+/// output; every tenth source shares its bundle UUID with the next, so
+/// bundle collisions are common.
+fn derived_resolution_pages(count: u32) -> u64 {
+    use crate::claims::{DerivedOutputClaim, SourceClaim, SourceClaims};
+    use crate::state::{AssetClaimant, ReadableBundleSource};
+    use distill_core::id::BundleFileHash;
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(StoreConfig::new(dir.path().join(".distill"))).unwrap();
+    let sources = (0..count)
+        .map(|index| {
+            let path = bundle_path(index);
+            let bundle = bundle_uuid(if index % 10 == 0 { index + 1 } else { index });
+            let readable = ReadableBundleSource {
+                root_name: "main".to_owned(),
+                normalized_path: path.clone(),
+                file_hash: BundleFileHash([0; 32]),
+            };
+            let parent = asset_uuid(index, 1);
+            SourceClaims {
+                root_name: "main".to_owned(),
+                path,
+                claims: vec![
+                    SourceClaim::Bundle { bundle, source: readable.clone() },
+                    SourceClaim::Authored {
+                        asset: parent,
+                        claimant: AssetClaimant::Authored {
+                            source: readable,
+                            bundle,
+                            local_id: "main".to_owned(),
+                        },
+                    },
+                    SourceClaim::DerivedOutput {
+                        child: AssetUuid::v5(parent, "meta"),
+                        output: DerivedOutputClaim {
+                            parent,
+                            output_key: "meta".to_owned(),
+                            terminal_type: RUNTIME_TYPE,
+                        },
+                    },
+                ],
+            }
+        })
+        .collect::<Vec<_>>();
+    store
+        .input_transaction(|txn| txn.replace_source_claims(None, &sources))
+        .unwrap();
+    let reader = store.reader().unwrap();
+    let served = AssetUuid::v5(asset_uuid(42, 1), "meta");
+    // Source 41 shares its bundle UUID with source 40: its child is withheld.
+    let withheld = AssetUuid::v5(asset_uuid(41, 1), "meta");
+    pages(&reader, || {
+        assert!(reader.derived_output(served).unwrap().is_some());
+        assert!(reader.derived_output(withheld).unwrap().is_none());
+        assert!(reader.asset_resolution(asset_uuid(count + 7, 1)).unwrap().is_none());
+    })
+}
+
+/// A derived child resolves by point reads of its claims and the errors
+/// that would withhold it and its parent, however many sources claim.
+#[test]
+fn a_derived_child_resolves_by_point_reads() {
+    let few = derived_resolution_pages(1_000);
+    let many = derived_resolution_pages(20_000);
+    // Thirteen index searches, each at most an index level or two deeper
+    // (51 and 69 pages when measured); a scan would fetch thousands.
+    assert!(many <= few + 24, "{few} {many}");
+}
+
 /// Which rules bundles generated bundles name is found once per edit of a
 /// bundle source: one seek per rules bundle, however many bundles each
 /// generated.
@@ -1680,7 +1750,7 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         "SEARCH source_claims USING INDEX source_claims_by_subject (kind=? AND subject=?)",
         "USE TEMP B-TREE FOR DISTINCT",
     ];
-    let cases: [(&str, &[&str]); 21] = [
+    let cases: [(&str, &[&str]); 20] = [
         // A full replacement streams the claims (a whole-namespace pass)
         // and deletes the stale ones by key.
         ("SELECT root_id, path, kind, subject, claimant, detail FROM source_claims", &["SCAN source_claims"]),
@@ -1734,10 +1804,6 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         (
             "SELECT subject FROM source_claims WHERE kind",
             &["SEARCH source_claims USING INDEX source_claims_by_claimant (claimant=? AND kind=?)"],
-        ),
-        (
-            "SELECT 1 FROM source_claims WHERE kind",
-            &["SEARCH source_claims USING COVERING INDEX source_claims_by_subject (kind=? AND subject=?)"],
         ),
         // A full replacement's held collisions, and a resolved one's row.
         (
@@ -2179,7 +2245,7 @@ fn cas_and_served_point_statements_search_their_keys() {
     store.asset_resolution(asset).unwrap();
     // A missing asset reads its collisions too.
     store.asset_resolution(asset_uuid(200, 1)).unwrap();
-    store.served_derived_output(asset).unwrap();
+    store.derived_output(asset).unwrap();
     store.served_path_candidates(&bundle_path(42)).unwrap();
     store.served_named_candidates(&bundle_path(42), "main").unwrap();
     store.rpc_target("pc").unwrap();
@@ -2297,13 +2363,13 @@ fn cas_and_served_point_statements_search_their_keys() {
             "SELECT name, definition_hash, generation FROM rpc_targets WHERE name = ?",
             &["SEARCH rpc_targets USING INDEX sqlite_autoindex_rpc_targets_1 (name=?)"],
         ),
+        // A derived child: its claims (then its and its parent's errors).
         (
-            "SELECT parent_uuid, output_key FROM derived_outputs WHERE child_uuid = ?",
-            &["SEARCH derived_outputs USING INDEX sqlite_autoindex_derived_outputs_1 (child_uuid=?)"],
-        ),
-        (
-            "SELECT parent_uuid, output_key, terminal_type FROM derived_outputs WHERE child_uuid = ? AND terminal_type IS NOT NULL",
-            &["SEARCH derived_outputs USING INDEX sqlite_autoindex_derived_outputs_1 (child_uuid=?)"],
+            "SELECT DISTINCT claimant, detail FROM source_claims WHERE kind = ? AND subject = ?",
+            &[
+                "SEARCH source_claims USING INDEX source_claims_by_subject (kind=? AND subject=?)",
+                "USE TEMP B-TREE FOR DISTINCT",
+            ],
         ),
         (
             "SELECT segment, offset, len FROM cas_extents WHERE content_hash = ?",

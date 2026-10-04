@@ -2,8 +2,8 @@
 //! from, as current-state rows.
 //!
 //! The namespace itself is the ordinary `bundles` / `assets` / `asset_tags`
-//! / `schemas` / `derived_outputs` rows. This module adds the
-//! served-only facts next to them: explicit resolutions, the change log that
+//! / `schemas` rows and the derived outputs `source_claims` names. This
+//! module adds the served-only facts next to them: the change log that
 //! subscriptions and reconnect fences read, the RPC target generations, the
 //! published pipeline diagnostic, and the typed load
 //! edges of stored artifacts.
@@ -74,14 +74,6 @@ pub(crate) const ASSET_BUNDLE_COLLISION: &str = "SELECT e.message FROM source_cl
      CROSS JOIN source_claims b ON b.root_id = a.root_id AND b.path = a.path AND b.kind = 0
      CROSS JOIN errors e ON e.scope_kind = 2 AND e.scope_id = b.subject AND e.family = ?2
      WHERE a.kind = 1 AND a.subject = ?1 LIMIT 1";
-
-/// One served derived-output row.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DerivedOutputRow {
-    pub parent: AssetUuid,
-    pub output_key: String,
-    pub terminal_type: TypeUuid,
-}
 
 /// One `change_log` payload. Reason and state codes belong to the RPC layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -339,37 +331,25 @@ impl StoreReader {
         {
             return Ok(Some(poison.map_or(AssetResolution::Published, AssetResolution::Failed)));
         }
+        Ok(self.withholding(asset)?.map(AssetResolution::Failed))
+    }
+
+    /// The namespace error withholding `asset`: its own UUID's collision,
+    /// else its bundle UUID's.
+    pub(crate) fn withholding(&self, asset: AssetUuid) -> Result<Option<String>, StoreError> {
         for sql in [ASSET_COLLISION, ASSET_BUNDLE_COLLISION] {
             if let Some(message) = self
                 .conn
                 .prepare_cached(sql)?
-                .query_row(rusqlite::params![id, crate::errors::NAMESPACE], |row| row.get(0))
+                .query_row(rusqlite::params![asset.0.as_slice(), crate::errors::NAMESPACE], |row| {
+                    row.get(0)
+                })
                 .optional()?
             {
-                return Ok(Some(AssetResolution::Failed(message)));
+                return Ok(Some(message));
             }
         }
         Ok(None)
-    }
-
-    /// One served derived-output row.
-    pub fn served_derived_output(
-        &self,
-        child: AssetUuid,
-    ) -> Result<Option<DerivedOutputRow>, StoreError> {
-        let mut statement = self.conn.prepare_cached(
-            "SELECT parent_uuid, output_key, terminal_type FROM derived_outputs
-             WHERE child_uuid = ?1 AND terminal_type IS NOT NULL",
-        )?;
-        Ok(statement
-            .query_row([child.0.as_slice()], |row| {
-                Ok(DerivedOutputRow {
-                    parent: AssetUuid(blob16(row.get(0)?)),
-                    output_key: row.get(1)?,
-                    terminal_type: TypeUuid(blob16(row.get(2)?)),
-                })
-            })
-            .optional()?)
     }
 
     /// Every asset a logical path names; more than one is an ambiguity.

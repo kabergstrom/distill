@@ -8,6 +8,7 @@ use distill_store::cas::record::{
     ResultOutcome,
 };
 use distill_store::cas::{AuxSpec, BuildCommit, CommitOutcome, OutputSpec};
+use distill_store::claims::{DerivedOutputClaim, SourceClaim, SourceClaims};
 use distill_store::state::{
     ReadableBundleSource, SkeletonFailureCode, NamespaceError, NamespaceErrorV1,
 };
@@ -66,12 +67,34 @@ fn success_commit(static_key: [u8; 32], trace: &[u8]) -> BuildCommit {
     }
 }
 
+/// The claims of a source at `path` deriving `key` from `parent`.
+fn deriving_source(path: &str, parent: AssetUuid, key: &str) -> SourceClaims {
+    SourceClaims {
+        root_name: "main".to_owned(),
+        path: path.to_owned(),
+        claims: vec![SourceClaim::DerivedOutput {
+            child: AssetUuid::v5(parent, key),
+            output: DerivedOutputClaim {
+                parent,
+                output_key: key.to_owned(),
+                terminal_type: distill_core::id::TypeUuid([0x51; 16]),
+            },
+        }],
+    }
+}
+
+fn under(path: &str) -> Vec<(String, String)> {
+    vec![("main".to_owned(), path.to_owned())]
+}
+
+/// A source `p.bundle` derives `key` from `parent`.
 fn declare_child(store: &mut Store, parent: AssetUuid, key: &str) -> AssetUuid {
-    let child = AssetUuid::v5(parent, key);
     store
-        .input_transaction(|txn| txn.set_derived_output(child, parent, key, distill_core::id::TypeUuid([0x51; 16])))
+        .input_transaction(|txn| {
+            txn.replace_source_claims(Some(&under("p.bundle")), &[deriving_source("p.bundle", parent, key)])
+        })
         .unwrap();
-    child
+    AssetUuid::v5(parent, key)
 }
 
 // ---- wire trees ----
@@ -443,8 +466,7 @@ fn derived_output_namespace_replacement_is_atomic_and_complete() {
     let next = AssetUuid::v5(next_parent, "meshlets");
     store
         .input_transaction(|txn| {
-            txn.clear_derived_outputs()?;
-            txn.set_derived_output(next, next_parent, "meshlets", distill_core::id::TypeUuid([0x51; 16]))
+            txn.replace_source_claims(None, &[deriving_source("q.bundle", next_parent, "meshlets")])
         })
         .unwrap();
     assert!(store.resolve_child(old).unwrap().is_none());
@@ -467,7 +489,7 @@ fn the_namespace_is_the_only_authority_for_child_resolution() {
     // The namespace retires the key at a later input version; the memo
     // row (the `results` row) still exists — resolution must miss.
     store
-        .input_transaction(|txn| txn.remove_derived_output(child))
+        .input_transaction(|txn| txn.replace_source_claims(Some(&under("p.bundle")), &[]))
         .unwrap();
     assert!(store.resolve_child(child).unwrap().is_none());
 }

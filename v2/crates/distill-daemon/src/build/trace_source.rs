@@ -159,7 +159,7 @@ impl<'a> StoreTraceSource<'a> {
     }
 
     /// The terminal type of `asset` as a derived child of its parent's
-    /// chain: one primary-key read of `derived_outputs`.
+    /// chain: its derived-output claim and the errors that would withhold it.
     fn derived_terminal(&self, asset: AssetUuid) -> Result<Option<TypeUuid>, BuildError> {
         let Some((parent, output_key)) = self
             .store

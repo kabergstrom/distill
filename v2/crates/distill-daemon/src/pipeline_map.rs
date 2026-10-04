@@ -8,9 +8,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use distill_build::pipeline::{PipelineError, PipelineRegistry, ProcessorRegistration, Target};
 use distill_core::id::{AssetUuid, TypeUuid};
-use distill_rpc::DerivedOutputEntry;
 
 use crate::callbacks::ProcessorDescriptor;
+
+/// A derived output of a parent asset's pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DerivedOutputEntry {
+    pub(crate) parent: AssetUuid,
+    pub(crate) output_key: String,
+    pub(crate) terminal_type: TypeUuid,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PipelineInterface {

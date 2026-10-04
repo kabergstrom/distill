@@ -651,7 +651,6 @@ fn published_tables(store: &Store) -> BTreeMap<&'static str, Vec<String>> {
         "assets",
         "asset_tags",
         "tag_epochs",
-        "derived_outputs",
         "errors",
     ]
     .into_iter()

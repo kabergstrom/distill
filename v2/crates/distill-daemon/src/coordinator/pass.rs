@@ -1231,19 +1231,6 @@ fn absorb_into(commit: &mut Commit, later: Commit) {
         PathMutation::Set { path, .. } | PathMutation::Remove { path } => path.clone(),
     });
     commit.new_entry_paths.extend(later.new_entry_paths);
-    if later.derived_outputs.is_some() {
-        commit.derived_outputs = later.derived_outputs;
-        commit.derived_output_mutations.clear();
-    }
-    keyed(
-        &mut commit.derived_output_mutations,
-        later.derived_output_mutations,
-        |mutation| match mutation {
-            DerivedOutputMutation::Set { child, .. } | DerivedOutputMutation::Remove { child } => {
-                *child
-            }
-        },
-    );
     if later.tag_poisons.is_some() {
         commit.tag_poisons = later.tag_poisons;
         commit.tag_poison_mutations.clear();

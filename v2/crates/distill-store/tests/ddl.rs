@@ -71,7 +71,6 @@ fn every_section_13_table_exists() {
         "tag_epochs",
         "results",
         "result_outputs",
-        "derived_outputs",
         "cas_extents",
         "cas_segments",
         "cas_refs",
@@ -283,7 +282,7 @@ fn extent_index_holds_the_only_physical_location() {
     );
     assert_eq!(pk_columns(&conn, "cas_extents"), ["content_hash"]);
     // And no other artifact table sneaks a physical location in.
-    for table in ["results", "result_outputs", "derived_outputs", "assets", "bundles"] {
+    for table in ["results", "result_outputs", "assets", "bundles"] {
         let cols = columns(&conn, table);
         assert!(
             !cols.iter().any(|c| c == "offset" || c == "segment"),
@@ -300,19 +299,6 @@ fn cas_segments_are_typed_regular_or_oversize() {
         columns(&conn, "cas_segments"),
         ["segment_id", "file_name", "segment_kind", "indexed_len", "state", "owner"]
     );
-}
-
-#[test]
-fn derived_output_namespace_is_keyed_by_child() {
-    // §9/§13: the input-versioned namespace index is the only authority
-    // for child resolution.
-    let dir = tempfile::tempdir().unwrap();
-    let conn = open_conn(&dir);
-    assert_eq!(
-        columns(&conn, "derived_outputs"),
-        ["child_uuid", "parent_uuid", "output_key", "terminal_type"]
-    );
-    assert_eq!(pk_columns(&conn, "derived_outputs"), ["child_uuid"]);
 }
 
 #[test]

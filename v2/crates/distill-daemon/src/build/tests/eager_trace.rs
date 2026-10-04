@@ -122,27 +122,23 @@ impl EagerTraceSource {
             .iter()
             .map(|(asset, entry)| (*asset, entry.role))
             .collect::<BTreeMap<_, _>>();
-        for (child, parent, output_key) in store
-            .all_derived_outputs()
-            .map_err(BuildError::infrastructure)?
-        {
-            let parent_type = entries.get(&parent).ok_or_else(|| {
-                BuildError::Infrastructure("derived parent is absent from trace index".to_owned())
-            })?;
-            let terminal = basis
-                .registry
-                .chain(parent_type.authored_type, basis.target)
-                .map_err(BuildError::failed)?
-                .extras
-                .get(&output_key)
-                .copied()
-                .ok_or_else(|| {
-                    BuildError::Infrastructure(
-                        "derived output is absent from the pinned pipeline map".to_owned(),
-                    )
-                })?;
-            terminal_types.insert(child, terminal);
-            roles.insert(child, EntryRole::Runtime);
+        // Every derived output each entry's chain declares that the
+        // namespace serves.
+        for (parent, entry) in &entries {
+            let Ok(chain) = basis.registry.chain(entry.authored_type, basis.target) else {
+                continue;
+            };
+            for (output_key, terminal) in &chain.extras {
+                let child = AssetUuid::v5(*parent, output_key);
+                if store
+                    .resolve_child(child)
+                    .map_err(BuildError::infrastructure)?
+                    .is_some()
+                {
+                    terminal_types.insert(child, *terminal);
+                    roles.insert(child, EntryRole::Runtime);
+                }
+            }
         }
         let tools = store
             .tool_hashes_at(basis.input_version)

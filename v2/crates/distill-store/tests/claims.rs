@@ -86,10 +86,6 @@ fn a_shared_bundle_uuid_collides_until_one_claimant_leaves() {
         [BundleUuid([1; 16]), BundleUuid([2; 16])]
     );
     assert_eq!(
-        pending.derived.into_iter().collect::<Vec<_>>(),
-        [AssetUuid([120; 16])]
-    );
-    assert_eq!(
         pending.paths.into_iter().collect::<Vec<_>>(),
         ["b.bundle"]
     );
@@ -131,6 +127,8 @@ fn an_asset_uuid_authored_twice_collides() {
     );
     // Both sources derive the same child from the same parent: one claimant.
     assert_eq!(store.derived_output_claims(AssetUuid([110; 16])).unwrap().len(), 1);
+    // The withheld parent withholds its child.
+    assert_eq!(store.resolve_child(AssetUuid([110; 16])).unwrap(), None);
 
     // The collision ending makes the survivor's bundle pending, though its
     // own claims did not change: it publishes the asset again.
@@ -139,6 +137,10 @@ fn an_asset_uuid_authored_twice_collides() {
         .unwrap();
     assert!(store.claims_namespace_errors().unwrap().is_empty());
     assert!(pending.bundles.contains(&BundleUuid([1; 16])));
+    assert_eq!(
+        store.resolve_child(AssetUuid([110; 16])).unwrap(),
+        Some((AssetUuid([10; 16]), "thumb".to_owned()))
+    );
     assert!(store.bundle_claim_sources(BundleUuid([2; 16])).unwrap().is_empty());
 }
 

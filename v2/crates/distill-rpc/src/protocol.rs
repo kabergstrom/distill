@@ -1423,27 +1423,6 @@ pub enum PathMutation {
     },
 }
 
-/// Snapshot-published derived child authority.  These rows come from the
-/// authored asset set crossed with the pinned pipeline map; cached build
-/// records never create namespace authority.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DerivedOutputEntry {
-    pub parent: AssetUuid,
-    pub output_key: String,
-    pub terminal_type: TypeUuid,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DerivedOutputMutation {
-    Set {
-        child: AssetUuid,
-        entry: DerivedOutputEntry,
-    },
-    Remove {
-        child: AssetUuid,
-    },
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TagProjectionMutation {
     Set {
@@ -1475,12 +1454,6 @@ pub struct Commit {
     /// before: a named reference (path and local id) may wait on one, so
     /// the path changes too.
     pub new_entry_paths: BTreeSet<String>,
-    /// `Some` replaces the complete derived-output namespace for the new
-    /// immutable version. `None` preserves it for metadata-only commits.
-    pub derived_outputs: Option<BTreeMap<AssetUuid, DerivedOutputEntry>>,
-    /// Bounded ordinary-publication updates applied after an optional full
-    /// replacement. Duplicate child keys are rejected.
-    pub derived_output_mutations: Vec<DerivedOutputMutation>,
     /// `Some` replaces the complete per-entry §10 tag-poison projection.
     /// A tag query whose other selectors could include one of these assets
     /// fails instead of returning an under-approximation.

@@ -17,44 +17,6 @@ pub(crate) fn validate_commit(commit: &Commit) -> Result<(), AdminError> {
             .validate()
             .map_err(|error| AdminError::InvalidConfigurationError { error })?;
     }
-    if let Some(derived_outputs) = &commit.derived_outputs {
-        for (child, entry) in derived_outputs {
-            if *child != AssetUuid::v5(entry.parent, &entry.output_key)
-                || entry.output_key.is_empty()
-                || !valid_identifier(&entry.output_key)
-            {
-                return Err(AdminError::InvalidAuthoringIdentity {
-                    uuid: *child,
-                    detail: "derived output does not match its canonical parent/key identity"
-                        .to_owned(),
-                });
-            }
-        }
-    }
-    let mut derived_children = BTreeSet::new();
-    for mutation in &commit.derived_output_mutations {
-        let (child, entry) = match mutation {
-            DerivedOutputMutation::Set { child, entry } => (*child, Some(entry)),
-            DerivedOutputMutation::Remove { child } => (*child, None),
-        };
-        if !derived_children.insert(child) {
-            return Err(AdminError::InvalidAuthoringIdentity {
-                uuid: child,
-                detail: "duplicate derived-output mutation".to_owned(),
-            });
-        }
-        if entry.is_some_and(|entry| {
-            child != AssetUuid::v5(entry.parent, &entry.output_key)
-                || entry.output_key.is_empty()
-                || !valid_identifier(&entry.output_key)
-        }) {
-            return Err(AdminError::InvalidAuthoringIdentity {
-                uuid: child,
-                detail: "derived output does not match its canonical parent/key identity"
-                    .to_owned(),
-            });
-        }
-    }
     let mut tag_assets = BTreeSet::new();
     for mutation in &commit.tag_projection_mutations {
         let (asset, tags) = match mutation {

@@ -1015,113 +1015,34 @@ pub(crate) fn upsert_extent(
     Ok(())
 }
 
-// ---- derived-output namespace (input-versioned, §9/§13) ----
-
-impl crate::db::InputTxn<'_> {
-    /// Replace-style publications clear the previous version's projection
-    /// before installing the successor rows in the same input transaction.
-    pub fn clear_derived_outputs(&mut self) -> Result<(), StoreError> {
-        self.txn.execute("DELETE FROM derived_outputs", [])?;
-        Ok(())
-    }
-
-    /// Publish one derived-output namespace row: `child uuid → (parent
-    /// uuid, output key)` — derived per published version from its
-    /// assets × pinned pipeline map (§9), the only authority for child
-    /// resolution.
-    pub fn set_derived_output(
-        &mut self,
-        child: AssetUuid,
-        parent: AssetUuid,
-        output_key: &str,
-        terminal_type: TypeUuid,
-    ) -> Result<(), StoreError> {
-        self.txn.execute(
-            "INSERT INTO derived_outputs(child_uuid, parent_uuid, output_key, terminal_type)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(child_uuid) DO UPDATE SET
-               parent_uuid = excluded.parent_uuid, output_key = excluded.output_key,
-               terminal_type = excluded.terminal_type",
-            rusqlite::params![
-                child.0.as_slice(),
-                parent.0.as_slice(),
-                output_key,
-                terminal_type.0.as_slice()
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// Retire a derived-output namespace row.
-    pub fn remove_derived_output(&mut self, child: AssetUuid) -> Result<bool, StoreError> {
-        let n = self.txn.execute(
-            "DELETE FROM derived_outputs WHERE child_uuid = ?1",
-            [child.0.as_slice()],
-        )?;
-        Ok(n > 0)
-    }
-}
+// ---- derived-output namespace (§9/§13) ----
 
 impl StoreReader {
-    /// Raw bounded lookup used while preparing an unpublished successor.
-    pub fn derived_output_row(
+    /// A derived child as the namespace serves it — the only authority
+    /// (§9): historical result rows never resurrect a retired child. A
+    /// child is its one derived-output claim while neither it nor its
+    /// parent is withheld.
+    pub fn derived_output(
         &self,
         child: AssetUuid,
-    ) -> Result<Option<(AssetUuid, String)>, StoreError> {
-        use rusqlite::OptionalExtension;
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT parent_uuid, output_key FROM derived_outputs WHERE child_uuid = ?1",
-                [child.0.as_slice()],
-                |row| {
-                    Ok((
-                        AssetUuid(crate::bundles::blob16(row.get::<_, Vec<u8>>(0)?)),
-                        row.get::<_, String>(1)?,
-                    ))
-                },
-            )
-            .optional()?)
+    ) -> Result<Option<crate::claims::DerivedOutputClaim>, StoreError> {
+        let mut claims = self.derived_output_claims(child)?;
+        if claims.len() != 1
+            || self.withholding(child)?.is_some()
+            || self.withholding(claims[0].parent)?.is_some()
+        {
+            return Ok(None);
+        }
+        Ok(claims.pop())
     }
 
-    pub fn all_derived_outputs(&self) -> Result<Vec<(AssetUuid, AssetUuid, String)>, StoreError> {
-        let mut statement = self.conn.prepare(
-            "SELECT child_uuid, parent_uuid, output_key FROM derived_outputs ORDER BY child_uuid",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-        rows.map(|row| {
-            let (child, parent, key) = row?;
-            Ok((
-                AssetUuid(crate::bundles::blob16(child)),
-                AssetUuid(crate::bundles::blob16(parent)),
-                key,
-            ))
-        })
-        .collect()
-    }
-
-    /// Resolve a derived child through the namespace index — the only
-    /// authority (§9): historical result rows never resurrect a
-    /// retired child.
+    /// [`Self::derived_output`]'s `(parent, output key)`.
     pub fn resolve_child(
         &self,
         child: AssetUuid,
     ) -> Result<Option<(AssetUuid, String)>, StoreError> {
-        use rusqlite::OptionalExtension;
         Ok(self
-            .conn
-            .query_row(
-                "SELECT parent_uuid, output_key FROM derived_outputs WHERE child_uuid = ?1",
-                [child.0.as_slice()],
-                |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?)),
-            )
-            .optional()?
-            .map(|(p, k)| (AssetUuid(crate::bundles::blob16(p)), k)))
+            .derived_output(child)?
+            .map(|claim| (claim.parent, claim.output_key)))
     }
 }

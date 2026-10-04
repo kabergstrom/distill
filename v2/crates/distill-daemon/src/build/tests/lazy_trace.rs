@@ -138,6 +138,32 @@ impl Project {
     }
 }
 
+/// The claims source that derives `key` from `parent`: `Some` publishes
+/// the child, `None` retires it.
+fn put_derived(
+    txn: &mut InputTxn<'_>,
+    parent: AssetUuid,
+    key: &str,
+    terminal: Option<TypeUuid>,
+) -> Result<(), StoreError> {
+    use distill_store::claims::{DerivedOutputClaim, SourceClaim, SourceClaims};
+    let path = format!("derived/{parent}/{key}");
+    let claims = terminal.map(|terminal_type| SourceClaims {
+        root_name: "derived".to_owned(),
+        path: path.clone(),
+        claims: vec![SourceClaim::DerivedOutput {
+            child: AssetUuid::v5(parent, key),
+            output: DerivedOutputClaim {
+                parent,
+                output_key: key.to_owned(),
+                terminal_type,
+            },
+        }],
+    });
+    txn.replace_source_claims(Some(&[("derived".to_owned(), path)]), claims.as_slice())?;
+    Ok(())
+}
+
 fn put_bundle(
     txn: &mut InputTxn<'_>,
     uuid: BundleUuid,
@@ -259,8 +285,8 @@ fn fixture() -> (Project, InputVersion) {
         txn.set_primary_asset(bundle(2), asset(4))?;
         txn.set_primary_asset(bundle(3), asset(6))?;
         txn.set_primary_asset(bundle(4), asset(8))?;
-        txn.set_derived_output(AssetUuid::v5(asset(1), "meta"), asset(1), "meta", EXTRA_A)?;
-        txn.set_derived_output(AssetUuid::v5(asset(6), "meta"), asset(6), "meta", EXTRA_A)?;
+        put_derived(txn, asset(1), "meta", Some(EXTRA_A))?;
+        put_derived(txn, asset(6), "meta", Some(EXTRA_A))?;
         Ok(())
     });
     (project, first_tools)
@@ -292,7 +318,7 @@ fn mutate(project: &mut Project) {
             false,
             &[("kind", Some("albedo"))],
         )?;
-        txn.remove_derived_output(AssetUuid::v5(asset(6), "meta"))?;
+        put_derived(txn, asset(6), "meta", None)?;
         txn.remove_bundle(bundle(4))?;
         txn.publish_tool_epoch(&BTreeMap::from([
             ("tool-b".to_owned(), tool_package(b"b v2")),
@@ -902,12 +928,7 @@ fn revalidating_a_trace_reads_only_what_it_asks_about() {
                 )?;
             }
             txn.set_primary_asset(bundle_uuid(b), uuid(b, 0))?;
-            txn.set_derived_output(
-                AssetUuid::v5(uuid(b, 0), "meta"),
-                uuid(b, 0),
-                "meta",
-                EXTRA_A,
-            )?;
+            put_derived(txn, uuid(b, 0), "meta", Some(EXTRA_A))?;
         }
         // One bundle whose name and local id no other shares.
         put_bundle(txn, bundle_uuid(BUNDLES), 1, "extra/solo.bundle", 0xee)?;

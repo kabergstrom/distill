@@ -107,7 +107,7 @@ read transaction:
 | `views[*].assets` (Built/Drifted/Failed/Deleted{at}) | An `assets` row → `Drifted{Asset}`; a derived output → `Drifted{Asset(parent)}`; otherwise its namespace error (own UUID collision, else its bundle UUID's) → Failed; nothing → Missing, deleted or never published (schema-min: no `asset_resolutions` table). |
 | `views[*].authoring` | `bundles` / `assets` / `asset_tags` / `schemas`. New `assets` columns hold the encoded authored value (canonical JSON + blobs) and `terminal_type`, so a snapshot never reads a file. |
 | `views[*].paths` | `bundles.primary_asset` by path (schema 49; was `path_index`); several roots at one path is the ambiguity. |
-| `views[*].derived_outputs` | `derived_outputs` (+ `terminal_type` column) |
+| `views[*].derived_outputs` | A child's one `source_claims` derived claim (kind 2, terminal type in its detail) while neither it nor its parent is withheld (schema-min: no `derived_outputs` table). |
 | `tag_poisons`, `version_poison`, `configuration`, `pipeline` | `assets.tag_poison`, the persisted version poison, `configuration_state`, `pipeline_state` (then §4's `errors`) |
 | `lineage_repair` | new persisted repair-state columns next to `configuration_state` |
 | `history`, `oldest_available_cursor` | `change_log(seq, version, kind, subject)` trimmed to 4096 rows; the oldest cursor in `store_meta` |
