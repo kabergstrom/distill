@@ -75,13 +75,10 @@ pub struct SnapshotStamp {
     pub version: InputVersion,
 }
 
-/// What a pipeline candidate publishes (§13): its module's content hash,
-/// stored, and the projections the store validates before publishing it.
+/// What a pipeline candidate publishes (§13): the projections the store
+/// validates before publishing it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineEpoch {
-    /// The pipeline dylib content hash — an input-hash input wherever
-    /// pipeline code runs (§9, §13).
-    pub dylib_hash: [u8; 32],
     /// Complete canonical target-definition set used to construct the
     /// candidate pipeline map. The store validates and compares these exact
     /// canonical rows before publishing.

@@ -1983,7 +1983,6 @@ fn pass_bookkeeping_statements_search_their_indexes() {
             .input_transaction(|txn| txn.publish_claims_namespace_errors().map(drop))
             .unwrap();
         store.pipeline_failure().unwrap();
-        store.pipeline_module_hash().unwrap();
         // A rejected pipeline candidate: no module, one failure row.
         let failure = crate::state::PipelineFailure::new(
             crate::state::PipelineFailureCode::CandidateRegistration,
@@ -2131,10 +2130,6 @@ fn pass_bookkeeping_statements_search_their_indexes() {
             .1
             .clone()
     };
-    assert_eq!(
-        exact("DELETE FROM store_meta WHERE key = 'pipeline_module_hash'"),
-        ["SEARCH store_meta USING INDEX sqlite_autoindex_store_meta_1 (key=?)"]
-    );
     assert_eq!(
         exact("DELETE FROM errors WHERE family = 5"),
         ["SEARCH errors USING INDEX sqlite_autoindex_errors_1 (family=?)"]

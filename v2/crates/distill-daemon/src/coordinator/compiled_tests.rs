@@ -631,9 +631,9 @@ fn bytes_only_authority() -> Arc<ProjectSchemaAuthority> {
     Arc::new(ProjectSchemaAuthority::from_schema(schema, [20; 32]).unwrap())
 }
 
-/// The projection under which the bytes type cooks to `terminal`, or to
-/// itself.
-fn bytes_projection(terminal: Option<TypeUuid>) -> PipelineProjection {
+/// The projection of module `dylib` under which the bytes type cooks to
+/// `terminal`, or to itself.
+fn bytes_projection(terminal: Option<TypeUuid>, dylib: u8) -> PipelineProjection {
     use distill_build::outputs::OutputDecls;
     use distill_build::pipeline::TargetSelector;
     let descriptors = terminal
@@ -648,22 +648,18 @@ fn bytes_projection(terminal: Option<TypeUuid>) -> PipelineProjection {
         .collect();
     PipelineProjection::build(
         descriptors,
-        [9; 32],
+        [dylib; 32],
         &BTreeMap::from([("dev".to_owned(), build_target(false))]),
         [BYTES_TYPE, EDITED_TYPE],
     )
     .unwrap()
 }
 
-/// A pipeline epoch of module `dylib` over `authority`'s types.
-fn pipeline_publication(
-    authority: &ProjectSchemaAuthority,
-    dylib: u8,
-) -> ConfigurationPipelinePublication {
+/// A pipeline epoch over `authority`'s types.
+fn pipeline_publication(authority: &ProjectSchemaAuthority) -> ConfigurationPipelinePublication {
     use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
     ConfigurationPipelinePublication::Epoch {
         epoch: ValidatedPipelineEpoch::validate(distill_store::state::PipelineEpoch {
-            dylib_hash: [dylib; 32],
             target_set: CanonicalTargetSet::canonical(vec![TargetSetRow {
                 name: "dev".into(),
                 target_definition_hash: distill_build::keys::target_definition_hash(&build_target(
@@ -733,16 +729,10 @@ fn published_tables(store: &Store) -> BTreeMap<&'static str, Vec<String>> {
     ]
     .into_iter()
     .map(|table| (table, store.table_rows(table).unwrap()))
-    .chain([
-        (
-            "configuration_generation",
-            vec![store.configuration_generation().unwrap().to_string()],
-        ),
-        (
-            "pipeline_module_hash",
-            vec![format!("{:?}", store.pipeline_module_hash().unwrap())],
-        ),
-    ])
+    .chain([(
+        "configuration_generation",
+        vec![store.configuration_generation().unwrap().to_string()],
+    )])
     .collect()
 }
 
@@ -851,8 +841,8 @@ pub(super) fn source_reclaimed() {
 #[test]
 fn a_reconfiguration_publishes_what_a_complete_publication_does() {
     let configuration = |authority: Arc<ProjectSchemaAuthority>, terminal, dylib| Configuration {
-        projection: bytes_projection(terminal),
-        pipeline: pipeline_publication(&authority, dylib),
+        projection: bytes_projection(terminal, dylib),
+        pipeline: pipeline_publication(&authority),
         authority,
     };
     const TERMINAL: TypeUuid = TypeUuid([0x63; 16]);
@@ -1032,7 +1022,7 @@ fn a_complete_publication_revalidates_a_poisoned_skeleton_after_a_schema_edit() 
                 [LABEL_TYPE],
             )
             .unwrap(),
-            pipeline: pipeline_publication(&authority, 1),
+            pipeline: pipeline_publication(&authority),
             authority,
         }
     };
@@ -1141,7 +1131,7 @@ fn assert_republication_matches_a_fresh_one(
             [LABEL_TYPE],
         )
         .unwrap(),
-        pipeline: pipeline_publication(&labeled_authority(false), 1),
+        pipeline: pipeline_publication(&labeled_authority(false)),
         authority: labeled_authority(false),
     };
     publish_completely(store, scanner, &configuration, &BTreeSet::new());
@@ -1178,7 +1168,7 @@ fn labeled_store(temp: &tempfile::TempDir, files: &[(&str, Vec<u8>)]) -> (Store,
             [LABEL_TYPE],
         )
         .unwrap(),
-        pipeline: pipeline_publication(&labeled_authority(false), 1),
+        pipeline: pipeline_publication(&labeled_authority(false)),
         authority: labeled_authority(false),
     };
     publish_completely(&mut store, &scanner, &configuration, &BTreeSet::new());

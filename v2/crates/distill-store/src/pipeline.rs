@@ -1,6 +1,6 @@
-//! Pipeline-side metadata (§13): the published module's content hash, the
-//! version's pipeline failure (an `errors` row), and the `tools` ToolEpoch
-//! table. Everything else about an epoch is the loaded module's.
+//! Pipeline-side metadata (§13): the version's pipeline failure (an `errors`
+//! row) and the `tools` ToolEpoch table. Everything else about an epoch, its
+//! module's content hash included, is the loaded module's.
 
 use crate::atomic_file;
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,12 +15,9 @@ use distill_core::tool::{
 use rusqlite::OptionalExtension;
 use unicode_normalization::is_nfc;
 
-use crate::db::{meta_get_blob, meta_set_blob, InputTxn, StoreReader};
+use crate::db::{InputTxn, StoreReader};
 use crate::error::StoreError;
 use crate::state::{InputVersion, PipelineEpoch, PipelineFailure};
-
-/// `store_meta` key of the content hash of the module the version serves.
-const PIPELINE_MODULE_HASH: &str = "pipeline_module_hash";
 
 /// One package member supplied at the registration boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -442,22 +439,18 @@ impl std::ops::Deref for ValidatedPipelineEpoch {
 
 impl InputTxn<'_> {
     /// Publish a staged pipeline candidate (§3, §13) as the Ready epoch:
-    /// the version serves its module, and no pipeline failure.
+    /// the version carries no pipeline failure.
     pub fn publish_pipeline_epoch(
         &mut self,
         epoch: &ValidatedPipelineEpoch,
     ) -> Result<(), StoreError> {
         validate_target_set(&epoch.target_set)?;
         validate_bootstrap_schema_registry(&epoch.schema_registry)?;
-        if meta_get_blob(&self.txn, PIPELINE_MODULE_HASH)?.as_deref() != Some(&epoch.dylib_hash[..])
-        {
-            meta_set_blob(&self.txn, PIPELINE_MODULE_HASH, &epoch.dylib_hash)?;
-        }
         self.set_pipeline_failure(None)
     }
 
-    /// A rejected candidate still publishes (§13): the version serves no
-    /// module and carries a pipeline failure naming the error.
+    /// A rejected candidate still publishes (§13): the version carries a
+    /// pipeline failure naming the error.
     pub fn publish_pipeline_failure(
         &mut self,
         failure: &PipelineFailure,
@@ -465,9 +458,6 @@ impl InputTxn<'_> {
         failure
             .validate()
             .map_err(StoreError::InvalidPipelineFailure)?;
-        self.txn
-            .prepare_cached("DELETE FROM store_meta WHERE key = ?1")?
-            .execute([PIPELINE_MODULE_HASH])?;
         self.set_pipeline_failure(Some(failure))
     }
 
@@ -603,12 +593,6 @@ impl InputTxn<'_> {
     }
 }
 
-fn invalid_state(detail: &str) -> StoreError {
-    StoreError::InvalidPipelineState {
-        detail: detail.to_owned(),
-    }
-}
-
 fn validate_bootstrap_schema_registry(
     candidate: &BTreeMap<TypeUuid, LogicalHash>,
 ) -> Result<(), StoreError> {
@@ -633,12 +617,6 @@ fn validate_target_set(target_set: &CanonicalTargetSet) -> Result<(), StoreError
         .map_err(StoreError::InvalidTargetSet)
 }
 
-fn exact_blob32(bytes: Vec<u8>, name: &str) -> Result<[u8; 32], StoreError> {
-    bytes
-        .try_into()
-        .map_err(|_| invalid_state(&format!("{name} is not exactly 32 bytes")))
-}
-
 /// Each key's last ToolEpoch row at a version, `(key, present, hash)`:
 /// one pass over the primary key (the row of a group's `MAX` supplies the
 /// bare columns).
@@ -651,14 +629,6 @@ pub(crate) const TOOL_AT: &str = "SELECT present, identity_object, tool_hash, in
      ORDER BY input_version DESC LIMIT 1";
 
 impl StoreReader {
-    /// The content hash of the module this version serves: `None` while
-    /// its pipeline has failed, or before any publication.
-    pub fn pipeline_module_hash(&self) -> Result<Option<[u8; 32]>, StoreError> {
-        meta_get_blob(&self.conn, PIPELINE_MODULE_HASH)?
-            .map(|hash| exact_blob32(hash, "pipeline module hash"))
-            .transpose()
-    }
-
     /// Test hook: every tool's hash at `basis`, for a reference trace
     /// index that checks the builds' own reads.
     #[cfg(any(test, feature = "test-hooks"))]

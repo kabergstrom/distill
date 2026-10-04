@@ -1718,7 +1718,6 @@ pub(crate) fn stored_pipeline_epoch(
         });
     }
     let epoch = StoredPipelineEpoch {
-        dylib_hash: prepared.dylib_hash(),
         target_set,
         schema_registry: requirements.schema_registry.clone(),
     };

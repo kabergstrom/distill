@@ -1446,7 +1446,7 @@ fn dylib_hash(variant: &GateVariant) -> [u8; 32] {
 fn ready_dylib_hash(process: &DaemonProcess) -> Option<[u8; 32]> {
     let store = process.coordinator().open_reader().unwrap();
     match store.pipeline_failure().unwrap() {
-        None => store.pipeline_module_hash().unwrap(),
+        None => process.coordinator().ready_dylib_hash(),
         Some(_) => None,
     }
 }

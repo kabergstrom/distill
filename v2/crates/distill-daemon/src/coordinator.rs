@@ -340,6 +340,16 @@ impl DaemonCoordinator {
             .is_some()
     }
 
+    /// Test hook: the content hash of the module the Ready pipeline epoch
+    /// loaded, if one is Ready.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn ready_dylib_hash(&self) -> Option<[u8; 32]> {
+        lock_pipeline(&self.pipeline)
+            .host
+            .published_ready_epoch()
+            .map(|epoch| epoch.dylib_hash())
+    }
+
     /// Whether publishing `candidate` with the current configuration and the
     /// pipeline module whose bytes hash to `dylib_hash` would install what
     /// already serves: the Ready epoch was staged from those bytes, and its

@@ -23,7 +23,6 @@ fn cfg(dir: &tempfile::TempDir) -> StoreConfig {
 }
 
 fn validated_epoch(
-    dylib_hash: [u8; 32],
     custom: Option<(TypeUuid, LogicalHash)>,
 ) -> ValidatedPipelineEpoch {
     let mut schema_registry = bootstrap_control_logical_registry_v1().unwrap();
@@ -31,7 +30,6 @@ fn validated_epoch(
         schema_registry.insert(type_uuid, logical_hash);
     }
     let epoch = PipelineEpoch {
-        dylib_hash,
         target_set: CanonicalTargetSet::canonical(vec![]).unwrap(),
         schema_registry,
     };
@@ -167,7 +165,6 @@ fn multi_table_input_transactions_are_all_or_nothing() {
                 },
             )?;
             txn.publish_pipeline_epoch(&validated_epoch(
-                [6u8; 32],
                 Some((TypeUuid([3u8; 16]), LogicalHash([5u8; 32]))),
             ))?;
             Err(StoreError::InvalidConfiguration {
@@ -183,7 +180,6 @@ fn multi_table_input_transactions_are_all_or_nothing() {
     assert!(store.entry(AssetUuid([2u8; 16])).unwrap().is_none());
     assert!(store.bundle(BundleUuid([1u8; 16])).unwrap().is_none());
     assert!(store.tool("tool").unwrap().is_none());
-    assert_eq!(store.pipeline_module_hash().unwrap(), None);
 }
 
 #[test]
@@ -308,7 +304,7 @@ fn namespace_errors_do_not_gate_the_namespace_or_the_pipeline() {
     let mut store = Store::open(cfg(&dir)).unwrap();
     store
         .input_transaction(|txn| {
-            txn.publish_pipeline_epoch(&validated_epoch([1u8; 32], None))?;
+            txn.publish_pipeline_epoch(&validated_epoch(None))?;
             txn.set_namespace_errors([namespace_error("identity collision")])?;
             Ok(())
         })
@@ -316,7 +312,6 @@ fn namespace_errors_do_not_gate_the_namespace_or_the_pipeline() {
 
     // Pipeline healthy…
     assert_eq!(store.pipeline_failure().unwrap(), None);
-    assert_eq!(store.pipeline_module_hash().unwrap(), Some([1u8; 32]));
     // …and so is the namespace.
     assert!(store.path_assets("x").unwrap().is_empty());
     assert!(store.entry(AssetUuid([1u8; 16])).unwrap().is_none());

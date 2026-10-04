@@ -1,5 +1,5 @@
-//! §13 pipeline-side metadata: the served module's content hash, the
-//! version's candidate failure, and the `tools` ToolEpoch table.
+//! §13 pipeline-side metadata: the version's candidate failure and the
+//! `tools` ToolEpoch table.
 
 use std::collections::BTreeMap;
 
@@ -45,7 +45,6 @@ fn tool_package(launcher: &[u8], resource: &[u8]) -> ToolRegistrationV2 {
 
 fn raw_epoch(n: u8) -> PipelineEpoch {
     PipelineEpoch {
-        dylib_hash: [n; 32],
         target_set: CanonicalTargetSet::canonical(vec![TargetSetRow {
             name: format!("target-{n}"),
             target_definition_hash: [n.wrapping_add(3); 32],
@@ -90,22 +89,15 @@ fn candidate_failure(message: &str) -> PipelineFailure {
     .unwrap()
 }
 
-// ---- the served module and the candidate failure ----
+// ---- the candidate failure ----
 
 #[test]
-fn no_module_or_failure_until_first_publication() {
-    let (_d, store) = store();
-    assert_eq!(store.pipeline_module_hash().unwrap(), None);
-    assert_eq!(store.pipeline_failure().unwrap(), None);
-}
-
-#[test]
-fn publishing_an_epoch_serves_its_module() {
+fn publishing_an_epoch_carries_no_failure() {
     let (_d, mut store) = store();
+    assert_eq!(store.pipeline_failure().unwrap(), None);
     store
         .input_transaction(|txn| txn.publish_pipeline_epoch(&epoch(3)))
         .unwrap();
-    assert_eq!(store.pipeline_module_hash().unwrap(), Some([3u8; 32]));
     assert_eq!(store.pipeline_failure().unwrap(), None);
 }
 
@@ -123,11 +115,6 @@ fn a_rejected_candidate_still_publishes_as_a_failure() {
         .input_transaction(|txn| txn.publish_pipeline_failure(&failure))
         .unwrap();
     assert_eq!(store.pipeline_failure().unwrap(), Some(failure));
-    assert_eq!(
-        store.pipeline_module_hash().unwrap(),
-        None,
-        "no module serves"
-    );
 }
 
 #[test]
@@ -142,18 +129,15 @@ fn the_next_successful_swap_publishes_over_the_failure() {
     store
         .input_transaction(|txn| txn.publish_pipeline_epoch(&epoch(7)))
         .unwrap();
-    assert_eq!(store.pipeline_module_hash().unwrap(), Some([7u8; 32]));
     assert_eq!(store.pipeline_failure().unwrap(), None, "healed");
 }
 
 #[test]
 fn noncanonical_target_rows_are_rejected() {
-    let (_d, store) = store();
     let mut forged_rows = raw_epoch(24);
     forged_rows.target_set.rows[0].name = "targe\u{301}t-24".into();
     let err = ValidatedPipelineEpoch::validate(forged_rows).unwrap_err();
     assert!(matches!(err, StoreError::InvalidTargetSet(_)));
-    assert_eq!(store.pipeline_module_hash().unwrap(), None);
 }
 
 // ---- tools: the ToolEpoch table ----

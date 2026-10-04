@@ -1259,7 +1259,8 @@ What went:
 - Bundle bytes, authored values and schema snapshots. Readers read the
   file and verify its observed hash.
 - Pipeline registrations, the schema registry and the target set.
-  `store_meta` keeps only the module hash. A runtime failure lives on the
+  Nothing about the module stays in `store_meta`: its hash is the loaded
+  epoch's, which nothing read from the store. A runtime failure lives on the
   loaded epoch.
 - Configuration state and served restart keys. These are `errors` rows
   and `pending_restart`.

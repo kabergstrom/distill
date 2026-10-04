@@ -178,7 +178,6 @@ fn typed_pipeline_failure_roundtrips_through_store_and_invalid_identity_rolls_ba
         .input_transaction(|txn| txn.publish_pipeline_failure(&failure))
         .unwrap();
     assert_eq!(store.pipeline_failure().unwrap(), Some(failure.clone()));
-    assert_eq!(store.pipeline_module_hash().unwrap(), None);
 
     let mut invalid = failure;
     invalid.identity[0] ^= 1;

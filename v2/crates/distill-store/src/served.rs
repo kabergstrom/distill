@@ -17,12 +17,9 @@ use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::bundles::{blob16, blob32};
-use crate::db::{meta_get_blob, meta_get_u64, meta_set_blob, meta_set_u64, InputTxn, StoreReader};
+use crate::db::{meta_get_u64, meta_set_u64, InputTxn, StoreReader};
 use crate::error::StoreError;
 use crate::state::{InputVersion, SnapshotStamp};
-
-/// `store_meta` key of the published pipeline diagnostic.
-pub const SERVED_PIPELINE: &str = "served_pipeline";
 
 const RPC_PIPELINE_GENERATION: &str = "rpc_pipeline_generation";
 const CHANGE_LOG_OLDEST: &str = "change_log_oldest";
@@ -592,8 +589,7 @@ pub(crate) fn decode_keys(bytes: &[u8]) -> Option<Vec<String>> {
 }
 
 /// Served-state writes shared by input transactions and served-only
-/// transactions (those that change fences or diagnostics without a new
-/// input version).
+/// transactions (those that change fences without a new input version).
 pub trait ServedWrite {
     #[doc(hidden)]
     fn served_conn(&self) -> &Connection;
@@ -601,11 +597,6 @@ pub trait ServedWrite {
     /// The input version this transaction's change-log rows belong to: the
     /// version being published, or the current one for served-only writes.
     fn change_version(&self) -> InputVersion;
-
-    /// A served diagnostic blob as this transaction sees it.
-    fn txn_served_blob(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
-        meta_get_blob(self.served_conn(), key)
-    }
 
     /// Every RPC target row as this transaction sees them.
     fn txn_rpc_targets(&self) -> Result<Vec<RpcTargetRow>, StoreError> {
@@ -665,19 +656,6 @@ pub trait ServedWrite {
             meta_set_u64(conn, CHANGE_LOG_OLDEST, oldest.0)?;
         }
         Ok(())
-    }
-
-    /// Replace (`Some`) or remove (`None`) a served diagnostic blob.
-    fn set_served_blob(&mut self, key: &str, value: Option<&[u8]>) -> Result<(), StoreError> {
-        let conn = self.served_conn();
-        match value {
-            Some(value) => meta_set_blob(conn, key, value),
-            None => {
-                conn.prepare_cached("DELETE FROM store_meta WHERE key = ?1")?
-                    .execute([key])?;
-                Ok(())
-            }
-        }
     }
 
     /// Advance the pipeline reconnect generation and return the new value.
