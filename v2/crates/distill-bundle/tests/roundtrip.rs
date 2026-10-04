@@ -246,6 +246,41 @@ fn backref_recursive_tree_blobs_at_two_depths() {
 }
 
 #[test]
+fn backref_inside_a_variant_payload_reenters_the_enum() {
+    // A list as an enum: { Leaf: {}, Node: { blob: Blob, next: BackRef(0) } }.
+    // A variant payload opens no frame of its own (§5), so the payload's
+    // BackRef(0) is the enum: `next` holds another variant, not a payload.
+    let sc = schema(en(&[
+        ("Leaf", st(&[])),
+        ("Node", st(&[("blob", N::Blob), ("next", N::BackRef(0))])),
+    ]));
+    let node = |bytes: &[u8], next| obj(&[("Node", obj(&[("blob", blob(bytes)), ("next", next)]))]);
+    let data = node(b"outer", node(b"inner", obj(&[("Leaf", obj(&[]))])));
+    let b = bundle(&[&sc], vec![("l", entry(UUID_A, &sc, data))], None);
+    let bytes = write_bundle(&b).unwrap();
+    let (_, _, chunk) = container_parts(&bytes);
+
+    let mut expect = Vec::new();
+    expect.extend_from_slice(b"outer"); // {Node}.blob
+    expect.resize(16, 0);
+    expect.extend_from_slice(b"inner"); // {Node}.next{Node}.blob
+    assert_eq!(chunk, expect);
+    assert_eq!(parse_bundle(&bytes).unwrap(), b);
+
+    // The payload itself is not what `next` names.
+    let payload_shaped = node(
+        b"outer",
+        obj(&[("blob", blob(b"x")), ("next", obj(&[("Leaf", obj(&[]))]))]),
+    );
+    let b = bundle(
+        &[&sc],
+        vec![("l", entry(UUID_A, &sc, payload_shaped))],
+        None,
+    );
+    write_bundle(&b).unwrap_err();
+}
+
+#[test]
 fn string_key_map_blobs_ordered_by_encoded_key() {
     let sc = schema(st(&[(
         "sm",

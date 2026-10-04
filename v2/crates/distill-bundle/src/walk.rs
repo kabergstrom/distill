@@ -10,7 +10,8 @@
 //!
 //! - `Option`: `Null` = None; anything else walks the inner node.
 //! - Enums: single-key `{ "Variant": payload }` objects; the payload is
-//!   the variant's node (a struct; unit variants are zero-field structs).
+//!   the variant's node (a struct; unit variants are zero-field structs),
+//!   walked in the enum's frame: a payload opens no frame of its own.
 //! - `Map` with a `String` key node: a JSON object. Any other key node: an
 //!   array of `[k, v]` pairs, strictly ascending by the key's canonical
 //!   encoded bytes.
@@ -220,37 +221,8 @@ impl<'w, 's> Walker<'w, 's> {
             }
             SchemaNode::Map { key, value: vnode } => self.walk_map(key, vnode, value),
             SchemaNode::Struct { fields, .. } => {
-                let AuthoredValue::Object(map) = value else {
-                    return Err(self.err_shape("struct object", value));
-                };
-                for k in map.keys() {
-                    if !fields.iter().any(|(name, _, _)| name == k) {
-                        return Err(BundleError::ExtraField {
-                            local_id: self.local_id.to_string(),
-                            path: self.path_str(),
-                            field: k.clone(),
-                        });
-                    }
-                }
                 self.frames.push(node);
-                let mut out = Ok(());
-                for (name, _, fnode) in fields {
-                    let Some(v) = map.get_mut(name) else {
-                        out = Err(BundleError::MissingField {
-                            local_id: self.local_id.to_string(),
-                            path: self.path_str(),
-                            field: name.clone(),
-                        });
-                        break;
-                    };
-                    self.path.push(PathComponent::Field(name.clone()));
-                    let r = self.walk(fnode, v);
-                    self.path.pop();
-                    if r.is_err() {
-                        out = r;
-                        break;
-                    }
-                }
+                let out = self.walk_fields(fields, value);
                 self.frames.pop();
                 out
             }
@@ -282,7 +254,12 @@ impl<'w, 's> Walker<'w, 's> {
                 };
                 self.frames.push(node);
                 self.path.push(PathComponent::Variant(vname.clone()));
-                let r = self.walk(vnode, payload);
+                // The payload is a struct node, but not a frame of its own
+                // (§5): a back-reference inside it counts the enum's frame.
+                let r = match vnode {
+                    SchemaNode::Struct { fields, .. } => self.walk_fields(fields, payload),
+                    vnode => self.walk(vnode, payload),
+                };
                 self.path.pop();
                 self.frames.pop();
                 r
@@ -301,6 +278,41 @@ impl<'w, 's> Walker<'w, 's> {
                 self.walk(target, value)
             }
         }
+    }
+
+    /// A struct body's fields, walked in whatever frame the caller opened:
+    /// a struct's own, or its enum's for a variant payload.
+    fn walk_fields(
+        &mut self,
+        fields: &'s [(String, u32, SchemaNode)],
+        value: &mut AuthoredValue,
+    ) -> Result<(), BundleError> {
+        let AuthoredValue::Object(map) = value else {
+            return Err(self.err_shape("struct object", value));
+        };
+        for k in map.keys() {
+            if !fields.iter().any(|(name, _, _)| name == k) {
+                return Err(BundleError::ExtraField {
+                    local_id: self.local_id.to_string(),
+                    path: self.path_str(),
+                    field: k.clone(),
+                });
+            }
+        }
+        for (name, _, fnode) in fields {
+            let Some(v) = map.get_mut(name) else {
+                return Err(BundleError::MissingField {
+                    local_id: self.local_id.to_string(),
+                    path: self.path_str(),
+                    field: name.clone(),
+                });
+            };
+            self.path.push(PathComponent::Field(name.clone()));
+            let r = self.walk(fnode, v);
+            self.path.pop();
+            r?;
+        }
+        Ok(())
     }
 
     fn check_reference(&self, value: &AuthoredValue, expected: &str) -> Result<(), BundleError> {
