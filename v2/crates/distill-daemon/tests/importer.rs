@@ -10,7 +10,9 @@ use distill_daemon::coordinator::DaemonCoordinator;
 use distill_daemon::scanner::AssetRoot;
 use distill_daemon::watcher::WatcherBatch;
 use distill_json::AuthoredValue;
-use distill_pipeline_fixture::{value as byte, value_of as byte_of, BYTE_IMPORTER, CHAIN_IMPORTER};
+use distill_pipeline_fixture::{
+    default_settings, settings, value as byte, value_of as byte_of, BYTE_IMPORTER, CHAIN_IMPORTER,
+};
 use distill_rpc::{
     AuthoringValue, ImportRequest, InputVersion, TargetDefinition, TargetDefinitionHash,
 };
@@ -81,13 +83,25 @@ fn connect(coordinator: &DaemonCoordinator) -> distill_rpc::Hub {
     }
 }
 
-/// Import `dest` from `sources` with `importer`, watched, through the RPC hub
-/// as a client does, at the current version; returns the imported bundle.
+/// Import `dest` from `sources` with `importer` at its default settings,
+/// watched, through the RPC hub as a client does, at the current version;
+/// returns the imported bundle.
 fn import(
     coordinator: &DaemonCoordinator,
     importer: &str,
     sources: &[&str],
     dest: &str,
+) -> BundleUuid {
+    import_with(coordinator, importer, sources, dest, &default_settings())
+}
+
+/// [`import`] with the importer settings `settings`.
+fn import_with(
+    coordinator: &DaemonCoordinator,
+    importer: &str,
+    sources: &[&str],
+    dest: &str,
+    settings: &AuthoredValue,
 ) -> BundleUuid {
     let base = coordinator.server().current_stamp().unwrap().version;
     let request = ImportRequest {
@@ -95,7 +109,7 @@ fn import(
         sources: sources.iter().map(|source| (*source).to_owned()).collect(),
         dest: dest.into(),
         settings: AuthoringValue {
-            canonical_value: Arc::from(b"{}".as_slice()),
+            canonical_value: Arc::from(distill_json::write(settings).unwrap().into_bytes()),
             blobs: Vec::new(),
         },
         watch: true,
@@ -139,11 +153,48 @@ fn bytes(value: [u8; 16]) -> AuthoredValue {
     )
 }
 
+/// `value` as a rules asset spells an importer's settings: a self-describing
+/// `AuthoredValueV1` enum, each variant's payload `{ value }`.
+fn wrapped(value: &AuthoredValue) -> AuthoredValue {
+    let (variant, payload) = match value {
+        AuthoredValue::Null => return object([("Null", object([]))]),
+        AuthoredValue::Bool(_) => ("Bool", value.clone()),
+        AuthoredValue::Int(_) => ("Int", value.clone()),
+        AuthoredValue::UInt(_) => ("UInt", value.clone()),
+        AuthoredValue::Float(_) => ("Float", value.clone()),
+        AuthoredValue::Str(_) => ("Str", value.clone()),
+        AuthoredValue::Blob(_) => ("Blob", value.clone()),
+        AuthoredValue::Array(items) => (
+            "Array",
+            AuthoredValue::Array(items.iter().map(wrapped).collect()),
+        ),
+        AuthoredValue::Object(fields) => (
+            "Object",
+            AuthoredValue::Object(
+                fields
+                    .iter()
+                    .map(|(name, value)| (name.clone(), wrapped(value)))
+                    .collect(),
+            ),
+        ),
+    };
+    object([(variant, object([("value", payload)]))])
+}
+
+/// A rules bundle whose one rule imports each `*.src` file with
+/// [`BYTE_IMPORTER`] at its default settings.
 fn directory_rules_bundle() -> Vec<u8> {
-    directory_rules_bundle_with_rule(true)
+    directory_rules_bundle_with(true, &default_settings())
 }
 
 fn directory_rules_bundle_with_rule(include_rule: bool) -> Vec<u8> {
+    directory_rules_bundle_with(include_rule, &default_settings())
+}
+
+/// A rules bundle whose one rule imports with [`BYTE_IMPORTER`] at
+/// `settings`: each `*.src` file when `include_rule`, else only `*.other`
+/// files, under another rule id.
+fn directory_rules_bundle_with(include_rule: bool, settings: &AuthoredValue) -> Vec<u8> {
     let row = BootstrapControlSpecV1::embedded()
         .unwrap()
         .0
@@ -171,10 +222,7 @@ fn directory_rules_bundle_with_rule(include_rule: bool) -> Vec<u8> {
         ("importer", AuthoredValue::Str(BYTE_IMPORTER.into())),
         ("matches", matches),
         ("output", AuthoredValue::Str("{stem}.bundle".into())),
-        (
-            "settings",
-            object([("Object", object([("value", object([]))]))]),
-        ),
+        ("settings", wrapped(settings)),
     ])];
     let data = object([("listing", query()), ("rules", AuthoredValue::Array(rules))]);
     distill_bundle::write_bundle(&Bundle {
@@ -226,7 +274,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     let first = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
     let first_asset = first.assets["asset"].uuid;
     assert_eq!(first.assets["asset"].data, byte(7));
-    assert_eq!(first.assets["$settings"].data, object([]));
+    assert_eq!(first.assets["$settings"].data, default_settings());
     assert!(first.assets.contains_key("$record"));
     assert!(coordinator
         .authoring_service()
@@ -259,7 +307,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     assert_eq!(second.uuid, imported_bundle);
     assert_eq!(second.assets["asset"].uuid, first_asset);
     assert_eq!(second.assets["asset"].data, byte(8));
-    assert_eq!(second.assets["$settings"].data, object([]));
+    assert_eq!(second.assets["$settings"].data, default_settings());
     assert_eq!(
         coordinator.open_reader().unwrap().input_version().unwrap(),
         InputVersion(5)
@@ -420,7 +468,7 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
     let generated_path = assets.join("foo.bundle");
     let generated = distill_bundle::parse_bundle(&std::fs::read(&generated_path).unwrap()).unwrap();
     assert_eq!(generated.assets["asset"].data, byte(9));
-    assert_eq!(generated.assets["$settings"].data, object([]));
+    assert_eq!(generated.assets["$settings"].data, default_settings());
     let meta = coordinator
         .open_reader()
         .unwrap()
@@ -525,6 +573,78 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
         .watched_import_failure(generated.uuid)
         .unwrap()
         .is_none());
+}
+
+/// A rule's settings are any authored value: an object holding an array
+/// and a nested object reaches the importer as authored, end to end from
+/// the rules file to the generated bundle's `$settings`.
+#[test]
+fn directory_rule_settings_holding_nested_values_reach_the_importer() {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    let rule_settings = settings([2, 3], 2);
+    std::fs::write(
+        assets.join("rules.bundle"),
+        directory_rules_bundle_with(true, &rule_settings),
+    )
+    .unwrap();
+    std::fs::write(assets.join("foo.src"), b"4").unwrap();
+    let coordinator = DaemonCoordinator::open(
+        StoreConfig::new(temp.path().join(".distill")),
+        vec![AssetRoot::new("main", &assets)],
+        vec![target()],
+        64,
+    )
+    .unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    configure(&coordinator, temp.path(), &assets);
+
+    assert_eq!(
+        coordinator
+            .reconcile_directory_imports(&mut writer)
+            .unwrap()
+            .len(),
+        1
+    );
+    let generated =
+        distill_bundle::parse_bundle(&std::fs::read(assets.join("foo.bundle")).unwrap()).unwrap();
+    assert_eq!(generated.assets["$settings"].data, rule_settings);
+    assert_eq!(generated.assets["asset"].data, byte((4 + 2 + 3) * 2));
+}
+
+/// An explicit import's settings reach the importer and its `$settings`.
+#[test]
+fn explicit_import_settings_reach_the_importer() {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("source.txt"), b"4").unwrap();
+    let coordinator = DaemonCoordinator::open(
+        StoreConfig::new(temp.path().join(".distill")),
+        vec![AssetRoot::new("main", &assets)],
+        vec![target()],
+        64,
+    )
+    .unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    configure(&coordinator, temp.path(), &assets);
+
+    let import_settings = settings([1, 0], 3);
+    import_with(
+        &coordinator,
+        BYTE_IMPORTER,
+        &["source.txt"],
+        "imported.bundle",
+        &import_settings,
+    );
+    let imported =
+        distill_bundle::parse_bundle(&std::fs::read(assets.join("imported.bundle")).unwrap())
+            .unwrap();
+    assert_eq!(imported.assets["$settings"].data, import_settings);
+    assert_eq!(imported.assets["asset"].data, byte((4 + 1) * 3));
 }
 
 /// Deleting a rules source orphans what its rules generated, found from

@@ -26,8 +26,8 @@ use distill_rpc::{
 };
 use distill_schema::ngp_schema::{
     node_hash, Field, FieldAttrs, FieldIdentifier, FieldLayout, LayoutIdentity, LogicalSchema,
-    PrimitiveType, Schema, SchemaLayouts, SchemaNode, SchemaTypeId, TypeAttrs, TypeDef, TypeLayout,
-    TypePath,
+    PrimitiveType, Schema, SchemaLayouts, SchemaNode, SchemaTypeId, StaticArray, TypeAttrs,
+    TypeDef, TypeLayout, TypePath,
 };
 use distill_schema::ProjectSchemaAuthority;
 use distill_store::{StoreConfig, StoreWriter};
@@ -468,8 +468,8 @@ pub use distill_pipeline_fixture::{
 /// The configured project's schema: [`TAGGED_TYPE`], and the pipeline
 /// module's [`PARENT_TYPE`], [`COOKED_TYPE`], [`REFLECTION_TYPE`] and
 /// [`VALUE_TYPE`] (each of these a struct of one `u8` field `value`) and
-/// [`SETTINGS_TYPE`] (a struct of no fields), laid out for this host. Its
-/// source hashes are the pipeline module's.
+/// [`SETTINGS_TYPE`] (`{ add: [u8; 2], scale: { by: u8 } }`), laid out for
+/// this host. Its source hashes are the pipeline module's.
 pub fn project_schema() -> Schema {
     let type_def = |id: usize, kind, krate: &str, name: &str, uuid, fields| TypeDef {
         id: SchemaTypeId(id),
@@ -534,14 +534,45 @@ pub fn project_schema() -> Schema {
             "fixture",
             "Settings",
             Some(SETTINGS_TYPE),
-            Vec::new(),
+            vec![field("add", 4, false), field("scale", 5, false)],
+        ),
+        TypeDef {
+            generic_argument_ids: vec![SchemaTypeId(0)],
+            ..type_def(
+                4,
+                PrimitiveType::StaticArray(StaticArray { length: 2 }),
+                "core",
+                "array",
+                None,
+                Vec::new(),
+            )
+        },
+        type_def(
+            5,
+            PrimitiveType::Struct,
+            "fixture",
+            "Scale",
+            None,
+            vec![field("by", 0, false)],
         ),
     ];
     let mut layouts = vec![
         layout(1, 1, Vec::new()),
         layout(string, string_align, Vec::new()),
         layout(string, string_align, vec![at_zero(string)]),
-        layout(0, 1, Vec::new()),
+        layout(
+            3,
+            1,
+            vec![
+                at_zero(2),
+                FieldLayout {
+                    offset: Some(2),
+                    field_size: Some(1),
+                },
+            ],
+        ),
+        layout(2, 1, Vec::new()),
+        layout(1, 1, vec![at_zero(1)]),
     ];
     for (name, uuid) in [
         ("Parent", PARENT_TYPE),

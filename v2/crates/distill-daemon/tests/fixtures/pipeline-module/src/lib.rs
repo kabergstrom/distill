@@ -2,7 +2,8 @@
 //! registers one processor, [`REFLECT`], which cooks a [`PARENT_TYPE`]
 //! asset to a [`COOKED_TYPE`] primary and a declared [`REFLECTION`] output
 //! of [`REFLECTION_TYPE`]: a derived child asset; and two importers,
-//! [`BYTE_IMPORTER`] and [`CHAIN_IMPORTER`], producing [`VALUE_TYPE`].
+//! [`BYTE_IMPORTER`] and [`CHAIN_IMPORTER`], producing [`VALUE_TYPE`] from
+//! settings of [`SETTINGS_TYPE`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,7 +18,7 @@ use distill_pipeline_api::importer::{AuthoringImportContext, AuthoringImporterEr
 use distill_pipeline_api::outputs::OutputDecls;
 use distill_pipeline_api::registration::{ModuleCallError, RegistrationArena, TargetDefinition};
 use distill_pipeline_api::target::TargetSelector;
-use distill_schema::ngp_schema::{LogicalSchema, SchemaNode};
+use distill_schema::ngp_schema::{LogicalSchema, PrimitiveKind, SchemaNode};
 
 /// The processor's input: a struct of one `u8` field `value`.
 pub const PARENT_TYPE: TypeUuid = TypeUuid([0xa1; 16]);
@@ -31,18 +32,19 @@ pub const REFLECT: &str = "fixture-reflect";
 pub const REFLECTION: &str = "reflection";
 
 /// The importers' settings type, a project type of the daemon tests'
-/// configuration: a struct of no fields.
+/// configuration: `{ add: [u8; 2], scale: { by: u8 } }`. An importer's
+/// value `n` imports as `(n + add[0] + add[1]) * scale.by`.
 pub const SETTINGS_TYPE: TypeUuid = TypeUuid([0xa6; 16]);
 /// The importers' output type, a project type of the daemon tests'
 /// configuration no processor cooks: a struct of one `u8` field `value`.
 pub const VALUE_TYPE: TypeUuid = TypeUuid([0xa5; 16]);
-/// Imports the number its one text source holds, taking that many times
-/// 10 ms. A source `"{value} {dir}"` is gated: the run writes `dir/started`
-/// and waits for `dir/release` (at most a minute).
+/// Imports the number its one text source holds, under its settings, taking
+/// that many times 10 ms. A source `"{value} {dir}"` is gated: the run
+/// writes `dir/started` and waits for `dir/release` (at most a minute).
 pub const BYTE_IMPORTER: &str = "byte-importer";
-/// Imports one more than the largest value among its sources that exist: a
-/// text source's number, or a bundle source's `asset` entry, so its sources
-/// may be other imports' outputs.
+/// Imports one more than the largest value among its sources that exist,
+/// under its settings: a text source's number, or a bundle source's `asset`
+/// entry, so its sources may be other imports' outputs.
 pub const CHAIN_IMPORTER: &str = "chain-importer";
 
 /// A [`VALUE_TYPE`] value.
@@ -64,6 +66,51 @@ pub fn value_of(value: &AuthoredValue) -> Option<u128> {
     }
 }
 
+/// A [`SETTINGS_TYPE`] value.
+pub fn settings(add: [u8; 2], by: u8) -> AuthoredValue {
+    let uint = |value: u8| AuthoredValue::UInt(value.into());
+    AuthoredValue::Object(BTreeMap::from([
+        (
+            "add".to_owned(),
+            AuthoredValue::Array(add.into_iter().map(uint).collect()),
+        ),
+        (
+            "scale".to_owned(),
+            AuthoredValue::Object(BTreeMap::from([("by".to_owned(), uint(by))])),
+        ),
+    ]))
+}
+
+/// The importers' default settings, under which a value imports as itself.
+pub fn default_settings() -> AuthoredValue {
+    settings([0, 0], 1)
+}
+
+/// `value` under `settings` (see [`SETTINGS_TYPE`]).
+fn apply(settings: &AuthoredValue, value: u128) -> Result<u128, AuthoringImporterError> {
+    let malformed = || AuthoringImporterError::rejected(7, format!("settings {settings:?}"));
+    let AuthoredValue::Object(fields) = settings else {
+        return Err(malformed());
+    };
+    let Some(AuthoredValue::Array(add)) = fields.get("add") else {
+        return Err(malformed());
+    };
+    let Some(AuthoredValue::Object(scale)) = fields.get("scale") else {
+        return Err(malformed());
+    };
+    let Some(AuthoredValue::UInt(by)) = scale.get("by") else {
+        return Err(malformed());
+    };
+    let mut sum = value;
+    for item in add {
+        let AuthoredValue::UInt(item) = item else {
+            return Err(malformed());
+        };
+        sum += item;
+    }
+    Ok(sum * by)
+}
+
 /// One `asset` entry holding `value`.
 fn output(value: u128) -> Result<ImportOutput, AuthoringImporterError> {
     let mut output = ImportOutput::new();
@@ -79,7 +126,7 @@ impl PipelineImporter for ByteImporter {
     fn import(
         &self,
         context: &mut dyn AuthoringImportContext,
-        _settings: &AuthoredValue,
+        settings: &AuthoredValue,
     ) -> Result<ImportOutput, AuthoringImporterError> {
         let source = context
             .sources()
@@ -107,7 +154,7 @@ impl PipelineImporter for ByteImporter {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
-        output(value.into())
+        output(apply(settings, value.into())?)
     }
 }
 
@@ -117,7 +164,7 @@ impl PipelineImporter for ChainImporter {
     fn import(
         &self,
         context: &mut dyn AuthoringImportContext,
-        _settings: &AuthoredValue,
+        settings: &AuthoredValue,
     ) -> Result<ImportOutput, AuthoringImporterError> {
         let mut value = 0;
         for source in context.sources().to_vec() {
@@ -139,7 +186,7 @@ impl PipelineImporter for ChainImporter {
             };
             value = value.max(source_value);
         }
-        output(value + 1)
+        output(apply(settings, value + 1)?)
     }
 }
 
@@ -152,10 +199,31 @@ fn importer(id: &str) -> ImporterDescriptor {
         settings_schema: LogicalSchema {
             root: SchemaNode::Struct {
                 rev: 0,
-                fields: Vec::new(),
+                fields: vec![
+                    (
+                        "add".to_owned(),
+                        0,
+                        SchemaNode::Array {
+                            len: 2,
+                            elem: Box::new(SchemaNode::Primitive(PrimitiveKind::U8)),
+                        },
+                    ),
+                    (
+                        "scale".to_owned(),
+                        0,
+                        SchemaNode::Struct {
+                            rev: 0,
+                            fields: vec![(
+                                "by".to_owned(),
+                                0,
+                                SchemaNode::Primitive(PrimitiveKind::U8),
+                            )],
+                        },
+                    ),
+                ],
             },
         },
-        default_settings: AuthoredValue::Object(BTreeMap::new()),
+        default_settings: default_settings(),
     }
 }
 
