@@ -82,11 +82,10 @@ use std::time::{Duration, Instant};
 use distill_build::trace::EntryRole;
 use distill_core::id::{AssetUuid, ContentHash};
 use distill_rpc::capnp_loader::{RemoteCall, RemoteHub, RemoteSnapshot, RemoteSubscription};
-use distill_rpc::capnp_transport::{
-    CapnpClient, RemoteConnectOutcome, ARTIFACT_NOT_FOUND, CONNECTION_CLOSED,
-};
+use distill_rpc::capnp_transport::{CapnpClient, RemoteConnectOutcome, RemoteError};
 use distill_rpc::{
-    AssetEvent, ConnectRequest, DriftedInput as RpcDriftedInput, ImportFailure, StreamEvent,
+    AssetEvent, ConnectRequest, DriftedInput as RpcDriftedInput, ImportFailure, RpcFailure,
+    StreamEvent,
 };
 use distill_store::state::{InputVersion, SnapshotStamp};
 use tokio::task::{AbortHandle, LocalSet};
@@ -1102,9 +1101,7 @@ async fn run_request(
     match event {
         IoEvent::ReconnectRequired { .. }
         | IoEvent::ConnectionError { .. }
-        | IoEvent::RestartRequired { .. } => {
-            shared.push_connection(&connection, event)
-        }
+        | IoEvent::RestartRequired { .. } => shared.push_connection(&connection, event),
         event => shared.push_request(Some(stamp), event, reservation),
     }
 }
@@ -1449,10 +1446,15 @@ fn remote_request_event<T: std::fmt::Debug>(
             reason: reconnect_reason(reason),
         },
         RemoteCall::SnapshotExpired => IoEvent::SnapshotExpired { req, basis },
-        RemoteCall::Error(error) if error.code == ARTIFACT_NOT_FOUND => {
-            IoEvent::SnapshotExpired { req, basis }
-        }
-        RemoteCall::Error(error) if error.code == CONNECTION_CLOSED => connection_lost(),
+        // An artifact that left the CAS is a cache miss at this snapshot.
+        RemoteCall::Error(RemoteError {
+            failure: Some(RpcFailure::ArtifactNotFound { .. }),
+            ..
+        }) => IoEvent::SnapshotExpired { req, basis },
+        RemoteCall::Error(RemoteError {
+            failure: Some(RpcFailure::ConnectionClosed),
+            ..
+        }) => connection_lost(),
         other => request_error(req, basis, remote_message(other)),
     }
 }
@@ -1462,7 +1464,10 @@ fn connection_event<T: std::fmt::Debug>(call: RemoteCall<T>) -> IoEvent {
         RemoteCall::ReconnectRequired(reason) => IoEvent::ReconnectRequired {
             reason: reconnect_reason(reason),
         },
-        RemoteCall::Error(error) if error.code == CONNECTION_CLOSED => connection_lost(),
+        RemoteCall::Error(RemoteError {
+            failure: Some(RpcFailure::ConnectionClosed),
+            ..
+        }) => connection_lost(),
         other => IoEvent::ConnectionError {
             message: remote_message(other),
         },

@@ -813,7 +813,8 @@ should reach zero by the end of phase 6.
     capnp transport). Use does not extend it. Calls on an expired one
     answer `snapshotExpired`; a fetch whose blob left the CAS answers
     `ARTIFACT_NOT_FOUND`; a connection closed by the connection bound
-    answers `CONNECTION_CLOSED`. The loader retries the round at a new
+    answers `CONNECTION_CLOSED` (since PROTOCOL_VERSION 18 the
+    `artifactNotFound` and `connectionClosed` arms of `RpcError.failure`). The loader retries the round at a new
     snapshot on either, up to 3 times; pack builds retry the same way.
     Artifact and pack-session pins, `ArtifactLeaseBackend`, connection
     deadlines and the lease sweep are gone (PROTOCOL_VERSION 9).

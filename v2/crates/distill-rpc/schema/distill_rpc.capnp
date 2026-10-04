@@ -28,9 +28,67 @@ struct ReconnectRequired {
   reason @0 :ReconnectReason;
 }
 
+# Why a call failed: `failure` says what, for programs (the Rust
+# `RpcFailure`, or a request the daemon could not decode); `message` says it
+# for people.
 struct RpcError {
-  code @0 :UInt16;
-  message @1 :Text;
+  message @0 :Text;
+  failure :union {
+    invalidRequest @1 :InvalidRequest;
+    snapshotExpired @2 :Void;
+    connectionClosed @3 :Void;
+    pipelineUnavailable @4 :PipelineUnavailableDiagnostic;
+    buildDepthExceeded @5 :BuildDepthExceeded;
+    invalidCursor @6 :InvalidCursor;
+    resourceLimit @7 :ResourceLimit;
+    artifactNotFound @8 :Data;
+    assetNotFound @9 :Data;
+    foreignSnapshot @10 :Void;
+    invalidPath @11 :Text;
+    invalidQuery @12 :Text;
+    tagIndexPoisoned @13 :List(Data);
+    staleInputVersion @14 :StaleInputVersion;
+    invalidAuthoringRequest @15 :Text;
+    lossyWrite @16 :LossyWrite;
+    authoringBackendUnavailable @17 :Text;
+    wireTreeNotFound @18 :Data;
+  }
+}
+
+# The request field the daemon could not decode, by what it must be.
+enum InvalidRequest {
+  uuid @0;
+  hash @1;
+  instance @2;
+  utf8 @3;
+  value @4;
+}
+
+struct BuildDepthExceeded {
+  limit @0 :UInt64;
+  chain @1 :List(Data);
+}
+
+struct InvalidCursor {
+  since @0 :UInt64;
+  current @1 :UInt64;
+}
+
+struct ResourceLimit {
+  resource @0 :Text;
+  limit @1 :UInt64;
+}
+
+struct StaleInputVersion {
+  expected @0 :UInt64;
+  got @1 :UInt64;
+}
+
+struct LossyWrite {
+  typeUuid @0 :Data;
+  asset @1 :Data;
+  fields @2 :List(Text);
+  detail @3 :Text;
 }
 
 struct ProtocolFailure {

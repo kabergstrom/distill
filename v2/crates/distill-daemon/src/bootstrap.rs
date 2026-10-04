@@ -11,7 +11,7 @@ use distill_build::keys::target_definition_hash;
 use distill_core::id::BundleUuid;
 use distill_rpc::capnp_loader::{RemoteCall, RemoteHub};
 use distill_rpc::capnp_transport::{CapnpClient, RemoteConnectOutcome};
-use distill_rpc::{ConnectRequest, ImportRequest, TargetDefinitionHash};
+use distill_rpc::{ConnectRequest, ImportRequest, RpcFailure, TargetDefinitionHash};
 use distill_schema::ProjectSchemaAuthority;
 use distill_store::state::InputVersion;
 
@@ -183,8 +183,8 @@ async fn import_at(
     match hub.import(base, request).await {
         Ok(RemoteCall::Success(bundle)) => Ok(bundle),
         Ok(RemoteCall::Error(error)) => Err(ImportAttemptError {
-            retry: error.message.starts_with("StaleInputVersion"),
-            message: format!("import: {} ({})", error.message, error.code),
+            retry: matches!(error.failure, Some(RpcFailure::StaleInputVersion { .. })),
+            message: format!("import: {}", error.message),
         }),
         Ok(other) => Err(ImportAttemptError {
             message: format!("import: {other:?}"),

@@ -176,7 +176,7 @@ async fn build_pack_at(
                 observed,
                 message,
             } => format!("daemon speaks protocol {expected}, this distilld {observed}: {message}"),
-            RemoteMetadataOutcome::Error { code, message } => format!("{message} ({code})"),
+            RemoteMetadataOutcome::Error(error) => error.message,
             RemoteMetadataOutcome::Connected { .. } => unreachable!("connected is Ok"),
         })
     })?;

@@ -27,8 +27,10 @@ pub use distill_store::state::{
 /// store: the state directory is locked to the daemon process). 17: the
 /// one reconnect reason is `pipelineEpochChanged` (a hub connection never
 /// outlives its store either, so nothing could produce
-/// `storeInstanceChanged`).
-pub const PROTOCOL_VERSION: u32 = 17;
+/// `storeInstanceChanged`). 18: `RpcError` says what failed as a typed
+/// `failure` union (the [`RpcFailure`], or a request the daemon could not
+/// decode) instead of a numeric code.
+pub const PROTOCOL_VERSION: u32 = 18;
 
 /// A watched import whose latest attempt failed. The bundle keeps serving its
 /// last good contents; the failure clears when a later import succeeds.

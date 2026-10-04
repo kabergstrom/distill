@@ -14,10 +14,9 @@ use distill_json::AuthoredValue;
 use distill_rpc::capnp_loader::{
     RemoteCall, RemoteChunkStream, RemoteError, RemoteHub, RemoteSnapshot,
 };
-use distill_rpc::capnp_transport::{ARTIFACT_NOT_FOUND, ASSET_NOT_FOUND};
 use distill_rpc::{
     ArtifactChunkKind, AuthoringValue, ConfigurationError, PathResolveResult, ReconnectReason,
-    ResolveResult, TagSelector,
+    ResolveResult, RpcFailure, TagSelector,
 };
 use distill_wire::artifact::{parse_artifact_parts, ArtifactError};
 use unicode_normalization::UnicodeNormalization;
@@ -112,7 +111,9 @@ impl PackBuildError {
     pub fn is_cache_miss(&self) -> bool {
         match self {
             Self::SnapshotExpired => true,
-            Self::Remote(error) => error.code == ARTIFACT_NOT_FOUND,
+            Self::Remote(error) => {
+                matches!(error.failure, Some(RpcFailure::ArtifactNotFound { .. }))
+            }
             _ => false,
         }
     }
@@ -666,7 +667,10 @@ async fn build_paths(
     for asset in assets {
         // A derived output has no runtime entry and so no path.
         let entry = match remote(snapshot.entry(asset).await) {
-            Err(PackBuildError::Remote(error)) if error.code == ASSET_NOT_FOUND => continue,
+            Err(PackBuildError::Remote(RemoteError {
+                failure: Some(RpcFailure::AssetNotFound { .. }),
+                ..
+            })) => continue,
             result => result?,
         };
         let path = entry.normalized_path;

@@ -57,32 +57,7 @@ use crate::{
 
 pub use crate::distill_rpc_capnp as schema;
 
-const WIRE_INVALID_UUID: u16 = 1001;
-const WIRE_INVALID_HASH: u16 = 1002;
-const WIRE_INVALID_INSTANCE: u16 = 1003;
-const WIRE_INVALID_UTF8: u16 = 1004;
-const WIRE_INVALID_VALUE: u16 = 1005;
-const RPC_FAILURE: u16 = 3000;
-/// `RpcError.code` of a fetch whose artifact left the CAS: a cache miss,
-/// retried at a new snapshot.
-pub const ARTIFACT_NOT_FOUND: u16 = 3001;
-/// `RpcError.code` of a call on a connection closed to admit a newer one.
-pub const CONNECTION_CLOSED: u16 = 3002;
-/// `RpcError.code` of an `entry` whose asset has no runtime entry (absent,
-/// authoring-only, or a derived output).
-pub const ASSET_NOT_FOUND: u16 = 3003;
-/// `RpcError.code` of a `Root.connect` or `Root.metadata` refused because
-/// `max_connections` connections are open: retry later.
-pub const CONNECTION_LIMIT: u16 = 3004;
-
-fn failure_code(error: &RpcFailure) -> u16 {
-    match error {
-        RpcFailure::ArtifactNotFound { .. } => ARTIFACT_NOT_FOUND,
-        RpcFailure::ConnectionClosed => CONNECTION_CLOSED,
-        RpcFailure::AssetNotFound { .. } => ASSET_NOT_FOUND,
-        _ => RPC_FAILURE,
-    }
-}
+use schema::InvalidRequest;
 
 /// Answer a target-bound call from its generation fence before decoding
 /// its parameters: a reconnect when the pipeline moved, an error when the
@@ -99,11 +74,7 @@ macro_rules! generation_gate {
                 return Ok(());
             }
             Err(error) => {
-                write_error(
-                    $results.get().init_result().init_error(),
-                    failure_code(&error),
-                    format!("{error:?}").as_str(),
-                );
+                write_failure($results.get().init_result().init_error(), &error);
                 return Ok(());
             }
         }
@@ -501,10 +472,7 @@ pub enum RemoteConnectOutcome {
         observed: u32,
         message: String,
     },
-    Error {
-        code: u16,
-        message: String,
-    },
+    Error(RemoteError),
 }
 
 pub enum RemoteMetadataOutcome {
@@ -518,10 +486,7 @@ pub enum RemoteMetadataOutcome {
         observed: u32,
         message: String,
     },
-    Error {
-        code: u16,
-        message: String,
-    },
+    Error(RemoteError),
 }
 
 impl fmt::Debug for RemoteConnectOutcome {
@@ -549,11 +514,7 @@ impl fmt::Debug for RemoteConnectOutcome {
                 .field("observed", observed)
                 .field("message", message)
                 .finish(),
-            Self::Error { code, message } => f
-                .debug_struct("Error")
-                .field("code", code)
-                .field("message", message)
-                .finish(),
+            Self::Error(error) => f.debug_tuple("Error").field(error).finish(),
         }
     }
 }
@@ -615,11 +576,7 @@ impl schema::root::Server for RootService {
                     write_connect_error(result, &error);
                 }
                 ConnectOutcome::Refused(failure) => {
-                    write_error(
-                        result.init_error(),
-                        CONNECTION_LIMIT,
-                        &format!("{failure:?}"),
-                    );
+                    write_failure(result.init_error(), &failure);
                 }
             }
             Ok(())
@@ -650,11 +607,7 @@ impl schema::root::Server for RootService {
                     failure.set_message("metadata bootstrap protocol mismatch");
                 }
                 MetadataConnectOutcome::Refused(failure) => {
-                    write_error(
-                        result.init_error(),
-                        CONNECTION_LIMIT,
-                        &format!("{failure:?}"),
-                    );
+                    write_failure(result.init_error(), &failure);
                 }
             }
             Ok(())
@@ -782,9 +735,9 @@ impl schema::hub::Server for HubService {
             let ops = match decode_authoring_ops(params.get_ops()?) {
                 Ok(ops) => ops,
                 Err(error) => {
-                    write_error(
+                    write_invalid_request(
                         results.get().init_result().init_error(),
-                        WIRE_INVALID_VALUE,
+                        InvalidRequest::Value,
                         &format!("invalid authoring operations: {error}"),
                     );
                     return Ok(());
@@ -816,9 +769,9 @@ impl schema::hub::Server for HubService {
             let request = match decode_import_request(params.get_request()?) {
                 Ok(request) => request,
                 Err(error) => {
-                    write_error(
+                    write_invalid_request(
                         results.get().init_result().init_error(),
-                        WIRE_INVALID_VALUE,
+                        InvalidRequest::Value,
                         &format!("invalid import request: {error}"),
                     );
                     return Ok(());
@@ -892,9 +845,9 @@ impl schema::hub::Server for HubService {
             let operation = match decode_long_running_op(params.get_operation()?) {
                 Ok(operation) => operation,
                 Err(error) => {
-                    write_error(
+                    write_invalid_request(
                         results.get().init_result().init_error(),
-                        WIRE_INVALID_VALUE,
+                        InvalidRequest::Value,
                         &format!("invalid long-running operation: {error}"),
                     );
                     return Ok(());
@@ -1580,14 +1533,14 @@ impl schema::delta_stream::Server for DeltaStreamService {
 
 #[derive(Debug)]
 struct WireFailure {
-    code: u16,
+    kind: InvalidRequest,
     message: String,
 }
 
 impl From<capnp::Error> for WireFailure {
     fn from(error: capnp::Error) -> Self {
         Self {
-            code: WIRE_INVALID_VALUE,
+            kind: InvalidRequest::Value,
             message: error.to_string(),
         }
     }
@@ -1629,7 +1582,7 @@ fn decode_uuid_list(
         .map(|(index, value)| {
             value
                 .map_err(|error| WireFailure {
-                    code: WIRE_INVALID_UUID,
+                    kind: InvalidRequest::Uuid,
                     message: format!("{field}[{index}] could not be read: {error}"),
                 })
                 .and_then(|value| decode_uuid(value, &format!("{field}[{index}]")).map(AssetUuid))
@@ -1872,7 +1825,7 @@ fn decode_pure_metadata_query(
         "q.normalizedPathPrefix",
     )?;
     let role = reader.get_role().map_err(|error| WireFailure {
-        code: WIRE_INVALID_VALUE,
+        kind: InvalidRequest::Value,
         message: format!("q.role is invalid: {error}"),
     })?;
 
@@ -1888,7 +1841,7 @@ fn decode_pure_metadata_query(
     let normalized_path_prefix = if reader.get_has_path_prefix() {
         if !valid_metadata_path_prefix(&path) {
             return Err(WireFailure {
-                code: WIRE_INVALID_UTF8,
+                kind: InvalidRequest::Utf8,
                 message: "q.normalizedPathPrefix is not canonical".to_owned(),
             });
         }
@@ -1897,7 +1850,7 @@ fn decode_pure_metadata_query(
         None
     } else {
         return Err(WireFailure {
-            code: WIRE_INVALID_UTF8,
+            kind: InvalidRequest::Utf8,
             message: "q.normalizedPathPrefix has non-empty unused payload".to_owned(),
         });
     };
@@ -1910,7 +1863,7 @@ fn decode_pure_metadata_query(
         None
     } else {
         return Err(WireFailure {
-            code: WIRE_INVALID_VALUE,
+            kind: InvalidRequest::Value,
             message: "q.role has non-default unused payload".to_owned(),
         });
     };
@@ -1934,7 +1887,7 @@ fn decode_present_uuid(
         Ok(None)
     } else {
         Err(WireFailure {
-            code: WIRE_INVALID_UUID,
+            kind: InvalidRequest::Uuid,
             message: format!("{field} has nonzero unused payload"),
         })
     }
@@ -1954,13 +1907,13 @@ fn decode_optional_uuid(
     field: &str,
 ) -> Result<Option<[u8; 16]>, WireFailure> {
     match reader.which().map_err(|error| WireFailure {
-        code: WIRE_INVALID_UUID,
+        kind: InvalidRequest::Uuid,
         message: format!("{field} selector is invalid: {error}"),
     })? {
         schema::optional_data::Which::Absent(()) => Ok(None),
         schema::optional_data::Which::Value(value) => {
             let value = value.map_err(|error| WireFailure {
-                code: WIRE_INVALID_UUID,
+                kind: InvalidRequest::Uuid,
                 message: format!("{field} could not be read: {error}"),
             })?;
             decode_uuid(value, field).map(Some)
@@ -1973,13 +1926,13 @@ fn decode_optional_text(
     field: &str,
 ) -> Result<Option<String>, WireFailure> {
     match reader.which().map_err(|error| WireFailure {
-        code: WIRE_INVALID_UTF8,
+        kind: InvalidRequest::Utf8,
         message: format!("{field} selector is invalid: {error}"),
     })? {
         schema::optional_text::Which::Absent(()) => Ok(None),
         schema::optional_text::Which::Value(value) => value
             .map_err(|error| WireFailure {
-                code: WIRE_INVALID_UTF8,
+                kind: InvalidRequest::Utf8,
                 message: format!("{field} could not be read: {error}"),
             })
             .and_then(|value| decode_text(value, field))
@@ -1991,7 +1944,7 @@ fn decode_optional_bool(
     reader: schema::optional_bool::Reader<'_>,
 ) -> Result<Option<bool>, WireFailure> {
     match reader.which().map_err(|error| WireFailure {
-        code: WIRE_INVALID_VALUE,
+        kind: InvalidRequest::Value,
         message: format!("query.authoringOnly selector is invalid: {error}"),
     })? {
         schema::optional_bool::Which::Absent(()) => Ok(None),
@@ -2003,21 +1956,21 @@ fn decode_optional_tag(
     reader: schema::optional_tag_selector::Reader<'_>,
 ) -> Result<Option<TagSelector>, WireFailure> {
     match reader.which().map_err(|error| WireFailure {
-        code: WIRE_INVALID_UTF8,
+        kind: InvalidRequest::Utf8,
         message: format!("query.tag selector is invalid: {error}"),
     })? {
         schema::optional_tag_selector::Which::Absent(()) => Ok(None),
         schema::optional_tag_selector::Which::Value(value) => {
             let value = value.map_err(|error| WireFailure {
-                code: WIRE_INVALID_UTF8,
+                kind: InvalidRequest::Utf8,
                 message: format!("query.tag could not be read: {error}"),
             })?;
             let tag = value.get_tag().map_err(|error| WireFailure {
-                code: WIRE_INVALID_UTF8,
+                kind: InvalidRequest::Utf8,
                 message: format!("query.tag.tag could not be read: {error}"),
             })?;
             let optional_value = value.get_value().map_err(|error| WireFailure {
-                code: WIRE_INVALID_UTF8,
+                kind: InvalidRequest::Utf8,
                 message: format!("query.tag.value could not be read: {error}"),
             })?;
             Ok(Some(TagSelector {
@@ -2038,7 +1991,7 @@ fn decode_text_list(
         .map(|(index, value)| {
             value
                 .map_err(|error| WireFailure {
-                    code: WIRE_INVALID_UTF8,
+                    kind: InvalidRequest::Utf8,
                     message: format!("{field}[{index}] could not be read: {error}"),
                 })
                 .and_then(|value| decode_text(value, &format!("{field}[{index}]")))
@@ -2047,27 +2000,31 @@ fn decode_text_list(
 }
 
 fn decode_uuid(bytes: &[u8], field: &str) -> Result<[u8; 16], WireFailure> {
-    fixed(bytes, field, WIRE_INVALID_UUID)
+    fixed(bytes, field, InvalidRequest::Uuid)
 }
 
 fn decode_hash(bytes: &[u8], field: &str) -> Result<[u8; 32], WireFailure> {
-    fixed(bytes, field, WIRE_INVALID_HASH)
+    fixed(bytes, field, InvalidRequest::Hash)
 }
 
 fn decode_instance(bytes: &[u8], field: &str) -> Result<[u8; 16], WireFailure> {
-    fixed(bytes, field, WIRE_INVALID_INSTANCE)
+    fixed(bytes, field, InvalidRequest::Instance)
 }
 
-fn fixed<const N: usize>(bytes: &[u8], field: &str, code: u16) -> Result<[u8; N], WireFailure> {
+fn fixed<const N: usize>(
+    bytes: &[u8],
+    field: &str,
+    kind: InvalidRequest,
+) -> Result<[u8; N], WireFailure> {
     bytes.try_into().map_err(|_| WireFailure {
-        code,
+        kind,
         message: format!("{field} must be {N} bytes, got {}", bytes.len()),
     })
 }
 
 fn decode_text(value: capnp::text::Reader<'_>, field: &str) -> Result<String, WireFailure> {
     value.to_str().map(str::to_owned).map_err(|_| WireFailure {
-        code: WIRE_INVALID_UTF8,
+        kind: InvalidRequest::Utf8,
         message: format!("{field} is not valid UTF-8"),
     })
 }
@@ -2151,15 +2108,116 @@ fn decode_connect_response(
                     .map_err(|error| capnp::Error::failed(error.message))?,
             })
         }
-        Which::Error(failure) => {
-            let failure = failure?;
-            Ok(RemoteConnectOutcome::Error {
-                code: failure.get_code(),
-                message: decode_text(failure.get_message()?, "error.message")
-                    .map_err(|error| capnp::Error::failed(error.message))?,
+        Which::Error(failure) => Ok(RemoteConnectOutcome::Error(decode_rpc_error(failure?)?)),
+    }
+}
+
+/// What a remote call's `RpcError` says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteError {
+    /// What failed; `None` for a request the daemon could not decode
+    /// (`message` names the field).
+    pub failure: Option<RpcFailure>,
+    pub message: String,
+}
+
+pub(crate) fn decode_rpc_error(
+    value: schema::rpc_error::Reader<'_>,
+) -> Result<RemoteError, capnp::Error> {
+    use schema::rpc_error::failure::Which;
+    let wire = |error: WireFailure| capnp::Error::failed(error.message);
+    let text =
+        |value: capnp::text::Reader<'_>, field: &str| decode_text(value, field).map_err(wire);
+    let limit = |value: u64| {
+        usize::try_from(value).map_err(|_| capnp::Error::failed(format!("limit {value} overflows")))
+    };
+    let failure = match value.get_failure().which()? {
+        Which::InvalidRequest(_) => None,
+        Which::SnapshotExpired(()) => Some(RpcFailure::SnapshotExpired),
+        Which::ConnectionClosed(()) => Some(RpcFailure::ConnectionClosed),
+        Which::PipelineUnavailable(diagnostic) => Some(RpcFailure::PipelineUnavailable(Box::new(
+            crate::PipelineUnavailableDiagnostic::PipelineFailure(decode_pipeline_failure(
+                diagnostic?.get_pipeline_failure()?,
+            )?),
+        ))),
+        Which::BuildDepthExceeded(value) => {
+            let value = value?;
+            Some(RpcFailure::BuildDepthExceeded {
+                limit: limit(value.get_limit())?,
+                chain: decode_uuid_list(value.get_chain()?, "buildDepthExceeded.chain")
+                    .map_err(wire)?,
             })
         }
-    }
+        Which::InvalidCursor(value) => {
+            let value = value?;
+            Some(RpcFailure::InvalidCursor {
+                since: InputVersion(value.get_since()),
+                current: InputVersion(value.get_current()),
+            })
+        }
+        Which::ResourceLimit(value) => {
+            let value = value?;
+            Some(RpcFailure::ResourceLimit {
+                resource: text(value.get_resource()?, "resourceLimit.resource")?,
+                limit: limit(value.get_limit())?,
+            })
+        }
+        Which::ArtifactNotFound(hash) => Some(RpcFailure::ArtifactNotFound {
+            hash: ContentHash(decode_hash(hash?, "artifactNotFound").map_err(wire)?),
+        }),
+        Which::AssetNotFound(uuid) => Some(RpcFailure::AssetNotFound {
+            uuid: AssetUuid(decode_uuid(uuid?, "assetNotFound").map_err(wire)?),
+        }),
+        Which::ForeignSnapshot(()) => Some(RpcFailure::ForeignSnapshot),
+        Which::InvalidPath(path) => Some(RpcFailure::InvalidPath {
+            path: text(path?, "invalidPath")?,
+        }),
+        Which::InvalidQuery(detail) => Some(RpcFailure::InvalidQuery {
+            detail: text(detail?, "invalidQuery")?,
+        }),
+        Which::TagIndexPoisoned(bundles) => Some(RpcFailure::TagIndexPoisoned {
+            bundles: decode_uuid_list(bundles?, "tagIndexPoisoned")
+                .map_err(wire)?
+                .into_iter()
+                .map(|uuid| BundleUuid(uuid.0))
+                .collect(),
+        }),
+        Which::StaleInputVersion(value) => {
+            let value = value?;
+            Some(RpcFailure::StaleInputVersion {
+                expected: InputVersion(value.get_expected()),
+                got: InputVersion(value.get_got()),
+            })
+        }
+        Which::InvalidAuthoringRequest(detail) => Some(RpcFailure::InvalidAuthoringRequest {
+            detail: text(detail?, "invalidAuthoringRequest")?,
+        }),
+        Which::LossyWrite(value) => {
+            let value = value?;
+            Some(RpcFailure::LossyWrite {
+                type_uuid: TypeUuid(
+                    decode_uuid(value.get_type_uuid()?, "lossyWrite.typeUuid").map_err(wire)?,
+                ),
+                asset: AssetUuid(
+                    decode_uuid(value.get_asset()?, "lossyWrite.asset").map_err(wire)?,
+                ),
+                fields: decode_text_list(value.get_fields()?, "lossyWrite.fields").map_err(wire)?,
+                detail: text(value.get_detail()?, "lossyWrite.detail")?,
+            })
+        }
+        Which::AuthoringBackendUnavailable(operation) => {
+            Some(RpcFailure::AuthoringBackendUnavailable {
+                operation: text(operation?, "authoringBackendUnavailable")?,
+            })
+        }
+        Which::WireTreeNotFound(hash) => Some(RpcFailure::WireTreeNotFound {
+            hash: LayoutHash(decode_hash(hash?, "wireTreeNotFound").map_err(wire)?),
+        }),
+    };
+    Ok(RemoteError {
+        failure,
+        message: text(value.get_message()?, "error.message")?,
+    })
 }
 
 fn decode_metadata_response(
@@ -2189,14 +2247,7 @@ fn decode_metadata_response(
                     .map_err(|error| capnp::Error::failed(error.message))?,
             })
         }
-        Which::Error(failure) => {
-            let failure = failure?;
-            Ok(RemoteMetadataOutcome::Error {
-                code: failure.get_code(),
-                message: decode_text(failure.get_message()?, "error.message")
-                    .map_err(|error| capnp::Error::failed(error.message))?,
-            })
-        }
+        Which::Error(failure) => Ok(RemoteMetadataOutcome::Error(decode_rpc_error(failure?)?)),
     }
 }
 
@@ -2659,11 +2710,7 @@ fn write_authoring_snapshot_result(
             write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
-        RpcResult::Failure(error) => write_error(
-            result.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        RpcResult::Failure(error) => write_failure(result.init_error(), &error),
     }
 }
 
@@ -2680,11 +2727,7 @@ fn write_metadata_snapshot_result(
             result.set_success(client);
         }
         MetadataCall::SnapshotExpired => result.set_snapshot_expired(()),
-        MetadataCall::Error(error) => write_error(
-            result.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        MetadataCall::Error(error) => write_failure(result.init_error(), &error),
     }
 }
 
@@ -2701,11 +2744,7 @@ fn write_metadata_authoring_snapshot_result(
             result.set_success(client);
         }
         MetadataCall::SnapshotExpired => result.set_snapshot_expired(()),
-        MetadataCall::Error(error) => write_error(
-            result.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        MetadataCall::Error(error) => write_failure(result.init_error(), &error),
     }
 }
 
@@ -2722,11 +2761,7 @@ fn write_metadata_authoring_refresh_result(
             result.set_success(client);
         }
         MetadataCall::SnapshotExpired => result.set_snapshot_expired(()),
-        MetadataCall::Error(error) => write_error(
-            result.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        MetadataCall::Error(error) => write_failure(result.init_error(), &error),
     }
 }
 
@@ -2759,11 +2794,7 @@ fn write_metadata_diagnostics_result(
             }
         }
         MetadataCall::SnapshotExpired => result.set_snapshot_expired(()),
-        MetadataCall::Error(error) => write_error(
-            result.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        MetadataCall::Error(error) => write_failure(result.init_error(), &error),
     }
     Ok(())
 }
@@ -2775,11 +2806,7 @@ fn write_metadata_uint64_result(
     match outcome {
         MetadataCall::Success(value) => result.set_success(value),
         MetadataCall::SnapshotExpired => result.set_snapshot_expired(()),
-        MetadataCall::Error(error) => write_error(
-            result.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        MetadataCall::Error(error) => write_failure(result.init_error(), &error),
     }
 }
 
@@ -2795,11 +2822,7 @@ fn write_metadata_uuid_list_result(
             }
         }
         MetadataNamespaceCall::SnapshotExpired => result.set_snapshot_expired(()),
-        MetadataNamespaceCall::Error(error) => write_error(
-            result.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        MetadataNamespaceCall::Error(error) => write_failure(result.init_error(), &error),
     }
 }
 
@@ -2812,11 +2835,7 @@ fn write_metadata_entry_result(
             write_pure_metadata_entry(result.reborrow().init_success(), &entry);
         }
         MetadataNamespaceCall::SnapshotExpired => result.set_snapshot_expired(()),
-        MetadataNamespaceCall::Error(error) => write_error(
-            result.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        MetadataNamespaceCall::Error(error) => write_failure(result.init_error(), &error),
     }
 }
 
@@ -2839,11 +2858,7 @@ fn write_metadata_path_result(
             }
         }
         MetadataNamespaceCall::SnapshotExpired => result.set_snapshot_expired(()),
-        MetadataNamespaceCall::Error(error) => write_error(
-            result.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        MetadataNamespaceCall::Error(error) => write_failure(result.init_error(), &error),
     }
 }
 
@@ -2865,11 +2880,7 @@ fn write_metadata_authoring_inspect_result(
             write_drifted(result.init_drifted(), &input, current)
         }
         MetadataNamespaceCall::SnapshotExpired => result.set_snapshot_expired(()),
-        MetadataNamespaceCall::Error(error) => write_error(
-            result.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        MetadataNamespaceCall::Error(error) => write_failure(result.init_error(), &error),
     }
 }
 
@@ -2933,11 +2944,7 @@ fn write_uuid_list_result(
             write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
-        RpcResult::Failure(error) => write_error(
-            result.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        RpcResult::Failure(error) => write_failure(result.init_error(), &error),
     }
 }
 
@@ -2954,11 +2961,7 @@ fn write_target_entry_result(
             write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
-        RpcResult::Failure(error) => write_error(
-            result.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        RpcResult::Failure(error) => write_failure(result.init_error(), &error),
     }
 }
 
@@ -2986,11 +2989,7 @@ fn write_authoring_inspect_result(
             write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
-        RpcResult::Failure(error) => write_error(
-            result.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        RpcResult::Failure(error) => write_failure(result.init_error(), &error),
     }
 }
 
@@ -3070,11 +3069,7 @@ fn write_void_result(mut result: schema::void_call::Builder<'_>, outcome: RpcRes
             write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
-        RpcResult::Failure(error) => write_error(
-            result.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        RpcResult::Failure(error) => write_failure(result.init_error(), &error),
     }
 }
 
@@ -3088,11 +3083,7 @@ fn write_uint64_result(mut result: schema::u_int64_call::Builder<'_>, outcome: R
             write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
-        RpcResult::Failure(error) => write_error(
-            result.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        RpcResult::Failure(error) => write_failure(result.init_error(), &error),
     }
 }
 
@@ -3109,11 +3100,7 @@ fn write_bundle_uuid_result(
             write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
-        RpcResult::Failure(error) => write_error(
-            result.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        RpcResult::Failure(error) => write_failure(result.init_error(), &error),
     }
 }
 
@@ -3136,11 +3123,7 @@ fn write_progress_result(
             write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
-        RpcResult::Failure(error) => write_error(
-            result.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        RpcResult::Failure(error) => write_failure(result.init_error(), &error),
     }
 }
 
@@ -3166,11 +3149,7 @@ fn write_import_failures_result(
             write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
-        RpcResult::Failure(error) => write_error(
-            result.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        RpcResult::Failure(error) => write_failure(result.init_error(), &error),
     }
 }
 
@@ -3184,11 +3163,7 @@ fn write_data_result(mut result: schema::data_call::Builder<'_>, outcome: RpcRes
             write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
-        RpcResult::Failure(error) => write_error(
-            result.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        RpcResult::Failure(error) => write_failure(result.init_error(), &error),
     }
 }
 
@@ -3221,11 +3196,7 @@ fn write_resolve_result(
             write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
-        RpcResult::Failure(error) => write_error(
-            result.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        RpcResult::Failure(error) => write_failure(result.init_error(), &error),
     }
 }
 
@@ -3258,11 +3229,7 @@ fn write_runtime_type_policy_result(
             write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
-        RpcResult::Failure(error) => write_error(
-            result.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        RpcResult::Failure(error) => write_failure(result.init_error(), &error),
     }
 }
 
@@ -3293,11 +3260,7 @@ fn write_path_result(
             write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
-        RpcResult::Failure(error) => write_error(
-            result.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        RpcResult::Failure(error) => write_failure(result.init_error(), &error),
     }
 }
 
@@ -3331,11 +3294,7 @@ fn write_fetch_result(
             write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
-        RpcResult::Failure(error) => write_error(
-            result.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        RpcResult::Failure(error) => write_failure(result.init_error(), &error),
     }
 }
 
@@ -3352,11 +3311,7 @@ fn write_metadata_fetch_result(
             result.set_success(client);
         }
         MetadataCall::SnapshotExpired => result.set_snapshot_expired(()),
-        MetadataCall::Error(error) => write_error(
-            result.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        MetadataCall::Error(error) => write_failure(result.init_error(), &error),
     }
 }
 
@@ -3431,11 +3386,7 @@ fn write_snapshot_configuration_result(
             write_reconnect(output.init_reconnect_required(), reason)
         }
         RpcResult::Failure(RpcFailure::SnapshotExpired) => output.set_snapshot_expired(()),
-        RpcResult::Failure(error) => write_error(
-            output.init_error(),
-            failure_code(&error),
-            &format!("{error:?}"),
-        ),
+        RpcResult::Failure(error) => write_failure(output.init_error(), &error),
     }
 }
 
@@ -3716,13 +3667,93 @@ fn write_bundle_source(
     output.set_file_hash(&source.file_hash.0);
 }
 
-fn write_error(mut output: schema::rpc_error::Builder<'_>, code: u16, message: &str) {
-    output.set_code(code);
+/// `error` as its typed `RpcError` arm, its Debug text the message.
+fn write_failure(mut output: schema::rpc_error::Builder<'_>, error: &RpcFailure) {
+    output.set_message(format!("{error:?}").as_str());
+    let mut failure = output.init_failure();
+    match error {
+        RpcFailure::SnapshotExpired => failure.set_snapshot_expired(()),
+        RpcFailure::ConnectionClosed => failure.set_connection_closed(()),
+        RpcFailure::PipelineUnavailable(diagnostic) => {
+            if let Err(invalid) = write_pipeline_unavailable(
+                failure.reborrow().init_pipeline_unavailable(),
+                diagnostic,
+            ) {
+                // The daemon's own diagnostic is malformed: say so.
+                failure.set_invalid_query(format!("{invalid}").as_str());
+            }
+        }
+        RpcFailure::BuildDepthExceeded { limit, chain } => {
+            let mut value = failure.init_build_depth_exceeded();
+            value.set_limit(*limit as u64);
+            let mut list = value.init_chain(chain.len() as u32);
+            for (index, asset) in chain.iter().enumerate() {
+                list.set(index as u32, &asset.0);
+            }
+        }
+        RpcFailure::InvalidCursor { since, current } => {
+            let mut value = failure.init_invalid_cursor();
+            value.set_since(since.0);
+            value.set_current(current.0);
+        }
+        RpcFailure::ResourceLimit { resource, limit } => {
+            let mut value = failure.init_resource_limit();
+            value.set_resource(resource.as_str());
+            value.set_limit(*limit as u64);
+        }
+        RpcFailure::ArtifactNotFound { hash } => failure.set_artifact_not_found(&hash.0),
+        RpcFailure::AssetNotFound { uuid } => failure.set_asset_not_found(&uuid.0),
+        RpcFailure::ForeignSnapshot => failure.set_foreign_snapshot(()),
+        RpcFailure::InvalidPath { path } => failure.set_invalid_path(path.as_str()),
+        RpcFailure::InvalidQuery { detail } => failure.set_invalid_query(detail.as_str()),
+        RpcFailure::TagIndexPoisoned { bundles } => {
+            let mut list = failure.init_tag_index_poisoned(bundles.len() as u32);
+            for (index, bundle) in bundles.iter().enumerate() {
+                list.set(index as u32, &bundle.0);
+            }
+        }
+        RpcFailure::StaleInputVersion { expected, got } => {
+            let mut value = failure.init_stale_input_version();
+            value.set_expected(expected.0);
+            value.set_got(got.0);
+        }
+        RpcFailure::InvalidAuthoringRequest { detail } => {
+            failure.set_invalid_authoring_request(detail.as_str())
+        }
+        RpcFailure::LossyWrite {
+            type_uuid,
+            asset,
+            fields,
+            detail,
+        } => {
+            let mut value = failure.init_lossy_write();
+            value.set_type_uuid(&type_uuid.0);
+            value.set_asset(&asset.0);
+            value.set_detail(detail.as_str());
+            let mut list = value.init_fields(fields.len() as u32);
+            for (index, field) in fields.iter().enumerate() {
+                list.set(index as u32, field.as_str());
+            }
+        }
+        RpcFailure::AuthoringBackendUnavailable { operation } => {
+            failure.set_authoring_backend_unavailable(operation.as_str())
+        }
+        RpcFailure::WireTreeNotFound { hash } => failure.set_wire_tree_not_found(&hash.0),
+    }
+}
+
+/// A request the daemon could not decode: which field, by `kind`, and why.
+fn write_invalid_request(
+    mut output: schema::rpc_error::Builder<'_>,
+    kind: InvalidRequest,
+    message: &str,
+) {
     output.set_message(message);
+    output.init_failure().set_invalid_request(kind);
 }
 
 fn write_wire_error(output: schema::rpc_error::Builder<'_>, failure: &WireFailure) {
-    write_error(output, failure.code, failure.message.as_str());
+    write_invalid_request(output, failure.kind, failure.message.as_str());
 }
 
 fn write_connect_error(mut result: schema::connect_call::Builder<'_>, error: &crate::ConnectError) {
@@ -3755,11 +3786,7 @@ fn write_rpc_result_error_snapshot(
     if error == RpcFailure::SnapshotExpired {
         result.reborrow().set_snapshot_expired(());
     } else {
-        write_error(
-            result.init_error(),
-            failure_code(&error),
-            format!("{error:?}").as_str(),
-        );
+        write_failure(result.init_error(), &error);
     }
 }
 
@@ -3770,11 +3797,7 @@ fn write_rpc_result_error_subscribe(
     if error == RpcFailure::SnapshotExpired {
         result.reborrow().set_snapshot_expired(());
     } else {
-        write_error(
-            result.init_error(),
-            failure_code(&error),
-            format!("{error:?}").as_str(),
-        );
+        write_failure(result.init_error(), &error);
     }
 }
 
@@ -3785,5 +3808,103 @@ fn write_reconnect(mut output: schema::reconnect_required::Builder<'_>, reason: 
 fn wire_reconnect(reason: ReconnectReason) -> schema::ReconnectReason {
     match reason {
         ReconnectReason::PipelineEpochChanged => schema::ReconnectReason::PipelineEpochChanged,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `error` written as an `RpcError` and read back.
+    fn round_trip(write: impl FnOnce(schema::rpc_error::Builder<'_>)) -> RemoteError {
+        let mut message = capnp::message::Builder::new_default();
+        write(message.init_root::<schema::rpc_error::Builder<'_>>());
+        let reader = message
+            .get_root_as_reader::<schema::rpc_error::Reader<'_>>()
+            .unwrap();
+        decode_rpc_error(reader).unwrap()
+    }
+
+    /// Every failure crosses the wire as its typed arm and reads back as
+    /// itself, with its Debug text as the message; a request the daemon
+    /// could not decode reads back as no failure, its message naming why.
+    #[test]
+    fn an_rpc_error_round_trips_its_failure() {
+        let pipeline = crate::PipelineFailure::new(
+            crate::PipelineFailureCode::CandidateRegistration,
+            crate::PipelineFailureOrigin::CandidateOpen,
+            crate::CleanupDisposition::CleanedAndClosed,
+            "duplicate processor id",
+        )
+        .unwrap();
+        let failures = [
+            RpcFailure::SnapshotExpired,
+            RpcFailure::ConnectionClosed,
+            RpcFailure::PipelineUnavailable(Box::new(
+                crate::PipelineUnavailableDiagnostic::PipelineFailure(pipeline),
+            )),
+            RpcFailure::BuildDepthExceeded {
+                limit: 4,
+                chain: vec![AssetUuid([1; 16]), AssetUuid([2; 16])],
+            },
+            RpcFailure::InvalidCursor {
+                since: InputVersion(3),
+                current: InputVersion(9),
+            },
+            RpcFailure::ResourceLimit {
+                resource: "open snapshots".to_owned(),
+                limit: 64,
+            },
+            RpcFailure::ArtifactNotFound {
+                hash: ContentHash([3; 32]),
+            },
+            RpcFailure::AssetNotFound {
+                uuid: AssetUuid([4; 16]),
+            },
+            RpcFailure::ForeignSnapshot,
+            RpcFailure::InvalidPath {
+                path: "../escape".to_owned(),
+            },
+            RpcFailure::InvalidQuery {
+                detail: "daemon state read failed".to_owned(),
+            },
+            RpcFailure::TagIndexPoisoned {
+                bundles: vec![BundleUuid([5; 16])],
+            },
+            RpcFailure::StaleInputVersion {
+                expected: InputVersion(7),
+                got: InputVersion(6),
+            },
+            RpcFailure::InvalidAuthoringRequest {
+                detail: "unknown field".to_owned(),
+            },
+            RpcFailure::LossyWrite {
+                type_uuid: TypeUuid([6; 16]),
+                asset: AssetUuid([7; 16]),
+                fields: vec!["speed".to_owned(), "mass".to_owned()],
+                detail: "no migration".to_owned(),
+            },
+            RpcFailure::AuthoringBackendUnavailable {
+                operation: "write".to_owned(),
+            },
+            RpcFailure::WireTreeNotFound {
+                hash: LayoutHash([8; 32]),
+            },
+        ];
+        for failure in failures {
+            let read = round_trip(|output| write_failure(output, &failure));
+            assert_eq!(read.message, format!("{failure:?}"));
+            assert_eq!(read.failure, Some(failure));
+        }
+        let read = round_trip(|output| {
+            write_invalid_request(output, InvalidRequest::Uuid, "uuid must be 16 bytes")
+        });
+        assert_eq!(
+            read,
+            RemoteError {
+                failure: None,
+                message: "uuid must be 16 bytes".to_owned(),
+            }
+        );
     }
 }

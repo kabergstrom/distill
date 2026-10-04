@@ -9364,6 +9364,11 @@ put production image codecs, mesh optimization, or shader compilers in core.
   connection never outlives its store either, so `StoreInstanceChanged` had
   no producer; it was reported when reading the pipeline fence failed, and
   that is now the call's error.)
+  (schema-min, protocol 18: a call's `RpcError` says what failed as a typed
+  `failure` union, one arm per `RpcFailure` plus `invalidRequest` for a
+  request the daemon could not decode, with the text for people beside it;
+  the numeric codes (`3000`–`3004`, `1001`–`1005`) are gone, and clients
+  match the arm, never the text.)
   (Refined in R25: bootstrap connect is also generated-binding-safe through a
   dedicated typed ConnectResult, and authoring reads move to a pinned
   AuthoringSnapshot capability.)

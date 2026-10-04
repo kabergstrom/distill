@@ -7,9 +7,10 @@ use std::sync::Arc;
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
 use distill_store::state::{InputVersion, SnapshotStamp, StoreInstanceId};
 
+pub use crate::capnp_transport::RemoteError;
 use crate::capnp_transport::{
-    decode_authoring_inspection, decode_configuration_error, decode_rpc_basis, schema,
-    RemoteConnectOutcome, RemoteMetadataOutcome,
+    decode_authoring_inspection, decode_configuration_error, decode_rpc_basis, decode_rpc_error,
+    schema, RemoteConnectOutcome, RemoteMetadataOutcome,
 };
 use crate::{
     ArtifactChunk, ArtifactChunkKind, AssetDeltaState, AssetEvent, AssetQuery, AuthoringEntryRole,
@@ -17,12 +18,6 @@ use crate::{
     MetadataEntry, PathResolveFailure, PathResolveResult, ReconnectReason, ResolveResult, RpcBasis,
     RuntimeTypePolicy, ServedLoadEdge, StreamEvent, TerminalEvent,
 };
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemoteError {
-    pub code: u16,
-    pub message: String,
-}
 
 #[derive(Debug)]
 pub enum RemoteCall<T> {
@@ -89,7 +84,7 @@ impl RemoteHub {
             ),
             schema::snapshot_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
             schema::snapshot_call::Which::Error(value) => {
-                Ok(RemoteCall::Error(decode_error(value?)?))
+                Ok(RemoteCall::Error(decode_rpc_error(value?)?))
             }
         }
     }
@@ -113,7 +108,9 @@ impl RemoteHub {
                 RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
             schema::data_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
-            schema::data_call::Which::Error(value) => Ok(RemoteCall::Error(decode_error(value?)?)),
+            schema::data_call::Which::Error(value) => {
+                Ok(RemoteCall::Error(decode_rpc_error(value?)?))
+            }
         }
     }
 
@@ -157,7 +154,7 @@ impl RemoteHub {
             ),
             schema::subscribe_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
             schema::subscribe_call::Which::Error(value) => {
-                Ok(RemoteCall::Error(decode_error(value?)?))
+                Ok(RemoteCall::Error(decode_rpc_error(value?)?))
             }
         }
     }
@@ -190,7 +187,9 @@ impl RemoteHub {
                 RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
             schema::void_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
-            schema::void_call::Which::Error(value) => Ok(RemoteCall::Error(decode_error(value?)?)),
+            schema::void_call::Which::Error(value) => {
+                Ok(RemoteCall::Error(decode_rpc_error(value?)?))
+            }
         }
     }
 
@@ -225,7 +224,7 @@ impl RemoteHub {
                 Ok(RemoteCall::SnapshotExpired)
             }
             schema::import_failures_call::Which::Error(value) => {
-                Ok(RemoteCall::Error(decode_error(value?)?))
+                Ok(RemoteCall::Error(decode_rpc_error(value?)?))
             }
         }
     }
@@ -270,7 +269,9 @@ impl RemoteHub {
                 RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
             schema::uuid_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
-            schema::uuid_call::Which::Error(value) => Ok(RemoteCall::Error(decode_error(value?)?)),
+            schema::uuid_call::Which::Error(value) => {
+                Ok(RemoteCall::Error(decode_rpc_error(value?)?))
+            }
         }
     }
 }
@@ -310,7 +311,7 @@ impl RemoteSnapshot {
             ),
             schema::u_int64_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
             schema::u_int64_call::Which::Error(value) => {
-                Ok(RemoteCall::Error(decode_error(value?)?))
+                Ok(RemoteCall::Error(decode_rpc_error(value?)?))
             }
         }
     }
@@ -334,7 +335,7 @@ impl RemoteSnapshot {
             ),
             schema::snapshot_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
             schema::snapshot_call::Which::Error(value) => {
-                Ok(RemoteCall::Error(decode_error(value?)?))
+                Ok(RemoteCall::Error(decode_rpc_error(value?)?))
             }
         }
     }
@@ -385,7 +386,7 @@ impl RemoteSnapshot {
                 Ok(RemoteCall::SnapshotExpired)
             }
             schema::chunk_stream_call::Which::Error(value) => {
-                Ok(RemoteCall::Error(decode_error(value?)?))
+                Ok(RemoteCall::Error(decode_rpc_error(value?)?))
             }
         }
     }
@@ -434,7 +435,7 @@ impl RemoteSnapshot {
             ),
             schema::resolve_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
             schema::resolve_call::Which::Error(value) => {
-                Ok(RemoteCall::Error(decode_error(value?)?))
+                Ok(RemoteCall::Error(decode_rpc_error(value?)?))
             }
         }
     }
@@ -487,7 +488,7 @@ impl RemoteSnapshot {
                 Ok(RemoteCall::SnapshotExpired)
             }
             schema::path_resolve_call::Which::Error(value) => {
-                Ok(RemoteCall::Error(decode_error(value?)?))
+                Ok(RemoteCall::Error(decode_rpc_error(value?)?))
             }
         }
     }
@@ -517,7 +518,7 @@ impl RemoteSnapshot {
             ),
             schema::uuid_list_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
             schema::uuid_list_call::Which::Error(value) => {
-                Ok(RemoteCall::Error(decode_error(value?)?))
+                Ok(RemoteCall::Error(decode_rpc_error(value?)?))
             }
         }
     }
@@ -541,7 +542,7 @@ impl RemoteSnapshot {
             ),
             schema::entry_meta_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
             schema::entry_meta_call::Which::Error(value) => {
-                Ok(RemoteCall::Error(decode_error(value?)?))
+                Ok(RemoteCall::Error(decode_rpc_error(value?)?))
             }
         }
     }
@@ -572,7 +573,7 @@ impl RemoteSnapshot {
                 Ok(RemoteCall::SnapshotExpired)
             }
             schema::runtime_type_policy_call::Which::Error(value) => {
-                Ok(RemoteCall::Error(decode_error(value?)?))
+                Ok(RemoteCall::Error(decode_rpc_error(value?)?))
             }
         }
     }
@@ -621,7 +622,7 @@ impl RemoteMetadataHub {
                 Ok(RemoteCall::SnapshotExpired)
             }
             schema::metadata_authoring_snapshot_call::Which::Error(value) => {
-                Ok(RemoteCall::Error(decode_error(value?)?))
+                Ok(RemoteCall::Error(decode_rpc_error(value?)?))
             }
         }
     }
@@ -678,7 +679,7 @@ impl RemoteMetadataAuthoringSnapshot {
                 Ok(RemoteCall::SnapshotExpired)
             }
             schema::metadata_authoring_inspect_call::Which::Error(value) => {
-                Ok(RemoteCall::Error(decode_error(value?)?))
+                Ok(RemoteCall::Error(decode_rpc_error(value?)?))
             }
         }
     }
@@ -1010,13 +1011,6 @@ fn decode_role(value: schema::AuthoringEntryRole) -> AuthoringEntryRole {
         schema::AuthoringEntryRole::Runtime => AuthoringEntryRole::Runtime,
         schema::AuthoringEntryRole::AuthoringOnly => AuthoringEntryRole::AuthoringOnly,
     }
-}
-
-fn decode_error(value: schema::rpc_error::Reader<'_>) -> Result<RemoteError, capnp::Error> {
-    Ok(RemoteError {
-        code: value.get_code(),
-        message: text(value.get_message()?, "rpc.error")?,
-    })
 }
 
 fn decode_text_list(value: capnp::text_list::Reader<'_>) -> Result<Vec<String>, capnp::Error> {

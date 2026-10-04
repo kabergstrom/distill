@@ -1277,8 +1277,8 @@ async fn connect_writer(address: SocketAddr) -> (CapnpClient, RemoteHub, schema:
     (client, hub, raw.0)
 }
 
-/// One write at `base`: its receipt, or the error code.
-async fn write_at(hub: &schema::hub::Client, base: InputVersion) -> Result<WriteReceipt, u16> {
+/// One write at `base`: its receipt, or the error's message.
+async fn write_at(hub: &schema::hub::Client, base: InputVersion) -> Result<WriteReceipt, String> {
     let mut call = hub.write_request();
     {
         let mut params = call.get();
@@ -1298,7 +1298,9 @@ async fn write_at(hub: &schema::hub::Client, base: InputVersion) -> Result<Write
         schema::data_call::Which::Success(bytes) => {
             Ok(WriteReceipt::decode(bytes.unwrap()).unwrap())
         }
-        schema::data_call::Which::Error(error) => Err(error.unwrap().get_code()),
+        schema::data_call::Which::Error(error) => {
+            Err(error.unwrap().get_message().unwrap().to_string().unwrap())
+        }
         _ => panic!("unexpected write outcome"),
     }
 }

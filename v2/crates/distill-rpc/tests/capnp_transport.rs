@@ -611,10 +611,7 @@ fn schema_reconnect_reason_is_the_pipeline_epoch_alone() {
         "ReconnectReason has one arm"
     );
     assert!(!source.contains("storeInstanceChanged"));
-    assert_eq!(
-        schema::ReconnectReason::PipelineEpochChanged as u16,
-        0
-    );
+    assert_eq!(schema::ReconnectReason::PipelineEpochChanged as u16, 0);
 }
 
 /// The authoring entry the daemon serves for the asset `byte`: one blob
@@ -1107,7 +1104,7 @@ async fn unbound_metadata_bootstrap_round_trips_over_tcp_while_failed() {
             assert!(matches!(
                 response.get().unwrap().get_result().unwrap().which().unwrap(),
                 schema::metadata_uuid_list_call::Which::Error(error)
-                    if error.clone().unwrap().get_code() == 1001
+                    if invalid_request(error.clone().unwrap()) == Some(schema::InvalidRequest::Uuid)
             ));
             drop(client);
             server_task.await.unwrap().unwrap();
@@ -1512,7 +1509,10 @@ async fn wire_rejects_wrong_hash_and_uuid_widths_as_typed_results() {
             let malformed_result = malformed_response.get().unwrap().get_result().unwrap();
             match malformed_result.which().unwrap() {
                 schema::connect_call::Which::Error(failure) => {
-                    assert_eq!(failure.unwrap().get_code(), 1002);
+                    assert_eq!(
+                        invalid_request(failure.unwrap()),
+                        Some(schema::InvalidRequest::Hash)
+                    );
                 }
                 _ => panic!("wrong target-definition hash width must be rejected"),
             }
@@ -1533,7 +1533,10 @@ async fn wire_rejects_wrong_hash_and_uuid_widths_as_typed_results() {
             let result = response.get().unwrap().get_result().unwrap();
             match result.which().unwrap() {
                 schema::resolve_call::Which::Error(failure) => {
-                    assert_eq!(failure.unwrap().get_code(), 1001)
+                    assert_eq!(
+                        invalid_request(failure.unwrap()),
+                        Some(schema::InvalidRequest::Uuid)
+                    )
                 }
                 _ => panic!("wrong UUID width must be a typed failure"),
             }
@@ -1544,7 +1547,10 @@ async fn wire_rejects_wrong_hash_and_uuid_widths_as_typed_results() {
             let result = response.get().unwrap().get_result().unwrap();
             match result.which().unwrap() {
                 schema::chunk_stream_call::Which::Error(failure) => {
-                    assert_eq!(failure.unwrap().get_code(), 1002)
+                    assert_eq!(
+                        invalid_request(failure.unwrap()),
+                        Some(schema::InvalidRequest::Hash)
+                    )
                 }
                 _ => panic!("wrong hash width must be a typed failure"),
             }
@@ -2190,7 +2196,12 @@ async fn remote_snapshot_serves_the_pack_surface() {
             );
             match snapshot.entry(definition.uuid).await.unwrap() {
                 RemoteCall::Error(error) => {
-                    assert_eq!(error.code, distill_rpc::capnp_transport::ASSET_NOT_FOUND)
+                    assert_eq!(
+                        error.failure,
+                        Some(RpcFailure::AssetNotFound {
+                            uuid: definition.uuid
+                        })
+                    )
                 }
                 other => panic!("an authoring-only entry is not a runtime entry: {other:?}"),
             }
@@ -2327,10 +2338,20 @@ async fn an_unreadable_generation_fence_answers_the_error_arm() {
             reimport.get().set_base(u64::MAX);
             reimport.get().reborrow().init_bundle().set_bytes(&[1]);
             let reimport = reimport.send().promise.await.unwrap();
-            match reimport.get().unwrap().get_result().unwrap().which().unwrap() {
+            match reimport
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
                 schema::uuid_call::Which::Error(error) => {
                     let error = error.unwrap();
-                    assert_eq!(error.get_code(), 3000);
+                    assert!(matches!(
+                        error.get_failure().which().unwrap(),
+                        schema::rpc_error::failure::Which::InvalidQuery(_)
+                    ));
                     let message = error.get_message().unwrap().to_str().unwrap();
                     assert!(message.contains("daemon state read failed"), "{message}");
                 }
@@ -2341,4 +2362,12 @@ async fn an_unreadable_generation_fence_answers_the_error_arm() {
             server_task.abort();
         })
         .await;
+}
+
+/// The request field an `RpcError` says the daemon could not decode.
+fn invalid_request(error: schema::rpc_error::Reader<'_>) -> Option<schema::InvalidRequest> {
+    match error.get_failure().which().unwrap() {
+        schema::rpc_error::failure::Which::InvalidRequest(kind) => Some(kind.unwrap()),
+        _ => None,
+    }
 }
