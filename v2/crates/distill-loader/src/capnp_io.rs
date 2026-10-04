@@ -196,6 +196,10 @@ pub struct RpcIoStats {
     pub held_snapshots: usize,
     /// Subscription, stream, and maintenance tasks alive.
     pub control_tasks: usize,
+    /// Artifact payload bytes received since the IO was created.
+    pub received_bytes: u64,
+    /// Artifact payload chunks received since the IO was created.
+    pub received_chunks: u64,
 }
 
 /// What one [`RpcIo::step`] did: the work a frame's `poll` may do, which
@@ -313,6 +317,8 @@ impl RpcIo {
                 .iter()
                 .filter(|task| !task.is_finished())
                 .count(),
+            received_bytes: shared.received_bytes.get(),
+            received_chunks: shared.received_chunks.get(),
         }
     }
 
@@ -607,6 +613,9 @@ struct Shared {
     next_serial: Cell<u64>,
     /// Polls of the tasks this IO spawned, ever (see [`StepStats`]).
     task_polls: Rc<Cell<usize>>,
+    /// Artifact payload bytes and chunks received, ever.
+    received_bytes: Cell<u64>,
+    received_chunks: Cell<u64>,
 }
 
 enum Link {
@@ -812,6 +821,8 @@ impl Shared {
             refreshed: tokio::sync::Notify::new(),
             next_serial: Cell::new(1),
             task_polls: Rc::new(Cell::new(0)),
+            received_bytes: Cell::new(0),
+            received_chunks: Cell::new(0),
         }
     }
 
@@ -1346,6 +1357,10 @@ async fn fetch_event(
     request_basis: IoBasis,
 ) -> (IoEvent, Option<Reservation>) {
     let fail = |message: String| (request_error(req, request_basis.clone(), message), None);
+    let mut timing = crate::stats::FetchTiming {
+        started: Some(Instant::now()),
+        ..Default::default()
+    };
     let mut terminal = match snapshot.fetch(content_hash).await {
         Ok(RemoteCall::Success(terminal)) => terminal,
         Ok(call) => return (remote_request_event(call, req, request_basis.clone()), None),
@@ -1356,11 +1371,15 @@ async fn fetch_event(
     let Ok(total_bytes) = usize::try_from(terminal.value.total_bytes()) else {
         return fail("fetched artifact is too large for this client".into());
     };
+    timing.answered = Some(Instant::now());
     let mut reservation = shared.admission.admit(total_bytes).await;
-    let (structural, blobs) = match collect_remote_chunks(&mut terminal.value, total_bytes).await {
-        Ok(payload) => payload,
-        Err(error) => return fail(error),
-    };
+    timing.admitted = Some(Instant::now());
+    let (structural, blobs) =
+        match collect_remote_chunks(shared, &mut terminal.value, total_bytes, &mut timing).await {
+            Ok(payload) => payload,
+            Err(error) => return fail(error),
+        };
+    timing.received = Some(Instant::now());
     // The layout hash the artifact header declares. The loader
     // authenticates the artifact itself (content hash, structure) when it
     // parses it; hashing every byte here as well would double that cost on
@@ -1376,7 +1395,8 @@ async fn fetch_event(
     };
     reservation.grow(wire_layout.len());
     let wire_layout = memory_wire_blob(wire_layout);
-    match fetched_artifact(layout_hash, structural, blobs, load_edges, wire_layout) {
+    timing.completed = Some(Instant::now());
+    match fetched_artifact(layout_hash, structural, blobs, load_edges, wire_layout, timing) {
         Ok(artifact) => (
             IoEvent::Fetched {
                 req,
@@ -1390,9 +1410,13 @@ async fn fetch_event(
     }
 }
 
+/// The payload's chunks, collected; counts them into `shared`'s totals and
+/// `timing` (chunks, bytes, copy time).
 async fn collect_remote_chunks(
+    shared: &Shared,
     stream: &mut distill_rpc::capnp_loader::RemoteChunkStream,
     total_bytes: usize,
+    timing: &mut crate::stats::FetchTiming,
 ) -> Result<(Vec<u8>, Vec<Vec<u8>>), String> {
     let mut structural = Vec::new();
     let mut blobs = std::collections::BTreeMap::<u32, Vec<u8>>::new();
@@ -1415,7 +1439,15 @@ async fn collect_remote_chunks(
                 if total > total_bytes {
                     return Err("artifact stream exceeds its authenticated total".into());
                 }
+                let copy_started = Instant::now();
                 output.extend_from_slice(&chunk.bytes);
+                timing.copy_ns += copy_started.elapsed().as_nanos() as u64;
+                timing.chunks += 1;
+                timing.bytes += chunk.bytes.len() as u64;
+                shared.received_chunks.set(shared.received_chunks.get() + 1);
+                shared
+                    .received_bytes
+                    .set(shared.received_bytes.get() + chunk.bytes.len() as u64);
             }
             Ok(None) => {
                 if blobs.keys().copied().ne(0..blobs.len() as u32) {

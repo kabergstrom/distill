@@ -47,6 +47,13 @@ pub trait AssetStorage {
 
     fn poll(&mut self, token: PendingToken) -> PendingState;
 
+    /// Nanoseconds of the last `update` spent writing upload staging
+    /// memory, for the loader's timeline (doc 22 phase 0); the call clears
+    /// it. Storage that does not measure it reports 0.
+    fn take_upload_ns(&mut self) -> u64 {
+        0
+    }
+
     fn commit(&mut self, type_uuid: TypeUuid, handle: HandleId, adoption: AdoptionId);
 
     fn free(

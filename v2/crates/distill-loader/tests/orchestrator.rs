@@ -411,6 +411,7 @@ fn artifact_with_edges<T: AssetType>(
                 })
                 .collect(),
             wire_layout: blob(dswl_bytes(&wire).unwrap()),
+            timing: Default::default(),
         },
     )
 }
@@ -1035,6 +1036,7 @@ fn malformed_fetch_terminally_fails_its_candidate() {
             blobs: Vec::new(),
             load_edges: Vec::new(),
             wire_layout: blob(Vec::new()),
+            timing: Default::default(),
         },
     );
     loader.process(&mut storage).unwrap();
@@ -2148,4 +2150,60 @@ fn named_refs_resolve_by_path_and_name_and_rebind_when_the_path_changes() {
         .commands
         .iter()
         .any(|command| matches!(command, Command::Resolve(_, asset, _) if *asset == uuid(49))));
+}
+
+// Doc 22 phase 0: a load leaves one timeline that reaches each loader mark
+// in order and is aggregated; an unchanged re-resolve finishes as unchanged.
+#[test]
+fn a_load_records_an_ordered_timeline_and_an_unchanged_reload_finishes_unchanged() {
+    use distill_loader::{Mark, Outcome, Stage};
+    let token = ModuleEpochToken::new(1);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 1, &token);
+    let asset_uuid = uuid(1);
+    let _handle = loader.add_ref::<A>(asset_uuid).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+    assert!(loader.stats().is_active(asset_uuid));
+
+    let (hash, fetched_artifact) = artifact::<A>(asset_uuid, &[]);
+    resolve(&mut loader, asset_uuid, hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, hash, fetched_artifact);
+    loader.process(&mut storage).unwrap();
+
+    assert!(!loader.stats().is_active(asset_uuid));
+    let timeline = loader.stats().history().last().copied().unwrap();
+    assert_eq!(timeline.uuid, asset_uuid);
+    assert_eq!(timeline.outcome, Outcome::Resident);
+    assert_eq!(timeline.type_uuid, Some(A::TYPE_UUID));
+    let order = [
+        Mark::Request,
+        Mark::Resolved,
+        Mark::FetchIssued,
+        Mark::Delivered,
+        Mark::Accepted,
+        Mark::Staged,
+        Mark::Resident,
+    ];
+    let marks = order.map(|mark| timeline.mark(mark).expect("mark reached"));
+    assert!(marks.windows(2).all(|pair| pair[0] <= pair[1]), "{marks:?}");
+    assert_eq!(loader.stats().stage(Stage::Total).count, 1);
+    assert_eq!(loader.stats().totals().resident, 1);
+    assert!(loader.stats().totals().steps >= 3);
+
+    loader.io_mut().push(IoEvent::Delta {
+        stamp: stamp(1),
+        assets: vec![(asset_uuid, distill_loader::AssetDeltaState::Changed)],
+        paths: Vec::new(),
+    });
+    loader.process(&mut storage).unwrap();
+    assert!(loader.stats().is_active(asset_uuid));
+    resolve(&mut loader, asset_uuid, hash);
+    loader.process(&mut storage).unwrap();
+    assert!(!loader.stats().is_active(asset_uuid));
+    let timeline = loader.stats().history().last().copied().unwrap();
+    assert_eq!(timeline.outcome, Outcome::Unchanged);
+    assert_eq!(timeline.mark(Mark::FetchIssued), None);
+    assert_eq!(loader.stats().totals().unchanged, 1);
 }

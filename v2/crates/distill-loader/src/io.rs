@@ -116,6 +116,8 @@ pub struct FetchedArtifact {
     /// Canonical DSWL body authenticated by the artifact header's
     /// `layout_hash`; LoaderIO resolves this before completing the fetch.
     pub wire_layout: Blob,
+    /// What the IO measured while fetching it (doc 22 phase 0).
+    pub timing: crate::stats::FetchTiming,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -13,6 +13,7 @@ pub mod io;
 pub mod orchestrator;
 mod rpc_decode;
 pub mod runtime;
+pub mod stats;
 pub mod storage;
 
 pub use admission::{Admit, FetchAdmission, Reservation};
@@ -33,6 +34,10 @@ pub use orchestrator::{
 pub use runtime::{
     AdoptionId, CompletionDisposition, ConnectionEpoch, HandleId, ManifestEntry, ManifestState,
     OutstandingPurpose, RequestOwner, RequestTracker,
+};
+pub use stats::{
+    AcceptParts, AssetTimeline, FetchTiming, LoaderStats, LoaderTotals, Mark, Outcome, Stage,
+    StageAggregate,
 };
 pub use storage::{
     AssetStorage, GameModuleEpoch, PendingState, PendingToken, RuntimeEpochError, RuntimeEpochs,

@@ -384,6 +384,7 @@ fn decode_fetched(
             blobs,
             load_edges,
             wire_layout: Blob::new(wire_backing, 0, wire_len),
+            timing: Default::default(),
         },
         terminal_type,
     })

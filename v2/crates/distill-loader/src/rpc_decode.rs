@@ -21,6 +21,7 @@ pub(crate) fn fetched_artifact(
     raw_blobs: Vec<Vec<u8>>,
     load_edges: Vec<distill_rpc::ServedLoadEdge>,
     wire_layout: Blob,
+    timing: crate::stats::FetchTiming,
 ) -> Result<FetchedArtifact, String> {
     verify_wire_layout(layout_hash, wire_layout.as_bytes())?;
     let blobs = raw_blobs
@@ -36,6 +37,7 @@ pub(crate) fn fetched_artifact(
         blobs,
         load_edges,
         wire_layout,
+        timing,
     })
 }
 

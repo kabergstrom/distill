@@ -35,6 +35,7 @@ use crate::runtime::{
     AdoptionId, CompletionDisposition, HandleId, ManifestEntry, ManifestState, OutstandingPurpose,
     OutstandingRequest, RequestOwner, RequestTracker,
 };
+use crate::stats::{AcceptParts, LoaderStats, Mark, Outcome};
 use crate::storage::{
     AssetStorage, GameModuleEpoch, PendingState, PendingToken, RuntimeEpochError, RuntimeEpochs,
     StorageError, StoredAdoption, UpdateResult,
@@ -183,6 +184,9 @@ struct Slot {
     path_subscribed: bool,
     status: LoadStatus,
     current: Option<CurrentValue>,
+    /// When a path slot's resolve was asked for ([`LoaderStats`] ns; 0 once
+    /// its timeline took it).
+    requested_at: u64,
 }
 
 struct DescriptorRecord {
@@ -406,6 +410,9 @@ pub struct Loader<I: LoaderIO> {
     reported_reconnect: Option<ReconnectReason>,
     registered_target: Option<RuntimeTarget>,
     draining: BTreeSet<GameModuleEpoch>,
+    stats: LoaderStats,
+    /// Reused by the sweep-end timeline cleanup.
+    stats_scratch: Vec<AssetUuid>,
 }
 
 impl<I: LoaderIO> Loader<I> {
@@ -434,7 +441,19 @@ impl<I: LoaderIO> Loader<I> {
             reported_reconnect: None,
             registered_target: None,
             draining: BTreeSet::new(),
+            stats: LoaderStats::new(),
+            stats_scratch: Vec::new(),
         }
+    }
+
+    /// Request-to-resident timelines and their aggregates (doc 22 phase 0).
+    pub fn stats(&self) -> &LoaderStats {
+        &self.stats
+    }
+
+    /// For [`LoaderStats::reset`] and [`LoaderStats::note_wakeup`].
+    pub fn stats_mut(&mut self) -> &mut LoaderStats {
+        &mut self.stats
     }
 
     pub fn io(&self) -> &I {
@@ -580,6 +599,7 @@ impl<I: LoaderIO> Loader<I> {
             state: ManifestState::Missing,
             adopted_at: AdoptionId(0),
         });
+        self.stats.begin(uuid, self.stats.now());
         self.dirty.insert(uuid);
         self.add_to_live_sweep(BTreeSet::from([uuid]));
         Ok(Handle {
@@ -657,6 +677,7 @@ impl<I: LoaderIO> Loader<I> {
     }
 
     pub fn process(&mut self, storage: &mut dyn AssetStorage) -> Result<(), LoaderError> {
+        self.stats.note_step();
         self.prune_released(storage);
         self.poll_pending(storage);
         self.requests.forget_cancelled();
@@ -830,6 +851,7 @@ impl<I: LoaderIO> Loader<I> {
                 path_subscribed: false,
                 status: LoadStatus::Unloaded,
                 current: None,
+                requested_at: self.stats.now(),
             },
         );
         Ok((id, lease))
@@ -942,6 +964,7 @@ impl<I: LoaderIO> Loader<I> {
         for uuid in detached.iter().copied().collect::<Vec<_>>() {
             if self.handles_for_uuid(uuid).is_empty() {
                 self.dirty.remove(&uuid);
+                self.stats.finish(uuid, Outcome::Abandoned, self.stats.now());
                 if let Some(candidate) = self
                     .sweep
                     .as_mut()
@@ -985,6 +1008,7 @@ impl<I: LoaderIO> Loader<I> {
                 if let Some(uuid) = bound_uuid {
                     if self.handles_for_uuid(uuid).is_empty() {
                         self.dirty.remove(&uuid);
+                        self.stats.finish(uuid, Outcome::Abandoned, self.stats.now());
                         if let Some(sweep) = &mut self.sweep {
                             sweep.dirty_seeds.remove(&uuid);
                             if let Some(candidate) = sweep.candidates.remove(&uuid) {
@@ -1047,7 +1071,9 @@ impl<I: LoaderIO> Loader<I> {
         let basis = self.io.begin_sweep();
         let affected = self.current_components_from(&self.dirty);
         let mut candidates = BTreeMap::new();
+        let now = self.stats.now();
         for uuid in affected {
+            self.stats.begin(uuid, now);
             candidates.insert(
                 uuid,
                 CandidateRecord {
@@ -1076,7 +1102,9 @@ impl<I: LoaderIO> Loader<I> {
         let sweep = self.sweep.as_mut().expect("checked above");
         let basis = sweep.basis.clone();
         sweep.dirty_seeds.extend(seeds);
+        let now = self.stats.now();
         for uuid in affected {
+            self.stats.begin(uuid, now);
             sweep.candidates.entry(uuid).or_insert(CandidateRecord {
                 basis: basis.clone(),
                 resolve_issued: false,
@@ -1103,6 +1131,15 @@ impl<I: LoaderIO> Loader<I> {
                 )
                 .map_err(|_| LoaderError::RequestIdsExhausted)?;
             self.io.resolve_path(req, &path, &basis);
+            // A re-resolve (a delta, a reconnect) times from here.
+            let now = self.stats.now();
+            for slot in self.slots.values_mut() {
+                if slot.requested_at == 0
+                    && matches!(&slot.binding, Binding::Indirect { path: bound, .. } if *bound == path)
+                {
+                    slot.requested_at = now;
+                }
+            }
             self.dirty_paths.remove(&path);
             // The sweep completes only once this answers; ending it earlier
             // would cancel the request.
@@ -1232,6 +1269,7 @@ impl<I: LoaderIO> Loader<I> {
                         adopted_at: AdoptionId(0),
                     });
                     entry.apply_delta(delta);
+                    self.stats.begin(uuid, self.stats.now());
                     self.dirty.insert(uuid);
                     if delta == crate::AssetDeltaState::Deleted {
                         for handle in self.handles_for_uuid(uuid) {
@@ -1337,6 +1375,8 @@ impl<I: LoaderIO> Loader<I> {
                     self.diagnostics.push(LoaderDiagnostic::EventMismatch);
                     return Ok(());
                 };
+                self.stats
+                    .fetched(asset_uuid, &artifact.timing, self.stats.now());
                 self.accept_fetched(asset_uuid, content_hash, artifact, basis);
             }
             IoEvent::SnapshotExpired { req, basis } => {
@@ -1442,6 +1482,7 @@ impl<I: LoaderIO> Loader<I> {
         else {
             return Ok(());
         };
+        self.stats.mark(uuid, Mark::Resolved, self.stats.now());
         match result {
             ResolveResult::Built { content_hash } => {
                 if candidate.basis != event_basis {
@@ -1483,6 +1524,7 @@ impl<I: LoaderIO> Loader<I> {
                     )
                     .map_err(|_| LoaderError::RequestIdsExhausted)?;
                 self.io.fetch(req, content_hash, &event_basis);
+                self.stats.mark(uuid, Mark::FetchIssued, self.stats.now());
                 for handle in self.handles_for_uuid(uuid) {
                     if let Some(slot) = self.slots.get_mut(&handle) {
                         slot.status = LoadStatus::Fetching;
@@ -1550,8 +1592,15 @@ impl<I: LoaderIO> Loader<I> {
         let mut retired = BTreeSet::new();
         let mut rebound = BTreeSet::new();
         let mut unsubscribe = Vec::new();
+        let now = self.stats.now();
         for id in ids {
             let slot = self.slots.get_mut(&id).expect("collected existing slot");
+            let requested_at = std::mem::take(&mut slot.requested_at);
+            if let PathResolveResult::Resolved(uuid) = &result {
+                let at = if requested_at == 0 { now } else { requested_at };
+                self.stats.begin(*uuid, at);
+                self.stats.mark(*uuid, Mark::PathResolved, now);
+            }
             if let Some(uuid) = slot.subscribed_uuid.take() {
                 unsubscribe.push(uuid);
             }
@@ -1586,6 +1635,7 @@ impl<I: LoaderIO> Loader<I> {
         for uuid in retired {
             if self.handles_for_uuid(uuid).is_empty() {
                 self.dirty.remove(&uuid);
+                self.stats.finish(uuid, Outcome::Abandoned, self.stats.now());
                 if let Some(candidate) = self
                     .sweep
                     .as_mut()
@@ -1622,6 +1672,7 @@ impl<I: LoaderIO> Loader<I> {
             self.diagnostics.push(LoaderDiagnostic::EventMismatch);
             return;
         }
+        let t_begin = self.stats.now();
         let blob_bytes = artifact
             .blobs
             .iter()
@@ -1726,6 +1777,7 @@ impl<I: LoaderIO> Loader<I> {
             );
             return;
         }
+        let t_checked = self.stats.now();
         let wire = match decode_dswl(artifact.wire_layout.as_bytes()) {
             Ok(wire) => wire,
             Err(error) => {
@@ -1756,6 +1808,7 @@ impl<I: LoaderIO> Loader<I> {
                 return;
             }
         }
+        let t_dswl = self.stats.now();
         let plans = match compile_plans(&wire, descriptor.descriptor.native_layout) {
             Ok(plans) => plans,
             Err(error) => {
@@ -1767,6 +1820,7 @@ impl<I: LoaderIO> Loader<I> {
                 return;
             }
         };
+        let t_planned = self.stats.now();
         let handles = self.handles_for_uuid(uuid);
         let existing = self
             .sweep
@@ -1812,6 +1866,15 @@ impl<I: LoaderIO> Loader<I> {
                 }
             }
         }
+        let t_constructed = self.stats.now();
+        // Header checks between parse and DSWL count as parse.
+        let parts = AcceptParts {
+            parse_ns: t_checked - t_begin,
+            dswl_ns: t_dswl - t_checked,
+            plan_ns: t_planned - t_dswl,
+            construct_ns: t_constructed - t_planned,
+        };
+        self.stats.accepted(uuid, type_uuid, parts, t_constructed);
         let candidate = self
             .sweep
             .as_mut()
@@ -1993,6 +2056,7 @@ impl<I: LoaderIO> Loader<I> {
             candidate
                 .expected_terminal_types
                 .extend(expected_terminal_types);
+            self.stats.begin(uuid, self.stats.now());
         }
         Ok(())
     }
@@ -2087,7 +2151,33 @@ impl<I: LoaderIO> Loader<I> {
         for uuid in processed_dirty {
             self.dirty.remove(&uuid);
         }
+        self.finish_orphan_timelines();
         Ok(())
+    }
+
+    /// The sweep ended: a timeline that is neither awaiting storage nor
+    /// queued for the next sweep will not reach a terminal mark.
+    fn finish_orphan_timelines(&mut self) {
+        let mut scratch = std::mem::take(&mut self.stats_scratch);
+        scratch.clear();
+        scratch.extend(
+            self.stats
+                .active()
+                .iter()
+                .map(|timeline| timeline.uuid)
+                .filter(|uuid| {
+                    !self.dirty.contains(uuid)
+                        && !self
+                            .pending
+                            .iter()
+                            .any(|pending| pending.members.contains(uuid))
+                }),
+        );
+        let now = self.stats.now();
+        for uuid in scratch.drain(..) {
+            self.stats.finish(uuid, Outcome::Abandoned, now);
+        }
+        self.stats_scratch = scratch;
     }
 
     fn candidate_complete(&self, candidate: &CandidateRecord) -> bool {
@@ -2189,6 +2279,14 @@ impl<I: LoaderIO> Loader<I> {
         members: &[AssetUuid],
         storage: &mut dyn AssetStorage,
     ) -> Result<StageComponentOutcome, LoaderError> {
+        let now = self.stats.now();
+        for uuid in members {
+            if sweep.candidates.get(uuid).is_some_and(|candidate| {
+                matches!(candidate.terminal, CandidateTerminal::Unchanged { .. })
+            }) {
+                self.stats.finish(*uuid, Outcome::Unchanged, now);
+            }
+        }
         if members.iter().all(|uuid| {
             sweep.candidates.get(uuid).is_some_and(|candidate| {
                 matches!(candidate.terminal, CandidateTerminal::Unchanged { .. })
@@ -2232,7 +2330,12 @@ impl<I: LoaderIO> Loader<I> {
                             self.rollback_updates(storage, adoption, &updates);
                             return Err(LoaderError::RuntimeEpoch(error));
                         }
-                        let token = match storage.update(*type_uuid, handle, value, adoption) {
+                        let update_began = self.stats.now();
+                        let update_result = storage.update(*type_uuid, handle, value, adoption);
+                        let staging_ns = storage.take_upload_ns();
+                        let update_ns = self.stats.now() - update_began;
+                        self.stats.updated(uuid, update_began, update_ns, staging_ns);
+                        let token = match update_result {
                             Ok(UpdateResult::Ready) => None,
                             Ok(UpdateResult::Pending(token)) => Some(token),
                             Err(error) => {
@@ -2295,7 +2398,12 @@ impl<I: LoaderIO> Loader<I> {
                             self.rollback_updates(storage, adoption, &updates);
                             return Err(LoaderError::RuntimeEpoch(error));
                         }
-                        let token = match storage.update(type_uuid, handle, value, adoption) {
+                        let update_began = self.stats.now();
+                        let update_result = storage.update(type_uuid, handle, value, adoption);
+                        let staging_ns = storage.take_upload_ns();
+                        let update_ns = self.stats.now() - update_began;
+                        self.stats.updated(uuid, update_began, update_ns, staging_ns);
+                        let token = match update_result {
                             Ok(UpdateResult::Ready) => None,
                             Ok(UpdateResult::Pending(token)) => Some(token),
                             Err(error) => {
@@ -2403,6 +2511,10 @@ impl<I: LoaderIO> Loader<I> {
         for update in &updates {
             storage.commit(update.type_uuid, update.handle, adoption);
         }
+        let now = self.stats.now();
+        for update in &updates {
+            self.stats.finish(update.uuid, Outcome::Resident, now);
+        }
         for update in updates {
             let old = self
                 .slots
@@ -2490,6 +2602,10 @@ impl<I: LoaderIO> Loader<I> {
         failures: &[(AssetUuid, MemberFailure)],
         basis: &IoBasis,
     ) {
+        let now = self.stats.now();
+        for uuid in members {
+            self.stats.finish(*uuid, Outcome::Failed, now);
+        }
         for uuid in members {
             for handle in self.handles_for_uuid(*uuid) {
                 if let Some(slot) = self.slots.get_mut(&handle) {
