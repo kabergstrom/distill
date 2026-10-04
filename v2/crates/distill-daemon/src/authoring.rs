@@ -521,14 +521,18 @@ impl AuthoringBackend for AuthoringService {
         Some(read())
     }
 
-    fn pipeline_runtime_failure(&self, snapshot: &StoreReader) -> Option<PipelineFailure> {
+    fn pipeline_runtime_failure(
+        &self,
+        snapshot: &StoreReader,
+    ) -> Result<Option<PipelineFailure>, RpcFailure> {
         // A candidate failure is the version's errors row; only the epoch
-        // the snapshot serves can fail at runtime.
-        self.compiled(snapshot)
-            .ok()?
+        // the snapshot serves can fail at runtime. A snapshot whose compiled
+        // state is not loaded sees no epoch to report on.
+        Ok(self
+            .compiled(snapshot)?
             .pipeline_epoch()
             .err()
-            .filter(|failure| failure.origin == PipelineFailureOrigin::PublishedRuntime)
+            .filter(|failure| failure.origin == PipelineFailureOrigin::PublishedRuntime))
     }
 
     fn write_files(

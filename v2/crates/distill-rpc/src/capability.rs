@@ -164,6 +164,18 @@ macro_rules! metadata_try {
     };
 }
 
+/// A metadata call's read that fails as an [`RpcFailure`]: an expired
+/// snapshot is the call's own retryable result.
+macro_rules! metadata_rpc_try {
+    ($expr:expr) => {
+        match $expr {
+            Ok(value) => value,
+            Err(RpcFailure::SnapshotExpired) => return MetadataCall::SnapshotExpired,
+            Err(error) => return MetadataCall::Error(error),
+        }
+    };
+}
+
 macro_rules! namespace_try {
     ($expr:expr) => {
         match $expr {
@@ -848,7 +860,7 @@ impl MetadataHub {
         MetadataCall::Success(MetadataDiagnostics {
             stamp: txn.stamp,
             configuration: metadata_try!(txn.configuration()),
-            pipeline: metadata_try!(self.server.inner.effective_pipeline(&txn)),
+            pipeline: metadata_rpc_try!(self.server.inner.effective_pipeline(&txn)),
             namespace_errors: metadata_try!(txn.snapshot().namespace_errors()),
         })
     }
@@ -973,7 +985,7 @@ impl MetadataSnapshot {
         MetadataCall::Success(MetadataDiagnostics {
             stamp: self.basis.snapshot,
             configuration: metadata_try!(txn.configuration()),
-            pipeline: metadata_try!(self.server.inner.effective_pipeline(&txn)),
+            pipeline: metadata_rpc_try!(self.server.inner.effective_pipeline(&txn)),
             namespace_errors: metadata_try!(txn.snapshot().namespace_errors()),
         })
     }

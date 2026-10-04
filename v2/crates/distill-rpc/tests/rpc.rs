@@ -1626,8 +1626,8 @@ impl AuthoringBackend for RuntimeFailedBackend {
     fn pipeline_runtime_failure(
         &self,
         _snapshot: &distill_store::StoreReader,
-    ) -> Option<PipelineFailure> {
-        Some(self.0.clone())
+    ) -> Result<Option<PipelineFailure>, RpcFailure> {
+        Ok(Some(self.0.clone()))
     }
 
     fn prepare_import(

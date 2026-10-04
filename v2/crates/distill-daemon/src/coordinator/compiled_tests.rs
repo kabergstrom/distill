@@ -964,3 +964,62 @@ fn a_complete_publication_revalidates_a_poisoned_skeleton_after_a_schema_edit() 
         assert_eq!(complete[table], reconfigured[table], "{table}");
     }
 }
+
+/// A snapshot whose version's compiled state the registry has released
+/// cannot see the pipeline that version served: its diagnostics expire,
+/// retryably, rather than claim a Ready pipeline it cannot see.
+#[test]
+fn a_snapshot_whose_compiled_state_was_released_expires_instead_of_reporting_ready() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("assets")).unwrap();
+    let mut config = StoreConfig::new(temp.path().join("state"));
+    config.parallelism = 1;
+    let coordinator = Arc::new(
+        DaemonCoordinator::open(
+            config,
+            vec![AssetRoot::new("main", temp.path().join("assets"))],
+            vec![rpc_target(false)],
+            8,
+        )
+        .unwrap(),
+    );
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    let hub = coordinator
+        .server()
+        .root()
+        .metadata(distill_rpc::PROTOCOL_VERSION)
+        .connected()
+        .expect("metadata connection")
+        .hub;
+    let distill_rpc::MetadataCall::Success(snapshot) = hub.snapshot() else {
+        panic!("expected a metadata snapshot");
+    };
+    match snapshot.diagnostics() {
+        distill_rpc::MetadataCall::Success(diagnostics) => {
+            assert_eq!(diagnostics.pipeline, PipelineDiagnostic::Ready)
+        }
+        other => panic!("expected diagnostics, got {other:?}"),
+    }
+
+    // Configurations publish until the snapshot's entry is released.
+    let mut fixture = Fixture {
+        temp,
+        coordinator: Arc::clone(&coordinator),
+        writer,
+    };
+    for index in 0..crate::compiled::RETAINED + 2 {
+        let candidate = fixture.candidate(index % 2 == 0, false);
+        coordinator
+            .publish_configuration_candidate(&mut fixture.writer, candidate)
+            .unwrap();
+    }
+    assert!(matches!(
+        coordinator.compiled_at(&coordinator.open_reader().unwrap()),
+        Ok(_)
+    ));
+    assert_eq!(
+        snapshot.diagnostics(),
+        distill_rpc::MetadataCall::SnapshotExpired
+    );
+}

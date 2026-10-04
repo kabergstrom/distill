@@ -817,12 +817,14 @@ pub trait AuthoringBackend: Send + Sync + 'static {
 
     /// The runtime failure of the pipeline epoch `snapshot` serves, if its
     /// module has failed since it was published. It lives on the loaded
-    /// epoch, never in the store.
+    /// epoch, never in the store. An error: the backend cannot see the
+    /// epoch `snapshot` serves (a retryable failure, such as
+    /// [`RpcFailure::SnapshotExpired`]), so it claims nothing about it.
     fn pipeline_runtime_failure(
         &self,
         _snapshot: &distill_store::StoreReader,
-    ) -> Option<PipelineFailure> {
-        None
+    ) -> Result<Option<PipelineFailure>, RpcFailure> {
+        Ok(None)
     }
 
     /// Apply an ordinary authoring batch, planned against `base`, to the

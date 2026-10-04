@@ -1282,26 +1282,27 @@ pub(crate) fn entry_role(authoring_only: bool) -> AuthoringEntryRole {
     }
 }
 
-/// The failure a pipeline diagnostic gates a request with; a store error
-/// reading it is one.
 /// The pipeline `snapshot` serves: its version's candidate failure, else
-/// the runtime failure `backend` holds for the epoch it serves.
+/// the runtime failure `backend` holds for the epoch it serves. A backend
+/// that cannot see that epoch fails the read (retryably), never Ready.
 fn pipeline_at(
     backend: &dyn AuthoringBackend,
     snapshot: &StoreReader,
-) -> Result<PipelineDiagnostic, StoreError> {
-    if let Some(failure) = snapshot.pipeline_failure()? {
+) -> Result<PipelineDiagnostic, RpcFailure> {
+    if let Some(failure) = snapshot.pipeline_failure().map_err(store_failure)? {
         return Ok(PipelineDiagnostic::Failed(failure));
     }
     Ok(backend
-        .pipeline_runtime_failure(snapshot)
+        .pipeline_runtime_failure(snapshot)?
         .map_or(PipelineDiagnostic::Ready, PipelineDiagnostic::Failed))
 }
 
+/// The failure a pipeline diagnostic gates a request with; a failure
+/// reading it is one.
 pub(crate) fn pipeline_failure(
-    diagnostic: Result<PipelineDiagnostic, StoreError>,
+    diagnostic: Result<PipelineDiagnostic, RpcFailure>,
 ) -> Option<RpcFailure> {
-    match diagnostic.map_err(store_failure) {
+    match diagnostic {
         Err(error) => Some(error),
         Ok(PipelineDiagnostic::Ready) => None,
         Ok(PipelineDiagnostic::Failed(failure)) => Some(RpcFailure::PipelineUnavailable(Box::new(
@@ -1626,7 +1627,7 @@ impl Inner {
 
     /// A snapshot's pipeline: its version's candidate failure, else the
     /// runtime failure of the epoch it serves, which the backend holds.
-    pub(crate) fn effective_pipeline(&self, txn: &SnapshotTxn) -> Result<PipelineDiagnostic, StoreError> {
+    pub(crate) fn effective_pipeline(&self, txn: &SnapshotTxn) -> Result<PipelineDiagnostic, RpcFailure> {
         pipeline_at(&*self.handle.authoring_backend(), txn.snapshot())
     }
 
@@ -1874,7 +1875,7 @@ impl Root {
                 reader.rpc_fences()?,
                 reader.rpc_target(&target_name)?,
                 reader.configuration_state()?,
-                pipeline_at(&*handle.authoring_backend(), reader)?,
+                pipeline_at(&*handle.authoring_backend(), reader),
                 reader.change_log_head()?,
             ))
         });
@@ -1903,6 +1904,10 @@ impl Root {
         if let ConfigurationStatus::Failed(error) = configuration_status(&configuration) {
             return ConnectOutcome::ConfigurationFailed(error);
         }
+        let pipeline = match pipeline {
+            Ok(pipeline) => pipeline,
+            Err(failure) => return ConnectOutcome::Refused(failure),
+        };
         if let PipelineDiagnostic::Failed(failure) = pipeline {
             return ConnectOutcome::PipelineUnavailable(
                 PipelineUnavailableDiagnostic::PipelineFailure(failure),

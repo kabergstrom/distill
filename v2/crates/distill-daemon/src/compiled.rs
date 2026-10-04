@@ -38,7 +38,7 @@ use crate::scanner::{AssetRoot, RootedScanner};
 pub type CompiledKey = Option<InputVersion>;
 
 /// How many superseded entries the registry itself keeps, and for how long.
-const RETAINED: usize = 4;
+pub(crate) const RETAINED: usize = 4;
 const RETAIN_FOR: Duration = Duration::from_secs(120);
 
 /// The compiled state of one store version. Immutable: a publication that
