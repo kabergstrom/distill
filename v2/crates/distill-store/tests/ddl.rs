@@ -87,7 +87,6 @@ fn every_section_13_table_exists() {
         "pipeline_state",
         "pipeline_schema_registry",
         "pipeline_target_set",
-        "configuration_state",
         "pending_restart",
         "registrations",
         "tools",
@@ -276,22 +275,9 @@ fn pipeline_state_row_shape() {
 }
 
 #[test]
-fn configuration_state_and_pending_restart_are_representable() {
+fn pending_restart_is_representable() {
     let dir = tempfile::tempdir().unwrap();
     let conn = open_conn(&dir);
-    assert_eq!(
-        columns(&conn, "configuration_state"),
-        [
-            "id",
-            "active_generation",
-            "input_version",
-            "poison_code",
-            "poison_detail_version",
-            "poison_detail",
-            "poison_reason_hash",
-            "poison_message"
-        ]
-    );
     assert_eq!(
         columns(&conn, "pending_restart"),
         ["generation", "config_key", "config_value"]

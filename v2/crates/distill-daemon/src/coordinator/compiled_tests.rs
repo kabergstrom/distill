@@ -646,11 +646,14 @@ fn published_tables(store: &Store) -> BTreeMap<&'static str, Vec<String>> {
         "derived_outputs",
         "pipeline_state",
         "pipeline_schema_registry",
-        "configuration_state",
         "errors",
     ]
     .into_iter()
     .map(|table| (table, store.table_rows(table).unwrap()))
+    .chain([(
+        "configuration_generation",
+        vec![store.configuration_generation().unwrap().to_string()],
+    )])
     .collect()
 }
 

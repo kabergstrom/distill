@@ -4,7 +4,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use distill_store::config::{change_class, ChangeClass, ConfigValidationError, RestartOnlyChange};
-use distill_store::state::{ConfigurationState, DscpV1, OperationKind};
+use distill_store::state::{ConfigurationError, ConfigurationState, DscpV1, OperationKind};
 use distill_store::{Store, StoreConfig};
 
 fn open() -> (tempfile::TempDir, Store) {
@@ -140,12 +140,12 @@ fn invalid_configuration_candidate_publishes_typed_snapshot_error() {
     let (_dir, mut store) = open();
     store
         .input_transaction(|txn| {
-            txn.publish_configuration_error(
+            txn.set_configuration_source_error(Some(&ConfigurationError::from_reason(
                 &DscpV1::NonLoopbackAddress {
                     address: "10.0.0.5:9999".to_owned(),
                 },
                 "non-loopback daemon address",
-            )
+            )))
         })
         .unwrap();
     let state = store.configuration_state().unwrap();

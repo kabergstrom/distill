@@ -82,17 +82,16 @@ impl InputTxn<'_> {
         self.replace_configuration_family(CONFIGURATION_SOURCE, error)
     }
 
-    /// Publish the configuration status the stored errors select (see
-    /// [`StoreReader::configuration_error`]), or ready at `generation`.
-    /// Returns the selected error.
+    /// The configuration status the stored errors select (see
+    /// [`StoreReader::configuration_error`]); with none, `generation`
+    /// becomes the active one. Returns the selected error.
     pub fn publish_configuration_status(
         &mut self,
         generation: u64,
     ) -> Result<Option<ConfigurationError>, StoreError> {
         let selected = self.reader().configuration_error()?;
-        match &selected {
-            None => self.publish_configuration_ready(generation)?,
-            Some(error) => self.publish_configuration_error(&error.detail, &error.message)?,
+        if selected.is_none() {
+            self.set_configuration_generation(generation)?;
         }
         Ok(selected)
     }

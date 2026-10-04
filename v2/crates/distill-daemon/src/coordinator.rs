@@ -39,7 +39,7 @@ use distill_store::files::{FileObservation, PendingFileWork};
 use distill_store::pipeline::ValidatedPipelineEpoch;
 use distill_store::served::ResolutionRow;
 use distill_store::state::{
-    AssetClaimant, CleanupDisposition, ConfigurationState, DirectoryAliasSide, DscpV1,
+    AssetClaimant, CleanupDisposition, DirectoryAliasSide, DscpV1,
     InputVersion, PipelineFailure, PipelineFailureCode, PipelineFailureOrigin,
     ReadableBundleSource, ScanFailureCode, ScanSubject,
     SkeletonFailureCode,
@@ -601,7 +601,7 @@ impl DaemonCoordinator {
         let base = self.server.stamp_of(store)?.version;
         self.server
             .coordinated_commit(store, base, |store| {
-                let generation = configuration_generation(store).map_err(|error| error.to_string())?;
+                let generation = store.configuration_generation().map_err(|error| error.to_string())?;
                 let (configuration, _) = store
                     .input_transaction(|transaction| {
                         transaction.set_configuration_source_error(error.as_ref())?;
@@ -964,7 +964,7 @@ impl DaemonCoordinator {
                 Err(CompiledLookupError::NotLoaded { .. }) => Arc::new(self.boot.clone()),
                 Err(error) => return Err(error.to_string()),
             };
-            let generation = configuration_generation(store).map_err(|error| error.to_string())?;
+            let generation = store.configuration_generation().map_err(|error| error.to_string())?;
             let ((configuration, version), _) = store
                 .input_transaction(|transaction| {
                     transaction.publish_pipeline_failure(&diagnostic)?;
@@ -1283,16 +1283,6 @@ impl PendingScanRejection {
 
 /// The status `error`, the configuration error the stored errors select,
 /// publishes.
-/// The generation of the last ready configuration the store published (0
-/// before any): what a configuration status published without a new
-/// candidate keeps.
-fn configuration_generation(store: &StoreReader) -> Result<u64, StoreError> {
-    Ok(match store.configuration_state()? {
-        ConfigurationState::Ready(epoch) => epoch.generation,
-        ConfigurationState::Failed { last_good, .. } => last_good.map_or(0, |epoch| epoch.generation),
-    })
-}
-
 fn configuration_status(error: Option<ConfigurationError>) -> ConfigurationStatus {
     error.map_or(ConfigurationStatus::Ready, ConfigurationStatus::Failed)
 }
@@ -2401,7 +2391,7 @@ fn publish_scan(
         })
         .collect::<BTreeSet<_>>();
     let newly_failed = withheld.newly_failed(store)?;
-    let mut generation = configuration_generation(store)?;
+    let mut generation = store.configuration_generation()?;
     if advance_configuration {
         generation = generation
             .checked_add(1)
@@ -2920,7 +2910,7 @@ fn prepare_incremental_publication(
             error: error.to_string(),
         },
     })?;
-    let configuration_generation = configuration_generation(store)?;
+    let configuration_generation = store.configuration_generation()?;
     let mut durable_bundles = BTreeMap::new();
     for bundle in plan.bundles.keys() {
         let meta = store.bundle(*bundle)?;

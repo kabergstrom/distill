@@ -1325,8 +1325,8 @@ fn candidate_rows_search_their_bucket() {
 /// the delete), the directory rules a dirty path's directories select, the
 /// pending work and its acknowledgement by path, the sources an asset's
 /// collision change makes pending (by claimant), the namespace error
-/// family's diff, the pipeline failure and one registered schema, and a
-/// root id.
+/// family's diff, the pipeline failure and one registered schema, the configuration
+/// status, and a root id.
 #[test]
 fn pass_bookkeeping_statements_search_their_indexes() {
     use crate::imports::ImportIndexSource;
@@ -1391,6 +1391,7 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         store.directory_rule_sources_listing(["", "d04/"]).unwrap();
         store.directory_rule_sources_at("main", &bundle_path(4)).unwrap();
         store.pipeline_failure().unwrap();
+        store.configuration_state().unwrap();
         store.ready_schema_hash(RUNTIME_TYPE).unwrap();
         store
             .input_transaction(|txn| {
@@ -1430,7 +1431,7 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         "SEARCH source_claims USING INDEX source_claims_by_subject (kind=? AND subject=?)",
         "USE TEMP B-TREE FOR DISTINCT",
     ];
-    let cases: [(&str, &[&str]); 22] = [
+    let cases: [(&str, &[&str]); 23] = [
         (
             "SELECT root_id, path, canonical_path, physical_path FROM directories",
             &["SCAN directories"],
@@ -1504,6 +1505,10 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         ),
         (
             "SELECT identity, record FROM errors",
+            &["SEARCH errors USING INDEX sqlite_autoindex_errors_1 (family=?)"],
+        ),
+        (
+            "SELECT code, identity, record, message FROM errors",
             &["SEARCH errors USING INDEX sqlite_autoindex_errors_1 (family=?)"],
         ),
     ];

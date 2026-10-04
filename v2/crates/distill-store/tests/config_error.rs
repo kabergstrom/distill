@@ -334,7 +334,10 @@ fn typed_configuration_error_roundtrips_and_message_is_not_hashed() {
     );
     store
         .input_transaction(|txn| {
-            txn.publish_configuration_error(&facts, "daemon address is not loopback")
+            txn.set_configuration_source_error(Some(&ConfigurationError::from_reason(
+                &facts,
+                "daemon address is not loopback",
+            )))
         })
         .unwrap();
 
@@ -356,15 +359,18 @@ fn typed_configuration_error_roundtrips_and_message_is_not_hashed() {
     );
 }
 
+/// The configuration status is the source's error: adopting a restart
+/// changes the generation but not the error, and healing the error makes
+/// the adopted generation ready.
 #[test]
-fn a_later_valid_generation_heals_all_persisted_error_fields() {
+fn only_its_source_heals_a_configuration_error() {
     let (_dir, mut store) = open();
     store
         .input_transaction(|txn| {
-            txn.publish_configuration_error(
+            txn.set_configuration_source_error(Some(&ConfigurationError::from_reason(
                 &DscpV1::InvalidParallelism { value: 0 },
                 "parallelism must be positive",
-            )
+            )))
         })
         .unwrap();
     store
@@ -375,7 +381,14 @@ fn a_later_valid_generation_heals_all_persisted_error_fields() {
         .unwrap();
     assert!(matches!(
         store.configuration_state().unwrap(),
-        ConfigurationState::Ready(_)
+        ConfigurationState::Failed { last_good: Some(ref epoch), .. } if epoch.generation == 1
+    ));
+    store
+        .input_transaction(|txn| txn.set_configuration_source_error(None))
+        .unwrap();
+    assert!(matches!(
+        store.configuration_state().unwrap(),
+        ConfigurationState::Ready(ref epoch) if epoch.generation == 1
     ));
 }
 
@@ -388,11 +401,8 @@ fn unknown_persisted_code_is_rejected_instead_of_becoming_an_other_variant() {
     conn.pragma_update(None, "ignore_check_constraints", true)
         .unwrap();
     conn.execute(
-        "INSERT INTO configuration_state(
-             id, active_generation, input_version,
-             poison_code, poison_detail_version, poison_detail,
-             poison_reason_hash, poison_message
-         ) VALUES (0, 0, 1, 65535, 1, X'', ?1, 'future')",
+        "INSERT INTO errors(family, scope_kind, scope_id, identity, code, record, message)
+         VALUES (4, 6, X'', ?1, 65535, X'', 'future')",
         [[7u8; 32].as_slice()],
     )
     .unwrap();
@@ -414,11 +424,8 @@ fn noncanonical_persisted_error_shape_is_rejected() {
     conn.pragma_update(None, "ignore_check_constraints", true)
         .unwrap();
     conn.execute(
-        "INSERT INTO configuration_state(
-             id, active_generation, input_version,
-             poison_code, poison_detail_version, poison_detail,
-             poison_reason_hash, poison_message
-         ) VALUES (0, 0, 1, 2, 1, ?1, ?2, 'truncated hash')",
+        "INSERT INTO errors(family, scope_kind, scope_id, identity, code, record, message)
+         VALUES (4, 6, X'', ?2, 2, ?1, 'truncated hash')",
         rusqlite::params![
             DscpV1::NonLoopbackAddress {
                 address: "127.0.0.1:1".to_owned(),
@@ -439,18 +446,18 @@ fn noncanonical_persisted_error_shape_is_rejected() {
 
 #[test]
 fn persisted_configuration_error_recomputes_detail_authority() {
-    let cases = ["version", "trailing-detail", "wrong-code", "wrong-digest"];
+    let cases = ["trailing-detail", "wrong-code", "wrong-digest"];
     for case in cases {
         let (dir, mut store) = open();
         let state_path = dir.path().join(".distill");
         store
             .input_transaction(|txn| {
-                txn.publish_configuration_error(
+                txn.set_configuration_source_error(Some(&ConfigurationError::from_reason(
                     &DscpV1::NonLoopbackAddress {
                         address: "10.0.0.5:9999".to_owned(),
                     },
                     "invalid address",
-                )
+                )))
             })
             .unwrap();
         drop(store);
@@ -459,38 +466,21 @@ fn persisted_configuration_error_recomputes_detail_authority() {
         conn.pragma_update(None, "ignore_check_constraints", true)
             .unwrap();
         match case {
-            "version" => {
-                conn.execute(
-                    "UPDATE configuration_state SET poison_detail_version = 2 WHERE id = 0",
-                    [],
-                )
-                .unwrap();
-            }
             "trailing-detail" => {
                 let mut detail: Vec<u8> = conn
-                    .query_row(
-                        "SELECT poison_detail FROM configuration_state WHERE id = 0",
-                        [],
-                        |row| row.get(0),
-                    )
+                    .query_row("SELECT record FROM errors WHERE family = 4", [], |row| row.get(0))
                     .unwrap();
                 detail.push(0);
-                conn.execute(
-                    "UPDATE configuration_state SET poison_detail = ?1 WHERE id = 0",
-                    [detail],
-                )
-                .unwrap();
+                conn.execute("UPDATE errors SET record = ?1 WHERE family = 4", [detail])
+                    .unwrap();
             }
             "wrong-code" => {
-                conn.execute(
-                    "UPDATE configuration_state SET poison_code = 7 WHERE id = 0",
-                    [],
-                )
-                .unwrap();
+                conn.execute("UPDATE errors SET code = 7 WHERE family = 4", [])
+                    .unwrap();
             }
             "wrong-digest" => {
                 conn.execute(
-                    "UPDATE configuration_state SET poison_reason_hash = ?1 WHERE id = 0",
+                    "UPDATE errors SET identity = ?1 WHERE family = 4",
                     [[0xabu8; 32].as_slice()],
                 )
                 .unwrap();
@@ -500,9 +490,10 @@ fn persisted_configuration_error_recomputes_detail_authority() {
         drop(conn);
 
         let reopened = Store::open(StoreConfig::new(&state_path)).unwrap();
-        assert!(matches!(
-            reopened.configuration_state(),
-            Err(StoreError::InvalidConfiguration { .. })
-        ));
+        let state = reopened.configuration_state();
+        assert!(
+            matches!(state, Err(StoreError::InvalidConfiguration { .. })),
+            "{case}: {state:?}"
+        );
     }
 }

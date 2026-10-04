@@ -639,11 +639,6 @@ pub trait ServedWrite {
         meta_get_blob(self.served_conn(), key)
     }
 
-    /// The configuration state as this transaction sees it.
-    fn txn_configuration_state(&self) -> Result<crate::state::ConfigurationState, StoreError> {
-        crate::config::read_configuration_state(self.served_conn())
-    }
-
     /// The reconnect fences as this transaction sees them.
     fn txn_rpc_fences(&self) -> Result<RpcFences, StoreError> {
         let conn = self.served_conn();

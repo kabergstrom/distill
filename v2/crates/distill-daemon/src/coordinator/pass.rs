@@ -1153,7 +1153,7 @@ impl DaemonCoordinator {
                 let claims_errors = store
                     .claims_namespace_errors()
                     .map_err(|error| error.to_string())?;
-                let generation = configuration_generation(store).map_err(|error| error.to_string())?;
+                let generation = store.configuration_generation().map_err(|error| error.to_string())?;
                 let (configuration, _) = store
                     .input_transaction(|transaction| {
                         transaction.set_namespace_errors(claims_errors)?;

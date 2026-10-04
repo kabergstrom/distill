@@ -11,22 +11,14 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use rusqlite::OptionalExtension;
 
-use crate::db::{InputTxn, Store, StoreReader};
+use crate::db::{meta_get_u64, meta_set_u64, InputTxn, Store, StoreReader};
 use crate::error::StoreError;
-use crate::state::{
-    ConfigurationEpoch, ConfigurationError, ConfigurationErrorCode, ConfigurationState, DscpV1,
-};
+use crate::state::{ConfigurationEpoch, ConfigurationState};
 
-type PersistedConfigurationRow = (
-    i64,
-    Option<i64>,
-    Option<i64>,
-    Option<Vec<u8>>,
-    Option<Vec<u8>>,
-    Option<String>,
-);
+/// `store_meta` key of the active configuration generation: the last ready
+/// configuration's, or the adopted restart's.
+const CONFIGURATION_GENERATION: &str = "configuration_generation";
 
 /// Store-side configuration. Defaults match §18's example config.
 #[derive(Debug, Clone)]
@@ -196,15 +188,7 @@ impl Store {
         rows.dedup_by(|a, b| a.0 == b.0);
         let generation = self
             .write_txn(|store| {
-                let active = store
-                    .conn
-                    .query_row(
-                        "SELECT active_generation FROM configuration_state WHERE id = 0",
-                        [],
-                        |r| r.get::<_, i64>(0),
-                    )
-                    .optional()?
-                    .unwrap_or(0) as u64;
+                let active = meta_get_u64(&store.conn, CONFIGURATION_GENERATION)?.unwrap_or(0);
                 let prior = store.conn
                     .prepare_cached("SELECT COALESCE(MAX(generation), 0) FROM pending_restart")?
                     .query_row(
@@ -259,7 +243,7 @@ impl StoreReader {
         let Some(generation) = generation else {
             return Ok(None);
         };
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT config_key FROM pending_restart WHERE generation = ?1 ORDER BY config_key",
         )?;
         let keys = stmt
@@ -271,158 +255,34 @@ impl StoreReader {
         }))
     }
 
+    /// The configuration status: the error the stored errors select (see
+    /// [`StoreReader::configuration_error`]) over the active generation.
     pub fn configuration_state(&self) -> Result<ConfigurationState, StoreError> {
-        read_configuration_state(&self.conn)
-    }
-}
-
-pub(crate) fn read_configuration_state(
-    conn: &rusqlite::Connection,
-) -> Result<ConfigurationState, StoreError> {
-    {
-        let row: Option<PersistedConfigurationRow> = conn
-            .query_row(
-                "SELECT active_generation, poison_code, poison_detail_version, poison_detail,
-                        poison_reason_hash, poison_message
-                 FROM configuration_state WHERE id = 0",
-                [],
-                |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let (generation, code, detail_version, detail, reason_hash, message) =
-            row.unwrap_or((0, None, None, None, None, None));
         let epoch = std::sync::Arc::new(ConfigurationEpoch {
-            generation: generation as u64,
+            generation: self.configuration_generation()?,
         });
-        Ok(match (code, detail_version, detail, reason_hash, message) {
-            (None, None, None, None, None) => ConfigurationState::Ready(epoch),
-            (Some(code), Some(detail_version), Some(detail), Some(reason_hash), Some(message)) => {
-                let code = u16::try_from(code)
-                    .ok()
-                    .and_then(|code| ConfigurationErrorCode::try_from(code).ok())
-                    .ok_or_else(|| StoreError::InvalidConfiguration {
-                        error: format!("unknown persisted configuration error code {code}"),
-                    })?;
-                let reason_hash: [u8; 32] = reason_hash.try_into().map_err(|bytes: Vec<u8>| {
-                    StoreError::InvalidConfiguration {
-                        error: format!(
-                            "persisted configuration error reason hash has length {}, expected 32",
-                            bytes.len()
-                        ),
-                    }
-                })?;
-                let detail_version =
-                    u8::try_from(detail_version).map_err(|_| StoreError::InvalidConfiguration {
-                        error: format!(
-                            "unknown persisted configuration error detail version {detail_version}"
-                        ),
-                    })?;
-                if detail_version != 1 {
-                    return Err(StoreError::InvalidConfiguration {
-                        error: format!(
-                            "unknown persisted configuration error detail version {detail_version}"
-                        ),
-                    });
-                }
-                let detail =
-                    DscpV1::from_canonical_detail_bytes(code, &detail).map_err(|error| {
-                        StoreError::InvalidConfiguration {
-                            error: error.to_string(),
-                        }
-                    })?;
-                let reason = ConfigurationError {
-                    code,
-                    reason_hash,
-                    detail: Box::new(detail),
-                    message,
-                };
-                reason
-                    .validate()
-                    .map_err(|error| StoreError::InvalidConfiguration {
-                        error: error.to_string(),
-                    })?;
-                ConfigurationState::Failed {
-                    reason,
-                    last_good: Some(epoch),
-                }
-            }
-            _ => {
-                return Err(StoreError::InvalidConfiguration {
-                    error: "persisted configuration error fields are incomplete".to_owned(),
-                });
-            }
+        Ok(match self.configuration_error()? {
+            None => ConfigurationState::Ready(epoch),
+            Some(reason) => ConfigurationState::Failed {
+                reason,
+                last_good: Some(epoch),
+            },
         })
+    }
+
+    /// The active configuration generation (0 before any).
+    pub fn configuration_generation(&self) -> Result<u64, StoreError> {
+        Ok(meta_get_u64(&self.conn, CONFIGURATION_GENERATION)?.unwrap_or(0))
     }
 }
 
 impl InputTxn<'_> {
-    /// Publish a validated configuration candidate, healing any prior error
-    /// while retaining the active generation selected by the configuration
-    /// coordinator.
-    pub fn publish_configuration_ready(&mut self, generation: u64) -> Result<(), StoreError> {
-        self.txn
-            .prepare_cached(
-                "INSERT INTO configuration_state(
-                 id, active_generation, input_version,
-                 poison_code, poison_detail_version, poison_detail,
-                 poison_reason_hash, poison_message
-             ) VALUES (0, ?1, ?2, NULL, NULL, NULL, NULL, NULL)
-             ON CONFLICT(id) DO UPDATE SET active_generation = excluded.active_generation,
-               input_version = excluded.input_version,
-               poison_code = NULL,
-               poison_detail_version = NULL,
-               poison_detail = NULL,
-               poison_reason_hash = NULL,
-               poison_message = NULL",
-            )?
-            .execute(rusqlite::params![generation as i64, self.version().0 as i64])?;
-        Ok(())
-    }
-
-    pub fn publish_configuration_error(
-        &mut self,
-        reason: &DscpV1,
-        message: &str,
-    ) -> Result<(), StoreError> {
-        let error = ConfigurationError::from_reason(reason, message);
-        error
-            .validate()
-            .map_err(|error| StoreError::InvalidConfiguration {
-                error: error.to_string(),
-            })?;
-        let detail = error.detail.canonical_detail_bytes();
-        self.txn
-            .prepare_cached(
-                "INSERT INTO configuration_state(
-                 id, active_generation, input_version,
-                 poison_code, poison_detail_version, poison_detail,
-                 poison_reason_hash, poison_message
-             ) VALUES (0, 0, ?1, ?2, 1, ?3, ?4, ?5)
-             ON CONFLICT(id) DO UPDATE SET input_version = excluded.input_version,
-               poison_code = excluded.poison_code,
-               poison_detail_version = excluded.poison_detail_version,
-               poison_detail = excluded.poison_detail,
-               poison_reason_hash = excluded.poison_reason_hash,
-               poison_message = excluded.poison_message",
-            )?
-            .execute(
-                rusqlite::params![
-                    self.version().0 as i64,
-                    error.code as u16,
-                    detail,
-                    error.reason_hash.as_slice(),
-                    error.message,
-                ],
-            )?;
+    /// Make `generation` the active configuration generation: written only
+    /// when it changes.
+    pub(crate) fn set_configuration_generation(&mut self, generation: u64) -> Result<(), StoreError> {
+        if self.reader().configuration_generation()? != generation {
+            meta_set_u64(&self.txn, CONFIGURATION_GENERATION, generation)?;
+        }
         Ok(())
     }
 
@@ -437,22 +297,7 @@ impl InputTxn<'_> {
         let generation = generation.ok_or_else(|| StoreError::InvalidConfiguration {
             error: "no pending-restart generation to adopt".to_owned(),
         })?;
-        self.txn
-            .prepare_cached(
-                "INSERT INTO configuration_state(
-                 id, active_generation, input_version,
-                 poison_code, poison_detail_version, poison_detail,
-                 poison_reason_hash, poison_message
-             ) VALUES (0, ?1, ?2, NULL, NULL, NULL, NULL, NULL)
-             ON CONFLICT(id) DO UPDATE SET active_generation = excluded.active_generation,
-               input_version = excluded.input_version,
-               poison_code = NULL,
-               poison_detail_version = NULL,
-               poison_detail = NULL,
-               poison_reason_hash = NULL,
-               poison_message = NULL",
-            )?
-            .execute(rusqlite::params![generation, self.version().0 as i64])?;
+        self.set_configuration_generation(generation as u64)?;
         self.txn
             .prepare_cached("DELETE FROM pending_restart")?
             .execute([])?;
