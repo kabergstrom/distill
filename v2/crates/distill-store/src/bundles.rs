@@ -452,7 +452,7 @@ impl Store {
     ) -> Result<(), StoreError> {
         self.write_txn(|store| {
             let mut assets = BTreeSet::new();
-            let txn = store.read.conn.savepoint()?;
+            let txn: &rusqlite::Connection = &store.read.conn;
             for update in updates {
                 if !assets.insert(update.asset) {
                     return Err(StoreError::InvalidConfiguration {
@@ -489,7 +489,6 @@ impl Store {
                     });
                 }
             }
-            txn.commit()?;
             Ok(())
         })
     }
@@ -508,7 +507,7 @@ impl Store {
             return Ok(changed);
         }
         self.write_txn(|store| {
-            let txn = store.read.conn.savepoint()?;
+            let txn: &rusqlite::Connection = &store.read.conn;
             for type_uuid in &changed {
                 let type_uuid_bytes = type_uuid.0.as_slice();
                 txn
@@ -525,7 +524,6 @@ impl Store {
                         .execute(rusqlite::params![type_uuid_bytes, epoch.as_slice()])?;
                 }
             }
-            txn.commit()?;
             Ok(())
         })?;
         Ok(changed)

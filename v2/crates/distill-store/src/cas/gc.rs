@@ -950,7 +950,7 @@ mod tests {
         store
             .write_txn(|store| {
                 store.put_artifact(b"before", &[])?;
-                let failed = store.write_txn(|store| {
+                let failed = store.isolated_write_transaction(|store| {
                     store.put_artifact(b"rolled back", &[])?;
                     Err::<(), _>(rejected())
                 });
@@ -997,7 +997,7 @@ mod tests {
         let (_, first) = segments(&store);
         store
             .write_txn(|store| {
-                let failed = store.write_txn(|store| {
+                let failed = store.isolated_write_transaction(|store| {
                     store.put_artifact(&payload(2), &[])?;
                     assert_eq!(segments(store).0, [1], "the savepoint rolled onto segment 1");
                     Err::<(), _>(rejected())
@@ -1027,7 +1027,7 @@ mod tests {
         // enclosing transaction commits.
         store
             .write_txn(|store| {
-                let failed = store.write_txn(|store| {
+                let failed = store.isolated_write_transaction(|store| {
                     store.put_artifact(&payload(4), &[])?;
                     Err::<(), _>(rejected())
                 });

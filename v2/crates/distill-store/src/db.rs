@@ -475,6 +475,9 @@ pub struct Store {
     /// The watcher work the open transaction queued
     /// ([`crate::files::QueuedWork`]).
     pub(crate) queued_work: crate::files::QueuedWork,
+    /// A write nested in the open transaction failed: nothing the
+    /// transaction wrote commits ([`Store::write_txn`]).
+    nested_failure: bool,
     /// Runs in `commit_build` between the append and the index transaction.
     #[cfg(test)]
     pub(crate) before_commit: Option<Box<dyn FnMut() + Send>>,
@@ -561,6 +564,7 @@ impl Store {
             _state_lock: state_lock,
             staged_packages: Vec::new(),
             queued_work: Default::default(),
+            nested_failure: false,
             #[cfg(test)]
             before_commit: None,
         };
@@ -608,6 +612,7 @@ impl Store {
             _state_lock: state_lock,
             staged_packages: Vec::new(),
             queued_work: Default::default(),
+            nested_failure: false,
             #[cfg(test)]
             before_commit: None,
         })
@@ -643,17 +648,17 @@ impl Store {
         F: FnOnce(&mut InputTxn<'_>) -> Result<T, StoreError>,
     {
         match self.input {
-            InputState::Begun { .. } => return self.joined_input_transaction(f, true),
+            InputState::Begun { .. } => return self.joined_input_transaction(f),
             InputState::Armed => {
                 self.begin_input()?;
-                return self.joined_input_transaction(f, true);
+                return self.joined_input_transaction(f);
             }
             InputState::Closed => {}
         }
         self.arm_input();
         self.begin_input()?;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.joined_input_transaction(f, true)
+            self.joined_input_transaction(f)
         }));
         match result {
             Ok(Ok(out)) => {
@@ -671,27 +676,19 @@ impl Store {
         }
     }
 
-    /// `f` as a savepoint in the open input (or, with none open, in a
-    /// transaction of its own), kept only when `keep`.
-    fn joined_input_transaction<T, F>(
-        &mut self,
-        f: F,
-        keep: bool,
-    ) -> Result<(T, InputVersion), StoreError>
+    /// `f` in the open input, which it fails when it fails (see
+    /// [`Store::write_txn`]).
+    fn joined_input_transaction<T, F>(&mut self, f: F) -> Result<(T, InputVersion), StoreError>
     where
         F: FnOnce(&mut InputTxn<'_>) -> Result<T, StoreError>,
     {
         let instance = self.instance_id();
         let config = Arc::clone(&self.config);
         let state_path = config.state_path.clone();
-        let open = self.input;
-        let staged = self.staged_packages.len();
-        let queued = self.queued_work.mark();
-        let txn = self.read.conn.savepoint()?;
-        let base = match open {
-            InputState::Begun { base } => base,
-            _ => InputVersion(meta_get_u64(&txn, "input_version")?.unwrap_or(0)),
+        let InputState::Begun { base } = self.input else {
+            unreachable!("an input transaction runs in a begun input");
         };
+        let txn: &Connection = &self.read.conn;
         let version = InputVersion(base.0 + 1);
         let out = {
             let mut input_txn = InputTxn {
@@ -708,18 +705,12 @@ impl Store {
                 queued_work: &mut self.queued_work,
             };
             f(&mut input_txn).and_then(|out| {
-                if keep {
-                    meta_set_u64(&input_txn.txn, "input_version", version.0)?;
-                    input_txn.txn.commit()?;
-                }
+                meta_set_u64(input_txn.txn, "input_version", version.0)?;
                 Ok(out)
             })
         };
-        if out.is_err() || !keep {
-            // The savepoint rolled back: so do the packages it staged and
-            // the work it queued or consumed.
-            self.staged_packages.truncate(staged);
-            self.queued_work.restore(queued);
+        if out.is_err() {
+            self.nested_failure = true;
         }
         Ok((out?, version))
     }
@@ -751,6 +742,7 @@ impl Store {
         assert_eq!(self.input, InputState::Armed, "an input begins once armed");
         self.refresh_config();
         self.read.conn.execute_batch("BEGIN IMMEDIATE")?;
+        self.nested_failure = false;
         let base = match meta_get_u64(&self.read.conn, "input_version") {
             Ok(version) => InputVersion(version.unwrap_or(0)),
             Err(error) => {
@@ -776,6 +768,13 @@ impl Store {
             return Ok(self.input_version()?);
         };
         let staged = std::mem::take(&mut self.staged_packages);
+        let failed = std::mem::replace(&mut self.nested_failure, false);
+        if keep && failed {
+            drop(staged);
+            self.queued_work.reset();
+            self.read.conn.execute_batch("ROLLBACK")?;
+            return Err(nested_failure());
+        }
         if keep {
             if let Err(error) = self.queued_work.flush(&self.read.conn) {
                 self.queued_work.reset();
@@ -818,47 +817,33 @@ impl Store {
 
     /// Run `f` as one write transaction: `BEGIN IMMEDIATE` when none is
     /// open, so the transaction holds SQLite's write lock from its first
-    /// read and never upgrades a read snapshot; inside an open one, a
-    /// savepoint in it. On failure everything `f` wrote rolls back (a nested
-    /// one only its own writes, so a caller that handles the error commits
-    /// none of them). The CAS needs no fixup: a writer finds its segment by
-    /// its `cas_segments` row, so a rolled-back allocation goes with its row
-    /// (and its id with `next_segment_id`), and bytes a rolled-back append
-    /// left in a surviving segment are dead space past its `indexed_len`.
+    /// read and never upgrades a read snapshot; inside an open one, part of
+    /// it. On failure everything `f` wrote rolls back: a nested failure
+    /// fails the open transaction, which then commits nothing, even when
+    /// its caller handled the error (transactions review H1). The CAS needs
+    /// no fixup: a writer finds its segment by its `cas_segments` row, so a
+    /// rolled-back allocation goes with its row (and its id with
+    /// `next_segment_id`), and bytes a rolled-back append left in a
+    /// surviving segment are dead space past its `indexed_len`.
     pub(crate) fn write_txn<T>(
         &mut self,
         f: impl FnOnce(&mut Store) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         if !self.read.conn.is_autocommit() {
-            let queued = self.queued_work.mark();
-            self.read.conn.execute_batch("SAVEPOINT write_txn")?;
             let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
-            let out = match out {
-                Ok(Ok(value)) => match self.read.conn.execute_batch("RELEASE write_txn") {
-                    Ok(()) => return Ok(value),
-                    Err(error) => Err(error.into()),
-                },
-                Ok(Err(error)) => Err(error),
-                Err(panic) => {
-                    self.queued_work.restore(queued);
-                    let _ = self
-                        .read
-                        .conn
-                        .execute_batch("ROLLBACK TO write_txn; RELEASE write_txn");
-                    std::panic::resume_unwind(panic)
-                }
-            };
-            self.queued_work.restore(queued);
-            let _ = self
-                .read
-                .conn
-                .execute_batch("ROLLBACK TO write_txn; RELEASE write_txn");
-            return out;
+            if !matches!(out, Ok(Ok(_))) {
+                self.nested_failure = true;
+            }
+            return out.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         }
         self.refresh_config();
         self.read.conn.execute_batch("BEGIN IMMEDIATE")?;
+        self.nested_failure = false;
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
         let out = match out {
+            Ok(Ok(_)) if std::mem::replace(&mut self.nested_failure, false) => {
+                Err(nested_failure())
+            }
             Ok(Ok(value)) => match self
                 .queued_work
                 .flush(&self.read.conn)
@@ -880,6 +865,35 @@ impl Store {
         self.queued_work.reset();
         let _ = self.read.conn.execute_batch("ROLLBACK");
         out
+    }
+
+    /// [`Store::write_txn`], except that inside an open transaction `f` is
+    /// a savepoint that rolls back alone when it fails, and the open
+    /// transaction keeps the rest: for a caller that handles the failure
+    /// and goes on (a build flush whose failure poisons one asset, Txn H1
+    /// and M3). The CAS needs no fixup, as in [`Store::write_txn`].
+    pub fn isolated_write_transaction<T>(
+        &mut self,
+        f: impl FnOnce(&mut Store) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        if self.read.conn.is_autocommit() {
+            return self.write_txn(f);
+        }
+        let queued = self.queued_work.mark();
+        let failed = self.nested_failure;
+        self.read.conn.execute_batch("SAVEPOINT isolated")?;
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        if let Ok(Ok(value)) = out {
+            self.read.conn.execute_batch("RELEASE isolated")?;
+            return Ok(value);
+        }
+        self.queued_work.restore(queued);
+        self.nested_failure = failed;
+        let _ = self
+            .read
+            .conn
+            .execute_batch("ROLLBACK TO isolated; RELEASE isolated");
+        out.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     }
 
     /// [`Store::write_txn`] for callers outside this crate: reads that decide
@@ -931,16 +945,23 @@ impl Store {
     /// version (§13): build results move only the memo sequence.
     pub(crate) fn memo_transaction<T, F>(&mut self, f: F) -> Result<(T, MemoSeq), StoreError>
     where
-        F: FnOnce(&rusqlite::Savepoint<'_>, MemoSeq) -> Result<T, StoreError>,
+        F: FnOnce(&Connection, MemoSeq) -> Result<T, StoreError>,
     {
         self.write_txn(|store| {
-            let txn = store.read.conn.savepoint()?;
-            let seq = MemoSeq(meta_get_u64(&txn, "memo_seq")?.unwrap_or(0) + 1);
-            let out = f(&txn, seq)?;
-            meta_set_u64(&txn, "memo_seq", seq.0)?;
-            txn.commit()?;
+            let txn: &Connection = &store.read.conn;
+            let seq = MemoSeq(meta_get_u64(txn, "memo_seq")?.unwrap_or(0) + 1);
+            let out = f(txn, seq)?;
+            meta_set_u64(txn, "memo_seq", seq.0)?;
             Ok((out, seq))
         })
+    }
+}
+
+/// The error a transaction whose nested write failed commits with: it
+/// rolled back.
+fn nested_failure() -> StoreError {
+    StoreError::Rejected {
+        detail: "a write in the transaction failed; it rolled back".to_owned(),
     }
 }
 
@@ -1127,7 +1148,7 @@ impl StoreReader {
 /// table writes through methods on this; dropping without commit rolls
 /// everything back.
 pub struct InputTxn<'a> {
-    pub(crate) txn: rusqlite::Savepoint<'a>,
+    pub(crate) txn: &'a Connection,
     base_stamp: SnapshotStamp,
     version: InputVersion,
     pub(crate) state_path: PathBuf,
@@ -1154,7 +1175,7 @@ impl InputTxn<'_> {
     pub fn reader(&self) -> ReadView<'_> {
         ReadView {
             reader: StoreReader {
-                conn: ReaderConn::Lent(NonNull::from(&*self.txn)),
+                conn: ReaderConn::Lent(NonNull::from(self.txn)),
                 config: Arc::clone(&self.config),
                 instance_id: self.base_stamp.instance,
             },

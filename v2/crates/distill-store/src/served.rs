@@ -805,7 +805,7 @@ pub trait ServedWrite {
 
 impl ServedWrite for InputTxn<'_> {
     fn served_conn(&self) -> &Connection {
-        &self.txn
+        self.txn
     }
 
     fn change_version(&self) -> InputVersion {
@@ -816,7 +816,7 @@ impl ServedWrite for InputTxn<'_> {
 /// A transaction that changes only served state (fences, diagnostics,
 /// artifact edges) without publishing a new input version.
 pub struct ServedTxn<'a> {
-    txn: rusqlite::Savepoint<'a>,
+    txn: &'a Connection,
     version: InputVersion,
 }
 
@@ -829,7 +829,7 @@ impl ServedTxn<'_> {
 
 impl ServedWrite for ServedTxn<'_> {
     fn served_conn(&self) -> &Connection {
-        &self.txn
+        self.txn
     }
 
     fn change_version(&self) -> InputVersion {
@@ -844,12 +844,9 @@ impl crate::db::Store {
         F: FnOnce(&mut ServedTxn<'_>) -> Result<T, StoreError>,
     {
         self.write_txn(|store| {
-            let txn = store.read.conn.savepoint()?;
-            let version = InputVersion(meta_get_u64(&txn, "input_version")?.unwrap_or(0));
-            let mut served = ServedTxn { txn, version };
-            let out = f(&mut served)?;
-            served.txn.commit()?;
-            Ok(out)
+            let txn: &Connection = &store.read.conn;
+            let version = InputVersion(meta_get_u64(txn, "input_version")?.unwrap_or(0));
+            f(&mut ServedTxn { txn, version })
         })
     }
 }

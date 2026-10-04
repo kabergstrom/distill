@@ -396,7 +396,7 @@ fn a_rolled_back_registration_leaves_no_package() {
 /// A savepoint that rolls back inside an input that commits drops the
 /// packages it staged and keeps the input's own.
 #[test]
-fn a_rolled_back_savepoint_drops_only_its_packages() {
+fn a_failed_nested_input_fails_the_input_and_drops_its_packages() {
     let dir = tempfile::tempdir().unwrap();
     let config = StoreConfig::new(dir.path().join(".distill"));
     let mut store = Store::open(config.clone()).unwrap();
@@ -409,12 +409,11 @@ fn a_rolled_back_savepoint_drops_only_its_packages() {
         Err(StoreError::Rejected { detail: "nested failure".into() })
     });
     assert!(inner.is_err());
-    store.finish_input(true).unwrap();
+    assert!(store.finish_input(true).is_err());
     let packages = std::fs::read_dir(config.state_path.join("tools/packages"))
-        .unwrap()
-        .count();
-    assert_eq!(packages, 1);
-    assert!(outer.root.unwrap().join("bin/tool").is_file());
-    assert!(store.tool("outer").unwrap().unwrap().revalidate().is_ok());
+        .map_or(0, Iterator::count);
+    assert_eq!(packages, 0);
+    assert!(!outer.root.unwrap().exists());
+    assert!(store.tool("outer").unwrap().is_none());
     assert!(store.tool("inner").unwrap().is_none());
 }

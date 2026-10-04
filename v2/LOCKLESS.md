@@ -574,7 +574,8 @@ should reach zero by the end of phase 6.
       an epoch that is still shared is retained (poisoned) rather than
       unloaded.
   - **One input per coordinated publication (closes the `Delta` gap).**
-    - Every store write is a savepoint. `Store::arm_input` makes the next
+    - Every store write joins the open transaction (schema-min: no
+      savepoints but an inline build's flush). `Store::arm_input` makes the next
       input transaction begin one outer transaction (`BEGIN IMMEDIATE`)
       that later writes join: the daemon's namespace, tag refinement's
       build and tag-index writes, and the server's served `Delta`.
@@ -1161,7 +1162,11 @@ should reach zero by the end of phase 6.
   per-edit statement count and bounds its page reads.
 - **A failed step commits nothing.** A write transaction nested in an
   open one is a savepoint, so a failed nested step rolls back only its own
-  writes. An authoring backend's error (a write, an import, a deferred
+  writes. (schema-min: a nested write is part of the open transaction,
+  and its failure fails that transaction, which then commits nothing even
+  when the caller handled the error. Only an inline build's flush, whose
+  failure a tag-index refinement turns into one asset's poison, is a
+  savepoint: `Store::isolated_write_transaction`.) An authoring backend's error (a write, an import, a deferred
   operation) rolls its input back; a watched import's memoized failure is
   returned as data (`ImportJob`'s `Ok(Err(failure))`) and commits alone.
   A runtime pipeline failure and its served fence, and a staged restart and
@@ -1173,7 +1178,7 @@ should reach zero by the end of phase 6.
   that indexes a record group is its commit, so recovery reads no records:
   it cuts bytes past `indexed_len`. A
   writer keeps no active-segment binding in memory: it finds its segment
-  by `cas_segments.owner` (`ACTIVE_SEGMENT`). A rolled-back write savepoint therefore needs
+  by `cas_segments.owner` (`ACTIVE_SEGMENT`). A rolled-back write (or isolated savepoint) therefore needs
   no CAS fixup: the allocation's row, its `next_segment_id` and its seals
   roll back with it, the id's next allocation truncates the file it left,
   and bytes it appended to a surviving segment are dead space the next

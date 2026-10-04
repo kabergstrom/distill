@@ -340,7 +340,8 @@ fn work_queued_and_acknowledged_in_one_transaction_is_never_written() {
     let work = store.pending_file_work().unwrap();
     assert_eq!(work.dirty.len(), 1);
     assert!(store.acknowledge_file_work(&work).unwrap());
-    // A step that rolls back takes the work it queued with it.
+    // A step that fails fails its input: the work it queued rolls back
+    // with the input.
     store
         .input_transaction(|transaction| {
             let root = transaction.intern_root("main")?;
@@ -351,7 +352,7 @@ fn work_queued_and_acknowledged_in_one_transaction_is_never_written() {
             })
         })
         .unwrap_err();
-    store.finish_input(true).unwrap();
+    store.finish_input(true).unwrap_err();
     assert!(store.committed_file_work().unwrap().is_empty());
     assert!(store.pending_file_work().unwrap().is_empty());
 

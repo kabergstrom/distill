@@ -144,8 +144,9 @@ enum QueuedEntry {
 /// The watcher work the open write transaction queued, not yet written: a
 /// scratch list of that transaction only. Its outermost commit writes the
 /// entries no pass consumed to `file_work`, so work queued and
-/// acknowledged in one transaction never becomes a row; a rollback, or a
-/// savepoint's, drops what it queued and restores what it consumed.
+/// acknowledged in one transaction never becomes a row; a rollback, or an
+/// isolated write's ([`crate::Store::isolated_write_transaction`]), drops
+/// what it queued and restores what it consumed.
 #[derive(Debug, Default)]
 pub(crate) struct QueuedWork {
     /// Advances at each outermost commit or rollback: a snapshot taken in
@@ -156,7 +157,7 @@ pub(crate) struct QueuedWork {
     consumed: usize,
 }
 
-/// A [`QueuedWork`] state a savepoint returns to on rollback.
+/// A [`QueuedWork`] state an isolated write returns to on rollback.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct QueuedMark {
     len: usize,

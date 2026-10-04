@@ -1067,7 +1067,9 @@ fn flush_writes(context: &BuildContext) -> Result<(), BuildError> {
     };
     match &context.stores {
         BuildStores::Worker { writer, .. } => writer.borrow_mut().write_transaction(publish),
-        BuildStores::Inline(store) => store.borrow_mut().write_transaction(publish),
+        // An inline build runs in its caller's transaction, which may handle
+        // the failure (a tag-index refinement poisons the asset) and go on.
+        BuildStores::Inline(store) => store.borrow_mut().isolated_write_transaction(publish),
         BuildStores::Snapshot(_) => {
             return Err(BuildError::Failed("a build at a read snapshot publishes nothing".to_owned()))
         }

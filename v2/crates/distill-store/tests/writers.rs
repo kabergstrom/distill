@@ -114,57 +114,86 @@ fn writers_follow_the_operational_configuration_from_their_next_transaction() {
     assert_eq!(opener.open_writer().unwrap().config().segment_size, before * 2);
 }
 
-/// A write transaction nested in an open input is a savepoint: when it
-/// fails, its own writes roll back and the input keeps the rest.
-#[test]
-fn a_failed_nested_write_rolls_back_only_its_own_writes() {
+/// Records `path` as an observed file in its own input transaction.
+fn observe(store: &mut Store, path: &str) -> Result<(), distill_store::StoreError> {
     use distill_store::files::{FileKind, FileObservation, FileState};
+    let file = FileObservation::from(FileState {
+        mtime: 0,
+        size: 0,
+        kind: FileKind::File,
+        content_hash: None,
+    });
+    store
+        .input_transaction(|txn| {
+            let root = txn.intern_root("main")?;
+            txn.upsert_file(root, path, &file, txn.version())
+        })
+        .map(drop)
+}
+
+fn observed_paths(store: &Store) -> Vec<String> {
+    store.observed_files().unwrap().into_iter().map(|row| row.path).collect()
+}
+
+/// A write transaction nested in an open input is part of it: when it
+/// fails, the input commits nothing, even when its caller handled the
+/// failure (transactions review H1).
+#[test]
+fn a_failed_nested_write_fails_the_open_input() {
     use distill_store::StoreError;
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(StoreConfig::new(dir.path().join("state"))).unwrap();
-    let observe = |store: &mut Store, path: &str| {
-        let file = FileObservation::from(FileState {
-            mtime: 0,
-            size: 0,
-            kind: FileKind::File,
-            content_hash: None,
-        });
-        store
-            .input_transaction(|txn| {
-                let root = txn.intern_root("main")?;
-                txn.upsert_file(root, path, &file, txn.version())
-            })
-            .map(drop)
-    };
+    for handled in [false, true] {
+        store.open_input().unwrap();
+        store.write_transaction(|store| observe(store, "before")).unwrap();
+        let failed = if handled {
+            store.write_transaction_with(
+                |error| error.to_string(),
+                |store| {
+                    observe(store, "failed").map_err(|error| error.to_string())?;
+                    Err::<(), _>("the step failed".to_owned())
+                },
+            )
+        } else {
+            store
+                .write_transaction(|store| {
+                    observe(store, "failed")?;
+                    Err::<(), _>(StoreError::Rejected {
+                        detail: "the step failed".to_owned(),
+                    })
+                })
+                .map_err(|error| error.to_string())
+        };
+        assert!(failed.is_err());
+        store.write_transaction(|store| observe(store, "after")).unwrap();
+        assert!(store.finish_input(true).is_err());
+        assert!(observed_paths(&store).is_empty());
+    }
+    // The next input is unaffected.
     store.open_input().unwrap();
-    store
-        .write_transaction(|store| {
-            observe(store, "kept")
-        })
-        .unwrap();
-    let failed = store.write_transaction(|store| {
+    store.write_transaction(|store| observe(store, "next")).unwrap();
+    store.finish_input(true).unwrap();
+    assert_eq!(observed_paths(&store), ["next"]);
+}
+
+/// An isolated write nested in an open input is a savepoint: when it
+/// fails, its own writes roll back and the input keeps the rest.
+#[test]
+fn a_failed_isolated_write_rolls_back_only_its_own_writes() {
+    use distill_store::StoreError;
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(StoreConfig::new(dir.path().join("state"))).unwrap();
+    store.open_input().unwrap();
+    store.write_transaction(|store| observe(store, "kept")).unwrap();
+    let failed = store.isolated_write_transaction(|store| {
         observe(store, "dropped")?;
         Err::<(), _>(StoreError::Rejected {
             detail: "the step failed".to_owned(),
         })
     });
     assert!(failed.is_err());
-    let failed_with = store.write_transaction_with(
-        |error| error.to_string(),
-        |store| {
-            observe(store, "dropped too").map_err(|error| error.to_string())?;
-            Err::<(), _>("the step failed".to_owned())
-        },
-    );
-    assert!(failed_with.is_err());
     store.finish_input(true).unwrap();
-    let paths = store
-        .observed_files()
-        .unwrap()
-        .into_iter()
-        .map(|row| row.path)
-        .collect::<Vec<_>>();
-    assert_eq!(paths, ["kept"]);
+    assert_eq!(observed_paths(&store), ["kept"]);
 }
 
 /// An inline (tag-refinement) build's flush nested in an open input: when it fails
@@ -216,7 +245,7 @@ fn a_failed_inline_build_flush_commits_no_partial_node() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(StoreConfig::new(dir.path().join("state"))).unwrap();
     store.open_input().unwrap();
-    let flush = store.write_transaction(|store| {
+    let flush = store.isolated_write_transaction(|store| {
         store.commit_build(node_commit(3))?;
         Err::<(), _>(StoreError::Rejected {
             detail: "a later write of the node failed".to_owned(),

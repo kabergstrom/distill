@@ -242,7 +242,7 @@ impl Store {
         rows: &[ImportIndexSource],
     ) -> Result<(), StoreError> {
         self.write_txn(|store| {
-            let transaction = store.read.conn.savepoint()?;
+            let transaction: &rusqlite::Connection = &store.read.conn;
             for (root_name, path) in sources {
                 transaction
                     .prepare_cached(
@@ -287,7 +287,6 @@ impl Store {
                     ])?;
                 }
             }
-            transaction.commit()?;
             Ok(())
         })
     }
