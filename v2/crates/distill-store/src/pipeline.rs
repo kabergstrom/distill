@@ -1,6 +1,6 @@
-//! Pipeline-side metadata (§13): the `pipeline_state` row and
-//! `registrations`, the compiled schema registry, and the `tools`
-//! ToolEpoch table.
+//! Pipeline-side metadata (§13): the published module's content hash, the
+//! version's pipeline failure (an `errors` row), and the `tools` ToolEpoch
+//! table. Everything else about an epoch is the loaded module's.
 
 use std::collections::{BTreeMap, BTreeSet};
 use crate::atomic_file;
@@ -8,18 +8,19 @@ use std::path::PathBuf;
 
 use distill_core::bootstrap::bootstrap_control_logical_registry_v1;
 use distill_core::id::{LogicalHash, TypeUuid};
-use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
+use distill_core::target_set::CanonicalTargetSet;
 use distill_core::tool::{
     ToolCwdPolicy, ToolExecutionIdentityV2, ToolPackageFile, ToolSourceIdentityV2,
 };
 use rusqlite::OptionalExtension;
 use unicode_normalization::is_nfc;
 
-use crate::db::{InputTxn, Store, StoreReader};
+use crate::db::{meta_get_blob, meta_set_blob, InputTxn, StoreReader};
 use crate::error::StoreError;
-use crate::state::{
-    InputVersion, PipelineEpoch, PipelineFailure, PipelineState, Registration, RegistrationKind,
-};
+use crate::state::{InputVersion, PipelineEpoch, PipelineFailure};
+
+/// `store_meta` key of the content hash of the module the version serves.
+const PIPELINE_MODULE_HASH: &str = "pipeline_module_hash";
 
 /// One package member supplied at the registration boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -438,52 +439,22 @@ impl std::ops::Deref for ValidatedPipelineEpoch {
 }
 
 impl InputTxn<'_> {
-    /// Publish a staged pipeline candidate (§3, §13) as the Ready epoch.
+    /// Publish a staged pipeline candidate (§3, §13) as the Ready epoch:
+    /// the version serves its module, and no pipeline failure.
     pub fn publish_pipeline_epoch(
         &mut self,
         epoch: &ValidatedPipelineEpoch,
     ) -> Result<(), StoreError> {
         validate_target_set(&epoch.target_set)?;
         validate_bootstrap_schema_registry(&epoch.schema_registry)?;
-        self.txn
-            .prepare_cached(
-                "INSERT INTO pipeline_state(
-                 id, dylib_hash, input_version,
-                 poison_code, poison_origin, poison_cleanup, poison_identity, poison_message
-             ) VALUES (0, ?1, ?2, NULL, NULL, NULL, NULL, NULL)
-             ON CONFLICT(id) DO UPDATE SET
-               dylib_hash = excluded.dylib_hash,
-               input_version = excluded.input_version,
-               poison_code = NULL,
-               poison_origin = NULL,
-               poison_cleanup = NULL,
-               poison_identity = NULL,
-               poison_message = NULL",
-            )?
-            .execute(rusqlite::params![epoch.dylib_hash.as_slice(), self.version().0 as i64,])?;
-        self.txn
-            .prepare_cached("DELETE FROM registrations")?
-            .execute([])?;
-        for reg in &epoch.registrations {
-            let kind = match reg.kind {
-                RegistrationKind::Importer => 0i64,
-                RegistrationKind::Processor => 1i64,
-            };
-            self.txn
-                .prepare_cached(
-                    "INSERT INTO registrations(kind, reg_id, version) VALUES (?1, ?2, ?3)",
-                )?
-                .execute(rusqlite::params![kind, reg.id, reg.version])?;
+        if meta_get_blob(&self.txn, PIPELINE_MODULE_HASH)?.as_deref() != Some(&epoch.dylib_hash[..]) {
+            meta_set_blob(&self.txn, PIPELINE_MODULE_HASH, &epoch.dylib_hash)?;
         }
-        replace_schema_registry(&self.txn, &epoch.schema_registry)?;
-        replace_target_set(&self.txn, &epoch.target_set)?;
-        Ok(())
+        self.set_pipeline_failure(None)
     }
 
-    /// A rejected candidate still publishes (§13): the version carries a
-    /// pipeline failure naming the error. The prior epoch's identity
-    /// columns are retained as `last_good` residency bookkeeping — never
-    /// served as this version's code.
+    /// A rejected candidate still publishes (§13): the version serves no
+    /// module and carries a pipeline failure naming the error.
     pub fn publish_pipeline_failure(
         &mut self,
         failure: &PipelineFailure,
@@ -492,30 +463,9 @@ impl InputTxn<'_> {
             .validate()
             .map_err(StoreError::InvalidPipelineFailure)?;
         self.txn
-            .prepare_cached(
-                "INSERT INTO pipeline_state(
-                 id, dylib_hash, input_version,
-                 poison_code, poison_origin, poison_cleanup, poison_identity, poison_message
-             ) VALUES (0, NULL, ?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(id) DO UPDATE SET
-               input_version = excluded.input_version,
-               poison_code = excluded.poison_code,
-               poison_origin = excluded.poison_origin,
-               poison_cleanup = excluded.poison_cleanup,
-               poison_identity = excluded.poison_identity,
-               poison_message = excluded.poison_message",
-            )?
-            .execute(
-                rusqlite::params![
-                    self.version().0 as i64,
-                    failure.code as u16,
-                    failure.origin as u16,
-                    failure.cleanup as u16,
-                    failure.identity.as_slice(),
-                    failure.message,
-                ],
-            )?;
-        Ok(())
+            .prepare_cached("DELETE FROM store_meta WHERE key = ?1")?
+            .execute([PIPELINE_MODULE_HASH])?;
+        self.set_pipeline_failure(Some(failure))
     }
 
     /// Publish a package snapshot or explicit ambient toolchain identity.
@@ -654,132 +604,10 @@ fn validate_bootstrap_schema_registry(
     Ok(())
 }
 
-fn replace_schema_registry(
-    conn: &rusqlite::Connection,
-    registry: &BTreeMap<TypeUuid, LogicalHash>,
-) -> Result<(), StoreError> {
-    conn
-        .prepare_cached("DELETE FROM pipeline_schema_registry")?
-        .execute([])?;
-    for (type_uuid, logical_hash) in registry {
-        conn
-            .prepare_cached(
-                "INSERT INTO pipeline_schema_registry(type_uuid, logical_hash) VALUES (?1, ?2)",
-            )?
-            .execute(rusqlite::params![type_uuid.0.as_slice(), logical_hash.0.as_slice()])?;
-    }
-    Ok(())
-}
-
-/// The pipeline failure the `pipeline_state` failure columns hold.
-fn decode_failure(
-    failure_code: Option<i64>,
-    failure_origin: Option<i64>,
-    failure_cleanup: Option<i64>,
-    failure_identity: Option<Vec<u8>>,
-    failure_message: Option<String>,
-) -> Result<Option<PipelineFailure>, StoreError> {
-    Ok(match (
-        failure_code,
-        failure_origin,
-        failure_cleanup,
-        failure_identity,
-        failure_message,
-    ) {
-        (None, None, None, None, None) => None,
-        (Some(code), Some(origin), Some(cleanup), Some(identity), Some(message)) => Some(
-            PipelineFailure::from_wire(
-                u16::try_from(code).map_err(|_| {
-                    StoreError::InvalidPipelineFailure(
-                        crate::state::PipelineFailureDecodeError::UnknownCode(code as u16),
-                    )
-                })?,
-                u16::try_from(origin).map_err(|_| {
-                    StoreError::InvalidPipelineFailure(
-                        crate::state::PipelineFailureDecodeError::UnknownOrigin(origin as u16),
-                    )
-                })?,
-                u16::try_from(cleanup).map_err(|_| {
-                    StoreError::InvalidPipelineFailure(
-                        crate::state::PipelineFailureDecodeError::UnknownCleanup(cleanup as u16),
-                    )
-                })?,
-                exact_blob32(identity, "pipeline-failure identity")?,
-                message,
-            )
-            .map_err(StoreError::InvalidPipelineFailure)?,
-        ),
-        _ => {
-            return Err(invalid_state("pipeline failure columns are incomplete"));
-        }
-    })
-}
-
-fn load_schema_registry(
-    conn: &rusqlite::Connection,
-) -> Result<BTreeMap<TypeUuid, LogicalHash>, StoreError> {
-    let mut stmt = conn.prepare(
-        "SELECT type_uuid, logical_hash FROM pipeline_schema_registry ORDER BY type_uuid",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-    })?;
-    let mut registry = BTreeMap::new();
-    for row in rows {
-        let (type_uuid, logical_hash) = row?;
-        let type_uuid = TypeUuid(
-            type_uuid
-                .try_into()
-                .map_err(|_| invalid_state("a pipeline registry UUID is not exactly 16 bytes"))?,
-        );
-        let logical_hash = LogicalHash(logical_hash.try_into().map_err(|_| {
-            invalid_state("a pipeline registry logical hash is not exactly 32 bytes")
-        })?);
-        registry.insert(type_uuid, logical_hash);
-    }
-    Ok(registry)
-}
-
 fn validate_target_set(target_set: &CanonicalTargetSet) -> Result<(), StoreError> {
     CanonicalTargetSet::from_canonical(target_set.rows.clone())
         .map(|_| ())
         .map_err(StoreError::InvalidTargetSet)
-}
-
-fn replace_target_set(
-    conn: &rusqlite::Connection,
-    target_set: &CanonicalTargetSet,
-) -> Result<(), StoreError> {
-    validate_target_set(target_set)?;
-    conn
-        .prepare_cached("DELETE FROM pipeline_target_set")?
-        .execute([])?;
-    for row in &target_set.rows {
-        conn
-            .prepare_cached(
-                "INSERT INTO pipeline_target_set(name, target_definition_hash) VALUES (?1, ?2)",
-            )?
-            .execute(rusqlite::params![row.name, row.target_definition_hash.as_slice()])?;
-    }
-    Ok(())
-}
-
-fn load_target_set(conn: &rusqlite::Connection) -> Result<CanonicalTargetSet, StoreError> {
-    let mut stmt = conn.prepare(
-        "SELECT name, target_definition_hash FROM pipeline_target_set ORDER BY CAST(name AS BLOB)",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-    })?;
-    let mut target_rows = Vec::new();
-    for row in rows {
-        let (name, target_definition_hash) = row?;
-        target_rows.push(TargetSetRow {
-            name,
-            target_definition_hash: exact_blob32(target_definition_hash, "target-definition hash")?,
-        });
-    }
-    CanonicalTargetSet::from_canonical(target_rows).map_err(StoreError::InvalidTargetSet)
 }
 
 fn exact_blob32(bytes: Vec<u8>, name: &str) -> Result<[u8; 32], StoreError> {
@@ -788,81 +616,6 @@ fn exact_blob32(bytes: Vec<u8>, name: &str) -> Result<[u8; 32], StoreError> {
         .map_err(|_| invalid_state(&format!("{name} is not exactly 32 bytes")))
 }
 
-impl Store {
-    /// Persist the first failure discovered in an already-published module
-    /// epoch without minting a new input version. This is a narrow monotonic
-    /// runtime-lifecycle transition, guarded by the exact dylib identity.
-    pub fn fail_published_pipeline_epoch(
-        &mut self,
-        expected_dylib_hash: [u8; 32],
-        failure: &PipelineFailure,
-    ) -> Result<(), StoreError> {
-        self.write_txn(|store| {
-            failure
-                .validate()
-                .map_err(StoreError::InvalidPipelineFailure)?;
-            if failure.origin != crate::state::PipelineFailureOrigin::PublishedRuntime {
-                return Err(StoreError::InvalidPipelineFailure(
-                    crate::state::PipelineFailureDecodeError::InvalidMatrix,
-                ));
-            }
-
-            let transaction = store.read.conn.savepoint()?;
-            let row: Option<(Option<Vec<u8>>, Option<i64>)> = transaction
-                .query_row(
-                    "SELECT dylib_hash, poison_code FROM pipeline_state WHERE id = 0",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            let (actual, already_unavailable) = match row {
-                Some((actual, failure_code)) => (
-                    actual
-                        .map(|bytes| exact_blob32(bytes, "published pipeline dylib hash"))
-                        .transpose()?,
-                    failure_code.is_some(),
-                ),
-                None => (None, false),
-            };
-            if actual != Some(expected_dylib_hash) || already_unavailable {
-                return Err(StoreError::StalePublishedPipeline {
-                    expected: expected_dylib_hash,
-                    actual,
-                    already_unavailable,
-                });
-            }
-            let changed = transaction
-                .prepare_cached(
-                    "UPDATE pipeline_state SET
-                     poison_code = ?1,
-                     poison_origin = ?2,
-                     poison_cleanup = ?3,
-                     poison_identity = ?4,
-                     poison_message = ?5
-                 WHERE id = 0 AND dylib_hash = ?6 AND poison_code IS NULL",
-                )?
-                .execute(
-                    rusqlite::params![
-                        failure.code as u16,
-                        failure.origin as u16,
-                        failure.cleanup as u16,
-                        failure.identity.as_slice(),
-                        failure.message,
-                        expected_dylib_hash.as_slice(),
-                    ],
-                )?;
-            if changed != 1 {
-                return Err(StoreError::StalePublishedPipeline {
-                    expected: expected_dylib_hash,
-                    actual,
-                    already_unavailable: true,
-                });
-            }
-            transaction.commit()?;
-            Ok(())
-        })
-    }
-}
 
 /// The last ToolEpoch row of one key at a pinned version (primary key).
 pub(crate) const TOOL_AT: &str = "SELECT present, identity_object, tool_hash, input_version
@@ -870,125 +623,12 @@ pub(crate) const TOOL_AT: &str = "SELECT present, identity_object, tool_hash, in
      ORDER BY input_version DESC LIMIT 1";
 
 impl StoreReader {
-    /// The published pipeline state, or `None` before any publication.
-    pub fn pipeline_state(&self) -> Result<Option<PipelineState>, StoreError> {
-        type StateRow = (
-            Option<Vec<u8>>,
-            Option<i64>,
-            Option<i64>,
-            Option<i64>,
-            Option<Vec<u8>>,
-            Option<String>,
-        );
-        let row: Option<StateRow> = self
-            .conn
-            .query_row(
-                "SELECT dylib_hash, poison_code, poison_origin, poison_cleanup,
-                        poison_identity, poison_message
-                 FROM pipeline_state WHERE id = 0",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
-            )
-            .optional()?;
-        let Some((
-            dylib,
-            failure_code,
-            failure_origin,
-            failure_cleanup,
-            failure_identity,
-            failure_message,
-        )) = row
-        else {
-            return Ok(None);
-        };
-
-        let epoch = match dylib {
-            Some(dylib) => {
-                let mut stmt = self
-                    .conn
-                    .prepare("SELECT kind, reg_id, version FROM registrations")?;
-                let registrations: Vec<Registration> = stmt
-                    .query_map([], |r| {
-                        Ok(Registration {
-                            kind: if r.get::<_, i64>(0)? == 0 {
-                                RegistrationKind::Importer
-                            } else {
-                                RegistrationKind::Processor
-                            },
-                            id: r.get(1)?,
-                            version: r.get(2)?,
-                        })
-                    })?
-                    .collect::<Result<_, _>>()?;
-                Some(std::sync::Arc::new(PipelineEpoch {
-                    dylib_hash: exact_blob32(dylib, "published pipeline dylib hash")?,
-                    target_set: load_target_set(&self.conn)?,
-                    schema_registry: load_schema_registry(&self.conn)?,
-                    registrations,
-                }))
-            }
-            None => None,
-        };
-
-        let failure = decode_failure(
-            failure_code,
-            failure_origin,
-            failure_cleanup,
-            failure_identity,
-            failure_message,
-        )?;
-
-        Ok(Some(match failure {
-            None => match epoch {
-                Some(epoch) => PipelineState::Ready(epoch),
-                // A row with no identity and no failure cannot be published
-                // through this API.
-                None => return Ok(None),
-            },
-            Some(error) => PipelineState::Failed {
-                error,
-                last_good: epoch,
-            },
-        }))
-    }
-
-    /// The published pipeline's failure, if it has one: the failure
-    /// columns of the one `pipeline_state` row, without its epoch.
-    pub fn pipeline_failure(&self) -> Result<Option<PipelineFailure>, StoreError> {
-        let row = self
-            .conn
-            .prepare_cached(
-                "SELECT poison_code, poison_origin, poison_cleanup, poison_identity, poison_message
-                 FROM pipeline_state WHERE id = 0",
-            )?
-            .query_row([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
-            .optional()?;
-        match row {
-            Some((code, origin, cleanup, identity, message)) => {
-                decode_failure(code, origin, cleanup, identity, message)
-            }
-            None => Ok(None),
-        }
-    }
-
-    /// The schema a ready pipeline registers for `type_uuid`: `None` when the
-    /// pipeline is not ready or registers none. One row of each table.
-    pub fn ready_schema_hash(&self, type_uuid: TypeUuid) -> Result<Option<LogicalHash>, StoreError> {
-        let hash: Option<Vec<u8>> = self
-            .conn
-            .prepare_cached(
-                "SELECT r.logical_hash FROM pipeline_state p, pipeline_schema_registry r
-                 WHERE p.id = 0 AND p.dylib_hash IS NOT NULL AND p.poison_code IS NULL
-                   AND r.type_uuid = ?1",
-            )?
-            .query_row([type_uuid.0.as_slice()], |r| r.get(0))
-            .optional()?;
-        hash.map(|hash| {
-            hash.try_into().map(LogicalHash).map_err(|_| {
-                invalid_state("a pipeline registry logical hash is not exactly 32 bytes")
-            })
-        })
-        .transpose()
+    /// The content hash of the module this version serves: `None` while
+    /// its pipeline has failed, or before any publication.
+    pub fn pipeline_module_hash(&self) -> Result<Option<[u8; 32]>, StoreError> {
+        meta_get_blob(&self.conn, PIPELINE_MODULE_HASH)?
+            .map(|hash| exact_blob32(hash, "pipeline module hash"))
+            .transpose()
     }
 
     /// Test hook: every tool's hash at `basis`, for a reference trace

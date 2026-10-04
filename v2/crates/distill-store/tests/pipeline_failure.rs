@@ -1,7 +1,7 @@
 use distill_core::canonical::{CanonicalEncoder, DSPP};
 use distill_store::state::{
     CleanupDisposition, PipelineFailure, PipelineFailureCode, PipelineFailureDecodeError,
-    PipelineFailureOrigin, PipelineState,
+    PipelineFailureOrigin,
 };
 use distill_store::{Store, StoreConfig, StoreError};
 
@@ -177,13 +177,8 @@ fn typed_pipeline_failure_roundtrips_through_store_and_invalid_identity_rolls_ba
     store
         .input_transaction(|txn| txn.publish_pipeline_failure(&failure))
         .unwrap();
-    match store.pipeline_state().unwrap().unwrap() {
-        PipelineState::Failed { error, last_good } => {
-            assert_eq!(error, failure);
-            assert!(last_good.is_none());
-        }
-        other => panic!("expected a failure, got {other:?}"),
-    }
+    assert_eq!(store.pipeline_failure().unwrap(), Some(failure.clone()));
+    assert_eq!(store.pipeline_module_hash().unwrap(), None);
 
     let mut invalid = failure;
     invalid.identity[0] ^= 1;

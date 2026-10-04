@@ -26,7 +26,6 @@ use distill_schema::ngp_schema::{
     SchemaLayouts, SchemaTypeId, TypeAttrs, TypeDef, TypeLayout, TypePath,
 };
 use distill_schema::ProjectSchemaAuthority;
-use distill_store::state::PipelineState;
 use distill_wire::native::CallbackPanic;
 
 const SETTINGS_TYPE: TypeUuid = TypeUuid([0x90; 16]);
@@ -137,16 +136,13 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
     .unwrap();
     let config = write_config(&temp, &module, authority.identity());
     let process = DaemonProcess::start(config.clone()).unwrap();
-    let pipeline_state = process
-        .coordinator()
-        .open_reader()
-        .unwrap()
-        .pipeline_state()
-        .unwrap();
+    let reader = process.coordinator().open_reader().unwrap();
+    let failure = reader.pipeline_failure().unwrap();
     assert!(
-        matches!(pipeline_state, Some(PipelineState::Ready(_))),
-        "fixture pipeline did not become ready: {pipeline_state:?}"
+        failure.is_none() && reader.pipeline_module_hash().unwrap().is_some(),
+        "fixture pipeline did not become ready: {failure:?}"
     );
+    drop(reader);
 
     let [texture, mesh, shader] = import_assets(&process, &config, &assets);
 

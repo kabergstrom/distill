@@ -57,8 +57,7 @@ fn every_section_13_table_exists() {
     // result_candidates / derived_outputs /
     // cas_extents / cas_segments (the three roles of §13's `artifacts`
     // row), cas_refs (what keeps each extent indexed), bundle_path_refs
-    // (the reference fields a rename rewrites), registrations (the
-    // pipeline_state registration list), and
+    // (the reference fields a rename rewrites), and
     // codegen_outputs (§20's daemon-owned expected-preimage authority).
     let expected: BTreeSet<String> = [
         "files",
@@ -84,11 +83,7 @@ fn every_section_13_table_exists() {
         "cas_extents",
         "cas_segments",
         "cas_refs",
-        "pipeline_state",
-        "pipeline_schema_registry",
-        "pipeline_target_set",
         "pending_restart",
-        "registrations",
         "tools",
         "roots",
         "store_meta",
@@ -240,38 +235,6 @@ fn tools_table_is_the_tool_epoch() {
         ]
     );
     assert_eq!(pk_columns(&conn, "tools"), ["tool_key", "input_version"]);
-}
-
-#[test]
-fn pipeline_state_row_shape() {
-    // §13: module content identity plus typed failure state.
-    let dir = tempfile::tempdir().unwrap();
-    let conn = open_conn(&dir);
-    assert_eq!(
-        columns(&conn, "pipeline_state"),
-        [
-            "id",
-            "dylib_hash",
-            "input_version",
-            "poison_code",
-            "poison_origin",
-            "poison_cleanup",
-            "poison_identity",
-            "poison_message"
-        ]
-    );
-    assert_eq!(
-        columns(&conn, "registrations"),
-        ["kind", "reg_id", "version"]
-    );
-    assert_eq!(
-        columns(&conn, "pipeline_schema_registry"),
-        ["type_uuid", "logical_hash"]
-    );
-    assert_eq!(
-        columns(&conn, "pipeline_target_set"),
-        ["name", "target_definition_hash"]
-    );
 }
 
 #[test]

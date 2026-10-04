@@ -21,6 +21,7 @@ use distill_rpc::{
     Commit, ImportJob, ImportRequest, InputVersion, LongRunningOp, PreparedImportCommit,
     PreparedOperationCommit, RpcFailure, WriteReceipt, WrittenFile,
 };
+use distill_store::state::{PipelineFailure, PipelineFailureOrigin};
 use distill_store::{Current, Store, StoreOpener, StoreReader};
 
 use distill_store::atomic_file;
@@ -518,6 +519,16 @@ impl AuthoringBackend for AuthoringService {
                 .map_err(|error| error.to_string())
         };
         Some(read())
+    }
+
+    fn pipeline_runtime_failure(&self, snapshot: &StoreReader) -> Option<PipelineFailure> {
+        // A candidate failure is the version's errors row; only the epoch
+        // the snapshot serves can fail at runtime.
+        self.compiled(snapshot)
+            .ok()?
+            .pipeline_epoch()
+            .err()
+            .filter(|failure| failure.origin == PipelineFailureOrigin::PublishedRuntime)
     }
 
     fn write_files(

@@ -11,10 +11,9 @@
 //! is gated on the epoch `Arc`'s strong count — that machinery lives with
 //! the module host, outside this crate. The store-side contract needs the
 //! epoch's *identity*: the pipeline dylib content hash (an input-hash
-//! input wherever pipeline code runs), the importer/processor
-//! registrations and versions, the exact logical schema map, and canonical
-//! target rows — exactly the `pipeline_state` row (§13). That is what [`PipelineEpoch`] here
-//! carries; residency is still expressed the spec's way (`Arc`), so pin
+//! input wherever pipeline code runs, and the only part stored), the exact
+//! logical schema map and canonical target rows the store validates before
+//! publishing it (§13). That is what [`PipelineEpoch`] here carries; residency is still expressed the spec's way (`Arc`), so pin
 //! counting composes when the module host wraps it.
 
 use std::collections::BTreeMap;
@@ -84,23 +83,8 @@ impl SnapshotStamp {
     }
 }
 
-/// An importer or processor registration recorded in `pipeline_state`
-/// (§13): id + version, the identity inputs of §9's input hashes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Registration {
-    pub kind: RegistrationKind,
-    pub id: String,
-    pub version: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RegistrationKind {
-    Importer,
-    Processor,
-}
-
-/// Store-side pipeline-epoch identity — the `pipeline_state` row (§13).
-/// See the module docs for the boundary with §3/§9's full epoch.
+/// What a pipeline candidate publishes (§13): its module's content hash,
+/// stored, and the projections the store validates before publishing it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineEpoch {
     /// The pipeline dylib content hash — an input-hash input wherever
@@ -113,8 +97,6 @@ pub struct PipelineEpoch {
     /// The candidate's complete compiled registry projection: the current
     /// logical schema of every registered type.
     pub schema_registry: BTreeMap<TypeUuid, LogicalHash>,
-    /// Importer/processor registrations and versions.
-    pub registrations: Vec<Registration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1890,62 +1872,6 @@ impl NamespaceError {
                 } => file(root_name, lossy_path(raw_relative_path)),
             },
         }
-    }
-}
-
-/// What a snapshot carries (§13): the validated epoch, or the named
-/// failure that kept a candidate from becoming one. `last_good` is
-/// residency bookkeeping only — the prior epoch stays loaded for the
-/// snapshots that pin it, but is never served as this version's code
-/// (§3, §13): obsolete processor code must not cook new bytes.
-#[derive(Debug, Clone)]
-pub enum PipelineState {
-    Ready(Arc<PipelineEpoch>),
-    Failed {
-        error: PipelineFailure,
-        last_good: Option<Arc<PipelineEpoch>>,
-    },
-}
-
-/// Typed reason a snapshot has no usable pipeline epoch.
-#[derive(Debug, Clone, Copy)]
-pub enum PipelineUnavailable<'a> {
-    Failed(&'a PipelineFailure),
-}
-
-impl fmt::Display for PipelineUnavailable<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PipelineUnavailable::Failed(error) => error.fmt(f),
-        }
-    }
-}
-
-impl PipelineState {
-    /// The pipeline state current at a snapshot's version. Fallible,
-    /// because a pipeline-failed version has no `PipelineEpoch` to
-    /// return (§3: a failed candidate never becomes one, and the prior
-    /// epoch may not stand in).
-    pub fn epoch(&self) -> Result<&Arc<PipelineEpoch>, PipelineUnavailable<'_>> {
-        match self {
-            PipelineState::Ready(epoch) => Ok(epoch),
-            PipelineState::Failed { error, .. } => Err(PipelineUnavailable::Failed(error)),
-        }
-    }
-
-    /// The §13 operation classification: pure-metadata reads remain valid
-    /// under failure (`Ok(None)` — no epoch consumed); pipeline-dependent
-    /// operations receive the epoch when ready (`Ok(Some(_))`) and fail
-    /// deterministically with its typed failure or schema-acceptance reason
-    /// otherwise.
-    pub fn check(
-        &self,
-        op: OperationKind,
-    ) -> Result<Option<&Arc<PipelineEpoch>>, PipelineUnavailable<'_>> {
-        if !op.requires_epoch() {
-            return Ok(None);
-        }
-        self.epoch().map(Some)
     }
 }
 

@@ -39,15 +39,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::{watch, Notify};
 use unicode_normalization::UnicodeNormalization;
 
-use distill_store::served::{
-    Change, ChangeEntry, ServedWrite, SERVED_PIPELINE,
-};
+use distill_store::served::{Change, ChangeEntry, ServedWrite};
 use distill_store::{Store, StoreConfig, StoreError, StoreOpener, StoreReader, StoreWriter};
 
 use crate::apply::{
-    apply_commit, configuration_status, publish_protocol_epoch, publish_restart_required,
-    publish_runtime_pipeline_failure, publish_target, publish_target_set,
-    read_served_pipeline, ApplyError,
+    apply_commit, configuration_status, publish_pipeline_fence, publish_protocol_epoch,
+    publish_restart_required, publish_target, publish_target_set, ApplyError,
 };
 use crate::persist::{delta_state, reconnect_reason};
 use crate::*;
@@ -728,50 +725,17 @@ impl ReportSnapshot<'_> {
 }
 
 impl ServerHandle {
-    /// Publish a runtime failure of the current pipeline epoch. Every
-    /// snapshot that pinned the epoch sees it and every connection must
-    /// reconnect. `persist` records the daemon's own durable failure first,
-    /// on the same writer. Called inside an open input, the failure joins
-    /// that input's version and readers learn of it when the input commits.
-    pub fn coordinated_runtime_pipeline_failure(
-        &self,
-        store: &mut Store,
-        failure: PipelineFailure,
-        persist: impl FnOnce(&mut Store) -> Result<(), String>,
-    ) -> Result<(), String> {
-        failure
-            .validate()
-            .map_err(|error| format!("invalid runtime pipeline failure: {error:?}"))?;
-        if failure.origin != PipelineFailureOrigin::PublishedRuntime {
-            return Err("runtime failure publication requires PublishedRuntime origin".to_owned());
-        }
-        // The durable failure and the served fence commit together.
-        let changed = store.write_transaction_with(
-            |error| error.to_string(),
-            |store| {
-                let (_, current) = store
-                    .served_blob(SERVED_PIPELINE)
-                    .and_then(read_served_pipeline)
-                    .map_err(|error| error.to_string())?;
-                match &current {
-                    PipelineDiagnostic::Ready => {}
-                    PipelineDiagnostic::Failed(existing) if existing == &failure => {
-                        return Ok(false)
-                    }
-                    other => {
-                        return Err(format!(
-                            "current RPC pipeline is not the observed ready epoch: {other:?}"
-                        ))
-                    }
-                }
-                persist(store)?;
-                store
-                    .served_transaction(|txn| publish_runtime_pipeline_failure(txn, failure))
-                    .map_err(|error| error.to_string())
-            },
-        )?;
+    /// Fence every connection after the served pipeline epoch failed at
+    /// runtime: a reconnect meets the failure, which the epoch holds in
+    /// memory (see [`AuthoringBackend::pipeline_runtime_failure`]). Called
+    /// inside an open input, the fence joins that input's version and
+    /// readers learn of it when the input commits.
+    pub fn coordinated_pipeline_fence(&self, store: &mut Store) -> Result<(), String> {
+        store
+            .served_transaction(|txn| publish_pipeline_fence(txn))
+            .map_err(|error| error.to_string())?;
         // Inside an open input, readers are told once it commits.
-        if changed && !store.input_open() {
+        if !store.input_open() {
             self.notify_published();
         }
         Ok(())
@@ -1143,16 +1107,8 @@ impl Server {
         self.inner.with_writer(job)
     }
 
-    pub fn coordinated_runtime_pipeline_failure(
-        &self,
-        failure: PipelineFailure,
-        persist: impl FnOnce(&mut Store) -> Result<(), String>,
-    ) -> Result<(), String> {
-        self.with_writer(|store| {
-            self.inner
-                .handle
-                .coordinated_runtime_pipeline_failure(store, failure, persist)
-        })
+    pub fn coordinated_pipeline_fence(&self) -> Result<(), String> {
+        self.with_writer(|store| self.inner.handle.coordinated_pipeline_fence(store))
     }
 
     pub fn replace_protocol_epoch(&self, protocol_epoch: u32) -> Result<SnapshotStamp, StoreError> {
@@ -1329,6 +1285,20 @@ pub(crate) fn entry_role(authoring_only: bool) -> AuthoringEntryRole {
 
 /// The failure a pipeline diagnostic gates a request with; a store error
 /// reading it is one.
+/// The pipeline `snapshot` serves: its version's candidate failure, else
+/// the runtime failure `backend` holds for the epoch it serves.
+fn pipeline_at(
+    backend: &dyn AuthoringBackend,
+    snapshot: &StoreReader,
+) -> Result<PipelineDiagnostic, StoreError> {
+    if let Some(failure) = snapshot.pipeline_failure()? {
+        return Ok(PipelineDiagnostic::Failed(failure));
+    }
+    Ok(backend
+        .pipeline_runtime_failure(snapshot)
+        .map_or(PipelineDiagnostic::Ready, PipelineDiagnostic::Failed))
+}
+
 pub(crate) fn pipeline_failure(
     diagnostic: Result<PipelineDiagnostic, StoreError>,
 ) -> Option<RpcFailure> {
@@ -1374,10 +1344,6 @@ impl SnapshotTxn {
         Ok(configuration_status(&self.snapshot().configuration_state()?))
     }
 
-    /// The served pipeline this snapshot pins, and its installing version.
-    pub(crate) fn pipeline(&self) -> Result<(InputVersion, PipelineDiagnostic), StoreError> {
-        read_served_pipeline(self.snapshot().served_blob(SERVED_PIPELINE)?)
-    }
 }
 
 /// A front end's connection with no read transaction open, kept for its
@@ -1659,24 +1625,10 @@ impl Inner {
         Ok(txn)
     }
 
-    /// The current served pipeline and its installing version.
-    pub(crate) fn current_pipeline(&self) -> Result<(InputVersion, PipelineDiagnostic), StoreError> {
-        read_served_pipeline(self.reader.served_blob(SERVED_PIPELINE)?)
-    }
-
-    /// A snapshot's pipeline: the current diagnostic while the epoch it
-    /// pinned is still installed (a runtime failure reaches it), else its own.
-    /// Two primary-key reads: the pinned row and the current one.
+    /// A snapshot's pipeline: its version's candidate failure, else the
+    /// runtime failure of the epoch it serves, which the backend holds.
     pub(crate) fn effective_pipeline(&self, txn: &SnapshotTxn) -> Result<PipelineDiagnostic, StoreError> {
-        let (pinned_at, pinned) = txn.pipeline()?;
-        Ok(match self.current_pipeline() {
-            Ok((installed_at, current)) if installed_at == pinned_at => current,
-            Ok(_) => pinned,
-            Err(error) => {
-                tracing::error!(%error, "cannot read the served pipeline");
-                pinned
-            }
-        })
+        pipeline_at(&*self.handle.authoring_backend(), txn.snapshot())
     }
 
     pub(crate) fn protocol_epoch(&self) -> u32 {
@@ -1923,7 +1875,7 @@ impl Root {
                 reader.rpc_fences()?,
                 reader.rpc_target(&target_name)?,
                 reader.configuration_state()?,
-                reader.served_blob(SERVED_PIPELINE)?,
+                pipeline_at(&*handle.authoring_backend(), reader)?,
                 reader.change_log_head()?,
             ))
         });
@@ -1952,14 +1904,10 @@ impl Root {
         if let ConfigurationStatus::Failed(error) = configuration_status(&configuration) {
             return ConnectOutcome::ConfigurationFailed(error);
         }
-        match read_served_pipeline(pipeline).map(|(_, pipeline)| pipeline) {
-            Ok(PipelineDiagnostic::Ready) => {}
-            Ok(PipelineDiagnostic::Failed(failure)) => {
-                return ConnectOutcome::PipelineUnavailable(
-                    PipelineUnavailableDiagnostic::PipelineFailure(failure),
-                );
-            }
-            Err(error) => return ConnectOutcome::Refused(store_failure(error)),
+        if let PipelineDiagnostic::Failed(failure) = pipeline {
+            return ConnectOutcome::PipelineUnavailable(
+                PipelineUnavailableDiagnostic::PipelineFailure(failure),
+            );
         }
         let Some(admission) = handle.admit_connection() else {
             return ConnectOutcome::Refused(connection_limit(handle));

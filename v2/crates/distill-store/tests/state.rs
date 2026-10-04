@@ -1,40 +1,13 @@
 //! §13 consistency-contract state machinery: version counters, the
 //! snapshot stamp (RPC-side realization of `IoBasis::Rpc`, §15), the
-//! `PipelineState` valid/invalid operation classification.
+//! operation classification.
 
 use std::sync::Arc;
 
-use distill_core::bootstrap::bootstrap_control_logical_registry_v1;
-use distill_core::target_set::CanonicalTargetSet;
 use distill_store::state::{
-    CleanupDisposition, ConfigurationEpoch, ConfigurationError, ConfigurationState, DscpV1,
-    InputVersion, MemoSeq, OperationKind, PipelineEpoch, PipelineFailure, PipelineFailureCode,
-    PipelineFailureOrigin, PipelineState, Registration, RegistrationKind, SnapshotStamp,
-    StoreInstanceId,
+    ConfigurationEpoch, ConfigurationError, ConfigurationState, DscpV1, InputVersion, MemoSeq,
+    OperationKind, SnapshotStamp, StoreInstanceId,
 };
-
-fn epoch() -> Arc<PipelineEpoch> {
-    Arc::new(PipelineEpoch {
-        dylib_hash: [7u8; 32],
-        target_set: CanonicalTargetSet::canonical(vec![]).unwrap(),
-        schema_registry: bootstrap_control_logical_registry_v1().unwrap(),
-        registrations: vec![Registration {
-            kind: RegistrationKind::Processor,
-            id: "tex-compress".to_owned(),
-            version: 3,
-        }],
-    })
-}
-
-fn failure() -> PipelineFailure {
-    PipelineFailure::new(
-        PipelineFailureCode::CandidateRegistration,
-        PipelineFailureOrigin::CandidateOpen,
-        CleanupDisposition::CleanedAndClosed,
-        "duplicate processor id `tex-compress`",
-    )
-    .unwrap()
-}
 
 fn configuration() -> Arc<ConfigurationEpoch> {
     Arc::new(ConfigurationEpoch { generation: 7 })
@@ -96,47 +69,13 @@ fn snapshot_stamps_compare_only_within_one_instance() {
     assert!(!s1.same_instance(&s3));
 }
 
-// ---- PipelineState ----
+// ---- OperationKind ----
 
 #[test]
-fn ready_state_yields_its_epoch() {
-    let e = epoch();
-    let state = PipelineState::Ready(e.clone());
-    let got = state.epoch().expect("ready state has an epoch");
-    assert_eq!(got.dylib_hash, e.dylib_hash);
-}
-
-#[test]
-fn failed_state_epoch_is_the_named_error() {
-    let state = PipelineState::Failed {
-        error: failure(),
-        last_good: None,
-    };
-    let err = state.epoch().expect_err("failed version has no epoch");
-    assert!(err.to_string().contains("tex-compress"));
-}
-
-#[test]
-fn last_good_is_residency_bookkeeping_never_served() {
-    // §13: "the prior epoch is never silently retained as the new
-    // version's code" — even with last_good resident, epoch() fails.
-    let state = PipelineState::Failed {
-        error: failure(),
-        last_good: Some(epoch()),
-    };
-    assert!(state.epoch().is_err());
-    assert!(state.check(OperationKind::Build).is_err());
-    assert!(state.check(OperationKind::LoadCurrent).is_err());
-}
-
-#[test]
-fn pure_metadata_reads_remain_valid_under_failure() {
+fn operations_are_classified_by_their_need_for_the_pipeline() {
     // §13: "pure-metadata reads — the path index, input versions, CAS
-    // reads, lease pinning — remain valid under poison".
-    let state = PipelineState::Failed {
-        error: failure(),
-        last_good: None,
-    };
+    // reads, lease pinning — remain valid under poison"; anything needing
+    // the pipeline map, registry, defaults or migration fns fails.
     for op in [
         OperationKind::PathIndex,
         OperationKind::InputVersionRead,
@@ -144,23 +83,7 @@ fn pure_metadata_reads_remain_valid_under_failure() {
         OperationKind::LeasePin,
     ] {
         assert!(!op.requires_epoch(), "{op:?} is pure metadata");
-        let got = state
-            .check(op)
-            .unwrap_or_else(|_| panic!("{op:?} must survive a pipeline failure"));
-        assert!(got.is_none(), "pure metadata ops consume no epoch");
     }
-}
-
-#[test]
-fn pipeline_dependent_ops_fail_deterministically_on_failure() {
-    // §13: "anything needing the pipeline map, registry, defaults, or
-    // migration fns (load_current, terminal-type queries, the
-    // derived-output namespace, builds) fails deterministically with a
-    // stable Failed naming the registration error".
-    let state = PipelineState::Failed {
-        error: failure(),
-        last_good: None,
-    };
     for op in [
         OperationKind::LoadCurrent,
         OperationKind::TerminalTypeQuery,
@@ -168,24 +91,7 @@ fn pipeline_dependent_ops_fail_deterministically_on_failure() {
         OperationKind::Build,
     ] {
         assert!(op.requires_epoch(), "{op:?} needs the pipeline");
-        let err = state.check(op).expect_err("must fail under a pipeline failure");
-        assert!(
-            err.to_string().contains("tex-compress"),
-            "the error names the failure"
-        );
     }
-}
-
-#[test]
-fn ready_state_supplies_the_epoch_to_pipeline_ops() {
-    let state = PipelineState::Ready(epoch());
-    let got = state
-        .check(OperationKind::Build)
-        .expect("ready state permits builds")
-        .expect("pipeline ops receive the epoch");
-    assert_eq!(got.dylib_hash, [7u8; 32]);
-    // Pure ops are also valid, without an epoch requirement.
-    assert!(state.check(OperationKind::CasRead).is_ok());
 }
 
 // ---- ConfigurationState (R22/H4) ----

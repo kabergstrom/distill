@@ -851,10 +851,10 @@ fn names_malformed_file(errors: &[NamespaceError], path: &str) -> bool {
 
 fn test_pipeline_failure() -> PipelineFailure {
     PipelineFailure::new(
-        PipelineFailureCode::PublishedCallbackPanic,
-        PipelineFailureOrigin::PublishedRuntime,
-        CleanupDisposition::PublishedEpochLeaked,
-        "processor callback panicked",
+        PipelineFailureCode::CandidateRegistration,
+        PipelineFailureOrigin::CandidateOpen,
+        CleanupDisposition::CleanedAndClosed,
+        "duplicate processor id",
     )
     .unwrap()
 }
@@ -1546,11 +1546,23 @@ fn connect_returns_typed_pipeline_unavailable_without_minting_a_hub() {
     );
 
     // No daemon path returns a project without a pipeline module to Ready:
-    // the coordinator's step is published by hand.
+    // the coordinator's step, publishing an epoch, is taken by hand.
+    let epoch = distill_store::pipeline::ValidatedPipelineEpoch::validate(
+        distill_store::state::PipelineEpoch {
+            dylib_hash: [1; 32],
+            target_set: distill_core::target_set::CanonicalTargetSet::canonical(vec![]).unwrap(),
+            schema_registry: distill_core::bootstrap::bootstrap_control_logical_registry_v1()
+                .unwrap(),
+        },
+    )
+    .unwrap();
     server
-        .coordinated_commit(rejected.version, |_| {
+        .coordinated_commit(rejected.version, |store| {
+            store
+                .input_transaction(|txn| txn.publish_pipeline_epoch(&epoch))
+                .map_err(|error| error.to_string())?;
             Ok(Commit {
-                pipeline: Some(PipelineDiagnostic::Ready),
+                pipeline_epoch_changed: true,
                 ..Commit::default()
             })
         })
@@ -1577,16 +1589,14 @@ fn published_runtime_failure_fences_shared_epoch_without_minting_a_version() {
         "processor callback panicked",
     )
     .unwrap();
-    let mut persisted = false;
+    // The failure lives on the loaded epoch, which the backend answers for;
+    // the daemon then fences every connection once.
+    let failed = server_over(
+        &project,
+        Arc::new(RuntimeFailedBackend(failure.clone())),
+    );
+    server.coordinated_pipeline_fence().unwrap();
 
-    server
-        .coordinated_runtime_pipeline_failure(failure.clone(), |_| {
-            persisted = true;
-            Ok(())
-        })
-        .unwrap();
-
-    assert!(persisted);
     assert_eq!(server.current_stamp().unwrap(), stamp);
     let reason = ReconnectReason::PipelineEpochChanged;
     assert_reconnect(pinned.version(), reason);
@@ -1608,13 +1618,13 @@ fn published_runtime_failure_fences_shared_epoch_without_minting_a_version() {
     assert_reconnect(pinned.resolve(entry.uuid), reason);
     assert_reconnect(hub.write(stamp.version, Vec::new(), false), reason);
     assert_eq!(
-        server.root().connect(request_for(7, 3, &[(1, false)])),
+        failed.root().connect(request_for(7, 3, &[(1, false)])),
         ConnectOutcome::PipelineUnavailable(PipelineUnavailableDiagnostic::PipelineFailure(
             failure.clone()
         ))
     );
     assert_eq!(
-        server
+        failed
             .root()
             .metadata(PROTOCOL_VERSION)
             .connected()
@@ -1628,8 +1638,47 @@ fn published_runtime_failure_fences_shared_epoch_without_minting_a_version() {
     );
 }
 
+/// A backend whose served pipeline epoch has failed at runtime.
+struct RuntimeFailedBackend(PipelineFailure);
+
+impl AuthoringBackend for RuntimeFailedBackend {
+    fn pipeline_runtime_failure(
+        &self,
+        _snapshot: &distill_store::StoreReader,
+    ) -> Option<PipelineFailure> {
+        Some(self.0.clone())
+    }
+
+    fn prepare_import(
+        &self,
+        _: &mut distill_store::Store,
+        _: InputVersion,
+        _: &ImportRequest,
+    ) -> Result<PreparedImportCommit, RpcFailure> {
+        unreachable!("no imports")
+    }
+
+    fn prepare_reimport(
+        &self,
+        _: &mut distill_store::Store,
+        _: InputVersion,
+        _: BundleUuid,
+    ) -> Result<PreparedImportCommit, RpcFailure> {
+        unreachable!("no reimports")
+    }
+
+    fn prepare_operation(
+        &self,
+        _: &mut distill_store::Store,
+        _: InputVersion,
+        _: &LongRunningOp,
+    ) -> Result<PreparedOperationCommit, RpcFailure> {
+        unreachable!("no operations")
+    }
+}
+
 #[test]
-fn commit_rejects_unauthenticated_dscp_and_noncanonical_typed_pipeline_diagnostics() {
+fn commit_rejects_an_unauthenticated_dscp() {
     let project = project();
     let server = project.server();
     let before = server.current_stamp().unwrap();
@@ -1644,16 +1693,6 @@ fn commit_rejects_unauthenticated_dscp_and_noncanonical_typed_pipeline_diagnosti
             ..Commit::default()
         }),
         Err(AdminError::InvalidConfigurationError { .. })
-    ));
-
-    let mut tampered = test_pipeline_failure();
-    tampered.identity = [0; 32];
-    assert!(matches!(
-        offer(&server, Commit {
-            pipeline: Some(PipelineDiagnostic::Failed(tampered)),
-            ..Commit::default()
-        }),
-        Err(AdminError::InvalidPipelineDiagnostic { .. })
     ));
     assert_eq!(server.current_stamp().unwrap(), before);
 }
@@ -2792,49 +2831,6 @@ fn a_failed_served_write_returns_the_store_error() {
     publish_unrelated(&mut project);
     assert!(server.discard_history_before(InputVersion(2)).is_err());
     assert_eq!(server.current_stamp().unwrap().version.0, before.version.0 + 1);
-}
-
-/// The durable runtime failure and the served fence are one transaction:
-/// when the served write fails, the persisted failure rolls back with it.
-#[test]
-fn a_runtime_pipeline_failure_persists_with_its_fence_or_not_at_all() {
-    let project = project();
-    let server = project.server();
-    let failure = PipelineFailure::new(
-        PipelineFailureCode::PublishedCallbackPanic,
-        PipelineFailureOrigin::PublishedRuntime,
-        CleanupDisposition::PublishedEpochLeaked,
-        "processor callback panicked",
-    )
-    .unwrap();
-    // The served pipeline write fails.
-    let db = server.with_writer(|store| store.state_path().join("meta.sqlite"));
-    rusqlite::Connection::open(&db)
-        .unwrap()
-        .execute_batch(
-            "CREATE TRIGGER fail_served_pipeline BEFORE INSERT ON store_meta
-             WHEN NEW.key = 'served_pipeline'
-             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
-        )
-        .unwrap();
-    let published = server.coordinated_runtime_pipeline_failure(failure, |store| {
-        store
-            .write_transaction(|store| {
-                store.replace_scan_diagnostics(
-                    Some(&[]),
-                    &[distill_store::files::ObservedDiagnostic {
-                        root_name: "main".to_owned(),
-                        path: "persisted".to_owned(),
-                        detail: Vec::new(),
-                    }],
-                )
-            })
-            .map_err(|error| error.to_string())
-    });
-    assert!(published.is_err());
-    server.with_writer(|store| {
-        assert!(store.scan_diagnostics().unwrap().is_empty(), "the persisted half committed");
-    });
 }
 
 /// Publishing a protocol epoch or target definition that is already in

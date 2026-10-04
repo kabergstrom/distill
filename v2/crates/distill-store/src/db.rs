@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 44;
+pub const SCHEMA_VERSION: u32 = 45;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -99,8 +99,9 @@ CREATE INDEX source_claims_by_claimant ON source_claims(claimant, kind);
 -- Per-entity errors (see `errors`): one row per current defect. `family`
 -- is the producer that owns the row (1 scan namespace, 2 the pending scan
 -- rejection's namespace errors, 3 its configuration error, 4 the
--- configuration source's error); `scope_kind` 1 file, 2 bundle, 3 asset,
--- 4 target, 5 pipeline, 6 configuration, 7 daemon.
+-- configuration source's error, 5 the pipeline candidate's failure);
+-- `scope_kind` 1 file, 2 bundle, 3 asset, 4 target, 5 pipeline,
+-- 6 configuration, 7 daemon.
 CREATE TABLE errors (
     family     INTEGER NOT NULL,
     scope_kind INTEGER NOT NULL CHECK (scope_kind BETWEEN 1 AND 7),
@@ -351,34 +352,6 @@ CREATE UNIQUE INDEX cas_segments_open ON cas_segments(owner)
 -- Segments by state: the dead ones the sweeper deletes, and the sealed ones
 -- compaction considers.
 CREATE INDEX cas_segments_by_state ON cas_segments(state);
-CREATE TABLE pipeline_state (
-    id                 INTEGER PRIMARY KEY CHECK (id = 0),
-    dylib_hash         BLOB,
-    input_version      INTEGER NOT NULL,
-    poison_code        INTEGER CHECK (poison_code BETWEEN 1 AND 8),
-    poison_origin      INTEGER CHECK (poison_origin BETWEEN 1 AND 2),
-    poison_cleanup     INTEGER CHECK (poison_cleanup BETWEEN 0 AND 7),
-    poison_identity    BLOB,
-    poison_message     TEXT,
-    CHECK ((poison_code IS NULL AND poison_origin IS NULL AND poison_cleanup IS NULL
-            AND poison_identity IS NULL AND poison_message IS NULL)
-        OR (poison_code IS NOT NULL AND poison_origin IS NOT NULL AND poison_cleanup IS NOT NULL
-            AND poison_identity IS NOT NULL AND poison_message IS NOT NULL))
-);
-CREATE TABLE registrations (
-    kind    INTEGER NOT NULL,
-    reg_id  TEXT NOT NULL,
-    version INTEGER NOT NULL,
-    PRIMARY KEY (kind, reg_id)
-);
-CREATE TABLE pipeline_schema_registry (
-    type_uuid   BLOB NOT NULL PRIMARY KEY,
-    logical_hash BLOB NOT NULL
-);
-CREATE TABLE pipeline_target_set (
-    name                   TEXT NOT NULL PRIMARY KEY,
-    target_definition_hash BLOB NOT NULL
-);
 CREATE TABLE pending_restart (
     generation   INTEGER NOT NULL,
     config_key   TEXT NOT NULL,

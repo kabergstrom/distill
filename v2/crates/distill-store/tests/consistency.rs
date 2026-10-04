@@ -14,7 +14,7 @@ use distill_store::pipeline::ValidatedPipelineEpoch;
 use distill_store::pipeline::{ResolvedToolPackageFile, ResolvedToolSourceV2, ToolRegistrationV2};
 use distill_store::state::{
     CleanupDisposition, PipelineEpoch, PipelineFailure, PipelineFailureCode, PipelineFailureOrigin,
-    PipelineState, ReadableBundleSource, SkeletonFailureCode, NamespaceError, NamespaceErrorV1,
+    ReadableBundleSource, SkeletonFailureCode, NamespaceError, NamespaceErrorV1,
 };
 use distill_store::{Store, StoreConfig, StoreError};
 
@@ -34,7 +34,6 @@ fn validated_epoch(
         dylib_hash,
         target_set: CanonicalTargetSet::canonical(vec![]).unwrap(),
         schema_registry,
-        registrations: vec![],
     };
     ValidatedPipelineEpoch::validate(epoch).unwrap()
 }
@@ -185,7 +184,7 @@ fn multi_table_input_transactions_are_all_or_nothing() {
     assert!(store.entry(AssetUuid([2u8; 16])).unwrap().is_none());
     assert!(store.bundle(BundleUuid([1u8; 16])).unwrap().is_none());
     assert!(store.tool("tool").unwrap().is_none());
-    assert!(store.pipeline_state().unwrap().is_none());
+    assert_eq!(store.pipeline_module_hash().unwrap(), None);
     assert_eq!(
         store.logical_path("a.bundle").unwrap(),
         distill_store::files::LogicalPathState::Missing
@@ -274,9 +273,7 @@ fn pure_metadata_reads_survive_a_pipeline_failure() {
         })
         .unwrap();
 
-    let state = store.pipeline_state().unwrap().expect("published");
-    assert!(matches!(state, PipelineState::Failed { .. }));
-    assert!(state.epoch().is_err());
+    assert!(store.pipeline_failure().unwrap().is_some());
 
     // CAS reads and path resolution still answer.
     assert_eq!(store.cas_read(&hash).unwrap(), vec![1u8; 64]);
@@ -302,7 +299,8 @@ fn namespace_errors_do_not_gate_the_namespace_or_the_pipeline() {
         .unwrap();
 
     // Pipeline healthy…
-    assert!(store.pipeline_state().unwrap().unwrap().epoch().is_ok());
+    assert_eq!(store.pipeline_failure().unwrap(), None);
+    assert_eq!(store.pipeline_module_hash().unwrap(), Some([1u8; 32]));
     // …and so is the namespace.
     assert!(store.path_assets("x").unwrap().is_empty());
     assert!(store.entry(AssetUuid([1u8; 16])).unwrap().is_none());

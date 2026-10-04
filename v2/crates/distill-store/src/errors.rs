@@ -10,7 +10,8 @@
 //! A scan that could not observe some subjects leaves a pending rejection:
 //! its namespace errors, the configuration error it found (a directory
 //! alias), and the subjects whose revalidation heals it. The configuration
-//! source's own error (a rejected `distill.toml`) is a family of its own.
+//! source's own error (a rejected `distill.toml`) is a family of its own,
+//! as is the pipeline candidate's failure.
 //! Every writer leaves these rows alone except the scan and configuration
 //! publications that change them, so a write elsewhere (an RPC authoring
 //! write) cannot erase them and a restart keeps them.
@@ -21,6 +22,7 @@ use crate::db::{InputTxn, StoreReader};
 use crate::error::StoreError;
 use crate::state::{
     ConfigurationError, ConfigurationErrorCode, DscpV1, ErrorScope, NamespaceError,
+    PipelineFailure,
 };
 
 /// The scan's namespace errors.
@@ -31,6 +33,10 @@ const SCAN_REJECTION: i64 = 2;
 const SCAN_REJECTION_CONFIGURATION: i64 = 3;
 /// The configuration source's error (at most one row).
 const CONFIGURATION_SOURCE: i64 = 4;
+/// The pipeline candidate's failure (at most one row): `code` and
+/// `identity` are the failure's, `record` its origin and cleanup (two
+/// little-endian `u16`s).
+const PIPELINE: i64 = 5;
 
 /// A scan rejection waiting for its subjects to heal. `subjects` are the
 /// rejected physical paths in the daemon's platform path encoding.
@@ -94,6 +100,37 @@ impl InputTxn<'_> {
             self.set_configuration_generation(generation)?;
         }
         Ok(selected)
+    }
+
+    /// Replace the version's pipeline failure; `None` heals it.
+    pub(crate) fn set_pipeline_failure(
+        &mut self,
+        failure: Option<&PipelineFailure>,
+    ) -> Result<(), StoreError> {
+        self.txn
+            .prepare_cached("DELETE FROM errors WHERE family = ?1")?
+            .execute([PIPELINE])?;
+        let Some(failure) = failure else {
+            return Ok(());
+        };
+        let mut record = (failure.origin as u16).to_le_bytes().to_vec();
+        record.extend_from_slice(&(failure.cleanup as u16).to_le_bytes());
+        let scope = ErrorScope::Pipeline;
+        self.txn
+            .prepare_cached(
+                "INSERT INTO errors(family, scope_kind, scope_id, identity, code, record, message)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?
+            .execute(rusqlite::params![
+                PIPELINE,
+                scope.kind(),
+                scope.id(),
+                failure.identity.as_slice(),
+                failure.code as u16,
+                record,
+                failure.message,
+            ])?;
+        Ok(())
     }
 
     fn replace_configuration_family(
@@ -225,6 +262,44 @@ impl StoreReader {
                 error: error.to_string(),
             }
         })
+    }
+
+    /// The version's pipeline failure, if its candidate failed.
+    pub fn pipeline_failure(&self) -> Result<Option<PipelineFailure>, StoreError> {
+        let row = self
+            .conn
+            .prepare_cached("SELECT code, identity, record, message FROM errors WHERE family = ?1")?
+            .query_row([PIPELINE], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .optional()?;
+        let Some((code, identity, record, message)) = row else {
+            return Ok(None);
+        };
+        let invalid = |detail: &str| StoreError::InvalidPipelineState {
+            detail: detail.to_owned(),
+        };
+        let code = u16::try_from(code).map_err(|_| invalid("stored pipeline failure code"))?;
+        let identity: [u8; 32] = identity
+            .try_into()
+            .map_err(|_| invalid("stored pipeline failure identity is not 32 bytes"))?;
+        let [origin_lo, origin_hi, cleanup_lo, cleanup_hi]: [u8; 4] = record
+            .try_into()
+            .map_err(|_| invalid("stored pipeline failure record is not 4 bytes"))?;
+        PipelineFailure::from_wire(
+            code,
+            u16::from_le_bytes([origin_lo, origin_hi]),
+            u16::from_le_bytes([cleanup_lo, cleanup_hi]),
+            identity,
+            message,
+        )
+        .map(Some)
+        .map_err(StoreError::InvalidPipelineFailure)
     }
 
     fn configuration_family(&self, family: i64) -> Result<Option<ConfigurationError>, StoreError> {

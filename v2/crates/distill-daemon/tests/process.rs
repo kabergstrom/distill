@@ -9,7 +9,7 @@ use distill_daemon::config::DaemonConfig;
 use distill_daemon::process::DaemonProcess;
 use distill_daemon::scanner::{DaemonOwnedDirectoryKind, ScanDiagnostic};
 use distill_schema::ngp_schema::{LayoutIdentity, Schema, SchemaLayouts};
-use distill_store::state::{ConfigurationState, DscpV1, PipelineState};
+use distill_store::state::{ConfigurationState, DscpV1};
 
 fn test_layout_identity() -> LayoutIdentity {
     LayoutIdentity {
@@ -164,9 +164,9 @@ fn process_serves_rpc_and_consumes_watcher_changes_until_drop() {
             .coordinator()
             .open_reader()
             .unwrap()
-            .pipeline_state()
+            .pipeline_failure()
             .unwrap(),
-        Some(PipelineState::Failed { .. })
+        Some(_)
     ));
 
     std::fs::write(temp.path().join("assets/source.txt"), b"source").unwrap();
@@ -180,9 +180,9 @@ fn process_serves_rpc_and_consumes_watcher_changes_until_drop() {
             .coordinator()
             .open_reader()
             .unwrap()
-            .pipeline_state()
+            .pipeline_failure()
             .unwrap(),
-        Some(PipelineState::Failed { .. })
+        Some(_)
     ));
     assert!(process.last_background_error().is_none());
     assert!(
@@ -460,9 +460,8 @@ fn valid_configuration_with_malformed_schema_fails_only_the_pipeline() {
                 store.configuration_state().unwrap(),
                 ConfigurationState::Ready(_)
             ) && matches!(
-                store.pipeline_state().unwrap(),
-                Some(PipelineState::Failed { error, .. })
-                    if error.message.contains("schema authority")
+                store.pipeline_failure().unwrap(),
+                Some(error) if error.message.contains("schema authority")
             )
         },
         "valid configuration with a malformed schema did not fail only the pipeline",
@@ -778,10 +777,9 @@ fn malformed_schema_is_a_stable_pipeline_failure_and_a_valid_edit_retries() {
                     .coordinator()
                     .open_reader()
                     .unwrap()
-                    .pipeline_state()
+                    .pipeline_failure()
                     .unwrap(),
-                Some(PipelineState::Failed { error, .. })
-                    if error.message.contains("schema authority")
+                Some(error) if error.message.contains("schema authority")
             )
         },
         "malformed schema was not published as a pipeline failure",
@@ -1210,9 +1208,10 @@ fn dylib_hash(variant: &GateVariant) -> [u8; 32] {
 }
 
 fn ready_dylib_hash(process: &DaemonProcess) -> Option<[u8; 32]> {
-    match process.coordinator().open_reader().unwrap().pipeline_state().unwrap() {
-        Some(PipelineState::Ready(epoch)) => Some(epoch.dylib_hash),
-        _ => None,
+    let store = process.coordinator().open_reader().unwrap();
+    match store.pipeline_failure().unwrap() {
+        None => store.pipeline_module_hash().unwrap(),
+        Some(_) => None,
     }
 }
 

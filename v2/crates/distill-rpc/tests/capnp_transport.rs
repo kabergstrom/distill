@@ -1479,15 +1479,18 @@ async fn wire_connect_returns_closed_pipeline_unavailable_diagnostic() {
             let project = project();
             let server = project.server();
             let failure = PipelineFailure::new(
-                PipelineFailureCode::PublishedCallbackPanic,
-                PipelineFailureOrigin::PublishedRuntime,
-                CleanupDisposition::PublishedEpochLeaked,
-                "processor callback panicked",
+                PipelineFailureCode::CandidateRegistration,
+                PipelineFailureOrigin::CandidateOpen,
+                CleanupDisposition::CleanedAndClosed,
+                "duplicate processor id",
             )
             .unwrap();
-            server
-                .coordinated_runtime_pipeline_failure(failure.clone(), |_| Ok(()))
+            let mut writer = project.coordinator().open_writer().unwrap();
+            project
+                .coordinator()
+                .publish_pipeline_rejection(&mut writer, failure.clone())
                 .unwrap();
+            drop(writer);
             let listener = Rc::new(
                 StagedListener::bind(server.root(), "127.0.0.1:0")
                     .await

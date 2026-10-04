@@ -25,16 +25,8 @@ impl Writer {
         self.0.push(value);
     }
 
-    fn u16(&mut self, value: u16) {
-        self.0.extend_from_slice(&value.to_le_bytes());
-    }
-
     fn u32(&mut self, value: usize) {
         let value = u32::try_from(value).expect("persisted RPC count fits u32");
-        self.0.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn u64(&mut self, value: u64) {
         self.0.extend_from_slice(&value.to_le_bytes());
     }
 
@@ -71,20 +63,12 @@ impl<'a> Reader<'a> {
         Ok(self.array::<1>()?[0])
     }
 
-    fn u16(&mut self) -> Result<u16, PersistError> {
-        Ok(u16::from_le_bytes(self.array()?))
-    }
-
     fn count(&mut self) -> Result<usize, PersistError> {
         let count = u32::from_le_bytes(self.array()?) as usize;
         if count > self.bytes.len() {
             return Err(PersistError("count exceeds remaining bytes".to_owned()));
         }
         Ok(count)
-    }
-
-    fn u64(&mut self) -> Result<u64, PersistError> {
-        Ok(u64::from_le_bytes(self.array()?))
     }
 
     fn text(&mut self) -> Result<String, PersistError> {
@@ -104,59 +88,6 @@ impl<'a> Reader<'a> {
 
 fn bad_tag(what: &str, tag: u8) -> PersistError {
     PersistError(format!("unknown {what} tag {tag}"))
-}
-
-/// The served pipeline blob: the input version whose publication installed
-/// this diagnostic, then the diagnostic. A runtime failure rewrites the
-/// diagnostic but keeps the installing version, so every snapshot that
-/// pinned the same pipeline sees it.
-pub(crate) fn encode_served_pipeline(installed_at: InputVersion, value: &PipelineDiagnostic) -> Vec<u8> {
-    let mut out = Writer::default();
-    out.u64(installed_at.0);
-    write_pipeline(&mut out, value);
-    out.0
-}
-
-pub(crate) fn decode_served_pipeline(
-    bytes: &[u8],
-) -> Result<(InputVersion, PipelineDiagnostic), PersistError> {
-    let mut reader = Reader { bytes };
-    let installed_at = InputVersion(reader.u64()?);
-    let value = read_pipeline(&mut reader)?;
-    reader.finish()?;
-    Ok((installed_at, value))
-}
-
-fn write_pipeline(out: &mut Writer, value: &PipelineDiagnostic) {
-    match value {
-        PipelineDiagnostic::Ready => out.u8(0),
-        PipelineDiagnostic::Failed(failure) => {
-            out.u8(1);
-            out.u16(failure.code as u16);
-            out.u16(failure.origin as u16);
-            out.u16(failure.cleanup as u16);
-            out.bytes(&failure.identity);
-            out.text(&failure.message);
-        }
-    }
-}
-
-fn read_pipeline(reader: &mut Reader<'_>) -> Result<PipelineDiagnostic, PersistError> {
-    Ok(match reader.u8()? {
-        0 => PipelineDiagnostic::Ready,
-        1 => {
-            let code = reader.u16()?;
-            let origin = reader.u16()?;
-            let cleanup = reader.u16()?;
-            let identity = reader.array()?;
-            let message = reader.text()?;
-            PipelineDiagnostic::Failed(
-                PipelineFailure::from_wire(code, origin, cleanup, identity, message)
-                    .map_err(|error| PersistError(format!("pipeline failure: {error:?}")))?,
-            )
-        }
-        tag => return Err(bad_tag("pipeline diagnostic", tag)),
-    })
 }
 
 pub(crate) fn encode_drifted_input(value: &DriftedInput) -> Vec<u8> {
@@ -238,24 +169,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pipeline_and_drift_values_round_trip() {
-        let failure = PipelineFailure::new(
-            PipelineFailureCode::CandidateRegistration,
-            PipelineFailureOrigin::CandidateOpen,
-            CleanupDisposition::CleanedAndClosed,
-            "boom",
-        )
-        .unwrap();
-        for value in [
-            PipelineDiagnostic::Ready,
-            PipelineDiagnostic::Failed(failure),
-        ] {
-            let bytes = encode_served_pipeline(InputVersion(7), &value);
-            assert_eq!(
-                decode_served_pipeline(&bytes).unwrap(),
-                (InputVersion(7), value)
-            );
-        }
+    fn drift_values_round_trip() {
         for input in [
             DriftedInput::File("a/b".into()),
             DriftedInput::Asset(AssetUuid([8; 16])),

@@ -585,7 +585,6 @@ fn pipeline_publication(authority: &ProjectSchemaAuthority, dylib: u8) -> Config
             }])
             .unwrap(),
             schema_registry: authority.logical_registry().unwrap(),
-            registrations: Vec::new(),
         })
         .unwrap(),
         tools: BTreeMap::new(),
@@ -644,16 +643,20 @@ fn published_tables(store: &Store) -> BTreeMap<&'static str, Vec<String>> {
         "tag_epochs",
         "path_index",
         "derived_outputs",
-        "pipeline_state",
-        "pipeline_schema_registry",
         "errors",
     ]
     .into_iter()
     .map(|table| (table, store.table_rows(table).unwrap()))
-    .chain([(
-        "configuration_generation",
-        vec![store.configuration_generation().unwrap().to_string()],
-    )])
+    .chain([
+        (
+            "configuration_generation",
+            vec![store.configuration_generation().unwrap().to_string()],
+        ),
+        (
+            "pipeline_module_hash",
+            vec![format!("{:?}", store.pipeline_module_hash().unwrap())],
+        ),
+    ])
     .collect()
 }
 

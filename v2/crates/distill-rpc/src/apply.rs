@@ -6,16 +6,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use distill_store::served::{
-    Change, ResolutionRow, ServedWrite,
-    SERVED_PIPELINE,
-};
+use distill_store::served::{Change, ResolutionRow, ServedWrite};
 use distill_store::StoreError;
 
-use crate::persist::{
-    decode_served_pipeline, delta_state_code, encode_drifted_input, encode_served_pipeline,
-    reconnect_code,
-};
+use crate::persist::{delta_state_code, encode_drifted_input, reconnect_code};
 use crate::validate::validate_commit;
 use crate::*;
 
@@ -53,23 +47,6 @@ impl From<ApplyError> for StoreError {
     }
 }
 
-fn corrupt(detail: impl std::fmt::Display) -> StoreError {
-    StoreError::Rejected {
-        detail: detail.to_string(),
-    }
-}
-
-/// The served pipeline diagnostic and the input version that installed it.
-/// No blob means the pipeline has been Ready since the store began.
-pub(crate) fn read_served_pipeline(
-    bytes: Option<Vec<u8>>,
-) -> Result<(InputVersion, PipelineDiagnostic), StoreError> {
-    match bytes {
-        None => Ok((InputVersion(0), PipelineDiagnostic::Ready)),
-        Some(bytes) => decode_served_pipeline(&bytes).map_err(corrupt),
-    }
-}
-
 /// The RPC view of the store's configuration state.
 pub(crate) fn configuration_status(
     state: &distill_store::state::ConfigurationState,
@@ -94,23 +71,10 @@ pub fn apply_commit<W: ServedWrite>(txn: &mut W, commit: &Commit) -> Result<(), 
             .map_err(|error| AdminError::InvalidNamespaceError { error })?;
     }
     let version = txn.change_version();
-    let (_, current_pipeline) = read_served_pipeline(txn.txn_served_blob(SERVED_PIPELINE)?)?;
-    let pipeline_epoch_changed = commit.pipeline_epoch_changed
-        || commit
-            .pipeline
-            .as_ref()
-            .is_some_and(|next| next != &current_pipeline);
-
     // The fence row comes first: a front end fences its connections on it
     // before it reaches this version's deltas.
-    if pipeline_epoch_changed {
-        txn.bump_rpc_pipeline_generation()?;
-        txn.append_change(
-            version,
-            &Change::ReconnectAll {
-                reason: reconnect_code(ReconnectReason::PipelineEpochChanged),
-            },
-        )?;
+    if commit.pipeline_epoch_changed {
+        publish_pipeline_fence(txn)?;
     }
     // A runtime entry the namespace has not announced yet can be the target
     // of a named reference (path and local id) still waiting for it: its
@@ -152,12 +116,6 @@ pub fn apply_commit<W: ServedWrite>(txn: &mut W, commit: &Commit) -> Result<(), 
             }
         }
     }
-    if let Some(pipeline) = &commit.pipeline {
-        txn.set_served_blob(
-            SERVED_PIPELINE,
-            Some(&encode_served_pipeline(version, pipeline)),
-        )?;
-    }
 
     asset_deltas.sort_by_key(|(uuid, _)| *uuid);
     for (asset, state) in asset_deltas {
@@ -184,31 +142,9 @@ pub fn apply_commit<W: ServedWrite>(txn: &mut W, commit: &Commit) -> Result<(), 
     Ok(())
 }
 
-/// Publish a runtime failure of the current pipeline epoch. The diagnostic
-/// keeps its installing version, so every snapshot that pinned this epoch
-/// sees the failure; every connection must reconnect. Returns `false` when
-/// the same failure is already published.
-pub fn publish_runtime_pipeline_failure<W: ServedWrite>(
-    txn: &mut W,
-    failure: PipelineFailure,
-) -> Result<bool, StoreError> {
-    let (installed_at, current) = read_served_pipeline(txn.txn_served_blob(SERVED_PIPELINE)?)?;
-    match &current {
-        PipelineDiagnostic::Ready => {}
-        PipelineDiagnostic::Failed(existing) if existing == &failure => return Ok(false),
-        other => {
-            return Err(StoreError::Rejected {
-                detail: format!("current RPC pipeline is not the observed ready epoch: {other:?}"),
-            })
-        }
-    }
-    txn.set_served_blob(
-        SERVED_PIPELINE,
-        Some(&encode_served_pipeline(
-            installed_at,
-            &PipelineDiagnostic::Failed(failure),
-        )),
-    )?;
+/// Fence every connection on a changed pipeline: an epoch installed,
+/// retired or failed, at the version `txn` writes.
+pub fn publish_pipeline_fence<W: ServedWrite>(txn: &mut W) -> Result<(), StoreError> {
     txn.bump_rpc_pipeline_generation()?;
     let version = txn.change_version();
     txn.append_change(
@@ -216,8 +152,7 @@ pub fn publish_runtime_pipeline_failure<W: ServedWrite>(
         &Change::ReconnectAll {
             reason: reconnect_code(ReconnectReason::PipelineEpochChanged),
         },
-    )?;
-    Ok(true)
+    )
 }
 
 /// Announce a changed restart-required key set: the keys the store's

@@ -1,12 +1,10 @@
-//! §13 pipeline-side metadata: the `pipeline_state` row (dylib hash,
-//! compiled schema registry and staged-candidate failure) and the `tools`
-//! ToolEpoch table.
+//! §13 pipeline-side metadata: the served module's content hash, the
+//! version's candidate failure, and the `tools` ToolEpoch table.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use distill_core::bootstrap::bootstrap_control_logical_registry_v1;
-use distill_core::id::{LogicalHash, TypeUuid};
+use distill_core::id::LogicalHash;
 use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
 use distill_core::tool::ToolCwdPolicy;
 use distill_store::pipeline::{
@@ -14,7 +12,6 @@ use distill_store::pipeline::{
 };
 use distill_store::state::{
     CleanupDisposition, PipelineEpoch, PipelineFailure, PipelineFailureCode, PipelineFailureOrigin,
-    PipelineState, Registration, RegistrationKind,
 };
 use distill_store::{Store, StoreConfig, StoreError};
 
@@ -46,9 +43,7 @@ fn tool_package(launcher: &[u8], resource: &[u8]) -> ToolRegistrationV2 {
     }
 }
 
-fn raw_epoch(n: u8, rows: &[(TypeUuid, LogicalHash)]) -> PipelineEpoch {
-    let mut schema_registry = bootstrap_control_logical_registry_v1().unwrap();
-    schema_registry.extend(rows.iter().copied());
+fn raw_epoch(n: u8) -> PipelineEpoch {
     PipelineEpoch {
         dylib_hash: [n; 32],
         target_set: CanonicalTargetSet::canonical(vec![TargetSetRow {
@@ -56,114 +51,26 @@ fn raw_epoch(n: u8, rows: &[(TypeUuid, LogicalHash)]) -> PipelineEpoch {
             target_definition_hash: [n.wrapping_add(3); 32],
         }])
         .unwrap(),
-        schema_registry,
-        registrations: vec![
-            Registration {
-                kind: RegistrationKind::Importer,
-                id: "gltf".into(),
-                version: 2,
-            },
-            Registration {
-                kind: RegistrationKind::Processor,
-                id: "tex".into(),
-                version: 5,
-            },
-        ],
+        schema_registry: bootstrap_control_logical_registry_v1().unwrap(),
     }
 }
 
 fn epoch(n: u8) -> ValidatedPipelineEpoch {
-    epoch_with_registry(n, &[])
-}
-
-fn epoch_with_registry(n: u8, rows: &[(TypeUuid, LogicalHash)]) -> ValidatedPipelineEpoch {
-    ValidatedPipelineEpoch::validate(raw_epoch(n, rows)).unwrap()
-}
-
-
-#[test]
-fn published_runtime_failure_is_durable_without_a_new_input_version() {
-    let (_dir, mut store) = store();
-    let ready = epoch(41);
-    store
-        .input_transaction(|txn| txn.publish_pipeline_epoch(&ready))
-        .unwrap();
-    let version = store.input_version().unwrap();
-    let failure = PipelineFailure::new(
-        PipelineFailureCode::PublishedCallbackPanic,
-        PipelineFailureOrigin::PublishedRuntime,
-        CleanupDisposition::PublishedEpochLeaked,
-        "drop thunk panicked",
-    )
-    .unwrap();
-    store
-        .fail_published_pipeline_epoch(ready.dylib_hash, &failure)
-        .unwrap();
-    assert_eq!(store.input_version().unwrap(), version);
-    assert!(matches!(
-        store.pipeline_state().unwrap(),
-        Some(PipelineState::Failed {
-            error,
-            last_good: Some(_),
-        }) if error == failure
-    ));
-    assert!(matches!(
-        store.fail_published_pipeline_epoch(ready.dylib_hash, &failure),
-        Err(StoreError::StalePublishedPipeline {
-            already_unavailable: true,
-            ..
-        })
-    ));
-}
-
-#[test]
-fn runtime_failure_cas_cannot_fence_another_epoch_or_use_candidate_origin() {
-    let (_dir, mut store) = store();
-    let ready = epoch(42);
-    store
-        .input_transaction(|txn| txn.publish_pipeline_epoch(&ready))
-        .unwrap();
-    let runtime = PipelineFailure::new(
-        PipelineFailureCode::PublishedCallbackRejected,
-        PipelineFailureOrigin::PublishedRuntime,
-        CleanupDisposition::PublishedEpochLeaked,
-        "callback rejected",
-    )
-    .unwrap();
-    assert!(matches!(
-        store.fail_published_pipeline_epoch([0xff; 32], &runtime),
-        Err(StoreError::StalePublishedPipeline { .. })
-    ));
-    assert!(matches!(
-        store.pipeline_state().unwrap(),
-        Some(PipelineState::Ready(_))
-    ));
-
-    let candidate = PipelineFailure::new(
-        PipelineFailureCode::CandidateOpen,
-        PipelineFailureOrigin::CandidateOpen,
-        CleanupDisposition::None,
-        "open failed",
-    )
-    .unwrap();
-    assert!(matches!(
-        store.fail_published_pipeline_epoch(ready.dylib_hash, &candidate),
-        Err(StoreError::InvalidPipelineFailure(_))
-    ));
+    ValidatedPipelineEpoch::validate(raw_epoch(n)).unwrap()
 }
 
 #[test]
 fn ready_requires_exact_bootstrap_logical_projection() {
     let type_uuid = distill_core::bootstrap::BOOTSTRAP_CONTROL_TYPE_UUIDS[0];
 
-    let mut missing = raw_epoch(1, &[]);
+    let mut missing = raw_epoch(1);
     missing.schema_registry.remove(&type_uuid);
     assert!(matches!(
         ValidatedPipelineEpoch::validate(missing),
         Err(StoreError::InvalidBootstrapRegistry { .. })
     ));
 
-    let mut changed = raw_epoch(2, &[]);
+    let mut changed = raw_epoch(2);
     changed
         .schema_registry
         .insert(type_uuid, LogicalHash([9; 32]));
@@ -172,12 +79,6 @@ fn ready_requires_exact_bootstrap_logical_projection() {
         Err(StoreError::InvalidBootstrapRegistry { .. })
     ));
 }
-
-fn h(n: u8) -> LogicalHash {
-    LogicalHash([n; 32])
-}
-
-const T: TypeUuid = TypeUuid([4u8; 16]);
 
 fn candidate_failure(message: &str) -> PipelineFailure {
     PipelineFailure::new(
@@ -189,31 +90,23 @@ fn candidate_failure(message: &str) -> PipelineFailure {
     .unwrap()
 }
 
-// ---- pipeline_state row ----
+// ---- the served module and the candidate failure ----
 
 #[test]
-fn no_pipeline_state_until_first_publication() {
+fn no_module_or_failure_until_first_publication() {
     let (_d, store) = store();
-    assert!(store.pipeline_state().unwrap().is_none());
+    assert_eq!(store.pipeline_module_hash().unwrap(), None);
+    assert_eq!(store.pipeline_failure().unwrap(), None);
 }
 
 #[test]
-fn publishing_an_epoch_roundtrips_identity_and_registrations() {
+fn publishing_an_epoch_serves_its_module() {
     let (_d, mut store) = store();
     store
         .input_transaction(|txn| txn.publish_pipeline_epoch(&epoch(3)))
         .unwrap();
-    let state = store.pipeline_state().unwrap().expect("published");
-    let got = state.epoch().expect("ready");
-    assert_eq!(got.dylib_hash, [3u8; 32]);
-    assert_eq!(got.dylib_hash, epoch(3).dylib_hash);
-    assert_eq!(got.target_set, epoch(3).target_set);
-    let mut regs = got.registrations.clone();
-    regs.sort_by(|a, b| a.id.cmp(&b.id));
-    assert_eq!(regs.len(), 2);
-    assert_eq!(regs[0].id, "gltf");
-    assert_eq!(regs[0].kind, RegistrationKind::Importer);
-    assert_eq!(regs[1].version, 5);
+    assert_eq!(store.pipeline_module_hash().unwrap(), Some([3u8; 32]));
+    assert_eq!(store.pipeline_failure().unwrap(), None);
 }
 
 #[test]
@@ -225,38 +118,12 @@ fn a_rejected_candidate_still_publishes_as_a_failure() {
     store
         .input_transaction(|txn| txn.publish_pipeline_epoch(&epoch(3)))
         .unwrap();
+    let failure = candidate_failure("dup processor id `tex`");
     store
-        .input_transaction(|txn| {
-            txn.publish_pipeline_failure(&candidate_failure("dup processor id `tex`"))
-        })
+        .input_transaction(|txn| txn.publish_pipeline_failure(&failure))
         .unwrap();
-
-    let state = store.pipeline_state().unwrap().expect("still published");
-    match &state {
-        PipelineState::Failed { error, last_good } => {
-            assert!(error.message.contains("dup processor id"));
-            // last_good is residency bookkeeping only — present, but
-            // epoch() still refuses.
-            let last: &Arc<PipelineEpoch> = last_good.as_ref().expect("prior epoch recorded");
-            assert_eq!(last.dylib_hash, [3u8; 32]);
-        }
-        other => panic!("expected Failed, got {other:?}"),
-    }
-    assert!(state.epoch().is_err());
-}
-
-#[test]
-fn poison_with_no_prior_epoch_has_no_last_good() {
-    let (_d, mut store) = store();
-    store
-        .input_transaction(|txn| {
-            txn.publish_pipeline_failure(&candidate_failure("first candidate invalid"))
-        })
-        .unwrap();
-    match store.pipeline_state().unwrap().expect("published") {
-        PipelineState::Failed { last_good, .. } => assert!(last_good.is_none()),
-        other => panic!("expected Failed, got {other:?}"),
-    }
+    assert_eq!(store.pipeline_failure().unwrap(), Some(failure));
+    assert_eq!(store.pipeline_module_hash().unwrap(), None, "no module serves");
 }
 
 #[test]
@@ -271,31 +138,18 @@ fn the_next_successful_swap_publishes_over_the_failure() {
     store
         .input_transaction(|txn| txn.publish_pipeline_epoch(&epoch(7)))
         .unwrap();
-    let state = store.pipeline_state().unwrap().expect("published");
-    assert_eq!(state.epoch().expect("healed").dylib_hash, [7u8; 32]);
-}
-
-
-#[test]
-fn a_candidate_registry_publishes_ready_and_roundtrips() {
-    let (_d, mut store) = store();
-    store
-        .input_transaction(|txn| txn.publish_pipeline_epoch(&epoch_with_registry(5, &[(T, h(2))])))
-        .unwrap();
-    let state = store.pipeline_state().unwrap().expect("published");
-    let got = state.epoch().expect("ready");
-    assert_eq!(got.schema_registry.get(&T), Some(&h(2)));
-    assert_eq!(got.schema_registry, raw_epoch(5, &[(T, h(2))]).schema_registry);
+    assert_eq!(store.pipeline_module_hash().unwrap(), Some([7u8; 32]));
+    assert_eq!(store.pipeline_failure().unwrap(), None, "healed");
 }
 
 #[test]
 fn noncanonical_target_rows_are_rejected() {
     let (_d, store) = store();
-    let mut forged_rows = raw_epoch(24, &[]);
+    let mut forged_rows = raw_epoch(24);
     forged_rows.target_set.rows[0].name = "targe\u{301}t-24".into();
     let err = ValidatedPipelineEpoch::validate(forged_rows).unwrap_err();
     assert!(matches!(err, StoreError::InvalidTargetSet(_)));
-    assert!(store.pipeline_state().unwrap().is_none());
+    assert_eq!(store.pipeline_module_hash().unwrap(), None);
 }
 
 // ---- tools: the ToolEpoch table ----

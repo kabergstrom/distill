@@ -335,32 +335,23 @@ impl DaemonCoordinator {
         let Some(epoch) = runtime.host.published_ready_epoch() else {
             return Ok(None);
         };
-        let observed = match runtime.host.snapshot().epoch() {
+        let failure = match runtime.host.snapshot().epoch() {
             Ok(_) => return Ok(None),
-            Err(failure) if failure.origin == PipelineFailureOrigin::PublishedRuntime => {
-                (epoch.dylib_hash(), failure)
-            }
+            Err(failure) if failure.origin == PipelineFailureOrigin::PublishedRuntime => failure,
             Err(_) => return Ok(None),
         };
-        let diagnostic = observed.1.clone();
-        self.server
-            .coordinated_runtime_pipeline_failure(store, diagnostic, |store| {
-                match store.fail_published_pipeline_epoch(observed.0, &observed.1) {
-                    Ok(()) => Ok(()),
-                    Err(StoreError::StalePublishedPipeline {
-                        actual: Some(actual),
-                        already_unavailable: true,
-                        ..
-                    }) if actual == observed.0 => Ok(()),
-                    Err(error) => Err(error.to_string()),
-                }
-            })
-            .map_err(CoordinatorError::RuntimePipeline)?;
-        warn_pipeline_failure(
-            &observed.1,
-            "published pipeline latched a runtime failure; importers from it are unavailable",
-        );
-        Ok(Some(observed.1))
+        // The failure lives on the epoch; connections are fenced once.
+        if epoch.claim_runtime_fence() {
+            if let Err(error) = self.server.coordinated_pipeline_fence(store) {
+                epoch.release_runtime_fence();
+                return Err(CoordinatorError::RuntimePipeline(error));
+            }
+            warn_pipeline_failure(
+                &failure,
+                "published pipeline latched a runtime failure; importers from it are unavailable",
+            );
+        }
+        Ok(Some(failure))
     }
 
     /// Whether a Ready pipeline epoch serves.
@@ -814,10 +805,12 @@ impl DaemonCoordinator {
                     ),
                 }
                 .map_err(|error| error.to_string())?;
-                let diagnostic = commit
-                    .pipeline
-                    .clone()
-                    .expect("scan commit always carries pipeline diagnostics");
+                let diagnostic = match &pipeline {
+                    ConfigurationPipelinePublication::Epoch { .. } => PipelineDiagnostic::Ready,
+                    ConfigurationPipelinePublication::Failed(failure) => {
+                        PipelineDiagnostic::Failed(failure.clone())
+                    }
+                };
                 let (snapshot, importers) = match (&pipeline, prepared_epoch.as_ref(), &diagnostic) {
                     (
                         ConfigurationPipelinePublication::Epoch { .. },
@@ -984,7 +977,6 @@ impl DaemonCoordinator {
             );
             Ok(Commit {
                 configuration: configuration.map(configuration_status),
-                pipeline: Some(PipelineDiagnostic::Failed(diagnostic.clone())),
                 pipeline_epoch_changed: true,
                 ..Commit::default()
             })
@@ -2411,7 +2403,6 @@ fn publish_scan(
         projection,
         &rpc_publishable_bundles,
     )?;
-    let mut next_pipeline = pipeline_diagnostic(store.pipeline_failure()?);
     let mut configuration = None;
     store.input_transaction(|transaction| {
         // Rows are labelled with the version the input publishes, which a
@@ -2455,12 +2446,10 @@ fn publish_scan(
         configuration = transaction.publish_configuration_status(generation)?;
         match pipeline {
             Some(ConfigurationPipelinePublication::Epoch { epoch, tools }) => {
-                next_pipeline = PipelineDiagnostic::Ready;
                 transaction.publish_pipeline_epoch(epoch)?;
                 transaction.publish_tool_epoch(tools)?;
             }
             Some(ConfigurationPipelinePublication::Failed(failure)) => {
-                next_pipeline = PipelineDiagnostic::Failed(failure.clone());
                 transaction.publish_pipeline_failure(failure)?;
             }
             None => {}
@@ -2547,7 +2536,6 @@ fn publish_scan(
         }
         Ok(())
     })?;
-    commit.pipeline = Some(next_pipeline);
     commit.configuration = Some(configuration_status(configuration));
     Ok(commit)
 }
@@ -2938,7 +2926,6 @@ fn prepare_incremental_publication(
     let mut commit = Commit {
         // Selected from the store's errors in the publishing input.
         configuration: None,
-        pipeline: Some(pipeline_diagnostic(store.pipeline_failure()?)),
         namespace_errors: Some(plan.namespace_errors.clone()),
         ..Commit::default()
     };
@@ -3137,13 +3124,6 @@ fn bundle_summary(source: &ScannedBundle) -> Result<BundleSummary, StoreError> {
     })
 }
 
-fn pipeline_diagnostic(failure: Option<PipelineFailure>) -> PipelineDiagnostic {
-    match failure {
-        None => PipelineDiagnostic::Ready,
-        Some(error) => PipelineDiagnostic::Failed(error),
-    }
-}
-
 /// Reobserve authored paths and advance the durable projection, on the
 /// authority, under `compiled`, the compiled state of the writer's version.
 /// The pending scan rejection and the configuration errors are the store's
@@ -3224,7 +3204,6 @@ fn rpc_commit(
     let mut commit = Commit {
         // Selected from the store's errors in the publishing input.
         configuration: None,
-        pipeline: Some(PipelineDiagnostic::Ready),
         namespace_errors: Some(candidate.namespace_errors.clone()),
         ..Commit::default()
     };

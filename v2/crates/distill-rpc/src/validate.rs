@@ -17,9 +17,6 @@ pub(crate) fn validate_commit(commit: &Commit) -> Result<(), AdminError> {
             .validate()
             .map_err(|error| AdminError::InvalidConfigurationError { error })?;
     }
-    if let Some(pipeline) = &commit.pipeline {
-        validate_pipeline_diagnostic(pipeline)?;
-    }
     if let Some(derived_outputs) = &commit.derived_outputs {
         for (child, entry) in derived_outputs {
             if *child != AssetUuid::v5(entry.parent, &entry.output_key)
@@ -165,18 +162,6 @@ pub(crate) fn validate_commit(commit: &Commit) -> Result<(), AdminError> {
         }
     }
     Ok(())
-}
-
-pub(crate) fn validate_pipeline_diagnostic(diagnostic: &PipelineDiagnostic) -> Result<(), AdminError> {
-    let invalid = |detail: &str| AdminError::InvalidPipelineDiagnostic {
-        detail: detail.to_owned(),
-    };
-    match diagnostic {
-        PipelineDiagnostic::Ready => Ok(()),
-        PipelineDiagnostic::Failed(failure) => failure
-            .validate()
-            .map_err(|error| invalid(&format!("invalid DSPP record: {error:?}"))),
-    }
 }
 
 pub(crate) fn validate_authoring_entry(entry: &AuthoringEntry) -> Result<(), AuthoringValueError> {

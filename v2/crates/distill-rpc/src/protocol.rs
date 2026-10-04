@@ -823,6 +823,16 @@ pub trait AuthoringBackend: Send + Sync + 'static {
         None
     }
 
+    /// The runtime failure of the pipeline epoch `snapshot` serves, if its
+    /// module has failed since it was published. It lives on the loaded
+    /// epoch, never in the store.
+    fn pipeline_runtime_failure(
+        &self,
+        _snapshot: &distill_store::StoreReader,
+    ) -> Option<PipelineFailure> {
+        None
+    }
+
     /// Apply an ordinary authoring batch, planned against `base`, to the
     /// files it changes, and return what it wrote. The write is complete
     /// once the files are atomically on disk: the store follows through the
@@ -1487,7 +1497,6 @@ pub struct Commit {
     pub tag_poison_mutations: Vec<TagPoisonMutation>,
     pub tag_projection_mutations: Vec<TagProjectionMutation>,
     pub configuration: Option<ConfigurationStatus>,
-    pub pipeline: Option<PipelineDiagnostic>,
     /// The publication installs, retires, or fails a module epoch even when
     /// the externally visible diagnostic remains `Ready`. Existing target
     /// Hubs must reconnect instead of retaining capabilities across that
@@ -1531,9 +1540,6 @@ pub enum AdminError {
     },
     InvalidConfigurationError {
         error: distill_store::state::DscpError,
-    },
-    InvalidPipelineDiagnostic {
-        detail: String,
     },
     DuplicatePathMutation {
         path: String,

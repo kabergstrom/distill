@@ -372,8 +372,8 @@ impl DaemonCoordinator {
         let mut more_work = false;
         let published = self.server.coordinated_maybe_commit(store, base, |store| {
             if scope.loop_pass {
-                // First: the scan's commit carries the pipeline diagnostic
-                // as the store then holds it.
+                // First: a runtime failure of the served epoch fences the
+                // connections in this version.
                 self.sync_runtime_pipeline_failure(store)
                     .map_err(|error| error.to_string())?;
             }
@@ -1297,9 +1297,6 @@ fn absorb_into(commit: &mut Commit, later: Commit) {
     );
     if later.configuration.is_some() {
         commit.configuration = later.configuration;
-    }
-    if later.pipeline.is_some() {
-        commit.pipeline = later.pipeline;
     }
     commit.pipeline_epoch_changed |= later.pipeline_epoch_changed;
     if later.namespace_errors.is_some() {

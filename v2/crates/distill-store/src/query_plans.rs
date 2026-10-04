@@ -1325,8 +1325,8 @@ fn candidate_rows_search_their_bucket() {
 /// the delete), the directory rules a dirty path's directories select, the
 /// pending work and its acknowledgement by path, the sources an asset's
 /// collision change makes pending (by claimant), the namespace error
-/// family's diff, the pipeline failure and one registered schema, the configuration
-/// status, and a root id.
+/// family's diff, the pipeline failure and the configuration status,
+/// and a root id.
 #[test]
 fn pass_bookkeeping_statements_search_their_indexes() {
     use crate::imports::ImportIndexSource;
@@ -1391,8 +1391,19 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         store.directory_rule_sources_listing(["", "d04/"]).unwrap();
         store.directory_rule_sources_at("main", &bundle_path(4)).unwrap();
         store.pipeline_failure().unwrap();
+        store.pipeline_module_hash().unwrap();
+        // A rejected pipeline candidate: no module, one failure row.
+        let failure = crate::state::PipelineFailure::new(
+            crate::state::PipelineFailureCode::CandidateRegistration,
+            crate::state::PipelineFailureOrigin::CandidateOpen,
+            crate::state::CleanupDisposition::CleanedAndClosed,
+            "rejected",
+        )
+        .unwrap();
+        store
+            .input_transaction(|txn| txn.publish_pipeline_failure(&failure))
+            .unwrap();
         store.configuration_state().unwrap();
-        store.ready_schema_hash(RUNTIME_TYPE).unwrap();
         store
             .input_transaction(|txn| {
                 txn.intern_root("main")?;
@@ -1431,7 +1442,7 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         "SEARCH source_claims USING INDEX source_claims_by_subject (kind=? AND subject=?)",
         "USE TEMP B-TREE FOR DISTINCT",
     ];
-    let cases: [(&str, &[&str]); 23] = [
+    let cases: [(&str, &[&str]); 21] = [
         (
             "SELECT root_id, path, canonical_path, physical_path FROM directories",
             &["SCAN directories"],
@@ -1487,17 +1498,6 @@ fn pass_bookkeeping_statements_search_their_indexes() {
             "SELECT r.name, t.path, t.rules_bundle, t.rules_asset FROM directory_rule_sources t JOIN roots r USING (root_id) WHERE t.listing_dir",
             &["SEARCH t USING INDEX directory_rule_sources_by_listing (listing_dir=?)", by_root],
         ),
-        (
-            "SELECT poison_code",
-            &["SEARCH pipeline_state USING INTEGER PRIMARY KEY (rowid=?)"],
-        ),
-        (
-            "SELECT r.logical_hash",
-            &[
-                "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)",
-                "SEARCH r USING INDEX sqlite_autoindex_pipeline_schema_registry_1 (type_uuid=?)",
-            ],
-        ),
         ("SELECT claimant FROM source_claims WHERE kind = 1", &by_subject),
         (
             "INSERT OR IGNORE INTO claim_pending(kind, subject) SELECT kind, subject",
@@ -1520,6 +1520,23 @@ fn pass_bookkeeping_statements_search_their_indexes() {
     assert_eq!(
         plan("SELECT value FROM store_meta")[0],
         ["SEARCH store_meta USING INDEX sqlite_autoindex_store_meta_1 (key=?)"]
+    );
+    let exact = |sql: &str| {
+        let normal = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        plans
+            .iter()
+            .find(|(traced, _)| normal(traced) == normal(sql))
+            .unwrap_or_else(|| panic!("{sql} was not run: {plans:#?}"))
+            .1
+            .clone()
+    };
+    assert_eq!(
+        exact("DELETE FROM store_meta WHERE key = 'pipeline_module_hash'"),
+        ["SEARCH store_meta USING INDEX sqlite_autoindex_store_meta_1 (key=?)"]
+    );
+    assert_eq!(
+        exact("DELETE FROM errors WHERE family = 5"),
+        ["SEARCH errors USING INDEX sqlite_autoindex_errors_1 (family=?)"]
     );
 }
 

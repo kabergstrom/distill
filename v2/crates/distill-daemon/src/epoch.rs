@@ -18,10 +18,7 @@ pub use distill_store::state::{
     CleanupDisposition as CandidateCleanupDisposition, PipelineFailure, PipelineFailureCode,
     PipelineFailureOrigin,
 };
-use distill_store::state::{
-    PipelineEpoch as StoredPipelineEpoch, Registration as StoredRegistration,
-    RegistrationKind as StoredRegistrationKind,
-};
+use distill_store::state::PipelineEpoch as StoredPipelineEpoch;
 use distill_store::StoreError;
 
 use crate::callbacks::{
@@ -650,6 +647,8 @@ struct EpochInner {
     reload_identity: OnceLock<ngp_module_host::ModuleReloadIdentity>,
     /// The first runtime failure; it fences the epoch for good.
     runtime_error: OnceLock<(PipelineFailureCode, String)>,
+    /// Whether the RPC fence for the runtime failure has been published.
+    runtime_fenced: std::sync::atomic::AtomicBool,
     /// Read through `&self` once published; torn down only with the epoch
     /// exclusively held (see `unload_epoch`) or in `Drop`.
     registration_arena: Option<CandidateRegistrationArena>,
@@ -700,6 +699,7 @@ impl PipelineEpoch {
             tools,
             reload_identity: OnceLock::new(),
             runtime_error: OnceLock::new(),
+            runtime_fenced: std::sync::atomic::AtomicBool::new(false),
             registration_arena: Some(arena),
             module: Some(module),
         }))
@@ -1153,6 +1153,22 @@ impl PipelineEpoch {
     pub fn report_runtime_failure(&self, error: impl Into<String>) {
         self.0
             .poison(PipelineFailureCode::PublishedCallbackRejected, error.into());
+    }
+
+    /// Claim the publication of this epoch's runtime-failure fence: `true`
+    /// once, until [`Self::release_runtime_fence`] gives it back.
+    pub(crate) fn claim_runtime_fence(&self) -> bool {
+        !self
+            .0
+            .runtime_fenced
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Give back a claimed fence whose publication failed.
+    pub(crate) fn release_runtime_fence(&self) {
+        self.0
+            .runtime_fenced
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn report_runtime_panic(&self, error: impl Into<String>) {
@@ -1714,32 +1730,10 @@ pub(crate) fn stored_pipeline_epoch(
             detail: "prepared module target rows are not canonical",
         });
     }
-    let registrations = prepared
-        .registrations()
-        .registrations
-        .iter()
-        .filter_map(|registration| {
-            let kind = match registration.kind {
-                RegistrationKind::Importer => StoredRegistrationKind::Importer,
-                RegistrationKind::Processor => StoredRegistrationKind::Processor,
-                RegistrationKind::Codegen
-                | RegistrationKind::Validator
-                | RegistrationKind::Migration
-                | RegistrationKind::Defaults
-                | RegistrationKind::Tool => return None,
-            };
-            Some(StoredRegistration {
-                kind,
-                id: registration.id.clone(),
-                version: registration.version,
-            })
-        })
-        .collect();
     let epoch = StoredPipelineEpoch {
         dylib_hash: prepared.dylib_hash(),
         target_set,
         schema_registry: requirements.schema_registry.clone(),
-        registrations,
     };
     ValidatedPipelineEpoch::validate(epoch)
 }
