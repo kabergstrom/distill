@@ -5,7 +5,7 @@
 //! answer there. [`StoreTraceSource`] answers each question when it is
 //! asked, by indexed reads in the snapshot's read transaction: an entry is
 //! one primary-key read (`distill_store::trace_reads`), a path one
-//! `path_index` range, a query one asset query driven by its most selective
+//! `bundles_by_path` search, a query one asset query driven by its most selective
 //! selector (DESIGN.md §13, asset queries), a tool one ToolEpoch row.
 //! Nothing reads the whole project unless a query names no indexed
 //! selector at all (its answer may then be the whole project). Nothing is

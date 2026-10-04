@@ -264,7 +264,26 @@ fn pure_metadata_reads_survive_a_pipeline_failure() {
     store
         .input_transaction(|txn| {
             let root = txn.intern_root("main")?;
-            txn.set_path_entry("a.bundle", root, AssetUuid([2u8; 16]))?;
+            txn.upsert_bundle(&BundleMeta {
+                bundle: BundleUuid([1u8; 16]),
+                root,
+                path: "a.bundle".to_owned(),
+                format_version: 1,
+                content_hash: ContentHash([1u8; 32]),
+                origin: None,
+                import_watched: false,
+            })?;
+            txn.upsert_asset(&AssetRecord {
+                asset: AssetUuid([2u8; 16]),
+                bundle: BundleUuid([1u8; 16]),
+                local_id: "main".to_owned(),
+                type_uuid: TypeUuid([3u8; 16]),
+                logical_hash: LogicalHash([4u8; 32]),
+                authoring_only: false,
+                tags: std::collections::BTreeMap::new(),
+                terminal_type: None,
+            })?;
+            txn.set_primary_asset(BundleUuid([1u8; 16]), AssetUuid([2u8; 16]))?;
             txn.publish_pipeline_failure(&pipeline_failure(
                 "candidate rejected: duplicate type uuid",
             ))

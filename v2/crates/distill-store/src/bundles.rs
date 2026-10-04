@@ -1,5 +1,5 @@
-//! Asset-namespace metadata (§13): `bundles`, `assets` + search tags,
-//! `path_index`, `schemas` — and bundle poison versus namespace errors.
+//! Asset-namespace metadata (§13): `bundles` (with each one's primary
+//! asset), `assets` + search tags, `schemas` — and bundle poison versus namespace errors.
 //!
 //! Bundle-scoped poison (§7, §13): a file that cannot be indexed
 //! publishes a poison row *only when the current malformed bytes
@@ -189,7 +189,7 @@ impl InputTxn<'_> {
                origin_rule = excluded.origin_rule,
                origin_group_root = excluded.origin_group_root,
                origin_group_path = excluded.origin_group_path,
-               import_watched = excluded.import_watched",
+               import_watched = excluded.import_watched, primary_asset = NULL",
             )?
             .execute(
                 rusqlite::params![
@@ -208,8 +208,7 @@ impl InputTxn<'_> {
         Ok(())
     }
 
-    /// Remove a bundle and everything it owns (assets, tags, its assets'
-    /// path-index rows).
+    /// Remove a bundle and everything it owns (assets, tags).
     pub fn remove_bundle(&mut self, bundle: BundleUuid) -> Result<bool, StoreError> {
         self.remove_owned_asset_rows(bundle)?;
         self.clear_path_refs(bundle)?;
@@ -245,14 +244,8 @@ impl InputTxn<'_> {
         Ok(())
     }
 
-    /// Drop every asset row a bundle owns, with tags and path-index rows.
+    /// Drop every asset row a bundle owns, with their tags.
     fn remove_owned_asset_rows(&mut self, bundle: BundleUuid) -> Result<(), StoreError> {
-        self.txn
-            .prepare_cached(
-                "DELETE FROM path_index WHERE asset_uuid IN
-               (SELECT asset_uuid FROM assets WHERE bundle_uuid = ?1)",
-            )?
-            .execute([bundle.0.as_slice()])?;
         self.txn
             .prepare_cached(
                 "DELETE FROM asset_tags WHERE asset_uuid IN
@@ -328,13 +321,25 @@ impl InputTxn<'_> {
         Ok(())
     }
 
-    /// Record a path/primary resolution entry (§13's `path_index`).
-    pub fn set_path_entry(
+    /// Name `asset`, a runtime entry of `bundle`, the asset the bundle's
+    /// path resolves to (§9). Call after [`InputTxn::upsert_bundle`], which
+    /// clears it, and the asset's own row.
+    pub fn set_primary_asset(
         &mut self,
-        path: &str,
-        root: RootId,
+        bundle: BundleUuid,
         asset: AssetUuid,
     ) -> Result<(), StoreError> {
+        let set = self
+            .txn
+            .prepare_cached(
+                "UPDATE bundles SET primary_asset = ?2 WHERE bundle_uuid = ?1
+                   AND (SELECT authoring_only FROM assets
+                        WHERE asset_uuid = ?2 AND bundle_uuid = ?1) = 0",
+            )?
+            .execute(rusqlite::params![bundle.0.as_slice(), asset.0.as_slice()])?;
+        if set == 1 {
+            return Ok(());
+        }
         let role: Option<i64> = self
             .txn
             .query_row(
@@ -343,16 +348,12 @@ impl InputTxn<'_> {
                 |row| row.get(0),
             )
             .optional()?;
-        if role == Some(1) {
-            return Err(StoreError::RoleIneligible { asset });
-        }
-        self.txn
-            .prepare_cached(
-                "INSERT INTO path_index(path, root_id, asset_uuid) VALUES (?1, ?2, ?3)
-             ON CONFLICT(path, root_id) DO UPDATE SET asset_uuid = excluded.asset_uuid",
-            )?
-            .execute(rusqlite::params![path, root.0, asset.0.as_slice()])?;
-        Ok(())
+        Err(match role {
+            Some(1) => StoreError::RoleIneligible { asset },
+            _ => StoreError::InvalidConfiguration {
+                error: format!("bundle {bundle} has no runtime entry {asset} to make primary"),
+            },
+        })
     }
 
     /// Publish the bundle-scoped poison row (§7, §13). Scope is decided
@@ -380,7 +381,7 @@ impl InputTxn<'_> {
                root_id = excluded.root_id, path = excluded.path,
                format_version = excluded.format_version,
                content_hash = excluded.content_hash, poison = excluded.poison,
-               import_watched = 0",
+               import_watched = 0, primary_asset = NULL",
             )?
             .execute(
                 rusqlite::params![
@@ -690,12 +691,12 @@ impl StoreReader {
             .map_err(StoreError::from)
     }
 
-    /// Complete path-index projection grouped by normalized logical path.
-    /// Multiple roots remain multiple candidates; no root is selected here.
+    /// Every bundle's primary asset by (logical path, root): several roots
+    /// at one path remain several candidates; no root is selected here.
     pub fn all_path_entries(&self) -> Result<Vec<(String, RootId, AssetUuid)>, StoreError> {
         let mut statement = self
             .conn
-            .prepare("SELECT path, root_id, asset_uuid FROM path_index ORDER BY path, root_id")?;
+            .prepare(PRIMARY_ASSETS)?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get(0)?,
@@ -707,13 +708,13 @@ impl StoreReader {
             .map_err(StoreError::from)
     }
 
-    /// Current logical candidates for one normalized path. Ordinary watcher
-    /// publications use this bounded lookup instead of enumerating the whole
-    /// path index.
+    /// Current logical candidates for one normalized path: the primaries of
+    /// its bundles in every root. Ordinary watcher publications use this
+    /// bounded lookup instead of enumerating every bundle.
     pub fn path_assets(&self, path: &str) -> Result<BTreeSet<AssetUuid>, StoreError> {
         let mut statement = self
             .conn
-            .prepare("SELECT asset_uuid FROM path_index WHERE path = ?1 ORDER BY asset_uuid")?;
+            .prepare_cached(PATH_PRIMARIES)?;
         let rows = statement.query_map([path], |row| row.get::<_, Vec<u8>>(0))?;
         rows.map(|row| row.map(|bytes| AssetUuid(blob16(bytes))))
             .collect::<Result<BTreeSet<_>, _>>()
@@ -880,7 +881,7 @@ impl StoreReader {
     ) -> Result<(), StoreError> {
         let mut statement = self
             .conn
-            .prepare_cached("SELECT path, root_id, asset_uuid FROM path_index ORDER BY path, root_id")?;
+            .prepare_cached(PRIMARY_ASSETS)?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             visit(row.get(0)?, RootId(row.get(1)?), AssetUuid(blob16(row.get(2)?)))?;
@@ -981,6 +982,12 @@ macro_rules! bundle_columns {
     };
 }
 const BUNDLE_COLUMNS: &str = bundle_columns!();
+/// Every bundle's primary asset by (path, root): a walk of `bundles_by_path`.
+const PRIMARY_ASSETS: &str = "SELECT path, root_id, primary_asset FROM bundles INDEXED BY bundles_by_path
+     WHERE primary_asset IS NOT NULL ORDER BY path, root_id";
+/// The primaries of the bundles at one path: a search of `bundles_by_path`.
+pub(crate) const PATH_PRIMARIES: &str =
+    "SELECT primary_asset FROM bundles WHERE path = ?1 AND primary_asset IS NOT NULL";
 /// The number of columns in [`BUNDLE_COLUMNS`]; a column selected after them
 /// has this index.
 const BUNDLE_COLUMN_COUNT: usize = 10;

@@ -2,7 +2,7 @@
 //! from, as current-state rows.
 //!
 //! The namespace itself is the ordinary `bundles` / `assets` / `asset_tags`
-//! / `schemas` / `path_index` / `derived_outputs` rows. This module adds the
+//! / `schemas` / `derived_outputs` rows. This module adds the
 //! served-only facts next to them: explicit resolutions, the change log that
 //! subscriptions and reconnect fences read, the RPC target generations, the
 //! published pipeline diagnostic, and the typed load
@@ -374,7 +374,7 @@ impl StoreReader {
     pub fn served_path_candidates(&self, path: &str) -> Result<BTreeSet<AssetUuid>, StoreError> {
         let mut statement = self
             .conn
-            .prepare_cached("SELECT asset_uuid FROM path_index WHERE path = ?1")?;
+            .prepare_cached(crate::bundles::PATH_PRIMARIES)?;
         let rows = statement.query_map([path], |row| row.get::<_, Vec<u8>>(0))?;
         rows.map(|row| row.map(|bytes| AssetUuid(blob16(bytes))))
             .collect::<Result<BTreeSet<_>, _>>()

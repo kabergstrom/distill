@@ -106,7 +106,7 @@ read transaction:
 | `current` | `store_meta.input_version`. `advance_empty_version` also becomes a real transaction. |
 | `views[*].assets` (Built/Drifted/Failed/Deleted{at}) | An `assets` row → `Drifted{Asset}`; a derived output → `Drifted{Asset(parent)}`; otherwise a row in new table `asset_resolutions(asset, kind, content_hash, error, deleted_at)`; no row → Missing. |
 | `views[*].authoring` | `bundles` / `assets` / `asset_tags` / `schemas`. New `assets` columns hold the encoded authored value (canonical JSON + blobs) and `terminal_type`, so a snapshot never reads a file. |
-| `views[*].paths` | `path_index`; several roots at one path is the ambiguity. |
+| `views[*].paths` | `bundles.primary_asset` by path (schema 49; was `path_index`); several roots at one path is the ambiguity. |
 | `views[*].derived_outputs` | `derived_outputs` (+ `terminal_type` column) |
 | `tag_poisons`, `version_poison`, `configuration`, `pipeline` | `assets.tag_poison`, the persisted version poison, `configuration_state`, `pipeline_state` (then §4's `errors`) |
 | `lineage_repair` | new persisted repair-state columns next to `configuration_state` |

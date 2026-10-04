@@ -183,8 +183,8 @@ fn put_asset(
 /// A project with every kind of row a trace reads: runtime and
 /// authoring-only entries of registered, chained, unregistered and
 /// off-target types; tags with and without values; tag-index poisons;
-/// a path in two roots (ambiguous), a path two roots give the same asset,
-/// a path to a missing asset; derived children; tools and a tombstone.
+/// a path in two roots (ambiguous), a bundle with no primary; derived
+/// children; tools and a tombstone.
 fn fixture() -> (Project, InputVersion) {
     let mut project = Project::new();
     let first_tools = project.input(|txn| {
@@ -254,13 +254,11 @@ fn fixture() -> (Project, InputVersion) {
         for poisoned in [asset(2), asset(4), asset(3), asset(8)] {
             txn.set_tag_index_pending(poisoned)?;
         }
-        txn.set_path_entry("textures/a.bundle", RootId(1), asset(1))?;
-        txn.set_path_entry("textures/a.bundle", RootId(2), asset(10))?;
-        txn.set_path_entry("textures/b.bundle", RootId(1), asset(4))?;
-        txn.set_path_entry("textures/b.bundle", RootId(2), asset(4))?;
-        txn.set_path_entry("models/m.bundle", RootId(1), asset(6))?;
-        txn.set_path_entry("textures/sub/c.bundle", RootId(1), asset(8))?;
-        txn.set_path_entry("ghost.bundle", RootId(1), GHOST)?;
+        txn.set_primary_asset(bundle(1), asset(1))?;
+        txn.set_primary_asset(bundle(6), asset(10))?;
+        txn.set_primary_asset(bundle(2), asset(4))?;
+        txn.set_primary_asset(bundle(3), asset(6))?;
+        txn.set_primary_asset(bundle(4), asset(8))?;
         txn.set_derived_output(AssetUuid::v5(asset(1), "meta"), asset(1), "meta", EXTRA_A)?;
         txn.set_derived_output(AssetUuid::v5(asset(6), "meta"), asset(6), "meta", EXTRA_A)?;
         Ok(())
@@ -268,12 +266,12 @@ fn fixture() -> (Project, InputVersion) {
     (project, first_tools)
 }
 
-/// The second snapshot: a moved path, a role change, a rehashed bundle, a
+/// The second snapshot: a changed primary, a role change, a rehashed bundle, a
 /// new and a cleared tag poison, a new asset, a retired child, a removed
 /// bundle, and a tool epoch that drops one tool and adds another.
 fn mutate(project: &mut Project) {
     project.input(|txn| {
-        txn.set_path_entry("models/m.bundle", RootId(1), asset(1))?;
+        txn.set_primary_asset(bundle(3), asset(7))?;
         put_asset(
             txn,
             asset(2),
@@ -660,13 +658,6 @@ fn store_source_answers_every_question_as_the_eager_capture_did() {
     )));
     assert!(observed(&|op| matches!(
         op,
-        TraceOp::Resolve {
-            observed: Observed::Ok(Some(GHOST)),
-            ..
-        }
-    )));
-    assert!(observed(&|op| matches!(
-        op,
         TraceOp::Query {
             observed: Observed::Err(StableFailureFingerprint::Poisoned { .. }),
             ..
@@ -910,7 +901,7 @@ fn revalidating_a_trace_reads_only_what_it_asks_about() {
                     &[("kind", Some(kind))],
                 )?;
             }
-            txn.set_path_entry(&path, RootId(1), uuid(b, 0))?;
+            txn.set_primary_asset(bundle_uuid(b), uuid(b, 0))?;
             txn.set_derived_output(
                 AssetUuid::v5(uuid(b, 0), "meta"),
                 uuid(b, 0),

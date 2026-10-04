@@ -84,7 +84,7 @@ fn seed(store: &mut Store) -> RootId {
             let root = txn.intern_root("main")?;
             txn.upsert_bundle(&bundle_meta(root, 1))?;
             txn.upsert_asset(&asset_record(10, 1, &["hero", "texture"]))?;
-            txn.set_path_entry("tex/1.bundle", root, AssetUuid([10u8; 16]))?;
+            txn.set_primary_asset(BundleUuid([1u8; 16]), AssetUuid([10u8; 16]))?;
             Ok(root)
         })
         .unwrap();
@@ -291,7 +291,7 @@ fn tag_index_refinement_is_value_aware_and_pending_state_never_underapproximates
 #[test]
 fn authoring_only_entries_are_visible_to_tooling_but_ineligible_at_runtime() {
     let (_d, mut store) = store();
-    let root = seed(&mut store);
+    seed(&mut store);
     let mut control = asset_record(11, 1, &["control"]);
     control.authoring_only = true;
     store
@@ -307,13 +307,16 @@ fn authoring_only_entries_are_visible_to_tooling_but_ineligible_at_runtime() {
     );
 
     let err = store
-        .input_transaction(|txn| txn.set_path_entry("tex/control.bundle", root, control.asset))
+        .input_transaction(|txn| txn.set_primary_asset(BundleUuid([1u8; 16]), control.asset))
         .unwrap_err();
     assert!(matches!(
         err,
         StoreError::RoleIneligible { asset } if asset == control.asset
     ));
-    assert!(store.path_assets("tex/control.bundle").unwrap().is_empty());
+    assert_eq!(
+        store.path_assets("tex/1.bundle").unwrap(),
+        BTreeSet::from([AssetUuid([10u8; 16])])
+    );
 }
 
 #[test]

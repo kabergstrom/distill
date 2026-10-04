@@ -2495,11 +2495,7 @@ fn publish_scan(
                 })?;
             }
             if let Some(primary) = &bundle.primary {
-                transaction.set_path_entry(
-                    &source.normalized_path,
-                    root,
-                    bundle.assets[primary].uuid,
-                )?;
+                transaction.set_primary_asset(bundle.uuid, bundle.assets[primary].uuid)?;
             }
         }
         for poison in candidate.bundle_poisons.values() {
@@ -2838,11 +2834,7 @@ fn publish_claimed(
             })?;
         }
         if let Some(primary) = &bundle.primary {
-            transaction.set_path_entry(
-                &source.normalized_path,
-                root,
-                bundle.assets[primary].uuid,
-            )?;
+            transaction.set_primary_asset(bundle.uuid, bundle.assets[primary].uuid)?;
         }
     }
     for (child, current) in &plan.derived_outputs {
@@ -3279,8 +3271,8 @@ fn rpc_commit(
     Ok(commit)
 }
 
-/// The path mutations taking the stored path index to `paths`. The index
-/// arrives grouped by path and merges, group by group, with `paths` in
+/// The path mutations taking the stored primaries to `paths`. They
+/// arrive grouped by path and merges, group by group, with `paths` in
 /// path order.
 fn path_mutations(
     old: &StoreReader,
@@ -3309,7 +3301,7 @@ fn path_mutations(
     Ok(())
 }
 
-/// Merge one stored path-index group, or the end of the index (`None`),
+/// Merge one stored path group, or the end of the primaries (`None`),
 /// into `mutations`: each candidate path ordered before it is new, and the
 /// group's own path is kept, replaced or removed.
 fn merge_path_group(
@@ -3726,14 +3718,15 @@ mod publish_diff_tests {
                         }
                         txn.upsert_bundle(&BundleMeta {
                             bundle: bundle(index),
-                            root: roots[0],
+                            root: roots[random.next(2) as usize],
                             path: path(index),
                             format_version: 1,
                             content_hash: ContentHash([0; 32]),
                             origin: None,
                             import_watched: false,
                         })?;
-                        for entry in 0..random.next(3) {
+                        let entries = random.next(3);
+                        for entry in 0..entries {
                             txn.upsert_asset(&AssetRecord {
                                 asset: asset(index * 8 + entry),
                                 bundle: bundle(index),
@@ -3745,11 +3738,9 @@ mod publish_diff_tests {
                                 terminal_type: None,
                             })?;
                         }
-                    }
-                    for index in 0..10 {
-                        if random.next(2) == 0 {
-                            let root = roots[random.next(2) as usize];
-                            txn.set_path_entry(&path(index), root, asset(random.next(40)))?;
+                        if entries > 0 && random.next(2) == 0 {
+                            let primary = asset(index * 8 + random.next(entries));
+                            txn.set_primary_asset(bundle(index), primary)?;
                         }
                     }
                     Ok(())

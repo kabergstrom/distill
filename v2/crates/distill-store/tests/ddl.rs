@@ -75,7 +75,6 @@ fn every_section_13_table_exists() {
         "assets",
         "asset_tags",
         "tag_epochs",
-        "path_index",
         "results",
         "result_outputs",
         "derived_outputs",
@@ -178,7 +177,8 @@ fn bundles_carry_the_physical_key_poison_and_directory_origin() {
             "origin_rule",
             "origin_group_root",
             "origin_group_path",
-            "import_watched"
+            "import_watched",
+            "primary_asset"
         ]
     );
     assert_eq!(pk_columns(&conn, "bundles"), ["bundle_uuid"]);

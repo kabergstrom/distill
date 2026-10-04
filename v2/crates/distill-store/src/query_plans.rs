@@ -4,7 +4,7 @@
 //! touches a small, fixed number of pages where the whole-table read it
 //! replaced touches them all.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
@@ -43,7 +43,7 @@ fn bundle_path(index: u32) -> String {
 
 /// A namespace of `count` bundles across two roots: each with a served
 /// runtime entry (tagged; one in a thousand rarely), a scanned file row and
-/// its bytes, and a path index entry; one in a hundred referencing
+/// its bytes, and the runtime entry as its primary; one in a hundred referencing
 /// [`REFERENCED`], one in a thousand with an authoring-only `$record` entry
 /// and beside a `.png` file, and one in five hundred poisoned instead.
 fn populate(store: &mut Store, count: u32) {
@@ -143,7 +143,7 @@ fn populate(store: &mut Store, count: u32) {
                 if index % 100 == 1 {
                     txn.set_bundle_path_refs(bundle, [REFERENCED])?;
                 }
-                txn.set_path_entry(&path, root, runtime)?;
+                txn.set_primary_asset(bundle, runtime)?;
             }
             Ok(())
         })
@@ -248,13 +248,12 @@ fn explain(conn: &Connection, sql: &str) -> Vec<String> {
 }
 
 /// The tables a selective read must never scan.
-const NAMESPACE_TABLES: [&str; 7] = [
+const NAMESPACE_TABLES: [&str; 6] = [
     "assets",
     "bundles",
     "files",
     "asset_tags",
     "bundle_path_refs",
-    "path_index",
     "directories",
 ];
 
@@ -1152,6 +1151,57 @@ fn tag_state_statements_search_the_asset_key() {
     );
 }
 
+/// A bundle's primary asset is a column of its row: setting it searches
+/// the bundle and the asset by key, a refusal reads the asset's role, and a
+/// path's primaries are a search of `bundles_by_path` (the walk of every
+/// primary, for a full publication, is that index in order).
+#[test]
+fn primary_asset_statements_search_their_keys() {
+    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, mut store) = store_with(20);
+    let plans = configuration_plans(&mut store, |store| {
+        store
+            .input_transaction(|txn| txn.set_primary_asset(bundle_uuid(3), asset_uuid(3, 1)))
+            .unwrap();
+        store
+            .input_transaction(|txn| txn.set_primary_asset(bundle_uuid(3), asset_uuid(3, 2)))
+            .unwrap_err();
+        assert_eq!(
+            store.path_assets(&bundle_path(3)).unwrap(),
+            BTreeSet::from([asset_uuid(3, 1)])
+        );
+        assert_eq!(store.all_path_entries().unwrap().len(), 20);
+    });
+    let by_key = "SEARCH assets USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)";
+    let bundle_key = "SEARCH bundles USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)";
+    let plans = plans
+        .iter()
+        .filter(|(sql, _)| !sql.contains("store_meta"))
+        .map(|(sql, plan)| (sql.split_whitespace().take(4).collect::<Vec<_>>().join(" "), plan.clone()))
+        .collect::<Vec<_>>();
+    let set = (
+        "UPDATE bundles SET primary_asset".to_owned(),
+        vec![bundle_key.to_owned(), "SCALAR SUBQUERY 1".to_owned(), by_key.to_owned()],
+    );
+    assert_eq!(
+        plans,
+        [
+            set.clone(),
+            set,
+            ("SELECT authoring_only FROM assets".to_owned(), vec![by_key.to_owned()]),
+            (
+                "SELECT primary_asset FROM bundles".to_owned(),
+                vec!["SEARCH bundles USING INDEX bundles_by_path (path=?)".to_owned()],
+            ),
+            (
+                "SELECT path, root_id, primary_asset".to_owned(),
+                vec!["SCAN bundles USING INDEX bundles_by_path".to_owned()],
+            ),
+        ],
+        "{plans:#?}"
+    );
+}
+
 /// A type whose tag epoch changes has exactly its rows marked pending, by
 /// one search of `assets_by_type`; an unchanged epoch marks nothing; the
 /// epochs are one read of the per-type table.
@@ -2026,8 +2076,8 @@ fn cas_and_served_point_statements_search_their_keys() {
             &["SEARCH a USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)", "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)"],
         ),
         (
-            "SELECT asset_uuid FROM path_index WHERE path = ?",
-            &["SEARCH path_index USING INDEX sqlite_autoindex_path_index_1 (path=?)"],
+            "SELECT primary_asset FROM bundles WHERE path = ? AND primary_asset IS NOT NULL",
+            &["SEARCH bundles USING INDEX bundles_by_path (path=?)"],
         ),
         (
             "SELECT asset_uuid, expected_terminal FROM artifact_load_edges WHERE content_hash = ? ORDER BY asset_uuid",

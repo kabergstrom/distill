@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 48;
+pub const SCHEMA_VERSION: u32 = 49;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -193,6 +193,11 @@ CREATE TABLE bundles (
     -- record so readers need not parse the bundle. 0 for a poisoned
     -- bundle.
     import_watched      INTEGER NOT NULL DEFAULT 0,
+    -- The runtime entry the bundle's path resolves to (§9), one of its
+    -- own assets; NULL when it names none or the bundle is poisoned.
+    -- Every write of the row clears it; the publication that writes the
+    -- assets sets it.
+    primary_asset       BLOB,
     -- The final segment of `path`: what a glob whose last segment is
     -- literal (`**/name.bundle`) is looked up by. Derived on write. (No
     -- extension column: every bundle path ends in `.bundle`.)
@@ -274,13 +279,6 @@ CREATE TABLE tag_epochs (
     type_uuid BLOB NOT NULL PRIMARY KEY,
     epoch     BLOB NOT NULL
 ) WITHOUT ROWID;
-CREATE TABLE path_index (
-    path       TEXT NOT NULL,
-    root_id    INTEGER NOT NULL,
-    asset_uuid BLOB NOT NULL,
-    PRIMARY KEY (path, root_id)
-);
-CREATE INDEX path_index_by_asset ON path_index(asset_uuid);
 -- A committed build result (§13): one candidate of the bucket its
 -- static-input key names, the memo of one dependency trace. `failure` is
 -- the encoded `FailureCause` of a deterministic failure, NULL for a
