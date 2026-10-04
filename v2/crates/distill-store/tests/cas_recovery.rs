@@ -111,7 +111,7 @@ fn a_lost_tail_is_reported_and_changes_nothing() {
     config.segment_size = 256;
     let mut store = Store::open(config.clone()).unwrap();
     let edges = [(AssetUuid([9; 16]), TypeUuid([1; 16]))];
-    let installed = store.put_artifact(PARENT, &[5u8; 250], &edges).unwrap();
+    let installed = store.put_artifact(&[5u8; 250], &edges).unwrap();
     let first = commit(&mut store, 1, b"first artifact");
     let second = commit(&mut store, 2, b"second artifact");
     drop(store);
@@ -249,7 +249,7 @@ fn a_rolled_back_publication_stays_rolled_back_across_a_restart() {
     store
         .write_transaction(|store| {
             store.commit_build(first)?;
-            store.put_artifact(AssetUuid([1; 16]), &first_bytes, &edges)?;
+            store.put_artifact(&first_bytes, &edges)?;
             Ok(())
         })
         .unwrap();

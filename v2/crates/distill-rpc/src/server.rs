@@ -799,7 +799,6 @@ impl ServerHandle {
                     .to_owned(),
             });
         }
-        let asset = parsed.asset_uuid;
         let edges = payload
             .load_edges
             .iter()
@@ -820,7 +819,7 @@ impl ServerHandle {
             }
         }
         let bytes = distill_wire::artifact::assemble_artifact(&payload.structural, &blob_parts);
-        match store.put_artifact(asset, &bytes, &edges) {
+        match store.put_artifact(&bytes, &edges) {
             Ok(stored) if stored == hash => Ok(()),
             Ok(stored) => Err(AdminError::InvalidArtifact {
                 detail: format!("stored artifact hash {stored:?} differs from {hash:?}"),

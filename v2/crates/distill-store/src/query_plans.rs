@@ -1903,9 +1903,9 @@ fn cas_and_served_point_statements_search_their_keys() {
         .unwrap();
     store.read.conn.trace(Some(trace));
     let installed = (0..12u8)
-        .map(|index| store.put_artifact(asset, &[index; 1000], &edges).unwrap())
+        .map(|index| store.put_artifact(&[index; 1000], &edges).unwrap())
         .collect::<Vec<_>>();
-    store.put_artifact(asset, &[0; 1000], &edges).unwrap();
+    store.put_artifact(&[0; 1000], &edges).unwrap();
     let key = [3; 32];
     store
         .commit_build(BuildCommit {

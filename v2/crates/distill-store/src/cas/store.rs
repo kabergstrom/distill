@@ -508,7 +508,6 @@ impl Store {
     /// also holds the artifact's wire tree when the CAS has it.
     pub fn put_artifact(
         &mut self,
-        _asset: AssetUuid,
         bytes: &[u8],
         load_edges: &[(AssetUuid, distill_core::id::TypeUuid)],
     ) -> Result<ContentHash, StoreError> {

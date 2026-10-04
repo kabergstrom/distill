@@ -949,7 +949,6 @@ enum BuildWrite {
     WireTree(Vec<u8>),
     Commit(BuildCommit),
     Artifact {
-        asset: AssetUuid,
         bytes: Arc<[u8]>,
         load_edges: Vec<(AssetUuid, TypeUuid)>,
     },
@@ -1047,11 +1046,10 @@ fn flush_writes(context: &BuildContext) -> Result<(), BuildError> {
                     store.commit_build(commit)?;
                 }
                 BuildWrite::Artifact {
-                    asset,
                     bytes,
                     load_edges,
                 } => {
-                    store.put_artifact(asset, &bytes, &load_edges)?;
+                    store.put_artifact(&bytes, &load_edges)?;
                 }
             }
         }
@@ -2316,7 +2314,6 @@ struct EncodedNodeOutput {
 
 /// One output's artifact, until its node is published.
 struct PendingArtifact {
-    asset: AssetUuid,
     output_key: String,
     type_uuids: Vec<TypeUuid>,
     bytes: Arc<[u8]>,
@@ -3048,7 +3045,6 @@ fn prepare_outputs(
             },
         );
         pending.push(PendingArtifact {
-            asset: output.asset,
             type_uuids: output_type_set(&output),
             output_key: output.output_key,
             bytes: Arc::from(output.bytes),
@@ -3166,7 +3162,6 @@ fn assemble_pending(
         record_write(
             context,
             BuildWrite::Artifact {
-                asset: artifact.asset,
                 bytes: artifact.bytes,
                 load_edges: artifact
                     .load_edges

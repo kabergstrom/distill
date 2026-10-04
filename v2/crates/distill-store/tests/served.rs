@@ -110,9 +110,9 @@ fn an_artifacts_load_edges_are_its_latest_installs_and_go_with_it() {
     let (_dir, mut store) = store();
     let old = [(AssetUuid([9; 16]), TypeUuid([1; 16]))];
     let new = [(AssetUuid([9; 16]), TypeUuid([2; 16]))];
-    let hash = store.put_artifact(ASSET, b"artifact bytes", &old).unwrap();
+    let hash = store.put_artifact(b"artifact bytes", &old).unwrap();
     store
-        .put_artifact(ASSET, b"artifact bytes", &new)
+        .put_artifact(b"artifact bytes", &new)
         .expect("a rebuild with changed load edges publishes");
     assert_eq!(store.artifact_load_edges(hash).unwrap(), new);
     store.evict_installed(&hash.0).unwrap();

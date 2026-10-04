@@ -879,14 +879,14 @@ mod tests {
         store
             .write_txn(|store| {
                 store.conn.execute_batch("SAVEPOINT inner")?;
-                store.put_artifact(AssetUuid([1; 16]), b"rolled back", &[])?;
+                store.put_artifact(b"rolled back", &[])?;
                 store.conn.execute_batch("ROLLBACK TO inner; RELEASE inner")?;
                 Ok(())
             })
             .unwrap();
-        store.put_artifact(AssetUuid([2; 16]), b"kept", &[]).unwrap();
+        store.put_artifact(b"kept", &[]).unwrap();
         let mut other = store.open_writer().unwrap();
-        other.put_artifact(AssetUuid([3; 16]), b"another writer's", &[]).unwrap();
+        other.put_artifact(b"another writer's", &[]).unwrap();
         let kept = *blake3::hash(b"kept").as_bytes();
         let read = store.cas_read(&kept);
         assert!(
@@ -949,9 +949,9 @@ mod tests {
         let mut store = Store::open(config.clone()).unwrap();
         store
             .write_txn(|store| {
-                store.put_artifact(AssetUuid([1; 16]), b"before", &[])?;
+                store.put_artifact(b"before", &[])?;
                 let failed = store.write_txn(|store| {
-                    store.put_artifact(AssetUuid([2; 16]), b"rolled back", &[])?;
+                    store.put_artifact(b"rolled back", &[])?;
                     Err::<(), _>(rejected())
                 });
                 assert!(matches!(failed, Err(StoreError::Rejected { .. })));
@@ -959,7 +959,7 @@ mod tests {
                 let (open, all) = segments(store);
                 assert_eq!(open, [0]);
                 assert_eq!(all.len(), 1, "{all:?}");
-                store.put_artifact(AssetUuid([3; 16]), b"after", &[])?;
+                store.put_artifact(b"after", &[])?;
                 Ok(())
             })
             .unwrap();
@@ -993,12 +993,12 @@ mod tests {
         let mut config = StoreConfig::new(dir.path().join("state"));
         config.segment_size = 256;
         let mut store = Store::open(config.clone()).unwrap();
-        store.put_artifact(AssetUuid([1; 16]), &payload(1), &[]).unwrap();
+        store.put_artifact(&payload(1), &[]).unwrap();
         let (_, first) = segments(&store);
         store
             .write_txn(|store| {
                 let failed = store.write_txn(|store| {
-                    store.put_artifact(AssetUuid([2; 16]), &payload(2), &[])?;
+                    store.put_artifact(&payload(2), &[])?;
                     assert_eq!(segments(store).0, [1], "the savepoint rolled onto segment 1");
                     Err::<(), _>(rejected())
                 });
@@ -1009,7 +1009,7 @@ mod tests {
                 assert_eq!(crate::db::meta_get_u64(&store.conn, "next_segment_id")?, Some(1));
                 let stray = store.cas.dir.join(crate::cas::store::segment_file_name(1, crate::cas::store::SegmentKind::Regular));
                 assert!(std::fs::metadata(&stray).unwrap().len() > 0, "the rolled-back allocation left its file");
-                store.put_artifact(AssetUuid([3; 16]), &payload(3), &[])?;
+                store.put_artifact(&payload(3), &[])?;
                 Ok(())
             })
             .unwrap();
@@ -1028,7 +1028,7 @@ mod tests {
         store
             .write_txn(|store| {
                 let failed = store.write_txn(|store| {
-                    store.put_artifact(AssetUuid([4; 16]), &payload(4), &[])?;
+                    store.put_artifact(&payload(4), &[])?;
                     Err::<(), _>(rejected())
                 });
                 assert!(failed.is_err());
@@ -1046,7 +1046,7 @@ mod tests {
         assert_eq!(store.cas_read(blake3::hash(&payload(1)).as_bytes()).unwrap(), payload(1));
         assert_eq!(store.cas_read(blake3::hash(&payload(3)).as_bytes()).unwrap(), payload(3));
         assert!(not_found(&store, &payload(4)));
-        store.put_artifact(AssetUuid([5; 16]), &payload(5), &[]).unwrap();
+        store.put_artifact(&payload(5), &[]).unwrap();
         assert_eq!(store.cas_read(blake3::hash(&payload(5)).as_bytes()).unwrap(), payload(5));
         let (open, all) = segments(&store);
         assert_eq!(open, [2]);
@@ -1060,7 +1060,7 @@ mod tests {
         let store = Store::open(StoreConfig::new(dir.path().join("state"))).unwrap();
         let (opener, first) = crate::opener::StoreOpener::new(store);
         let mut writer = opener.open_writer().unwrap();
-        writer.put_artifact(AssetUuid([1; 16]), b"committed", &[]).unwrap();
+        writer.put_artifact(b"committed", &[]).unwrap();
         assert_eq!(open_segments(&*first), 1);
         writer.open_input().unwrap();
         drop(writer);
