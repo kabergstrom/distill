@@ -14,7 +14,8 @@
 //! rename across filesystems fails (`EXDEV`, or `ERROR_NOT_SAME_DEVICE`)
 //! before the target changes: such a write fails and changes nothing. A
 //! file in a staging directory is uncommitted by definition, so the process
-//! that owns the tree empties it when it opens the tree ([`open_staging`]);
+//! that owns the tree empties it when it opens the tree ([`open_staging`];
+//! on Windows a file another process holds open is left for a later open);
 //! nothing else ever deletes a temp. The scanner and the watcher ignore
 //! every path through a directory named [`STAGING_DIR`].
 //!
@@ -58,6 +59,10 @@ pub fn staging_dir(owner: &Path) -> PathBuf {
 /// earlier process left in it (writes that never committed). Call it before
 /// anything writes into `owner`. The directory itself is created by the
 /// first write.
+///
+/// On Windows a file another process holds open (a virus scanner, an
+/// indexer) cannot be deleted; it is logged and left for a later open. A
+/// new temp never takes its name (see [`create_temp`]).
 pub fn open_staging(owner: &Path) -> io::Result<()> {
     let staging = staging_dir(owner);
     let entries = match fs::read_dir(&staging) {
@@ -69,21 +74,78 @@ pub fn open_staging(owner: &Path) -> io::Result<()> {
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        if entry.file_type()?.is_dir() {
-            fs::remove_dir_all(&path)?;
+        let removal = if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(&path)
         } else {
-            match fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
+            fs::remove_file(&path)
+        };
+        match removal {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) if held_open(&error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "uncommitted temp is held open; left for a later open"
+                );
             }
+            Err(error) => return Err(error),
         }
-        removed = true;
     }
     if removed {
         sync_dir(&staging)?;
     }
     Ok(())
+}
+
+/// Whether `error` is Windows refusing to delete a file because another
+/// handle holds it: a sharing or lock violation, access denied (a handle
+/// without `FILE_SHARE_DELETE`, a delete already pending), or a directory
+/// left non-empty by such a member.
+fn held_open(error: &io::Error) -> bool {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    const ERROR_DIR_NOT_EMPTY: i32 = 145;
+    cfg!(windows)
+        && matches!(
+            error.raw_os_error(),
+            Some(
+                ERROR_ACCESS_DENIED
+                    | ERROR_SHARING_VIOLATION
+                    | ERROR_LOCK_VIOLATION
+                    | ERROR_DIR_NOT_EMPTY
+            )
+        )
+}
+
+/// Create a temp for `target` in `staging` with `create`, which fails with
+/// `AlreadyExists` when the name is taken. A temp is named by the process
+/// id and a sequence number; a name an earlier process of the same id left
+/// behind (one [`open_staging`] could not delete) is passed over for the
+/// next number.
+fn create_temp<T>(
+    staging: &Path,
+    target: &Path,
+    create: impl Fn(&Path) -> io::Result<T>,
+) -> Result<(PathBuf, T), AtomicWriteError> {
+    let name = target
+        .file_name()
+        .and_then(OsStr::to_str)
+        .map(|name| truncated(name, 64))
+        .unwrap_or("temp");
+    loop {
+        let temp = staging.join(format!(
+            "{}-{}-{name}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        match create(&temp) {
+            Ok(created) => return Ok((temp, created)),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(source) => return Err(AtomicWriteError::Io { path: temp, source }),
+        }
+    }
 }
 
 /// What the target must hold right before it is replaced or removed.
@@ -254,21 +316,9 @@ pub fn stage_with(
 ) -> Result<Staged, AtomicWriteError> {
     let staging = staging_dir(owner);
     create_dirs(&staging).map_err(io_at(&staging))?;
-    let name = target
-        .file_name()
-        .and_then(OsStr::to_str)
-        .map(|name| truncated(name, 64))
-        .unwrap_or("file");
-    let temp = staging.join(format!(
-        "{}-{}-{name}",
-        std::process::id(),
-        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)
-        .map_err(io_at(&temp))?;
+    let (temp, mut file) = create_temp(&staging, target, |temp| {
+        OpenOptions::new().write(true).create_new(true).open(temp)
+    })?;
     let staged = Staged {
         temp,
         target: target.to_path_buf(),
@@ -297,17 +347,7 @@ pub struct StagedDir {
 pub fn stage_dir(owner: &Path, target: &Path) -> Result<StagedDir, AtomicWriteError> {
     let staging = staging_dir(owner);
     create_dirs(&staging).map_err(io_at(&staging))?;
-    let name = target
-        .file_name()
-        .and_then(OsStr::to_str)
-        .map(|name| truncated(name, 64))
-        .unwrap_or("dir");
-    let temp = staging.join(format!(
-        "{}-{}-{name}",
-        std::process::id(),
-        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::create_dir(&temp).map_err(io_at(&temp))?;
+    let (temp, ()) = create_temp(&staging, target, |temp| fs::create_dir(temp))?;
     Ok(StagedDir {
         temp,
         target: target.to_path_buf(),
@@ -679,5 +719,56 @@ mod tests {
         assert!(in_staging(Path::new("/root/.distill-staging/1-2-a.bundle")));
         assert!(!in_staging(Path::new("/root/a.bundle")));
         assert!(is_staging_name(OsStr::new(STAGING_DIR)));
+    }
+
+    /// Temps an earlier process of this process's id left behind (which
+    /// `open_staging` could not delete) are passed over, not reused.
+    #[test]
+    fn a_leftover_temp_of_the_same_process_id_is_never_reused() {
+        let temp = tempfile::tempdir().unwrap();
+        let owner = temp.path();
+        let target = owner.join("file.bundle");
+        fs::create_dir(staging_dir(owner)).unwrap();
+        let next = TEMP_SEQUENCE.load(Ordering::Relaxed);
+        let leftovers = (next..next + 64)
+            .map(|sequence| format!("{}-{sequence}-file.bundle", std::process::id()))
+            .collect::<Vec<_>>();
+        for name in &leftovers {
+            fs::write(staging_dir(owner).join(name), b"leftover").unwrap();
+        }
+        write(owner, &target, b"new", Expected::Absent).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        let mut expected = leftovers;
+        expected.sort();
+        assert_eq!(names(&staging_dir(owner)), expected);
+        for name in &expected {
+            assert_eq!(fs::read(staging_dir(owner).join(name)).unwrap(), b"leftover");
+        }
+    }
+
+    /// A temp another process holds open without `FILE_SHARE_DELETE`
+    /// cannot be deleted: opening the tree leaves it, and writes go on.
+    #[cfg(windows)]
+    #[test]
+    fn opening_the_tree_leaves_a_temp_held_open() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let owner = temp.path();
+        let target = owner.join("file.bundle");
+        std::mem::forget(stage(owner, &target, b"uncommitted").unwrap());
+        let held_name = names(&staging_dir(owner)).remove(0);
+        let held = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(staging_dir(owner).join(&held_name))
+            .unwrap();
+        open_staging(owner).unwrap();
+        assert_eq!(names(&staging_dir(owner)), [held_name.clone()]);
+        write(owner, &target, b"new", Expected::Absent).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        drop(held);
+        open_staging(owner).unwrap();
+        assert!(names(&staging_dir(owner)).is_empty());
     }
 }
