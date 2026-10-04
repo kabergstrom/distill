@@ -2786,7 +2786,8 @@ mod published_compare_tests {
     #[test]
     fn an_unchanged_tree_matches_and_every_change_does_not() {
         type Change = fn(&Path);
-        let changes: [(&str, Change); 7] = [
+        #[allow(unused_mut)]
+        let mut changes: Vec<(&str, Change)> = vec![
             ("content", |root| {
                 fs::write(root.join("dir.txt"), b"changed!").unwrap()
             }),
@@ -2805,12 +2806,13 @@ mod published_compare_tests {
             ("directory", |root| {
                 fs::create_dir(root.join("empty")).unwrap()
             }),
-            ("symlink target", |root| {
-                fs::remove_file(root.join("alias.txt")).unwrap();
-                #[cfg(unix)]
-                std::os::unix::fs::symlink(root.join("a.bundle"), root.join("alias.txt")).unwrap();
-            }),
         ];
+        // The world has its symlinks only on Unix.
+        #[cfg(unix)]
+        changes.push(("symlink target", |root| {
+            fs::remove_file(root.join("alias.txt")).unwrap();
+            std::os::unix::fs::symlink(root.join("a.bundle"), root.join("alias.txt")).unwrap();
+        }));
         for (name, change) in changes {
             let mut world = new_world();
             let published = world.scanner.scan().unwrap();
