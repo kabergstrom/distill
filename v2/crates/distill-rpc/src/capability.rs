@@ -547,7 +547,9 @@ fn inspect_authoring(
     uuid: AssetUuid,
 ) -> Result<AuthoringInspectResult, RpcFailure> {
     let Some(meta) = snapshot.served_entry_meta(uuid).map_err(store_failure)? else {
-        if snapshot.asset_resolution(uuid).map_err(store_failure)?.is_some() {
+        // A served derived output is a runtime asset with no authored
+        // entry; any other UUID without a served entry is missing here.
+        if snapshot.derived_output(uuid).map_err(store_failure)?.is_some() {
             return Ok(AuthoringInspectResult::RoleIneligible {
                 observed: AuthoringEntryRole::Runtime,
             });

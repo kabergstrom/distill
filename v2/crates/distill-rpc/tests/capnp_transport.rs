@@ -8,7 +8,10 @@ use distill_rpc::capnp_transport::{
 };
 use distill_rpc::*;
 use distill_schema::ngp_schema::{node_hash, SchemaNode};
-use distill_test_project::{Asset, TestBuilds, TestProject, ROOT};
+use distill_json::AuthoredValue;
+use distill_test_project::{
+    Asset, TestBuilds, TestProject, PARENT_TYPE, REFLECTION, ROOT, TAGGED_TYPE,
+};
 use tokio::task::LocalSet;
 
 fn target() -> TargetDefinition {
@@ -604,23 +607,25 @@ fn write_authoring_entry_value(
 async fn authoring_snapshot_round_trips_over_real_tcp_with_exact_stamp_and_role_fence() {
     LocalSet::new()
         .run_until(async {
-            let mut project = project();
+            let mut project = TestProject::configured(false);
             let server = project.server();
             let entry = authoring_entry(3, AuthoringEntryRole::AuthoringOnly);
             // A runtime asset with no authoring entry, for the authoring
-            // role fence: two bundle files claim its UUID, so the daemon
-            // withholds the entry and serves only its (failed) resolution.
-            let runtime_entry = authoring_entry(5, AuthoringEntryRole::Runtime);
-            let runtime_uuid = runtime_entry.uuid;
-            write_entry(&mut project, &entry);
-            write_entry(&mut project, &runtime_entry);
-            project.write_bundle(
-                "collision.bundle",
-                BundleUuid([60; 16]),
-                None,
-                &[asset_of(&runtime_entry)],
+            // role fence: the declared output of a processed parent.
+            let parent = project.asset(
+                "parent",
+                AssetUuid([5; 16]),
+                PARENT_TYPE,
+                AuthoredValue::Object([("value".to_owned(), AuthoredValue::UInt(5))].into()),
             );
+            let runtime_uuid = AssetUuid::v5(parent.uuid, REFLECTION);
+            write_entry(&mut project, &entry);
+            project.write_bundle("parent.bundle", BundleUuid([60; 16]), Some("parent"), &[parent]);
             let first_stamp = project.publish();
+            let request = ConnectRequest::new(
+                project.target().name(),
+                project.target().definition_hash(),
+            );
 
             let listener = Rc::new(
                 StagedListener::bind(server.root(), "127.0.0.1:0")
@@ -632,7 +637,7 @@ async fn authoring_snapshot_round_trips_over_real_tcp_with_exact_stamp_and_role_
             let server_task =
                 tokio::task::spawn_local(async move { server_listener.serve_one().await });
             let client = CapnpClient::connect_local(address).await.unwrap();
-            let hub = match client.connect(&request()).await.unwrap() {
+            let hub = match client.connect(&request).await.unwrap() {
                 RemoteConnectOutcome::Connected { hub, .. } => hub,
                 other => panic!("expected connected, got {other:?}"),
             };
@@ -2037,15 +2042,26 @@ impl BuildBackend for PackBackend {
 async fn remote_snapshot_serves_the_pack_surface() {
     LocalSet::new()
         .run_until(async {
-            let mut project = project();
+            let mut project = TestProject::configured(false);
             let server = project.server();
             let backend = Arc::new(PackBackend::default());
             server.install_build_backend(backend.clone());
-            let entry = authoring_entry(5, AuthoringEntryRole::Runtime);
-            let definition = authoring_entry(6, AuthoringEntryRole::AuthoringOnly);
-            write_entry(&mut project, &entry);
-            write_entry(&mut project, &definition);
+            let group = |value: &str| {
+                AuthoredValue::Object(
+                    [("group".to_owned(), AuthoredValue::Str(value.to_owned()))].into(),
+                )
+            };
+            let entry = project.asset("entry-5", AssetUuid([5; 16]), TAGGED_TYPE, group("group-5"));
+            let definition = project
+                .asset("entry-6", AssetUuid([6; 16]), TAGGED_TYPE, group("group-6"))
+                .authoring_only();
+            project.write_bundle("bundle-5.bundle", BundleUuid([6; 16]), Some("entry-5"), &[entry.clone()]);
+            project.write_bundle("bundle-6.bundle", BundleUuid([7; 16]), None, &[definition.clone()]);
             project.publish();
+            let request = ConnectRequest::new(
+                project.target().name(),
+                project.target().definition_hash(),
+            );
             let listener = Rc::new(
                 StagedListener::bind(server.root(), "127.0.0.1:0")
                     .await
@@ -2055,23 +2071,11 @@ async fn remote_snapshot_serves_the_pack_surface() {
             let serving = Rc::clone(&listener);
             let server_task = tokio::task::spawn_local(async move { serving.serve().await });
             let client = CapnpClient::connect_local(address).await.unwrap();
-            let hub = RemoteHub::connected(client.connect(&request()).await.unwrap()).unwrap();
+            let hub = RemoteHub::connected(client.connect(&request).await.unwrap()).unwrap();
             let snapshot = hub.snapshot().await.unwrap().success().unwrap();
 
             // query and entry carry the runtime namespace.
             let selected = snapshot
-                .query(&AssetQuery {
-                    bundle_uuid: Some(entry.bundle),
-                    ..AssetQuery::default()
-                })
-                .await
-                .unwrap()
-                .success()
-                .unwrap();
-            assert_eq!(selected, vec![entry.uuid]);
-            // Without a project schema the daemon's tag index stays
-            // pending: a tag selector is a typed failure, not an empty set.
-            match snapshot
                 .query(&AssetQuery {
                     tag: Some(TagSelector {
                         tag: "group".into(),
@@ -2081,21 +2085,15 @@ async fn remote_snapshot_serves_the_pack_surface() {
                 })
                 .await
                 .unwrap()
-            {
-                RemoteCall::Error(error) => assert_eq!(
-                    error.message,
-                    format!(
-                        "{:?}",
-                        RpcFailure::TagIndexPoisoned {
-                            bundles: vec![entry.bundle]
-                        }
-                    )
-                ),
-                other => panic!("a pending tag index fails a tag query: {other:?}"),
-            }
+                .success()
+                .unwrap();
+            assert_eq!(selected, vec![entry.uuid]);
             let meta = snapshot.entry(entry.uuid).await.unwrap().success().unwrap();
-            assert_eq!(meta.normalized_path, entry.normalized_path);
-            assert_eq!(meta.tags, entry.tags);
+            assert_eq!(meta.normalized_path, "bundle-5.bundle");
+            assert_eq!(
+                meta.tags,
+                [("group".to_owned(), Some("group-5".to_owned()))].into()
+            );
             match snapshot.entry(definition.uuid).await.unwrap() {
                 RemoteCall::Error(error) => {
                     assert_eq!(error.code, distill_rpc::capnp_transport::ASSET_NOT_FOUND)
@@ -2131,7 +2129,13 @@ async fn remote_snapshot_serves_the_pack_surface() {
                 AuthoringInspectResult::Inspection(inspection) => {
                     assert_eq!(inspection.role, AuthoringEntryRole::AuthoringOnly);
                     assert_eq!(inspection.stamp, snapshot.basis().snapshot);
-                    assert_eq!(inspection.value, definition.value);
+                    assert_eq!(
+                        distill_json::parse(
+                            std::str::from_utf8(&inspection.value.canonical_value).unwrap()
+                        )
+                        .unwrap(),
+                        definition.value
+                    );
                 }
                 other => panic!("expected an inspection, got {other:?}"),
             }
@@ -2142,12 +2146,12 @@ async fn remote_snapshot_serves_the_pack_surface() {
             // A definition file rewritten since the snapshot is drift over
             // the wire too, at the version the daemon has published.
             let mut rewritten = definition.clone();
-            rewritten.value.blobs = vec![Arc::from([0xAA])];
-            write_entry(&mut project, &rewritten);
+            rewritten.value = group("group-6b");
+            project.write_bundle("bundle-6.bundle", BundleUuid([7; 16]), None, &[rewritten]);
             assert_eq!(
                 authoring.inspect(definition.uuid).await.unwrap().success(),
                 Some(AuthoringInspectResult::Drifted {
-                    input: DriftedInput::File(definition.normalized_path.clone()),
+                    input: DriftedInput::File("bundle-6.bundle".to_owned()),
                     current: snapshot.basis().snapshot,
                 })
             );

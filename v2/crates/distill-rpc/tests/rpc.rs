@@ -1049,18 +1049,47 @@ fn unbound_metadata_bootstrap_survives_a_configuration_error_and_has_no_runtime_
 
 #[test]
 fn authoring_snapshot_pins_role_inclusive_metadata_without_runtime_escape() {
-    let mut project = project();
+    let mut project = TestProject::configured(false);
     let server = project.server();
-    let runtime = authoring_entry(1, AuthoringEntryRole::Runtime);
-    let tooling = authoring_entry(2, AuthoringEntryRole::AuthoringOnly);
+    // Each asset is its own bundle file `bundle-{byte}.bundle`.
+    let write = |project: &mut TestProject, byte: u8, asset: Asset| {
+        let primary = (!asset.authoring_only).then(|| asset.local_id.clone());
+        project.write_bundle(
+            &format!("bundle-{byte}.bundle"),
+            BundleUuid([byte.wrapping_add(1); 16]),
+            primary.as_deref(),
+            &[asset],
+        );
+    };
+    let tagged = |project: &TestProject, byte: u8, group: &str| {
+        project.asset(
+            &format!("entry-{byte}"),
+            asset_id(byte),
+            TAGGED_TYPE,
+            object("group", AuthoredValue::Str(group.to_owned())),
+        )
+    };
     // The asset 99 the namespace deleted is missing, as if never published.
-    let removed = authoring_entry(99, AuthoringEntryRole::Runtime);
-    publish_entry(&mut project, &removed);
-    project.remove(&removed.normalized_path);
-    write_entry(&mut project, &runtime);
-    write_entry(&mut project, &tooling);
+    let removed = tagged(&project, 99, "group-99");
+    write(&mut project, 99, removed);
+    project.publish();
+    project.remove("bundle-99.bundle");
+    let runtime = tagged(&project, 1, "group-1");
+    write(&mut project, 1, runtime);
+    let tooling = tagged(&project, 2, "group-2").authoring_only();
+    write(&mut project, 2, tooling);
+    // The parent's declared output is a runtime asset with no authoring
+    // entry of its own.
+    let parent = project.asset(
+        "entry-3",
+        asset_id(3),
+        PARENT_TYPE,
+        object("value", AuthoredValue::UInt(3)),
+    );
+    write(&mut project, 3, parent);
+    let derived = AssetUuid::v5(asset_id(3), REFLECTION);
     let stamp = project.publish();
-    let hub = connect(&server, &[(1, false), (2, false)]);
+    let hub = connect_to(&server, project.target());
     let pinned = authoring_snapshot(&hub);
 
     assert_eq!(pinned.stamp(), stamp);
@@ -1071,54 +1100,62 @@ fn authoring_snapshot_pins_role_inclusive_metadata_without_runtime_escape() {
             authoring_only: Some(false),
             ..AssetQuery::default()
         }),
-        RpcResult::Success(vec![runtime.uuid])
+        RpcResult::Success(vec![asset_id(1), asset_id(3)])
     );
     assert_eq!(
         pinned.query(AssetQuery {
             authoring_only: Some(true),
             ..AssetQuery::default()
         }),
-        RpcResult::Success(vec![tooling.uuid])
+        RpcResult::Success(vec![asset_id(2)])
     );
-    // Without a project schema the daemon's tag index is pending: every
-    // other selector is served, a tag selector names the poisoned bundle.
-    let every_selector_but_tags = AssetQuery {
-        uuid: Some(tooling.uuid),
-        bundle_path: Some(tooling.normalized_path.clone()),
-        local_id: Some(tooling.local_id.clone()),
-        bundle_uuid: Some(tooling.bundle),
-        authored_type: Some(tooling.type_uuid),
-        terminal_type: Some(tooling.terminal_type),
-        tag: None,
-        path_prefix: Some("bundle-".to_owned()),
-        path_glob: Some("bundle-?.bundle".to_owned()),
-        authoring_only: Some(true),
-    };
+    // Every selector at once, the tag value among them.
     assert_eq!(
-        pinned.query(every_selector_but_tags.clone()),
-        RpcResult::Success(vec![tooling.uuid])
+        pinned.query(AssetQuery {
+            uuid: Some(asset_id(2)),
+            bundle_path: Some("bundle-2.bundle".to_owned()),
+            local_id: Some("entry-2".to_owned()),
+            bundle_uuid: Some(BundleUuid([3; 16])),
+            authored_type: Some(TAGGED_TYPE),
+            terminal_type: Some(TAGGED_TYPE),
+            tag: Some(TagSelector {
+                tag: "group".to_owned(),
+                value: Some("group-2".to_owned()),
+            }),
+            path_prefix: Some("bundle-".to_owned()),
+            path_glob: Some("bundle-?.bundle".to_owned()),
+            authoring_only: Some(true),
+        }),
+        RpcResult::Success(vec![asset_id(2)])
     );
     assert_eq!(
         pinned.query(AssetQuery {
             tag: Some(TagSelector {
                 tag: "group".to_owned(),
-                value: Some("group-2".to_owned()),
+                value: Some("group-1".to_owned()),
             }),
-            ..every_selector_but_tags
+            ..AssetQuery::default()
         }),
-        RpcResult::Failure(RpcFailure::TagIndexPoisoned {
-            bundles: vec![tooling.bundle],
-        })
+        RpcResult::Success(vec![asset_id(1)])
     );
-    match pinned.inspect(tooling.uuid) {
+    match pinned.inspect(asset_id(2)) {
         RpcResult::Success(AuthoringInspectResult::Inspection(inspection)) => {
             assert_eq!(inspection.stamp, stamp);
-            assert_eq!(inspection.uuid, tooling.uuid);
+            assert_eq!(inspection.uuid, asset_id(2));
             assert_eq!(inspection.role, AuthoringEntryRole::AuthoringOnly);
-            assert_eq!(inspection.value, tooling.value);
+            assert_eq!(
+                distill_json::parse(std::str::from_utf8(&inspection.value.canonical_value).unwrap()).unwrap(),
+                object("group", AuthoredValue::Str("group-2".to_owned()))
+            );
         }
         other => panic!("expected pinned inspection, got {other:?}"),
     }
+    assert_eq!(
+        pinned.inspect(derived),
+        RpcResult::Success(AuthoringInspectResult::RoleIneligible {
+            observed: AuthoringEntryRole::Runtime,
+        })
+    );
     assert_eq!(
         pinned.inspect(asset_id(99)),
         RpcResult::Success(AuthoringInspectResult::Missing)
@@ -1130,7 +1167,7 @@ fn authoring_snapshot_pins_role_inclusive_metadata_without_runtime_escape() {
 
     let runtime_snapshot = snapshot(&hub);
     assert!(matches!(
-        runtime_snapshot.resolve(tooling.uuid),
+        runtime_snapshot.resolve(asset_id(2)),
         RpcResult::Success(TerminalEvent {
             value: ResolveResult::RoleIneligible {
                 observed: AuthoringEntryRole::AuthoringOnly
