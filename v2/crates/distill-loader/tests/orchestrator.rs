@@ -505,6 +505,45 @@ fn begin_deletion(loader: &mut Loader<MockIo>, storage: &mut Storage, root: Asse
     loader.process(storage).unwrap();
 }
 
+/// A deleted asset that comes back is published as `Changed`: the loader
+/// takes it as a valid transition (no diagnostic) and re-resolves it.
+#[test]
+fn a_returning_asset_is_a_valid_transition_and_reloads() {
+    let token = ModuleEpochToken::new(1);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 1, &token);
+    let asset_uuid = uuid(1);
+    let handle = loader.add_ref::<A>(asset_uuid).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+    let (hash, fetched_artifact) = artifact::<A>(asset_uuid, &[]);
+    resolve(&mut loader, asset_uuid, hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, hash, fetched_artifact.clone());
+    loader.process(&mut storage).unwrap();
+    begin_deletion(&mut loader, &mut storage, asset_uuid);
+    assert_eq!(loader.status(&handle), LoadStatus::Dead);
+    let (deleted_req, _) = loader.io().resolve_for(asset_uuid);
+
+    loader.io_mut().push(IoEvent::Delta {
+        stamp: stamp(2),
+        assets: vec![(asset_uuid, distill_loader::AssetDeltaState::Changed)],
+        paths: Vec::new(),
+    });
+    loader.process(&mut storage).unwrap();
+    assert!(!loader.take_diagnostics().iter().any(|diagnostic| matches!(
+        diagnostic,
+        LoaderDiagnostic::ManifestTransition { .. }
+    )));
+    let (req, _) = loader.io().resolve_for(asset_uuid);
+    assert_ne!(req, deleted_req, "the returning asset is resolved again");
+    resolve(&mut loader, asset_uuid, hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, hash, fetched_artifact);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.status(&handle), LoadStatus::Loaded);
+}
+
 #[test]
 fn one_basis_resolve_fetch_and_fixup_commit_at_process_boundary() {
     let token = ModuleEpochToken::new(1);

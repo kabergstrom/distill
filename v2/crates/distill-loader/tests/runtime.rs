@@ -1,5 +1,4 @@
 use distill_core::id::{AssetUuid, ContentHash};
-use distill_loader::runtime::ManifestTransitionError;
 use distill_loader::{
     AdoptionId, AssetDeltaState, CompletionDisposition, ConnectionEpoch, HandleId, IoBasis,
     ManifestEntry, ManifestHash, ManifestState, OutstandingPurpose, RequestOwner, RequestTracker,
@@ -117,10 +116,9 @@ fn typed_deletion_and_restoration_preserve_client_relative_semantics() {
     };
     live.apply_delta(AssetDeltaState::Deleted).unwrap();
     assert_eq!(live.state, ManifestState::Dead);
-    assert_eq!(
-        live.apply_delta(AssetDeltaState::Changed),
-        Err(ManifestTransitionError::ChangedDeadWithoutRestoration)
-    );
+    let mut returning = live.clone();
+    returning.apply_delta(AssetDeltaState::Changed).unwrap();
+    assert_eq!(returning.state, ManifestState::Missing);
     live.apply_delta(AssetDeltaState::Restored).unwrap();
     assert_eq!(live.state, ManifestState::Missing);
 

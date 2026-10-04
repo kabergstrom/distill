@@ -39,7 +39,6 @@ pub enum ManifestState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManifestTransitionError {
-    ChangedDeadWithoutRestoration,
     RestoredLiveAsset,
 }
 
@@ -60,9 +59,9 @@ impl ManifestEntry {
                     };
                 }
                 ManifestState::Invalidated { .. } | ManifestState::Missing => {}
-                ManifestState::Dead => {
-                    return Err(ManifestTransitionError::ChangedDeadWithoutRestoration);
-                }
+                // The daemon publishes a returning asset as Changed: it has
+                // no last-good hash, and resolves afresh.
+                ManifestState::Dead => self.state = ManifestState::Missing,
             },
             AssetDeltaState::Deleted => {
                 if !matches!(self.state, ManifestState::Missing) {
