@@ -423,105 +423,19 @@ pub(crate) fn bundle_path_references(bundle: &Bundle) -> BTreeSet<String> {
     for entry in bundle.assets.values() {
         // A parsed bundle holds every entry's schema snapshot.
         if let Some(schema) = bundle.schemas.get(&entry.schema_hash) {
-            collect_references(&schema.root, &entry.data, &mut Vec::new(), &mut paths);
+            // The walk takes the value mutably for the rewrite; this visit
+            // changes nothing, so it walks a copy.
+            let mut data = entry.data.clone();
+            visit_references(&schema.root, &mut data, &mut Vec::new(), &mut |reference| {
+                if let Some(path) = reference_path(reference) {
+                    paths.insert(path.clone());
+                }
+                false
+            })
+            .expect("a visit that changes nothing cannot fail");
         }
     }
     paths
-}
-
-/// [`rewrite_value`]'s traversal, collecting each reference it would test.
-/// `frames` are the struct/enum frames open on the path, which a
-/// back-reference re-enters (`distill_core::frames`).
-fn collect_references<'s>(
-    schema: &'s SchemaNode,
-    value: &AuthoredValue,
-    frames: &mut Vec<&'s SchemaNode>,
-    paths: &mut BTreeSet<String>,
-) {
-    match schema {
-        SchemaNode::AssetRef(_) | SchemaNode::WeakRef(_) => match value {
-            AuthoredValue::Str(path) => {
-                paths.insert(path.clone());
-            }
-            AuthoredValue::Object(fields) => {
-                if let Some(AuthoredValue::Str(path)) = fields.get("path") {
-                    paths.insert(path.clone());
-                }
-            }
-            _ => {}
-        },
-        SchemaNode::Struct { fields, .. } => {
-            frames.push(schema);
-            collect_field_references(fields, value, frames, paths);
-            frames.pop();
-        }
-        SchemaNode::Enum { variants, .. } => {
-            let AuthoredValue::Object(values) = value else {
-                return;
-            };
-            let Some((name, payload)) = values.iter().next() else {
-                return;
-            };
-            if let Some((_, _, variant)) =
-                variants.iter().find(|(candidate, _, _)| candidate == name)
-            {
-                // A variant payload opens no frame of its own (§5).
-                frames.push(schema);
-                match variant {
-                    SchemaNode::Struct { fields, .. } => {
-                        collect_field_references(fields, payload, frames, paths)
-                    }
-                    variant => collect_references(variant, payload, frames, paths),
-                }
-                frames.pop();
-            }
-        }
-        SchemaNode::Vec(inner) | SchemaNode::Set(inner) | SchemaNode::Array { elem: inner, .. } => {
-            if let AuthoredValue::Array(values) = value {
-                for value in values {
-                    collect_references(inner, value, frames, paths);
-                }
-            }
-        }
-        SchemaNode::Option(inner) => {
-            if !matches!(value, AuthoredValue::Null) {
-                collect_references(inner, value, frames, paths);
-            }
-        }
-        SchemaNode::Map { key, value: item } => {
-            if let AuthoredValue::Object(values) = value {
-                if matches!(key.as_ref(), SchemaNode::String) {
-                    for value in values.values() {
-                        collect_references(item, value, frames, paths);
-                    }
-                }
-            }
-        }
-        SchemaNode::BackRef(distance) => {
-            if let Some((target, reentry)) = reenter(frames, *distance) {
-                collect_references(target, value, frames, paths);
-                reentry.restore(frames);
-            }
-        }
-        SchemaNode::Primitive(_) | SchemaNode::String | SchemaNode::Blob | SchemaNode::Unit => {}
-    }
-}
-
-/// A struct body's references, in whatever frame the caller opened.
-fn collect_field_references<'s>(
-    fields: &'s [(String, u32, SchemaNode)],
-    value: &AuthoredValue,
-    frames: &mut Vec<&'s SchemaNode>,
-    paths: &mut BTreeSet<String>,
-) {
-    let AuthoredValue::Object(values) = value else {
-        return;
-    };
-    for (name, _, field) in fields {
-        if let Some(value) = values.get(name) {
-            collect_references(field, value, frames, paths);
-        }
-    }
 }
 
 fn rewrite_bundle_path_references(
@@ -535,124 +449,132 @@ fn rewrite_bundle_path_references(
         let schema = schemas
             .get(&entry.schema_hash)
             .ok_or_else(|| invalid("bundle entry schema snapshot is missing"))?;
-        changed |= rewrite_value(&schema.root, &mut entry.data, &mut Vec::new(), from, to);
+        changed |= visit_references(
+            &schema.root,
+            &mut entry.data,
+            &mut Vec::new(),
+            &mut |reference| match reference_path(reference) {
+                Some(path) if path == from => {
+                    *path = to.to_owned();
+                    true
+                }
+                _ => false,
+            },
+        )?;
     }
     Ok(changed)
 }
 
-fn rewrite_value<'s>(
+/// The path a reference query names: the bare string or the object's
+/// `path` (§4). A local-id-only query names none.
+fn reference_path(reference: &mut AuthoredValue) -> Option<&mut String> {
+    match reference {
+        AuthoredValue::Str(path) => Some(path),
+        AuthoredValue::Object(fields) => match fields.get_mut("path") {
+            Some(AuthoredValue::Str(path)) => Some(path),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+/// The one reference walk of a rename: every asset/weak reference query in
+/// `value`, under options, the active variant, sequences, sets, and the
+/// values of string-keyed maps. `visit` returns whether it changed the
+/// query. `frames` are the struct/enum frames open on the path, which a
+/// back-reference re-enters (`distill_core::frames`).
+/// re-enters (`distill_core::frames`).
+fn visit_references<'s>(
     schema: &'s SchemaNode,
     value: &mut AuthoredValue,
     frames: &mut Vec<&'s SchemaNode>,
-    from: &str,
-    to: &str,
-) -> bool {
+    visit: &mut dyn FnMut(&mut AuthoredValue) -> bool,
+) -> Result<bool, RpcFailure> {
     match schema {
-        SchemaNode::AssetRef(_) | SchemaNode::WeakRef(_) => rewrite_reference(value, from, to),
+        SchemaNode::AssetRef(_) | SchemaNode::WeakRef(_) => Ok(visit(value)),
         SchemaNode::Struct { fields, .. } => {
             frames.push(schema);
-            let changed = rewrite_fields(fields, value, frames, from, to);
+            let changed = visit_fields(fields, value, frames, visit);
             frames.pop();
             changed
         }
         SchemaNode::Enum { variants, .. } => {
             let AuthoredValue::Object(values) = value else {
-                return false;
+                return Ok(false);
             };
             let Some((name, payload)) = values.iter_mut().next() else {
-                return false;
+                return Ok(false);
             };
             let Some((_, _, variant)) = variants.iter().find(|(candidate, _, _)| candidate == name)
             else {
-                return false;
+                return Ok(false);
             };
             // A variant payload opens no frame of its own (§5).
             frames.push(schema);
             let changed = match variant {
-                SchemaNode::Struct { fields, .. } => {
-                    rewrite_fields(fields, payload, frames, from, to)
-                }
-                variant => rewrite_value(variant, payload, frames, from, to),
+                SchemaNode::Struct { fields, .. } => visit_fields(fields, payload, frames, visit),
+                variant => visit_references(variant, payload, frames, visit),
             };
             frames.pop();
             changed
         }
         SchemaNode::Vec(inner) | SchemaNode::Set(inner) | SchemaNode::Array { elem: inner, .. } => {
             let AuthoredValue::Array(values) = value else {
-                return false;
+                return Ok(false);
             };
             let mut changed = false;
             for value in values {
-                changed |= rewrite_value(inner, value, frames, from, to);
+                changed |= visit_references(inner, value, frames, visit)?;
             }
-            changed
+            Ok(changed)
         }
         SchemaNode::Option(inner) => {
-            !matches!(value, AuthoredValue::Null) && rewrite_value(inner, value, frames, from, to)
-        }
-        SchemaNode::Map { key, value: item } => {
-            let AuthoredValue::Object(values) = value else {
-                return false;
-            };
-            let mut changed = false;
-            if matches!(key.as_ref(), SchemaNode::String) {
-                for value in values.values_mut() {
-                    changed |= rewrite_value(item, value, frames, from, to);
-                }
+            if matches!(value, AuthoredValue::Null) {
+                Ok(false)
+            } else {
+                visit_references(inner, value, frames, visit)
             }
-            changed
         }
+        SchemaNode::Map { key, value: item } => match value {
+            AuthoredValue::Object(values) if matches!(key.as_ref(), SchemaNode::String) => {
+                let mut changed = false;
+                for value in values.values_mut() {
+                    changed |= visit_references(item, value, frames, visit)?;
+                }
+                Ok(changed)
+            }
+            _ => Ok(false),
+        },
         SchemaNode::BackRef(distance) => {
             let Some((target, reentry)) = reenter(frames, *distance) else {
-                return false;
+                return Ok(false);
             };
-            let changed = rewrite_value(target, value, frames, from, to);
+            let changed = visit_references(target, value, frames, visit);
             reentry.restore(frames);
             changed
         }
         SchemaNode::Primitive(_) | SchemaNode::String | SchemaNode::Blob | SchemaNode::Unit => {
-            false
+            Ok(false)
         }
     }
 }
 
-/// A struct body's rewrites, in whatever frame the caller opened.
-fn rewrite_fields<'s>(
+/// A struct body's references, in whatever frame the caller opened.
+fn visit_fields<'s>(
     fields: &'s [(String, u32, SchemaNode)],
     value: &mut AuthoredValue,
     frames: &mut Vec<&'s SchemaNode>,
-    from: &str,
-    to: &str,
-) -> bool {
+    visit: &mut dyn FnMut(&mut AuthoredValue) -> bool,
+) -> Result<bool, RpcFailure> {
     let AuthoredValue::Object(values) = value else {
-        return false;
+        return Ok(false);
     };
     let mut changed = false;
     for (name, _, field) in fields {
         if let Some(value) = values.get_mut(name) {
-            changed |= rewrite_value(field, value, frames, from, to);
+            changed |= visit_references(field, value, frames, visit)?;
         }
     }
-    changed
-}
-
-fn rewrite_reference(value: &mut AuthoredValue, from: &str, to: &str) -> bool {
-    match value {
-        AuthoredValue::Str(path) if path == from => {
-            *path = to.to_owned();
-            true
-        }
-        AuthoredValue::Object(fields) => fields.get_mut("path").is_some_and(|path| {
-            if let AuthoredValue::Str(path) = path {
-                if path == from {
-                    *path = to.to_owned();
-                    return true;
-                }
-            }
-            false
-        }),
-        _ => false,
-    }
+    Ok(changed)
 }
 
 fn validate_rooted_destination(
