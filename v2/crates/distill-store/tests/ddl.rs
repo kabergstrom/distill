@@ -83,7 +83,6 @@ fn every_section_13_table_exists() {
         "scan_rejection_subjects",
         "codegen_outputs",
         "watched_import_failures",
-        "asset_resolutions",
         "change_log",
         "rpc_targets",
         "artifact_load_edges",

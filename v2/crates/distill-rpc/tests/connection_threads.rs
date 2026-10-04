@@ -1085,15 +1085,11 @@ fn store_failure(error: distill_store::StoreError) -> RpcFailure {
     }
 }
 
-/// The served projection of the version `next`: `ASSET` fails with a
-/// message naming it.
-fn ledger_commit(next: InputVersion) -> Commit {
+/// The served projection of a version: `ASSET` changed in it.
+fn ledger_commit() -> Commit {
     Commit {
-        assets: vec![AssetMutation::Set {
+        assets: vec![AssetMutation {
             uuid: ASSET,
-            resolution: StoredResolve::Failed {
-                error: format!("v{}", next.0),
-            },
             delta: AssetDeltaState::Changed,
         }],
         ..Commit::default()
@@ -1283,7 +1279,7 @@ fn a_coordinated_commits_backend_row_and_served_projection_land_together() {
                     admin
                         .coordinated_commit(base, |store| {
                             ledger_row(store, next).map_err(|error| error.to_string())?;
-                            Ok(ledger_commit(next))
+                            Ok(ledger_commit())
                         })
                         .unwrap();
                 }
@@ -1301,16 +1297,17 @@ fn a_coordinated_commits_backend_row_and_served_projection_land_together() {
             let version = snapshot.input_version().unwrap();
             let ledger = snapshot.root_id(&ledger_root(version)).unwrap();
             let next_ledger = snapshot.root_id(&ledger_root(InputVersion(version.0 + 1))).unwrap();
-            let served = snapshot.asset_resolution(ASSET).unwrap();
+            let served = snapshot
+                .change_log_after(0)
+                .unwrap()
+                .last()
+                .map(|entry| (entry.version, entry.change.clone()));
             assert_eq!(next_ledger, None, "no later backend row at {version:?}");
             if version != start {
                 assert!(ledger.is_some(), "backend row at {version:?}");
                 assert_eq!(
                     served,
-                    Some(distill_store::served::ResolutionRow::Failed(format!(
-                        "v{}",
-                        version.0
-                    ))),
+                    Some((version, distill_store::served::Change::Asset { asset: ASSET, state: 0 })),
                     "served projection at {version:?}"
                 );
             }

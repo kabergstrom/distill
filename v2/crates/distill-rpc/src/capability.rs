@@ -18,10 +18,9 @@ use unicode_normalization::UnicodeNormalization;
 
 use distill_store::bundles::{AssetAnswer, AssetFilter};
 use distill_store::files::GlobKeys;
-use distill_store::served::{ResolutionRow, ServedEntryMeta};
+use distill_store::served::{AssetResolution, ServedEntryMeta};
 use distill_store::{Store, StoreError, StoreReader};
 
-use crate::persist::decode_drifted_input;
 use crate::server::{
     entry_role, history_deltas, pipeline_failure,
     store_failure, ConnectionState,
@@ -1690,10 +1689,8 @@ pub enum ResolveStep {
 }
 
 enum VersionResolve {
-    Built(ContentHash),
     Drifted(DriftedInput),
     Failed(String),
-    Deleted(InputVersion),
 }
 
 impl Snapshot {
@@ -1880,16 +1877,15 @@ impl Snapshot {
         let target = self.connection.borrow().target.clone();
         let resolution = match &derived {
             Some(output) => Some(VersionResolve::Drifted(DriftedInput::Asset(output.parent))),
+            // A served entry is published; anything else resolves by its
+            // rows (a deleted asset is missing).
+            None if meta.is_some() => Some(VersionResolve::Drifted(DriftedInput::Asset(uuid))),
             None => match snapshot.asset_resolution(uuid)? {
-                None | Some(ResolutionRow::Missing) => None,
-                Some(ResolutionRow::Built(hash)) => Some(VersionResolve::Built(hash)),
-                Some(ResolutionRow::Drifted(bytes)) => Some(VersionResolve::Drifted(
-                    decode_drifted_input(&bytes).map_err(|error| StoreError::Rejected {
-                        detail: format!("corrupt drift input: {error}"),
-                    })?,
-                )),
-                Some(ResolutionRow::Failed(error)) => Some(VersionResolve::Failed(error)),
-                Some(ResolutionRow::Deleted(at)) => Some(VersionResolve::Deleted(at)),
+                None => None,
+                Some(AssetResolution::Published) => {
+                    Some(VersionResolve::Drifted(DriftedInput::Asset(uuid)))
+                }
+                Some(AssetResolution::Failed(error)) => Some(VersionResolve::Failed(error)),
             },
         };
         // A drifted asset is built on demand. The backend keys the build by
@@ -1940,25 +1936,11 @@ impl Snapshot {
             };
         }
         let value = match resolution {
-            Some(VersionResolve::Built(content_hash)) => {
-                if let Err(error) =
-                    load_artifact(&self.server.inner.reader, content_hash)
-                {
-                    return done(RpcResult::Failure(error));
-                }
-                ResolveResult::Built { content_hash }
-            }
             Some(VersionResolve::Drifted(input)) => match self.server.inner.current_stamp() {
                 Ok(current) => ResolveResult::Drifted { input, current },
                 Err(error) => return done(RpcResult::Failure(store_failure(error))),
             },
             Some(VersionResolve::Failed(error)) => ResolveResult::Failed { error },
-            Some(VersionResolve::Deleted(at)) => ResolveResult::Deleted {
-                at: SnapshotStamp {
-                    instance: self.basis.snapshot.instance,
-                    version: at,
-                },
-            },
             None => ResolveResult::Missing,
         };
         done(RpcResult::Success(TerminalEvent {

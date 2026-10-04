@@ -21,10 +21,10 @@ use distill_bundle::Bundle;
 use distill_core::bootstrap::is_bootstrap_control_type;
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, TypeUuid};
 use distill_rpc::{
-    AssetDeltaState, AssetMutation, AuthoringEntry, AuthoringMutation,
+    AssetDeltaState, AssetMutation, AuthoringEntry, AuthoringEntryRole, AuthoringMutation,
     Commit, ConfigurationError, ConfigurationStatus, CoordinatedCommitError,
-    DerivedOutputEntry, DerivedOutputMutation, DriftedInput, PathMutation, PipelineDiagnostic,
-    Server, ServerHandle, SnapshotStamp, StoredResolve, TargetDefinition, NamespaceError,
+    DerivedOutputEntry, DerivedOutputMutation, PathMutation, PipelineDiagnostic,
+    Server, ServerHandle, SnapshotStamp, TargetDefinition, NamespaceError,
     RpcFailure, NamespaceErrorV1,
 };
 use distill_schema::ProjectSchemaAuthority;
@@ -37,7 +37,7 @@ use distill_store::config::{PendingRestart, RestartOnlyChange};
 use distill_store::errors::ScanRejectionRecord;
 use distill_store::files::{FileObservation, PendingFileWork};
 use distill_store::pipeline::ValidatedPipelineEpoch;
-use distill_store::served::ResolutionRow;
+use distill_store::served::AssetResolution;
 use distill_store::state::{
     AssetClaimant, CleanupDisposition, DirectoryAliasSide, DscpV1,
     InputVersion, PipelineFailure, PipelineFailureCode, PipelineFailureOrigin,
@@ -1658,14 +1658,14 @@ impl Withheld {
         Some(poison)
     }
 
-    /// The withheld assets whose stored resolution is not yet their
-    /// error: each publishes `Failed` once.
-    fn newly_failed(&self, reader: &StoreReader) -> Result<BTreeMap<AssetUuid, String>, StoreError> {
-        let mut failed = BTreeMap::new();
+    /// The withheld assets that do not resolve to their error yet: each
+    /// publishes its change once.
+    fn newly_failed(&self, reader: &StoreReader) -> Result<BTreeSet<AssetUuid>, StoreError> {
+        let mut failed = BTreeSet::new();
         for (asset, message) in &self.assets {
             let current = reader.asset_resolution(*asset)?;
-            if !matches!(&current, Some(ResolutionRow::Failed(error)) if error == message) {
-                failed.insert(*asset, message.clone());
+            if !matches!(&current, Some(AssetResolution::Failed(error)) if error == message) {
+                failed.insert(*asset);
             }
         }
         Ok(failed)
@@ -2958,11 +2958,8 @@ fn prepare_incremental_publication(
         if let Some(poison) = plan.bundle_poisons.get(bundle_uuid) {
             for entry in &poison.entries {
                 current_assets.insert(entry.asset);
-                commit.assets.push(AssetMutation::Set {
+                commit.assets.push(AssetMutation {
                     uuid: entry.asset,
-                    resolution: StoredResolve::Failed {
-                        error: poison.message.clone(),
-                    },
                     delta: AssetDeltaState::Changed,
                 });
                 if old.assets.contains(&entry.asset) {
@@ -2978,25 +2975,25 @@ fn prepare_incremental_publication(
                 .expect("indexed current bundle parsed successfully");
             for (local_id, entry) in &bundle.assets {
                 current_assets.insert(entry.uuid);
-                commit.assets.push(AssetMutation::Set {
+                commit.assets.push(AssetMutation {
                     uuid: entry.uuid,
-                    resolution: StoredResolve::Drifted {
-                        input: DriftedInput::Asset(entry.uuid),
-                    },
                     delta: AssetDeltaState::Changed,
                 });
-                commit.authoring.push(AuthoringMutation::Set(rpc_entry(
-                    source.normalized_path.clone(),
-                    bundle,
-                    local_id,
-                    projection.interface(entry.type_uuid).terminal,
-                )?));
+                push_entry(
+                    &mut commit,
+                    store,
+                    rpc_entry(
+                        source.normalized_path.clone(),
+                        bundle,
+                        local_id,
+                        projection.interface(entry.type_uuid).terminal,
+                    )?,
+                )?;
             }
         }
         for asset in old.assets.difference(&current_assets) {
-            commit.assets.push(AssetMutation::Set {
+            commit.assets.push(AssetMutation {
                 uuid: *asset,
-                resolution: StoredResolve::Deleted,
                 delta: AssetDeltaState::Deleted,
             });
             commit
@@ -3005,10 +3002,9 @@ fn prepare_incremental_publication(
         }
     }
     append_path_mutations(&mut commit, path_projections, &old_paths);
-    for (asset, error) in plan.withheld.newly_failed(store)? {
-        commit.assets.push(AssetMutation::Set {
+    for asset in plan.withheld.newly_failed(store)? {
+        commit.assets.push(AssetMutation {
             uuid: asset,
-            resolution: StoredResolve::Failed { error },
             delta: AssetDeltaState::Changed,
         });
         if store.served_entry_meta(asset)?.is_some() {
@@ -3172,7 +3168,7 @@ fn rpc_commit(
     candidate: &ScanCandidate,
     published: &[Arc<ScannedBundle>],
     withheld: &Withheld,
-    newly_failed: &BTreeMap<AssetUuid, String>,
+    newly_failed: &BTreeSet<AssetUuid>,
     old: &StoreReader,
     projection: &PipelineProjection,
     changed_bundles: &BTreeSet<BundleUuid>,
@@ -3190,12 +3186,9 @@ fn rpc_commit(
         .keys()
         .copied()
         .collect::<BTreeSet<_>>();
-    for (asset, error) in newly_failed {
-        commit.assets.push(AssetMutation::Set {
+    for asset in newly_failed {
+        commit.assets.push(AssetMutation {
             uuid: *asset,
-            resolution: StoredResolve::Failed {
-                error: error.clone(),
-            },
             delta: AssetDeltaState::Changed,
         });
         if old.asset_exists(*asset)? {
@@ -3214,19 +3207,20 @@ fn rpc_commit(
             if !changed_bundles.contains(&bundle.uuid) {
                 continue;
             }
-            commit.assets.push(AssetMutation::Set {
+            commit.assets.push(AssetMutation {
                 uuid: entry.uuid,
-                resolution: StoredResolve::Drifted {
-                    input: DriftedInput::Asset(entry.uuid),
-                },
                 delta: AssetDeltaState::Changed,
             });
-            commit.authoring.push(AuthoringMutation::Set(rpc_entry(
-                source.normalized_path.clone(),
-                bundle,
-                local_id,
-                projection.interface(entry.type_uuid).terminal,
-            )?));
+            push_entry(
+                &mut commit,
+                old,
+                rpc_entry(
+                    source.normalized_path.clone(),
+                    bundle,
+                    local_id,
+                    projection.interface(entry.type_uuid).terminal,
+                )?,
+            )?;
         }
         if let Some(primary) = &bundle.primary {
             paths
@@ -3241,11 +3235,8 @@ fn rpc_commit(
             if !changed_bundles.contains(&poison.bundle) {
                 continue;
             }
-            commit.assets.push(AssetMutation::Set {
+            commit.assets.push(AssetMutation {
                 uuid: entry.asset,
-                resolution: StoredResolve::Failed {
-                    error: poison.message.clone(),
-                },
                 delta: AssetDeltaState::Changed,
             });
             if old.asset_exists(entry.asset)? {
@@ -3257,9 +3248,8 @@ fn rpc_commit(
     }
     old.for_each_asset_bundle(|asset, _| {
         if !current_assets.contains(&asset) {
-            commit.assets.push(AssetMutation::Set {
+            commit.assets.push(AssetMutation {
                 uuid: asset,
-                resolution: StoredResolve::Deleted,
                 delta: AssetDeltaState::Deleted,
             });
             commit
@@ -3333,6 +3323,17 @@ fn merge_path_group(
         }),
         None => mutations.push(PathMutation::Remove { path }),
     }
+}
+
+/// Push `entry`'s authoring mutation, and its bundle path when it is a
+/// runtime entry the namespace `old` holds does not resolve: a named
+/// reference to it may be waiting.
+fn push_entry(commit: &mut Commit, old: &StoreReader, entry: AuthoringEntry) -> Result<(), StoreError> {
+    if entry.role == AuthoringEntryRole::Runtime && old.asset_resolution(entry.uuid)?.is_none() {
+        commit.new_entry_paths.insert(entry.normalized_path.clone());
+    }
+    commit.authoring.push(AuthoringMutation::Set(entry));
+    Ok(())
 }
 
 fn rpc_entry(

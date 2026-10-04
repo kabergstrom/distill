@@ -18,7 +18,7 @@ use distill_schema::ngp_schema::{
 };
 use distill_store::config::RestartOnlyChange;
 use distill_store::state::{ConfigurationState, DscpV1, InputVersion, NamespaceErrorV1};
-use distill_store::served::ResolutionRow;
+use distill_store::served::AssetResolution;
 use distill_store::{Store, StoreConfig, StoreReader};
 
 fn ordinary_bundle() -> (Vec<u8>, BundleUuid, AssetUuid) {
@@ -203,7 +203,7 @@ fn assert_only_the_shared_asset_is_withheld(store: &StoreReader) {
     assert!(store.entry(AssetUuid([40; 16])).unwrap().is_none());
     assert_eq!(
         store.asset_resolution(AssetUuid([40; 16])).unwrap(),
-        Some(ResolutionRow::Failed(error.message))
+        Some(AssetResolution::Failed(error.message))
     );
 }
 

@@ -5591,9 +5591,10 @@ node's trace rather than its key, and a strong load dependency enters the
 trace as a `Read` of the content its dependency built to. A cached node
 answers a lookup only where its trace revalidates. The asset uuid stays in
 the key: artifacts embed their asset uuid (§12), so two assets with equal
-content are still two builds. `asset_resolutions` stays a projection of
-the input version (§13): it records *that* an asset is drifted, never a
-build's result, so a build's completion changes no input version.
+content are still two builds. An asset's resolution is read from the
+input version's own rows (§13): its `assets` row says *that* it is
+drifted, never a build's result, so a build's completion changes no
+input version.
 
 **Resolve.** A resolve of a drifted asset at snapshot `S` computes the
 node's key at `S` and looks it up: a cached result whose trace holds at

@@ -2177,6 +2177,8 @@ fn cas_and_served_point_statements_search_their_keys() {
     store.bundle(BundleUuid([42; 16])).unwrap();
     store.root_name(crate::files::RootId(1)).unwrap();
     store.asset_resolution(asset).unwrap();
+    // A missing asset reads its collisions too.
+    store.asset_resolution(asset_uuid(200, 1)).unwrap();
     store.served_derived_output(asset).unwrap();
     store.served_path_candidates(&bundle_path(42)).unwrap();
     store.served_named_candidates(&bundle_path(42), "main").unwrap();
@@ -2269,8 +2271,23 @@ fn cas_and_served_point_statements_search_their_keys() {
             &["SEARCH cas_segments USING INTEGER PRIMARY KEY (rowid=?)"],
         ),
         (
-            "SELECT kind, content_hash, detail, deleted_version FROM asset_resolutions WHERE asset_uuid = ?",
-            &["SEARCH asset_resolutions USING INDEX sqlite_autoindex_asset_resolutions_1 (asset_uuid=?)"],
+            "SELECT b.poison FROM assets a JOIN bundles b ON b.bundle_uuid = a.bundle_uuid WHERE a.asset_uuid = ?",
+            &[
+                "SEARCH a USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)",
+                "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)",
+            ],
+        ),
+        (
+            "SELECT message FROM errors WHERE scope_kind = ? AND scope_id = ? AND family = ?",
+            &["SEARCH errors USING INDEX errors_by_scope (scope_kind=? AND scope_id=?)"],
+        ),
+        (
+            "SELECT e.message FROM source_claims a CROSS JOIN source_claims b ON b.root_id = a.root_id AND b.path = a.path AND b.kind = ? CROSS JOIN errors e ON e.scope_kind = ? AND e.scope_id = b.subject AND e.family = ? WHERE a.kind = ? AND a.subject = ? LIMIT ?",
+            &[
+                "SEARCH a USING INDEX source_claims_by_subject (kind=? AND subject=?)",
+                "SEARCH b USING COVERING INDEX sqlite_autoindex_source_claims_1 (root_id=? AND path=? AND kind=?)",
+                "SEARCH e USING INDEX errors_by_scope (scope_kind=? AND scope_id=?)",
+            ],
         ),
         (
             "SELECT name, definition_hash, generation FROM rpc_targets ORDER BY name",

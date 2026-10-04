@@ -1007,8 +1007,7 @@ fn authoring_snapshot_pins_role_inclusive_metadata_without_runtime_escape() {
     let server = project.server();
     let runtime = authoring_entry(1, AuthoringEntryRole::Runtime);
     let tooling = authoring_entry(2, AuthoringEntryRole::AuthoringOnly);
-    // A runtime resolution with no authoring entry: the asset 99 the
-    // namespace deleted resolves Deleted.
+    // The asset 99 the namespace deleted is missing, as if never published.
     let removed = authoring_entry(99, AuthoringEntryRole::Runtime);
     publish_entry(&mut project, &removed);
     project.remove(&removed.normalized_path);
@@ -1076,9 +1075,7 @@ fn authoring_snapshot_pins_role_inclusive_metadata_without_runtime_escape() {
     }
     assert_eq!(
         pinned.inspect(asset_id(99)),
-        RpcResult::Success(AuthoringInspectResult::RoleIneligible {
-            observed: AuthoringEntryRole::Runtime,
-        })
+        RpcResult::Success(AuthoringInspectResult::Missing)
     );
     assert_eq!(
         pinned.inspect(asset_id(98)),
@@ -1358,7 +1355,7 @@ fn resolve_path_and_fetch_terminal_outcomes_all_carry_the_snapshot_basis() {
     );
     assert_eq!(
         snap.resolve(deleted).success().unwrap().value,
-        ResolveResult::Deleted { at: stamp }
+        ResolveResult::Missing
     );
 
     let path = snap.resolve_path("textures/a.bundle").success().unwrap();
@@ -1461,24 +1458,6 @@ fn snapshots_pin_old_metadata_and_refresh_repins_latest() {
         ResolveResult::Built {
             content_hash: second,
         }
-    );
-}
-
-#[test]
-fn deleted_result_preserves_the_deleting_stamp_across_later_commits() {
-    let mut project = project();
-    let server = project.server();
-    let hub = connect(&server, &[(1, false)]);
-    let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
-    publish_entry(&mut project, &entry);
-    project.remove(&entry.normalized_path);
-    let deleted_at = project.publish();
-    let later = publish_unrelated(&mut project);
-    let snap = snapshot(&hub);
-    assert_eq!(snap.version(), RpcResult::Success(later.version));
-    assert_eq!(
-        snap.resolve(entry.uuid).success().unwrap().value,
-        ResolveResult::Deleted { at: deleted_at }
     );
 }
 
@@ -2409,9 +2388,8 @@ fn commit_validation_is_atomic_for_duplicate_names_and_invalid_paths() {
     let project = project();
     let server = project.server();
     let before = server.current_stamp().unwrap();
-    let deleted = AssetMutation::Set {
+    let deleted = AssetMutation {
         uuid: asset_id(1),
-        resolution: StoredResolve::Deleted,
         delta: AssetDeltaState::Deleted,
     };
     assert!(matches!(

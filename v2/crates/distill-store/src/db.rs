@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 53;
+pub const SCHEMA_VERSION: u32 = 54;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -357,15 +357,6 @@ CREATE TABLE watched_import_failures (
 -- Served RPC state (LOCKLESS.md §2.2). Current-state only: a snapshot
 -- lease reads these inside its own read transaction.
 --
--- Explicit resolutions. kind: 0 missing, 1 built, 2 drifted, 3 failed,
--- 4 deleted. An asset with no row resolves Missing.
-CREATE TABLE asset_resolutions (
-    asset_uuid      BLOB NOT NULL PRIMARY KEY,
-    kind            INTEGER NOT NULL CHECK (kind BETWEEN 0 AND 4),
-    content_hash    BLOB,
-    detail          BLOB,
-    deleted_version INTEGER
-);
 -- Publication deltas and fence events, read by every RPC front end after
 -- its cursor. Rows are trimmed by version; `change_log_oldest` in
 -- store_meta is the oldest cursor a subscriber may resume from.

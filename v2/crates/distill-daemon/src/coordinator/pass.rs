@@ -1222,9 +1222,7 @@ fn absorb_into(commit: &mut Commit, later: Commit) {
         earlier.retain(|item| !replaced.contains(&key(item)));
         earlier.extend(later);
     }
-    keyed(&mut commit.assets, later.assets, |mutation| match mutation {
-        AssetMutation::Set { uuid, .. } | AssetMutation::Remove { uuid, .. } => *uuid,
-    });
+    keyed(&mut commit.assets, later.assets, |mutation| mutation.uuid);
     keyed(&mut commit.authoring, later.authoring, |mutation| match mutation {
         AuthoringMutation::Set(entry) => entry.uuid,
         AuthoringMutation::Remove { uuid } => *uuid,
@@ -1232,6 +1230,7 @@ fn absorb_into(commit: &mut Commit, later: Commit) {
     keyed(&mut commit.paths, later.paths, |mutation| match mutation {
         PathMutation::Set { path, .. } | PathMutation::Remove { path } => path.clone(),
     });
+    commit.new_entry_paths.extend(later.new_entry_paths);
     if later.derived_outputs.is_some() {
         commit.derived_outputs = later.derived_outputs;
         commit.derived_output_mutations.clear();

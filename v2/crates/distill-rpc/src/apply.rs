@@ -6,10 +6,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use distill_store::served::{Change, ResolutionRow, ServedWrite};
+use distill_store::served::{Change, ServedWrite};
 use distill_store::StoreError;
 
-use crate::persist::{delta_state_code, encode_drifted_input, reconnect_code};
+use crate::persist::{delta_state_code, reconnect_code};
 use crate::validate::validate_commit;
 use crate::*;
 
@@ -61,8 +61,8 @@ pub(crate) fn configuration_status(
 
 /// Apply `commit`'s served projection: the version the daemon publishes in
 /// `txn` (or published just before it) already holds the namespace the
-/// commit describes; this writes the resolutions, diagnostics, fences and
-/// change log that go with it.
+/// commit describes; this writes the fences and change log that go with
+/// it.
 pub fn apply_commit<W: ServedWrite>(txn: &mut W, commit: &Commit) -> Result<(), ApplyError> {
     validate_commit(commit)?;
     for error in commit.namespace_errors.iter().flatten() {
@@ -76,47 +76,11 @@ pub fn apply_commit<W: ServedWrite>(txn: &mut W, commit: &Commit) -> Result<(), 
     if commit.pipeline_epoch_changed {
         publish_pipeline_fence(txn)?;
     }
-    // A runtime entry the namespace has not announced yet can be the target
-    // of a named reference (path and local id) still waiting for it: its
-    // bundle's path changes too. Entries keep their identity per local id,
-    // so a changed bundle with the same names notifies only its assets.
-    let mut named_paths = BTreeSet::new();
-    for mutation in &commit.authoring {
-        if let AuthoringMutation::Set(entry) = mutation {
-            if entry.role == AuthoringEntryRole::Runtime
-                && !txn.txn_has_live_resolution(entry.uuid)?
-            {
-                named_paths.insert(entry.normalized_path.clone());
-            }
-        }
-    }
-
-    let mut asset_deltas = Vec::with_capacity(commit.assets.len());
-    for mutation in &commit.assets {
-        match mutation {
-            AssetMutation::Set {
-                uuid,
-                resolution,
-                delta,
-            } => {
-                let row = match resolution {
-                    StoredResolve::Built { content_hash } => ResolutionRow::Built(*content_hash),
-                    StoredResolve::Drifted { input } => {
-                        ResolutionRow::Drifted(encode_drifted_input(input))
-                    }
-                    StoredResolve::Failed { error } => ResolutionRow::Failed(error.clone()),
-                    StoredResolve::Deleted => ResolutionRow::Deleted(version),
-                };
-                txn.set_asset_resolution(*uuid, Some(&row))?;
-                asset_deltas.push((*uuid, *delta));
-            }
-            AssetMutation::Remove { uuid, delta } => {
-                txn.set_asset_resolution(*uuid, None)?;
-                asset_deltas.push((*uuid, *delta));
-            }
-        }
-    }
-
+    let mut asset_deltas = commit
+        .assets
+        .iter()
+        .map(|mutation| (mutation.uuid, mutation.delta))
+        .collect::<Vec<_>>();
     asset_deltas.sort_by_key(|(uuid, _)| *uuid);
     for (asset, state) in asset_deltas {
         txn.append_change(
@@ -133,7 +97,7 @@ pub fn apply_commit<W: ServedWrite>(txn: &mut W, commit: &Commit) -> Result<(), 
         .map(|mutation| match mutation {
             PathMutation::Set { path, .. } | PathMutation::Remove { path } => path.clone(),
         })
-        .chain(named_paths)
+        .chain(commit.new_entry_paths.iter().cloned())
         .collect::<BTreeSet<_>>();
     for path in paths {
         txn.append_change(version, &Change::Path { path })?;

@@ -51,16 +51,29 @@ pub struct ServedEntryMeta {
     pub tags: BTreeMap<String, Option<String>>,
 }
 
-/// An explicit `asset_resolutions` row.
+/// How a published asset resolves (see [`StoreReader::asset_resolution`]);
+/// an asset with none is missing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ResolutionRow {
-    Missing,
-    Built(ContentHash),
-    /// The RPC layer's encoded drift input.
-    Drifted(Vec<u8>),
+pub enum AssetResolution {
+    /// Its row is published: it builds on demand.
+    Published,
+    /// It fails with its bundle's poison or the error withholding it.
     Failed(String),
-    Deleted(InputVersion),
 }
+
+/// A published asset's row and its bundle's poison.
+pub(crate) const ASSET_POISON: &str = "SELECT b.poison FROM assets a
+     JOIN bundles b ON b.bundle_uuid = a.bundle_uuid WHERE a.asset_uuid = ?1";
+/// The collision withholding asset `?1`: its own UUID's (scope 3).
+pub(crate) const ASSET_COLLISION: &str =
+    "SELECT message FROM errors WHERE scope_kind = 3 AND scope_id = ?1 AND family = ?2";
+/// The collision withholding asset `?1`'s bundle: the bundle UUID (scope 2)
+/// a source authoring the asset claims. The joins are ordered (`CROSS
+/// JOIN`) so errors are searched by their full scope, not scanned per kind.
+pub(crate) const ASSET_BUNDLE_COLLISION: &str = "SELECT e.message FROM source_claims a
+     CROSS JOIN source_claims b ON b.root_id = a.root_id AND b.path = a.path AND b.kind = 0
+     CROSS JOIN errors e ON e.scope_kind = 2 AND e.scope_id = b.subject AND e.family = ?2
+     WHERE a.kind = 1 AND a.subject = ?1 LIMIT 1";
 
 /// One served derived-output row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,42 +325,31 @@ impl StoreReader {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// The explicit resolution row of `asset`, if any.
-    pub fn asset_resolution(&self, asset: AssetUuid) -> Result<Option<ResolutionRow>, StoreError> {
-        let mut statement = self.conn.prepare_cached(
-            "SELECT kind, content_hash, detail, deleted_version
-             FROM asset_resolutions WHERE asset_uuid = ?1",
-        )?;
-        let row = statement
-            .query_row([asset.0.as_slice()], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<Vec<u8>>>(1)?,
-                    row.get::<_, Option<Vec<u8>>>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                ))
-            })
-            .optional()?;
-        let Some((kind, hash, detail, deleted)) = row else {
-            return Ok(None);
-        };
-        let corrupt = || {
-            StoreError::Sqlite(rusqlite::Error::InvalidColumnType(
-                0,
-                "asset_resolutions".to_owned(),
-                rusqlite::types::Type::Blob,
-            ))
-        };
-        Ok(Some(match kind {
-            0 => ResolutionRow::Missing,
-            1 => ResolutionRow::Built(ContentHash(blob32(hash.ok_or_else(corrupt)?))),
-            2 => ResolutionRow::Drifted(detail.ok_or_else(corrupt)?),
-            3 => ResolutionRow::Failed(
-                String::from_utf8(detail.ok_or_else(corrupt)?).map_err(|_| corrupt())?,
-            ),
-            4 => ResolutionRow::Deleted(InputVersion(deleted.ok_or_else(corrupt)? as u64)),
-            _ => return Err(corrupt()),
-        }))
+    /// How `asset` resolves, by point reads: its published row (failed
+    /// with its bundle's poison), else the namespace error withholding it
+    /// (its own UUID's collision, else its bundle UUID's). `None` is
+    /// missing: never published, or deleted.
+    pub fn asset_resolution(&self, asset: AssetUuid) -> Result<Option<AssetResolution>, StoreError> {
+        let id = asset.0.as_slice();
+        if let Some(poison) = self
+            .conn
+            .prepare_cached(ASSET_POISON)?
+            .query_row([id], |row| row.get::<_, Option<String>>(0))
+            .optional()?
+        {
+            return Ok(Some(poison.map_or(AssetResolution::Published, AssetResolution::Failed)));
+        }
+        for sql in [ASSET_COLLISION, ASSET_BUNDLE_COLLISION] {
+            if let Some(message) = self
+                .conn
+                .prepare_cached(sql)?
+                .query_row(rusqlite::params![id, crate::errors::NAMESPACE], |row| row.get(0))
+                .optional()?
+            {
+                return Ok(Some(AssetResolution::Failed(message)));
+            }
+        }
+        Ok(None)
     }
 
     /// One served derived-output row.
@@ -655,48 +657,6 @@ pub trait ServedWrite {
         rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
     }
 
-    /// Whether `asset` has a resolution row other than `Deleted`: a runtime
-    /// entry the served namespace already announced.
-    fn txn_has_live_resolution(&self, asset: AssetUuid) -> Result<bool, StoreError> {
-        Ok(self.served_conn().query_row(
-            "SELECT EXISTS(SELECT 1 FROM asset_resolutions WHERE asset_uuid = ?1 AND kind != 4)",
-            [asset.0.as_slice()],
-            |row| row.get(0),
-        )?)
-    }
-
-    /// Replace (`Some`) or remove (`None`) an explicit resolution row.
-    fn set_asset_resolution(
-        &mut self,
-        asset: AssetUuid,
-        row: Option<&ResolutionRow>,
-    ) -> Result<(), StoreError> {
-        let conn = self.served_conn();
-        let Some(row) = row else {
-            conn
-                .prepare_cached("DELETE FROM asset_resolutions WHERE asset_uuid = ?1")?
-                .execute([asset.0.as_slice()])?;
-            return Ok(());
-        };
-        let (kind, hash, detail, deleted): (i64, Option<Vec<u8>>, Option<Vec<u8>>, Option<i64>) =
-            match row {
-                ResolutionRow::Missing => (0, None, None, None),
-                ResolutionRow::Built(hash) => (1, Some(hash.0.to_vec()), None, None),
-                ResolutionRow::Drifted(input) => (2, None, Some(input.clone()), None),
-                ResolutionRow::Failed(error) => (3, None, Some(error.clone().into_bytes()), None),
-                ResolutionRow::Deleted(version) => (4, None, None, Some(version.0 as i64)),
-            };
-        conn
-            .prepare_cached(
-                "INSERT INTO asset_resolutions(asset_uuid, kind, content_hash, detail, deleted_version)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(asset_uuid) DO UPDATE SET
-               kind = excluded.kind, content_hash = excluded.content_hash,
-               detail = excluded.detail, deleted_version = excluded.deleted_version",
-            )?
-            .execute(rusqlite::params![asset.0.as_slice(), kind, hash, detail, deleted])?;
-        Ok(())
-    }
 
     /// Append one change-log row at `version`.
     fn append_change(&mut self, version: InputVersion, change: &Change) -> Result<(), StoreError> {

@@ -95,9 +95,7 @@ pub(crate) fn validate_commit(commit: &Commit) -> Result<(), AdminError> {
     }
     let mut assets = BTreeSet::new();
     for mutation in &commit.assets {
-        let uuid = match mutation {
-            AssetMutation::Set { uuid, .. } | AssetMutation::Remove { uuid, .. } => *uuid,
-        };
+        let uuid = mutation.uuid;
         if !assets.insert(uuid) {
             return Err(AdminError::DuplicateAssetMutation { uuid });
         }

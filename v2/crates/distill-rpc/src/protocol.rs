@@ -396,14 +396,6 @@ pub enum ResolveResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StoredResolve {
-    Built { content_hash: ContentHash },
-    Drifted { input: DriftedInput },
-    Failed { error: String },
-    Deleted,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathResolveResult {
     Resolved(AssetUuid),
     Missing,
@@ -1405,17 +1397,12 @@ pub struct SubscriptionInstall {
     pub installed: InputVersion,
 }
 
+/// An asset whose resolution a publication changes, with the delta its
+/// subscribers see. How it resolves is read from the store's tables.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AssetMutation {
-    Set {
-        uuid: AssetUuid,
-        resolution: StoredResolve,
-        delta: AssetDeltaState,
-    },
-    Remove {
-        uuid: AssetUuid,
-        delta: AssetDeltaState,
-    },
+pub struct AssetMutation {
+    pub uuid: AssetUuid,
+    pub delta: AssetDeltaState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1484,6 +1471,10 @@ pub struct Commit {
     pub assets: Vec<AssetMutation>,
     pub authoring: Vec<AuthoringMutation>,
     pub paths: Vec<PathMutation>,
+    /// The bundle paths of runtime entries the namespace did not hold
+    /// before: a named reference (path and local id) may wait on one, so
+    /// the path changes too.
+    pub new_entry_paths: BTreeSet<String>,
     /// `Some` replaces the complete derived-output namespace for the new
     /// immutable version. `None` preserves it for metadata-only commits.
     pub derived_outputs: Option<BTreeMap<AssetUuid, DerivedOutputEntry>>,

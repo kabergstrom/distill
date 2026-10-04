@@ -3,9 +3,7 @@
 //! the authored-value codec roundtrips.
 
 use distill_core::id::{AssetUuid, TypeUuid};
-use distill_store::served::{
-    Change, ResolutionRow, ServedWrite,
-};
+use distill_store::served::{Change, ServedWrite};
 use distill_store::state::InputVersion;
 use distill_store::{Store, StoreConfig};
 
@@ -21,32 +19,26 @@ const ASSET: AssetUuid = AssetUuid([3; 16]);
 fn snapshot_keeps_its_version_while_the_writer_publishes() {
     let (_dir, mut store) = store();
     store
-        .input_transaction(|txn| txn.set_asset_resolution(ASSET, Some(&ResolutionRow::Missing)))
+        .input_transaction(|txn| {
+            let version = txn.version();
+            txn.append_change(version, &Change::Path { path: "a".into() })
+        })
         .unwrap();
     let snapshot = store.reader().unwrap().begin_snapshot().unwrap();
     assert_eq!(snapshot.stamp().version, InputVersion(1));
     store
         .input_transaction(|txn| {
             let version = txn.version();
-            txn.set_asset_resolution(ASSET, Some(&ResolutionRow::Failed("boom".into())))?;
             txn.append_change(version, &Change::Asset { asset: ASSET, state: 3 })
         })
         .unwrap();
-    assert_eq!(
-        snapshot.asset_resolution(ASSET).unwrap(),
-        Some(ResolutionRow::Missing)
-    );
     assert_eq!(snapshot.input_version().unwrap(), InputVersion(1));
-    assert!(snapshot.change_log_after(0).unwrap().is_empty());
+    assert_eq!(snapshot.change_log_after(0).unwrap().len(), 1);
     let reader = snapshot.into_reader().unwrap();
-    assert_eq!(
-        reader.asset_resolution(ASSET).unwrap(),
-        Some(ResolutionRow::Failed("boom".into()))
-    );
     let changes = reader.change_log_after(0).unwrap();
-    assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0].version, InputVersion(2));
-    assert_eq!(changes[0].change, Change::Asset { asset: ASSET, state: 3 });
+    assert_eq!(changes.len(), 2);
+    assert_eq!(changes[1].version, InputVersion(2));
+    assert_eq!(changes[1].change, Change::Asset { asset: ASSET, state: 3 });
 }
 
 #[test]
