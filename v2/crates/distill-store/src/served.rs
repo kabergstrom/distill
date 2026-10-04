@@ -71,6 +71,16 @@ pub(crate) const ASSET_BUNDLE_COLLISION: &str = "SELECT e.message FROM source_cl
      CROSS JOIN source_claims b ON b.root_id = a.root_id AND b.path = a.path AND b.kind = 0
      CROSS JOIN errors e ON e.scope_kind = 2 AND e.scope_id = b.subject AND e.family = ?2
      WHERE a.kind = 1 AND a.subject = ?1 LIMIT 1";
+/// Every asset a namespace error withholds (see
+/// [`ASSET_COLLISION`], [`ASSET_BUNDLE_COLLISION`]): each colliding asset
+/// UUID, and each asset a source claiming a colliding bundle UUID authors.
+/// Searches from the collision rows, so it costs the defects.
+pub(crate) const WITHHELD_ASSETS: &str = "SELECT scope_id FROM errors
+     WHERE scope_kind = 3 AND family = ?1
+     UNION SELECT a.subject FROM errors e
+     CROSS JOIN source_claims b ON b.kind = 0 AND b.subject = e.scope_id
+     CROSS JOIN source_claims a ON a.root_id = b.root_id AND a.path = b.path AND a.kind = 1
+     WHERE e.scope_kind = 2 AND e.family = ?1";
 
 /// One `change_log` payload. Reason and state codes belong to the RPC layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,6 +356,14 @@ impl StoreReader {
             }
         }
         Ok(None)
+    }
+
+    /// Every asset a namespace error withholds (see [`Self::withholding`]).
+    pub fn withheld_assets(&self) -> Result<BTreeSet<AssetUuid>, StoreError> {
+        let mut statement = self.conn.prepare_cached(WITHHELD_ASSETS)?;
+        let rows = statement.query_map([crate::errors::NAMESPACE], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.map(|row| Ok(AssetUuid(blob16(row?))))
+            .collect()
     }
 
     /// Every asset a logical path names; more than one is an ambiguity.

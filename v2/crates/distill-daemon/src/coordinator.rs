@@ -2185,11 +2185,12 @@ fn scan_file_changes(
     Ok((writes, removed))
 }
 
-/// Which bundles' stored asset rows differ from a candidate's. The rows
-/// arrive grouped by bundle; each group is compared and dropped, so only
-/// bundle identities are held.
+/// The stored asset rows, by bundle, and which bundles' differ from a
+/// candidate's: one ordered read of the rows serves every question a scan
+/// publication asks of them.
 struct AssetGroupChanges {
-    stored: BTreeSet<BundleUuid>,
+    /// Every stored asset row, by bundle.
+    stored: BTreeMap<BundleUuid, BTreeSet<AssetUuid>>,
     differ: BTreeSet<BundleUuid>,
 }
 
@@ -2199,7 +2200,7 @@ impl AssetGroupChanges {
         current: &BTreeMap<BundleUuid, BTreeSet<AssetUuid>>,
     ) -> Result<Self, StoreError> {
         let mut changes = Self {
-            stored: BTreeSet::new(),
+            stored: BTreeMap::new(),
             differ: BTreeSet::new(),
         };
         let mut close = |group: Option<(BundleUuid, BTreeSet<AssetUuid>)>| {
@@ -2207,7 +2208,7 @@ impl AssetGroupChanges {
                 if current.get(&bundle) != Some(&assets) {
                     changes.differ.insert(bundle);
                 }
-                changes.stored.insert(bundle);
+                changes.stored.insert(bundle, assets);
             }
         };
         let mut group = None::<(BundleUuid, BTreeSet<AssetUuid>)>;
@@ -2231,7 +2232,7 @@ impl AssetGroupChanges {
         bundle: &BundleUuid,
         current: &BTreeMap<BundleUuid, BTreeSet<AssetUuid>>,
     ) -> bool {
-        if self.stored.contains(bundle) {
+        if self.stored.contains_key(bundle) {
             self.differ.contains(bundle)
         } else {
             current.contains_key(bundle)
@@ -2350,6 +2351,15 @@ fn publish_scan(
         })
         .collect::<BTreeSet<_>>();
     let newly_failed = withheld.newly_failed(store)?;
+    // What the old namespace resolves: an asset with a row, or one an
+    // error withholds.
+    let stored_assets = asset_changes
+        .stored
+        .values()
+        .flatten()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let withheld_before = store.withheld_assets()?;
     let mut generation = store.configuration_generation()?;
     if advance_configuration {
         generation = generation
@@ -2366,6 +2376,8 @@ fn publish_scan(
         &published,
         &withheld,
         &newly_failed,
+        &stored_assets,
+        &withheld_before,
         store,
         projection,
         &rpc_publishable_bundles,
@@ -2426,8 +2438,8 @@ fn publish_scan(
         for bundle in old_bundle_summaries.keys() {
             if rewritten.contains(bundle) {
                 // A poisoned rewrite replaces every asset row itself.
-                if let Some(keep) = kept.get(bundle) {
-                    transaction.retain_bundle_assets(*bundle, keep)?;
+                if let (Some(keep), Some(held)) = (kept.get(bundle), asset_changes.stored.get(bundle)) {
+                    transaction.retain_bundle_assets(held, keep)?;
                 }
             } else if !current_bundle_summaries.contains_key(bundle)
                 || publishable_changed_bundles.contains(bundle)
@@ -2446,7 +2458,7 @@ fn publish_scan(
                 .entry(source.root_name.clone())
                 .or_insert(transaction.intern_root(&source.root_name)?);
             let summary = &current_bundle_summaries[&bundle.uuid];
-            transaction.upsert_bundle(&BundleMeta {
+            let meta = BundleMeta {
                 bundle: bundle.uuid,
                 root,
                 path: source.normalized_path.clone(),
@@ -2454,15 +2466,11 @@ fn publish_scan(
                 content_hash: ContentHash(source.file_hash.0),
                 origin: summary.origin.clone(),
                 import_watched: summary.import_watched,
-            })?;
-            transaction.set_bundle_path_refs(
-                bundle.uuid,
-                crate::operations::bundle_path_references(bundle)
-                    .iter()
-                    .map(String::as_str),
-            )?;
-            for (local_id, entry) in &bundle.assets {
-                transaction.upsert_pending_asset(&AssetRecord {
+            };
+            let assets = bundle
+                .assets
+                .iter()
+                .map(|(local_id, entry)| AssetRecord {
                     asset: entry.uuid,
                     bundle: bundle.uuid,
                     local_id: local_id.clone(),
@@ -2471,11 +2479,32 @@ fn publish_scan(
                     authoring_only: entry.authoring_only,
                     tags: BTreeMap::new(),
                     terminal_type: Some(projection.interface(entry.type_uuid).terminal),
-                })?;
+                })
+                .collect::<Vec<_>>();
+            let primary = bundle.primary.as_ref().map(|primary| bundle.assets[primary].uuid);
+            // A bundle with a row, or whose asset has one (a poisoned
+            // bundle's skeleton row, say), republishes over them.
+            if old_bundle_summaries.contains_key(&bundle.uuid)
+                || assets.iter().any(|asset| stored_assets.contains(&asset.asset))
+            {
+                transaction.upsert_bundle(&meta)?;
+                for asset in &assets {
+                    transaction.upsert_pending_asset(asset)?;
+                }
+                if let Some(primary) = primary {
+                    transaction.set_primary_asset(bundle.uuid, primary)?;
+                }
+            } else {
+                // Neither the bundle nor its assets have rows: nothing of
+                // them to clear.
+                transaction.insert_bundle(&meta, &assets, primary)?;
             }
-            if let Some(primary) = &bundle.primary {
-                transaction.set_primary_asset(bundle.uuid, bundle.assets[primary].uuid)?;
-            }
+            transaction.set_bundle_path_refs(
+                bundle.uuid,
+                crate::operations::bundle_path_references(bundle)
+                    .iter()
+                    .map(String::as_str),
+            )?;
         }
         for poison in candidate.bundle_poisons.values() {
             if !publishable_changed_bundles.contains(&poison.bundle) {
@@ -2741,6 +2770,7 @@ fn publish_claimed(
         plan,
         mut commit,
         changed_bundles,
+        held,
         configuration_generation,
     } = prepare_incremental_publication(&transaction.reader(), inputs, pending, projection, forced)?;
     transaction.set_namespace_errors(plan.namespace_errors.iter().cloned())?;
@@ -2784,7 +2814,7 @@ fn publish_claimed(
             .as_ref()
             .expect("indexed current bundle parsed successfully");
         transaction.retain_bundle_assets(
-            *bundle_uuid,
+            &held[bundle_uuid],
             &bundle.assets.values().map(|entry| entry.uuid).collect(),
         )?;
         let summary = bundle_summary(source)?;
@@ -2829,6 +2859,8 @@ struct IncrementalPublication {
     plan: IncrementalScanPlan,
     commit: Commit,
     changed_bundles: BTreeSet<BundleUuid>,
+    /// The asset rows each planned bundle had.
+    held: BTreeMap<BundleUuid, BTreeSet<AssetUuid>>,
     configuration_generation: u64,
 }
 
@@ -2950,7 +2982,8 @@ fn prepare_incremental_publication(
                 });
                 push_entry(
                     &mut commit,
-                    store,
+                    // An asset of the bundle had a row; another may have one elsewhere.
+                    |asset| Ok(old.assets.contains(&asset) || store.asset_resolution(asset)?.is_some()),
                     rpc_entry(
                         source.normalized_path.clone(),
                         bundle,
@@ -2982,10 +3015,15 @@ fn prepare_incremental_publication(
                 .push(AuthoringMutation::Remove { uuid: asset });
         }
     }
+    let held = durable_bundles
+        .into_iter()
+        .map(|(bundle, basis)| (bundle, basis.assets))
+        .collect();
     Ok(IncrementalPublication {
         plan,
         commit,
         changed_bundles,
+        held,
         configuration_generation,
     })
 }
@@ -3133,11 +3171,17 @@ pub(crate) fn publish_incremental_paths(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The commit of a scan publication: `stored_assets` are the old
+/// namespace's asset rows, and `withheld_before` the assets its errors
+/// withheld.
+#[allow(clippy::too_many_arguments)] // Each input is read once by the scan publication.
 fn rpc_commit(
     candidate: &ScanCandidate,
     published: &[Arc<ScannedBundle>],
     withheld: &Withheld,
     newly_failed: &BTreeSet<AssetUuid>,
+    stored_assets: &BTreeSet<AssetUuid>,
+    withheld_before: &BTreeSet<AssetUuid>,
     old: &StoreReader,
     projection: &PipelineProjection,
     changed_bundles: &BTreeSet<BundleUuid>,
@@ -3160,7 +3204,7 @@ fn rpc_commit(
             uuid: *asset,
             delta: AssetDeltaState::Changed,
         });
-        if old.asset_exists(*asset)? {
+        if stored_assets.contains(asset) {
             commit
                 .authoring
                 .push(AuthoringMutation::Remove { uuid: *asset });
@@ -3182,7 +3226,7 @@ fn rpc_commit(
             });
             push_entry(
                 &mut commit,
-                old,
+                |asset| Ok(stored_assets.contains(&asset) || withheld_before.contains(&asset)),
                 rpc_entry(
                     source.normalized_path.clone(),
                     bundle,
@@ -3208,25 +3252,22 @@ fn rpc_commit(
                 uuid: entry.asset,
                 delta: AssetDeltaState::Changed,
             });
-            if old.asset_exists(entry.asset)? {
+            if stored_assets.contains(&entry.asset) {
                 commit
                     .authoring
                     .push(AuthoringMutation::Remove { uuid: entry.asset });
             }
         }
     }
-    old.for_each_asset_bundle(|asset, _| {
-        if !current_assets.contains(&asset) {
-            commit.assets.push(AssetMutation {
-                uuid: asset,
-                delta: AssetDeltaState::Deleted,
-            });
-            commit
-                .authoring
-                .push(AuthoringMutation::Remove { uuid: asset });
-        }
-        Ok(())
-    })?;
+    for asset in stored_assets.difference(&current_assets) {
+        commit.assets.push(AssetMutation {
+            uuid: *asset,
+            delta: AssetDeltaState::Deleted,
+        });
+        commit
+            .authoring
+            .push(AuthoringMutation::Remove { uuid: *asset });
+    }
     path_mutations(old, &paths, &mut commit.paths)?;
     Ok(commit)
 }
@@ -3295,10 +3336,14 @@ fn merge_path_group(
 }
 
 /// Push `entry`'s authoring mutation, and its bundle path when it is a
-/// runtime entry the namespace `old` holds does not resolve: a named
-/// reference to it may be waiting.
-fn push_entry(commit: &mut Commit, old: &StoreReader, entry: AuthoringEntry) -> Result<(), StoreError> {
-    if entry.role == AuthoringEntryRole::Runtime && old.asset_resolution(entry.uuid)?.is_none() {
+/// runtime entry the old namespace did not resolve (`resolved` says
+/// whether it did): a named reference to it may be waiting.
+fn push_entry(
+    commit: &mut Commit,
+    resolved: impl FnOnce(AssetUuid) -> Result<bool, StoreError>,
+    entry: AuthoringEntry,
+) -> Result<(), StoreError> {
+    if entry.role == AuthoringEntryRole::Runtime && !resolved(entry.uuid)? {
         commit.new_entry_paths.insert(entry.normalized_path.clone());
     }
     commit.authoring.push(AuthoringMutation::Set(entry));

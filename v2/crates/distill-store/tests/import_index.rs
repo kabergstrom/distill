@@ -82,7 +82,7 @@ fn dirty_paths_join_the_read_sets_that_observed_them() {
     );
     assert_eq!(store.directory_rule_sources().unwrap().len(), 3);
     assert_eq!(
-        store.directory_rule_sources_at("main", "b.bundle").unwrap()[0].rules_bundle,
+        rules_at(&store, "b.bundle")[0].rules_bundle,
         BundleUuid([2; 16])
     );
 }
@@ -105,7 +105,7 @@ fn a_source_replacement_drops_only_that_source() {
         .replace_import_index(&[("main".to_owned(), "a.bundle".to_owned())], &[])
         .unwrap();
     assert_eq!(bundles(store.watched_imports_reading(["x"], false).unwrap()), [2]);
-    assert!(store.directory_rule_sources_at("main", "a.bundle").unwrap().is_empty());
+    assert!(rules_at(&store, "a.bundle").is_empty());
     // A bundle that moved is reindexed at its new source; its old rows go.
     publish(&mut store, "c.bundle", 2);
     store
@@ -117,7 +117,7 @@ fn a_source_replacement_drops_only_that_source() {
     assert!(store.watched_imports_reading(["x"], false).unwrap().is_empty());
     assert_eq!(bundles(store.watched_imports_reading(["y"], false).unwrap()), [2]);
     assert_eq!(
-        store.directory_rule_sources_at("main", "c.bundle").unwrap()[0].rules_bundle,
+        rules_at(&store, "c.bundle")[0].rules_bundle,
         BundleUuid([2; 16])
     );
 }
@@ -168,4 +168,14 @@ fn rules_are_found_by_the_directories_a_path_is_under() {
     // `dir1/x.png` is under `""` and `dir1/`.
     assert_eq!(found(&["", "dir1/"]), [1, 3]);
     assert_eq!(found(&["", "elsewhere/"]), [3]);
+}
+
+/// The directory-import rules the source `path` of the root "main" holds.
+fn rules_at(store: &distill_store::StoreReader, path: &str) -> Vec<distill_store::imports::DirectoryRuleSource> {
+    store
+        .directory_rule_sources()
+        .unwrap()
+        .into_iter()
+        .filter(|source| source.root_name == "main" && source.path == path)
+        .collect()
 }

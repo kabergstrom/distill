@@ -181,7 +181,6 @@ fn selective_reads(reader: &StoreReader) {
     reader.generated_bundles().unwrap();
     reader.import_watched_bundles().unwrap();
     reader.bundles_referencing_path(REFERENCED).unwrap();
-    reader.asset_exists(asset_uuid(42, 1)).unwrap();
     reader.observed_files_in(PathSelection::Subtree("d07")).unwrap();
     reader.observed_files_in(PathSelection::Prefix("d07/b000")).unwrap();
     reader.observed_files_in(PathSelection::Name("b00042.bundle")).unwrap();
@@ -698,6 +697,16 @@ fn derived_resolution_pages(count: u32) -> u64 {
     let served = AssetUuid::v5(asset_uuid(42, 1), "meta");
     // Source 41 shares its bundle UUID with source 40: its child is withheld.
     let withheld = AssetUuid::v5(asset_uuid(41, 1), "meta");
+    if count <= 1_000 {
+        // The withheld set is what point resolution withholds: the assets
+        // of the sources sharing a bundle UUID.
+        let expected = (0..count)
+            .map(|index| asset_uuid(index, 1))
+            .filter(|asset| reader.withholding(*asset).unwrap().is_some())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(expected.len() as u32, count / 10 * 2);
+        assert_eq!(reader.withheld_assets().unwrap(), expected);
+    }
     pages(&reader, || {
         assert!(reader.derived_output(served).unwrap().is_some());
         assert!(reader.derived_output(withheld).unwrap().is_none());
@@ -754,8 +763,8 @@ fn a_transaction_reads_each_counter_once() {
     assert_eq!(store.input_version().unwrap(), crate::state::InputVersion(version.0 + 1));
 }
 
-/// A rewritten bundle reads its assets and drops each vanished one (and
-/// its tags) by key.
+/// A rewritten bundle's assets are read by bundle, and each vanished one
+/// (and its tags) is dropped by key.
 #[test]
 fn a_rewritten_bundle_drops_its_vanished_assets_by_key() {
     let (_dir, store) = store_with(0);
@@ -1330,7 +1339,7 @@ fn import_index_statements_search_their_keys() {
             [bundle_uuid(2), bundle_uuid(4)]
         );
         assert_eq!(store.directory_rule_sources().unwrap().len(), 2);
-        assert_eq!(store.directory_rule_sources_at("main", &bundle_path(2)).unwrap().len(), 1);
+        assert_eq!(rules_at(store, &bundle_path(2)).len(), 1);
         let generating = store.generating_rules_bundles().unwrap();
         assert_eq!(
             generating,
@@ -1385,15 +1394,6 @@ fn import_index_statements_search_their_keys() {
                 "SEARCH k USING COVERING INDEX import_keys_by_key (kind=?)",
                 bundle_key,
                 by_root,
-                "USE TEMP B-TREE FOR ORDER BY",
-            ],
-        ),
-        (
-            "SELECT r.name, b.path, k.bundle_uuid, k.asset_uuid FROM roots r JOIN bundles b ON b.root_id = r.root_id CROSS JOIN import_keys k ON k.bundle_uuid = b.bundle_uuid WHERE r.name = 'main' AND b.path = 'd02/b00002.bundle' AND k.kind = 3 ORDER BY k.bundle_uuid, k.asset_uuid",
-            vec![
-                "SEARCH r USING COVERING INDEX sqlite_autoindex_roots_1 (name=?)",
-                "SEARCH b USING INDEX bundles_by_path (path=? AND root_id=?)",
-                "SEARCH k USING PRIMARY KEY (bundle_uuid=? AND kind=?)",
                 "USE TEMP B-TREE FOR ORDER BY",
             ],
         ),
@@ -1769,7 +1769,6 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         store.acknowledge_file_work(&work).unwrap();
         store.replace_import_index(&sources[..1], &rows[..1]).unwrap();
         store.directory_rule_sources_listing(["", "d04/"]).unwrap();
-        store.directory_rule_sources_at("main", &bundle_path(4)).unwrap();
         store.claims_namespace_errors().unwrap();
         store.pipeline_failure().unwrap();
         store.pipeline_module_hash().unwrap();
@@ -2591,4 +2590,49 @@ fn every_bundle_file_hash_is_one_extension_search() {
         ],
         "{plans:#?}"
     );
+}
+
+/// The directory-import rules the source `path` of the root "main" holds.
+fn rules_at(store: &StoreReader, path: &str) -> Vec<crate::imports::DirectoryRuleSource> {
+    store
+        .directory_rule_sources()
+        .unwrap()
+        .into_iter()
+        .filter(|source| source.root_name == "main" && source.path == path)
+        .collect()
+}
+
+/// The assets the old namespace's errors withhold are found from the
+/// collision rows: a range of the asset collisions, and per bundle
+/// collision its claims and their sources' authored claims, by key.
+#[test]
+fn the_withheld_assets_are_searched_from_the_collisions() {
+    let (_dir, store) = store_with(0);
+    assert_eq!(
+        store.query_plan_details(crate::served::WITHHELD_ASSETS).unwrap(),
+        [
+            "COMPOUND QUERY",
+            "LEFT-MOST SUBQUERY",
+            "SEARCH errors USING INDEX errors_by_scope (scope_kind=?)",
+            "UNION USING TEMP B-TREE",
+            "SEARCH e USING INDEX errors_by_scope (scope_kind=?)",
+            "SEARCH b USING INDEX source_claims_by_subject (kind=? AND subject=?)",
+            "SEARCH a USING COVERING INDEX sqlite_autoindex_source_claims_1 \
+             (root_id=? AND path=? AND kind=?)",
+        ]
+    );
+}
+
+/// A new bundle's row and its assets' rows are plain inserts: nothing is
+/// searched or cleared.
+#[test]
+fn a_new_bundle_is_inserted_without_a_search() {
+    let (_dir, store) = store_with(0);
+    for sql in [
+        crate::bundles::INSERT_BUNDLE,
+        crate::bundles::INSERT_ASSET,
+        "INSERT INTO asset_tags(asset_uuid, tag, value) VALUES (?1, ?2, ?3)",
+    ] {
+        assert_eq!(store.query_plan_details(sql).unwrap(), [""; 0], "{sql}");
+    }
 }

@@ -103,11 +103,13 @@ pub(crate) type PassWork<'a> = (
 );
 
 /// What refreshing the import index found: the bundle sources it reindexed,
-/// by (root, path), and the rules bundles whose generated bundles they may
-/// orphan: those a generated bundle names that are at one of those sources
-/// or no longer exist.
+/// by (root, path), whether one of them now holds directory-import rules,
+/// and the rules bundles whose generated bundles they may orphan: those a
+/// generated bundle names that are at one of those sources or no longer
+/// exist.
 pub(crate) struct IndexRefresh {
     changed: BTreeSet<(String, String)>,
+    changed_rules: bool,
     previous: Vec<BundleUuid>,
 }
 
@@ -163,18 +165,16 @@ impl AuthoringService {
         dirty: &[distill_store::files::DirtyEntry],
         fresh: impl Fn(&str, &str) -> Option<Arc<ScannedBundle>>,
     ) -> Result<IndexRefresh, RpcFailure> {
-        let (changed, previous) = self.refresh_dirty_import_index(store, dirty, fresh)?;
-        Ok(IndexRefresh { changed, previous })
+        self.refresh_dirty_import_index(store, dirty, fresh)
     }
 
-    /// Reindex the bundle sources `dirty` names, parsing each once. Returns
-    /// their keys and the directory rules they held before.
+    /// Reindex the bundle sources `dirty` names, parsing each once.
     fn refresh_dirty_import_index(
         &self,
         store: &mut Store,
         dirty: &[distill_store::files::DirtyEntry],
         fresh: impl Fn(&str, &str) -> Option<Arc<ScannedBundle>>,
-    ) -> Result<(BTreeSet<(String, String)>, Vec<BundleUuid>), RpcFailure> {
+    ) -> Result<IndexRefresh, RpcFailure> {
         store.write_transaction_with(invalid, |store| {
             let compiled = self.compiled(store)?;
             let keys = dirty
@@ -217,8 +217,18 @@ impl AuthoringService {
                 rows.push(self.index_import_bundle(store, &meta, root_name, bundle)?);
             }
             if keys.is_empty() {
-                return Ok((BTreeSet::new(), Vec::new()));
+                return Ok(IndexRefresh {
+                    changed: BTreeSet::new(),
+                    changed_rules: false,
+                    previous: Vec::new(),
+                });
             }
+            // The rows replace every row of these sources: one of them
+            // holds rules exactly when a row at it has some.
+            let changed_rules = rows.iter().any(|row| {
+                !row.directory_rules.is_empty()
+                    && keys.contains_key(&(row.root_name.clone(), row.path.clone()))
+            });
             let sources = keys.keys().cloned().collect::<Vec<_>>();
             store
                 .replace_import_index(&sources, &rows)
@@ -240,7 +250,11 @@ impl AuthoringService {
                 })
                 .map(|(rules, _)| rules)
                 .collect();
-            Ok((keys.into_keys().collect(), previous))
+            Ok(IndexRefresh {
+                changed: keys.into_keys().collect(),
+                changed_rules,
+                previous,
+            })
         })
     }
 
@@ -449,14 +463,7 @@ impl AuthoringService {
         // read when a changed source holds rules, so a rule id it duplicates
         // is found; otherwise only the rules whose listing a dirty path may
         // be in are read.
-        let mut changed_rules = false;
-        for (root, path) in changed {
-            changed_rules |= !store
-                .directory_rule_sources_at(root, path)
-                .map_err(invalid)?
-                .is_empty();
-        }
-        let entries = if work.is_none() || capabilities_changed || changed_rules {
+        let entries = if work.is_none() || capabilities_changed || refreshed.changed_rules {
             let sources = store.directory_rule_sources().map_err(invalid)?;
             self.directory_rule_entries(&store, sources)?
         } else {

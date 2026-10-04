@@ -598,7 +598,7 @@ fn retaining_a_bundles_assets_drops_only_the_vanished() {
     store
         .input_transaction(|txn| {
             txn.retain_bundle_assets(
-                BundleUuid([1; 16]),
+                &BTreeSet::from([AssetUuid([1; 16]), AssetUuid([2; 16]), AssetUuid([3; 16])]),
                 &BTreeSet::from([AssetUuid([1; 16]), AssetUuid([3; 16]), AssetUuid([4; 16])]),
             )
         })

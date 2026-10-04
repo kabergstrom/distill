@@ -154,6 +154,17 @@ pub struct TagIndexState {
 /// The tag poison of an asset whose tags a refinement has yet to compute.
 const TAG_PENDING: &str = "tag indexing pending";
 
+/// A new bundle's row (see [`InputTxn::insert_bundle`]).
+pub(crate) const INSERT_BUNDLE: &str = "INSERT INTO bundles(bundle_uuid, root_id, path,
+         format_version, content_hash, poison, origin_rules_bundle, origin_rule,
+         origin_group_root, origin_group_path, import_watched, primary_asset)
+     VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11)";
+
+/// A new asset's row (see [`InputTxn::insert_bundle`]).
+pub(crate) const INSERT_ASSET: &str = "INSERT INTO assets(asset_uuid, bundle_uuid, local_id,
+         type_uuid, logical_hash, authoring_only, terminal_type, tag_poison)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
+
 impl InputTxn<'_> {
     /// Publish (or republish) a bundle row. Clears any poison: fixing
     /// the file heals on the next version (§13). Healing republishes
@@ -208,16 +219,78 @@ impl InputTxn<'_> {
         Ok(())
     }
 
-    /// Drop the assets of `bundle` that `keep` does not name, with their
-    /// tags: what vanished from a bundle this input rewrites with
-    /// [`InputTxn::upsert_bundle`]. The rest stay, for the upserts that
-    /// rewrite them.
+    /// Publish a bundle that has no row: its row, naming `primary` (a
+    /// runtime entry of `assets`), and the rows of `assets`, its entries,
+    /// whose tags a refinement in the same input computes (see
+    /// [`Self::upsert_pending_asset`]). Nothing of it is there to clear, so
+    /// these are plain inserts: a row already there is an error.
+    pub fn insert_bundle(
+        &mut self,
+        meta: &BundleMeta,
+        assets: &[AssetRecord],
+        primary: Option<AssetUuid>,
+    ) -> Result<(), StoreError> {
+        if let Some(asset) = primary {
+            match assets.iter().find(|record| record.asset == asset) {
+                Some(record) if !record.authoring_only => {}
+                Some(_) => return Err(StoreError::RoleIneligible { asset }),
+                None => {
+                    return Err(StoreError::InvalidConfiguration {
+                        error: format!(
+                            "bundle {} has no runtime entry {asset} to make primary",
+                            meta.bundle
+                        ),
+                    })
+                }
+            }
+        }
+        self.txn
+            .prepare_cached(INSERT_BUNDLE)?
+            .execute(rusqlite::params![
+                meta.bundle.0.as_slice(),
+                meta.root.0,
+                meta.path,
+                meta.format_version,
+                meta.content_hash.0.as_slice(),
+                meta.origin.as_ref().map(|o| o.rules_bundle.0.as_slice().to_vec()),
+                meta.origin.as_ref().map(|o| o.rule.0.as_slice()),
+                meta.origin.as_ref().map(|o| o.group_root.as_str()),
+                meta.origin.as_ref().map(|o| o.group_path.as_str()),
+                meta.import_watched,
+                primary.map(|asset| asset.0.to_vec()),
+            ])?;
+        for rec in assets {
+            self.txn
+                .prepare_cached(INSERT_ASSET)?
+                .execute(rusqlite::params![
+                    rec.asset.0.as_slice(),
+                    rec.bundle.0.as_slice(),
+                    rec.local_id,
+                    rec.type_uuid.0.as_slice(),
+                    rec.logical_hash.0.as_slice(),
+                    i64::from(rec.authoring_only),
+                    rec.terminal_type.map(|terminal| terminal.0.to_vec()),
+                    TAG_PENDING,
+                ])?;
+            for (tag, value) in &rec.tags {
+                self.txn
+                    .prepare_cached(
+                        "INSERT INTO asset_tags(asset_uuid, tag, value) VALUES (?1, ?2, ?3)",
+                    )?
+                    .execute(rusqlite::params![rec.asset.0.as_slice(), tag, value])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop the assets of `held`, the assets a bundle this input rewrites
+    /// with [`InputTxn::upsert_bundle`] had, that `keep` does not name,
+    /// with their tags. The rest stay, for the upserts that rewrite them.
     pub fn retain_bundle_assets(
         &mut self,
-        bundle: BundleUuid,
+        held: &BTreeSet<AssetUuid>,
         keep: &BTreeSet<AssetUuid>,
     ) -> Result<(), StoreError> {
-        let held = self.reader().asset_ids_in_bundle(bundle)?;
         for asset in held.difference(keep) {
             self.txn
                 .prepare_cached("DELETE FROM asset_tags WHERE asset_uuid = ?1")?
@@ -687,14 +760,6 @@ impl StoreReader {
         })
     }
 
-    /// Whether an `assets` row (skeleton rows included) exists for `asset`.
-    pub fn asset_exists(&self, asset: AssetUuid) -> Result<bool, StoreError> {
-        Ok(self
-            .conn
-            .prepare_cached("SELECT EXISTS(SELECT 1 FROM assets WHERE asset_uuid = ?1)")?
-            .query_row([asset.0.as_slice()], |row| row.get(0))?)
-    }
-
     /// Raw deterministic identity set for one bundle, including poisoned
     /// skeleton rows. Incremental healing needs the prior UUID set without
     /// interpreting poisoned metadata or enumerating unrelated bundles.
@@ -852,25 +917,6 @@ impl StoreReader {
         })?;
         rows.collect::<Result<BTreeMap<_, _>, _>>()
             .map_err(StoreError::from)
-    }
-
-    /// Visit every asset row's (asset, bundle), skeleton rows included, in
-    /// asset UUID order, without collecting them.
-    pub fn for_each_asset_bundle(
-        &self,
-        mut visit: impl FnMut(AssetUuid, BundleUuid) -> Result<(), StoreError>,
-    ) -> Result<(), StoreError> {
-        let mut statement = self
-            .conn
-            .prepare_cached("SELECT asset_uuid, bundle_uuid FROM assets ORDER BY asset_uuid")?;
-        let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            visit(
-                AssetUuid(blob16(row.get::<_, Vec<u8>>(0)?)),
-                BundleUuid(blob16(row.get::<_, Vec<u8>>(1)?)),
-            )?;
-        }
-        Ok(())
     }
 
     /// Visit every asset row's (bundle, asset), skeleton rows included, in

@@ -345,23 +345,6 @@ impl StoreReader {
         )
     }
 
-    /// The directory-import rules assets held by the source at (root, path).
-    pub fn directory_rule_sources_at(
-        &self,
-        root_name: &str,
-        path: &str,
-    ) -> Result<Vec<DirectoryRuleSource>, StoreError> {
-        self.directory_rule_rows(
-            // The source's bundles first, then their rows.
-            "SELECT r.name, b.path, k.bundle_uuid, k.asset_uuid
-             FROM roots r JOIN bundles b ON b.root_id = r.root_id
-             CROSS JOIN import_keys k ON k.bundle_uuid = b.bundle_uuid
-             WHERE r.name = ?1 AND b.path = ?2 AND k.kind = 3
-             ORDER BY k.bundle_uuid, k.asset_uuid",
-            rusqlite::params![root_name, path],
-        )
-    }
-
     /// The directory-import rules assets whose listing directory is one of
     /// `dirs`: given the ancestor directories of a path (`""`, `a/`,
     /// `a/b/`, ...), every rule whose listing may match it. One indexed
