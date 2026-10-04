@@ -2,10 +2,9 @@
 //!
 //! A write stages its bytes as a temp file in a *staging directory*, syncs
 //! the temp (and fails if the sync fails), and only then renames it over the
-//! target. On Unix the target's directory is synced after the rename; on
-//! Windows the rename is `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING |
-//! MOVEFILE_WRITE_THROUGH`, which returns once the move is on disk. A reader
-//! of the target sees the old bytes or the new ones, never a mix.
+//! target, then syncs the target's directory: `fsync` on Unix,
+//! `FlushFileBuffers` on a directory handle on Windows. A reader of the
+//! target sees the old bytes or the new ones, never a mix.
 //!
 //! **Staging directories.** Every directory tree Distill writes into (each
 //! asset root, the codegen output, the tool object store, a pack output)
@@ -523,8 +522,10 @@ fn replace(from: &Path, to: &Path) -> io::Result<()> {
     fs::rename(from, to)
 }
 
-/// `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`:
-/// an atomic replace on one volume.
+/// `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`: an atomic replace on one
+/// volume. Like a Unix rename it is durable only once its directory is
+/// synced ([`sync_dir`]): `MOVEFILE_WRITE_THROUGH` waits only for the copy
+/// of a move across volumes, which this never makes.
 ///
 /// `MoveFileExW` refuses (`ERROR_ACCESS_DENIED`) to replace a target any
 /// process holds open, even one opened with `FILE_SHARE_DELETE` (a reader
@@ -536,9 +537,7 @@ fn replace(from: &Path, to: &Path) -> io::Result<()> {
 #[cfg(windows)]
 fn replace(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
     let wide = |path: &Path| {
         path.as_os_str()
             .encode_wide()
@@ -548,13 +547,8 @@ fn replace(from: &Path, to: &Path) -> io::Result<()> {
     let (from_wide, to_wide) = (wide(from), wide(to));
     // SAFETY: both arguments are NUL-terminated UTF-16 strings that outlive
     // the call.
-    let moved = unsafe {
-        MoveFileExW(
-            from_wide.as_ptr(),
-            to_wide.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
+    let moved =
+        unsafe { MoveFileExW(from_wide.as_ptr(), to_wide.as_ptr(), MOVEFILE_REPLACE_EXISTING) };
     if moved != 0 {
         return Ok(());
     }
@@ -567,11 +561,19 @@ fn replace(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
-/// Windows has no directory fsync: `MOVEFILE_WRITE_THROUGH` makes the
-/// rename durable, and NTFS journals directory entries.
+/// `FlushFileBuffers` on the directory, which writes its entries to disk.
+/// Opening a directory takes `FILE_FLAG_BACKUP_SEMANTICS`, which needs no
+/// privilege; the flush takes `FILE_WRITE_DATA` (`FILE_ADD_FILE` for a
+/// directory), the right a rename into the directory already needed.
 #[cfg(windows)]
-fn sync_dir(_path: &Path) -> io::Result<()> {
-    Ok(())
+fn sync_dir(path: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_DATA};
+    OpenOptions::new()
+        .access_mode(FILE_WRITE_DATA)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?
+        .sync_all()
 }
 
 #[cfg(not(windows))]
