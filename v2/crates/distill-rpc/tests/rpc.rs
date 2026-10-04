@@ -750,6 +750,65 @@ fn authoring_payload_decoder_materializes_authenticated_blob_bytes() {
 }
 
 #[test]
+fn authoring_payload_decoder_reenters_an_enum_from_its_variant_payload() {
+    // { End: {}, Link: { blob: Blob, next: BackRef(0) } }: a variant
+    // payload opens no frame of its own (§5), so `next` is the enum again.
+    let schema = LogicalSchema {
+        root: SchemaNode::Enum {
+            rev: 0,
+            variants: vec![
+                (
+                    "End".to_owned(),
+                    0,
+                    SchemaNode::Struct {
+                        rev: 0,
+                        fields: Vec::new(),
+                    },
+                ),
+                (
+                    "Link".to_owned(),
+                    0,
+                    SchemaNode::Struct {
+                        rev: 0,
+                        fields: vec![
+                            ("blob".to_owned(), 0, SchemaNode::Blob),
+                            ("next".to_owned(), 0, SchemaNode::BackRef(0)),
+                        ],
+                    },
+                ),
+            ],
+        },
+    };
+    let value = AuthoringValue {
+        canonical_value: Arc::from(
+            &br#"{"Link":{"blob":{"$distill_blob":0},"next":{"Link":{"blob":{"$distill_blob":1},"next":{"End":{}}}}}}"#[..],
+        ),
+        blobs: vec![Arc::from([1u8]), Arc::from([2u8])],
+    };
+    let link = |byte: u8, next: AuthoredValue| {
+        AuthoredValue::Object(BTreeMap::from([(
+            "Link".to_owned(),
+            AuthoredValue::Object(BTreeMap::from([
+                ("blob".to_owned(), AuthoredValue::Blob(vec![byte])),
+                ("next".to_owned(), next),
+            ])),
+        )]))
+    };
+    let end = AuthoredValue::Object(BTreeMap::from([(
+        "End".to_owned(),
+        AuthoredValue::Object(BTreeMap::new()),
+    )]));
+    assert_eq!(
+        decode_authoring_payload(
+            node_hash(&schema.root).unwrap(),
+            snapshot_to_json(&schema).unwrap().as_bytes(),
+            &value,
+        )
+        .unwrap(),
+        link(1, link(2, end))
+    );
+}
+#[test]
 fn tag_queries_fail_when_other_selectors_could_include_a_poisoned_entry() {
     // Without a project schema the daemon's tag index stays pending: the
     // entry's bundle is poisoned.

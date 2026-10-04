@@ -188,18 +188,8 @@ pub(crate) fn materialize_blob_tokens(
             *value = AuthoredValue::Blob(blobs[*index as usize].to_vec());
         }
         SchemaNode::Struct { fields, .. } => {
-            let AuthoredValue::Object(object) = value else {
-                unreachable!("validated struct shape")
-            };
             frames.push(schema.clone());
-            for (name, _, field_schema) in fields {
-                materialize_blob_tokens(
-                    field_schema,
-                    object.get_mut(name).expect("validated struct field"),
-                    frames,
-                    blobs,
-                );
-            }
+            materialize_fields(fields, value, frames, blobs);
             frames.pop();
         }
         SchemaNode::Enum { variants, .. } => {
@@ -217,12 +207,14 @@ pub(crate) fn materialize_blob_tokens(
                 .expect("validated enum schema")
                 .2;
             frames.push(schema.clone());
-            materialize_blob_tokens(
-                variant_schema,
-                object.get_mut(&name).expect("validated enum value"),
-                frames,
-                blobs,
-            );
+            let payload = object.get_mut(&name).expect("validated enum value");
+            // A variant payload opens no frame of its own (§5).
+            match variant_schema {
+                SchemaNode::Struct { fields, .. } => {
+                    materialize_fields(fields, payload, frames, blobs)
+                }
+                variant_schema => materialize_blob_tokens(variant_schema, payload, frames, blobs),
+            }
             frames.pop();
         }
         SchemaNode::Vec(element) | SchemaNode::Set(element) => {
@@ -276,6 +268,27 @@ pub(crate) fn materialize_blob_tokens(
     }
 }
 
+/// A struct body's fields, materialized in whatever frame the caller
+/// opened: a struct's own, or its enum's for a variant payload.
+fn materialize_fields(
+    fields: &[(String, u32, SchemaNode)],
+    value: &mut AuthoredValue,
+    frames: &mut Vec<SchemaNode>,
+    blobs: &[Arc<[u8]>],
+) {
+    let AuthoredValue::Object(object) = value else {
+        unreachable!("validated struct shape")
+    };
+    for (name, _, field_schema) in fields {
+        materialize_blob_tokens(
+            field_schema,
+            object.get_mut(name).expect("validated struct field"),
+            frames,
+            blobs,
+        );
+    }
+}
+
 pub(crate) fn walk_schema_value(
     schema: &SchemaNode,
     value: &AuthoredValue,
@@ -307,19 +320,8 @@ pub(crate) fn walk_schema_value(
             }
         }
         SchemaNode::Struct { fields, .. } => {
-            let AuthoredValue::Object(object) = value else {
-                return Err(shape("struct value must be an object"));
-            };
-            if object.len() != fields.len() {
-                return Err(shape("struct value field set does not match schema"));
-            }
             frames.push(schema.clone());
-            for (name, _, field_schema) in fields {
-                let field_value = object
-                    .get(name)
-                    .ok_or_else(|| shape("struct value is missing a schema field"))?;
-                walk_schema_value(field_schema, field_value, frames, used, blob_count)?;
-            }
+            walk_fields(fields, value, frames, used, blob_count)?;
             frames.pop();
         }
         SchemaNode::Enum { variants, .. } => {
@@ -335,7 +337,15 @@ pub(crate) fn walk_schema_value(
                 .find(|(candidate, _, _)| candidate == name)
                 .ok_or_else(|| shape("enum value names an unknown variant"))?;
             frames.push(schema.clone());
-            walk_schema_value(variant_schema, variant_value, frames, used, blob_count)?;
+            // A variant payload opens no frame of its own (§5).
+            match variant_schema {
+                SchemaNode::Struct { fields, .. } => {
+                    walk_fields(fields, variant_value, frames, used, blob_count)?
+                }
+                variant_schema => {
+                    walk_schema_value(variant_schema, variant_value, frames, used, blob_count)?
+                }
+            }
             frames.pop();
         }
         SchemaNode::Vec(element) | SchemaNode::Set(element) => {
@@ -403,6 +413,33 @@ pub(crate) fn walk_schema_value(
         SchemaNode::Primitive(kind) => validate_primitive(*kind, value)?,
         SchemaNode::AssetRef(_) | SchemaNode::WeakRef(_) => validate_reference(value)?,
         SchemaNode::String | SchemaNode::Unit => {}
+    }
+    Ok(())
+}
+
+/// A struct body's fields, validated in whatever frame the caller opened:
+/// a struct's own, or its enum's for a variant payload.
+fn walk_fields(
+    fields: &[(String, u32, SchemaNode)],
+    value: &AuthoredValue,
+    frames: &mut Vec<SchemaNode>,
+    used: &mut BTreeSet<u32>,
+    blob_count: u32,
+) -> Result<(), AuthoringValueError> {
+    let shape = |detail: &str| AuthoringValueError::SchemaValueShape {
+        detail: detail.to_owned(),
+    };
+    let AuthoredValue::Object(object) = value else {
+        return Err(shape("struct value must be an object"));
+    };
+    if object.len() != fields.len() {
+        return Err(shape("struct value field set does not match schema"));
+    }
+    for (name, _, field_schema) in fields {
+        let field_value = object
+            .get(name)
+            .ok_or_else(|| shape("struct value is missing a schema field"))?;
+        walk_schema_value(field_schema, field_value, frames, used, blob_count)?;
     }
     Ok(())
 }
