@@ -329,13 +329,6 @@ impl DaemonProcess {
         self.last_background_error.borrow().clone()
     }
 
-    /// Whether a fatal watcher/coordinator failure has stopped the serving
-    /// loops. The development supervisor uses this to tear down its producer
-    /// children instead of remaining alive around a dead daemon.
-    pub fn has_stopped(&self) -> bool {
-        *self.stop.borrow()
-    }
-
     pub fn wait(self) -> ! {
         loop {
             thread::park();

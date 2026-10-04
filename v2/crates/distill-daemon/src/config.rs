@@ -511,29 +511,6 @@ impl DaemonConfig {
             .collect()
     }
 
-    pub fn candidate_requirements(
-        &self,
-        authority: &ProjectSchemaAuthority,
-    ) -> Result<CandidateRequirements, DaemonConfigError> {
-        let rpc_targets = self.target_definitions(authority.identity())?;
-        let targets = rpc_targets
-            .iter()
-            .map(|target| PipelineTarget {
-                name: target.name().to_owned(),
-                fingerprint: target.definition_hash().0,
-            })
-            .collect();
-        Ok(CandidateRequirements {
-            module_abi: host_module_abi_identity(),
-            source_hashes: authority.schema().source_hashes.clone(),
-            layout_hashes: authority.schema().layout_hashes.clone(),
-            schema_registry: authority
-                .logical_registry()
-                .map_err(|error| DaemonConfigError::Target(error.to_string()))?,
-            targets,
-        })
-    }
-
     /// This configuration over `authority`, staged for publication
     /// ([`crate::coordinator::DaemonCoordinator::publish_configuration_candidate`]),
     /// or every defect that rejects it.

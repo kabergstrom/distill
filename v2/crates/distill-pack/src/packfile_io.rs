@@ -228,10 +228,6 @@ impl PackfileIO {
         })
     }
 
-    pub fn verify_target(&self, runtime: &RuntimeTarget) -> Result<(), MountError> {
-        Self::verify_runtime(&self.manifest, runtime)
-    }
-
     fn verify_runtime(manifest: &PackManifest, runtime: &RuntimeTarget) -> Result<(), MountError> {
         if manifest.target.name != runtime.target.nfc().collect::<String>()
             || manifest.target_def_hash != runtime.target_def_hash

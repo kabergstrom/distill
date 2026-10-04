@@ -727,17 +727,6 @@ impl PipelineEpoch {
         &self.0.token
     }
 
-    /// Mint a residency-tracked clone of the epoch token for a module-owned
-    /// value whose lifetime is not already represented by a `PipelineEpoch`
-    /// `Arc` pin.
-    pub fn module_pin(&self) -> ModuleEpochPin {
-        self.0
-            .registration_arena
-            .as_ref()
-            .expect("published epoch registration arena must be resident")
-            .owner_pin()
-    }
-
     pub fn targets(&self) -> &[TargetDefinition] {
         &self.0.targets
     }
@@ -786,12 +775,6 @@ impl PipelineEpoch {
             .collect()
     }
 
-    pub fn has_default_table(&self, type_uuid: TypeUuid) -> bool {
-        self.callback_rows().into_iter().any(|(_, callback)| {
-            matches!(callback, CallbackHandle::Defaults { descriptor, .. } if descriptor.type_uuid == type_uuid)
-        })
-    }
-
     pub fn default_table_types(&self) -> Vec<TypeUuid> {
         self.callback_rows()
             .into_iter()
@@ -800,12 +783,6 @@ impl PipelineEpoch {
                 _ => None,
             })
             .collect()
-    }
-
-    pub fn has_migration_function(&self, key: &str) -> bool {
-        self.callback_rows().into_iter().any(|(_, callback)| {
-            matches!(callback, CallbackHandle::Migration { key: registered, .. } if registered == key)
-        })
     }
 
     pub fn migration_function_keys(&self) -> Vec<String> {

@@ -139,10 +139,6 @@ impl RequestTracker {
         }
     }
 
-    pub fn connection_epoch(&self) -> ConnectionEpoch {
-        self.connection
-    }
-
     pub fn reconnect(&mut self) -> Result<ConnectionEpoch, RequestError> {
         self.connection.0 = self
             .connection

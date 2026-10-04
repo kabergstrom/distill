@@ -425,10 +425,6 @@ impl ScanDelta {
         self.observed.files.values()
     }
 
-    pub fn observed_bundles(&self) -> impl Iterator<Item = &ScannedBundle> {
-        self.observed.bundles.values().map(AsRef::as_ref)
-    }
-
     /// The bundle this delta read at `key`, if it observed one there.
     pub(crate) fn observed_bundle(&self, key: &(String, String)) -> Option<&Arc<ScannedBundle>> {
         self.observed.bundles.get(key)
@@ -981,14 +977,6 @@ impl RootedScanner {
             .max_by_key(|root| root.components().count())
             .cloned()
             .ok_or_else(|| ScanError::UnknownRoot(path.display().to_string()))
-    }
-
-    /// Every configured root directory.
-    pub fn root_paths(&self) -> Vec<PathBuf> {
-        self.root_snapshot()
-            .values()
-            .map(|root| root.configured.path.clone())
-            .collect()
     }
 
     fn root_snapshot(&self) -> Arc<BTreeMap<String, CanonicalRoot>> {
