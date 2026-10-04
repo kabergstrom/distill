@@ -1258,6 +1258,15 @@ impl Drop for EpochInner {
                 std::mem::forget(arena);
             }
         }
+        // A closed library's copy is loaded by no one: delete it. A leaked
+        // (poisoned) image keeps its file until the next open empties the
+        // staging directory.
+        if self.module.is_none()
+            && !self.token.is_poisoned()
+            && distill_store::atomic_file::in_staging(&self.staged.path)
+        {
+            let _ = std::fs::remove_file(&self.staged.path);
+        }
     }
 }
 
@@ -1342,9 +1351,13 @@ pub struct ModuleHost {
 }
 
 impl ModuleHost {
+    /// A host whose module copies live in `state_dir`'s staging directory.
+    /// Opening it empties that directory: no one loads an earlier
+    /// process's copies now. Call it with the state lock held.
     pub fn new(state_dir: impl AsRef<Path>) -> std::io::Result<Self> {
         let state_dir = state_dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(state_dir.join("modules"))?;
+        std::fs::create_dir_all(&state_dir)?;
+        distill_store::atomic_file::open_staging(&state_dir)?;
         Ok(Self {
             state_dir,
             next_epoch_id: 1,
@@ -1530,9 +1543,7 @@ impl ModuleHost {
             } else {
                 format!("-{attempt}")
             };
-            let path = self
-                .state_dir
-                .join("modules")
+            let path = distill_store::atomic_file::staging_dir(&self.state_dir)
                 .join(format!("pipeline-{id}{suffix}.{extension}"));
             match ngp_module_host::stage_copy_to(source, &path) {
                 Ok(staged) => {

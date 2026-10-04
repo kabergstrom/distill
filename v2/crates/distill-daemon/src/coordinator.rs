@@ -161,6 +161,13 @@ impl DaemonCoordinator {
     ) -> Result<Self, CoordinatorInitError> {
         let module_state_path = store_config.state_path.join("pipeline-host");
         let state_path = store_config.state_path.clone();
+        // Claims are input state: they describe the published namespace
+        // they were committed with, under the projection it was published
+        // under, and a publication under another projection replaces them
+        // in its own transaction. A restart keeps them. The store takes the
+        // state lock, so the module host empties its staging directory
+        // under it.
+        let mut opened_store = Store::open(store_config.clone())?;
         let host = ModuleHost::new(&module_state_path).map_err(CoordinatorInitError::ModuleIo)?;
         let scanner = RootedScanner::new(roots.clone())?;
         scanner.retain_daemon_owned_directory(DaemonOwnedDirectoryKind::State, &state_path)?;
@@ -168,16 +175,7 @@ impl DaemonCoordinator {
             DaemonOwnedDirectoryKind::ModuleStaging,
             &module_state_path,
         )?;
-        scanner.retain_daemon_owned_directory(
-            DaemonOwnedDirectoryKind::ModuleStaging,
-            module_state_path.join("modules"),
-        )?;
         let target_set = distill_rpc::target_map(targets)?;
-        // Claims are input state: they describe the published namespace
-        // they were committed with, under the projection it was published
-        // under, and a publication under another projection replaces them
-        // in its own transaction. A restart keeps them.
-        let mut opened_store = Store::open(store_config.clone())?;
         if opened_store.pending_restart()?.is_some() {
             opened_store.input_transaction(|transaction| {
                 transaction.adopt_pending_restart().map(|_| ())

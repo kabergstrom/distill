@@ -1050,3 +1050,42 @@ fn host_reverse_callback_boundary_preserves_explicit_status_failures() {
         .unwrap_err();
     assert_eq!(error.detail(), "duplicate processor");
 }
+
+/// Module copies live in the host's staging directory: a closed epoch's
+/// copy is deleted, and a new host (the next process) empties what an
+/// earlier one left there, so copies never accumulate across restarts.
+#[test]
+fn module_copies_are_staged_and_never_outlive_their_process() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("pipeline.dylib");
+    write_module(&source, 4);
+    let state = temp.path().join("state");
+    let staging = distill_store::atomic_file::staging_dir(&state);
+    let copies = || std::fs::read_dir(&staging).unwrap().count();
+    let mut host = module_host(&state).unwrap();
+    let mut loader = FakeLoader {
+        module: Some(fake_module(4, Arc::new(Mutex::new(Calls::default())))),
+        open_error: None,
+    };
+    let epoch = host
+        .publish_candidate(&source, requirements(4), &mut loader)
+        .unwrap();
+    assert_eq!(copies(), 1);
+
+    // Replacing the module closes the first epoch: its copy goes.
+    write_module(&source, 5);
+    let mut next = FakeLoader {
+        module: Some(fake_module(5, Arc::new(Mutex::new(Calls::default())))),
+        open_error: None,
+    };
+    host.publish_candidate(&source, requirements(5), &mut next)
+        .unwrap();
+    drop(epoch);
+    assert_eq!(copies(), 1);
+
+    // A process that exits without closing leaves its copy; the next
+    // host empties the staging directory when it opens.
+    std::mem::forget(host);
+    let _host = module_host(&state).unwrap();
+    assert_eq!(copies(), 0);
+}
