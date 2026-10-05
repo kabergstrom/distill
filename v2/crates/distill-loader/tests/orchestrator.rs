@@ -2527,12 +2527,12 @@ fn a_delta_keeps_a_fetched_payload_and_refetches_only_changed_content() {
 }
 
 
-/// A handle that binds to a candidate after its payload was taken (here a
-/// path resolving to a dependency fetched while a sibling still fetches)
-/// has no constructed value: the candidate fetches again, constructs only
-/// the new handle's value, and the component then commits.
+/// A handle that binds to a candidate after its payload was accepted (here
+/// a path resolving to a dependency fetched while a sibling still fetches)
+/// gets its value from the payload the candidate keeps until its component
+/// stages: no second fetch, and the component commits with both handles.
 #[test]
-fn a_handle_joining_a_fetched_candidate_refetches_it() {
+fn a_handle_joining_a_fetched_candidate_builds_from_the_kept_payload() {
     let token = ModuleEpochToken::new(80);
     let mut loader = Loader::new(mock_io());
     register(&mut loader, 80, &token);
@@ -2556,7 +2556,7 @@ fn a_handle_joining_a_fetched_candidate_refetches_it() {
     resolve(&mut loader, child_uuid, child_hash);
     resolve(&mut loader, sibling_uuid, sibling_hash);
     loader.process(&mut storage).unwrap();
-    fetched(&mut loader, child_hash, child_artifact.clone());
+    fetched(&mut loader, child_hash, child_artifact);
     loader.process(&mut storage).unwrap();
     assert_eq!(fetch_count(&loader), 3);
 
@@ -2570,13 +2570,10 @@ fn a_handle_joining_a_fetched_candidate_refetches_it() {
         basis: path_basis,
     });
     loader.process(&mut storage).unwrap();
-    assert_eq!(fetch_count(&loader), 4, "the child fetches again");
+    assert!(storage.updates.is_empty(), "the sibling still fetches");
     fetched(&mut loader, sibling_hash, sibling_artifact);
     loader.process(&mut storage).unwrap();
-    assert!(storage.updates.is_empty(), "the component waits for the refetch");
-
-    fetched(&mut loader, child_hash, child_artifact);
-    loader.process(&mut storage).unwrap();
+    assert_eq!(fetch_count(&loader), 3, "no second fetch of the child");
     assert_eq!(loader.status(&parent), LoadStatus::Loaded);
     assert_eq!(loader.status(&by_path), LoadStatus::Loaded);
     assert_eq!(storage.commits.len(), 4, "parent, sibling and both child handles");

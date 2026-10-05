@@ -341,6 +341,9 @@ enum CandidateTerminal {
         type_uuid: Option<TypeUuid>,
         load_deps: Option<Vec<AssetUuid>>,
         values: BTreeMap<HandleId, ErasedValue>,
+        /// The fetched payload, kept until the component stages so a handle
+        /// that binds later builds its value without a second fetch.
+        payload: Option<Box<RetainedPayload>>,
     },
     Failed(String),
     Missing,
@@ -348,6 +351,16 @@ enum CandidateTerminal {
         values: BTreeMap<HandleId, ErasedValue>,
         strong_references: PlaceholderReferences,
     },
+}
+
+/// A fetched payload and what its values are built from: the artifact's
+/// buffers (shared, not copied), its compiled plans, and its fixed and
+/// variable sections as ranges of `artifact.structural`.
+struct RetainedPayload {
+    artifact: FetchedArtifact,
+    plans: CompiledPlans,
+    fixed: std::ops::Range<usize>,
+    variable: std::ops::Range<usize>,
 }
 
 struct CandidateRecord {
@@ -411,9 +424,8 @@ pub struct Loader<I: LoaderIO> {
     /// under them is still wanted (doc 22 §5).
     lingering: Vec<IoBasis>,
     /// Sweep candidates a new handle joined after they may have been
-    /// fetched: values are constructed per handle at fetch, so a fetched
-    /// candidate missing the new handle's value fetches again
-    /// (`issue_refetches`).
+    /// fetched: values are constructed per handle at fetch, so the new
+    /// handle's value is built from the kept payload (`construct_joined`).
     joined: BTreeSet<AssetUuid>,
     /// Rounds restarted since a sweep last completed.
     sweep_retries: u32,
@@ -710,7 +722,7 @@ impl<I: LoaderIO> Loader<I> {
         }
         self.ensure_sweep()?;
         self.issue_sweep_requests()?;
-        self.issue_refetches()?;
+        self.construct_joined();
         self.expand_dependencies()?;
         self.retire_lingering();
         self.plan_and_stage(storage)?;
@@ -1229,68 +1241,75 @@ impl<I: LoaderIO> Loader<I> {
         }
     }
 
-    /// Fetch again each joined candidate whose payload was already taken
-    /// without a value for every handle; `accept_fetched` constructs only
-    /// the missing ones. A carried candidate waits for its re-resolve.
-    fn issue_refetches(&mut self) -> Result<(), LoaderError> {
+    /// Build the values of handles that joined a candidate after its payload
+    /// was accepted, from the payload it keeps until its component stages.
+    /// A carried candidate waits for its re-resolve.
+    fn construct_joined(&mut self) {
         if self.joined.is_empty() {
-            return Ok(());
+            return;
         }
-        let Some(sweep) = &self.sweep else {
+        let Some(sweep) = self.sweep.as_mut() else {
             self.joined.clear();
-            return Ok(());
+            return;
         };
-        let basis = sweep.basis.clone();
-        let mut refetch = Vec::new();
         let mut waiting = BTreeSet::new();
+        let mut failed = Vec::new();
         for uuid in std::mem::take(&mut self.joined) {
-            let Some(candidate) = sweep.candidates.get(&uuid) else {
+            let Some(candidate) = sweep.candidates.get_mut(&uuid) else {
                 continue;
             };
             if candidate.unverified {
                 waiting.insert(uuid);
                 continue;
             }
-            if let CandidateTerminal::Built {
-                content_hash,
+            let CandidateTerminal::Built {
                 fetched: true,
+                type_uuid: Some(type_uuid),
                 values,
+                payload: Some(payload),
                 ..
-            } = &candidate.terminal
-            {
-                if self
-                    .handles_for_uuid(uuid)
-                    .iter()
-                    .any(|handle| !values.contains_key(handle))
-                {
-                    refetch.push((uuid, *content_hash));
-                }
+            } = &mut candidate.terminal
+            else {
+                continue;
+            };
+            let missing = self
+                .slots
+                .iter()
+                .filter(|(id, slot)| {
+                    slot.binding.uuid() == Some(uuid)
+                        && (slot.internal_lease.is_some() || slot.lease.upgrade().is_some())
+                        && !values.contains_key(id)
+                })
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            if missing.is_empty() {
+                continue;
+            }
+            let Some(descriptor) = self
+                .descriptors
+                .get(type_uuid)
+                .filter(|record| self.epochs.can_issue_work(record.epoch))
+            else {
+                failed.push((uuid, format!("no live descriptor for fetched terminal type {type_uuid}")));
+                continue;
+            };
+            let structural = &payload.artifact.structural;
+            match construct_handle_values(
+                descriptor,
+                &payload.plans,
+                &structural[payload.fixed.clone()],
+                &structural[payload.variable.clone()],
+                &payload.artifact,
+                missing.iter(),
+            ) {
+                Ok(constructed) => values.extend(constructed),
+                Err(error) => failed.push((uuid, error)),
             }
         }
         self.joined = waiting;
-        for (uuid, content_hash) in refetch {
-            let req = self
-                .requests
-                .issue(
-                    RequestOwner::Content {
-                        asset: uuid,
-                        hash: content_hash,
-                    },
-                    OutstandingPurpose::Fetch,
-                    basis.clone(),
-                )
-                .map_err(|_| LoaderError::RequestIdsExhausted)?;
-            self.io.fetch(req, content_hash, &basis);
-            if let Some(CandidateTerminal::Built { fetched, .. }) = self
-                .sweep
-                .as_mut()
-                .and_then(|sweep| sweep.candidates.get_mut(&uuid))
-                .map(|candidate| &mut candidate.terminal)
-            {
-                *fetched = false;
-            }
+        for (uuid, error) in failed {
+            self.fail_construction(uuid, error);
         }
-        Ok(())
     }
 
     fn issue_sweep_requests(&mut self) -> Result<(), LoaderError> {
@@ -1739,6 +1758,7 @@ impl<I: LoaderIO> Loader<I> {
                     type_uuid: None,
                     load_deps: None,
                     values: BTreeMap::new(),
+                    payload: None,
                 };
                 let req = self
                     .requests
@@ -2087,39 +2107,29 @@ impl<I: LoaderIO> Loader<I> {
                 _ => None,
             })
             .unwrap_or_default();
-        let mut constructed = BTreeMap::new();
-        for handle in &handles {
-            if existing.contains(handle) {
-                continue;
+        let constructed = match construct_handle_values(
+            descriptor,
+            &plans,
+            parsed.fixed,
+            parsed.variable,
+            &artifact,
+            handles.iter().filter(|handle| !existing.contains(handle)),
+        ) {
+            Ok(constructed) => constructed,
+            Err(error) => {
+                self.fail_construction(uuid, error);
+                return;
             }
-            match construct_value(
-                descriptor.descriptor,
-                &descriptor.token,
-                &plans,
-                parsed.fixed,
-                parsed.variable,
-                &artifact,
-            ) {
-                Ok(value) => {
-                    constructed.insert(*handle, value);
-                }
-                Err(error) => {
-                    for value in constructed.into_values() {
-                        let _ = value.destroy();
-                    }
-                    self.diagnostics
-                        .push(LoaderDiagnostic::Artifact(error.clone()));
-                    if let Some(candidate) = self
-                        .sweep
-                        .as_mut()
-                        .and_then(|sweep| sweep.candidates.get_mut(&uuid))
-                    {
-                        candidate.terminal = CandidateTerminal::Failed(error);
-                    }
-                    return;
-                }
-            }
-        }
+        };
+        let base = artifact.structural.as_ptr() as usize;
+        let fixed = parsed.fixed.as_ptr() as usize - base;
+        let variable = parsed.variable.as_ptr() as usize - base;
+        let retained = RetainedPayload {
+            fixed: fixed..fixed + parsed.fixed.len(),
+            variable: variable..variable + parsed.variable.len(),
+            artifact,
+            plans,
+        };
         let t_constructed = self.stats.now();
         // Header checks between parse and DSWL count as parse.
         let parts = AcceptParts {
@@ -2139,6 +2149,7 @@ impl<I: LoaderIO> Loader<I> {
             type_uuid: candidate_type,
             load_deps: candidate_deps,
             values,
+            payload,
             ..
         } = &mut candidate.terminal
         else {
@@ -2148,7 +2159,22 @@ impl<I: LoaderIO> Loader<I> {
         *candidate_type = Some(type_uuid);
         *candidate_deps = Some(load_deps.clone());
         values.extend(constructed);
+        *payload = Some(Box::new(retained));
         candidate.load_expectations = load_expectations;
+    }
+
+    fn fail_construction(&mut self, uuid: AssetUuid, error: String) {
+        self.diagnostics
+            .push(LoaderDiagnostic::Artifact(error.clone()));
+        if let Some(candidate) = self
+            .sweep
+            .as_mut()
+            .and_then(|sweep| sweep.candidates.get_mut(&uuid))
+        {
+            let terminal =
+                std::mem::replace(&mut candidate.terminal, CandidateTerminal::Failed(error));
+            destroy_candidate_values(terminal);
+        }
     }
 
     fn reject_fetched(&mut self, uuid: AssetUuid, basis: &IoBasis, message: String) {
@@ -3130,6 +3156,40 @@ impl<I: LoaderIO> Loader<I> {
             .ok_or(LoaderError::AdoptionIdsExhausted)?;
         Ok(adoption)
     }
+}
+
+/// A value for each of `handles`, built from one fetched payload. On an
+/// error the values built so far are destroyed.
+fn construct_handle_values<'a>(
+    descriptor: &DescriptorRecord,
+    plans: &CompiledPlans,
+    fixed: &[u8],
+    variable: &[u8],
+    artifact: &FetchedArtifact,
+    handles: impl Iterator<Item = &'a HandleId>,
+) -> Result<BTreeMap<HandleId, ErasedValue>, String> {
+    let mut constructed = BTreeMap::new();
+    for handle in handles {
+        match construct_value(
+            descriptor.descriptor,
+            &descriptor.token,
+            plans,
+            fixed,
+            variable,
+            artifact,
+        ) {
+            Ok(value) => {
+                constructed.insert(*handle, value);
+            }
+            Err(error) => {
+                for value in constructed.into_values() {
+                    let _ = value.destroy();
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(constructed)
 }
 
 fn destroy_candidate_values(terminal: CandidateTerminal) {
