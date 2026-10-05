@@ -117,6 +117,7 @@ fn compiled_pipeline_cdylib_opens_registers_unloads_and_closes() {
             distill_pipeline_fixture::COOKED_TYPE,
             distill_pipeline_fixture::REFLECTION_TYPE,
             distill_pipeline_fixture::SETTINGS_TYPE,
+            distill_pipeline_fixture::FLOAT_SETTINGS_TYPE,
             distill_pipeline_fixture::VALUE_TYPE,
         ]
         .into_iter()
@@ -149,6 +150,7 @@ fn compiled_pipeline_cdylib_opens_registers_unloads_and_closes() {
             distill_pipeline_fixture::BYTE_IMPORTER,
             distill_pipeline_fixture::CHAIN_IMPORTER,
             distill_pipeline_fixture::SETTINGS_IMPORTER,
+            distill_pipeline_fixture::FLOAT_IMPORTER,
         ]
     );
 

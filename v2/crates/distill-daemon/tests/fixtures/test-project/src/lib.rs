@@ -470,13 +470,15 @@ pub fn canonical_artifact(
 /// field `group`, a search tag.
 pub const TAGGED_TYPE: TypeUuid = TypeUuid([0xa4; 16]);
 pub use distill_pipeline_fixture::{
-    COOKED_TYPE, PARENT_TYPE, REFLECT, REFLECTION, REFLECTION_TYPE, SETTINGS_TYPE, VALUE_TYPE,
+    COOKED_TYPE, FLOAT_SETTINGS_TYPE, PARENT_TYPE, REFLECT, REFLECTION, REFLECTION_TYPE,
+    SETTINGS_TYPE, VALUE_TYPE,
 };
 
 /// The configured project's schema: [`TAGGED_TYPE`], and the pipeline
 /// module's [`PARENT_TYPE`], [`COOKED_TYPE`], [`REFLECTION_TYPE`] and
 /// [`VALUE_TYPE`] (each of these a struct of one `u8` field `value`) and
-/// [`SETTINGS_TYPE`] (`{ add: [u8; 2], scale: { by: u8 } }`), laid out for
+/// [`SETTINGS_TYPE`] (`{ add: [u8; 2], scale: { by: u8 } }`) and
+/// [`FLOAT_SETTINGS_TYPE`] (`{ rate: f32 }`), laid out for
 /// this host. Its source hashes are the pipeline module's.
 pub fn project_schema() -> Schema {
     let type_def = |id: usize, kind, krate: &str, name: &str, uuid, fields| TypeDef {
@@ -582,6 +584,18 @@ pub fn project_schema() -> Schema {
         layout(2, 1, Vec::new()),
         layout(1, 1, vec![at_zero(1)]),
     ];
+    let f32_id = types.len();
+    types.push(type_def(f32_id, PrimitiveType::F32, "core", "f32", None, Vec::new()));
+    layouts.push(layout(4, 4, Vec::new()));
+    types.push(type_def(
+        types.len(),
+        PrimitiveType::Struct,
+        "fixture",
+        "FloatSettings",
+        Some(FLOAT_SETTINGS_TYPE),
+        vec![field("rate", f32_id, false)],
+    ));
+    layouts.push(layout(4, 4, vec![at_zero(4)]));
     for (name, uuid) in [
         ("Parent", PARENT_TYPE),
         ("Cooked", COOKED_TYPE),

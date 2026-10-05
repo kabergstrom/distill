@@ -136,7 +136,11 @@ impl RegisteredImporter {
         }
         let settings_schema = importer.settings_schema().clone();
         let settings_hash = node_hash(&settings_schema.root).map_err(invalid)?;
-        let default_settings = importer.default_settings();
+        // Canonical, as an output's recorded `$settings` read back: settings
+        // completed from these defaults then equal the record of an
+        // unchanged output (an integral `30.0` would not, and the output
+        // would reimport on every pass).
+        let default_settings = canonical_authored(importer.default_settings());
         validate_default_settings(
             settings_type_uuid,
             settings_hash,
@@ -3537,10 +3541,10 @@ fn decode_wrapped_authored_value(
             field(fields, "value")?,
             "AuthoredValueV1.UInt.value",
         )?)),
-        "Float" => Ok(AuthoredValue::Float(as_f64(
+        "Float" => Ok(canonical_authored(AuthoredValue::Float(as_f64(
             field(fields, "value")?,
             "AuthoredValueV1.Float.value",
-        )?)),
+        )?))),
         "Str" => Ok(AuthoredValue::Str(
             as_string(field(fields, "value")?, "AuthoredValueV1.Str.value")?.to_owned(),
         )),
@@ -3892,9 +3896,39 @@ fn as_i128(value: &AuthoredValue, context: &str) -> Result<i128, RpcFailure> {
     }
 }
 
+
+/// `value` as canonical JSON reads it back: a leaf the writer spells
+/// another way parses as that spelling (an integral float such as `30.0`
+/// is written `30` and reads back as `UInt(30)`; a non-negative `Int` as
+/// `UInt`). Settings an output records in its `$settings` come back in
+/// this form, so settings compared with a record (an importer's defaults,
+/// a rule's authored floats) are put in it first. Blobs and leaves the
+/// writer rejects stay as they are.
+fn canonical_authored(value: AuthoredValue) -> AuthoredValue {
+    match value {
+        AuthoredValue::Array(items) => {
+            AuthoredValue::Array(items.into_iter().map(canonical_authored).collect())
+        }
+        AuthoredValue::Object(fields) => AuthoredValue::Object(
+            fields
+                .into_iter()
+                .map(|(name, value)| (name, canonical_authored(value)))
+                .collect(),
+        ),
+        AuthoredValue::Blob(_) => value,
+        leaf => distill_json::write(&leaf)
+            .ok()
+            .and_then(|text| distill_json::parse(&text).ok())
+            .unwrap_or(leaf),
+    }
+}
+/// A float, or an integer: canonical JSON writes an integral float as an
+/// integer, so a float field reads back as one.
 fn as_f64(value: &AuthoredValue, context: &str) -> Result<f64, RpcFailure> {
     match value {
         AuthoredValue::Float(value) => Ok(*value),
+        AuthoredValue::UInt(value) => Ok(*value as f64),
+        AuthoredValue::Int(value) => Ok(*value as f64),
         _ => Err(invalid(format!("{context} must be a float"))),
     }
 }

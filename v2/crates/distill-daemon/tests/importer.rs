@@ -12,7 +12,7 @@ use distill_daemon::watcher::WatcherBatch;
 use distill_json::AuthoredValue;
 use distill_pipeline_fixture::{
     default_settings, settings, value as byte, value_of as byte_of, BYTE_IMPORTER, CHAIN_IMPORTER,
-    SETTINGS_IMPORTER,
+    SETTINGS_IMPORTER, FLOAT_IMPORTER, float_settings,
 };
 use distill_rpc::{
     AuthoringValue, ImportRequest, InputVersion, TargetDefinition, TargetDefinitionHash,
@@ -201,6 +201,15 @@ fn directory_rules_bundle_with_rule(include_rule: bool) -> Vec<u8> {
 /// `settings`: each `*.src` file when `include_rule`, else only `*.other`
 /// files, under another rule id.
 fn directory_rules_bundle_with(include_rule: bool, settings: &AuthoredValue) -> Vec<u8> {
+    directory_rules_bundle_for(include_rule, BYTE_IMPORTER, settings)
+}
+
+/// [`directory_rules_bundle_with`], its rule importing with `importer`.
+fn directory_rules_bundle_for(
+    include_rule: bool,
+    importer: &str,
+    settings: &AuthoredValue,
+) -> Vec<u8> {
     let row = BootstrapControlSpecV1::embedded()
         .unwrap()
         .0
@@ -225,7 +234,7 @@ fn directory_rules_bundle_with(include_rule: bool, settings: &AuthoredValue) -> 
     let rules = vec![object([
         ("group", object([("PerFile", object([]))])),
         ("id", bytes(if include_rule { [97; 16] } else { [100; 16] })),
-        ("importer", AuthoredValue::Str(BYTE_IMPORTER.into())),
+        ("importer", AuthoredValue::Str(importer.into())),
         ("matches", matches),
         ("output", AuthoredValue::Str("{stem}.bundle".into())),
         ("settings", wrapped(settings)),
@@ -739,6 +748,84 @@ fn directory_rule_settings_leaving_out_fields_take_the_defaults() {
         .reconcile_directory_imports(&mut writer)
         .unwrap()
         .is_empty());
+}
+
+/// A directory rule importing with `rule_settings` through
+/// [`FLOAT_IMPORTER`], whose settings hold an integral float (canonical
+/// JSON writes `30.0` as `30`, which the output's `$settings` read back as
+/// an integer): once its output settled, a quiet daemon (a full rescan and
+/// the generated bundle's own watcher pass) imports nothing, leaves the
+/// output unwritten and publishes no new version.
+fn assert_integral_float_settings_stay_quiet(rule_settings: &AuthoredValue) {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(
+        assets.join("rules.bundle"),
+        directory_rules_bundle_for(true, FLOAT_IMPORTER, rule_settings),
+    )
+    .unwrap();
+    std::fs::write(assets.join("foo.src"), b"4").unwrap();
+    let coordinator = DaemonCoordinator::open(
+        StoreConfig::new(temp.path().join(".distill")),
+        vec![AssetRoot::new("main", &assets)],
+        vec![target()],
+        64,
+    )
+    .unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    configure(&coordinator, temp.path(), &assets);
+    assert_eq!(
+        coordinator
+            .reconcile_directory_imports(&mut writer)
+            .unwrap()
+            .len(),
+        1
+    );
+    let generated = assets.join("foo.bundle");
+    assert_eq!(
+        distill_bundle::parse_bundle(&std::fs::read(&generated).unwrap())
+            .unwrap()
+            .assets["asset"]
+            .data,
+        byte(4)
+    );
+    coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["foo.bundle"]), false)
+        .unwrap();
+    let version = writer.input_version().unwrap();
+    let written = std::fs::metadata(&generated).unwrap().modified().unwrap();
+
+    for _ in 0..3 {
+        coordinator.reconcile_full_scan(&mut writer).unwrap();
+        assert!(coordinator
+            .reconcile_directory_imports(&mut writer)
+            .unwrap()
+            .is_empty());
+        coordinator
+            .reconcile_batch(&mut writer, &batch(&assets, &["foo.bundle"]), false)
+            .unwrap();
+    }
+    assert_eq!(writer.input_version().unwrap(), version);
+    assert_eq!(
+        std::fs::metadata(&generated).unwrap().modified().unwrap(),
+        written
+    );
+}
+
+/// [`assert_integral_float_settings_stay_quiet`], the rule leaving `rate`
+/// to the importer's default `30.0`.
+#[test]
+fn a_rule_at_integral_float_defaults_leaves_a_quiet_daemon_quiet() {
+    assert_integral_float_settings_stay_quiet(&object([]));
+}
+
+/// [`assert_integral_float_settings_stay_quiet`], the rule authoring `rate`
+/// `30.0` itself.
+#[test]
+fn a_rule_authoring_an_integral_float_leaves_a_quiet_daemon_quiet() {
+    assert_integral_float_settings_stay_quiet(&float_settings(30.0));
 }
 
 
