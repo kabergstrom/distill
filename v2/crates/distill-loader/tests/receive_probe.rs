@@ -20,6 +20,9 @@
 //!
 //! `probe_copy_shapes`: memcpy shapes for one 256 MiB pass.
 
+// The probe-local streaming copy is x86_64 only.
+#![cfg(target_arch = "x86_64")]
+
 use std::cell::Cell;
 use std::io::{BufWriter, Read, Write};
 use std::net::TcpListener;
@@ -141,7 +144,7 @@ fn spawn_sender(listener: TcpListener, messages: usize) -> std::thread::JoinHand
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Receiver {
     Stock,
-    /// `Stock` copying into the sink with `distill_core::copy` streaming
+    /// `Stock` copying into the sink with the probe-local streaming
     /// stores, fenced per message (nt-copy).
     StockStreaming,
     Split,
@@ -210,8 +213,8 @@ fn receive(receiver: Receiver, sink: &mut [u8], sink_cursor: &mut usize) -> Part
                     let bytes = message.get_root::<capnp::data::Reader>().unwrap();
                     let t2 = Instant::now();
                     if receiver == Receiver::StockStreaming {
-                        distill_core::copy::copy_streaming(&mut sink[at..at + bytes.len()], bytes);
-                        distill_core::copy::publish();
+                        copy_streaming(&mut sink[at..at + bytes.len()], bytes);
+                        sfence();
                     } else {
                         sink[at..at + bytes.len()].copy_from_slice(bytes);
                     }
@@ -411,17 +414,17 @@ fn probe_copy_shapes() {
             chunk.copy_from_slice(src);
         }
     });
-    run("256 x 1 MiB streaming copy (distill_core::copy), hot src, warm dst", &mut || {
+    run("256 x 1 MiB streaming copy, hot src, warm dst", &mut || {
         for chunk in dst.chunks_exact_mut(CHUNK) {
-            distill_core::copy::copy_streaming(chunk, &src_hot);
+            copy_streaming(chunk, &src_hot);
         }
-        distill_core::copy::publish();
+        sfence();
     });
     run("256 x 1 MiB streaming copy, cold src, warm dst", &mut || {
         for (chunk, src) in dst.chunks_exact_mut(CHUNK).zip(src_big.chunks_exact(CHUNK)) {
-            distill_core::copy::copy_streaming(chunk, src);
+            copy_streaming(chunk, src);
         }
-        distill_core::copy::publish();
+        sfence();
     });
     // The loader's fetch buffer (nt-copy): sized once, never touched before
     // 64 KiB chunks arrive, so every page faults in during the copy.
@@ -444,10 +447,10 @@ fn probe_copy_shapes() {
             // SAFETY: `out` has room for `FONT` bytes, all written before
             // `set_len`.
             unsafe {
-                distill_core::copy::copy_streaming_raw(font.as_ptr(), out.as_mut_ptr(), FONT);
+                copy_streaming_raw(font.as_ptr(), out.as_mut_ptr(), FONT);
                 out.set_len(FONT);
             }
-            distill_core::copy::publish();
+            sfence();
             std::hint::black_box(out);
         }
     });
@@ -494,13 +497,88 @@ fn fresh_fill(src_hot: &[u8], streaming: bool) {
         unsafe {
             let dst = out.as_mut_ptr().add(at);
             if streaming {
-                distill_core::copy::copy_streaming_raw(src_hot.as_ptr(), dst, PIECE);
+                copy_streaming_raw(src_hot.as_ptr(), dst, PIECE);
             } else {
                 std::ptr::copy_nonoverlapping(src_hot.as_ptr(), dst, PIECE);
             }
             out.set_len(at + PIECE);
         }
     }
-    distill_core::copy::publish();
+    sfence();
     std::hint::black_box(&out);
+}
+
+/// Probe-local streaming copy (doc 22 §1.6, nt-copy measurements): AVX2
+/// non-temporal stores with the destination head to 32-byte alignment and
+/// the tail copied ordinarily. Measurement only; nothing in Distill or the
+/// engine uses streaming stores.
+fn copy_streaming(dst: &mut [u8], src: &[u8]) {
+    assert_eq!(dst.len(), src.len());
+    assert!(std::arch::is_x86_feature_detected!("avx2"), "the probe needs AVX2");
+    // SAFETY: AVX2 checked above; equal lengths.
+    unsafe { copy_avx2(dst, src) }
+}
+
+/// # Safety
+/// `src` valid for `len` reads, `dst` for `len` writes, not overlapping.
+unsafe fn copy_streaming_raw(src: *const u8, dst: *mut u8, len: usize) {
+    // SAFETY: the caller's contract.
+    unsafe {
+        copy_streaming(
+            std::slice::from_raw_parts_mut(dst, len),
+            std::slice::from_raw_parts(src, len),
+        )
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn copy_avx2(dst: &mut [u8], src: &[u8]) {
+    use std::arch::x86_64::*;
+    let head = dst.as_ptr().align_offset(32).min(dst.len());
+    dst[..head].copy_from_slice(&src[..head]);
+    let body = (dst.len() - head) & !127;
+    // SAFETY: [head, head + body) is in bounds of both; destination aligned.
+    unsafe {
+        let s = src.as_ptr().add(head);
+        let d = dst.as_mut_ptr().add(head);
+        let mut at = 0;
+        while at < body {
+            let a = _mm256_loadu_si256(s.add(at) as *const __m256i);
+            let b = _mm256_loadu_si256(s.add(at + 32) as *const __m256i);
+            let c = _mm256_loadu_si256(s.add(at + 64) as *const __m256i);
+            let e = _mm256_loadu_si256(s.add(at + 96) as *const __m256i);
+            _mm256_stream_si256(d.add(at) as *mut __m256i, a);
+            _mm256_stream_si256(d.add(at + 32) as *mut __m256i, b);
+            _mm256_stream_si256(d.add(at + 64) as *mut __m256i, c);
+            _mm256_stream_si256(d.add(at + 96) as *mut __m256i, e);
+            at += 128;
+        }
+    }
+    let tail = head + body;
+    dst[tail..].copy_from_slice(&src[tail..]);
+}
+
+/// Orders the streaming stores before the buffer is handed on.
+fn sfence() {
+    // SAFETY: SSE is part of x86_64.
+    unsafe { std::arch::x86_64::_mm_sfence() }
+}
+
+#[test]
+fn probe_streaming_copy_matches_copy_from_slice() {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return;
+    }
+    let source: Vec<u8> = (0..70_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+    for len in [0, 1, 31, 127, 128, 129, 4095, 65_537] {
+        for (src_off, dst_off) in [(0, 0), (1, 7), (33, 17), (5, 31)] {
+            let src = &source[src_off..src_off + len];
+            let mut expected = vec![0xeeu8; len + 64];
+            expected[dst_off..dst_off + len].copy_from_slice(src);
+            let mut actual = vec![0xeeu8; len + 64];
+            copy_streaming(&mut actual[dst_off..dst_off + len], src);
+            sfence();
+            assert!(actual == expected, "len {len} src+{src_off} dst+{dst_off}");
+        }
+    }
 }

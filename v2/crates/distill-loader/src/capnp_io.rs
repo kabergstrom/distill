@@ -1472,11 +1472,10 @@ async fn collect_remote_chunks(
                 let len = chunk.bytes.len();
                 bytes.reserve(len);
                 let at = bytes.len();
-                // Ordinary stores, not `distill_core::copy` streaming ones: the
-                // buffer is fresh, so each page is faulted in and zeroed by the
-                // kernel just before the copy reaches it and is cache-hot;
-                // streaming stores measured slower here (doc 22 §1.6, nt-copy).
-                // A pooled, prefaulted buffer (phase 2) takes streaming stores.
+                // Ordinary stores. Streaming stores were measured slower into
+                // this fresh buffer (doc 22 §1.7, nt-copy); phase 2 measures
+                // them on pooled, prefaulted buffers and adds them only if the
+                // engine-side gain is real.
                 // SAFETY: `reserve` made room for `len` bytes past `at`; the
                 // copy initialises all of them before `set_len`.
                 unsafe {

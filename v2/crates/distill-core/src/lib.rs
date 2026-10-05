@@ -4,7 +4,6 @@
 pub mod bootstrap;
 pub mod callback;
 pub mod canonical;
-pub mod copy;
 pub mod frames;
 pub mod id;
 pub mod target_set;
