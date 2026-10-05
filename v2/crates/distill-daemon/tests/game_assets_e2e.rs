@@ -258,7 +258,8 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
     )));
 
     // Named assets: the bundle holds two meshes, each loaded by its path and
-    // the name its importer gave it; an unknown name resolves to nothing.
+    // the name its importer gave it; the daemon answers an unknown name with no
+    // asset, which fails its reference at once (Dead).
     let primary_named = live_loader
         .add_ref_named::<MeshTerminal>("game-assets.bundle", "mesh")
         .unwrap();
@@ -281,7 +282,7 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
         std::thread::sleep(Duration::from_millis(10));
     }
     settle_loader(&mut live_loader, &mut live_storage);
-    assert_eq!(live_loader.status(&unknown_named), LoadStatus::Unloaded);
+    assert_eq!(live_loader.status(&unknown_named), LoadStatus::Dead);
     let indices_of = |handle: HandleId| {
         live_storage
             .values

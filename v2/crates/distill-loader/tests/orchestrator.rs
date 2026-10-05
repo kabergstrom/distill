@@ -1473,7 +1473,7 @@ fn reconnect_missing_detaches_loaded_indirect_uuid_and_subscription() {
         old_resolve_count,
         "the stale UUID must not be resolved again while its path says Missing"
     );
-    assert_eq!(loader.status(&handle), LoadStatus::Unloaded);
+    assert_eq!(loader.status(&handle), LoadStatus::Dead);
 }
 
 #[test]
@@ -2126,7 +2126,7 @@ fn named_refs_resolve_by_path_and_name_and_rebind_when_the_path_changes() {
     }
     assert_eq!(loader.status(&walk), LoadStatus::Loaded);
     assert_eq!(loader.status(&skeleton), LoadStatus::Loaded);
-    assert_eq!(loader.status(&run), LoadStatus::Unloaded);
+    assert_eq!(loader.status(&run), LoadStatus::Dead);
 
     // "Run" is imported later: the daemon announces the path, and the
     // missing name resolves again.
@@ -2206,4 +2206,78 @@ fn a_load_records_an_ordered_timeline_and_an_unchanged_reload_finishes_unchanged
     assert_eq!(timeline.outcome, Outcome::Unchanged);
     assert_eq!(timeline.mark(Mark::FetchIssued), None);
     assert_eq!(loader.stats().totals().unchanged, 1);
+}
+
+#[test]
+fn an_unknown_path_fails_at_its_first_answer_and_resolves_when_it_appears() {
+    let token = ModuleEpochToken::new(50);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 50, &token);
+    let path = "prefabs/nonexistent.prefab.bundle";
+    let handle = loader.add_ref_indirect::<A>(path).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+
+    // A failed request is not an answer: the reference stays unbound.
+    let (req, basis) = loader.io().path_for(path);
+    loader.io_mut().push(IoEvent::RequestError {
+        req,
+        message: "connection reset".into(),
+        basis,
+    });
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.status(&handle), LoadStatus::Unloaded);
+    assert!(!loader
+        .take_diagnostics()
+        .iter()
+        .any(|d| matches!(d, LoaderDiagnostic::PathUnresolved { .. })));
+
+    // The daemon answers that no asset is at the path: the reference is
+    // Dead at once, with a diagnostic naming the path.
+    loader.io_mut().push(IoEvent::Delta {
+        stamp: stamp(1),
+        assets: Vec::new(),
+        paths: vec![path.to_owned()],
+    });
+    loader.process(&mut storage).unwrap();
+    let (req, basis) = loader.io().path_for(path);
+    loader.io_mut().push(IoEvent::PathResolved {
+        req,
+        path: path.into(),
+        result: PathResolveResult::Missing,
+        basis,
+    });
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.status(&handle), LoadStatus::Dead);
+    assert!(loader.take_diagnostics().iter().any(|d| matches!(
+        d,
+        LoaderDiagnostic::PathUnresolved { path: p, error } if p.path == path && error == "no asset at this path"
+    )));
+    // The path stays subscribed: once imported, the daemon announces it
+    // and the reference resolves and loads.
+    assert!(loader
+        .io()
+        .commands
+        .iter()
+        .any(|command| matches!(command, Command::SubscribePath(p) if p == path)));
+    loader.io_mut().push(IoEvent::Delta {
+        stamp: stamp(2),
+        assets: Vec::new(),
+        paths: vec![path.to_owned()],
+    });
+    loader.process(&mut storage).unwrap();
+    let (req, basis) = loader.io().path_for(path);
+    loader.io_mut().push(IoEvent::PathResolved {
+        req,
+        path: path.into(),
+        result: PathResolveResult::Resolved(uuid(50)),
+        basis,
+    });
+    loader.process(&mut storage).unwrap();
+    let (hash, bytes) = artifact::<A>(uuid(50), &[]);
+    resolve(&mut loader, uuid(50), hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, hash, bytes);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.status(&handle), LoadStatus::Loaded);
 }

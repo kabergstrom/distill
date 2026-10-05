@@ -109,6 +109,12 @@ pub enum LoaderDiagnostic {
     LoadCycle {
         cycle: Vec<AssetUuid>,
     },
+    /// A definite path answer naming no asset: the references into `path`
+    /// are `Dead` until a delta naming the path resolves it again.
+    PathUnresolved {
+        path: AssetPath,
+        error: String,
+    },
     Storage {
         handle: HandleId,
         error: StorageError,
@@ -1350,7 +1356,7 @@ impl<I: LoaderIO> Loader<I> {
                 if let Some(sweep) = &mut self.sweep {
                     sweep.pending_paths.remove(&path);
                 }
-                self.accept_path(&path, result, storage);
+                self.accept_path(&path, result, true, storage);
             }
             IoEvent::Fetched {
                 req,
@@ -1437,6 +1443,7 @@ impl<I: LoaderIO> Loader<I> {
                             PathResolveResult::Failed {
                                 error: message.clone(),
                             },
+                            false,
                             storage,
                         );
                     }
@@ -1574,10 +1581,16 @@ impl<I: LoaderIO> Loader<I> {
         Ok(())
     }
 
+    /// Bind every reference into `path` to `result`. A definite answer that
+    /// names no asset (no such path, an ambiguous one, a source without paths)
+    /// makes them `Dead` and reports [`LoaderDiagnostic::PathUnresolved`]; the
+    /// path stays subscribed, so a later delta naming it resolves it again. A
+    /// failed request (`definite` false) leaves them `Unloaded`.
     fn accept_path(
         &mut self,
         path: &AssetPath,
         result: PathResolveResult,
+        definite: bool,
         storage: &mut dyn AssetStorage,
     ) {
         let ids = self
@@ -1588,6 +1601,22 @@ impl<I: LoaderIO> Loader<I> {
                 _ => None,
             })
             .collect::<BTreeSet<_>>();
+        if definite && !ids.is_empty() {
+            let error = match &result {
+                PathResolveResult::Resolved(_) => None,
+                PathResolveResult::Missing => Some("no asset at this path".to_owned()),
+                PathResolveResult::Unsupported => {
+                    Some("this asset source does not resolve paths".to_owned())
+                }
+                PathResolveResult::Failed { error } => Some(error.clone()),
+            };
+            if let Some(error) = error {
+                self.diagnostics.push(LoaderDiagnostic::PathUnresolved {
+                    path: path.clone(),
+                    error,
+                });
+            }
+        }
         self.cancel_pending_for_handles(storage, &ids);
         let mut retired = BTreeSet::new();
         let mut rebound = BTreeSet::new();
@@ -1624,7 +1653,11 @@ impl<I: LoaderIO> Loader<I> {
                 PathResolveResult::Missing
                 | PathResolveResult::Unsupported
                 | PathResolveResult::Failed { .. } => {
-                    slot.status = LoadStatus::Unloaded;
+                    slot.status = if definite {
+                        LoadStatus::Dead
+                    } else {
+                        LoadStatus::Unloaded
+                    };
                 }
             }
         }
