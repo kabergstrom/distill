@@ -28,6 +28,8 @@ distill-schema = { path = "../distill-schema" }
 distill-store = { path = "../distill-store" }
 distill-wire = { path = "../distill-wire" }
 globset = { workspace = true }
+# Fresh import identities: one random seed per import run.
+getrandom = "0.2"
 notify = { workspace = true }
 ngp-module-host = { path = "../../../../newgameplus/ngp-module-host" }
 rayon = { workspace = true }

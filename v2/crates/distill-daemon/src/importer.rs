@@ -1295,7 +1295,7 @@ impl AuthoringService {
             .run_import(base, importer, invocation, None)
             .map_err(ImportExecutionError::into_rpc)?;
         let ImportRun {
-            base: run_base,
+            base: _,
             importer,
             destination,
             prior,
@@ -1304,6 +1304,7 @@ impl AuthoringService {
             watch,
             origin,
             read_set,
+            identity_seed,
             outcome,
         } = run;
         let output = outcome.map_err(|failure| failure.rpc)?;
@@ -1311,7 +1312,7 @@ impl AuthoringService {
             .checked_fold(
                 store,
                 base,
-                run_base,
+                identity_seed,
                 &importer,
                 &destination,
                 prior.as_ref(),
@@ -1504,6 +1505,7 @@ impl AuthoringService {
             watch,
             origin,
             read_set,
+            identity_seed: IdentitySeed::random(),
             outcome,
         })
     }
@@ -1527,6 +1529,7 @@ impl AuthoringService {
             watch,
             origin,
             read_set,
+            identity_seed,
             outcome,
         } = run;
         if run_base != base {
@@ -1582,7 +1585,7 @@ impl AuthoringService {
         let (_, bundle, bytes) = self.checked_fold(
             store,
             base,
-            run_base,
+            identity_seed,
             &importer,
             &destination,
             prior.as_ref(),
@@ -1623,7 +1626,7 @@ impl AuthoringService {
         &self,
         store: &StoreReader,
         base: InputVersion,
-        run_base: InputVersion,
+        identity_seed: IdentitySeed,
         importer: &RegisteredImporter,
         destination: &ImportDestination,
         prior: Option<&PriorImport>,
@@ -1643,7 +1646,7 @@ impl AuthoringService {
             )));
         }
         let (bundle, bytes) = self
-            .folded_bundle(&compiled, run_base, importer, destination, prior, request)
+            .folded_bundle(&compiled, identity_seed, importer, prior, request)
             .map_err(ImportExecutionError::unmemoized)?;
         if store
             .bundle(bundle)
@@ -1676,26 +1679,19 @@ impl AuthoringService {
         Ok((compiled, bundle, bytes))
     }
 
-    /// The bundle a successful run folds to: its identity and
-    /// bytes. New identities are seeded by the run's base, so the fold is
-    /// the same wherever the run publishes.
-    #[allow(clippy::too_many_arguments)]
+    /// The bundle a successful run folds to: its identity and bytes.
+    /// Identities the prior bundle lacks expand the run's random seed, so
+    /// every fold of one run (a pass's preview of its output, its
+    /// publication) mints the same ones.
     fn folded_bundle(
         &self,
         compiled: &Compiled,
-        run_base: InputVersion,
+        identity_seed: IdentitySeed,
         importer: &RegisteredImporter,
-        destination: &ImportDestination,
         prior: Option<&PriorImport>,
         mut request: FoldRequest,
     ) -> Result<(BundleUuid, Vec<u8>), RpcFailure> {
-        let seed = import_identity_seed(
-            run_base,
-            &destination.root,
-            &destination.path,
-            importer.capability_hash,
-        );
-        let mut ids = HashIdentitySource::new(seed);
+        let mut ids = SeededIdentitySource::new(identity_seed);
         request.origin = request
             .origin
             .or_else(|| prior.and_then(|prior| prior.model.record.origin.clone()));
@@ -1726,9 +1722,8 @@ impl AuthoringService {
         let compiled = self.compiled(store)?;
         let (_, bytes) = self.folded_bundle(
             &compiled,
-            run.base,
+            run.identity_seed,
             &run.importer,
-            &run.destination,
             run.prior.as_ref(),
             FoldRequest {
                 output: output.clone(),
@@ -2882,7 +2877,7 @@ fn build_import_bundle(
     importer: &RegisteredImporter,
     imported: &ImportedBundle,
     prior: Option<&Bundle>,
-    ids: &mut HashIdentitySource,
+    ids: &mut SeededIdentitySource,
 ) -> Result<Vec<u8>, RpcFailure> {
     let mut schemas = BTreeMap::new();
     let mut assets = BTreeMap::new();
@@ -3965,6 +3960,8 @@ pub(crate) struct ImportRun {
     watch: bool,
     origin: Option<DirectoryOrigin>,
     read_set: Vec<FileDep>,
+    /// Drawn once per run: the fresh UUIDs every fold of this run mints.
+    identity_seed: IdentitySeed,
     outcome: Result<ImportOutput, ImportRunFailure>,
 }
 
@@ -4048,20 +4045,40 @@ impl ImportExecutionError {
     }
 }
 
-struct HashIdentitySource {
-    seed: [u8; 32],
+/// The seed of the UUIDs one import run mints: 32 bytes of OS randomness,
+/// drawn once per run. Fresh identity depends on nothing a bundle could
+/// later be reimported from (source path, input version, importer), so a
+/// bundle keeps its UUIDs only through its prior (DESIGN §7, §8). Every
+/// fold of the run expands the same seed: a pass's preview of the output,
+/// which the imports chained to it read, and the output it publishes carry
+/// the same UUIDs.
+#[derive(Clone, Copy)]
+struct IdentitySeed([u8; 32]);
+
+impl IdentitySeed {
+    fn random() -> Self {
+        let mut seed = [0; 32];
+        getrandom::getrandom(&mut seed).expect("OS randomness unavailable");
+        Self(seed)
+    }
+}
+
+/// UUIDv4s expanded from an [`IdentitySeed`]: BLAKE3 of the seed and a
+/// counter, a PRF keyed by the random seed.
+struct SeededIdentitySource {
+    seed: IdentitySeed,
     next: u64,
 }
 
-impl HashIdentitySource {
-    fn new(seed: [u8; 32]) -> Self {
+impl SeededIdentitySource {
+    fn new(seed: IdentitySeed) -> Self {
         Self { seed, next: 0 }
     }
 
     fn mint(&mut self, domain: &[u8]) -> [u8; 16] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(domain);
-        hasher.update(&self.seed);
+        hasher.update(&self.seed.0);
         hasher.update(&self.next.to_le_bytes());
         self.next = self
             .next
@@ -4075,7 +4092,7 @@ impl HashIdentitySource {
     }
 }
 
-impl IdentitySource for HashIdentitySource {
+impl IdentitySource for SeededIdentitySource {
     fn next_asset(&mut self) -> AssetUuid {
         AssetUuid(self.mint(b"DSIA"))
     }
@@ -4085,23 +4102,35 @@ impl IdentitySource for HashIdentitySource {
     }
 }
 
-fn import_identity_seed(
-    base: InputVersion,
-    root: &str,
-    path: &str,
-    capability: [u8; 32],
-) -> [u8; 32] {
-    distill_core::canonical::domain_digest(*b"DSII", 1, |encoder| {
-        encoder.u64(base.0);
-        encoder.str(root);
-        encoder.str(path);
-        encoder.raw(&capability);
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn minted(seed: IdentitySeed) -> (BundleUuid, Vec<AssetUuid>) {
+        let mut ids = SeededIdentitySource::new(seed);
+        let assets = (0..3).map(|_| ids.next_asset()).collect();
+        (ids.next_bundle(), assets)
+    }
+
+    /// Every fold of one run mints the same UUIDs; another run's are new,
+    /// even for the same destination and sources.
+    #[test]
+    fn a_runs_identities_repeat_per_fold_and_differ_between_runs() {
+        let seed = IdentitySeed::random();
+        assert_eq!(minted(seed), minted(seed));
+        let (bundle, assets) = minted(seed);
+        let (other_bundle, other_assets) = minted(IdentitySeed::random());
+        assert_ne!(bundle, other_bundle);
+        for asset in &assets {
+            assert!(!other_assets.contains(asset));
+        }
+        let unique = assets.iter().collect::<BTreeSet<_>>();
+        assert_eq!(unique.len(), assets.len());
+        for uuid in assets.iter().map(|asset| asset.0).chain([bundle.0]) {
+            assert_eq!(uuid[6] >> 4, 4, "version 4");
+            assert_eq!(uuid[8] >> 6, 0b10, "RFC 4122 variant");
+        }
+    }
 
     #[test]
     fn capability_changes_select_only_read_sets_that_record_capabilities() {
