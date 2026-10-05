@@ -410,6 +410,11 @@ pub struct Loader<I: LoaderIO> {
     /// Bases of sweeps a delta replaced, kept open while a fetch issued
     /// under them is still wanted (doc 22 §5).
     lingering: Vec<IoBasis>,
+    /// Sweep candidates a new handle joined after they may have been
+    /// fetched: values are constructed per handle at fetch, so a fetched
+    /// candidate missing the new handle's value fetches again
+    /// (`issue_refetches`).
+    joined: BTreeSet<AssetUuid>,
     /// Rounds restarted since a sweep last completed.
     sweep_retries: u32,
     pending: Vec<PendingComponent>,
@@ -446,6 +451,7 @@ impl<I: LoaderIO> Loader<I> {
             dirty_paths: BTreeSet::new(),
             sweep: None,
             lingering: Vec::new(),
+            joined: BTreeSet::new(),
             sweep_retries: 0,
             pending: Vec::new(),
             diagnostics: Vec::new(),
@@ -704,6 +710,7 @@ impl<I: LoaderIO> Loader<I> {
         }
         self.ensure_sweep()?;
         self.issue_sweep_requests()?;
+        self.issue_refetches()?;
         self.expand_dependencies()?;
         self.retire_lingering();
         self.plan_and_stage(storage)?;
@@ -1204,15 +1211,86 @@ impl<I: LoaderIO> Loader<I> {
         let now = self.stats.now();
         for uuid in affected {
             self.stats.begin(uuid, now);
-            sweep.candidates.entry(uuid).or_insert(CandidateRecord {
-                basis: basis.clone(),
-                resolve_issued: false,
-                unverified: false,
-                expected_terminal_types: BTreeSet::new(),
-                load_expectations: PlaceholderReferences::new(),
-                terminal: CandidateTerminal::Pending,
-            });
+            match sweep.candidates.entry(uuid) {
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    self.joined.insert(uuid);
+                }
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(CandidateRecord {
+                        basis: basis.clone(),
+                        resolve_issued: false,
+                        unverified: false,
+                        expected_terminal_types: BTreeSet::new(),
+                        load_expectations: PlaceholderReferences::new(),
+                        terminal: CandidateTerminal::Pending,
+                    });
+                }
+            }
         }
+    }
+
+    /// Fetch again each joined candidate whose payload was already taken
+    /// without a value for every handle; `accept_fetched` constructs only
+    /// the missing ones. A carried candidate waits for its re-resolve.
+    fn issue_refetches(&mut self) -> Result<(), LoaderError> {
+        if self.joined.is_empty() {
+            return Ok(());
+        }
+        let Some(sweep) = &self.sweep else {
+            self.joined.clear();
+            return Ok(());
+        };
+        let basis = sweep.basis.clone();
+        let mut refetch = Vec::new();
+        let mut waiting = BTreeSet::new();
+        for uuid in std::mem::take(&mut self.joined) {
+            let Some(candidate) = sweep.candidates.get(&uuid) else {
+                continue;
+            };
+            if candidate.unverified {
+                waiting.insert(uuid);
+                continue;
+            }
+            if let CandidateTerminal::Built {
+                content_hash,
+                fetched: true,
+                values,
+                ..
+            } = &candidate.terminal
+            {
+                if self
+                    .handles_for_uuid(uuid)
+                    .iter()
+                    .any(|handle| !values.contains_key(handle))
+                {
+                    refetch.push((uuid, *content_hash));
+                }
+            }
+        }
+        self.joined = waiting;
+        for (uuid, content_hash) in refetch {
+            let req = self
+                .requests
+                .issue(
+                    RequestOwner::Content {
+                        asset: uuid,
+                        hash: content_hash,
+                    },
+                    OutstandingPurpose::Fetch,
+                    basis.clone(),
+                )
+                .map_err(|_| LoaderError::RequestIdsExhausted)?;
+            self.io.fetch(req, content_hash, &basis);
+            if let Some(CandidateTerminal::Built { fetched, .. }) = self
+                .sweep
+                .as_mut()
+                .and_then(|sweep| sweep.candidates.get_mut(&uuid))
+                .map(|candidate| &mut candidate.terminal)
+            {
+                *fetched = false;
+            }
+        }
+        Ok(())
     }
 
     fn issue_sweep_requests(&mut self) -> Result<(), LoaderError> {

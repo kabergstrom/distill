@@ -2525,3 +2525,60 @@ fn a_delta_keeps_a_fetched_payload_and_refetches_only_changed_content() {
     assert_eq!(storage.commits.len(), 2);
     assert!(loader.take_diagnostics().is_empty());
 }
+
+
+/// A handle that binds to a candidate after its payload was taken (here a
+/// path resolving to a dependency fetched while a sibling still fetches)
+/// has no constructed value: the candidate fetches again, constructs only
+/// the new handle's value, and the component then commits.
+#[test]
+fn a_handle_joining_a_fetched_candidate_refetches_it() {
+    let token = ModuleEpochToken::new(80);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 80, &token);
+    let parent_uuid = uuid(80);
+    let child_uuid = uuid(81);
+    let sibling_uuid = uuid(82);
+    let parent = loader.add_ref::<A>(parent_uuid).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+    let (parent_hash, parent_artifact) = artifact_with_edges::<A>(
+        parent_uuid,
+        &[(child_uuid, B::TYPE_UUID), (sibling_uuid, B::TYPE_UUID)],
+    );
+    resolve(&mut loader, parent_uuid, parent_hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, parent_hash, parent_artifact);
+    loader.process(&mut storage).unwrap();
+    loader.process(&mut storage).unwrap();
+    let (child_hash, child_artifact) = artifact::<B>(child_uuid, &[]);
+    let (sibling_hash, sibling_artifact) = artifact::<B>(sibling_uuid, &[]);
+    resolve(&mut loader, child_uuid, child_hash);
+    resolve(&mut loader, sibling_uuid, sibling_hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, child_hash, child_artifact.clone());
+    loader.process(&mut storage).unwrap();
+    assert_eq!(fetch_count(&loader), 3);
+
+    let by_path = loader.add_ref_indirect::<B>("child.b").unwrap();
+    loader.process(&mut storage).unwrap();
+    let (path_req, path_basis) = loader.io().path_for("child.b");
+    loader.io_mut().push(IoEvent::PathResolved {
+        req: path_req,
+        path: "child.b".into(),
+        result: PathResolveResult::Resolved(child_uuid),
+        basis: path_basis,
+    });
+    loader.process(&mut storage).unwrap();
+    assert_eq!(fetch_count(&loader), 4, "the child fetches again");
+    fetched(&mut loader, sibling_hash, sibling_artifact);
+    loader.process(&mut storage).unwrap();
+    assert!(storage.updates.is_empty(), "the component waits for the refetch");
+
+    fetched(&mut loader, child_hash, child_artifact);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.status(&parent), LoadStatus::Loaded);
+    assert_eq!(loader.status(&by_path), LoadStatus::Loaded);
+    assert_eq!(storage.commits.len(), 4, "parent, sibling and both child handles");
+    assert!(loader.take_diagnostics().is_empty());
+}
