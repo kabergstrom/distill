@@ -765,6 +765,7 @@ fn editing_a_rules_settings_reimports_its_outputs_in_a_watcher_pass() {
     coordinator.reconcile_directory_imports(&mut writer).unwrap();
     let read = || distill_bundle::parse_bundle(&std::fs::read(assets.join("foo.bundle")).unwrap()).unwrap();
     assert_eq!(read().assets["asset"].data, byte(8));
+    let generated = identities(&assets.join("foo.bundle"));
     // The generated bundle's publication settles first, as in the daemon.
     coordinator
         .reconcile_batch(&mut writer, &batch(&assets, &["foo.bundle"]), false)
@@ -775,6 +776,8 @@ fn editing_a_rules_settings_reimports_its_outputs_in_a_watcher_pass() {
         .reconcile_batch(&mut writer, &batch(&assets, &["rules.bundle"]), false)
         .unwrap();
     assert_eq!(read().assets["asset"].data, byte(12));
+    // The regenerated output folds over its prior: every UUID is kept.
+    assert_eq!(identities(&assets.join("foo.bundle")), generated);
 }
 /// Deleting a rules source orphans what its rules generated, found from
 /// the work alone: the removed rules bundle no longer has a row, and the
@@ -1777,4 +1780,179 @@ fn read_settings_returns_the_bundle_settings_and_an_edit_reruns_the_reader() {
     assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
     assert_eq!(outcome.imported.len(), 1, "the reader, and only it");
     assert_eq!(value("reader.bundle"), Some(5));
+}
+
+/// The bundle UUID and each entry's UUID by local id of the bundle at `path`.
+fn identities(path: &std::path::Path) -> (BundleUuid, BTreeMap<String, AssetUuid>) {
+    let bundle = distill_bundle::parse_bundle(&std::fs::read(path).unwrap()).unwrap();
+    let entries = bundle
+        .assets
+        .iter()
+        .map(|(local_id, entry)| (local_id.clone(), entry.uuid))
+        .collect();
+    (bundle.uuid, entries)
+}
+
+/// A daemon over a fresh store at `dir/.distill` whose root "main" is
+/// `assets`, scanned and configured.
+fn open_configured(dir: &std::path::Path, assets: &std::path::Path) -> DaemonCoordinator {
+    let coordinator = DaemonCoordinator::open(
+        StoreConfig::new(dir.join(".distill")),
+        vec![AssetRoot::new("main", assets)],
+        vec![target()],
+        64,
+    )
+    .unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    configure(&coordinator, dir, assets);
+    coordinator
+}
+
+/// A first import mints random UUIDs that depend on nothing it read:
+/// identical sources at two paths get distinct ones. The bundle then keeps
+/// them through every reimport, also from a source moved to another path
+/// together with the bundle.
+#[test]
+fn first_imports_mint_fresh_identities_that_reimports_and_moves_keep() {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(assets.join("copy")).unwrap();
+    std::fs::write(assets.join("source.txt"), b"7").unwrap();
+    std::fs::write(assets.join("copy/source.txt"), b"7").unwrap();
+    let coordinator = open_configured(temp.path(), &assets);
+    let mut writer = coordinator.open_writer().unwrap();
+
+    let bundle = import(&coordinator, BYTE_IMPORTER, &["source.txt"], "imported.bundle");
+    let copy = import(
+        &coordinator,
+        BYTE_IMPORTER,
+        &["copy/source.txt"],
+        "copy/imported.bundle",
+    );
+    let first = identities(&assets.join("imported.bundle"));
+    let copied = identities(&assets.join("copy/imported.bundle"));
+    assert_eq!(first.0, bundle);
+    assert_eq!(copied.0, copy);
+    assert_ne!(bundle, copy);
+    assert_eq!(
+        first.1.keys().collect::<Vec<_>>(),
+        ["$record", "$settings", "asset"]
+    );
+    for uuid in first.1.values() {
+        assert!(
+            !copied.1.values().any(|other| other == uuid),
+            "identical sources at two paths share {uuid:?}"
+        );
+    }
+
+    // An explicit reimport over the bundle, and a watched one.
+    assert_eq!(
+        import(&coordinator, BYTE_IMPORTER, &["source.txt"], "imported.bundle"),
+        bundle
+    );
+    assert_eq!(identities(&assets.join("imported.bundle")), first);
+    std::fs::write(assets.join("source.txt"), b"8").unwrap();
+    coordinator
+        .reconcile_incremental(&mut writer, &batch(&assets, &["source.txt"]))
+        .unwrap();
+    assert_eq!(
+        coordinator.reconcile_watched_imports(&mut writer).unwrap(),
+        vec![bundle]
+    );
+    assert_eq!(identities(&assets.join("imported.bundle")), first);
+
+    // The source and its bundle move to another directory; the import from
+    // the moved source over the moved bundle keeps every UUID.
+    std::fs::create_dir_all(assets.join("moved")).unwrap();
+    std::fs::rename(assets.join("source.txt"), assets.join("moved/source.txt")).unwrap();
+    std::fs::rename(
+        assets.join("imported.bundle"),
+        assets.join("moved/imported.bundle"),
+    )
+    .unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    assert_eq!(
+        import(
+            &coordinator,
+            BYTE_IMPORTER,
+            &["moved/source.txt"],
+            "moved/imported.bundle",
+        ),
+        bundle
+    );
+    let moved = identities(&assets.join("moved/imported.bundle"));
+    assert_eq!(moved, first);
+    let moved = distill_bundle::parse_bundle(
+        &std::fs::read(assets.join("moved/imported.bundle")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(moved.assets["asset"].data, byte(8));
+}
+
+/// A first import whose bundle was written but whose commit the daemon lost
+/// (a crash before the store committed; here the whole store is lost) does
+/// not mint twice: the retried import finds the written bundle in the scan
+/// and folds over it.
+#[test]
+fn a_first_import_retried_after_its_commit_was_lost_keeps_its_identities() {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("source.txt"), b"7").unwrap();
+    let coordinator = open_configured(temp.path(), &assets);
+    let bundle = import(&coordinator, BYTE_IMPORTER, &["source.txt"], "imported.bundle");
+    let first = identities(&assets.join("imported.bundle"));
+    drop(coordinator);
+
+    std::fs::remove_dir_all(temp.path().join(".distill")).unwrap();
+    let coordinator = open_configured(temp.path(), &assets);
+    assert_eq!(
+        import(&coordinator, BYTE_IMPORTER, &["source.txt"], "imported.bundle"),
+        bundle
+    );
+    assert_eq!(identities(&assets.join("imported.bundle")), first);
+}
+
+/// A pass folds a first import twice: once as the output the imports
+/// chained to it read, once to publish it. Both folds mint the same UUIDs,
+/// so the chained import's read of the output still holds at publication
+/// and the whole chain publishes in one version.
+#[test]
+fn a_first_import_chained_in_a_pass_publishes_the_identities_its_readers_read() {
+    let (_temp, assets, coordinator) = chained_imports(&["b"]);
+    let before = identities(&assets.join("a.bundle"));
+    let mut writer = coordinator.open_writer().unwrap();
+    let base = writer.input_version().unwrap();
+
+    // The generated bundle is deleted and its source edited: its rules
+    // import it anew, and the import reading it runs on that output.
+    std::fs::remove_file(assets.join("a.bundle")).unwrap();
+    std::fs::write(assets.join("a.src"), b"5").unwrap();
+    let outcome = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["a.bundle", "a.src"]), false)
+        .unwrap();
+    assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+    // b published with the regenerated a it read: had the publication
+    // minted other UUIDs than the preview b read, b would have drifted.
+    assert_eq!(outcome.stamp.version, InputVersion(base.0 + 1));
+    assert_eq!(outcome.imported.len(), 2, "{:?}", outcome.imported);
+    let reader = coordinator.open_reader().unwrap();
+    assert_eq!(
+        generated_values(&reader, &assets, &["a", "b"]),
+        [Some(5), Some(6)]
+    );
+    // The outputs' own watcher work finds nothing left to import.
+    let echo = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["a.bundle", "b.bundle"]), false)
+        .unwrap();
+    assert!(echo.imported.is_empty(), "{:?}", echo.imported);
+    assert!(echo.failures.is_empty(), "{:?}", echo.failures);
+    let after = identities(&assets.join("a.bundle"));
+    for uuid in after.1.values().chain([&AssetUuid(after.0 .0)]) {
+        assert!(
+            !before.1.values().any(|old| old == uuid) && before.0 .0 != uuid.0,
+            "a deleted bundle's identity is not minted again"
+        );
+    }
 }
