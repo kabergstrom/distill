@@ -2075,6 +2075,26 @@ affects only newly adopted assets, never silently reinterpreting old ones.
   or adoption) and live in the file as content. Identity survives file renames
   and moves trivially because it travels inside the file — and survives daemon
   downtime, git operations, and daemon-state loss for the same reason.
+- Import minting (§8): a first import's UUIDs (bundle, entries, `$settings`,
+  `$record`) are random UUIDv4s, expanded by BLAKE3 from one 32-byte OS-random
+  seed drawn per import run.
+  - They depend on nothing a bundle can be reimported from (source path,
+    input version, importer): identical sources at two paths get distinct
+    UUIDs; a bundle moved with its source keeps its own.
+  - Minted once: every later fold takes them from the prior bundle (entries
+    by `local_id`).
+  - Every fold of one run expands the same seed, so a pass's preview of an
+    output (read by imports chained to it, §8) and its publication carry the
+    same UUIDs.
+  - A retried first import never mints twice. A run's UUIDs leave the daemon
+    only in its atomically written bundle; a write whose commit was lost
+    (crash, rolled-back pass) is a file the next scan indexes, and the retry
+    folds over it as its prior. A run that wrote nothing exposed no UUID.
+  - Directory-rule outputs (§8) fold over the prior bundle at their output
+    path, so they keep their UUIDs across reimports; a source moved to
+    another path generates a new output path, a first import with new UUIDs,
+    and orphans the old output. Moving the output along is a collision, not
+    a reimport: its `ImportRecord.origin` names the old group.
 - Processing preserves identity: the primary output carries the parent
   asset's UUID. Extra derived outputs (§9) get `UUIDv5(parent_uuid,
   output_key)` — keys are statically declared and unique across the type's
@@ -2384,8 +2404,9 @@ import(source bytes, settings, Option<prior bundle>) → bundle
 Content flows from the sources; identity and decisions flow from the prior
 bundle — the bundle UUID, entry UUIDs (matched by `local_id`), primary
 selection, and the import-settings entry itself. Fresh UUIDs are minted only
-for entries with no `local_id` match: the single nondeterministic step.
-Everything else is deterministic, which makes re-import a **fixpoint**: a
+where the prior has none (no `local_id` match, or no prior bundle): the single
+nondeterministic step, random and drawn once per run (§7), never derived from
+the source path, input version or importer. Everything else is deterministic, which makes re-import a **fixpoint**: a
 bundle is in sync exactly when re-running its import over its recorded
 read-set reproduces it byte-identically. `doctor` and CI verify that
 fixpoint for every watched bundle, so the
