@@ -22,7 +22,7 @@
 
 use std::cell::Cell;
 use std::io::{BufWriter, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
@@ -141,6 +141,9 @@ fn spawn_sender(listener: TcpListener, messages: usize) -> std::thread::JoinHand
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Receiver {
     Stock,
+    /// `Stock` copying into the sink with `distill_core::copy` streaming
+    /// stores, fenced per message (nt-copy).
+    StockStreaming,
     Split,
     Reused,
 }
@@ -195,7 +198,7 @@ fn receive(receiver: Receiver, sink: &mut [u8], sink_cursor: &mut usize) -> Part
             let at = *sink_cursor;
             *sink_cursor = (*sink_cursor + CHUNK) % (SINK - CHUNK);
             match receiver {
-                Receiver::Stock => {
+                Receiver::Stock | Receiver::StockStreaming => {
                     let t0 = Instant::now();
                     let f0 = minflt();
                     let message = capnp_futures::serialize::try_read_message(&mut reader, options)
@@ -206,7 +209,12 @@ fn receive(receiver: Receiver, sink: &mut [u8], sink_cursor: &mut usize) -> Part
                     let f1 = minflt();
                     let bytes = message.get_root::<capnp::data::Reader>().unwrap();
                     let t2 = Instant::now();
-                    sink[at..at + bytes.len()].copy_from_slice(bytes);
+                    if receiver == Receiver::StockStreaming {
+                        distill_core::copy::copy_streaming(&mut sink[at..at + bytes.len()], bytes);
+                        distill_core::copy::publish();
+                    } else {
+                        sink[at..at + bytes.len()].copy_from_slice(bytes);
+                    }
                     let t3 = Instant::now();
                     let f3 = minflt();
                     drop(message);
@@ -294,7 +302,7 @@ fn report(receiver: Receiver, iteration: usize, parts: &Parts) {
         busy as f64 * 1e-6,
         rate(bytes, busy),
     );
-    if receiver == Receiver::Stock {
+    if matches!(receiver, Receiver::Stock | Receiver::StockStreaming) {
         println!(
             "  read_message {:7.1} ms {}  faults {}",
             parts.read_message_ns as f64 * 1e-6,
@@ -348,7 +356,12 @@ fn probe_receive_parts() {
     // Warm sink: prefaulted once, reused (a staging ring stand-in).
     let mut sink = vec![1u8; SINK];
     let mut cursor = 0usize;
-    for receiver in [Receiver::Stock, Receiver::Split, Receiver::Reused] {
+    for receiver in [
+        Receiver::Stock,
+        Receiver::StockStreaming,
+        Receiver::Split,
+        Receiver::Reused,
+    ] {
         // The first pass warms the allocator (glibc's dynamic mmap
         // threshold) and the sender; it is reported but not representative.
         for iteration in 0..=ITERATIONS {
@@ -356,30 +369,6 @@ fn probe_receive_parts() {
             report(receiver, iteration, &parts);
         }
     }
-}
-
-/// Copy with 32-byte non-temporal stores; `dst` must be 32-byte aligned
-/// and both lengths a multiple of 128.
-#[target_feature(enable = "avx2")]
-unsafe fn copy_nt(dst: &mut [u8], src: &[u8]) {
-    use std::arch::x86_64::*;
-    assert_eq!(dst.len(), src.len());
-    assert_eq!(dst.as_ptr() as usize % 32, 0);
-    let mut offset = 0;
-    let s = src.as_ptr();
-    let d = dst.as_mut_ptr();
-    while offset < src.len() {
-        let a = _mm256_loadu_si256(s.add(offset) as *const __m256i);
-        let b = _mm256_loadu_si256(s.add(offset + 32) as *const __m256i);
-        let c = _mm256_loadu_si256(s.add(offset + 64) as *const __m256i);
-        let e = _mm256_loadu_si256(s.add(offset + 96) as *const __m256i);
-        _mm256_stream_si256(d.add(offset) as *mut __m256i, a);
-        _mm256_stream_si256(d.add(offset + 32) as *mut __m256i, b);
-        _mm256_stream_si256(d.add(offset + 64) as *mut __m256i, c);
-        _mm256_stream_si256(d.add(offset + 96) as *mut __m256i, e);
-        offset += 128;
-    }
-    _mm_sfence();
 }
 
 fn aligned(buffer: &mut [u8], len: usize) -> &mut [u8] {
@@ -391,6 +380,7 @@ fn aligned(buffer: &mut [u8], len: usize) -> &mut [u8] {
 #[ignore = "measurement probe (doc 22 phase 0)"]
 fn probe_copy_shapes() {
     const TOTAL: usize = 256 << 20;
+    const FONT: usize = 36 << 20;
     let bytes = TOTAL as u64;
     let mut dst_buffer = vec![1u8; TOTAL + 64];
     let dst = aligned(&mut dst_buffer, TOTAL);
@@ -421,11 +411,44 @@ fn probe_copy_shapes() {
             chunk.copy_from_slice(src);
         }
     });
-    run("256 x 1 MiB non-temporal copy, hot src, warm dst", &mut || {
+    run("256 x 1 MiB streaming copy (distill_core::copy), hot src, warm dst", &mut || {
         for chunk in dst.chunks_exact_mut(CHUNK) {
-            // SAFETY: AVX2 is present on the measuring machine; chunks of
-            // an aligned buffer stay aligned.
-            unsafe { copy_nt(chunk, &src_hot) };
+            distill_core::copy::copy_streaming(chunk, &src_hot);
+        }
+        distill_core::copy::publish();
+    });
+    run("256 x 1 MiB streaming copy, cold src, warm dst", &mut || {
+        for (chunk, src) in dst.chunks_exact_mut(CHUNK).zip(src_big.chunks_exact(CHUNK)) {
+            distill_core::copy::copy_streaming(chunk, src);
+        }
+        distill_core::copy::publish();
+    });
+    // The loader's fetch buffer (nt-copy): sized once, never touched before
+    // 64 KiB chunks arrive, so every page faults in during the copy.
+    run("fresh 256 MiB Vec, 64 KiB memcpy chunks (page faults)", &mut || {
+        fresh_fill(&src_hot, false);
+    });
+    run("fresh 256 MiB Vec, 64 KiB streaming chunks (page faults)", &mut || {
+        fresh_fill(&src_hot, true);
+    });
+    // The font's `to_vec` (36 MiB, fresh pages): 7 per pass, 252 MiB.
+    let font = &src_big[..FONT];
+    run("7 x 36 MiB to_vec into fresh pages (glibc: non-temporal above 24 MiB)", &mut || {
+        for _ in 0..7 {
+            std::hint::black_box(font.to_vec());
+        }
+    });
+    run("7 x 36 MiB streaming copy into fresh pages", &mut || {
+        for _ in 0..7 {
+            let mut out = Vec::<u8>::with_capacity(FONT);
+            // SAFETY: `out` has room for `FONT` bytes, all written before
+            // `set_len`.
+            unsafe {
+                distill_core::copy::copy_streaming_raw(font.as_ptr(), out.as_mut_ptr(), FONT);
+                out.set_len(FONT);
+            }
+            distill_core::copy::publish();
+            std::hint::black_box(out);
         }
     });
     run("256 x 1 MiB memcpy into one cache-resident 1 MiB dst", &mut || {
@@ -457,4 +480,27 @@ fn probe_copy_shapes() {
             rate(bytes, low),
         );
     }
+}
+
+/// 256 MiB into a fresh `Vec` in 64 KiB chunks from a hot source, as the
+/// loader's fetch buffer fills; dropped after.
+fn fresh_fill(src_hot: &[u8], streaming: bool) {
+    const TOTAL: usize = 256 << 20;
+    const PIECE: usize = 64 << 10;
+    let mut out = Vec::<u8>::with_capacity(TOTAL);
+    for at in (0..TOTAL).step_by(PIECE) {
+        // SAFETY: `out` has `TOTAL` bytes of capacity; each piece is written
+        // in full before `set_len` covers it.
+        unsafe {
+            let dst = out.as_mut_ptr().add(at);
+            if streaming {
+                distill_core::copy::copy_streaming_raw(src_hot.as_ptr(), dst, PIECE);
+            } else {
+                std::ptr::copy_nonoverlapping(src_hot.as_ptr(), dst, PIECE);
+            }
+            out.set_len(at + PIECE);
+        }
+    }
+    distill_core::copy::publish();
+    std::hint::black_box(&out);
 }

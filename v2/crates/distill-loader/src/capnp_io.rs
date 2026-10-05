@@ -1374,7 +1374,7 @@ async fn fetch_event(
     timing.answered = Some(Instant::now());
     let mut reservation = shared.admission.admit(total_bytes).await;
     timing.admitted = Some(Instant::now());
-    let (structural, blobs) =
+    let payload =
         match collect_remote_chunks(shared, &mut terminal.value, total_bytes, &mut timing).await {
             Ok(payload) => payload,
             Err(error) => return fail(error),
@@ -1384,7 +1384,8 @@ async fn fetch_event(
     // authenticates the artifact itself (content hash, structure) when it
     // parses it; hashing every byte here as well would double that cost on
     // the engine thread.
-    let layout_hash = match distill_wire::artifact::artifact_header_layout_hash(&structural) {
+    let structural = &payload.bytes[payload.structural.clone()];
+    let layout_hash = match distill_wire::artifact::artifact_header_layout_hash(structural) {
         Ok(layout_hash) => layout_hash,
         Err(error) => return fail(format!("invalid fetched artifact: {error}")),
     };
@@ -1396,7 +1397,7 @@ async fn fetch_event(
     reservation.grow(wire_layout.len());
     let wire_layout = memory_wire_blob(wire_layout);
     timing.completed = Some(Instant::now());
-    match fetched_artifact(layout_hash, structural, blobs, load_edges, wire_layout, timing) {
+    match fetched_artifact(layout_hash, payload, load_edges, wire_layout, timing) {
         Ok(artifact) => (
             IoEvent::Fetched {
                 req,
@@ -1410,27 +1411,55 @@ async fn fetch_event(
     }
 }
 
-/// The payload's chunks, collected; counts them into `shared`'s totals and
-/// `timing` (chunks, bytes, copy time).
+/// A fetched payload: every section in one buffer, sized from the
+/// authenticated total before the first chunk, each section starting at a
+/// [`SECTION_ALIGN`]-byte offset.
+pub(crate) struct RemotePayload {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) structural: std::ops::Range<usize>,
+    pub(crate) blobs: Vec<std::ops::Range<usize>>,
+}
+
+/// Section start alignment in a [`RemotePayload`]: what a separately
+/// allocated section had from the allocator.
+const SECTION_ALIGN: usize = 16;
+
+/// The payload's chunks, collected into one buffer sized up front (no
+/// growth reallocations); counts them into `shared`'s totals and `timing`
+/// (chunks, bytes, copy time). The server sends the structural section,
+/// then blob 0, 1, ... in order, each section's chunks contiguous.
 async fn collect_remote_chunks(
     shared: &Shared,
     stream: &mut distill_rpc::capnp_loader::RemoteChunkStream,
     total_bytes: usize,
     timing: &mut crate::stats::FetchTiming,
-) -> Result<(Vec<u8>, Vec<Vec<u8>>), String> {
-    let mut structural = Vec::new();
-    let mut blobs = std::collections::BTreeMap::<u32, Vec<u8>>::new();
+) -> Result<RemotePayload, String> {
+    // Room for the alignment padding of up to 64 sections; more sections
+    // grow the buffer once.
+    let mut bytes = Vec::<u8>::with_capacity(total_bytes.saturating_add(64 * SECTION_ALIGN));
+    // [0] structural, [k + 1] blob k; the last one's end is `bytes.len()`.
+    let mut sections = Vec::<std::ops::Range<usize>>::new();
     let mut total = 0usize;
     loop {
         match stream.next_chunk().await {
             Ok(Some(chunk)) => {
-                let output = match chunk.kind {
-                    distill_rpc::ArtifactChunkKind::Structural => &mut structural,
-                    distill_rpc::ArtifactChunkKind::Blob { index } => {
-                        blobs.entry(index).or_default()
-                    }
+                let section = match chunk.kind {
+                    distill_rpc::ArtifactChunkKind::Structural => 0usize,
+                    distill_rpc::ArtifactChunkKind::Blob { index } => index as usize + 1,
                 };
-                if chunk.offset != output.len() as u64 {
+                if sections.is_empty() && section == 1 {
+                    sections.push(0..0); // no structural chunk: an empty section
+                }
+                if section == sections.len() && chunk.offset == 0 {
+                    if let Some(last) = sections.last_mut() {
+                        last.end = bytes.len();
+                    }
+                    let start = bytes.len().next_multiple_of(SECTION_ALIGN);
+                    bytes.resize(start, 0);
+                    sections.push(start..start);
+                } else if section + 1 != sections.len()
+                    || chunk.offset != (bytes.len() - sections[section].start) as u64
+                {
                     return Err("artifact chunks are not contiguous".into());
                 }
                 total = total
@@ -1440,25 +1469,47 @@ async fn collect_remote_chunks(
                     return Err("artifact stream exceeds its authenticated total".into());
                 }
                 let copy_started = Instant::now();
-                output.extend_from_slice(&chunk.bytes);
+                let len = chunk.bytes.len();
+                bytes.reserve(len);
+                let at = bytes.len();
+                // Ordinary stores, not `distill_core::copy` streaming ones: the
+                // buffer is fresh, so each page is faulted in and zeroed by the
+                // kernel just before the copy reaches it and is cache-hot;
+                // streaming stores measured slower here (doc 22 §1.6, nt-copy).
+                // A pooled, prefaulted buffer (phase 2) takes streaming stores.
+                // SAFETY: `reserve` made room for `len` bytes past `at`; the
+                // copy initialises all of them before `set_len`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        chunk.bytes.as_ptr(),
+                        bytes.as_mut_ptr().add(at),
+                        len,
+                    );
+                    bytes.set_len(at + len);
+                }
                 timing.copy_ns += copy_started.elapsed().as_nanos() as u64;
                 timing.chunks += 1;
-                timing.bytes += chunk.bytes.len() as u64;
+                timing.bytes += len as u64;
                 shared.received_chunks.set(shared.received_chunks.get() + 1);
                 shared
                     .received_bytes
-                    .set(shared.received_bytes.get() + chunk.bytes.len() as u64);
+                    .set(shared.received_bytes.get() + len as u64);
             }
             Ok(None) => {
-                if blobs.keys().copied().ne(0..blobs.len() as u32) {
-                    return Err("artifact blob chunk indices are not contiguous".into());
-                }
                 if total != total_bytes {
                     return Err(
                         "artifact stream length differs from its authenticated total".into(),
                     );
                 }
-                return Ok((structural, blobs.into_values().collect()));
+                if let Some(last) = sections.last_mut() {
+                    last.end = bytes.len();
+                }
+                let mut sections = sections.into_iter();
+                return Ok(RemotePayload {
+                    structural: sections.next().unwrap_or(0..0),
+                    blobs: sections.collect(),
+                    bytes,
+                });
             }
             Err(error) => return Err(error.to_string()),
         }

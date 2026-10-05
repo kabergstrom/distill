@@ -17,23 +17,23 @@ pub(crate) fn io_basis(basis: &RpcBasis) -> IoBasis {
 
 pub(crate) fn fetched_artifact(
     layout_hash: LayoutHash,
-    structural: Vec<u8>,
-    raw_blobs: Vec<Vec<u8>>,
+    payload: crate::capnp_io::RemotePayload,
     load_edges: Vec<distill_rpc::ServedLoadEdge>,
     wire_layout: Blob,
     timing: crate::stats::FetchTiming,
 ) -> Result<FetchedArtifact, String> {
     verify_wire_layout(layout_hash, wire_layout.as_bytes())?;
-    let blobs = raw_blobs
+    // The structural section is small and read on the loader thread; the
+    // blobs stay ranges of the one received buffer.
+    let structural = Arc::from(&payload.bytes[payload.structural.clone()]);
+    let backing: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(payload.bytes);
+    let blobs = payload
+        .blobs
         .into_iter()
-        .map(|bytes| {
-            let len = bytes.len();
-            let backing: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(bytes);
-            Blob::new(backing, 0, len)
-        })
+        .map(|range| Blob::new(backing.clone(), range.start, range.len()))
         .collect();
     Ok(FetchedArtifact {
-        structural: Arc::from(structural),
+        structural,
         blobs,
         load_edges,
         wire_layout,

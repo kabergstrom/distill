@@ -765,7 +765,8 @@ impl RemoteChunkStream {
                 )))
             }
         };
-        let bytes: Arc<[u8]> = Arc::from(value.get_bytes()?.to_vec());
+        // One copy out of the message (`Arc::from(Vec)` would copy a second time).
+        let bytes: Arc<[u8]> = Arc::from(value.get_bytes()?);
         self.received = self.received.saturating_add(bytes.len() as u64);
         Ok(Some(ArtifactChunk {
             kind,
