@@ -126,6 +126,10 @@ pub struct RequestTracker {
     newest: BTreeMap<RequestOwner, ReqId>,
     /// Requests retired by `retire_basis` since `forget_cancelled`.
     cancelled: BTreeSet<ReqId>,
+    /// Requests the loader stopped wanting while their basis stays open
+    /// (a delta keeps the old basis for its in-flight fetches, doc 22 §5):
+    /// their answers still arrive and are dropped as `Cancelled`.
+    dropped: BTreeMap<ReqId, IoBasis>,
 }
 
 impl RequestTracker {
@@ -136,6 +140,7 @@ impl RequestTracker {
             outstanding: BTreeMap::new(),
             newest: BTreeMap::new(),
             cancelled: BTreeSet::new(),
+            dropped: BTreeMap::new(),
         }
     }
 
@@ -148,6 +153,7 @@ impl RequestTracker {
         self.outstanding.clear();
         self.newest.clear();
         self.cancelled.clear();
+        self.dropped.clear();
         Ok(self.connection)
     }
 
@@ -175,7 +181,7 @@ impl RequestTracker {
     /// event can never become acceptable after another state transition.
     pub fn complete(&mut self, req: ReqId, event_basis: &IoBasis) -> CompletionDisposition {
         let Some(record) = self.outstanding.remove(&req) else {
-            if self.cancelled.remove(&req) {
+            if self.cancelled.remove(&req) || self.dropped.remove(&req).is_some() {
                 return CompletionDisposition::Cancelled;
             }
             return CompletionDisposition::UnknownOrRetired;
@@ -204,8 +210,44 @@ impl RequestTracker {
             }
             keep
         });
+        self.dropped.retain(|req, dropped| {
+            let keep = dropped != basis;
+            if !keep {
+                cancelled.insert(*req);
+            }
+            keep
+        });
         let outstanding = &self.outstanding;
         self.newest.retain(|_, req| outstanding.contains_key(req));
+    }
+
+    /// Stop wanting every request under `basis` except its fetches, which
+    /// stay outstanding: the basis stays open for them.
+    pub fn drop_basis_except_fetches(&mut self, basis: &IoBasis) {
+        let dropped = &mut self.dropped;
+        self.outstanding.retain(|req, record| {
+            let keep = &record.basis != basis || record.purpose == OutstandingPurpose::Fetch;
+            if !keep {
+                dropped.insert(*req, record.basis.clone());
+            }
+            keep
+        });
+        let outstanding = &self.outstanding;
+        self.newest.retain(|_, req| outstanding.contains_key(req));
+    }
+
+    /// The (asset, content hash) of each fetch outstanding under `basis`.
+    pub fn fetches_under<'a>(
+        &'a self,
+        basis: &'a IoBasis,
+    ) -> impl Iterator<Item = (AssetUuid, ContentHash)> + 'a {
+        self.outstanding
+            .values()
+            .filter(move |record| &record.basis == basis)
+            .filter_map(|record| match record.owner {
+                RequestOwner::Content { asset, hash } => Some((asset, hash)),
+                _ => None,
+            })
     }
 
     /// Forget the requests retired before this batch: their answers can no

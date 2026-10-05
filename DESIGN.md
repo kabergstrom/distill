@@ -6197,7 +6197,14 @@ assets under that basis, then expand — a rebuilt parent's new artifact
 may carry load deps
 the client has never held, so the sweep resolves newly appearing
 dependencies against the same basis and repeats to a fixpoint — fetch,
-and swap behind handles at one frame boundary. Component adoption
+and swap behind handles at one frame boundary. Each component swaps as
+soon as it closes (every member fetched and its load edges known), not
+when the whole sweep is done, and a component whose storage update
+waits on GPU readiness holds only itself (newgameplus doc 22 §5). A
+delta arriving mid-sweep rebases it: every candidate re-resolves at the
+new basis, and one whose answer names the ContentHash it already fetched
+or is still fetching keeps that payload; the old basis stays open until
+those fetches answer. Component adoption
 requires every member's terminal outcome to carry **one** basis: the
 basis rides in every outcome (`IoEvent`, below), so a mixed-basis
 component is detectable by inspection, and the rule for it is the
@@ -6261,8 +6268,8 @@ The only freedom left to a client is its **retry policy** on `Drifted`:
   member of an affected component re-resolves at the refreshed snapshot
   (Version-consistent swap, above; early cutoff keeps unchanged members
   cheap), and unrelated components never drift; the loop
-  terminates at quiescence; until a full sweep succeeds at one snapshot the
-  client keeps its previous consistent set. Mixed versions are structurally
+  terminates at quiescence; until a component succeeds at one snapshot the
+  client keeps that component's previous consistent set. Mixed versions are structurally
   impossible — every resolve in a batch names the same snapshot, so batches
   are consistent by construction, not by checking.
 - **Surface (tooling).** No retry: report the drift. A pack build fails

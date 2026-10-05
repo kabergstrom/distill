@@ -67,13 +67,33 @@ impl ComponentPlanner {
         held: &BTreeSet<AssetUuid>,
         candidates: &BTreeMap<AssetUuid, CandidateAsset>,
     ) -> Vec<AdoptionDecision> {
+        let edges = candidates
+            .values()
+            .map(|candidate| (candidate.uuid, candidate.load_deps.clone()))
+            .collect();
+        self.components(held, &edges)
+            .into_iter()
+            .map(|members| decide(members, candidates))
+            .collect()
+    }
+
+    /// The load-dependency components (weakly connected over old ∪
+    /// candidate edges) of `held` and the candidates in `edges`, each
+    /// sorted. A candidate whose load edges are not known yet has an empty
+    /// edge list: its component is not closed (doc 22 §5), and only it can
+    /// grow it.
+    pub fn components(
+        &self,
+        held: &BTreeSet<AssetUuid>,
+        edges: &BTreeMap<AssetUuid, Vec<AssetUuid>>,
+    ) -> Vec<Vec<AssetUuid>> {
         let mut universe = held.clone();
-        universe.extend(candidates.keys().copied());
-        for candidate in candidates.values() {
-            universe.extend(candidate.load_deps.iter().copied());
+        universe.extend(edges.keys().copied());
+        for deps in edges.values() {
+            universe.extend(deps.iter().copied());
         }
         for (parent, children) in &self.current {
-            if held.contains(parent) || candidates.contains_key(parent) {
+            if held.contains(parent) || edges.contains_key(parent) {
                 universe.insert(*parent);
                 universe.extend(children.iter().copied());
             }
@@ -90,23 +110,15 @@ impl ComponentPlanner {
         for (parent, children) in &self.current {
             union_edges(*parent, children, &indices, &mut sets);
         }
-        for candidate in candidates.values() {
-            union_edges(
-                candidate.uuid,
-                &candidate.load_deps.iter().copied().collect(),
-                &indices,
-                &mut sets,
-            );
+        for (uuid, deps) in edges {
+            union_edges(*uuid, deps.iter(), &indices, &mut sets);
         }
 
         let mut components: BTreeMap<usize, Vec<AssetUuid>> = BTreeMap::new();
         for (index, uuid) in nodes.into_iter().enumerate() {
             components.entry(sets.find(index)).or_default().push(uuid);
         }
-        components
-            .into_values()
-            .map(|members| decide(members, candidates))
-            .collect()
+        components.into_values().collect()
     }
 }
 
@@ -167,9 +179,9 @@ pub fn load_cycles(graph: &BTreeMap<AssetUuid, Vec<AssetUuid>>) -> Vec<Vec<Asset
     cycles
 }
 
-fn union_edges(
+fn union_edges<'a>(
     parent: AssetUuid,
-    children: &BTreeSet<AssetUuid>,
+    children: impl IntoIterator<Item = &'a AssetUuid>,
     indices: &BTreeMap<AssetUuid, usize>,
     sets: &mut DisjointSets,
 ) {
@@ -183,7 +195,8 @@ fn union_edges(
     }
 }
 
-fn decide(
+/// The adoption decision for one component's `members`.
+pub fn decide(
     members: Vec<AssetUuid>,
     candidates: &BTreeMap<AssetUuid, CandidateAsset>,
 ) -> AdoptionDecision {

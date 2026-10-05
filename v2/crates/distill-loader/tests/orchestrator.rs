@@ -2281,3 +2281,247 @@ fn an_unknown_path_fails_at_its_first_answer_and_resolves_when_it_appears() {
     loader.process(&mut storage).unwrap();
     assert_eq!(loader.status(&handle), LoadStatus::Loaded);
 }
+
+fn fetch_count(loader: &Loader<MockIo>) -> usize {
+    loader
+        .io()
+        .commands
+        .iter()
+        .filter(|command| matches!(command, Command::Fetch(..)))
+        .count()
+}
+
+fn ended(loader: &Loader<MockIo>, ended_basis: &IoBasis) -> usize {
+    loader
+        .io()
+        .commands
+        .iter()
+        .filter(|command| matches!(command, Command::EndSweep(basis) if basis == ended_basis))
+        .count()
+}
+
+/// Doc 22 §5: a component commits once it is closed, not when the whole
+/// sweep is. A small asset commits while a large unrelated one is still
+/// being fetched in the same sweep.
+#[test]
+fn a_closed_component_commits_while_an_unrelated_fetch_is_in_flight() {
+    let token = ModuleEpochToken::new(70);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 70, &token);
+    let large_uuid = uuid(70);
+    let small_uuid = uuid(71);
+    let large = loader.add_ref::<A>(large_uuid).unwrap();
+    let small = loader.add_ref::<B>(small_uuid).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+
+    let (large_hash, large_artifact) = artifact::<A>(large_uuid, &[]);
+    let (small_hash, small_artifact) = artifact::<B>(small_uuid, &[]);
+    resolve(&mut loader, large_uuid, large_hash);
+    resolve(&mut loader, small_uuid, small_hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, small_hash, small_artifact);
+    loader.process(&mut storage).unwrap();
+
+    assert_eq!(loader.status(&small), LoadStatus::Loaded);
+    assert_eq!(loader.status(&large), LoadStatus::Fetching);
+    assert_eq!(storage.commits, vec![(small.id(), storage.updates[0].1)]);
+    assert_eq!(ended(&loader, &basis()), 0, "the sweep stays open for the large fetch");
+
+    fetched(&mut loader, large_hash, large_artifact);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.status(&large), LoadStatus::Loaded);
+    assert_eq!(storage.commits.len(), 2);
+    assert_eq!(ended(&loader, &basis()), 1, "the sweep ends with its last component");
+}
+
+/// Doc 22 §5: a component waiting on GPU readiness blocks only itself; a
+/// later, unrelated load commits meanwhile.
+#[test]
+fn a_component_waiting_on_the_gpu_does_not_block_an_unrelated_one() {
+    let token = ModuleEpochToken::new(72);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 72, &token);
+    let gpu_uuid = uuid(72);
+    let other_uuid = uuid(73);
+    let gpu = loader.add_ref::<A>(gpu_uuid).unwrap();
+    let mut storage = Storage::default();
+    storage.pending_handles.insert(gpu.id());
+    loader.process(&mut storage).unwrap();
+    let (gpu_hash, gpu_artifact) = artifact::<A>(gpu_uuid, &[]);
+    resolve(&mut loader, gpu_uuid, gpu_hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, gpu_hash, gpu_artifact);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(storage.updates.len(), 1);
+    assert!(storage.commits.is_empty(), "the GPU upload is still pending");
+
+    let other = loader.add_ref::<B>(other_uuid).unwrap();
+    loader.process(&mut storage).unwrap();
+    let (other_hash, other_artifact) = artifact::<B>(other_uuid, &[]);
+    resolve(&mut loader, other_uuid, other_hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, other_hash, other_artifact);
+    loader.process(&mut storage).unwrap();
+
+    assert_eq!(loader.status(&other), LoadStatus::Loaded);
+    assert_ne!(loader.status(&gpu), LoadStatus::Loaded);
+    assert_eq!(storage.commits.len(), 1);
+    assert_eq!(storage.commits[0].0, other.id());
+
+    storage.pending_ready = true;
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.status(&gpu), LoadStatus::Loaded);
+    assert_eq!(storage.commits.len(), 2);
+}
+
+/// A closed component that shares a member with an adoption still waiting
+/// on the GPU stages only after that adoption commits: an asset never has
+/// two adoptions racing.
+#[test]
+fn a_component_sharing_a_member_with_a_pending_adoption_waits_for_it() {
+    let token = ModuleEpochToken::new(74);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 74, &token);
+    let child_uuid = uuid(74);
+    let parent_uuid = uuid(75);
+    let child = loader.add_ref::<B>(child_uuid).unwrap();
+    let mut storage = Storage::default();
+    storage.pending_handles.insert(child.id());
+    loader.process(&mut storage).unwrap();
+    let (child_hash, child_artifact) = artifact::<B>(child_uuid, &[]);
+    resolve(&mut loader, child_uuid, child_hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, child_hash, child_artifact.clone());
+    loader.process(&mut storage).unwrap();
+    assert_eq!(storage.updates.len(), 1);
+
+    let parent = loader.add_ref::<A>(parent_uuid).unwrap();
+    loader.process(&mut storage).unwrap();
+    let (parent_hash, parent_artifact) =
+        artifact_with_edges::<A>(parent_uuid, &[(child_uuid, B::TYPE_UUID)]);
+    resolve(&mut loader, parent_uuid, parent_hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, parent_hash, parent_artifact);
+    loader.process(&mut storage).unwrap();
+    loader.process(&mut storage).unwrap();
+    // The child joined the parent's component; it is not committed yet, so
+    // it resolves and fetches again.
+    resolve(&mut loader, child_uuid, child_hash);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(fetch_count(&loader), 3);
+    fetched(&mut loader, child_hash, child_artifact);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(storage.updates.len(), 1, "the parent's component waits");
+    assert!(storage.commits.is_empty());
+
+    storage.pending_ready = true;
+    loader.process(&mut storage).unwrap();
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.status(&parent), LoadStatus::Loaded);
+    assert_eq!(loader.status(&child), LoadStatus::Loaded);
+    assert_eq!(storage.commits.len(), 3);
+}
+
+/// Doc 22 §5: a delta re-resolves the sweep's members at the new basis
+/// instead of abandoning them; an unchanged in-flight payload is kept and
+/// not fetched again, and the old basis ends once nothing waits on it.
+#[test]
+fn a_delta_keeps_an_unchanged_in_flight_payload() {
+    let token = ModuleEpochToken::new(76);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 76, &token);
+    let kept_uuid = uuid(76);
+    let changed_uuid = uuid(77);
+    let kept = loader.add_ref::<A>(kept_uuid).unwrap();
+    let changed = loader.add_ref::<B>(changed_uuid).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+    let (kept_hash, kept_artifact) = artifact::<A>(kept_uuid, &[]);
+    resolve(&mut loader, kept_uuid, kept_hash);
+    loader.process(&mut storage).unwrap();
+    let (kept_req, old_basis) = loader.io().fetch_for(kept_hash);
+    assert_eq!(fetch_count(&loader), 1);
+
+    let new_basis = basis_with(10);
+    loader.io_mut().basis = new_basis.clone();
+    loader.io_mut().push(IoEvent::Delta {
+        stamp: stamp(1),
+        assets: vec![(changed_uuid, distill_loader::AssetDeltaState::Changed)],
+        paths: Vec::new(),
+    });
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.io().resolve_for(kept_uuid).1, new_basis);
+    assert_eq!(loader.io().resolve_for(changed_uuid).1, new_basis);
+    assert_eq!(ended(&loader, &old_basis), 0, "the kept fetch holds the old basis");
+
+    resolve(&mut loader, kept_uuid, kept_hash);
+    let (changed_hash, changed_artifact) = artifact::<B>(changed_uuid, &[]);
+    resolve(&mut loader, changed_uuid, changed_hash);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(fetch_count(&loader), 2, "only the changed member fetches");
+    loader.io_mut().push(IoEvent::Fetched {
+        req: kept_req,
+        content_hash: kept_hash,
+        artifact: kept_artifact,
+        basis: old_basis.clone(),
+    });
+    fetched(&mut loader, changed_hash, changed_artifact);
+    loader.process(&mut storage).unwrap();
+
+    assert_eq!(loader.status(&kept), LoadStatus::Loaded);
+    assert_eq!(loader.status(&changed), LoadStatus::Loaded);
+    assert_eq!(fetch_count(&loader), 2);
+    assert_eq!(ended(&loader, &old_basis), 1, "the old basis ends once unused");
+    assert_eq!(ended(&loader, &new_basis), 1);
+    assert!(loader.take_diagnostics().is_empty());
+}
+
+/// A payload already fetched before the delta is kept as well, and a member
+/// whose content changed drops its in-flight fetch: the old basis ends at
+/// once and the new content is fetched.
+#[test]
+fn a_delta_keeps_a_fetched_payload_and_refetches_only_changed_content() {
+    let token = ModuleEpochToken::new(78);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 78, &token);
+    let parent_uuid = uuid(78);
+    let child_uuid = uuid(79);
+    let parent = loader.add_ref::<A>(parent_uuid).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+    let (parent_hash, parent_artifact) =
+        artifact_with_edges::<A>(parent_uuid, &[(child_uuid, B::TYPE_UUID)]);
+    resolve(&mut loader, parent_uuid, parent_hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, parent_hash, parent_artifact);
+    loader.process(&mut storage).unwrap();
+    loader.process(&mut storage).unwrap();
+    let old_child_hash = ContentHash([0x11; 32]);
+    resolve(&mut loader, child_uuid, old_child_hash);
+    loader.process(&mut storage).unwrap();
+    let (_, old_basis) = loader.io().fetch_for(old_child_hash);
+    assert_eq!(fetch_count(&loader), 2);
+
+    let new_basis = basis_with(11);
+    loader.io_mut().basis = new_basis.clone();
+    loader.io_mut().push(IoEvent::Delta {
+        stamp: stamp(1),
+        assets: vec![(child_uuid, distill_loader::AssetDeltaState::Changed)],
+        paths: Vec::new(),
+    });
+    loader.process(&mut storage).unwrap();
+    resolve(&mut loader, parent_uuid, parent_hash);
+    let (child_hash, child_artifact) = artifact::<B>(child_uuid, &[]);
+    resolve(&mut loader, child_uuid, child_hash);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(fetch_count(&loader), 3, "the parent is not fetched again");
+    assert_eq!(loader.io().fetch_for(child_hash).1, new_basis);
+    assert_eq!(ended(&loader, &old_basis), 1, "nothing waits on the old basis");
+
+    fetched(&mut loader, child_hash, child_artifact);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.status(&parent), LoadStatus::Loaded);
+    assert_eq!(storage.commits.len(), 2);
+    assert!(loader.take_diagnostics().is_empty());
+}

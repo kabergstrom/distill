@@ -24,7 +24,7 @@ use distill_wire::native::validate_native_descriptor;
 use distill_wire::plan::{compile_plans, CompiledPlans, PlanId};
 
 use crate::component::{
-    load_cycles, AdoptionDecision, CandidateAsset, CandidateOutcome, ComponentPlanner,
+    decide, load_cycles, AdoptionDecision, CandidateAsset, CandidateOutcome, ComponentPlanner,
     MemberFailure,
 };
 use crate::io::{
@@ -353,6 +353,10 @@ enum CandidateTerminal {
 struct CandidateRecord {
     basis: IoBasis,
     resolve_issued: bool,
+    /// Carried over a delta with its fetched or in-flight payload (doc 22
+    /// §5): the terminal is kept until a resolve on the new basis confirms
+    /// its content hash.
+    unverified: bool,
     expected_terminal_types: BTreeSet<TypeUuid>,
     load_expectations: PlaceholderReferences,
     terminal: CandidateTerminal,
@@ -403,6 +407,9 @@ pub struct Loader<I: LoaderIO> {
     dirty: BTreeSet<AssetUuid>,
     dirty_paths: BTreeSet<AssetPath>,
     sweep: Option<Sweep>,
+    /// Bases of sweeps a delta replaced, kept open while a fetch issued
+    /// under them is still wanted (doc 22 §5).
+    lingering: Vec<IoBasis>,
     /// Rounds restarted since a sweep last completed.
     sweep_retries: u32,
     pending: Vec<PendingComponent>,
@@ -438,6 +445,7 @@ impl<I: LoaderIO> Loader<I> {
             dirty: BTreeSet::new(),
             dirty_paths: BTreeSet::new(),
             sweep: None,
+            lingering: Vec::new(),
             sweep_retries: 0,
             pending: Vec::new(),
             diagnostics: Vec::new(),
@@ -697,6 +705,7 @@ impl<I: LoaderIO> Loader<I> {
         self.ensure_sweep()?;
         self.issue_sweep_requests()?;
         self.expand_dependencies()?;
+        self.retire_lingering();
         self.plan_and_stage(storage)?;
         Ok(())
     }
@@ -876,11 +885,94 @@ impl<I: LoaderIO> Loader<I> {
     /// arrives for them) and retired here; its unanswered path resolves are
     /// owed again by the next sweep.
     fn abandon_sweep(&mut self) {
+        for basis in std::mem::take(&mut self.lingering) {
+            self.end_sweep(&basis);
+        }
         if let Some(sweep) = self.sweep.take() {
             self.dirty_paths.extend(sweep.pending_paths.iter().cloned());
             self.end_sweep(&sweep.basis);
             for candidate in sweep.candidates.into_values() {
                 destroy_candidate_values(candidate.terminal);
+            }
+        }
+    }
+
+    /// A delta mid-sweep (doc 22 §5): move the live sweep to a new basis
+    /// instead of abandoning it. Every member is resolved again there; a
+    /// fetched or in-flight payload is kept (`unverified`) until that
+    /// resolve confirms its content hash. The old basis stays open while a
+    /// fetch issued under it is still wanted (`retire_lingering`); its other
+    /// requests are dropped. Without a new basis, the sweep is abandoned.
+    fn rebase_sweep(&mut self) {
+        let Some(old) = self.sweep.take() else {
+            return;
+        };
+        let basis = self.io.begin_sweep();
+        if basis == old.basis {
+            self.sweep = Some(old);
+            self.abandon_sweep();
+            return;
+        }
+        self.requests.drop_basis_except_fetches(&old.basis);
+        self.dirty_paths.extend(old.pending_paths);
+        let mut candidates = BTreeMap::new();
+        for (uuid, candidate) in old.candidates {
+            let carried = matches!(candidate.terminal, CandidateTerminal::Built { .. });
+            let terminal = if carried {
+                candidate.terminal
+            } else {
+                destroy_candidate_values(candidate.terminal);
+                CandidateTerminal::Pending
+            };
+            candidates.insert(
+                uuid,
+                CandidateRecord {
+                    basis: basis.clone(),
+                    resolve_issued: false,
+                    unverified: carried,
+                    expected_terminal_types: candidate.expected_terminal_types,
+                    load_expectations: candidate.load_expectations,
+                    terminal,
+                },
+            );
+        }
+        self.lingering.push(old.basis);
+        self.sweep = Some(Sweep {
+            basis,
+            candidates,
+            pending_paths: BTreeSet::new(),
+            dirty_seeds: old.dirty_seeds,
+        });
+    }
+
+    /// End each lingering basis once no fetch under it is wanted: one is
+    /// wanted while a candidate still waits on that asset and content hash.
+    fn retire_lingering(&mut self) {
+        let mut index = 0;
+        while index < self.lingering.len() {
+            let wanted = self
+                .requests
+                .fetches_under(&self.lingering[index])
+                .any(|(asset, hash)| {
+                    self.sweep
+                        .as_ref()
+                        .and_then(|sweep| sweep.candidates.get(&asset))
+                        .is_some_and(|candidate| {
+                            matches!(
+                                candidate.terminal,
+                                CandidateTerminal::Built {
+                                    content_hash,
+                                    fetched: false,
+                                    ..
+                                } if content_hash == hash
+                            )
+                        })
+                });
+            if wanted {
+                index += 1;
+            } else {
+                let basis = self.lingering.swap_remove(index);
+                self.end_sweep(&basis);
             }
         }
     }
@@ -1085,6 +1177,7 @@ impl<I: LoaderIO> Loader<I> {
                 CandidateRecord {
                     basis: basis.clone(),
                     resolve_issued: false,
+                    unverified: false,
                     expected_terminal_types: BTreeSet::new(),
                     load_expectations: PlaceholderReferences::new(),
                     terminal: CandidateTerminal::Pending,
@@ -1114,6 +1207,7 @@ impl<I: LoaderIO> Loader<I> {
             sweep.candidates.entry(uuid).or_insert(CandidateRecord {
                 basis: basis.clone(),
                 resolve_issued: false,
+                unverified: false,
                 expected_terminal_types: BTreeSet::new(),
                 load_expectations: PlaceholderReferences::new(),
                 terminal: CandidateTerminal::Pending,
@@ -1159,7 +1253,9 @@ impl<I: LoaderIO> Loader<I> {
             .expect("checked above")
             .candidates
             .iter()
-            .filter(|(_, candidate)| matches!(candidate.terminal, CandidateTerminal::Pending))
+            .filter(|(_, candidate)| {
+                candidate.unverified || matches!(candidate.terminal, CandidateTerminal::Pending)
+            })
             .map(|(uuid, _)| *uuid)
             .collect::<Vec<_>>();
         for uuid in pending {
@@ -1268,7 +1364,7 @@ impl<I: LoaderIO> Loader<I> {
                 )));
             }
             IoEvent::Delta { assets, paths, .. } => {
-                self.abandon_sweep();
+                self.rebase_sweep();
                 for (uuid, delta) in assets {
                     let entry = self.manifest.entry(uuid).or_insert(ManifestEntry {
                         state: ManifestState::Missing,
@@ -1312,6 +1408,8 @@ impl<I: LoaderIO> Loader<I> {
                 self.detach_indirect_slots(storage, Some(&paths));
                 self.dirty.extend(old_components);
                 self.dirty_paths.extend(paths);
+                // A live (rebased) sweep takes the delta's members now.
+                self.add_to_live_sweep(self.dirty.clone());
             }
             IoEvent::Resolved {
                 req,
@@ -1407,6 +1505,7 @@ impl<I: LoaderIO> Loader<I> {
                     .sweep
                     .as_ref()
                     .is_some_and(|sweep| sweep.basis == basis)
+                    || self.lingering.contains(&basis)
                 {
                     self.sweep_retries += 1;
                     self.restart_sweep();
@@ -1431,8 +1530,22 @@ impl<I: LoaderIO> Loader<I> {
                             self.fail_candidate(uuid, &basis, message.clone());
                         }
                     }
-                    Some((OutstandingPurpose::Fetch, RequestOwner::Content { asset, .. })) => {
-                        self.fail_candidate(asset, &basis, message.clone());
+                    Some((OutstandingPurpose::Fetch, RequestOwner::Content { asset, hash })) => {
+                        // A fetch under a lingering basis fails its candidate only
+                        // while the candidate still waits on that content.
+                        let waits = self
+                            .sweep
+                            .as_ref()
+                            .and_then(|sweep| sweep.candidates.get(&asset))
+                            .is_some_and(|candidate| {
+                                matches!(
+                                    candidate.terminal,
+                                    CandidateTerminal::Built { content_hash, .. } if content_hash == hash
+                                )
+                            });
+                        if waits {
+                            self.fail_candidate(asset, &basis, message.clone());
+                        }
                     }
                     Some((OutstandingPurpose::ResolvePath, RequestOwner::Path(path))) => {
                         if let Some(sweep) = &mut self.sweep {
@@ -1490,6 +1603,36 @@ impl<I: LoaderIO> Loader<I> {
             return Ok(());
         };
         self.stats.mark(uuid, Mark::Resolved, self.stats.now());
+        if candidate.unverified {
+            // A payload carried over a delta: kept when its content hash is
+            // still the one to load, else dropped before the answer applies.
+            candidate.unverified = false;
+            let kept = candidate.basis == event_basis
+                && unchanged.is_none()
+                && matches!(
+                    (&result, &candidate.terminal),
+                    (
+                        ResolveResult::Built { content_hash },
+                        CandidateTerminal::Built { content_hash: carried, .. },
+                    ) if carried == content_hash
+                );
+            if kept {
+                let in_flight = matches!(
+                    candidate.terminal,
+                    CandidateTerminal::Built { fetched: false, .. }
+                );
+                if in_flight {
+                    for handle in self.handles_for_uuid(uuid) {
+                        if let Some(slot) = self.slots.get_mut(&handle) {
+                            slot.status = LoadStatus::Fetching;
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            let terminal = std::mem::replace(&mut candidate.terminal, CandidateTerminal::Pending);
+            destroy_candidate_values(terminal);
+        }
         match result {
             ResolveResult::Built { content_hash } => {
                 if candidate.basis != event_basis {
@@ -1692,7 +1835,7 @@ impl<I: LoaderIO> Loader<I> {
             .as_ref()
             .and_then(|sweep| sweep.candidates.get(&uuid))
             .is_some_and(|candidate| {
-                candidate.basis == basis
+                (candidate.basis == basis || self.lingering.contains(&basis))
                     && matches!(
                         candidate.terminal,
                         CandidateTerminal::Built {
@@ -1941,7 +2084,7 @@ impl<I: LoaderIO> Loader<I> {
             .sweep
             .as_mut()
             .and_then(|sweep| sweep.candidates.get_mut(&uuid))
-            .filter(|candidate| &candidate.basis == basis)
+            .filter(|candidate| &candidate.basis == basis || self.lingering.contains(basis))
         {
             candidate.terminal = CandidateTerminal::Failed(message);
         }
@@ -2082,6 +2225,7 @@ impl<I: LoaderIO> Loader<I> {
                 .or_insert(CandidateRecord {
                     basis: basis.clone(),
                     resolve_issued: false,
+                    unverified: false,
                     expected_terminal_types: BTreeSet::new(),
                     load_expectations: PlaceholderReferences::new(),
                     terminal: CandidateTerminal::Pending,
@@ -2094,30 +2238,79 @@ impl<I: LoaderIO> Loader<I> {
         Ok(())
     }
 
+    /// Stage each closed load-dependency component of the sweep (doc 22
+    /// §5). A component is closed when every member is complete (its
+    /// payload fetched and constructed, its load edges known) and no member
+    /// still waits on GPU readiness from an earlier adoption. Path resolves
+    /// do not hold components: a resolved path seeds its own candidates.
+    /// The sweep ends once nothing is left in it.
     fn plan_and_stage(&mut self, storage: &mut dyn AssetStorage) -> Result<(), LoaderError> {
-        if !self.pending.is_empty() {
-            return Ok(());
-        }
         let Some(sweep) = &self.sweep else {
             return Ok(());
         };
-        if !sweep.pending_paths.is_empty()
-            || sweep
-                .candidates
-                .values()
-                .any(|candidate| !self.candidate_complete(candidate))
-        {
-            return Ok(());
-        }
         let held = sweep.candidates.keys().copied().collect::<BTreeSet<_>>();
-        let current = self.current_graph();
-        let graph = sweep
+        let edges = sweep
             .candidates
             .iter()
             .map(|(uuid, candidate)| (*uuid, self.candidate_deps(candidate)))
             .collect::<BTreeMap<_, _>>();
-        let cycles = load_cycles(&graph);
-        for cycle in cycles {
+        let closed = ComponentPlanner::new(self.current_graph())
+            .components(&held, &edges)
+            .into_iter()
+            .filter(|members| {
+                members.iter().all(|uuid| {
+                    sweep
+                        .candidates
+                        .get(uuid)
+                        .is_none_or(|candidate| self.candidate_complete(candidate))
+                }) && !self.pending.iter().any(|pending| {
+                    pending
+                        .members
+                        .iter()
+                        .any(|member| members.binary_search(member).is_ok())
+                })
+            })
+            .collect::<Vec<_>>();
+        if !closed.is_empty() {
+            self.stage_closed(closed, storage)?;
+        }
+        let Some(sweep) = &self.sweep else {
+            return Ok(());
+        };
+        if sweep.candidates.is_empty() && sweep.pending_paths.is_empty() {
+            let sweep = self.sweep.take().expect("checked Some");
+            // Every candidate and path answered: release the sweep's basis.
+            self.end_sweep(&sweep.basis);
+            self.sweep_retries = 0;
+            for uuid in sweep.dirty_seeds {
+                self.dirty.remove(&uuid);
+            }
+            self.finish_orphan_timelines();
+        }
+        Ok(())
+    }
+
+    /// Stage or poison the closed components `closed` and take their
+    /// members out of the sweep.
+    fn stage_closed(
+        &mut self,
+        closed: Vec<Vec<AssetUuid>>,
+        storage: &mut dyn AssetStorage,
+    ) -> Result<(), LoaderError> {
+        let graph = {
+            let sweep = self.sweep.as_ref().expect("closed components need a sweep");
+            closed
+                .iter()
+                .flatten()
+                .filter_map(|uuid| {
+                    sweep
+                        .candidates
+                        .get(uuid)
+                        .map(|candidate| (*uuid, self.candidate_deps(candidate)))
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        for cycle in load_cycles(&graph) {
             let failed = cycle[0];
             self.fail_placeholder_candidate(
                 failed,
@@ -2125,25 +2318,29 @@ impl<I: LoaderIO> Loader<I> {
             );
             self.diagnostics.push(LoaderDiagnostic::LoadCycle { cycle });
         }
-        let candidates = self
-            .sweep
-            .as_ref()
-            .expect("cycle rejection retains the sweep")
-            .candidates
-            .iter()
-            .map(|(uuid, candidate)| {
-                (
-                    *uuid,
-                    CandidateAsset {
-                        uuid: *uuid,
-                        basis: candidate.basis.clone(),
-                        load_deps: self.candidate_deps(candidate),
-                        outcome: self.candidate_outcome(*uuid, candidate),
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let decisions = ComponentPlanner::new(current).plan(&held, &candidates);
+        let decisions = {
+            let sweep = self.sweep.as_ref().expect("cycle rejection retains the sweep");
+            let candidates = closed
+                .iter()
+                .flatten()
+                .filter_map(|uuid| {
+                    let candidate = sweep.candidates.get(uuid)?;
+                    Some((
+                        *uuid,
+                        CandidateAsset {
+                            uuid: *uuid,
+                            basis: candidate.basis.clone(),
+                            load_deps: self.candidate_deps(candidate),
+                            outcome: self.candidate_outcome(*uuid, candidate),
+                        },
+                    ))
+                })
+                .collect::<BTreeMap<_, _>>();
+            closed
+                .into_iter()
+                .map(|members| decide(members, &candidates))
+                .collect::<Vec<_>>()
+        };
         if decisions
             .iter()
             .any(|decision| matches!(decision, AdoptionDecision::Reresolve { .. }))
@@ -2152,39 +2349,45 @@ impl<I: LoaderIO> Loader<I> {
             return Ok(());
         }
         let mut sweep = self.sweep.take().expect("checked Some");
-        // Every candidate and path answered: release the sweep's basis.
-        self.end_sweep(&sweep.basis);
-        self.sweep_retries = 0;
-        let processed_dirty = std::mem::take(&mut sweep.dirty_seeds);
         for decision in decisions {
-            match decision {
+            let members = match decision {
                 AdoptionDecision::Ready { members, .. } => {
                     match self.stage_component(&mut sweep, &members, storage) {
                         Ok(StageComponentOutcome::Staged) => {}
                         Ok(StageComponentOutcome::Failed { uuid, error }) => {
                             let failures = vec![(uuid, MemberFailure::Failed(error))];
                             self.freeze_component(&mut sweep, &members, &failures);
-                            self.diagnostics
-                                .push(LoaderDiagnostic::ComponentPoisoned { members, failures });
+                            self.diagnostics.push(LoaderDiagnostic::ComponentPoisoned {
+                                members: members.clone(),
+                                failures,
+                            });
                         }
                         Err(error) => {
                             destroy_sweep_values(sweep);
                             return Err(error);
                         }
                     }
+                    members
                 }
                 AdoptionDecision::Poisoned { members, failures } => {
                     self.freeze_component(&mut sweep, &members, &failures);
-                    self.diagnostics
-                        .push(LoaderDiagnostic::ComponentPoisoned { members, failures });
+                    self.diagnostics.push(LoaderDiagnostic::ComponentPoisoned {
+                        members: members.clone(),
+                        failures,
+                    });
+                    members
                 }
                 AdoptionDecision::Reresolve { .. } => unreachable!("handled above"),
+            };
+            for uuid in &members {
+                if let Some(candidate) = sweep.candidates.remove(uuid) {
+                    destroy_candidate_values(candidate.terminal);
+                }
+                sweep.dirty_seeds.remove(uuid);
+                self.dirty.remove(uuid);
             }
         }
-        for uuid in processed_dirty {
-            self.dirty.remove(&uuid);
-        }
-        self.finish_orphan_timelines();
+        self.sweep = Some(sweep);
         Ok(())
     }
 
@@ -2214,6 +2417,9 @@ impl<I: LoaderIO> Loader<I> {
     }
 
     fn candidate_complete(&self, candidate: &CandidateRecord) -> bool {
+        if candidate.unverified {
+            return false;
+        }
         match &candidate.terminal {
             CandidateTerminal::Pending => false,
             CandidateTerminal::Unchanged { .. } => true,
