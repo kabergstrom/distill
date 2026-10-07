@@ -2759,6 +2759,243 @@ pub enum Grouping { PerFile, ByStem }   // ByStem: group key is
                                         // in two directories are two groups.
 ```
 
+### Default imports (Proposed, not implemented)
+
+> **Status: proposed, not implemented.** Nothing below exists in the daemon
+> yet. Where this section and the rest of the document disagree, the rest of
+> the document describes the current behavior.
+
+A file under an asset root imports with no rules bundle written for it: the
+pipeline module declares **default import rules** that pick an importer by
+path, and the daemon applies them exactly like a directory-import rules
+bundle (above), as the lowest-precedence layer. Rules bundles and explicit
+imports stay the way to override an importer or set per-file settings.
+
+#### Why requests are "never sniffed from extensions" (§19), and what defaults keep
+
+The rule dates from review codex-7 #10: `Hub.import(base, path, settings)`
+named no importer, destination or watch policy, and importer registration had
+no extension matcher, so the importer was implicit in code and unreachable
+from the committed file. The fix was `ImportRequest` (importer id, sources,
+destination, settings, watch) and `ImportRecord` (§6), so that:
+
+- **Reproducibility from the file alone.** `$record` names the importer,
+  sources, settings and read-set; `reimport` and the fixpoint check (`doctor`,
+  CI) run what the bundle says, never what a lookup table says today.
+- **Selection is authored data (§2 layer 1), not code (layer 2).** A module
+  rebuild that changes an extension table cannot silently re-target an
+  existing bundle to another importer.
+- **No guessing.** Ambiguity is an error, never a tiebreak (§8 collisions,
+  §18 multi-root ambiguity).
+
+Default imports keep all three:
+
+- A default import writes the same `$record` as any directory import: the
+  importer id, sources, completed settings and a `DirectoryOrigin`. Once
+  written, the bundle never consults the default table again: `reimport`,
+  watched re-import and `doctor`'s fixpoint read the record.
+- The default table only decides **first selection** of a file no authored
+  rule or explicit import claims, the same role a rules bundle's `matches`
+  plays. Its identity is stable and recorded (rule id, below), so a table
+  change is visible as a rule change, never a silent reinterpretation.
+- Selection is by **path only**; there is no content sniffing in selection
+  (see Heuristics).
+
+`ImportRequest` itself is unchanged: an explicit request still names its
+importer.
+
+#### Declaration
+
+The mapping is declared by the pipeline module; which roots use it is
+declared by the daemon configuration.
+
+```rust
+/// Registered next to the importer (`RegistrationArena::register_default_import`).
+pub struct DefaultImportRule {
+    /// Stable authored identity, like `ImportRule.id`; globally unique
+    /// across default rules and authored rules (§8 validation).
+    pub id: ImportRuleId,
+    /// Path selector only (§10 `FileQuery`): globs over the file name,
+    /// e.g. `**/*.{glb,gltf}`.
+    pub matches: FileQuery,
+    pub group: Grouping,
+    pub importer: String,                 // Importer::ID
+    /// Output template, as `ImportRule.output`: "{name}.bundle".
+    pub output: String,
+}
+```
+
+- Settings are always the importer's default settings, completed as for an
+  authored rule's `{}`; a default rule carries none. Per-file settings are a
+  rules bundle's or an explicit import's job.
+- The table is part of the pipeline epoch (§3): registering, removing or
+  changing a default rule is a capability change, and the pass revalidates
+  every default rule as it does after a capability change today.
+- A game crate's `register` calls `register_engine_assets` (which declares the
+  engine's defaults) and may declare its own; two default rules matching one
+  file is a registration-time error, never first-match across crates.
+- Per root, in `[assets]`:
+  - `default_imports = ["main"]`: the roots defaults apply to. **Opt-in**:
+    enabling defaults on an existing tree writes a bundle beside every
+    matching file (`newgameplus/test-assets/` holds 580 `.glb` files,
+    most of them kit pieces).
+  - `default_imports_exclude = { main = ["scratch/**"] }`: path globs per
+    root that defaults never select.
+- In-tree opt-out, per folder, committed: an authored rule whose `importer` is
+  the reserved id `"none"` claims what it matches and imports nothing. A rules
+  bundle with listing `scenes/sponza/**` and one `none` rule turns defaults off
+  for that folder without touching the daemon config.
+
+Options considered for where the mapping lives:
+
+| Where | For | Against |
+|---|---|---|
+| Pipeline module registration (proposed) | The module that knows a format declares its extensions; one table for every project using the engine; versioned with the importer | Code, not authored data: needs the recorded rule id and epoch revalidation above |
+| Daemon config table `[[assets.default_rule]]` | Per project, committed with the config | Config is not an asset: no bundle UUID for the origin, edits are not watched imports; every project re-declares the engine's extensions |
+| A committed root rules bundle (`root.rules.bundle`) | Zero new mechanism | It is the rules bundle the user wants not to write; it would be copied per root and drift from the importer set |
+
+#### Precedence
+
+For one file, first that applies:
+
+1. **Explicit import.** A file that is a source of any bundle whose `$record`
+   has no origin (an explicit `ImportRequest`) is never default-selected,
+   wherever that bundle lives. The import index gains a source row per
+   imported bundle (`import_keys` kind 4: source path), derived at publication
+   like the other kinds.
+2. **Authored rules.** A file matched by any rule of any rules bundle (first
+   match within that bundle, §8) belongs to that rule; a `none` rule claims
+   without importing. A rules bundle that *lists* a file but has no matching
+   rule does not claim it.
+3. **Default rule**, if the root enables defaults and no exclude glob matches.
+4. Otherwise the file is not imported.
+
+- An existing bundle at the default output path that some other origin or no
+  origin owns suppresses the default import, never collides: defaults yield.
+  A collision between two authored rules stays an error (§8).
+- Adding an authored rule over a default-imported file moves ownership: the
+  default output's origin is no longer produced and it enters the orphan state
+  (§8), and the new rule's output, if at the same path, is an ownership
+  collision the author resolves by deleting the orphan. Recommended
+  refinement: a default-origin bundle at the authored rule's own output path is
+  **adopted** (its origin rewritten by the new rule's fold, UUIDs kept through
+  the prior), since nobody authored it.
+
+#### Origin and reconstruction (§2)
+
+A default import records an ordinary `DirectoryOrigin`, so the `ImportRecord`
+schema (a bootstrap control type) does not change:
+
+- `rules_bundle`: the root's **default-rules UUID**, derived, never stored:
+  `blake3("DSDR" ‖ version:u8 ‖ root name (len:u32+bytes))[..16]`, reserved:
+  no bundle file may claim it (a source claim of it is a namespace collision,
+  §13).
+- `rule`: the `DefaultImportRule.id`.
+- `group`: the group key, as for authored rules.
+
+Reconstruction from the tree alone: a scan that finds a `$record` origin naming
+a root's default-rules UUID recognizes it by recomputing the digest from the
+configured root names, and attributes the bundle to the default layer. The
+default layer "exists" while the root enables defaults; its rules are the
+registered default rules. Disabling defaults on a root, or a module that stops
+registering a rule id, orphans its outputs (§8), never deletes them.
+
+#### Output location
+
+- Beside the sources, by the rule's template; the engine's defaults use
+  `{name}.bundle` (`chest.glb` → `chest.glb.bundle`), the form every rules
+  bundle in `example-module/assets/` already uses, so moving a folder from
+  rules to defaults keeps its bundle paths and UUIDs.
+- Committed, as every generated bundle (§8 watched-import workflow: identity
+  must survive checkout). A root whose generated bundles are not committed
+  (`newgameplus/test-assets/`: downloads and their bundles are gitignored,
+  only `test.rules.bundle` is tracked) either leaves defaults off for that root
+  (`test` in deferred-ngp's `tools/distill/distill.toml`) or excludes the
+  folders whose bulk is not wanted (`scenes/sponza/**`: about 70 images).
+
+#### Heuristics
+
+- **Extension only.** The engine's formats are all named by extension; no
+  default mapping needs content to decide.
+- **No content sniffing in selection.** Selection today is a pure function of
+  the listing (`FILQ`, §8), which is why `touch_directory_path` can find a
+  path's owner without reading it. Sniffing would make ownership depend on
+  bytes: an edit could move a file between importers (a new owner, the old
+  output orphaned), and every listing evaluation would read file heads. A file
+  whose extension lies fails in its importer with a stable code, which is
+  memoized and listed in `importFailures` like any watched failure (including
+  a first attempt that has no bundle yet, keyed by origin, §13).
+- Magic bytes stay **inside** importers, where they already are (`.ttc` vs
+  `.ttf` in `ngp.font`, legacy vs DX10 header in `ngp.dds`, `.glb` vs `.gltf`
+  in `ngp.gltf`).
+- **Naming conventions are game convention, not format.** `n_*.png` → normal
+  map, `*_mr.png` → linear: they hold in one team's art, not in the format.
+  Sponza's images are named by hash (`715093869573992647.jpg`), and
+  `test.rules.bundle` lists its 24 normal maps and 20 metallic-roughness maps
+  by name, taken from the glTF material slots: no name heuristic would find
+  them. A rules bundle expresses a convention exactly (glob + settings),
+  committed and reviewable; a convention in the module would be global and
+  invisible. Defaults therefore carry no settings.
+- Formats with no safe default get **no** default rule: `ngp.raw` (needs
+  `format`, `width`, `height`), glTF `.bin` buffers, GLSL includes (`.glsl`,
+  read through the stage's import context).
+
+#### Engine defaults (`newgameplus_pipeline::register_engine_assets`)
+
+| Importer | Settings type | Default rule | Notes |
+|---|---|---|---|
+| `ngp.gltf` | `GltfImportSettings` (scene, max_texture_size, texture_mips, generate_tangents, optimize, cpu_readable, collision, animation, meshes, images) | `**/*.{glb,gltf}`, PerFile, `{name}.bundle` | Rigs, clips, `cpu_readable` and collision stay rules (`characters.rules.bundle`, `models.rules.bundle`) |
+| `ngp.image` | `ImageSettings` (`color` srgb/linear/normal, `mips`, `max_size`) | `**/*.{png,jpg,jpeg}` | Defaults import `srgb`; normal and linear maps need a rule |
+| `ngp.dds` | `DdsTextureSettings` (`srgb`) | `**/*.dds` | |
+| `ngp.raw` | `RawTextureSettings` (format, width, height, depth, mip_count) | none | No format in the file |
+| `ngp.font` | `FontImportSettings` (`face`) | `**/*.{ttf,otf,ttc}` | Today explicit imports (`Roboto-Regular.ttf.bundle`); `NotoSansSC-Regular.otf`, unimported now, would import |
+| `ngp.sound` | none | `**/*.{wav,ogg,flac}` | |
+| `ngp.cue` | none | `**/*.cue` | |
+| `ngp.mix` | none | `**/*.mix` | `audio.mix.bundle` is an explicit import today: precedence 1 keeps it |
+| `ngp.prefab` | none | `**/*.prefab` | |
+| `ngp.glsl` | `GlslSettings` | `**/*.{vert,frag,comp}` (the stage extensions the importer accepts) | Includes excluded |
+
+#### Pipeline updates
+
+- **Importer version or default settings change**: as for authored rules
+  today. The capability dep in each read-set changes and watched outputs
+  re-import; changed defaults make the completed settings differ from the
+  recorded `$settings`, so the task re-runs. Bundle and entry UUIDs survive
+  through the prior bundle (fold by `local_id`, §8).
+- **A default rule's importer changes** (same rule id): its outputs re-import
+  in place with the new importer, keeping the bundle UUID; entries the new
+  importer emits under the same `local_id`s keep theirs, others retire (§8
+  total replacement). Changing what a default means is therefore a deliberate
+  act: keep the id for a compatible importer, mint a new id when the outputs
+  should orphan instead of being reinterpreted.
+- **A default rule removed**: its outputs orphan (§8); nothing is deleted.
+- **A new default rule** (a new extension): every matching unclaimed file in
+  an enabled root imports on the next pass, which is a tree-wide write;
+  release notes of the module should say so.
+
+#### Failures (interaction with bundle-less failure memos, §8, §13)
+
+- A default import's first attempt that fails has no bundle; it is memoized
+  in the daemon database keyed by its origin (default-rules UUID, rule id,
+  group) with its attempt basis, listed by `Snapshot.importFailures` with no
+  bundle, and re-run when a path its basis read changes, exactly as for an
+  authored rule's first attempt.
+- The row clears when the import succeeds, when the file leaves the group, or
+  when the default layer no longer produces the origin (root disabled, rule
+  unregistered, file now claimed by an authored rule or an explicit import).
+- Default imports make first-attempt failures far more common (every
+  unclaimed `*.png` in an enabled root is attempted), which is the reason that
+  failure table must exist before defaults ship.
+
+#### Open questions
+
+- Opt-in per root (proposed) or on by default for every root.
+- Whether the `none` rule is a reserved importer id or a `Grouping::Ignore`
+  variant (the latter changes the `DirectoryImportRules` schema, a bootstrap
+  control type).
+- Whether a default output is adopted by an authored rule at the same output
+  path (proposed refinement under Precedence) or stays a collision.
+
 ### Build import (pure)
 
 For every bundle in the tree, the daemon validates each entry against its
@@ -8108,7 +8345,9 @@ put production image codecs, mesh optimization, or shader compilers in core.
   watch, read-set — so re-import reconstructs from the file alone.
   Imports are requested by explicit `ImportRequest` (importer id, sources,
   dest, settings, watch — never sniffed from extensions); `reimport`
-  re-runs a bundle's recorded `ImportRecord` (§17).
+  re-runs a bundle's recorded `ImportRecord` (§17). (Proposed, not
+  implemented: default imports choose a first importer by path, §8
+  "Default imports", and still record it.)
 - **Validators** (§9): typed, single-asset, bound by the determinism
   contract; two severities; advisory at authoring time, publishability
   gate at build import; part of build identity via the dylib hash.
