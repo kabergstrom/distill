@@ -26,8 +26,8 @@ use distill_rpc::{
 };
 use distill_schema::ngp_schema::{
     node_hash, Field, FieldAttrs, FieldIdentifier, FieldLayout, LayoutIdentity, LogicalSchema,
-    PrimitiveType, Schema, SchemaLayouts, SchemaNode, SchemaTypeId, StaticArray, TypeAttrs,
-    TypeDef, TypeLayout, TypePath,
+    PrimitiveType, Schema, SchemaLayouts, SchemaNode, SchemaTypeId, StaticArray, TagEncoding,
+    TypeAttrs, TypeDef, TypeLayout, TypePath,
 };
 use distill_schema::ProjectSchemaAuthority;
 use distill_store::{StoreConfig, StoreWriter};
@@ -470,16 +470,17 @@ pub fn canonical_artifact(
 /// field `group`, a search tag.
 pub const TAGGED_TYPE: TypeUuid = TypeUuid([0xa4; 16]);
 pub use distill_pipeline_fixture::{
-    COOKED_TYPE, FLOAT_SETTINGS_TYPE, PARENT_TYPE, REFLECT, REFLECTION, REFLECTION_TYPE,
-    SETTINGS_TYPE, VALUE_TYPE,
+    COOKED_TYPE, FLOAT_SETTINGS_TYPE, OPTIONAL_SETTINGS_TYPE, PARENT_TYPE, REFLECT, REFLECTION,
+    REFLECTION_TYPE, SETTINGS_TYPE, VALUE_TYPE,
 };
 
 /// The configured project's schema: [`TAGGED_TYPE`], and the pipeline
 /// module's [`PARENT_TYPE`], [`COOKED_TYPE`], [`REFLECTION_TYPE`] and
 /// [`VALUE_TYPE`] (each of these a struct of one `u8` field `value`) and
 /// [`SETTINGS_TYPE`] (`{ add: [u8; 2], scale: { by: u8 } }`) and
-/// [`FLOAT_SETTINGS_TYPE`] (`{ rate: f32 }`), laid out for
-/// this host. Its source hashes are the pipeline module's.
+/// [`FLOAT_SETTINGS_TYPE`] (`{ rate: f32 }`) and [`OPTIONAL_SETTINGS_TYPE`]
+/// (`{ skeleton: Option<{ path: String, name: Option<String> }> }`), laid
+/// out for this host. Its source hashes are the pipeline module's.
 pub fn project_schema() -> Schema {
     let type_def = |id: usize, kind, krate: &str, name: &str, uuid, fields| TypeDef {
         id: SchemaTypeId(id),
@@ -596,6 +597,108 @@ pub fn project_schema() -> Schema {
         vec![field("rate", f32_id, false)],
     ));
     layouts.push(layout(4, 4, vec![at_zero(4)]));
+    // `Option<T>` of a `T` beginning with a `String`: its variants, then
+    // the enum, niche-encoded in the string's capacity (`None` is the first
+    // value past `isize::MAX`). Returns the enum's id.
+    let option = |types: &mut Vec<TypeDef>,
+                  layouts: &mut Vec<TypeLayout>,
+                  inner: usize,
+                  size: usize,
+                  align: usize| {
+        let none = types.len();
+        types.push(TypeDef {
+            path: TypePath {
+                containing_type: Some("Option".to_owned()),
+                ..type_def(0, PrimitiveType::EnumVariant, "core", "None", None, Vec::new()).path
+            },
+            ..type_def(none, PrimitiveType::EnumVariant, "core", "None", None, Vec::new())
+        });
+        layouts.push(layout(0, 1, Vec::new()));
+        let some = types.len();
+        types.push(TypeDef {
+            path: TypePath {
+                containing_type: Some("Option".to_owned()),
+                ..type_def(0, PrimitiveType::EnumVariant, "core", "Some", None, Vec::new()).path
+            },
+            ..type_def(
+                some,
+                PrimitiveType::EnumVariant,
+                "core",
+                "Some",
+                None,
+                vec![Field {
+                    id: FieldIdentifier::Number(0),
+                    type_id: SchemaTypeId(inner),
+                    attrs: FieldAttrs::default(),
+                }],
+            )
+        });
+        layouts.push(layout(size, align, vec![at_zero(size)]));
+        let id = types.len();
+        let variant = |name: &str, id: usize| Field {
+            id: FieldIdentifier::Variant(name.to_owned()),
+            type_id: SchemaTypeId(id),
+            attrs: FieldAttrs::default(),
+        };
+        types.push(TypeDef {
+            generic_argument_ids: vec![SchemaTypeId(inner)],
+            ..type_def(
+                id,
+                PrimitiveType::Enum,
+                "core",
+                "Option",
+                None,
+                vec![variant("None", none), variant("Some", some)],
+            )
+        });
+        layouts.push(TypeLayout {
+            tag_encoding: Some(TagEncoding::Niche {
+                niche_field_offset: 0,
+                niche_field_size: 8,
+                untagged_variant: 1,
+                niche_variants_start: 0,
+                niche_variants_end: 0,
+                niche_start: 1 << 63,
+            }),
+            ..layout(size, align, vec![FieldLayout::default(), FieldLayout::default()])
+        });
+        id
+    };
+    let option_string_id = option(&mut types, &mut layouts, 1, string, string_align);
+    let skeleton_ref_id = types.len();
+    types.push(type_def(
+        skeleton_ref_id,
+        PrimitiveType::Struct,
+        "fixture",
+        "SkeletonRef",
+        None,
+        vec![
+            field("path", 1, false),
+            field("name", option_string_id, false),
+        ],
+    ));
+    layouts.push(layout(
+        2 * string,
+        string_align,
+        vec![
+            at_zero(string),
+            FieldLayout {
+                offset: Some(string as u64),
+                field_size: Some(string as u64),
+            },
+        ],
+    ));
+    let option_skeleton_id =
+        option(&mut types, &mut layouts, skeleton_ref_id, 2 * string, string_align);
+    types.push(type_def(
+        types.len(),
+        PrimitiveType::Struct,
+        "fixture",
+        "OptionalSettings",
+        Some(OPTIONAL_SETTINGS_TYPE),
+        vec![field("skeleton", option_skeleton_id, false)],
+    ));
+    layouts.push(layout(2 * string, string_align, vec![at_zero(2 * string)]));
     for (name, uuid) in [
         ("Parent", PARENT_TYPE),
         ("Cooked", COOKED_TYPE),

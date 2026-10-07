@@ -12,7 +12,7 @@ use distill_daemon::watcher::WatcherBatch;
 use distill_json::AuthoredValue;
 use distill_pipeline_fixture::{
     default_settings, settings, value as byte, value_of as byte_of, BYTE_IMPORTER, CHAIN_IMPORTER,
-    SETTINGS_IMPORTER, FLOAT_IMPORTER, REQUIRE_IMPORTER, float_settings,
+    SETTINGS_IMPORTER, FLOAT_IMPORTER, OPTIONAL_IMPORTER, REQUIRE_IMPORTER, float_settings,
 };
 use distill_rpc::{
     AuthoringValue, ImportRequest, InputVersion, TargetDefinition, TargetDefinitionHash,
@@ -828,6 +828,146 @@ fn a_rule_authoring_an_integral_float_leaves_a_quiet_daemon_quiet() {
     assert_integral_float_settings_stay_quiet(&float_settings(30.0));
 }
 
+/// An [`OPTIONAL_IMPORTER`] `skeleton` value: `{ path, name }`, `name`
+/// left out when `None` is given.
+fn skeleton(path: Option<&str>, name: Option<Option<&str>>) -> AuthoredValue {
+    let mut fields = BTreeMap::new();
+    if let Some(path) = path {
+        fields.insert("path".to_owned(), AuthoredValue::Str(path.into()));
+    }
+    if let Some(name) = name {
+        fields.insert(
+            "name".to_owned(),
+            name.map_or(AuthoredValue::Null, |name| AuthoredValue::Str(name.into())),
+        );
+    }
+    object([("skeleton", AuthoredValue::Object(fields))])
+}
+
+/// A directory rule through [`OPTIONAL_IMPORTER`] with `rule_settings`,
+/// over one source `foo.src`: the coordinator after reconciling the scan,
+/// and the asset root.
+fn optional_rule_project(
+    temp: &tempfile::TempDir,
+    rule_settings: &AuthoredValue,
+) -> (DaemonCoordinator, distill_store::StoreWriter, std::path::PathBuf) {
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(
+        assets.join("rules.bundle"),
+        directory_rules_bundle_for(true, OPTIONAL_IMPORTER, rule_settings),
+    )
+    .unwrap();
+    std::fs::write(assets.join("foo.src"), b"4").unwrap();
+    let coordinator = DaemonCoordinator::open(
+        StoreConfig::new(temp.path().join(".distill")),
+        vec![AssetRoot::new("main", &assets)],
+        vec![target()],
+        64,
+    )
+    .unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    configure(&coordinator, temp.path(), &assets);
+    (coordinator, writer, assets)
+}
+
+/// A rule's object for an `Option` struct whose default is `None` (doc 21
+/// §4.2, sparse settings): the fields it leaves out that are `Option`s are
+/// `None`, so `{ "path": … }` imports as `{ "path": …, "name": null }`, and
+/// an unchanged rule then matches what its output recorded: a quiet daemon
+/// stays quiet.
+#[test]
+fn a_rule_object_over_a_none_default_leaves_absent_option_fields_none() {
+    let temp = tempfile::tempdir().unwrap();
+    let (coordinator, mut writer, assets) =
+        optional_rule_project(&temp, &skeleton(Some("rig.gltf"), None));
+    assert_eq!(
+        coordinator
+            .reconcile_directory_imports(&mut writer)
+            .unwrap()
+            .len(),
+        1
+    );
+    let generated = assets.join("foo.bundle");
+    let bundle = distill_bundle::parse_bundle(&std::fs::read(&generated).unwrap()).unwrap();
+    assert_eq!(
+        bundle.assets["$settings"].data,
+        skeleton(Some("rig.gltf"), Some(None))
+    );
+    assert_eq!(bundle.assets["asset"].data, byte(4));
+    coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["foo.bundle"]), false)
+        .unwrap();
+    let version = writer.input_version().unwrap();
+    let written = std::fs::metadata(&generated).unwrap().modified().unwrap();
+    for _ in 0..3 {
+        coordinator.reconcile_full_scan(&mut writer).unwrap();
+        assert!(coordinator
+            .reconcile_directory_imports(&mut writer)
+            .unwrap()
+            .is_empty());
+        coordinator
+            .reconcile_batch(&mut writer, &batch(&assets, &["foo.bundle"]), false)
+            .unwrap();
+    }
+    assert_eq!(writer.input_version().unwrap(), version);
+    assert_eq!(
+        std::fs::metadata(&generated).unwrap().modified().unwrap(),
+        written
+    );
+}
+
+/// The same rule spelling `name` whole imports the same way: a full
+/// object is taken as authored.
+#[test]
+fn a_rule_spelling_the_whole_option_struct_imports_it_as_authored() {
+    for name in [None, Some("Armature")] {
+        let temp = tempfile::tempdir().unwrap();
+        let rule_settings = skeleton(Some("rig.gltf"), Some(name));
+        let (coordinator, mut writer, assets) = optional_rule_project(&temp, &rule_settings);
+        assert_eq!(
+            coordinator
+                .reconcile_directory_imports(&mut writer)
+                .unwrap()
+                .len(),
+            1
+        );
+        let bundle =
+            distill_bundle::parse_bundle(&std::fs::read(assets.join("foo.bundle")).unwrap())
+                .unwrap();
+        assert_eq!(bundle.assets["$settings"].data, rule_settings);
+        assert!(coordinator
+            .reconcile_directory_imports(&mut writer)
+            .unwrap()
+            .is_empty());
+    }
+}
+
+/// A rule's object over a `None` default that leaves out a required field
+/// does not import: the error names the field, its path in the settings,
+/// the importer and the rule.
+#[test]
+fn a_rule_object_over_a_none_default_missing_a_required_field_names_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let (coordinator, mut writer, assets) =
+        optional_rule_project(&temp, &skeleton(None, Some(Some("Armature"))));
+    let error = coordinator
+        .reconcile_directory_imports(&mut writer)
+        .unwrap_err()
+        .to_string()
+        // The detail arrives Debug-quoted, once per wrapping.
+        .replace('\\', "");
+    for part in [
+        r#"missing struct field "path""#,
+        "data.skeleton",
+        OPTIONAL_IMPORTER,
+        "directory rule",
+    ] {
+        assert!(error.contains(part), "{part:?} not in {error:?}");
+    }
+    assert!(!assets.join("foo.bundle").exists());
+}
 
 /// Editing a rules source's settings while the daemon watches re-imports
 /// what the rule generated with the new settings, through the watcher

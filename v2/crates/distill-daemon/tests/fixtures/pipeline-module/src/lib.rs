@@ -6,7 +6,8 @@
 //! [`REQUIRE_IMPORTER`],
 //! producing [`VALUE_TYPE`] from settings of [`SETTINGS_TYPE`]; and
 //! [`FLOAT_IMPORTER`], producing [`VALUE_TYPE`] from settings of
-//! [`FLOAT_SETTINGS_TYPE`].
+//! [`FLOAT_SETTINGS_TYPE`]; and [`OPTIONAL_IMPORTER`], producing
+//! [`VALUE_TYPE`] from settings of [`OPTIONAL_SETTINGS_TYPE`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -41,6 +42,11 @@ pub const SETTINGS_TYPE: TypeUuid = TypeUuid([0xa6; 16]);
 /// [`FLOAT_IMPORTER`]'s settings type, a project type of the daemon tests'
 /// configuration: `{ rate: f32 }`.
 pub const FLOAT_SETTINGS_TYPE: TypeUuid = TypeUuid([0xa7; 16]);
+/// [`OPTIONAL_IMPORTER`]'s settings type, a project type of the daemon
+/// tests' configuration: `{ skeleton: Option<SkeletonRef> }`, where
+/// `SkeletonRef` is `{ path: String, name: Option<String> }` (the shape of
+/// `GltfImportSettings.animation.skeleton` in newgameplus).
+pub const OPTIONAL_SETTINGS_TYPE: TypeUuid = TypeUuid([0xa8; 16]);
 /// The importers' output type, a project type of the daemon tests'
 /// configuration no processor cooks: a struct of one `u8` field `value`.
 pub const VALUE_TYPE: TypeUuid = TypeUuid([0xa5; 16]);
@@ -62,6 +68,9 @@ pub const REQUIRE_IMPORTER: &str = "require-importer";
 /// Imports the number its one text source holds, whatever its settings
 /// ([`FLOAT_SETTINGS_TYPE`], defaults [`float_default_settings`]).
 pub const FLOAT_IMPORTER: &str = "float-importer";
+/// Imports the number its one text source holds, whatever its settings
+/// ([`OPTIONAL_SETTINGS_TYPE`], defaults [`optional_default_settings`]).
+pub const OPTIONAL_IMPORTER: &str = "optional-importer";
 
 /// A [`VALUE_TYPE`] value.
 pub fn value(value: u128) -> AuthoredValue {
@@ -114,6 +123,14 @@ pub fn float_settings(rate: f64) -> AuthoredValue {
 /// (canonical JSON writes it `30`, which parses back as an integer).
 pub fn float_default_settings() -> AuthoredValue {
     float_settings(30.0)
+}
+
+/// [`OPTIONAL_IMPORTER`]'s default settings: `skeleton` `None`.
+pub fn optional_default_settings() -> AuthoredValue {
+    AuthoredValue::Object(BTreeMap::from([(
+        "skeleton".to_owned(),
+        AuthoredValue::Null,
+    )]))
 }
 
 /// `value` under `settings` (see [`SETTINGS_TYPE`]).
@@ -328,6 +345,34 @@ fn float_importer() -> ImporterDescriptor {
     }
 }
 
+/// [`OPTIONAL_IMPORTER`]'s descriptor: version 1, settings an
+/// [`OPTIONAL_SETTINGS_TYPE`].
+fn optional_importer() -> ImporterDescriptor {
+    let option = |node| SchemaNode::Option(Box::new(node));
+    ImporterDescriptor {
+        id: OPTIONAL_IMPORTER.to_owned(),
+        version: 1,
+        settings_type_uuid: OPTIONAL_SETTINGS_TYPE,
+        settings_schema: LogicalSchema {
+            root: SchemaNode::Struct {
+                rev: 0,
+                fields: vec![(
+                    "skeleton".to_owned(),
+                    0,
+                    option(SchemaNode::Struct {
+                        rev: 0,
+                        fields: vec![
+                            ("path".to_owned(), 0, SchemaNode::String),
+                            ("name".to_owned(), 0, option(SchemaNode::String)),
+                        ],
+                    }),
+                )],
+            },
+        },
+        default_settings: optional_default_settings(),
+    }
+}
+
 /// An importer's descriptor: version 1, settings a [`SETTINGS_TYPE`].
 fn importer(id: &str) -> ImporterDescriptor {
     ImporterDescriptor {
@@ -422,6 +467,9 @@ fn register(
         .into_result()?;
     arena
         .register_importer(float_importer(), FloatImporter)
+        .into_result()?;
+    arena
+        .register_importer(optional_importer(), FloatImporter)
         .into_result()?;
     Ok(targets.iter().map(|target| target.name.clone()).collect())
 }

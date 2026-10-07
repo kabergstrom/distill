@@ -141,12 +141,13 @@ impl RegisteredImporter {
         // unchanged output (an integral `30.0` would not, and the output
         // would reimport on every pass).
         let default_settings = canonical_authored(importer.default_settings());
-        validate_default_settings(
+        validate_settings(
             settings_type_uuid,
             settings_hash,
             &settings_schema,
             &default_settings,
-        )?;
+        )
+        .map_err(|error| invalid(format!("invalid importer default settings: {error}")))?;
         let version = importer.version();
         let capability_hash = distill_core::canonical::domain_digest(*b"DSIC", 1, |encoder| {
             encoder.str(&id);
@@ -999,12 +1000,20 @@ impl AuthoringService {
     ) -> Result<(RegisteredImporter, ImportInvocation), RpcFailure> {
         let compiled = self.compiled(store)?;
         let importer = self.registered_importer(&compiled, &task.importer)?;
-        validate_default_settings(
+        validate_settings(
             importer.settings_type_uuid,
             importer.settings_hash,
             &importer.settings_schema,
             &task.settings,
-        )?;
+        )
+        .map_err(|error| {
+            invalid(format!(
+                "invalid settings for importer {} in directory rule {} of rules bundle {}: {error}",
+                task.importer,
+                uuid_text(task.rule.0),
+                task.rules_bundle
+            ))
+        })?;
         require_base(store, base)?;
         let destination = self.resolve_directory_destination(
             store,
@@ -2963,12 +2972,14 @@ fn current_type_schema(
         .ok_or_else(|| invalid(format!("output type {type_uuid} has no current schema")))
 }
 
-fn validate_default_settings(
+/// `value` checked against an importer's settings schema, as the bundle
+/// writer checks an output's `$settings`: the error names the path.
+fn validate_settings(
     type_uuid: TypeUuid,
     hash: LogicalHash,
     schema: &LogicalSchema,
     value: &AuthoredValue,
-) -> Result<(), RpcFailure> {
+) -> Result<(), distill_bundle::BundleError> {
     let bundle = Bundle {
         format_version: BUNDLE_FORMAT_VERSION,
         uuid: BundleUuid([0x41; 16]),
@@ -2985,9 +2996,7 @@ fn validate_default_settings(
             },
         )]),
     };
-    distill_bundle::write_bundle(&bundle)
-        .map(drop)
-        .map_err(|error| invalid(format!("invalid importer default settings: {error}")))
+    distill_bundle::write_bundle(&bundle).map(drop)
 }
 
 fn encode_import_record(record: &ImportRecord) -> Result<AuthoredValue, RpcFailure> {

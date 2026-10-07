@@ -195,28 +195,40 @@ fn decode_payload(
 /// from `defaults`, the importer's default settings: a missing field takes
 /// the default's, a present struct field is completed the same way, anything
 /// else stays as authored (an enum keeps its authored variant whole). A
-/// default holding a blob is never filled in: a blob is authored, so leaving
-/// it out stays the missing-field error.
+/// present `Option` is completed as its element. Where there is no default
+/// (an object authored over a `null` default, as for an `Option` struct
+/// whose default is `None`), a missing `Option` field is `None` and a
+/// missing required field stays missing: the validation's error names it.
+/// A default holding a blob is never filled in: a blob is authored, so
+/// leaving it out stays the missing-field error. Completing a completed
+/// value changes nothing.
 pub fn complete_settings(schema: &SchemaNode, value: &mut AuthoredValue, defaults: &AuthoredValue) {
-    let (
-        SchemaNode::Struct { fields, .. },
-        AuthoredValue::Object(object),
-        AuthoredValue::Object(defaults),
-    ) = (schema, value, defaults)
-    else {
-        return;
-    };
-    for (name, _, field_schema) in fields {
-        let Some(default) = defaults.get(name) else {
-            continue;
-        };
-        match object.get_mut(name) {
-            Some(field) => complete_settings(field_schema, field, default),
-            None if !holds_blob(default) => {
-                object.insert(name.clone(), default.clone());
+    match (schema, value) {
+        (SchemaNode::Option(_), AuthoredValue::Null) => {}
+        (SchemaNode::Option(element), value) => complete_settings(element, value, defaults),
+        (SchemaNode::Struct { fields, .. }, AuthoredValue::Object(object)) => {
+            let defaults = match defaults {
+                AuthoredValue::Object(defaults) => Some(defaults),
+                _ => None,
+            };
+            for (name, _, field_schema) in fields {
+                let default = defaults.and_then(|defaults| defaults.get(name));
+                match (object.get_mut(name), default) {
+                    (Some(field), Some(default)) => complete_settings(field_schema, field, default),
+                    (Some(field), None) => {
+                        complete_settings(field_schema, field, &AuthoredValue::Null)
+                    }
+                    (None, Some(default)) if !holds_blob(default) => {
+                        object.insert(name.clone(), default.clone());
+                    }
+                    (None, None) if matches!(field_schema, SchemaNode::Option(_)) => {
+                        object.insert(name.clone(), AuthoredValue::Null);
+                    }
+                    (None, _) => {}
+                }
             }
-            None => {}
         }
+        _ => {}
     }
 }
 
@@ -411,8 +423,9 @@ pub(crate) fn walk_schema_value<'s>(
             let AuthoredValue::Array(values) = value else {
                 return Err(shape("sequence value must be an array"));
             };
-            for value in values {
-                walk_schema_value(element, value, frames, used, blob_count)?;
+            for (index, value) in values.iter().enumerate() {
+                walk_schema_value(element, value, frames, used, blob_count)
+                    .map_err(|error| located(&format!("[{index}]"), error))?;
             }
         }
         SchemaNode::Array { len, elem } => {
@@ -422,8 +435,9 @@ pub(crate) fn walk_schema_value<'s>(
             if usize::try_from(*len).ok() != Some(values.len()) {
                 return Err(shape("array value length does not match schema"));
             }
-            for value in values {
-                walk_schema_value(elem, value, frames, used, blob_count)?;
+            for (index, value) in values.iter().enumerate() {
+                walk_schema_value(elem, value, frames, used, blob_count)
+                    .map_err(|error| located(&format!("[{index}]"), error))?;
             }
         }
         SchemaNode::Option(element) => {
@@ -473,7 +487,8 @@ pub(crate) fn walk_schema_value<'s>(
 }
 
 /// A struct body's fields, validated in whatever frame the caller opened:
-/// a struct's own, or its enum's for a variant payload.
+/// a struct's own, or its enum's for a variant payload. A missing or
+/// extra field is named, and an error inside a field is located there.
 fn walk_fields<'s>(
     fields: &'s [(String, u32, SchemaNode)],
     value: &AuthoredValue,
@@ -481,22 +496,38 @@ fn walk_fields<'s>(
     used: &mut BTreeSet<u32>,
     blob_count: u32,
 ) -> Result<(), AuthoringValueError> {
-    let shape = |detail: &str| AuthoringValueError::SchemaValueShape {
-        detail: detail.to_owned(),
-    };
+    let shape = |detail: String| AuthoringValueError::SchemaValueShape { detail };
     let AuthoredValue::Object(object) = value else {
-        return Err(shape("struct value must be an object"));
+        return Err(shape("struct value must be an object".to_owned()));
     };
-    if object.len() != fields.len() {
-        return Err(shape("struct value field set does not match schema"));
+    if let Some(extra) = object
+        .keys()
+        .find(|key| !fields.iter().any(|(name, _, _)| name == *key))
+    {
+        return Err(shape(format!("struct field {extra:?} is not in the schema")));
     }
     for (name, _, field_schema) in fields {
         let field_value = object
             .get(name)
-            .ok_or_else(|| shape("struct value is missing a schema field"))?;
-        walk_schema_value(field_schema, field_value, frames, used, blob_count)?;
+            .ok_or_else(|| shape(format!("missing struct field {name:?}")))?;
+        walk_schema_value(field_schema, field_value, frames, used, blob_count)
+            .map_err(|error| located(&format!(".{name}"), error))?;
     }
     Ok(())
+}
+
+/// `error`, raised inside `part` (`.field` or `[index]`) of the value,
+/// located at its path from the value's root, spelled as a bundle error's
+/// (`at data.animation.skeleton: missing struct field "name"`).
+fn located(part: &str, error: AuthoringValueError) -> AuthoringValueError {
+    let AuthoringValueError::SchemaValueShape { detail } = error else {
+        return error;
+    };
+    let detail = match detail.strip_prefix("at data") {
+        Some(inner) => format!("at data{part}{inner}"),
+        None => format!("at data{part}: {detail}"),
+    };
+    AuthoringValueError::SchemaValueShape { detail }
 }
 
 pub(crate) fn validate_primitive(
@@ -710,5 +741,124 @@ mod tests {
         let mut value = distill_json::parse(text).unwrap();
         materialize_blob_tokens(&schema, &mut value, &mut Vec::new(), &[]);
         assert_eq!(value, distill_json::parse(text).unwrap());
+    }
+
+    /// `{ skeleton: Option<{ path: String, name: Option<String> }>, rate: u8 }`,
+    /// the shape of `GltfImportSettings.animation`'s `skeleton` beside a
+    /// plain field.
+    fn optional_struct_settings() -> SchemaNode {
+        let record = |fields: Vec<(&str, SchemaNode)>| SchemaNode::Struct {
+            rev: 0,
+            fields: fields
+                .into_iter()
+                .map(|(name, node)| (name.to_owned(), 0, node))
+                .collect(),
+        };
+        record(vec![
+            (
+                "skeleton",
+                SchemaNode::Option(Box::new(record(vec![
+                    ("path", SchemaNode::String),
+                    ("name", SchemaNode::Option(Box::new(SchemaNode::String))),
+                ]))),
+            ),
+            ("rate", SchemaNode::Primitive(PrimitiveKind::U8)),
+        ])
+    }
+
+    /// `text` completed from `defaults` under [`optional_struct_settings`],
+    /// and its validation.
+    fn complete(
+        text: &str,
+        defaults: &str,
+    ) -> (AuthoredValue, Result<(), AuthoringValueError>) {
+        let schema = optional_struct_settings();
+        let mut value = distill_json::parse(text).unwrap();
+        complete_settings(&schema, &mut value, &distill_json::parse(defaults).unwrap());
+        let walked = walk_schema_value(&schema, &value, &mut Vec::new(), &mut BTreeSet::new(), 0);
+        (value, walked)
+    }
+
+    #[test]
+    fn an_object_over_a_null_default_leaves_absent_option_fields_none() {
+        let (value, walked) = complete(
+            r#"{"skeleton":{"path":"characters/fox_rig.gltf"}}"#,
+            r#"{"rate":30,"skeleton":null}"#,
+        );
+        walked.unwrap();
+        assert_eq!(
+            value,
+            distill_json::parse(
+                r#"{"rate":30,"skeleton":{"name":null,"path":"characters/fox_rig.gltf"}}"#
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn an_object_over_a_null_default_missing_a_required_field_names_it() {
+        let (_, walked) = complete(
+            r#"{"skeleton":{"name":"Armature"}}"#,
+            r#"{"rate":30,"skeleton":null}"#,
+        );
+        let Err(AuthoringValueError::SchemaValueShape { detail }) = walked else {
+            panic!("expected a shape error, got {walked:?}");
+        };
+        assert_eq!(detail, r#"at data.skeleton: missing struct field "path""#);
+    }
+
+    #[test]
+    fn a_full_object_stays_as_authored() {
+        let full = r#"{"rate":2,"skeleton":{"name":"Armature","path":"rig.gltf"}}"#;
+        for defaults in [
+            r#"{"rate":30,"skeleton":null}"#,
+            r#"{"rate":30,"skeleton":{"name":null,"path":"other.gltf"}}"#,
+        ] {
+            let (value, walked) = complete(full, defaults);
+            walked.unwrap();
+            assert_eq!(value, distill_json::parse(full).unwrap());
+        }
+        // An authored `null` over a present default stays `None`.
+        let (value, walked) = complete(
+            r#"{"skeleton":null}"#,
+            r#"{"rate":30,"skeleton":{"name":null,"path":"other.gltf"}}"#,
+        );
+        walked.unwrap();
+        assert_eq!(
+            value,
+            distill_json::parse(r#"{"rate":30,"skeleton":null}"#).unwrap()
+        );
+    }
+
+    #[test]
+    fn an_option_struct_over_a_present_default_completes_from_it() {
+        let (value, walked) = complete(
+            r#"{"skeleton":{"path":"rig.gltf"}}"#,
+            r#"{"rate":30,"skeleton":{"name":"Armature","path":"other.gltf"}}"#,
+        );
+        walked.unwrap();
+        assert_eq!(
+            value,
+            distill_json::parse(r#"{"rate":30,"skeleton":{"name":"Armature","path":"rig.gltf"}}"#)
+                .unwrap()
+        );
+    }
+
+    /// Completed settings are what an output's `$settings` records and
+    /// reads back: canonical JSON round trips them, and completing the
+    /// read-back record (or the completed value) again changes nothing, so
+    /// an unchanged rule matches its output's record on every pass.
+    #[test]
+    fn completed_settings_are_canonical_and_complete_to_themselves() {
+        let defaults = r#"{"rate":30,"skeleton":null}"#;
+        let (value, walked) = complete(r#"{"skeleton":{"path":"rig.gltf"}}"#, defaults);
+        walked.unwrap();
+        let written = distill_json::write(&value).unwrap();
+        assert_eq!(written, r#"{"rate":30,"skeleton":{"name":null,"path":"rig.gltf"}}"#);
+        let read_back = distill_json::parse(&written).unwrap();
+        assert_eq!(read_back, value);
+        let (again, walked) = complete(&written, defaults);
+        walked.unwrap();
+        assert_eq!(again, value);
     }
 }
