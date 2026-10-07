@@ -32,8 +32,7 @@ use distill_schema::ngp_schema::{node_hash, snapshot_to_json, LogicalSchema};
 use distill_store::bundles::{BundleMeta, DirectoryOrigin as StoredDirectoryOrigin};
 use distill_store::imports::{
     DirectoryImportFailure, DirectoryRuleSource, ImportIndexSource, ImportReadKey, WatchedImport,
-    WatchedImportFailure,
-    WatchedImportTerminal,
+    WatchedImportFailure, WatchedImportTerminal,
 };
 use distill_store::{Store, StoreError, StoreOpener, StoreReader};
 use globset::Glob;
