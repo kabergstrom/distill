@@ -72,9 +72,12 @@ pub struct PassOutcome {
     /// became due after the plan, or a path's watcher work moved on. The
     /// caller runs another pass.
     pub more_work: bool,
-    /// Importers that failed with no bundle yet to hold the failure memo.
-    /// The rest of the pass published; these rerun when their sources
-    /// change.
+    /// Import failures nothing memoizes: a cycle cut from a chain, a chain
+    /// deeper than the bound, or an importer failure with neither a bundle
+    /// nor a directory origin to hold its memo. The rest of the pass
+    /// published. (A directory import that fails before its bundle exists
+    /// is memoized by its origin and listed with the watched-import
+    /// failures instead.)
     pub failures: Vec<String>,
     /// The bundles whose imports published.
     pub imported: Vec<BundleUuid>,
@@ -521,7 +524,7 @@ impl DaemonCoordinator {
                             tracing::warn!(
                                 ?import,
                                 ?error,
-                                "import failed with no bundle to hold its failure"
+                                "import failed with nothing to hold its failure"
                             );
                             failures.push(format!("{error:?}"));
                         }

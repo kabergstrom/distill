@@ -3140,7 +3140,9 @@ fn write_import_failures_result(
             let mut list = result.init_success(failures.len() as u32);
             for (index, failure) in failures.iter().enumerate() {
                 let mut entry = list.reborrow().get(index as u32);
-                entry.set_bundle(&failure.bundle.0);
+                // Empty for a directory import that failed before any bundle
+                // existed at its output.
+                entry.set_bundle(failure.bundle.as_ref().map_or(&[][..], |bundle| &bundle.0));
                 entry.set_root(failure.root.as_str());
                 entry.set_path(failure.path.as_str());
                 entry.set_message(failure.message.as_str());

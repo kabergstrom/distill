@@ -1733,6 +1733,8 @@ impl Snapshot {
     /// version (an idle version's shared transaction would hide every
     /// failure recorded after it began). A failure whose bundle this
     /// snapshot does not have is left for the snapshot that does.
+    /// A directory import that failed before any bundle existed at its
+    /// output is named by that output, with no bundle.
     pub fn import_failures(&self) -> RpcResult<Vec<ImportFailure>> {
         let txn = match self.preflight() {
             Ok(txn) => txn,
@@ -1750,10 +1752,32 @@ impl Snapshot {
                 continue;
             };
             failures.push(ImportFailure {
-                bundle,
+                bundle: Some(bundle),
                 root,
                 path: meta.path,
                 message,
+            });
+        }
+        // Directory imports that failed before any bundle existed at their
+        // output, named by that output: listed while the snapshot has their
+        // rules bundle and no bundle at the output.
+        for failure in rpc_try!(self
+            .server
+            .inner
+            .reader
+            .directory_import_failure_messages())
+        {
+            if rpc_try!(reader.bundle(failure.rules_bundle)).is_none()
+                || rpc_try!(reader.bundle_at(&failure.destination_root, &failure.destination_path))
+                    .is_some()
+            {
+                continue;
+            }
+            failures.push(ImportFailure {
+                bundle: None,
+                root: failure.destination_root,
+                path: failure.destination_path,
+                message: failure.message,
             });
         }
         failures.sort_by(|a, b| (&a.root, &a.path).cmp(&(&b.root, &b.path)));

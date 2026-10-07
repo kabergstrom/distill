@@ -2654,7 +2654,26 @@ state as the failure's basis (the bundle's committed
 revalidates the terminal failure exactly like a build trace and re-runs
 exactly when *that* outcome changes — healing a missing file, listing, or
 importer wakes it; unchanged failures never continuously retry and can
-never be suppressed forever. The default
+never be suppressed forever. A directory import (below) whose attempt
+fails before any bundle exists at its output has no bundle to key the
+record by: it is kept by the import's **origin** instead (rules bundle,
+rule id, group: what `DirectoryOrigin` names), with the output path it
+would write, a digest of the task it ran (importer, sources, completed
+settings, output) and the index keys its basis reads (e.g. a clip file
+rejected because the skeleton bundle it reads does not exist yet).
+- The rules pass treats the origin's group as due when a path or importer
+  capability its basis observed changes, when its rules source changes or
+  goes, or when its task digests otherwise. An unchanged one is not
+  re-run, not even by a full revalidation (startup).
+- The record is listed with the watched-import failures (§17), by its
+  output path, with no bundle.
+- It clears when the import succeeds (the bundle it writes holds the state
+  from then on) or when the rules no longer produce its origin (its source,
+  rule or rules bundle went).
+- Like every failure record it is disposable (§2): a daemon on fresh state
+  re-runs the import and records it again.
+
+The default
 remains `watch = false`: explicit re-import, read-set
 as provenance only. Read-set entries are authoring-side dependencies — they
 gate re-*import*, never enter build input hashes, and leave build purity
@@ -4975,6 +4994,8 @@ that published it, never copied into a table.
 | `cas_segments` | every segment file and its state (open, sealed, dead); a writer's one open segment is unique, and a dead file is deleted only once no read can reach it |
 | `tools` | **ToolEpoch** state (§9): tool key → (`ToolExecutionIdentityV2`, DSCT hash, optional staged package root) — input-versioned. Package registrations snapshot and stage their complete directory no-replace; ambient registrations retain an explicit absolute launcher and toolchain identity, and are nonmemoizable unless they carry a trusted fingerprint. No row resolves to a library handle: runtime `dlopen` in pipeline code and a staged-library API are banned (§3, §9) |
 | `watched_import_failures` | bundle uuid → a watched import's last failure: the attempted version, the basis it read and the terminal error. The basis is what decides whether the import is due again |
+| `directory_import_failures` | directory-import origin (rules bundle, rule id, group root and path) → the last failure of an import that has written no bundle yet (§8): the output it would write, the digest of the task it ran, the attempted version, the basis, the terminal error. Cleared when the import succeeds or its origin is no longer produced |
+| `directory_import_failure_keys` | a `directory_import_failures` row → what its basis reads (a path, a listing, an importer capability; `import_keys` kinds 0 to 2), indexed by (kind, key): the failures a changed path or capability may heal. Its rows go with the failure's |
 | `change_log` | publication deltas and fence events in order, read by every RPC front end after its cursor and by a subscriber's history one subject at a time. Only real changes are logged: the first publication on an empty store logs no deltas (no client holds the version before it), and a rescan logs the assets of the bundles that changed and the paths whose candidates changed. Trimmed by version |
 | `rpc_targets` | the RPC target set: name → definition hash and reconnect generation |
 | `artifact_load_edges` | an artifact's direct load edges' expected terminal types, the one piece of artifact metadata its bytes do not carry; written with the CAS index and deleted with its extent |
@@ -5751,8 +5772,10 @@ Modeled on v1's `FileTracker`, whose behavior is carried over:
   read-set moved between plan and apply is not applied; it and the pending
   paths stay queued for a retry pass. One bundle's importer failure does not
   hold back the rest: the failing bundle keeps its last good result (with
-  the failure memoized) or, with nothing to keep, is reported as the pass's
-  background error, which clears when a later pass succeeds. Outside the
+  the failure memoized); a directory import with no bundle yet memoizes its
+  failure by its origin (§8). A failure nothing can hold (an import cycle,
+  a chain past the level bound) is reported as the pass's background error,
+  which clears when a later pass succeeds. Outside the
   single input remain: configuration/schema/pipeline candidate
   publications (each its own version, before the pass, because they install
   the epoch and importers the pass uses), codegen (files only, no version),
@@ -7199,6 +7222,11 @@ its bundle's root and path at the snapshot, so the names agree with the
 snapshot's `resolvePath`; a failure whose bundle the snapshot lacks is
 left out until a snapshot that has it. A bundle listed there keeps serving
 its last good contents; its entry clears when a later import succeeds.
+Since protocol 19 it also lists the directory imports that failed before
+any bundle existed at their output (§8): `bundle` is empty, and root and
+path name the output the import would write. One is listed while the
+snapshot has its rules bundle and no bundle at that output; nothing is
+served at the output until the import succeeds.
 
 Subscriptions are cursor-bound and one connection owns one ordered delta
 stream. Its first installation at `installed >= since` atomically returns the

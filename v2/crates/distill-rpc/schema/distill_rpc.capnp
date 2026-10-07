@@ -342,6 +342,8 @@ struct UuidListCall {
 
 # A watched import whose latest attempt failed (see Snapshot.importFailures).
 struct ImportFailure {
+  # Empty for a directory import that failed before any bundle existed at
+  # its output (protocol 19); `path` is then that output.
   bundle @0 :Data;
   root @1 :Text;
   path @2 :Text;

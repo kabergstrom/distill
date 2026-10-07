@@ -141,6 +141,22 @@ fn import_failures(coordinator: &DaemonCoordinator) -> Vec<(String, String)> {
     }
 }
 
+/// The watched-import failures a runtime client polls, as (path, bundle,
+/// message): no bundle for a directory import that never wrote one.
+fn listed_failures(coordinator: &DaemonCoordinator) -> Vec<(String, Option<BundleUuid>, String)> {
+    let snapshot = match connect(coordinator).snapshot() {
+        distill_rpc::RpcResult::Success(snapshot) => snapshot,
+        other => panic!("expected a snapshot, got {other:?}"),
+    };
+    match snapshot.import_failures() {
+        distill_rpc::RpcResult::Success(failures) => failures
+            .into_iter()
+            .map(|failure| (failure.path, failure.bundle, failure.message))
+            .collect(),
+        other => panic!("expected import failures, got {other:?}"),
+    }
+}
+
 fn object<const N: usize>(fields: [(&str, AuthoredValue); N]) -> AuthoredValue {
     AuthoredValue::Object(
         fields
@@ -1512,7 +1528,8 @@ fn an_rpc_write_during_a_pass_makes_it_stale_and_its_retry_applies_everything_on
 
 /// One failing import in a multi-bundle pass: the others publish, the
 /// failing bundle keeps its last good contents and records the failure, and
-/// a new output whose importer fails is reported, all in one version.
+/// a new output whose importer fails records its failure by its origin, with
+/// no bundle, all in one version.
 #[test]
 fn an_import_failure_in_a_pass_keeps_its_last_good_bundle_while_the_rest_publish() {
     let (_temp, assets, coordinator) = imported_sources(&[("a", "1"), ("b", "2"), ("c", "3")]);
@@ -1534,16 +1551,17 @@ fn an_import_failure_in_a_pass_keeps_its_last_good_bundle_while_the_rest_publish
     let version = InputVersion(base.0 + 1);
     assert_eq!(outcome.stamp.version, version);
     assert_eq!(outcome.imported.len(), 2);
-    assert_eq!(outcome.failures.len(), 1, "{:?}", outcome.failures);
+    assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
     assert!(!outcome.more_work);
     let reader = coordinator.open_reader().unwrap();
     assert_eq!(
         generated_values(&reader, &assets, &["a", "b", "c", "d"]),
         [Some(4), Some(2), Some(6), None]
     );
-    let failures = import_failures(&coordinator);
-    assert_eq!(failures.len(), 1);
-    assert_eq!(failures[0].0, "b.bundle");
+    let failures = listed_failures(&coordinator);
+    assert_eq!(failures.len(), 2, "{failures:?}");
+    assert_eq!((failures[0].0.as_str(), failures[0].1.is_some()), ("b.bundle", true));
+    assert_eq!((failures[1].0.as_str(), failures[1].1), ("d.bundle", None));
     assert_changes_exactly(&changed_assets(&reader, version), &assets, &["a", "c"]);
 }
 
@@ -2247,4 +2265,164 @@ fn an_import_rejected_for_a_removed_bundle_reruns_when_it_returns() {
     assert_eq!(outcome.imported.len(), 1, "the clip");
     assert!(import_failures(&coordinator).is_empty());
     assert_eq!(clip(), Some(3));
+}
+
+/// A project whose rules import every `*.src` with [`REQUIRE_IMPORTER`]:
+/// `rig.txt` holds 4, and each of `clips` is a source naming `rig.txt`,
+/// whose import does not exist yet.
+fn rig_clips_project(
+    dir: &std::path::Path,
+    clips: &[&str],
+) -> (std::path::PathBuf, DaemonCoordinator) {
+    let assets = dir.join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(
+        assets.join("rules.bundle"),
+        directory_rules_bundle_for(true, REQUIRE_IMPORTER, &default_settings()),
+    )
+    .unwrap();
+    std::fs::write(assets.join("rig.txt"), b"4").unwrap();
+    for clip in clips {
+        std::fs::write(assets.join(format!("{clip}.src")), b"rig.txt").unwrap();
+    }
+    let coordinator = open_configured(dir, &assets);
+    (assets, coordinator)
+}
+
+/// The value the bundle at `path` imported, if it exists.
+fn imported_value(path: &std::path::Path) -> Option<u128> {
+    let bytes = std::fs::read(path).ok()?;
+    byte_of(&distill_bundle::parse_bundle(&bytes).unwrap().assets["asset"].data)
+}
+
+/// Assert the failures listed are exactly `paths`' bundle-less ones, each
+/// rejected for reading `rig.txt`'s missing import.
+fn assert_rig_failures(coordinator: &DaemonCoordinator, paths: &[&str]) {
+    let failures = listed_failures(coordinator);
+    assert_eq!(
+        failures
+            .iter()
+            .map(|(path, bundle, _)| (path.as_str(), *bundle))
+            .collect::<Vec<_>>(),
+        paths.iter().map(|path| (*path, None)).collect::<Vec<_>>(),
+        "{failures:?}"
+    );
+    for (_, _, message) in &failures {
+        assert!(message.contains("rig.txt has no import"), "{failures:?}");
+    }
+}
+
+/// A directory import whose first attempt fails has no bundle to hold its
+/// failure: the daemon keeps it by origin, lists it with no bundle, and
+/// reruns it when a path its read set observed changes, not on unrelated
+/// work (newgameplus doc 21 §7.4: a clip file rejected because the
+/// skeleton file's bundle it reads does not exist yet). Its success clears
+/// the failure.
+#[test]
+fn a_first_directory_import_failure_is_listed_and_reruns_when_its_read_set_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let (assets, coordinator) = rig_clips_project(temp.path(), &["clip"]);
+    let mut writer = coordinator.open_writer().unwrap();
+    assert!(coordinator
+        .reconcile_directory_imports(&mut writer)
+        .unwrap()
+        .is_empty());
+    assert!(!assets.join("clip.bundle").exists());
+    assert_rig_failures(&coordinator, &["clip.bundle"]);
+
+    // Revalidating every rule does not rerun it: its basis still holds.
+    let version = coordinator.server().current_stamp().unwrap().version;
+    assert!(coordinator
+        .reconcile_directory_imports(&mut writer)
+        .unwrap()
+        .is_empty());
+    assert_eq!(coordinator.server().current_stamp().unwrap().version, version);
+    assert_rig_failures(&coordinator, &["clip.bundle"]);
+
+    // Unrelated work does not rerun it.
+    std::fs::write(assets.join("other.txt"), b"1").unwrap();
+    let outcome = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["other.txt"]), false)
+        .unwrap();
+    assert!(outcome.imported.is_empty() && outcome.failures.is_empty());
+    assert_rig_failures(&coordinator, &["clip.bundle"]);
+
+    // The rig's bundle appears: the clip imports, and its failure clears.
+    import_with(&coordinator, BYTE_IMPORTER, &["rig.txt"], "rig.txt.bundle", &settings([0, 0], 3));
+    let outcome = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["rig.txt.bundle"]), false)
+        .unwrap();
+    assert_eq!(outcome.imported.len(), 1, "the clip");
+    assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+    assert!(listed_failures(&coordinator).is_empty());
+    assert_eq!(imported_value(&assets.join("clip.bundle")), Some(3));
+}
+
+/// A bundle-less failure clears once its rules no longer produce it: its
+/// source goes, then the rules bundle goes.
+#[test]
+fn a_bundle_less_failure_clears_when_its_source_or_rules_go() {
+    let temp = tempfile::tempdir().unwrap();
+    let (assets, coordinator) = rig_clips_project(temp.path(), &["clip", "walk"]);
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_directory_imports(&mut writer).unwrap();
+    assert_rig_failures(&coordinator, &["clip.bundle", "walk.bundle"]);
+
+    std::fs::remove_file(assets.join("clip.src")).unwrap();
+    let outcome = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["clip.src"]), false)
+        .unwrap();
+    assert!(outcome.imported.is_empty() && outcome.failures.is_empty());
+    assert_rig_failures(&coordinator, &["walk.bundle"]);
+
+    std::fs::remove_file(assets.join("rules.bundle")).unwrap();
+    coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["rules.bundle"]), false)
+        .unwrap();
+    assert!(listed_failures(&coordinator).is_empty());
+    let reader = coordinator.open_reader().unwrap();
+    assert!(reader.directory_import_failure_origins(None).unwrap().is_empty());
+}
+
+/// Bundle-less failures are disposable daemon state (§2): a daemon reopened
+/// on its state keeps listing them, one on fresh state reruns the import
+/// and lists it again, and either reruns it when what it read appears.
+#[test]
+fn a_bundle_less_failure_survives_a_restart_and_is_rederived_from_fresh_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let (assets, coordinator) = rig_clips_project(temp.path(), &["clip"]);
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_directory_imports(&mut writer).unwrap();
+    assert_rig_failures(&coordinator, &["clip.bundle"]);
+    drop(writer);
+    drop(coordinator);
+
+    // Reopened on its state.
+    let coordinator = open_configured(temp.path(), &assets);
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_directory_imports(&mut writer).unwrap();
+    assert_rig_failures(&coordinator, &["clip.bundle"]);
+    drop(writer);
+    drop(coordinator);
+
+    // Reopened on fresh state.
+    std::fs::remove_dir_all(temp.path().join(".distill")).unwrap();
+    let coordinator = open_configured(temp.path(), &assets);
+    let mut writer = coordinator.open_writer().unwrap();
+    assert!(coordinator
+        .open_reader()
+        .unwrap()
+        .directory_import_failure_origins(None)
+        .unwrap()
+        .is_empty());
+    coordinator.reconcile_directory_imports(&mut writer).unwrap();
+    assert_rig_failures(&coordinator, &["clip.bundle"]);
+
+    import_with(&coordinator, BYTE_IMPORTER, &["rig.txt"], "rig.txt.bundle", &settings([0, 0], 3));
+    let outcome = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["rig.txt.bundle"]), false)
+        .unwrap();
+    assert_eq!(outcome.imported.len(), 1, "the clip");
+    assert!(listed_failures(&coordinator).is_empty());
+    assert_eq!(imported_value(&assets.join("clip.bundle")), Some(3));
 }

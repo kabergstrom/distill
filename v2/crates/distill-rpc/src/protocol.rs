@@ -30,17 +30,22 @@ pub use distill_store::state::{
 /// `storeInstanceChanged`). 18: `RpcError` says what failed as a typed
 /// `failure` union (the [`RpcFailure`], or a request the daemon could not
 /// decode) instead of a numeric code, and `importFailures` moves from the hub
-/// to the snapshot, naming each failure's bundle at that snapshot.
-pub const PROTOCOL_VERSION: u32 = 18;
+/// to the snapshot, naming each failure's bundle at that snapshot. 19:
+/// `importFailures` also lists the directory imports whose attempt failed
+/// before any bundle existed at their output, with an empty `bundle`.
+pub const PROTOCOL_VERSION: u32 = 19;
 
 /// A watched import whose latest attempt failed. The bundle keeps serving its
 /// last good contents; the failure clears when a later import succeeds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportFailure {
-    pub bundle: BundleUuid,
+    /// `None` for a directory import whose attempt failed before any bundle
+    /// existed at its output: nothing is served there until it succeeds.
+    pub bundle: Option<BundleUuid>,
     /// Asset root name.
     pub root: String,
-    /// The bundle's path within `root`.
+    /// The bundle's path within `root` (the output it would write, with no
+    /// bundle).
     pub path: String,
     pub message: String,
 }

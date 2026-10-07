@@ -31,7 +31,8 @@ use distill_rpc::{
 use distill_schema::ngp_schema::{node_hash, snapshot_to_json, LogicalSchema};
 use distill_store::bundles::{BundleMeta, DirectoryOrigin as StoredDirectoryOrigin};
 use distill_store::imports::{
-    DirectoryRuleSource, ImportIndexSource, ImportReadKey, WatchedImport, WatchedImportFailure,
+    DirectoryImportFailure, DirectoryRuleSource, ImportIndexSource, ImportReadKey, WatchedImport,
+    WatchedImportFailure,
     WatchedImportTerminal,
 };
 use distill_store::{Store, StoreError, StoreOpener, StoreReader};
@@ -529,7 +530,7 @@ impl AuthoringService {
         // read when a changed source holds rules, so a rule id it duplicates
         // is found; otherwise only the rules whose listing a dirty path may
         // be in are read.
-        let entries = if work.is_none() || capabilities_changed || refreshed.changed_rules {
+        let mut entries = if work.is_none() || capabilities_changed || refreshed.changed_rules {
             let sources = store.directory_rule_sources().map_err(invalid)?;
             self.directory_rule_entries(&store, sources, &refreshed.rules)?
         } else {
@@ -539,6 +540,31 @@ impl AuthoringService {
                 &refreshed.rules,
             )?
         };
+        // The failures recorded with no bundle to hold them (§8) that the
+        // work may heal or end: those whose basis reads a dirty path or an
+        // importer capability that changed, and those of rules bundles
+        // gone or at a changed source. Their groups are touched like any
+        // other, so each reruns when due and is cleared once its rules no
+        // longer produce it. With no work every group is touched anyway.
+        let failing = match work {
+            Some(_) => {
+                self.affected_directory_failures(store, &paths, capabilities_changed, changed)?
+            }
+            None => BTreeSet::new(),
+        };
+        let unread = failing
+            .iter()
+            .map(|origin| origin.rules_bundle)
+            .filter(|rules| !entries.iter().any(|entry| entry.rules_bundle == *rules))
+            .collect::<BTreeSet<_>>();
+        if !unread.is_empty() {
+            let mut sources = Vec::new();
+            for rules in unread {
+                sources.extend(store.directory_rule_sources_of(rules).map_err(invalid)?);
+            }
+            entries.extend(self.directory_rule_entries(&store, sources, &refreshed.rules)?);
+            entries.sort_by_key(|entry| (entry.rules_bundle, entry.rules_asset));
+        }
         let mut backend =
             RootedImportBackend::over(compiled.scanner(), &store, &capabilities, overlay);
         let mut groups = BTreeMap::new();
@@ -576,6 +602,29 @@ impl AuthoringService {
                         &mut touched_origins,
                     )?;
                 }
+            }
+            for origin in &failing {
+                touched_origins.insert(origin.clone());
+                let rule = |rule: &DecodedDirectoryRule| rule.id.0 == origin.rule.0;
+                let Some((entry, rule_index)) = entries.iter().find_map(|entry| {
+                    (entry.rules_bundle == origin.rules_bundle)
+                        .then(|| entry.rules.rules.iter().position(rule))
+                        .flatten()
+                        .map(|index| (entry, index))
+                }) else {
+                    continue;
+                };
+                let group = RootedPath {
+                    root: RootName(origin.group_root.clone()),
+                    path: origin.group_path.clone(),
+                };
+                touch_directory_group(
+                    entry,
+                    rule_index,
+                    &group,
+                    &mut touched,
+                    &mut touched_origins,
+                );
             }
         } else {
             for entry in &entries {
@@ -630,6 +679,24 @@ impl AuthoringService {
                 )));
             }
         }
+        // A bundle-less failure whose origin the rules no longer produce (its
+        // source, rule or rules bundle went) has nothing left to rerun.
+        let ended = if work.is_none() {
+            store
+                .directory_import_failure_origins(None)
+                .map_err(invalid)?
+                .into_iter()
+                .filter(|origin| !active_origins.contains(origin))
+                .collect::<Vec<_>>()
+        } else {
+            touched_origins
+                .difference(&active_origins)
+                .cloned()
+                .collect()
+        };
+        store
+            .clear_directory_import_failures(&ended)
+            .map_err(invalid)?;
         if work.is_none() {
             let bundles = store.generated_bundles().map_err(invalid)?;
             self.record_directory_orphans(store, &bundles, &active_origins, &capabilities)?;
@@ -642,6 +709,50 @@ impl AuthoringService {
             )?;
         }
         Ok(tasks)
+    }
+
+    /// The bundle-less directory-import failures a pass's work may heal or
+    /// end: those whose basis reads one of `paths` (or lists, or, with
+    /// `capabilities_changed`, observes an importer capability), and those
+    /// whose rules bundle is gone or at one of the `changed` sources.
+    fn affected_directory_failures(
+        &self,
+        store: &StoreReader,
+        paths: &[(String, String)],
+        capabilities_changed: bool,
+        changed: &BTreeSet<(String, String)>,
+    ) -> Result<BTreeSet<StoredDirectoryOrigin>, RpcFailure> {
+        let mut failing = store
+            .directory_import_failures_reading(
+                paths.iter().map(|(_, path)| path.as_str()),
+                capabilities_changed,
+            )
+            .map_err(invalid)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if changed.is_empty() {
+            return Ok(failing);
+        }
+        let mut rules_changed = BTreeMap::<BundleUuid, bool>::new();
+        for origin in store.directory_import_failure_origins(None).map_err(invalid)? {
+            let stale = match rules_changed.entry(origin.rules_bundle) {
+                std::collections::btree_map::Entry::Occupied(stale) => *stale.get(),
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    let stale = match store.bundle(origin.rules_bundle).map_err(invalid)? {
+                        None => true,
+                        Some(meta) => store
+                            .root_name(meta.root)
+                            .map_err(invalid)?
+                            .is_none_or(|root| changed.contains(&(root, meta.path))),
+                    };
+                    *slot.insert(stale)
+                }
+            };
+            if stale {
+                failing.insert(origin);
+            }
+        }
+        Ok(failing)
     }
 
     fn record_directory_orphans(
@@ -822,7 +933,8 @@ impl AuthoringService {
 
     /// Whether an import may read one of `outputs` (root, path) as `store`
     /// indexes them: a watched import reading the path or listing a query
-    /// it matches, or directory rules whose listing it matches. A cheap
+    /// it matches, directory rules whose listing it matches, or a directory
+    /// import failed with no bundle whose basis reads or lists. A cheap
     /// check on the committed index before a pass plans the imports chained
     /// to its outputs.
     pub(crate) fn may_read_outputs(
@@ -857,6 +969,14 @@ impl AuthoringService {
             if reads {
                 return Ok(true);
             }
+        }
+        // A directory import that failed with no bundle may read them.
+        if !store
+            .directory_import_failures_reading(paths.iter().copied(), false)
+            .map_err(invalid)?
+            .is_empty()
+        {
+            return Ok(true);
         }
         let dirs = paths
             .iter()
@@ -1053,6 +1173,7 @@ impl AuthoringService {
                 // generated output is an independent fold whose own sources,
                 // probes, and importer capability form its read set.
                 basis_deps: Vec::new(),
+                directory_task: Some(directory_task_digest(task)?),
             },
         ))
     }
@@ -1069,8 +1190,23 @@ impl AuthoringService {
             &task.destination_root,
             &task.destination_path,
         )?;
+        let compiled = self.compiled(store)?;
         let Some(meta) = destination.meta else {
-            return Ok(true);
+            // No bundle yet: due unless the same task's failure is recorded
+            // under its origin and its basis still reproduces.
+            let Some(failure) = store
+                .directory_import_failure(&directory_task_origin(task))
+                .map_err(invalid)?
+            else {
+                return Ok(true);
+            };
+            if failure.task != directory_task_digest(task)? {
+                return Ok(true);
+            }
+            let basis = decode_attempt_basis(&failure.basis)?;
+            let mut backend =
+                RootedImportBackend::over(compiled.scanner(), store, capabilities, overlay);
+            return Ok(!revalidate_read_set(&basis, &mut backend));
         };
         let prior = self.read_prior_import_published(store, &meta)?;
         let expected_origin = DirectoryOrigin {
@@ -1091,7 +1227,6 @@ impl AuthoringService {
         {
             return Ok(true);
         }
-        let compiled = self.compiled(store)?;
         let mut backend =
             RootedImportBackend::over(compiled.scanner(), store, capabilities, overlay);
         let basis = match store.watched_import_failure(meta.bundle).map_err(invalid)? {
@@ -1238,6 +1373,7 @@ impl AuthoringService {
                 watch: request.watch,
                 origin: None,
                 basis_deps: Vec::new(),
+                directory_task: None,
             },
         ))
     }
@@ -1319,6 +1455,7 @@ impl AuthoringService {
             read_set,
             identity_seed,
             outcome,
+            directory_task: _,
         } = run;
         let output = outcome.map_err(|failure| failure.rpc)?;
         let (compiled, folded, bytes) = self
@@ -1400,6 +1537,7 @@ impl AuthoringService {
                 watch,
                 origin: None,
                 basis_deps: Vec::new(),
+                directory_task: None,
             },
         ))
     }
@@ -1424,6 +1562,7 @@ impl AuthoringService {
             watch,
             origin,
             basis_deps,
+            directory_task,
         } = invocation;
         let capabilities = self.importer_capabilities(&compiled);
         let mut backend =
@@ -1520,6 +1659,7 @@ impl AuthoringService {
             read_set,
             identity_seed: IdentitySeed::random(),
             outcome,
+            directory_task,
         })
     }
 
@@ -1544,6 +1684,7 @@ impl AuthoringService {
             read_set,
             identity_seed,
             outcome,
+            directory_task,
         } = run;
         if run_base != base {
             require_base(store, base).map_err(ImportExecutionError::unmemoized)?;
@@ -1559,27 +1700,43 @@ impl AuthoringService {
         let output = match outcome {
             Ok(output) => output,
             Err(failure) => {
+                let holder = match (&destination.meta, &origin, directory_task) {
+                    (Some(meta), _, _) => Some(FailureHolder::Bundle(meta)),
+                    (None, Some(origin), Some(task)) => Some(FailureHolder::Origin {
+                        origin: stored_origin(origin),
+                        task,
+                        root: &destination.root,
+                        path: &destination.path,
+                    }),
+                    (None, _, _) => None,
+                };
                 let memo = self
                     .record_failed_attempt(
                         store,
                         run_base,
-                        destination.meta.as_ref(),
-                        watch,
+                        holder.filter(|_| watch),
                         &read_set,
                         failure.terminal,
                         &failure.message,
                     )
                     .map_err(ImportExecutionError::unmemoized)?;
                 let memoized = memo == Some(true);
-                if memoized {
-                    // Handled (memoized) failures never reach the loop's
-                    // error path; without this the author sees nothing and
-                    // the last good bundle silently stays served.
+                // Handled (memoized) failures never reach the loop's error
+                // path; without this the author sees nothing and the last
+                // good bundle silently stays served.
+                if memoized && destination.meta.is_some() {
                     tracing::warn!(
                         root = %destination.root,
                         path = %destination.path,
                         error = %failure.message,
                         "watched import failed; the previous bundle stays served"
+                    );
+                } else if memoized {
+                    tracing::warn!(
+                        root = %destination.root,
+                        path = %destination.path,
+                        error = %failure.message,
+                        "directory import failed; no bundle is written until it succeeds"
                     );
                 }
                 return Err(ImportExecutionError {
@@ -1589,12 +1746,19 @@ impl AuthoringService {
                     // The read set moved since the run: the failure is not
                     // the current sources'.
                     drifted: memo == Some(false),
-                    // Nothing holds a memo: no watched bundle exists yet.
+                    // Nothing holds a memo: no watched bundle exists yet, and
+                    // the import has no directory origin.
                     importer_failed: memo.is_none(),
                 });
             }
         };
 
+        // A failure recorded under the origin before any bundle existed
+        // goes once the bundle this publishes holds the import's state.
+        let recorded_origin = origin
+            .as_ref()
+            .filter(|_| destination.meta.is_none() && directory_task.is_some())
+            .map(stored_origin);
         let (_, bundle, bytes) = self.checked_fold(
             store,
             base,
@@ -1614,6 +1778,12 @@ impl AuthoringService {
             },
         )?;
         let preimage = destination.meta.as_ref().map(|meta| meta.content_hash);
+        if let Some(origin) = &recorded_origin {
+            store
+                .clear_directory_import_failures([origin])
+                .map_err(invalid)
+                .map_err(ImportExecutionError::unmemoized)?;
+        }
         if let Some(meta) = &destination.meta {
             if store
                 .clear_watched_import_failure(bundle)
@@ -1775,21 +1945,20 @@ impl AuthoringService {
         Ok(())
     }
 
-    /// Memoize a watched run's failure. `Some(true)` once memoized;
-    /// `Some(false)` when its read set moved since the run, so the failure is
-    /// not the current sources'; `None` when no watched bundle exists to
-    /// hold it.
+    /// Memoize a watched run's failure under `holder`. `Some(true)` once
+    /// memoized; `Some(false)` when its read set moved since the run, so the
+    /// failure is not the current sources'; `None` when nothing holds it (no
+    /// watched bundle exists, and the import has no directory origin).
     fn record_failed_attempt(
         &self,
         store: &mut Store,
         base: InputVersion,
-        destination: Option<&BundleMeta>,
-        watch: bool,
+        holder: Option<FailureHolder<'_>>,
         read_set: &[FileDep],
         terminal: WatchedImportTerminal,
         message: &str,
     ) -> Result<Option<bool>, RpcFailure> {
-        let Some(destination) = destination.filter(|_| watch) else {
+        let Some(holder) = holder else {
             return Ok(None);
         };
         let basis = encode_attempt_basis(read_set)?;
@@ -1805,17 +1974,41 @@ impl AuthoringService {
         // revalidation above only decides whether it is still wanted.
         store.write_transaction_with(invalid, |store| {
             let memo_seq = store.memo_seq().map_err(crate::authoring::invalid)?;
-            store
-                .record_watched_import_failure(&WatchedImportFailure {
-                    bundle: destination.bundle,
-                    attempted_input_version: base,
-                    basis,
-                    terminal,
-                    message: message.to_owned(),
-                    memo_seq,
-                })
-                .map_err(invalid)?;
-            self.reindex_watched_bundle(store, destination)
+            match holder {
+                FailureHolder::Bundle(destination) => {
+                    store
+                        .record_watched_import_failure(&WatchedImportFailure {
+                            bundle: destination.bundle,
+                            attempted_input_version: base,
+                            basis,
+                            terminal,
+                            message: message.to_owned(),
+                            memo_seq,
+                        })
+                        .map_err(invalid)?;
+                    self.reindex_watched_bundle(store, destination)
+                }
+                FailureHolder::Origin {
+                    origin,
+                    task,
+                    root,
+                    path,
+                } => store
+                    .record_directory_import_failure(&DirectoryImportFailure {
+                        origin,
+                        destination_root: root.to_owned(),
+                        destination_path: path.to_owned(),
+                        task,
+                        attempted_input_version: base,
+                        basis,
+                        reads: import_read_keys(read_set),
+                        terminal,
+                        message: message.to_owned(),
+                        memo_seq,
+                    })
+                    .map(|_| ())
+                    .map_err(invalid),
+            }
         })?;
         Ok(Some(true))
     }
@@ -2302,6 +2495,36 @@ fn directory_task_origin(task: &DirectoryImportTask) -> StoredDirectoryOrigin {
         group_root: task.group.root.0.clone(),
         group_path: task.group.path.clone(),
     }
+}
+
+/// `origin` as the store keys it.
+fn stored_origin(origin: &DirectoryOrigin) -> StoredDirectoryOrigin {
+    StoredDirectoryOrigin {
+        rules_bundle: origin.rules_bundle,
+        rule: distill_store::bundles::DirectoryRuleId(origin.rule.0),
+        group_root: origin.group.root.0.clone(),
+        group_path: origin.group.path.clone(),
+    }
+}
+
+/// What a directory task runs: its importer, sources, settings (completed
+/// with the importer's defaults) and output. A failure recorded with no
+/// bundle to hold it stands for the task that digests the same; one that
+/// digests otherwise runs again (an edited rule's settings, a group that
+/// gained a source).
+fn directory_task_digest(task: &DirectoryImportTask) -> Result<[u8; 32], RpcFailure> {
+    let settings = distill_json::write(&task.settings).map_err(invalid)?;
+    Ok(distill_core::canonical::domain_digest(*b"DSDT", 1, |encoder| {
+        encoder.str(&task.importer);
+        encoder.u32(task.sources.len() as u32);
+        for source in &task.sources {
+            encoder.str(&source.root.0);
+            encoder.str(&source.path);
+        }
+        encoder.str(&settings);
+        encoder.str(&task.destination_root);
+        encoder.str(&task.destination_path);
+    }))
 }
 
 /// The directory, ending in `/` (`""` for the whole root), that every path
@@ -3988,7 +4211,8 @@ pub(crate) enum PassPublication {
     /// What the run read changed before it could publish: it was discarded,
     /// and a later pass reruns it.
     Drifted,
-    /// The importer failed and no bundle exists yet to hold the memo.
+    /// The importer failed, and neither a bundle nor a directory origin
+    /// holds the memo.
     Failed(RpcFailure),
 }
 
@@ -4006,6 +4230,9 @@ pub(crate) struct ImportRun {
     /// Drawn once per run: the fresh UUIDs every fold of this run mints.
     identity_seed: IdentitySeed,
     outcome: Result<ImportOutput, ImportRunFailure>,
+    /// A directory task's digest ([`directory_task_digest`]): what a
+    /// failure with no bundle to hold it is recorded under.
+    directory_task: Option<[u8; 32]>,
 }
 
 impl ImportRun {
@@ -4016,6 +4243,19 @@ impl ImportRun {
             .is_ok()
             .then(|| (self.destination.root.clone(), self.destination.path.clone()))
     }
+}
+
+/// What holds a watched run's failure memo: the bundle at its destination,
+/// or, for a directory import before any bundle exists there, its origin
+/// (the task's digest and the output it would write).
+enum FailureHolder<'a> {
+    Bundle(&'a BundleMeta),
+    Origin {
+        origin: StoredDirectoryOrigin,
+        task: [u8; 32],
+        root: &'a str,
+        path: &'a str,
+    },
 }
 
 /// An importer failure a watched import memoizes.
@@ -4050,6 +4290,8 @@ struct ImportInvocation {
     watch: bool,
     origin: Option<DirectoryOrigin>,
     basis_deps: Vec<FileDep>,
+    /// A directory task's digest ([`directory_task_digest`]).
+    directory_task: Option<[u8; 32]>,
 }
 
 struct ImportExecutionError {

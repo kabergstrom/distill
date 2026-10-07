@@ -5,11 +5,17 @@
 //! an unchanged failure does not spin and the exact healing observation wakes
 //! the import. The daemon owns the versioned basis codec; the store preserves
 //! those bytes exactly and owns the memo-sequence transaction.
+//!
+//! A directory import whose attempt fails before any bundle exists at its
+//! output has no bundle to key the memo by: its failure is kept by its
+//! origin (rules bundle, rule, group) instead, with the keys its basis
+//! reads ([`DirectoryImportFailure`]).
 
 use rusqlite::OptionalExtension;
 
 use distill_core::id::{AssetUuid, BundleUuid};
 
+use crate::bundles::{DirectoryOrigin, DirectoryRuleId};
 use crate::state::{InputVersion, MemoSeq};
 use crate::{Store, StoreError, StoreReader};
 
@@ -153,6 +159,306 @@ impl StoreReader {
             )
             .optional()
             .map_err(StoreError::from)
+    }
+}
+
+/// A directory import whose attempt failed while no bundle existed at its
+/// output to hold the memo (§8): kept by its origin until the import
+/// succeeds or its origin is no longer produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryImportFailure {
+    pub origin: DirectoryOrigin,
+    /// The output the attempt would have written: what the failure is
+    /// listed by.
+    pub destination_root: String,
+    pub destination_path: String,
+    /// Digest of what the attempt ran (importer, sources, settings,
+    /// output): a task that digests otherwise runs again.
+    pub task: [u8; 32],
+    pub attempted_input_version: InputVersion,
+    pub basis: Vec<u8>,
+    /// What `basis` reads, for finding the failures a change may heal.
+    pub reads: Vec<ImportReadKey>,
+    /// `Dependency` or `Importer`; an orphan always has a bundle.
+    pub terminal: WatchedImportTerminal,
+    pub message: String,
+    /// Filled by reads. Callers may leave any value when recording.
+    pub memo_seq: MemoSeq,
+}
+
+/// A bundle-less failure as a runtime client lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryImportFailureMessage {
+    pub rules_bundle: BundleUuid,
+    pub destination_root: String,
+    pub destination_path: String,
+    pub message: String,
+}
+
+const DIRECTORY_FAILURE_BY_ORIGIN: &str = "SELECT failure_id FROM directory_import_failures
+     WHERE rules_bundle = ?1 AND rule = ?2 AND group_root = ?3 AND group_path = ?4";
+const DIRECTORY_FAILURE_AT_ORIGIN: &str = "SELECT failure_id, rules_bundle, rule, group_root,
+        group_path, destination_root, destination_path, task, attempted_input_version, basis,
+        terminal_kind, terminal_code, message, memo_seq
+     FROM directory_import_failures
+     WHERE rules_bundle = ?1 AND rule = ?2 AND group_root = ?3 AND group_path = ?4";
+/// The failures whose basis reads a path.
+const DIRECTORY_FAILURES_READING_PATH: &str =
+    "SELECT f.rules_bundle, f.rule, f.group_root, f.group_path
+     FROM directory_import_failure_keys k JOIN directory_import_failures f USING (failure_id)
+     WHERE k.kind = 0 AND k.key = ?1";
+/// The failures whose basis lists a directory or, with `?1`, observes an
+/// importer capability.
+const DIRECTORY_FAILURES_LISTING: &str =
+    "SELECT f.rules_bundle, f.rule, f.group_root, f.group_path
+     FROM directory_import_failure_keys k JOIN directory_import_failures f USING (failure_id)
+     WHERE k.kind = 1 OR (k.kind = 2 AND ?1)";
+
+fn directory_origin_row(row: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<DirectoryOrigin> {
+    Ok(DirectoryOrigin {
+        rules_bundle: BundleUuid(uuid16(row.get(at)?)?),
+        rule: DirectoryRuleId(uuid16(row.get(at + 1)?)?),
+        group_root: row.get(at + 2)?,
+        group_path: row.get(at + 3)?,
+    })
+}
+
+fn origin_params(origin: &DirectoryOrigin) -> [&dyn rusqlite::ToSql; 4] {
+    [
+        &origin.rules_bundle.0,
+        &origin.rule.0,
+        &origin.group_root,
+        &origin.group_path,
+    ]
+}
+
+impl Store {
+    /// Record `failure` under its origin, replacing the one recorded there
+    /// and its read keys.
+    pub fn record_directory_import_failure(
+        &mut self,
+        failure: &DirectoryImportFailure,
+    ) -> Result<MemoSeq, StoreError> {
+        let (terminal_kind, terminal_code) = match failure.terminal {
+            WatchedImportTerminal::Dependency => (1_i64, None),
+            WatchedImportTerminal::Importer { code: 0 } => {
+                return Err(StoreError::InvalidConfiguration {
+                    error: "watched importer failure code zero is reserved".to_owned(),
+                });
+            }
+            WatchedImportTerminal::Importer { code } => (2_i64, Some(i64::from(code))),
+            WatchedImportTerminal::DirectoryOrphan => {
+                return Err(StoreError::InvalidConfiguration {
+                    error: "a directory import with no bundle cannot be orphaned".to_owned(),
+                });
+            }
+        };
+        if failure.basis.is_empty() {
+            return Err(StoreError::InvalidConfiguration {
+                error: "directory import failure basis is empty".to_owned(),
+            });
+        }
+        let origin = &failure.origin;
+        let (_, sequence) = self.memo_transaction(|transaction, sequence| {
+            transaction
+                .prepare_cached(
+                    "INSERT INTO directory_import_failures(
+                       rules_bundle, rule, group_root, group_path, destination_root,
+                       destination_path, task, attempted_input_version, basis,
+                       terminal_kind, terminal_code, message, memo_seq
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                     ON CONFLICT(rules_bundle, rule, group_root, group_path) DO UPDATE SET
+                       destination_root = excluded.destination_root,
+                       destination_path = excluded.destination_path,
+                       task = excluded.task,
+                       attempted_input_version = excluded.attempted_input_version,
+                       basis = excluded.basis,
+                       terminal_kind = excluded.terminal_kind,
+                       terminal_code = excluded.terminal_code,
+                       message = excluded.message,
+                       memo_seq = excluded.memo_seq",
+                )?
+                .execute(rusqlite::params![
+                    origin.rules_bundle.0.as_slice(),
+                    origin.rule.0.as_slice(),
+                    origin.group_root,
+                    origin.group_path,
+                    failure.destination_root,
+                    failure.destination_path,
+                    failure.task.as_slice(),
+                    failure.attempted_input_version.0 as i64,
+                    failure.basis,
+                    terminal_kind,
+                    terminal_code,
+                    failure.message,
+                    sequence.0 as i64,
+                ])?;
+            let id: i64 = transaction
+                .prepare_cached(DIRECTORY_FAILURE_BY_ORIGIN)?
+                .query_row(origin_params(origin), |row| row.get(0))?;
+            transaction
+                .prepare_cached("DELETE FROM directory_import_failure_keys WHERE failure_id = ?1")?
+                .execute([id])?;
+            let mut insert = transaction.prepare_cached(
+                "INSERT OR IGNORE INTO directory_import_failure_keys(failure_id, kind, key)
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            for read in &failure.reads {
+                let (kind, key) = read.row();
+                insert.execute(rusqlite::params![id, kind, key])?;
+            }
+            Ok(())
+        })?;
+        Ok(sequence)
+    }
+
+    /// Clear the failures recorded under `origins`; how many there were.
+    /// Advances the memo sequence only when one is cleared.
+    pub fn clear_directory_import_failures<'a>(
+        &mut self,
+        origins: impl IntoIterator<Item = &'a DirectoryOrigin>,
+    ) -> Result<usize, StoreError> {
+        self.write_txn(|store| {
+            let mut ids = Vec::new();
+            for origin in origins {
+                ids.extend(
+                    store
+                        .read
+                        .conn
+                        .prepare_cached(DIRECTORY_FAILURE_BY_ORIGIN)?
+                        .query_row(origin_params(origin), |row| row.get::<_, i64>(0))
+                        .optional()?,
+                );
+            }
+            if ids.is_empty() {
+                return Ok(0);
+            }
+            store.memo_transaction(|transaction, _| {
+                let mut delete = transaction.prepare_cached(
+                    "DELETE FROM directory_import_failures WHERE failure_id = ?1",
+                )?;
+                for id in &ids {
+                    delete.execute([id])?;
+                }
+                Ok(())
+            })?;
+            Ok(ids.len())
+        })
+    }
+}
+
+impl StoreReader {
+    /// The failure recorded under `origin`, with its read keys.
+    pub fn directory_import_failure(
+        &self,
+        origin: &DirectoryOrigin,
+    ) -> Result<Option<DirectoryImportFailure>, StoreError> {
+        let found = self
+            .conn
+            .prepare_cached(DIRECTORY_FAILURE_AT_ORIGIN)?
+            .query_row(origin_params(origin), |row| {
+                let terminal = match (row.get::<_, i64>(10)?, row.get::<_, Option<i64>>(11)?) {
+                    (1, None) => WatchedImportTerminal::Dependency,
+                    (2, Some(code)) if (1..=i64::from(u32::MAX)).contains(&code) => {
+                        WatchedImportTerminal::Importer { code: code as u32 }
+                    }
+                    _ => return Err(rusqlite::Error::InvalidQuery),
+                };
+                let task: Vec<u8> = row.get(7)?;
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    DirectoryImportFailure {
+                        origin: directory_origin_row(row, 1)?,
+                        destination_root: row.get(5)?,
+                        destination_path: row.get(6)?,
+                        task: task.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        attempted_input_version: InputVersion(row.get::<_, i64>(8)? as u64),
+                        basis: row.get(9)?,
+                        reads: Vec::new(),
+                        terminal,
+                        message: row.get(12)?,
+                        memo_seq: MemoSeq(row.get::<_, i64>(13)? as u64),
+                    },
+                ))
+            })
+            .optional()?;
+        let Some((id, mut failure)) = found else {
+            return Ok(None);
+        };
+        failure.reads = self.query_rows(
+            "SELECT kind, key FROM directory_import_failure_keys
+             WHERE failure_id = ?1 ORDER BY kind, key",
+            [id],
+            |row| {
+                Ok(match row.get::<_, i64>(0)? {
+                    0 => ImportReadKey::Path(row.get(1)?),
+                    1 => ImportReadKey::Listing,
+                    2 => ImportReadKey::Capability,
+                    _ => return Err(rusqlite::Error::InvalidQuery),
+                })
+            },
+        )?;
+        Ok(Some(failure))
+    }
+
+    /// The origins of the failures whose basis reads one of `paths`, lists
+    /// a directory, or (when `capabilities`) observes an importer
+    /// capability, in order.
+    pub fn directory_import_failures_reading<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a str>,
+        capabilities: bool,
+    ) -> Result<Vec<DirectoryOrigin>, StoreError> {
+        let mut found = std::collections::BTreeSet::new();
+        let origin = |row: &rusqlite::Row<'_>| directory_origin_row(row, 0);
+        for path in paths {
+            found.extend(self.query_rows(DIRECTORY_FAILURES_READING_PATH, [path], origin)?);
+        }
+        found.extend(self.query_rows(DIRECTORY_FAILURES_LISTING, [capabilities], origin)?);
+        Ok(found.into_iter().collect())
+    }
+
+    /// The origins of every failure, or of those under `rules_bundle`, in
+    /// order.
+    pub fn directory_import_failure_origins(
+        &self,
+        rules_bundle: Option<BundleUuid>,
+    ) -> Result<Vec<DirectoryOrigin>, StoreError> {
+        let origin = |row: &rusqlite::Row<'_>| directory_origin_row(row, 0);
+        match rules_bundle {
+            Some(bundle) => self.query_rows(
+                "SELECT rules_bundle, rule, group_root, group_path FROM directory_import_failures
+                 WHERE rules_bundle = ?1 ORDER BY rules_bundle, rule, group_root, group_path",
+                [bundle.0.as_slice()],
+                origin,
+            ),
+            None => self.query_rows(
+                "SELECT rules_bundle, rule, group_root, group_path FROM directory_import_failures
+                 ORDER BY rules_bundle, rule, group_root, group_path",
+                [],
+                origin,
+            ),
+        }
+    }
+
+    /// Every bundle-less failure's output and message, in no order: one
+    /// walk of the memo table.
+    pub fn directory_import_failure_messages(
+        &self,
+    ) -> Result<Vec<DirectoryImportFailureMessage>, StoreError> {
+        self.query_rows(
+            "SELECT rules_bundle, destination_root, destination_path, message
+             FROM directory_import_failures",
+            [],
+            |row| {
+                Ok(DirectoryImportFailureMessage {
+                    rules_bundle: BundleUuid(uuid16(row.get(0)?)?),
+                    destination_root: row.get(1)?,
+                    destination_path: row.get(2)?,
+                    message: row.get(3)?,
+                })
+            },
+        )
     }
 }
 
@@ -323,6 +629,20 @@ impl StoreReader {
                  ORDER BY r.name, b.path, k.bundle_uuid, k.asset_uuid"
             ),
             rusqlite::params![],
+        )
+    }
+
+    /// The directory-import rules assets `rules_bundle` holds, in asset
+    /// order.
+    pub fn directory_rule_sources_of(
+        &self,
+        rules_bundle: BundleUuid,
+    ) -> Result<Vec<DirectoryRuleSource>, StoreError> {
+        self.directory_rule_rows(
+            &format!(
+                "{RULE_COLUMNS} WHERE k.bundle_uuid = ?1 AND k.kind = 3 ORDER BY k.asset_uuid"
+            ),
+            [rules_bundle.0.as_slice()],
         )
     }
 

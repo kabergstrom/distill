@@ -77,6 +77,8 @@ fn every_section_13_table_exists() {
         "roots",
         "store_meta",
         "watched_import_failures",
+        "directory_import_failures",
+        "directory_import_failure_keys",
         "change_log",
         "rpc_targets",
         "artifact_load_edges",

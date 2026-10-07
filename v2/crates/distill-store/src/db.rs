@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 61;
+pub const SCHEMA_VERSION: u32 = 62;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -320,6 +320,44 @@ CREATE TABLE watched_import_failures (
             AND terminal_code BETWEEN 1 AND 4294967295)
         OR (terminal_kind = 3 AND terminal_code IS NULL))
 );
+-- Schema 62: a directory import's failure while no bundle exists at its
+-- output to hold the memo (§8), keyed by its origin: the rules bundle, the
+-- rule's stable id and the group. `task` digests what the attempt ran
+-- (importer, sources, settings, output); a task that digests otherwise runs
+-- again. Memo state, as `watched_import_failures`: losing a row reruns the
+-- import.
+CREATE TABLE directory_import_failures (
+    failure_id              INTEGER PRIMARY KEY,
+    rules_bundle            BLOB NOT NULL,
+    rule                    BLOB NOT NULL,
+    group_root              TEXT NOT NULL,
+    group_path              TEXT NOT NULL,
+    destination_root        TEXT NOT NULL,
+    destination_path        TEXT NOT NULL,
+    task                    BLOB NOT NULL CHECK (length(task) = 32),
+    attempted_input_version INTEGER NOT NULL,
+    basis                   BLOB NOT NULL,
+    terminal_kind           INTEGER NOT NULL CHECK (terminal_kind IN (1, 2)),
+    terminal_code           INTEGER,
+    message                 TEXT NOT NULL,
+    memo_seq                INTEGER NOT NULL,
+    CHECK ((terminal_kind = 1 AND terminal_code IS NULL)
+        OR (terminal_kind = 2 AND terminal_code IS NOT NULL
+            AND terminal_code BETWEEN 1 AND 4294967295))
+);
+CREATE UNIQUE INDEX directory_import_failures_by_origin
+    ON directory_import_failures(rules_bundle, rule, group_root, group_path);
+-- What a bundle-less failure's basis reads, in `import_keys` kinds 0 to 2:
+-- the failures a changed path or importer capability may heal.
+CREATE TABLE directory_import_failure_keys (
+    failure_id INTEGER NOT NULL
+        REFERENCES directory_import_failures(failure_id) ON DELETE CASCADE,
+    kind       INTEGER NOT NULL CHECK (kind IN (0, 1, 2)),
+    key        TEXT NOT NULL,
+    PRIMARY KEY (failure_id, kind, key)
+) WITHOUT ROWID;
+CREATE INDEX directory_import_failure_keys_by_key
+    ON directory_import_failure_keys(kind, key, failure_id);
 -- Served RPC state (LOCKLESS.md §2.2). Current-state only: a snapshot
 -- lease reads these inside its own read transaction.
 --

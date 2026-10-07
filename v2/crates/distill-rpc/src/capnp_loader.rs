@@ -442,10 +442,13 @@ impl RemoteSnapshot {
                 let mut failures = Vec::new();
                 for entry in list? {
                     failures.push(ImportFailure {
-                        bundle: BundleUuid(fixed::<16>(
-                            entry.get_bundle()?,
-                            "importFailures.bundle",
-                        )?),
+                        bundle: match entry.get_bundle()? {
+                            [] => None,
+                            bundle => Some(BundleUuid(fixed::<16>(
+                                bundle,
+                                "importFailures.bundle",
+                            )?)),
+                        },
                         root: entry.get_root()?.to_string()?,
                         path: entry.get_path()?.to_string()?,
                         message: entry.get_message()?.to_string()?,

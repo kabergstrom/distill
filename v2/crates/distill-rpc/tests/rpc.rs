@@ -189,6 +189,38 @@ fn record_import_failure(project: &TestProject, bundle: BundleUuid, message: &st
         .unwrap();
 }
 
+/// Record the failure of a directory import of `rules` whose output
+/// `destination` has no bundle: memo state, no version.
+fn record_directory_import_failure(
+    project: &TestProject,
+    rules: BundleUuid,
+    destination: &str,
+    message: &str,
+) {
+    let mut writer = project.coordinator().open_writer().unwrap();
+    let attempted_input_version = writer.input_version().unwrap();
+    let memo_seq = writer.memo_seq().unwrap();
+    writer
+        .record_directory_import_failure(&distill_store::imports::DirectoryImportFailure {
+            origin: distill_store::bundles::DirectoryOrigin {
+                rules_bundle: rules,
+                rule: distill_store::bundles::DirectoryRuleId([7; 16]),
+                group_root: ROOT.to_owned(),
+                group_path: destination.replace(".bundle", ".src"),
+            },
+            destination_root: ROOT.to_owned(),
+            destination_path: destination.to_owned(),
+            task: [3; 32],
+            attempted_input_version,
+            basis: vec![1],
+            reads: vec![distill_store::imports::ImportReadKey::Path("rig.bundle".into())],
+            terminal: distill_store::imports::WatchedImportTerminal::Importer { code: 9 },
+            message: message.into(),
+            memo_seq,
+        })
+        .unwrap();
+}
+
 #[test]
 fn import_failures_are_named_at_the_snapshot_and_read_as_they_stand() {
     let mut project = project();
@@ -207,7 +239,9 @@ fn import_failures_are_named_at_the_snapshot_and_read_as_they_stand() {
     assert_eq!(failures(&before), vec![]);
 
     // The bundle moves, and a second bundle appears, in a later version;
-    // both fail after `before` opened.
+    // both fail after `before` opened, and so do two directory imports of
+    // the second bundle's rules that never wrote a bundle, one of them at
+    // the first bundle's new path.
     project.remove(&moved.normalized_path);
     write_entry(
         &mut project,
@@ -220,29 +254,40 @@ fn import_failures_are_named_at_the_snapshot_and_read_as_they_stand() {
     publish_entry(&mut project, &added);
     record_import_failure(&project, moved.bundle, "moved failed");
     record_import_failure(&project, added.bundle, "added failed");
+    record_directory_import_failure(&project, added.bundle, "clip.bundle", "clip failed");
+    record_directory_import_failure(&project, added.bundle, "moved.bundle", "shadowed");
 
     // Recorded after it opened, yet seen; named as `before` has the bundle,
-    // and the bundle it lacks is left out.
+    // and the bundle it lacks is left out, as are the directory failures
+    // whose rules bundle it lacks.
     assert_eq!(
         failures(&before),
         vec![(
-            moved.bundle,
+            Some(moved.bundle),
             ROOT.to_owned(),
             "bundle-1.bundle".to_owned(),
             "moved failed".to_owned()
         )]
     );
+    // A directory failure is named by its output, with no bundle; one
+    // whose output holds a bundle at the snapshot is left out.
     assert_eq!(
         failures(&snapshot(&hub)),
         vec![
             (
-                added.bundle,
+                Some(added.bundle),
                 ROOT.to_owned(),
                 "bundle-2.bundle".to_owned(),
                 "added failed".to_owned()
             ),
             (
-                moved.bundle,
+                None,
+                ROOT.to_owned(),
+                "clip.bundle".to_owned(),
+                "clip failed".to_owned()
+            ),
+            (
+                Some(moved.bundle),
                 ROOT.to_owned(),
                 "moved.bundle".to_owned(),
                 "moved failed".to_owned()

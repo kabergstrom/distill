@@ -1056,8 +1056,9 @@ impl DaemonCoordinator {
         )
     }
 
-    /// An imports-only pass. An importer failure with no bundle to hold its
-    /// memo is this call's error, after the rest of the pass published.
+    /// An imports-only pass. A failure nothing memoizes (see
+    /// [`PassOutcome::failures`]) is this call's error, after the rest of
+    /// the pass published.
     #[cfg(any(test, feature = "test-hooks"))]
     fn import_pass(
         &self,
