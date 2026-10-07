@@ -1,8 +1,9 @@
 //! The pipeline module the daemon tests load: it serves every target and
 //! registers one processor, [`REFLECT`], which cooks a [`PARENT_TYPE`]
 //! asset to a [`COOKED_TYPE`] primary and a declared [`REFLECTION`] output
-//! of [`REFLECTION_TYPE`]: a derived child asset; three importers,
-//! [`BYTE_IMPORTER`], [`CHAIN_IMPORTER`] and [`SETTINGS_IMPORTER`],
+//! of [`REFLECTION_TYPE`]: a derived child asset; four importers,
+//! [`BYTE_IMPORTER`], [`CHAIN_IMPORTER`], [`SETTINGS_IMPORTER`] and
+//! [`REQUIRE_IMPORTER`],
 //! producing [`VALUE_TYPE`] from settings of [`SETTINGS_TYPE`]; and
 //! [`FLOAT_IMPORTER`], producing [`VALUE_TYPE`] from settings of
 //! [`FLOAT_SETTINGS_TYPE`].
@@ -54,6 +55,10 @@ pub const CHAIN_IMPORTER: &str = "chain-importer";
 /// Imports the sum of `scale.by` over the settings of its sources' imports
 /// (`read_settings`; a source no import names adds 0), under its settings.
 pub const SETTINGS_IMPORTER: &str = "settings-importer";
+/// Each text source names another path; imports the sum of `scale.by`
+/// over the settings of those paths' imports (`read_settings`), under its
+/// settings. A named path no import names is rejection 9.
+pub const REQUIRE_IMPORTER: &str = "require-importer";
 /// Imports the number its one text source holds, whatever its settings
 /// ([`FLOAT_SETTINGS_TYPE`], defaults [`float_default_settings`]).
 pub const FLOAT_IMPORTER: &str = "float-importer";
@@ -245,6 +250,40 @@ impl PipelineImporter for SettingsImporter {
     }
 }
 
+struct RequireImporter;
+
+impl PipelineImporter for RequireImporter {
+    fn import(
+        &self,
+        context: &mut dyn AuthoringImportContext,
+        settings: &AuthoredValue,
+    ) -> Result<ImportOutput, AuthoringImporterError> {
+        let mut value = 0;
+        for source in context.sources().to_vec() {
+            let bytes = context.read(&source.path)?;
+            let named = String::from_utf8(bytes)
+                .map_err(|_| AuthoringImporterError::rejected(3, "not text"))?;
+            let named = named.trim();
+            let imported = context.read_settings(named)?.ok_or_else(|| {
+                AuthoringImporterError::rejected(9, format!("{named} has no import"))
+            })?;
+            let by = match &imported {
+                AuthoredValue::Object(fields) => match fields.get("scale") {
+                    Some(AuthoredValue::Object(scale)) => match scale.get("by") {
+                        Some(AuthoredValue::UInt(by)) => Some(*by),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            };
+            value += by
+                .ok_or_else(|| AuthoringImporterError::rejected(8, format!("{imported:?}")))?;
+        }
+        output(apply(settings, value)?)
+    }
+}
+
 struct FloatImporter;
 
 impl PipelineImporter for FloatImporter {
@@ -377,6 +416,9 @@ fn register(
         .into_result()?;
     arena
         .register_importer(importer(SETTINGS_IMPORTER), SettingsImporter)
+        .into_result()?;
+    arena
+        .register_importer(importer(REQUIRE_IMPORTER), RequireImporter)
         .into_result()?;
     arena
         .register_importer(float_importer(), FloatImporter)

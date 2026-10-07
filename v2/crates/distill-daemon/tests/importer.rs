@@ -12,7 +12,7 @@ use distill_daemon::watcher::WatcherBatch;
 use distill_json::AuthoredValue;
 use distill_pipeline_fixture::{
     default_settings, settings, value as byte, value_of as byte_of, BYTE_IMPORTER, CHAIN_IMPORTER,
-    SETTINGS_IMPORTER, FLOAT_IMPORTER, float_settings,
+    SETTINGS_IMPORTER, FLOAT_IMPORTER, REQUIRE_IMPORTER, float_settings,
 };
 use distill_rpc::{
     AuthoringValue, ImportRequest, InputVersion, TargetDefinition, TargetDefinitionHash,
@@ -2042,4 +2042,69 @@ fn a_first_import_chained_in_a_pass_publishes_the_identities_its_readers_read() 
             "a deleted bundle's identity is not minted again"
         );
     }
+}
+
+/// A watched import rejected because a bundle it reads went away re-runs
+/// when the bundle comes back: the memoized failure keeps the probe of the
+/// missing path in its read set (newgameplus doc 21 §7.4: a clip file
+/// bound to a skeleton file's bundle).
+#[test]
+fn an_import_rejected_for_a_removed_bundle_reruns_when_it_returns() {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(
+        assets.join("rules.bundle"),
+        directory_rules_bundle_for(true, REQUIRE_IMPORTER, &default_settings()),
+    )
+    .unwrap();
+    std::fs::write(assets.join("rig.txt"), b"4").unwrap();
+    std::fs::write(assets.join("clip.src"), b"rig.txt").unwrap();
+    let coordinator = open_configured(temp.path(), &assets);
+    let mut writer = coordinator.open_writer().unwrap();
+    import_with(&coordinator, BYTE_IMPORTER, &["rig.txt"], "rig.txt.bundle", &settings([0, 0], 3));
+    coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["rig.txt.bundle"]), false)
+        .unwrap();
+    coordinator.reconcile_directory_imports(&mut writer).unwrap();
+    let clip = || {
+        let bundle =
+            distill_bundle::parse_bundle(&std::fs::read(assets.join("clip.bundle")).unwrap())
+                .unwrap();
+        byte_of(&bundle.assets["asset"].data)
+    };
+    assert_eq!(clip(), Some(3));
+    coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["clip.bundle"]), false)
+        .unwrap();
+
+    // The rig's bundle goes: the clip's re-import is rejected and listed,
+    // keeping its last good bundle.
+    let rig = std::fs::read(assets.join("rig.txt.bundle")).unwrap();
+    std::fs::remove_file(assets.join("rig.txt.bundle")).unwrap();
+    let outcome = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["rig.txt.bundle"]), false)
+        .unwrap();
+    assert!(outcome.imported.is_empty());
+    let failures = import_failures(&coordinator);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_eq!(failures[0].0, "clip.bundle");
+    assert!(failures[0].1.contains("rig.txt has no import"), "{failures:?}");
+    assert_eq!(clip(), Some(3));
+
+    // An unrelated change does not re-run it.
+    std::fs::write(assets.join("other.txt"), b"1").unwrap();
+    let outcome = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["other.txt"]), false)
+        .unwrap();
+    assert!(outcome.imported.is_empty() && outcome.failures.is_empty());
+
+    // It comes back: the clip re-imports and its failure clears.
+    std::fs::write(assets.join("rig.txt.bundle"), rig).unwrap();
+    let outcome = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["rig.txt.bundle"]), false)
+        .unwrap();
+    assert_eq!(outcome.imported.len(), 1, "the clip");
+    assert!(import_failures(&coordinator).is_empty());
+    assert_eq!(clip(), Some(3));
 }
