@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 62;
+pub const SCHEMA_VERSION: u32 = 63;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -160,12 +160,15 @@ CREATE INDEX bundle_path_refs_by_target ON bundle_path_refs(target);
 -- watched import is revalidated against reads: kind 0 a path (`key`), 1 a
 -- listing, 2 an importer capability. Kind 3: a directory-import rules
 -- asset whose listing is under the directory `key` (ending in `/`, `''`
--- for the whole root). The source is the bundle's; the basis is the
--- failure memo's or the record's. A bundle's rows go with its row.
+-- for the whole root). Kind 4, under an explicit import's `$record` (no
+-- origin): one of its sources, `key` its root and path (see
+-- `imports::explicit_source_key`); default imports never select it. The
+-- source is the bundle's; the basis is the failure memo's or the
+-- record's. A bundle's rows go with its row.
 CREATE TABLE import_keys (
     bundle_uuid BLOB NOT NULL REFERENCES bundles(bundle_uuid) ON DELETE CASCADE,
     asset_uuid  BLOB NOT NULL,
-    kind        INTEGER NOT NULL CHECK (kind IN (0, 1, 2, 3)),
+    kind        INTEGER NOT NULL CHECK (kind IN (0, 1, 2, 3, 4)),
     key         TEXT NOT NULL,
     PRIMARY KEY (bundle_uuid, kind, asset_uuid, key)
 ) WITHOUT ROWID;

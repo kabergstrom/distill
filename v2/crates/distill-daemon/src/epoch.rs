@@ -370,6 +370,9 @@ impl CandidateRegistrationArena {
             (RegistrationKind::Tool, CallbackHandle::Tool(descriptor)) => {
                 descriptor.id == registration.id
             }
+            (RegistrationKind::DefaultImport, CallbackHandle::DefaultImport(rule)) => {
+                distill_core::id::AssetUuid(rule.id.0).to_string() == registration.id
+            }
             _ => false,
         };
         if !matches {
@@ -378,6 +381,25 @@ impl CandidateRegistrationArena {
             ));
         }
 
+        if let CallbackHandle::DefaultImport(rule) = callback {
+            crate::default_imports::validate_rule(rule).map_err(ModuleCallError::new)?;
+            while let Some(node) = prior {
+                // SAFETY: prior nodes are linked and live for the complete
+                // candidate lifetime.
+                let linked = unsafe { node.as_ref() };
+                if let CallbackHandle::DefaultImport(existing) = &linked.callback {
+                    if crate::default_imports::rules_overlap(existing, rule) {
+                        return Err(ModuleCallError::new(format!(
+                            "default import rules {} and {} match the same files",
+                            distill_core::id::AssetUuid(existing.id.0),
+                            distill_core::id::AssetUuid(rule.id.0)
+                        )));
+                    }
+                }
+                prior = linked.next;
+            }
+            return Ok(());
+        }
         if let CallbackHandle::Processor { descriptor, .. } = callback {
             while let Some(node) = prior {
                 // SAFETY: prior nodes are linked and live for the complete
@@ -800,6 +822,18 @@ impl PipelineEpoch {
             .into_iter()
             .filter_map(|(_, callback)| match callback {
                 CallbackHandle::Tool(descriptor) => Some(descriptor),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The default import rules (§8 "Default imports") this epoch
+    /// registers, in registration order.
+    pub fn default_import_rules(&self) -> Vec<distill_build::import::DefaultImportRule> {
+        self.callback_rows()
+            .into_iter()
+            .filter_map(|(_, callback)| match callback {
+                CallbackHandle::DefaultImport(rule) => Some(rule),
                 _ => None,
             })
             .collect()
@@ -1660,7 +1694,8 @@ fn validate_registered_schema_types(
             CallbackHandle::None
             | CallbackHandle::Codegen { .. }
             | CallbackHandle::Migration { .. }
-            | CallbackHandle::Tool(_) => {}
+            | CallbackHandle::Tool(_)
+            | CallbackHandle::DefaultImport(_) => {}
         }
         cursor = node.next;
     }

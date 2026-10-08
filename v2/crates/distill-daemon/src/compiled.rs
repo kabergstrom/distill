@@ -28,6 +28,9 @@ use distill_schema::ProjectSchemaAuthority;
 use distill_store::state::{InputVersion, PipelineFailure};
 use distill_store::{StoreError, StoreReader};
 
+use distill_core::id::BundleUuid;
+
+use crate::default_imports::DefaultImports;
 use crate::epoch::{PipelineEpoch, PipelineSnapshot};
 use crate::importer::RegisteredImporters;
 use crate::pipeline_map::PipelineProjection;
@@ -52,6 +55,8 @@ pub struct Compiled {
     /// The pipeline epoch's importers: the only importers there are.
     importers: Arc<RegisteredImporters>,
     pipeline: PipelineSnapshot,
+    /// The default import layer: `None` while the pipeline is not Ready.
+    defaults: Option<Arc<DefaultImports>>,
     /// Resolves rooted paths against `roots`; its roots never change.
     scanner: RootedScanner,
     roots: Arc<Vec<AssetRoot>>,
@@ -68,6 +73,7 @@ impl Compiled {
             projection: Arc::new(PipelineProjection::default()),
             importers: Arc::new(RegisteredImporters::new()),
             pipeline: PipelineSnapshot::unpublished(),
+            defaults: None,
             scanner,
             roots: Arc::new(roots),
         }
@@ -81,6 +87,7 @@ impl Compiled {
         targets: BTreeMap<String, Target>,
         projection: PipelineProjection,
         importers: RegisteredImporters,
+        defaults: Option<Arc<DefaultImports>>,
         pipeline: PipelineSnapshot,
         scanner: RootedScanner,
         roots: Vec<AssetRoot>,
@@ -91,6 +98,7 @@ impl Compiled {
             targets: Arc::new(targets),
             projection: Arc::new(projection),
             importers: Arc::new(importers),
+            defaults,
             pipeline,
             scanner,
             roots: Arc::new(roots),
@@ -108,6 +116,7 @@ impl Compiled {
             key: Some(key),
             importers: Arc::new(RegisteredImporters::new()),
             pipeline: PipelineSnapshot::failed(failure),
+            defaults: None,
             ..self.clone()
         }
     }
@@ -134,6 +143,19 @@ impl Compiled {
 
     pub(crate) fn pipeline_importers(&self) -> &RegisteredImporters {
         &self.importers
+    }
+
+    /// The default import layer (§8 "Default imports"), while the pipeline
+    /// is Ready.
+    pub(crate) fn default_imports(&self) -> Option<&DefaultImports> {
+        self.defaults.as_deref()
+    }
+
+    /// The root whose default layer `rules_bundle` is the reserved UUID of:
+    /// a default import's origin, recognized from the configured roots
+    /// alone (whether or not the pipeline is Ready).
+    pub(crate) fn default_layer_root(&self, rules_bundle: BundleUuid) -> Option<&str> {
+        crate::default_imports::default_layer_root(&self.roots, rules_bundle)
     }
 
     pub fn pipeline_snapshot(&self) -> PipelineSnapshot {

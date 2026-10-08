@@ -1456,6 +1456,7 @@ fn import_index_statements_search_their_keys() {
             ],
         }),
         directory_rules: vec![(asset_uuid(index, 3), "d02/".to_owned())],
+        explicit: None,
     };
     let plans = configuration_plans(&mut store, |store| {
         store
@@ -1921,6 +1922,7 @@ fn pass_bookkeeping_statements_search_their_indexes() {
         bundle: bundle_uuid(index),
         watched: None,
         directory_rules: vec![(asset_uuid(index, 3), format!("d{:02}/", index % 50))],
+        explicit: None,
     };
     let sources = (0..200)
         .step_by(2)

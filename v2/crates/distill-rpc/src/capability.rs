@@ -1760,14 +1760,17 @@ impl Snapshot {
         }
         // Directory imports that failed before any bundle existed at their
         // output, named by that output: listed while the snapshot has their
-        // rules bundle and no bundle at the output.
+        // rules bundle (a default import's is its root's reserved one, which
+        // no file holds) and no bundle at the output.
         for failure in rpc_try!(self
             .server
             .inner
             .reader
             .directory_import_failure_messages())
         {
-            if rpc_try!(reader.bundle(failure.rules_bundle)).is_none()
+            let default_layer = failure.rules_bundle
+                == distill_core::id::default_rules_bundle(&failure.destination_root);
+            if (!default_layer && rpc_try!(reader.bundle(failure.rules_bundle)).is_none())
                 || rpc_try!(reader.bundle_at(&failure.destination_root, &failure.destination_path))
                     .is_some()
             {

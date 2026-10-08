@@ -62,6 +62,9 @@ pub struct DaemonSection {
 pub struct AssetsSection {
     pub roots: BTreeMap<String, PathBuf>,
     pub schema_path: PathBuf,
+    /// Per root, path globs the default import rules never select (§8
+    /// "Default imports"); `["**"]` turns them off for the root.
+    pub default_imports_exclude: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +155,7 @@ pub enum DaemonConfigError {
     Target(String),
     Rebuild(String),
     Watch(String),
+    DefaultImportsExclude(String),
 }
 
 impl std::fmt::Display for DaemonConfigError {
@@ -190,6 +194,8 @@ struct RawDaemon {
 struct RawAssets {
     roots: BTreeMap<String, PathBuf>,
     schema_path: PathBuf,
+    #[serde(default)]
+    default_imports_exclude: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -323,6 +329,8 @@ impl DaemonConfig {
         }
 
         let roots = normalize_paths("asset root", raw.assets.roots, base, true)?;
+        let default_imports_exclude =
+            default_imports_exclude(&raw.assets.default_imports_exclude, &roots)?;
         let state_path = resolve(base, &raw.daemon.state_path)?;
         let schema_path = resolve(base, &raw.assets.schema_path)?;
         let pipeline_dylib = resolve(base, &library_path(&raw.modules.pipeline_dylib))?;
@@ -375,7 +383,11 @@ impl DaemonConfig {
                 address,
                 state_path,
             },
-            assets: AssetsSection { roots, schema_path },
+            assets: AssetsSection {
+                roots,
+                schema_path,
+                default_imports_exclude,
+            },
             modules: ModulesSection { pipeline_dylib },
             targets,
             codegen: CodegenSection {
@@ -556,6 +568,7 @@ impl DaemonConfig {
         };
         Ok(ConfigurationCandidate {
             roots: self.asset_roots(),
+            default_imports_exclude: self.assets.default_imports_exclude.clone(),
             targets,
             build_targets,
             pipeline_source: self.modules.pipeline_dylib.clone(),
@@ -617,6 +630,14 @@ fn validate_raw_candidate(raw: &RawConfig, base: &Path) -> Vec<DaemonConfigError
             }
             Err(error) => errors.push(error),
         }
+    }
+
+    let named_roots = normalized_roots
+        .iter()
+        .map(|name| (name.clone(), PathBuf::new()))
+        .collect::<BTreeMap<_, _>>();
+    if let Err(error) = default_imports_exclude(&raw.assets.default_imports_exclude, &named_roots) {
+        errors.push(error);
     }
 
     let pipeline_dylib = library_path(&raw.modules.pipeline_dylib);
@@ -913,6 +934,32 @@ fn normalize_paths(
     Ok(paths)
 }
 
+/// `assets.default_imports_exclude`, keyed by NFC root name: every key names a
+/// configured root and every pattern is a valid glob.
+fn default_imports_exclude(
+    raw: &BTreeMap<String, Vec<String>>,
+    roots: &BTreeMap<String, PathBuf>,
+) -> Result<BTreeMap<String, Vec<String>>, DaemonConfigError> {
+    let mut excludes = BTreeMap::new();
+    for (raw_name, patterns) in raw {
+        let name = raw_name.nfc().collect::<String>();
+        if !roots.contains_key(&name) {
+            return Err(DaemonConfigError::DefaultImportsExclude(format!(
+                "assets.default_imports_exclude names unknown root {raw_name:?}"
+            )));
+        }
+        for pattern in patterns {
+            globset::Glob::new(pattern).map_err(|error| {
+                DaemonConfigError::DefaultImportsExclude(format!(
+                    "assets.default_imports_exclude.{raw_name}: invalid glob {pattern:?}: {error}"
+                ))
+            })?;
+        }
+        excludes.insert(name, patterns.clone());
+    }
+    Ok(excludes)
+}
+
 fn validate_name(kind: &'static str, name: &str) -> Result<(), DaemonConfigError> {
     if name.is_empty()
         || !is_nfc(name)
@@ -1074,6 +1121,7 @@ mod tests {
             assets: RawAssets {
                 roots: BTreeMap::from([("main".to_owned(), assets)]),
                 schema_path: temp.path().join("schema.json"),
+                default_imports_exclude: BTreeMap::new(),
             },
             modules: RawModules {
                 pipeline_dylib: temp.path().join("pipeline.so"),

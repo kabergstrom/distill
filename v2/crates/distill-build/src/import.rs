@@ -6,7 +6,10 @@ use std::collections::BTreeMap;
 use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
 use distill_json::AuthoredValue;
 
-pub use distill_pipeline_api::import::{ImportEntry, ImportError, ImportOutput, ImportOutputError};
+pub use distill_pipeline_api::import::{
+    DefaultImportRule, ImportEntry, ImportError, ImportOutput, ImportOutputError, ImportRuleId,
+    NO_IMPORTER,
+};
 
 use crate::dslf::DslfV1;
 use crate::query::{
@@ -17,9 +20,6 @@ use crate::trace::{
     local_failure_fingerprint, CapabilityKey, Observed, RawFileFailureClass, RawFileOp,
     RawFileSubject, StableFailureFingerprint,
 };
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ImportRuleId(pub [u8; 16]);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DirectoryOrigin {

@@ -207,3 +207,14 @@ hash_newtype! {
     /// blake3 of the DSWL encoding of a type's wire layout tree (§12).
     LayoutHash
 }
+
+/// The reserved rules-bundle UUID of the asset root `root`'s default import
+/// layer (§8 "Default imports"): what a default import's `DirectoryOrigin`
+/// names as its rules bundle. Derived from the root's name, never stored; no
+/// bundle file may claim it.
+pub fn default_rules_bundle(root: &str) -> BundleUuid {
+    let digest = crate::canonical::domain_digest(*b"DSDR", 1, |encoder| encoder.str(root));
+    let mut uuid = [0; 16];
+    uuid.copy_from_slice(&digest[..16]);
+    BundleUuid(uuid)
+}

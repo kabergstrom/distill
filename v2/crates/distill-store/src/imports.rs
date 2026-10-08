@@ -482,6 +482,27 @@ impl ImportReadKey {
 
 /// `import_keys.kind` of a directory-import rules asset.
 const DIRECTORY_RULES: i64 = 3;
+/// `import_keys.kind` of an explicit import's source.
+const EXPLICIT_SOURCE: i64 = 4;
+
+/// An explicit import source's `import_keys.key`: its root's byte length,
+/// `:`, the root and the path. Root names may hold any character but NUL,
+/// so the length frames them.
+pub fn explicit_source_key(root: &str, path: &str) -> String {
+    format!("{}:{root}{path}", root.len())
+}
+
+fn parse_explicit_source_key(key: &str) -> rusqlite::Result<(String, String)> {
+    let (len, rest) = key.split_once(':').ok_or(rusqlite::Error::InvalidQuery)?;
+    let len = len
+        .parse::<usize>()
+        .map_err(|_| rusqlite::Error::InvalidQuery)?;
+    if !rest.is_char_boundary(len) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let (root, path) = rest.split_at(len);
+    Ok((root.to_owned(), path.to_owned()))
+}
 
 /// A watched import's index rows: its `$record` entry and what the basis
 /// it is revalidated against reads. The basis itself is the failure memo's
@@ -490,6 +511,15 @@ const DIRECTORY_RULES: i64 = 3;
 pub struct WatchedImport {
     pub record: AssetUuid,
     pub reads: Vec<ImportReadKey>,
+}
+
+/// An explicit import's index rows (§8 "Default imports"): its `$record`
+/// entry and its sources, by (root, path), which default imports never
+/// select.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplicitImport {
+    pub record: AssetUuid,
+    pub sources: Vec<(String, String)>,
 }
 
 /// A directory-import rules asset and the bundle source holding it.
@@ -508,6 +538,9 @@ pub struct ImportIndexSource {
     pub path: String,
     pub bundle: BundleUuid,
     pub watched: Option<WatchedImport>,
+    /// Present iff the bundle is an explicit import (its `$record` has no
+    /// origin).
+    pub explicit: Option<ExplicitImport>,
     /// Each directory-import rules asset, with its listing directory: the
     /// directory every path its listing matches is under (`""` for the
     /// whole root), ending in `/`. See
@@ -561,6 +594,16 @@ impl Store {
                             watched.record.0.as_slice(),
                             kind,
                             key
+                        ])?;
+                    }
+                }
+                if let Some(explicit) = &row.explicit {
+                    for (root, path) in &explicit.sources {
+                        insert.execute(rusqlite::params![
+                            bundle,
+                            explicit.record.0.as_slice(),
+                            EXPLICIT_SOURCE,
+                            explicit_source_key(root, path)
                         ])?;
                     }
                 }
@@ -619,6 +662,42 @@ impl StoreReader {
         }
         found.extend(self.query_rows(WATCHED_LISTING, [capabilities], bundle)?);
         Ok(found.into_iter().collect())
+    }
+
+    /// Every explicit import source, by (root, path): the files default
+    /// imports never select (§8 "Default imports"). One indexed walk.
+    pub fn explicit_import_sources(
+        &self,
+    ) -> Result<std::collections::BTreeSet<(String, String)>, StoreError> {
+        Ok(self
+            .query_rows(
+                "SELECT DISTINCT key FROM import_keys WHERE kind = 4",
+                [],
+                |row| parse_explicit_source_key(&row.get::<_, String>(0)?),
+            )?
+            .into_iter()
+            .collect())
+    }
+
+    /// The explicit import sources of the bundles at `sources` (bundle
+    /// files, by root and path), as the index holds them.
+    pub fn explicit_import_sources_of(
+        &self,
+        sources: &[(String, String)],
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        let mut found = Vec::new();
+        for (root, path) in sources {
+            found.extend(self.query_rows(
+                "SELECT k.key FROM import_keys k JOIN bundles b USING (bundle_uuid)
+                 JOIN roots r ON r.root_id = b.root_id
+                 WHERE r.name = ?1 AND b.path = ?2 AND k.kind = 4",
+                rusqlite::params![root, path],
+                |row| parse_explicit_source_key(&row.get::<_, String>(0)?),
+            )?);
+        }
+        found.sort();
+        found.dedup();
+        Ok(found)
     }
 
     /// Every directory-import rules asset, by (root, path).

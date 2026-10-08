@@ -154,6 +154,7 @@ fn compiled_pipeline_cdylib_opens_registers_unloads_and_closes() {
             distill_pipeline_fixture::REQUIRE_IMPORTER,
             distill_pipeline_fixture::FLOAT_IMPORTER,
             distill_pipeline_fixture::OPTIONAL_IMPORTER,
+            &distill_core::id::AssetUuid(distill_pipeline_fixture::DEFAULT_RULE).to_string(),
         ]
     );
 

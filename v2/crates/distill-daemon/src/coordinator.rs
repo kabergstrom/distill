@@ -46,6 +46,7 @@ use distill_store::{Store, StoreConfig, StoreError, StoreOpener, StoreReader, St
 use crate::authoring::{AuthoringService, AuthoringServiceInitError};
 use crate::callbacks::EpochAuthoringImporter;
 use crate::compiled::{Compiled, CompiledLookupError, CompiledRegistry, StagedCompiled};
+use crate::default_imports::DefaultImports;
 use crate::epoch::{
     stored_pipeline_epoch, CandidateRejection, CandidateRequirements, ModuleHost, PipelineEpoch,
     PipelineSnapshot,
@@ -78,6 +79,7 @@ struct LogicalRename {
 /// module and schema authority ([`crate::config::DaemonConfig::configuration_candidate`]).
 pub struct ConfigurationCandidate {
     pub(crate) roots: Vec<AssetRoot>,
+    pub(crate) default_imports_exclude: BTreeMap<String, Vec<String>>,
     pub(crate) targets: Vec<TargetDefinition>,
     pub(crate) build_targets: BTreeMap<String, Target>,
     pub(crate) pipeline_source: PathBuf,
@@ -590,6 +592,7 @@ impl DaemonCoordinator {
     ) -> Result<SnapshotStamp, CoordinatorError> {
         let ConfigurationCandidate {
             roots,
+            default_imports_exclude,
             targets,
             build_targets,
             pipeline_source,
@@ -650,6 +653,7 @@ impl DaemonCoordinator {
             .copied()
             .filter(|type_uuid| !distill_core::bootstrap::is_bootstrap_control_type(*type_uuid))
             .collect::<Vec<_>>();
+        let mut prepared_defaults = None;
         let (pipeline, mut prepared_epoch, projection) = match prepared_epoch {
             Ok(prepared) => {
                 match PipelineProjection::build(
@@ -683,15 +687,31 @@ impl DaemonCoordinator {
                             }
                             return Err(CoordinatorError::InvalidManifest(error.to_string()));
                         }
-                        if let Err(error) = self.authoring.prepare_pipeline_importers(
-                            EpochAuthoringImporter::metadata_only(prepared.importer_descriptors()),
-                        ) {
-                            if let Some(failure) = runtime.host.discard_unpublished(prepared) {
-                                drop(runtime);
-                                return self.publish_pipeline_rejection(store, failure);
+                        let defaults = self
+                            .authoring
+                            .prepare_pipeline_importers(EpochAuthoringImporter::metadata_only(
+                                prepared.importer_descriptors(),
+                            ))
+                            .map_err(|error| format!("{error:?}"))
+                            .and_then(|importers| {
+                                DefaultImports::prepare(
+                                    prepared.default_import_rules(),
+                                    &importers,
+                                    &roots,
+                                    &default_imports_exclude,
+                                )
+                            });
+                        let defaults = match defaults {
+                            Ok(defaults) => defaults,
+                            Err(error) => {
+                                if let Some(failure) = runtime.host.discard_unpublished(prepared) {
+                                    drop(runtime);
+                                    return self.publish_pipeline_rejection(store, failure);
+                                }
+                                return Err(CoordinatorError::InvalidManifest(error));
                             }
-                            return Err(CoordinatorError::InvalidManifest(format!("{error:?}")));
-                        }
+                        };
+                        prepared_defaults = Some(Arc::new(defaults));
                         let tools = prepared.tool_epoch();
                         (
                             ConfigurationPipelinePublication::Epoch { tools },
@@ -787,31 +807,35 @@ impl DaemonCoordinator {
                         PipelineDiagnostic::Failed(failure.clone())
                     }
                 };
-                let (snapshot, importers) = match (&pipeline, prepared_epoch.as_ref(), &diagnostic)
-                {
-                    (
-                        ConfigurationPipelinePublication::Epoch { .. },
-                        Some(prepared),
-                        PipelineDiagnostic::Ready,
-                    ) => (
-                        PipelineSnapshot::ready(prepared.clone()),
-                        self.authoring
-                            .prepare_pipeline_importers(EpochAuthoringImporter::all(prepared))
-                            .map_err(|error| format!("{error:?}"))?,
-                    ),
-                    (_, _, PipelineDiagnostic::Failed(error)) => {
-                        (PipelineSnapshot::failed(error.clone()), Default::default())
-                    }
-                    _ => unreachable!(
+                let (snapshot, importers, defaults) =
+                    match (&pipeline, prepared_epoch.as_ref(), &diagnostic) {
+                        (
+                            ConfigurationPipelinePublication::Epoch { .. },
+                            Some(prepared),
+                            PipelineDiagnostic::Ready,
+                        ) => (
+                            PipelineSnapshot::ready(prepared.clone()),
+                            self.authoring
+                                .prepare_pipeline_importers(EpochAuthoringImporter::all(prepared))
+                                .map_err(|error| format!("{error:?}"))?,
+                            prepared_defaults.clone(),
+                        ),
+                        (_, _, PipelineDiagnostic::Failed(error)) => (
+                            PipelineSnapshot::failed(error.clone()),
+                            Default::default(),
+                            None,
+                        ),
+                        _ => unreachable!(
                         "durable configuration pipeline state must match its prepared candidate"
                     ),
-                };
+                    };
                 let entry = self.compiled.stage(Compiled::candidate(
                     version,
                     Arc::clone(&schema_authority),
                     build_targets.clone(),
                     projection.clone(),
                     importers,
+                    defaults,
                     snapshot,
                     scanner.clone(),
                     roots.clone(),

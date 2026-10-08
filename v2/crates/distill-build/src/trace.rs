@@ -38,11 +38,7 @@ pub struct PackDefinitionControlValue {
     pub include_path_table: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DirectoryGrouping {
-    PerFile,
-    ByStem,
-}
+pub use distill_pipeline_api::import::DirectoryGrouping;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DirectoryImportRule {

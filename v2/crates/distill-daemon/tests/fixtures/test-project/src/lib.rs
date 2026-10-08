@@ -748,6 +748,17 @@ fn host_triple() -> String {
 /// `distill-pipeline-fixture`) and `dir/schema.json` ([`project_schema`]).
 /// Returns it loaded.
 pub fn write_configuration(dir: &Path, root: &Path, optimize: bool) -> DaemonConfig {
+    write_configuration_excluding(dir, root, optimize, &[])
+}
+
+/// [`write_configuration`] whose root excludes `excludes` from the default
+/// imports (`[assets] default_imports_exclude`).
+pub fn write_configuration_excluding(
+    dir: &Path,
+    root: &Path,
+    optimize: bool,
+    excludes: &[&str],
+) -> DaemonConfig {
     std::fs::write(
         dir.join("schema.json"),
         serde_json::to_vec(&project_schema()).unwrap(),
@@ -762,6 +773,7 @@ state_path = '{state}'
 [assets]
 roots = {{ {ROOT} = '{root}' }}
 schema_path = '{schema}'
+default_imports_exclude = {{ {ROOT} = {excludes:?} }}
 [modules]
 pipeline_dylib = '{module}'
 [targets.dev]
@@ -787,6 +799,7 @@ cache_limit = "16MiB"
         os = std::env::consts::OS,
         arch = std::env::consts::ARCH,
         generated = toml_path(dir.join("generated")),
+        excludes = excludes,
     );
     let path = dir.join("distill.toml");
     std::fs::write(&path, config).unwrap();

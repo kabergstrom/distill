@@ -40,6 +40,7 @@ fn source(path: &str, bundle: u8, reads: Vec<ImportReadKey>) -> ImportIndexSourc
             reads,
         }),
         directory_rules: vec![(AssetUuid([bundle; 16]), format!("dir{bundle}/"))],
+        explicit: None,
     }
 }
 

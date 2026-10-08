@@ -5,12 +5,15 @@
 //! boxed payload whose cleanup and call thunks are monomorphized there, and
 //! hand it to the host through the one non-generic [`RegistrationHost`] call.
 
+use distill_core::id::AssetUuid;
+
 use crate::callbacks::{
     cleanup_callback, erase_callback, CallbackHandle, CodegenDescriptor, DefaultsDescriptor,
     ImporterDescriptor, MigrationKey, PipelineCodegen, PipelineDefaults, PipelineImporter,
     PipelineMigration, PipelineProcessor, PipelineValidator, ProcessorDescriptor, ToolDescriptor,
     ValidatorDescriptor,
 };
+use crate::import::DefaultImportRule;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetDefinition {
@@ -27,6 +30,7 @@ pub enum RegistrationKind {
     Migration,
     Defaults,
     Tool,
+    DefaultImport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,6 +256,20 @@ impl<'a> RegistrationArena<'a> {
             version: 1,
         };
         let callback = ErasedCallback::new(descriptor.clone(), CallbackHandle::Tool(descriptor));
+        self.host.install_callback(registration, callback)
+    }
+
+    /// Declare a default import rule (§8 "Default imports"): files under
+    /// every asset root that match it, and that no explicit import or
+    /// authored rule claims, import with its importer and default
+    /// settings. Part of the pipeline epoch.
+    pub fn register_default_import(&mut self, rule: DefaultImportRule) -> RegistrationStatus {
+        let registration = Registration {
+            kind: RegistrationKind::DefaultImport,
+            id: AssetUuid(rule.id.0).to_string(),
+            version: 1,
+        };
+        let callback = ErasedCallback::new(rule.clone(), CallbackHandle::DefaultImport(rule));
         self.host.install_callback(registration, callback)
     }
 }

@@ -17,9 +17,12 @@ use distill_pipeline_api::callbacks::{
     ImporterDescriptor, PipelineImporter, PipelineProcessContext, PipelineProcessor,
     ProcessorDescriptor, ProcessorError, ProcessorProduct, ProcessorProducts,
 };
-use distill_pipeline_api::import::ImportOutput;
+use distill_pipeline_api::import::{
+    DefaultImportRule, DirectoryGrouping, ImportOutput, ImportRuleId,
+};
 use distill_pipeline_api::importer::{AuthoringImportContext, AuthoringImporterError};
 use distill_pipeline_api::outputs::OutputDecls;
+use distill_pipeline_api::query::FileQuery;
 use distill_pipeline_api::registration::{ModuleCallError, RegistrationArena, TargetDefinition};
 use distill_pipeline_api::target::TargetSelector;
 use distill_schema::ngp_schema::{LogicalSchema, PrimitiveKind, SchemaNode};
@@ -71,6 +74,12 @@ pub const FLOAT_IMPORTER: &str = "float-importer";
 /// Imports the number its one text source holds, whatever its settings
 /// ([`OPTIONAL_SETTINGS_TYPE`], defaults [`optional_default_settings`]).
 pub const OPTIONAL_IMPORTER: &str = "optional-importer";
+/// The default import rule (§8 "Default imports"): every `*.num` file,
+/// per file, with [`BYTE_IMPORTER`] at its default settings, to
+/// `{name}.bundle`.
+pub const DEFAULT_RULE: [u8; 16] = [0xd5; 16];
+/// The extension [`DEFAULT_RULE`] matches.
+pub const DEFAULT_EXTENSION: &str = "num";
 
 /// A [`VALUE_TYPE`] value.
 pub fn value(value: u128) -> AuthoredValue {
@@ -470,6 +479,16 @@ fn register(
         .into_result()?;
     arena
         .register_importer(optional_importer(), FloatImporter)
+        .into_result()?;
+    arena
+        .register_default_import(DefaultImportRule {
+            id: ImportRuleId(DEFAULT_RULE),
+            matches: FileQuery::new(None, Some(format!("**/*.{DEFAULT_EXTENSION}")))
+                .map_err(|error| ModuleCallError::new(format!("{error:?}")))?,
+            group: DirectoryGrouping::PerFile,
+            importer: BYTE_IMPORTER.to_owned(),
+            output: "{name}.bundle".to_owned(),
+        })
         .into_result()?;
     Ok(targets.iter().map(|target| target.name.clone()).collect())
 }

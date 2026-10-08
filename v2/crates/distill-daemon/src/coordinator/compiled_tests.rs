@@ -144,6 +144,7 @@ impl Fixture {
         }
         ConfigurationCandidate {
             roots,
+            default_imports_exclude: BTreeMap::new(),
             targets: vec![rpc_target(optimize)],
             build_targets: BTreeMap::from([("dev".to_owned(), build_target(optimize))]),
             pipeline_source: self.temp.path().join("missing-pipeline.so"),

@@ -20,7 +20,7 @@ use ngp_schema::{LogicalSchema, SchemaNode};
 
 use crate::codegen::{CodegenFailure, GeneratedFile};
 use crate::failure::StableFailureFingerprint;
-use crate::import::ImportOutput;
+use crate::import::{DefaultImportRule, ImportOutput};
 use crate::importer::{AuthoringImportContext, AuthoringImporter, AuthoringImporterError};
 use crate::outputs::OutputDecls;
 use crate::query::{AssetQuery, IntakeError};
@@ -479,6 +479,7 @@ pub enum CallbackHandle {
         parent: DefaultCall,
     },
     Tool(ToolDescriptor),
+    DefaultImport(DefaultImportRule),
 }
 
 impl std::fmt::Debug for CallbackHandle {
@@ -492,6 +493,7 @@ impl std::fmt::Debug for CallbackHandle {
             Self::Migration { .. } => "CallbackHandle::Migration",
             Self::Defaults { .. } => "CallbackHandle::Defaults",
             Self::Tool(_) => "CallbackHandle::Tool",
+            Self::DefaultImport(_) => "CallbackHandle::DefaultImport",
         })
     }
 }

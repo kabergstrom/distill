@@ -6,7 +6,47 @@ use distill_core::id::TypeUuid;
 use distill_json::AuthoredValue;
 
 use crate::failure::StableFailureFingerprint;
-use crate::query::{normalize_identifier, IntakeError};
+use crate::query::{normalize_identifier, FileQuery, IntakeError};
+
+/// Stable authored identity of an import rule (§8): an `ImportRule.id` in a
+/// rules bundle or a [`DefaultImportRule::id`]. Globally unique across both.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ImportRuleId(pub [u8; 16]);
+
+/// How an import rule folds matched files into imports (§8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DirectoryGrouping {
+    /// One import per matched file.
+    PerFile,
+    /// One import per (root, parent directory, stem).
+    ByStem,
+}
+
+/// The importer id an authored rule names to claim the files it matches and
+/// import nothing (§8 "Default imports"): a committed opt-out from the
+/// default rules. No importer may register under it.
+pub const NO_IMPORTER: &str = "none";
+
+/// A default import rule (§8 "Default imports"), registered by a pipeline
+/// module: the importer that imports a file no explicit import or authored
+/// rule claims, chosen by path alone. Its imports use the importer's default
+/// settings and record an ordinary directory origin under the root's
+/// reserved default-rules bundle UUID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultImportRule {
+    /// Recorded in every output's origin: kept for a compatible change of
+    /// importer, minted anew to orphan the outputs instead.
+    pub id: ImportRuleId,
+    /// Path selector only, e.g. `**/*.{glb,gltf}`. No two default rules may
+    /// match one file.
+    pub matches: FileQuery,
+    pub group: DirectoryGrouping,
+    /// `Importer::ID`, registered by the same module.
+    pub importer: String,
+    /// Output template over `{stem}` / `{name}`, beside the sources:
+    /// `"{name}.bundle"`.
+    pub output: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportError {

@@ -2759,11 +2759,16 @@ pub enum Grouping { PerFile, ByStem }   // ByStem: group key is
                                         // in two directories are two groups.
 ```
 
-### Default imports (Proposed, not implemented)
+### Default imports
 
-> **Status: proposed, not implemented.** Nothing below exists in the daemon
-> yet. Where this section and the rest of the document disagree, the rest of
-> the document describes the current behavior.
+> **Implemented** (decisions of 2026-10-08: the mapping is registered by the
+> pipeline module and part of its epoch; defaults are on for every root,
+> with per-root excludes; the folder opt-out is a `none` rule; an authored
+> rule adopts a default output at its own output path). Code:
+> `distill-daemon/src/default_imports.rs` (the layer of one compiled state),
+> `importer.rs` `directory_import_tasks` (precedence, step-aside, adoption,
+> orphans), `distill-pipeline-api/src/import.rs` (`DefaultImportRule`,
+> `NO_IMPORTER`), `distill-store/src/imports.rs` (`import_keys` kind 4).
 
 A file under an asset root imports with no rules bundle written for it: the
 pipeline module declares **default import rules** that pick an importer by
@@ -2818,7 +2823,7 @@ pub struct DefaultImportRule {
     /// Path selector only (§10 `FileQuery`): globs over the file name,
     /// e.g. `**/*.{glb,gltf}`.
     pub matches: FileQuery,
-    pub group: Grouping,
+    pub group: DirectoryGrouping,
     pub importer: String,                 // Importer::ID
     /// Output template, as `ImportRule.output`: "{name}.bundle".
     pub output: String,
@@ -2830,27 +2835,43 @@ pub struct DefaultImportRule {
   rules bundle's or an explicit import's job.
 - The table is part of the pipeline epoch (§3): registering, removing or
   changing a default rule is a capability change, and the pass revalidates
-  every default rule as it does after a capability change today.
+  the whole default layer as it does every authored rule after a capability
+  change. The layer exists only while the pipeline is Ready: at boot, before
+  a configuration is published, and after a rejected pipeline, nothing is
+  imported by default and nothing the layer imported is orphaned or cleared;
+  watched default outputs defer like any other watched import.
 - A game crate's `register` calls `register_engine_assets` (which declares the
   engine's defaults) and may declare its own; two default rules matching one
-  file is a registration-time error, never first-match across crates.
-- Per root, in `[assets]`:
-  - `default_imports = ["main"]`: the roots defaults apply to. **Opt-in**:
-    enabling defaults on an existing tree writes a bundle beside every
-    matching file (`newgameplus/test-assets/` holds 580 `.glb` files,
-    most of them kit pieces).
+  file is a registration-time error, never first-match across crates. The
+  check runs as each rule registers: a path built from either rule's
+  selectors (`{a,b}` alternatives expanded, wildcards filled) that both
+  match. It is exact for extension rules; a pass still refuses a file two
+  rules match.
+- Validation at registration: the importer is a normalized identifier and
+  not `none`, the selector is non-empty and compiles, the output template
+  renders one file name. A configuration whose pipeline names an importer
+  in a default rule that it does not register is rejected like an importer
+  error. No importer may register under the id `none`.
+- An authored rule may not reuse a default rule's id; the pass refuses such
+  a rules bundle.
+- Per root, in `[assets]`: defaults apply to **every** root.
   - `default_imports_exclude = { main = ["scratch/**"] }`: path globs per
-    root that defaults never select.
+    root that defaults never select; `["**"]` turns a root off. Keys must
+    name configured roots and patterns must compile, else the configuration
+    is rejected. A change is a configuration change: the layer is
+    revalidated whole, so a newly excluded file's output orphans and a
+    released one imports.
 - In-tree opt-out, per folder, committed: an authored rule whose `importer` is
-  the reserved id `"none"` claims what it matches and imports nothing. A rules
-  bundle with listing `scenes/sponza/**` and one `none` rule turns defaults off
-  for that folder without touching the daemon config.
+  the reserved id `"none"` (`distill_pipeline_api::import::NO_IMPORTER`)
+  claims what it matches and imports nothing. A rules bundle with listing
+  `scenes/sponza/**` and one `none` rule turns defaults off for that folder
+  without touching the daemon config.
 
 Options considered for where the mapping lives:
 
 | Where | For | Against |
 |---|---|---|
-| Pipeline module registration (proposed) | The module that knows a format declares its extensions; one table for every project using the engine; versioned with the importer | Code, not authored data: needs the recorded rule id and epoch revalidation above |
+| Pipeline module registration (chosen) | The module that knows a format declares its extensions; one table for every project using the engine; versioned with the importer | Code, not authored data: needs the recorded rule id and epoch revalidation above |
 | Daemon config table `[[assets.default_rule]]` | Per project, committed with the config | Config is not an asset: no bundle UUID for the origin, edits are not watched imports; every project re-declares the engine's extensions |
 | A committed root rules bundle (`root.rules.bundle`) | Zero new mechanism | It is the rules bundle the user wants not to write; it would be copied per root and drift from the importer set |
 
@@ -2860,26 +2881,34 @@ For one file, first that applies:
 
 1. **Explicit import.** A file that is a source of any bundle whose `$record`
    has no origin (an explicit `ImportRequest`) is never default-selected,
-   wherever that bundle lives. The import index gains a source row per
-   imported bundle (`import_keys` kind 4: source path), derived at publication
-   like the other kinds.
+   wherever that bundle lives. The import index holds a source row per
+   imported bundle (`import_keys` kind 4, key `{root len}:{root}{path}`),
+   derived at publication like the other kinds; a pass touches the default
+   groups of sources gained or lost, so a default output whose file is now
+   explicitly imported orphans in the pass that publishes the import.
+   Explicit imports claim against the default layer only: authored rules
+   keep matching a file an explicit import also reads, as before defaults.
 2. **Authored rules.** A file matched by any rule of any rules bundle (first
    match within that bundle, §8) belongs to that rule; a `none` rule claims
    without importing. A rules bundle that *lists* a file but has no matching
    rule does not claim it.
-3. **Default rule**, if the root enables defaults and no exclude glob matches.
+3. **Default rule**, if no exclude glob of the root matches.
 4. Otherwise the file is not imported.
 
 - An existing bundle at the default output path that some other origin or no
-  origin owns suppresses the default import, never collides: defaults yield.
-  A collision between two authored rules stays an error (§8).
-- Adding an authored rule over a default-imported file moves ownership: the
-  default output's origin is no longer produced and it enters the orphan state
-  (§8), and the new rule's output, if at the same path, is an ownership
-  collision the author resolves by deleting the orphan. Recommended
-  refinement: a default-origin bundle at the authored rule's own output path is
-  **adopted** (its origin rewritten by the new rule's fold, UUIDs kept through
-  the prior), since nobody authored it.
+  origin owns, or a file there that is not a bundle, suppresses the default
+  import, never collides: defaults yield. A default task also yields to an
+  authored task writing the same output in the same pass. A collision
+  between two authored rules stays an error (§8).
+- An authored rule whose output path holds a default-origin bundle
+  **adopts** it: the rule's import runs as a reimport of that bundle (its
+  origin rewritten by the new rule's fold, bundle and entry UUIDs kept
+  through the prior), and the bundle is not orphaned, since nobody authored
+  it. A default output at another path than the new rule's output orphans
+  (§8).
+- An explicit import whose destination is a default output takes it over
+  the same way: the prior's origin is dropped, the bundle becomes explicit
+  and keeps its UUIDs.
 
 #### Origin and reconstruction (§2)
 
@@ -2887,17 +2916,18 @@ A default import records an ordinary `DirectoryOrigin`, so the `ImportRecord`
 schema (a bootstrap control type) does not change:
 
 - `rules_bundle`: the root's **default-rules UUID**, derived, never stored:
-  `blake3("DSDR" ‖ version:u8 ‖ root name (len:u32+bytes))[..16]`, reserved:
-  no bundle file may claim it (a source claim of it is a namespace collision,
-  §13).
+  `distill_core::id::default_rules_bundle`, the first 16 bytes of
+  `domain_digest("DSDR", version 1, str(root name))` (§13 canonical
+  encoding). Reserved: no bundle file may claim it. The daemon does not yet
+  check that a bundle file's own UUID differs (open question below).
 - `rule`: the `DefaultImportRule.id`.
 - `group`: the group key, as for authored rules.
 
 Reconstruction from the tree alone: a scan that finds a `$record` origin naming
 a root's default-rules UUID recognizes it by recomputing the digest from the
 configured root names, and attributes the bundle to the default layer. The
-default layer "exists" while the root enables defaults; its rules are the
-registered default rules. Disabling defaults on a root, or a module that stops
+default layer exists while the pipeline is Ready; its rules are the
+registered default rules. Excluding a path, or a module that stops
 registering a rule id, orphans its outputs (§8), never deletes them.
 
 #### Output location
@@ -2909,8 +2939,8 @@ registering a rule id, orphans its outputs (§8), never deletes them.
 - Committed, as every generated bundle (§8 watched-import workflow: identity
   must survive checkout). A root whose generated bundles are not committed
   (`newgameplus/test-assets/`: downloads and their bundles are gitignored,
-  only `test.rules.bundle` is tracked) either leaves defaults off for that root
-  (`test` in deferred-ngp's `tools/distill/distill.toml`) or excludes the
+  only `test.rules.bundle` is tracked) excludes everything
+  (`test = ["**"]` in deferred-ngp's `tools/distill/distill.toml`) or the
   folders whose bulk is not wanted (`scenes/sponza/**`: about 70 images).
 
 #### Heuristics
@@ -2942,18 +2972,20 @@ registering a rule id, orphans its outputs (§8), never deletes them.
 
 #### Engine defaults (`newgameplus_pipeline::register_engine_assets`)
 
+Each rule has a fixed id (`ENGINE_DEFAULT_IMPORTS` in `newgameplus-pipeline/src/lib.rs`), PerFile, output `{name}.bundle`.
+
 | Importer | Settings type | Default rule | Notes |
 |---|---|---|---|
 | `ngp.gltf` | `GltfImportSettings` (scene, max_texture_size, texture_mips, generate_tangents, optimize, cpu_readable, collision, animation, meshes, images) | `**/*.{glb,gltf}`, PerFile, `{name}.bundle` | Rigs, clips, `cpu_readable` and collision stay rules (`characters.rules.bundle`, `models.rules.bundle`) |
 | `ngp.image` | `ImageSettings` (`color` srgb/linear/normal, `mips`, `max_size`) | `**/*.{png,jpg,jpeg}` | Defaults import `srgb`; normal and linear maps need a rule |
 | `ngp.dds` | `DdsTextureSettings` (`srgb`) | `**/*.dds` | |
 | `ngp.raw` | `RawTextureSettings` (format, width, height, depth, mip_count) | none | No format in the file |
-| `ngp.font` | `FontImportSettings` (`face`) | `**/*.{ttf,otf,ttc}` | Today explicit imports (`Roboto-Regular.ttf.bundle`); `NotoSansSC-Regular.otf`, unimported now, would import |
+| `ngp.font` | `FontImportSettings` (`face`) | `**/*.{ttf,otf,ttc}` | Explicit imports today (`Roboto-Regular.ttf.bundle`): precedence 1 keeps them. `NotoSansSC-Regular.otf` is CFF, which `ngp.font` rejects (TrueType only): excluded in `example-module/assets/distill.toml` |
 | `ngp.sound` | none | `**/*.{wav,ogg,flac}` | |
 | `ngp.cue` | none | `**/*.cue` | |
 | `ngp.mix` | none | `**/*.mix` | `audio.mix.bundle` is an explicit import today: precedence 1 keeps it |
 | `ngp.prefab` | none | `**/*.prefab` | |
-| `ngp.glsl` | `GlslSettings` | `**/*.{vert,frag,comp}` (the stage extensions the importer accepts) | Includes excluded |
+| `ngp.glsl` | `GlslSettings` | `**/*.{vert,frag,comp}` | Includes (`.glsl`) have no rule. deferred-ngp excludes its `glsl` root (`["**"]`): its stages are cooked by `compile_shaders.sh` and embedded, but the explicitly imported ones |
 
 #### Pipeline updates
 
@@ -2969,8 +3001,8 @@ registering a rule id, orphans its outputs (§8), never deletes them.
   act: keep the id for a compatible importer, mint a new id when the outputs
   should orphan instead of being reinterpreted.
 - **A default rule removed**: its outputs orphan (§8); nothing is deleted.
-- **A new default rule** (a new extension): every matching unclaimed file in
-  an enabled root imports on the next pass, which is a tree-wide write;
+- **A new default rule** (a new extension): every matching unclaimed file
+  not excluded imports on the next pass, which is a tree-wide write;
   release notes of the module should say so.
 
 #### Failures (interaction with bundle-less failure memos, §8, §13)
@@ -2981,21 +3013,35 @@ registering a rule id, orphans its outputs (§8), never deletes them.
   bundle, and re-run when a path its basis read changes, exactly as for an
   authored rule's first attempt.
 - The row clears when the import succeeds, when the file leaves the group, or
-  when the default layer no longer produces the origin (root disabled, rule
-  unregistered, file now claimed by an authored rule or an explicit import).
+  when the default layer no longer produces the origin (path excluded, rule
+  unregistered, file now claimed by an authored rule or an explicit
+  import).
 - Default imports make first-attempt failures far more common (every
-  unclaimed `*.png` in an enabled root is attempted), which is the reason that
+  unclaimed `*.png` not excluded is attempted), which is the reason that
   failure table must exist before defaults ship.
 
 #### Open questions
 
-- Opt-in per root (proposed) or on by default for every root.
-- Whether the `none` rule is a reserved importer id or a `Grouping::Ignore`
-  variant (the latter changes the `DirectoryImportRules` schema, a bootstrap
-  control type).
-- Whether a default output is adopted by an authored rule at the same output
-  path (proposed refinement under Precedence) or stays a collision.
+- An explicit import does not claim a file from authored rules (precedence
+  1 applies against the default layer only, as authored rules and explicit
+  imports coexisted before defaults). Whether it should.
+- The reserved default-rules UUIDs are not checked against bundle files: a
+  committed bundle whose own UUID equals one would be attributed to the
+  default layer's origin space. A source-claim check (§13 namespace
+  collision) is not implemented.
+- Deleting a redundant rules bundle (one whose rules match what the
+  defaults would do) orphans its outputs, which then hold the default
+  outputs' paths: defaults step aside until the orphans are deleted, and
+  the regenerated bundles get new UUIDs. Whether the default layer should
+  adopt an orphan of a removed rules bundle at its output path.
+- Whole-layer revalidation (configuration or capability change, a rules
+  source changed, on any rules bundle) checks the task of every default
+  group (`directory_task_needs_run`), as revalidating every authored rule
+  does; its cost on a large tree is not measured.
 
+Resolved (2026-10-08): defaults are on for every root with per-root
+excludes; the opt-out is the reserved importer id `none` (no schema change);
+an authored rule adopts a default output at its own output path.
 ### Build import (pure)
 
 For every bundle in the tree, the daemon validates each entry against its
@@ -5218,7 +5264,7 @@ that published it, never copied into a table.
 | `files` | **(root id, normalized root-relative path)** → mtime, size, kind, content hash — last-known tree state — and, for a traversed directory, its canonical path, unique across roots (`files_by_canonical`; a root's own directory is its configuration's): two observed directories with one canonical path are an inconsistent table, not an alias to choose between. Physical tracking is per root: multiple roots form one *logical* namespace (§18), and a single-path key could hold only one of two same-path observations, silently choosing a root. The logical path index derives as a multimap with three states — `Missing`, `Unique(root)`, `Ambiguous(roots)` — and ambiguity is representable, not pre-collapsed |
 | `source_claims` | what each scanned source claims, keyed by the claimant: bundle and asset uuids, primary paths, malformed skeletons, and its derived outputs (kind 2: child uuid → parent uuid, output key and the child's terminal type, from the source's assets × the pinned pipeline map, §9). A derived child is its one claim while neither it nor its parent is withheld by a collision — read by point lookups, the only authority for child resolution. A subject with more than one distinct claimant collides: an asset resolves by point reads of its `assets` row, its bundle's poison, else its and its bundle's claimants here (`source_claims_by_subject` covers the claimant); the full collision listing (diagnostics, full publication, a reconfiguration's colliding sources) walks that index's bundle and asset claims. A malformed skeleton (kind 5) is its namespace error. A deleted asset is a missing one, and subscribers learn of the deletion from `change_log` |
 | `file_work` | the watcher work no pass has consumed, in one order: changed paths (root id, path, exists/deleted, observation) and renames. A transaction queues its work in memory and writes, at its commit, only what no pass consumed in it; a pass acknowledges exactly the rows it captured, by sequence range |
-| `import_keys` | the import index, one row per (bundle, asset, kind, key) indexed by (kind, key): what each watched import's basis reads (a path, a listing, an importer capability) under its `$record` entry, and each directory-import rules asset by the directory of its listing's literal prefix, so a changed path finds the rules that may list it by its ancestor directories. A row's source is its bundle's row, and its rows go with that row (a foreign key); the basis itself is read when needed, from the failure memo or the `$record`. Derived from the committed bundles and kept by source: every bundle publication queues its paths in `file_work`, and an import pass reindexes the dirty bundle sources, parsing each once, before it acknowledges that work, so the index is current but for pending work. It is never rebuilt whole; a store starts with no bundles and an empty index |
+| `import_keys` | the import index, one row per (bundle, asset, kind, key) indexed by (kind, key): what each watched import's basis reads (a path, a listing, an importer capability) under its `$record` entry, and each directory-import rules asset by the directory of its listing's literal prefix, so a changed path finds the rules that may list it by its ancestor directories, and (kind 4) each explicit import's sources, keyed `{root len}:{root}{path}`, which the default import layer (§8 "Default imports") never selects. A row's source is its bundle's row, and its rows go with that row (a foreign key); the basis itself is read when needed, from the failure memo or the `$record`. Derived from the committed bundles and kept by source: every bundle publication queues its paths in `file_work`, and an import pass reindexes the dirty bundle sources, parsing each once, before it acknowledges that work, so the index is current but for pending work. It is never rebuilt whole; a store starts with no bundles and an empty index |
 | `bundles` | bundle uuid → **(root id, normalized path)**, format version, content hash, primary asset (the runtime entry its path resolves to; a path's candidates are the primaries of its bundles in every root, a search of `bundles_by_path`) — the physical key, matching `files`: UUID-based access must reach the owning file without a logical-index round trip that could turn ambiguous under a same-path file in a second root; path-query ambiguity is derived separately. Directory-import ownership derives at scan from generated bundles' `DirectoryOrigin` records (§8), whose `rule` is the authored stable `ImportRuleId`, never a vector index; deleting that id re-derives the orphan state, never reassigns ownership |
 | `bundle_path_refs` | bundle uuid → each logical path its entries' asset/weak reference fields name, written with the bundle's rows at publication. Rename-with-fixups (§4) reads only the bundles that reference the moving path, plus the poisoned ones, whose references are unknown |
 | `assets` | object | `local_id → asset entry` |
@@ -7614,6 +7660,9 @@ schema_path = "target/asset-schema.json"
 # repair command creates a missing manifest. Discovery still rejects any
 # second SchemaLineageManifest anywhere in the configured roots.
 lineage_manifest = { root = "main", path = "schema/schema-lineage.bundle" }
+# Path globs per root the default import rules (§8 "Default imports") never
+# select; `["**"]` turns a root off. Defaults apply to every root.
+default_imports_exclude = { main = ["scratch/**"] }
 
 [modules]
 # Rebuilt by `distilld dev`'s optional development supervisor; the serving
@@ -7768,6 +7817,7 @@ ships; an unclassified key is a spec defect:
 | `assets.roots` | input-versioned epoch | staged candidate epoch (above); root changes reconcile through the scanner (§14); existing snapshots keep their configuration |
 | `assets.schema_path` | input-versioned epoch | the schema artifact is watched at the new path; a swap lands as a schema input event (§3, §5) |
 | `assets.lineage_manifest` | input-versioned epoch | normalized rooted destination for Missing-manifest repair; staging requires a named configured root and valid §10 path, and changing it cannot move or select an existing manifest |
+| `assets.default_imports_exclude` | input-versioned epoch | joins the compiled state's default import layer (§8 "Default imports"); staging requires configured root names and valid globs; the next pass revalidates the layer whole (outputs of newly excluded files orphan, released files import) |
 | `[targets]` definitions | input-versioned epoch | joins the combined execution candidate (§3): the pipeline map re-validates against the new target set; bound Hubs receive `ReconnectRequired` (§17) |
 | `modules.pipeline_dylib` | input-versioned epoch | module epoch rotation (§3) through the staged-candidate mechanism |
 | tool registrations (§3, §9) | input-versioned epoch | ToolEpoch (§13): a complete staged package or explicit ambient toolchain identity plus DSCT hash publishes at an input version |
@@ -8345,9 +8395,9 @@ put production image codecs, mesh optimization, or shader compilers in core.
   watch, read-set — so re-import reconstructs from the file alone.
   Imports are requested by explicit `ImportRequest` (importer id, sources,
   dest, settings, watch — never sniffed from extensions); `reimport`
-  re-runs a bundle's recorded `ImportRecord` (§17). (Proposed, not
-  implemented: default imports choose a first importer by path, §8
-  "Default imports", and still record it.)
+  re-runs a bundle's recorded `ImportRecord` (§17). Default imports
+  choose a first importer by path (§8 "Default imports") and still record
+  it.
 - **Validators** (§9): typed, single-asset, bound by the determinism
   contract; two severities; advisory at authoring time, publishability
   gate at build import; part of build identity via the dylib hash.
