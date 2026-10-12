@@ -125,7 +125,6 @@ fn project_schema() -> Schema {
     Schema {
         source_hashes: Default::default(),
         type_ops_hash: String::new(),
-        layout_hashes: Default::default(),
         rustc_version: String::new(),
         types,
         layouts: vec![SchemaLayouts {
@@ -139,7 +138,6 @@ fn tagged_schema() -> Schema {
     Schema {
         source_hashes: Default::default(),
         type_ops_hash: String::new(),
-        layout_hashes: Default::default(),
         rustc_version: String::new(),
         types: vec![
             TypeDef {

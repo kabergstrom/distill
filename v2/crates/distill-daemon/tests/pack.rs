@@ -19,7 +19,6 @@ fn config(temp: &tempfile::TempDir) -> DaemonConfig {
     let schema = Schema {
         source_hashes: Default::default(),
         type_ops_hash: String::new(),
-        layout_hashes: Default::default(),
         rustc_version: String::new(),
         types: Vec::new(),
         layouts: vec![SchemaLayouts {

@@ -608,7 +608,6 @@ pub fn schema(entries: Vec<(TypeDef, TypeLayout)>) -> Schema {
     Schema {
         source_hashes: Default::default(),
         type_ops_hash: String::new(),
-        layout_hashes: Default::default(),
         rustc_version: String::new(),
         types,
         layouts: vec![SchemaLayouts {

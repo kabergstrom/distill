@@ -718,7 +718,6 @@ pub fn project_schema() -> Schema {
     Schema {
         source_hashes: BTreeMap::from([pipeline_module().1.clone()]),
         type_ops_hash: String::new(),
-        layout_hashes: Default::default(),
         rustc_version: String::new(),
         types,
         layouts: vec![SchemaLayouts {

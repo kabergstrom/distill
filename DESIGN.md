@@ -1288,7 +1288,6 @@ distill contains no schema-model code. The refactor, normative here:
 pub struct Schema {
     pub source_hashes: BTreeMap<String, String>,
     pub type_ops_hash: String,        // paired generated module TypeOps table
-    pub layout_hashes: BTreeMap<String, String>, // NGP module reload metadata
     pub rustc_version: String,        // producer metadata, not logical identity
     pub types: Vec<TypeDef>,          // logical facts + native matching metadata
     pub layouts: Vec<SchemaLayouts>,  // ≥ 1, one per compilation identity

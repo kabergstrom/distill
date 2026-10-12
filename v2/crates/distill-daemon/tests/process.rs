@@ -75,7 +75,6 @@ fn write_schema_path(path: &std::path::Path, marker: &str) {
             .into_iter()
             .collect(),
         type_ops_hash: String::new(),
-        layout_hashes: Default::default(),
         rustc_version: String::new(),
         types: Vec::new(),
         layouts: vec![SchemaLayouts {
@@ -1036,11 +1035,11 @@ fn malformed_schema_is_a_stable_pipeline_failure_and_a_valid_edit_retries() {
 // Pipeline swaps gated on the watched schema (ngp_module_host::SourceGate).
 //
 // One standalone pipeline crate is built in three variants, in the same
-// directory so their source and layout hashes are comparable:
+// directory so their source hashes are comparable:
 // - `v1`: importer version 1;
 // - `v2`: importer version 2 and a new struct (a layout change);
-// - `v3`: importer version 3, otherwise `v2` (a fn-body-only change: same
-//   layout hash as `v2`).
+// - `v3`: importer version 3, otherwise `v2` (a fn-body-only change, which
+//   waits for its schema like any other).
 // The importer writes its version into the imported value, so a capability-
 // driven reimport is visible in the bundle.
 
@@ -1051,7 +1050,6 @@ const GATE_CRATE: &str = "distill_gate_fixture";
 struct GateVariant {
     dylib: std::path::PathBuf,
     source_hash: String,
-    layout_hash: String,
 }
 
 struct GateVariants {
@@ -1278,33 +1276,20 @@ ngp-source-hash = {{ path = '{}' }}
             // written here; it is opened only to read its identity exports.
             let library = unsafe { ngp_module_host::HostedLibrary::open(staged.clone()) }.unwrap();
             // SAFETY: the fixture derives NgpSourceIdentity.
-            let identity = unsafe { ngp_module_host::read_reload_identity(&library) }.unwrap();
+            let identity = unsafe { ngp_module_host::read_source_identity(&library) }.unwrap();
             library.close();
             let _ = std::fs::remove_file(staged.path());
-            assert_eq!(identity.source.crate_name, GATE_CRATE);
-            assert!(
-                !identity.layout_hash.is_empty(),
-                "NgpSourceIdentity exports a layout hash"
-            );
+            assert_eq!(identity.crate_name, GATE_CRATE);
             GateVariant {
                 dylib,
-                source_hash: identity.source.source_hash,
-                layout_hash: identity.layout_hash,
+                source_hash: identity.source_hash,
             }
         };
         let v1 = build("v1", 1, false);
         let v2 = build("v2", 2, true);
         let v3 = build("v3", 3, true);
         assert_ne!(v1.source_hash, v2.source_hash);
-        assert_ne!(
-            v1.layout_hash, v2.layout_hash,
-            "a new struct changes the layout hash"
-        );
-        assert_ne!(v2.source_hash, v3.source_hash);
-        assert_eq!(
-            v2.layout_hash, v3.layout_hash,
-            "a fn body keeps the layout hash"
-        );
+        assert_ne!(v2.source_hash, v3.source_hash, "a fn body changes the source hash");
         GateVariants { v1, v2, v3 }
     })
 }
@@ -1358,9 +1343,6 @@ fn write_gate_schema(temp: &tempfile::TempDir, variant: &GateVariant) {
             .into_iter()
             .collect(),
         type_ops_hash: String::new(),
-        layout_hashes: [(GATE_CRATE.to_owned(), variant.layout_hash.clone())]
-            .into_iter()
-            .collect(),
         rustc_version: String::new(),
         types: vec![
             type_def(
@@ -1547,41 +1529,7 @@ fn pipeline_ahead_of_its_schema_keeps_serving_until_the_schema_catches_up() {
 }
 
 #[test]
-fn pipeline_with_an_unchanged_layout_is_adopted_ahead_of_source_walk() {
-    let variants = gate_variants();
-    let temp = tempfile::tempdir().unwrap();
-    let process = start_gate_daemon(&temp, &variants.v2);
-    assert_eq!(imported_value(&temp).as_deref(), Some("v2:note"));
-    let generation = pipeline_generation(&process);
-
-    // Only fn bodies changed: the schema already describes this build. The
-    // swap can share a pass with the watcher work of the import's own bundle
-    // write, which the capability-driven reimport rewrites: more work for
-    // the next pass, never an error.
-    install_gate_pipeline(&temp, &variants.v3);
-    let no_error = || {
-        assert_eq!(process.last_background_error(), None);
-    };
-    wait_long(
-        || {
-            no_error();
-            ready_dylib_hash(&process) == Some(dylib_hash(&variants.v3))
-        },
-        "a layout-preserving pipeline was not adopted ahead of source-walk",
-    );
-    wait_long(
-        || {
-            no_error();
-            imported_value(&temp).as_deref() == Some("v3:note")
-        },
-        "the new importer version did not reimport the watched import",
-    );
-    assert_eq!(pipeline_generation(&process), generation + 1);
-    assert_eq!(process.last_background_error(), None);
-}
-
-#[test]
-fn source_walk_catching_up_after_an_ahead_of_walk_adoption_is_not_republished() {
+fn a_code_only_pipeline_waits_for_its_schema() {
     let variants = gate_variants();
     let temp = tempfile::tempdir().unwrap();
     let process = start_gate_daemon(&temp, &variants.v2);
@@ -1601,6 +1549,12 @@ fn source_walk_catching_up_after_an_ahead_of_walk_adoption_is_not_republished() 
     std::fs::remove_file(temp.path().join("pipeline.so")).unwrap();
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(pipeline_generation(&process), generation);
+    assert_eq!(ready_dylib_hash(&process), Some(dylib_hash(&variants.v2)));
+
+    // Only fn bodies changed, but its source hash is not the schema's: the
+    // candidate waits, nothing is published.
+    install_gate_pipeline(&temp, &variants.v3);
+    std::thread::sleep(Duration::from_millis(500));
     assert_eq!(
         process
             .coordinator()
@@ -1610,60 +1564,23 @@ fn source_walk_catching_up_after_an_ahead_of_walk_adoption_is_not_republished() 
             .version,
         before
     );
+    assert_eq!(pipeline_generation(&process), generation);
     assert_eq!(ready_dylib_hash(&process), Some(dylib_hash(&variants.v2)));
     assert_eq!(process.last_background_error(), None);
+    assert_eq!(imported_value(&temp).as_deref(), Some("v2:note"));
 
-    // The new dylib is adopted against the schema source-walk has not
-    // refreshed yet.
-    install_gate_pipeline(&temp, &variants.v3);
+    // Source-walk refreshes the source hash: exactly one epoch change.
+    write_gate_schema(&temp, &variants.v3);
     wait_long(
         || ready_dylib_hash(&process) == Some(dylib_hash(&variants.v3)),
-        "a layout-preserving pipeline was not adopted ahead of source-walk",
+        "the matching schema did not adopt the waiting pipeline",
     );
     wait_long(
         || imported_value(&temp).as_deref() == Some("v3:note"),
         "the new importer version did not reimport the watched import",
     );
-    // Let the watcher publish the reimport's own bundle write first.
-    std::thread::sleep(SETTLED);
+    std::thread::sleep(Duration::from_millis(500));
     assert_eq!(pipeline_generation(&process), generation + 1);
-    let before = process
-        .coordinator()
-        .server()
-        .current_stamp()
-        .unwrap()
-        .version;
-
-    // Then source-walk's fast path refreshes only the pipeline crate's
-    // source hash, to the adopted module's. Exactly one epoch change for
-    // the edit.
-    write_gate_schema(&temp, &variants.v3);
-    std::thread::sleep(Duration::from_millis(1000));
-    assert_eq!(pipeline_generation(&process), generation + 1);
-    assert_eq!(
-        process
-            .coordinator()
-            .server()
-            .current_stamp()
-            .unwrap()
-            .version,
-        before
-    );
-    assert_eq!(ready_dylib_hash(&process), Some(dylib_hash(&variants.v3)));
-    assert_eq!(process.last_background_error(), None);
-
-    // The observed schema still gates the next build: another code-only
-    // change is adopted ahead of the walk as before.
-    install_gate_pipeline(&temp, &variants.v2);
-    wait_long(
-        || ready_dylib_hash(&process) == Some(dylib_hash(&variants.v2)),
-        "the next layout-preserving pipeline was not adopted",
-    );
-    wait_long(
-        || imported_value(&temp).as_deref() == Some("v2:note"),
-        "the next importer version did not reimport the watched import",
-    );
-    assert_eq!(pipeline_generation(&process), generation + 2);
     assert_eq!(process.last_background_error(), None);
 }
 
@@ -1682,8 +1599,9 @@ fn a_schema_refresh_observed_before_its_dylib_gives_one_epoch_change() {
         .unwrap()
         .version;
 
-    // The schema already names v3's source while v2 still serves: v2 would
-    // load against it as it is, so nothing is published.
+    // The schema already names v3's source while v2 still serves: v2's
+    // source hash is not the schema's, so it keeps serving and nothing is
+    // published.
     write_gate_schema(&temp, &variants.v3);
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(pipeline_generation(&process), generation);

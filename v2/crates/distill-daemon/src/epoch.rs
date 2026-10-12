@@ -574,10 +574,6 @@ impl Drop for CallbackIngressGuard {
 pub struct CandidateRequirements {
     pub module_abi: ModuleAbiIdentity,
     pub source_hashes: BTreeMap<String, String>,
-    /// The watched schema's `layout_hashes`: a module whose source is ahead
-    /// of the schema is still adopted when its layout hash matches (only fn
-    /// bodies changed; see `ngp_module_host::SourceGate`).
-    pub layout_hashes: BTreeMap<String, String>,
     pub schema_registry: BTreeMap<TypeUuid, distill_core::id::LogicalHash>,
     pub targets: Vec<TargetDefinition>,
 }
@@ -607,16 +603,6 @@ fn host_callback_panic(surface: HostCallbackSurface, operation: &str) -> ModuleC
 pub trait LoadedPipelineModule: Send {
     fn source_identity(&mut self)
         -> Result<ngp_module_host::ModuleSourceIdentity, ModuleCallError>;
-    /// Source identity plus the module's layout hash. Without an override
-    /// the layout hash is `""`, which never matches a schema's.
-    fn reload_identity(
-        &mut self,
-    ) -> Result<ngp_module_host::ModuleReloadIdentity, ModuleCallError> {
-        Ok(ngp_module_host::ModuleReloadIdentity {
-            source: self.source_identity()?,
-            layout_hash: String::new(),
-        })
-    }
     fn module_abi(&mut self) -> Result<ModuleAbiIdentity, ModuleCallError>;
     fn register(
         &mut self,
@@ -663,9 +649,9 @@ struct EpochInner {
     targets: Vec<TargetDefinition>,
     registration: RegistrationSet,
     tools: BTreeMap<String, distill_store::pipeline::ToolRegistrationV2>,
-    /// Source and layout identity the module reported when it was validated;
+    /// Source identity the module reported when it was validated;
     /// set once by `prepare_candidate`.
-    reload_identity: OnceLock<ngp_module_host::ModuleReloadIdentity>,
+    source_identity: OnceLock<ngp_module_host::ModuleSourceIdentity>,
     /// The first runtime failure; it fences the epoch for good.
     runtime_error: OnceLock<(PipelineFailureCode, String)>,
     /// Whether the RPC fence for the runtime failure has been published.
@@ -718,7 +704,7 @@ impl PipelineEpoch {
                 .collect(),
             registration,
             tools,
-            reload_identity: OnceLock::new(),
+            source_identity: OnceLock::new(),
             runtime_error: OnceLock::new(),
             runtime_fenced: std::sync::atomic::AtomicBool::new(false),
             registration_arena: Some(arena),
@@ -734,10 +720,10 @@ impl PipelineEpoch {
         self.0.staged.content_hash
     }
 
-    /// The module's source and layout identity, as validated against the
+    /// The module's source identity, as validated against the
     /// schema it was published with (`None` only for test-built epochs).
-    pub fn reload_identity(&self) -> Option<&ngp_module_host::ModuleReloadIdentity> {
-        self.0.reload_identity.get()
+    pub fn source_identity(&self) -> Option<&ngp_module_host::ModuleSourceIdentity> {
+        self.0.source_identity.get()
     }
 
     pub fn staged_path(&self) -> &Path {
@@ -1382,10 +1368,10 @@ pub enum CandidateRejection {
     /// The candidate cannot serve; publishing this failure fences the
     /// pipeline.
     Failed(PipelineFailure),
-    /// The module's source hash is ahead of the watched schema and its layout
-    /// hash differs (`ngp_module_host::SourceGate::Wait`), while a Ready
-    /// epoch is published. Nothing is published: the Ready epoch keeps
-    /// serving, and the next schema write retries the candidate.
+    /// The module's source hash differs from the watched schema's
+    /// (`ngp_module_host::SourceGate::Wait`) while a Ready epoch is
+    /// published. Nothing is published: the Ready epoch keeps serving, and
+    /// the next schema write retries the candidate.
     AwaitingSchema(String),
 }
 
@@ -1499,7 +1485,7 @@ impl ModuleHost {
 
         let validation =
             validate_open_module(module.as_mut(), requirements, &mut registration_arena);
-        let (registration, reload_identity) = match validation {
+        let (registration, source_identity) = match validation {
             Ok(validated) => validated,
             Err(error) => {
                 let cleanup = discard_candidate(module, registration_arena);
@@ -1564,7 +1550,7 @@ impl ModuleHost {
             },
             module,
         );
-        let _ = epoch.0.reload_identity.set(reload_identity);
+        let _ = epoch.0.source_identity.set(source_identity);
         Ok(epoch)
     }
 
@@ -1808,21 +1794,12 @@ fn validate_open_module(
     module: &mut dyn LoadedPipelineModule,
     requirements: &CandidateRequirements,
     registration_arena: &mut CandidateRegistrationArena,
-) -> Result<(RegistrationSet, ngp_module_host::ModuleReloadIdentity), CandidatePhaseError> {
-    let identity = boundary_call("source_identity", || module.reload_identity())
+) -> Result<(RegistrationSet, ngp_module_host::ModuleSourceIdentity), CandidatePhaseError> {
+    let identity = boundary_call("source_identity", || module.source_identity())
         .map_err(|error| CandidatePhaseError::attestation(error.to_string()))?;
-    let crate_name = &identity.source.crate_name;
-    match identity.gate(&requirements.source_hashes, &requirements.layout_hashes) {
+    let crate_name = &identity.crate_name;
+    match identity.gate(&requirements.source_hashes) {
         ngp_module_host::SourceGate::Match => {}
-        ngp_module_host::SourceGate::AheadOfWalk { schema_source_hash } => {
-            tracing::info!(
-                crate_name = %crate_name,
-                module = %identity.source.source_hash,
-                schema = %schema_source_hash,
-                "pipeline source changed but its layout hash matches the schema; \
-                 adopting it ahead of source-walk"
-            );
-        }
         ngp_module_host::SourceGate::Wait {
             schema_source_hash: None,
         } => {
@@ -1836,7 +1813,7 @@ fn validate_open_module(
             return Err(CandidatePhaseError::awaiting_schema(format!(
                 "module source hash mismatch for crate `{crate_name}` (module {}, schema \
                  {schema_source_hash}); waiting for source-walk",
-                identity.source.source_hash
+                identity.source_hash
             )));
         }
     }

@@ -246,21 +246,17 @@ a connection of its own, and SQLite's write lock orders the writers.
 - **Module epochs** unload when the last clone of their token drops.
 - **Pipeline swaps** use New Game Plus's reload gate
   (`ngp_module_host::SourceGate`). A candidate module whose source hash is
-  the watched schema's loads. One whose source is ahead of the schema but
-  whose layout hash (`__ngp_layout_hash`: the crate with non-const fn items
-  stripped) equals the schema's `layout_hashes` entry loads ahead of
-  source-walk. Any other mismatch leaves the candidate pending while a Ready
-  epoch keeps serving: no input version, no pipeline generation bump, and
-  the next schema or module write retries it. Without a Ready epoch, or for
-  a crate the schema lacks, it is a `CandidateAttestation` failure.
-  A schema write that leaves the Ready epoch's version key
-  (`ModuleReloadIdentity::version_key`: the module's own source hash, the
-  other crates' source hashes, the layout hashes, plus the rest of the
-  schema) unchanged, as source-walk catching up after an ahead-of-walk
-  adoption does, is observed without republishing, as is a pipeline write
-  of the bytes the Ready epoch was staged from. A missing pipeline module
-  (cargo removes the dylib before linking the new one) leaves the Ready
-  epoch serving until it reappears.
+  the watched schema's loads. A mismatch leaves the candidate pending while
+  a Ready epoch keeps serving: no input version, no pipeline generation
+  bump, and the next schema or module write retries it. Without a Ready
+  epoch, or for a crate the schema lacks, it is a `CandidateAttestation`
+  failure. A schema write that leaves the Ready epoch's version key
+  (`ModuleSourceIdentity::version_key`: the module's own source hash and
+  the other crates' source hashes, plus the rest of the schema) unchanged
+  is observed without republishing, as is a pipeline write of the bytes the
+  Ready epoch was staged from. A missing pipeline module (cargo removes the
+  dylib before linking the new one) leaves the Ready epoch serving until it
+  reappears.
 - **rebuild** (a serving `distilld`) runs the configuration's `[[rebuild]]`
   jobs: it watches each job's dep-info inputs with its own `notify` watcher
   and runs the job's steps as child processes, one at a time (in a process

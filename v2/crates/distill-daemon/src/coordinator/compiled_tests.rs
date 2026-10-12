@@ -60,7 +60,6 @@ fn authority(source: u8) -> Arc<ProjectSchemaAuthority> {
             Schema {
                 source_hashes: BTreeMap::new(),
                 type_ops_hash: String::new(),
-                layout_hashes: Default::default(),
                 rustc_version: String::new(),
                 types: Vec::new(),
                 layouts: vec![SchemaLayouts {
@@ -157,7 +156,6 @@ impl Fixture {
                     allocator: "system".into(),
                 },
                 source_hashes: BTreeMap::new(),
-                layout_hashes: BTreeMap::new(),
                 schema_registry: BTreeMap::new(),
                 targets: Vec::new(),
             },
@@ -447,7 +445,6 @@ fn typed_authority(edited: bool) -> Arc<ProjectSchemaAuthority> {
             Schema {
                 source_hashes: BTreeMap::new(),
                 type_ops_hash: String::new(),
-                layout_hashes: Default::default(),
                 rustc_version: String::new(),
                 types: vec![
                     def(
@@ -910,7 +907,6 @@ fn labeled_authority(tagged: bool) -> Arc<ProjectSchemaAuthority> {
             Schema {
                 source_hashes: BTreeMap::new(),
                 type_ops_hash: String::new(),
-                layout_hashes: Default::default(),
                 rustc_version: String::new(),
                 types: vec![
                     def(

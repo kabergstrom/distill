@@ -4345,7 +4345,6 @@ mod tests {
             Schema {
                 source_hashes: BTreeMap::new(),
                 type_ops_hash: String::new(),
-                layout_hashes: Default::default(),
                 rustc_version: String::new(),
                 types: vec![
                     TypeDef {
@@ -4466,7 +4465,6 @@ mod tests {
             Schema {
                 source_hashes: BTreeMap::new(),
                 type_ops_hash: String::new(),
-                layout_hashes: Default::default(),
                 rustc_version: String::new(),
                 types: vec![
                     TypeDef {

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -221,7 +221,6 @@ fn requirements(tag: u8) -> CandidateRequirements {
         source_hashes: [("pipeline".to_owned(), format!("{tag:016x}"))]
             .into_iter()
             .collect(),
-        layout_hashes: BTreeMap::new(),
         schema_registry,
         targets: vec![TargetDefinition {
             name: "desktop".into(),

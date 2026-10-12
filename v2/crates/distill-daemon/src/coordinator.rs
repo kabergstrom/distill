@@ -367,16 +367,15 @@ impl DaemonCoordinator {
     /// Whether publishing `candidate` with the current configuration and the
     /// pipeline module whose bytes hash to `dylib_hash` would install what
     /// already serves: the Ready epoch was staged from those bytes, and its
-    /// version key (`ngp_module_host::ModuleReloadIdentity::version_key`,
+    /// version key (`ngp_module_host::ModuleSourceIdentity::version_key`,
     /// which uses the module's own source hash, plus the rest of the schema)
     /// is the same against `candidate` as against the installed schema.
     ///
-    /// This is source-walk catching up after an `AheadOfWalk` adoption: it
-    /// rewrites only the pipeline crate's source hash. It is also a pipeline
-    /// event for bytes the epoch already serves: the pass that adopted them
-    /// may have observed the file mid-replacement (cargo removes and
-    /// re-links it) and staged it a moment later. Neither is republished, so
-    /// the epoch, the RPC generation, and the imports stay.
+    /// This is a pipeline event for bytes the epoch already serves: the pass
+    /// that adopted them may have observed the file mid-replacement (cargo
+    /// removes and re-links it) and staged it a moment later. It is also a
+    /// schema rewrite that changes nothing the module sees. Neither is
+    /// republished, so the epoch, the RPC generation, and the imports stay.
     pub(crate) fn ready_pipeline_serves(
         &self,
         candidate: &ProjectSchemaAuthority,
@@ -401,8 +400,8 @@ impl DaemonCoordinator {
             tracing::debug!("the watched pipeline is not the Ready epoch's");
             return false;
         }
-        let Some(identity) = epoch.reload_identity() else {
-            tracing::debug!("Ready pipeline epoch has no reload identity");
+        let Some(identity) = epoch.source_identity() else {
+            tracing::debug!("Ready pipeline epoch has no source identity");
             return false;
         };
         let key = |authority: &ProjectSchemaAuthority| {
@@ -412,7 +411,7 @@ impl DaemonCoordinator {
             // `Schema` has no `PartialEq`; its derived `Debug` covers every
             // field, in order.
             (
-                identity.version_key(&schema.source_hashes, &schema.layout_hashes),
+                identity.version_key(&schema.source_hashes),
                 format!("{rest:?}"),
             )
         };

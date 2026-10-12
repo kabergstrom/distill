@@ -65,8 +65,8 @@ impl PipelineModuleLoader for DynamicPipelineModuleLoader {
         .map_err(|error| ModuleCallError::new(error.to_string()))?;
         // SAFETY: `open_verified` authenticated and pinned the exact staged
         // image. The shared reader bounds and copies the four NGP data symbols
-        // and the layout hash while that image remains resident.
-        let identity = unsafe { ngp_module_host::read_reload_identity(&image) }
+        // while that image remains resident.
+        let identity = unsafe { ngp_module_host::read_source_identity(&image) }
             .map_err(|error| ModuleCallError::new(error.to_string()))?;
         let table = {
             // SAFETY: the symbol has a fixed C ABI and is not called through a
@@ -96,7 +96,7 @@ impl PipelineModuleLoader for DynamicPipelineModuleLoader {
 struct DynamicLoadedPipelineModule {
     image: Option<ngp_module_host::HostedLibrary>,
     table: Option<PipelineModuleTableV2>,
-    identity: ngp_module_host::ModuleReloadIdentity,
+    identity: ngp_module_host::ModuleSourceIdentity,
 }
 
 impl DynamicLoadedPipelineModule {
@@ -110,13 +110,6 @@ impl LoadedPipelineModule for DynamicLoadedPipelineModule {
     fn source_identity(
         &mut self,
     ) -> Result<ngp_module_host::ModuleSourceIdentity, ModuleCallError> {
-        self.table()?;
-        Ok(self.identity.source.clone())
-    }
-
-    fn reload_identity(
-        &mut self,
-    ) -> Result<ngp_module_host::ModuleReloadIdentity, ModuleCallError> {
         self.table()?;
         Ok(self.identity.clone())
     }
@@ -225,12 +218,9 @@ mod tests {
                 register: empty_register,
                 unload: empty_unload,
             }),
-            identity: ngp_module_host::ModuleReloadIdentity {
-                source: ngp_module_host::ModuleSourceIdentity {
-                    crate_name: "pipeline".to_owned(),
-                    source_hash: "0123456789abcdef".to_owned(),
-                },
-                layout_hash: String::new(),
+            identity: ngp_module_host::ModuleSourceIdentity {
+                crate_name: "pipeline".to_owned(),
+                source_hash: "0123456789abcdef".to_owned(),
             },
         };
 
