@@ -56,6 +56,22 @@ pub enum FileDep {
 
 pub trait ImportBackend {
     fn read(&mut self, path: &str) -> Result<(RootedPath, Vec<u8>), RawFileFailureClass>;
+    /// `read` with the blake3 hash of the bytes, which a read set records.
+    /// A backend that hashes what it reads anyway answers that hash rather
+    /// than hashing twice.
+    fn read_hashed(
+        &mut self,
+        path: &str,
+    ) -> Result<(RootedPath, Vec<u8>, [u8; 32]), RawFileFailureClass> {
+        let (path, bytes) = self.read(path)?;
+        let hash = *blake3::hash(&bytes).as_bytes();
+        Ok((path, bytes, hash))
+    }
+    /// The hash `read_hashed` answers, without the bytes: what a read-set
+    /// revalidation compares.
+    fn read_hash(&mut self, path: &str) -> Result<(RootedPath, [u8; 32]), RawFileFailureClass> {
+        self.read_hashed(path).map(|(path, _, hash)| (path, hash))
+    }
     fn probe(&mut self, path: &str) -> Result<Option<RootName>, RawFileFailureClass>;
     fn enumerate(&mut self, query: &FileQuery) -> Result<Vec<RootedPath>, RawFileFailureClass>;
     fn capability(&mut self, key: &CapabilityKey) -> Option<[u8; 32]>;
@@ -97,12 +113,9 @@ impl<'a, B: ImportBackend + ?Sized> ImportContext<'a, B> {
 
     pub fn read(&mut self, path: &str) -> Result<Vec<u8>, ImportError> {
         let path = normalize_path(path).map_err(|error| self.intake_failure(error))?;
-        match self.backend.read(&path) {
-            Ok((rooted, bytes)) => {
-                let observed = FileContentObservation {
-                    path: rooted,
-                    hash: *blake3::hash(&bytes).as_bytes(),
-                };
+        match self.backend.read_hashed(&path) {
+            Ok((rooted, bytes, hash)) => {
+                let observed = FileContentObservation { path: rooted, hash };
                 self.read_set.push(FileDep::Read {
                     path,
                     observed: Observed::Ok(observed),

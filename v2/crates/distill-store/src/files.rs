@@ -511,9 +511,8 @@ impl StoreReader {
     pub fn root_id(&self, name: &str) -> Result<Option<RootId>, StoreError> {
         Ok(self
             .conn
-            .query_row("SELECT root_id FROM roots WHERE name = ?1", [name], |r| {
-                r.get(0)
-            })
+            .prepare_cached("SELECT root_id FROM roots WHERE name = ?1")?
+            .query_row([name], |r| r.get(0))
             .optional()?
             .map(RootId))
     }
@@ -522,9 +521,8 @@ impl StoreReader {
     pub fn root_name(&self, root: RootId) -> Result<Option<String>, StoreError> {
         Ok(self
             .conn
-            .query_row("SELECT name FROM roots WHERE root_id = ?1", [root.0], |r| {
-                r.get(0)
-            })
+            .prepare_cached("SELECT name FROM roots WHERE root_id = ?1")?
+            .query_row([root.0], |r| r.get(0))
             .optional()?)
     }
 
@@ -532,23 +530,22 @@ impl StoreReader {
     pub fn file(&self, root: RootId, path: &str) -> Result<Option<FileState>, StoreError> {
         Ok(self
             .conn
-            .query_row(
+            .prepare_cached(
                 "SELECT mtime, size, kind, content_hash FROM files
                  WHERE root_id = ?1 AND path = ?2",
-                rusqlite::params![root.0, path],
-                |r| {
-                    Ok(FileState {
-                        mtime: r.get(0)?,
-                        size: r.get::<_, i64>(1)? as u64,
-                        kind: FileKind::from_i64(r.get(2)?),
-                        content_hash: r.get::<_, Option<Vec<u8>>>(3)?.map(|b| {
-                            let mut h = [0u8; 32];
-                            h.copy_from_slice(&b);
-                            ContentHash(h)
-                        }),
-                    })
-                },
-            )
+            )?
+            .query_row(rusqlite::params![root.0, path], |r| {
+                Ok(FileState {
+                    mtime: r.get(0)?,
+                    size: r.get::<_, i64>(1)? as u64,
+                    kind: FileKind::from_i64(r.get(2)?),
+                    content_hash: r.get::<_, Option<Vec<u8>>>(3)?.map(|b| {
+                        let mut h = [0u8; 32];
+                        h.copy_from_slice(&b);
+                        ContentHash(h)
+                    }),
+                })
+            })
             .optional()?)
     }
 }

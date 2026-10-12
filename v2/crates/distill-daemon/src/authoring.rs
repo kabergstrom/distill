@@ -25,7 +25,7 @@ use distill_store::{Store, StoreOpener, StoreReader};
 
 use crate::compiled::{Compiled, CompiledRegistry};
 use crate::coordinator::publish_incremental_paths;
-use crate::importer::{RegisteredImporter, RegisteredImporters};
+use crate::importer::{ImportControlsCache, RegisteredImporter, RegisteredImporters};
 use crate::scanner::ScanError;
 use distill_store::atomic_file;
 
@@ -38,6 +38,9 @@ pub struct AuthoringService {
     /// version its own transaction sees (`crate::compiled`).
     compiled: Arc<CompiledRegistry>,
     tag_index_coordinator: OnceLock<Weak<crate::coordinator::DaemonCoordinator>>,
+    /// Published import bundles' decoded `$record` and `$settings`, by
+    /// file content hash (`crate::importer::ImportControls`).
+    pub(crate) import_controls: ImportControlsCache,
 }
 
 impl AuthoringService {
@@ -46,6 +49,7 @@ impl AuthoringService {
             opener,
             compiled,
             tag_index_coordinator: OnceLock::new(),
+            import_controls: ImportControlsCache::default(),
         }
     }
 

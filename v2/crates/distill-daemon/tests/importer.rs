@@ -2744,6 +2744,93 @@ fn a_none_rule_opts_files_out_of_the_default_layer() {
     );
 }
 
+/// A loop pass over a removed rules bundle whose work is all that is
+/// pending revalidates the default layer under the directories its rules
+/// listed: removing a rules bundle that generated nothing (its only rule
+/// `none`) imports the files it held out of the layer.
+#[test]
+fn removing_a_none_only_rules_bundle_imports_its_files_by_default() {
+    let temp = tempfile::tempdir().unwrap();
+    let (assets, coordinator) = default_import_project(
+        temp.path(),
+        &[
+            ("quiet.num", b"1"),
+            ("loud.num", b"2"),
+            (
+                "rules.bundle",
+                &rules_bundle_matching(98, 97, "quiet.num", "none", "{name}.bundle"),
+            ),
+        ],
+        &[],
+    );
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator
+        .reconcile_directory_imports(&mut writer)
+        .unwrap();
+    settle_file_work(&coordinator, &mut writer);
+    assert!(coordinator
+        .pending_file_work(&mut writer)
+        .unwrap()
+        .is_empty());
+    assert!(!assets.join("quiet.num.bundle").exists());
+
+    std::fs::remove_file(assets.join("rules.bundle")).unwrap();
+    let outcome = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["rules.bundle"]), false)
+        .unwrap();
+    assert_eq!(outcome.imported.len(), 1, "quiet.num: {outcome:?}");
+    assert_eq!(
+        origin_of(&coordinator, &assets.join("quiet.num.bundle")),
+        default_origin()
+    );
+}
+
+/// A rules bundle added and then removed in a subdirectory claims and
+/// releases the default outputs under it, each in one loop pass, which
+/// revalidates the default layer only under the directories the rules list.
+#[test]
+fn a_subdirectory_rules_change_claims_and_releases_its_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let (assets, coordinator) = default_import_project(
+        temp.path(),
+        &[("top.num", b"1"), ("sub/quiet.num", b"2")],
+        &[],
+    );
+    let mut writer = coordinator.open_writer().unwrap();
+    assert_eq!(
+        coordinator
+            .reconcile_directory_imports(&mut writer)
+            .unwrap()
+            .len(),
+        2
+    );
+    settle_file_work(&coordinator, &mut writer);
+    let quiet = assets.join("sub/quiet.num.bundle");
+    let top = std::fs::read(assets.join("top.num.bundle")).unwrap();
+
+    std::fs::write(
+        assets.join("sub/rules.bundle"),
+        rules_bundle_matching(98, 97, "sub/quiet.num", "none", "{name}.bundle"),
+    )
+    .unwrap();
+    let outcome = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["sub/rules.bundle"]), false)
+        .unwrap();
+    assert!(outcome.imported.is_empty(), "{outcome:?}");
+    assert!(orphaned(&coordinator, &quiet));
+    assert!(!orphaned(&coordinator, &assets.join("top.num.bundle")));
+    settle_file_work(&coordinator, &mut writer);
+
+    std::fs::remove_file(assets.join("sub/rules.bundle")).unwrap();
+    let outcome = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["sub/rules.bundle"]), false)
+        .unwrap();
+    assert_eq!(outcome.imported.len(), 1, "sub/quiet.num: {outcome:?}");
+    assert_eq!(origin_of(&coordinator, &quiet), default_origin());
+    assert!(!orphaned(&coordinator, &quiet));
+    assert_eq!(std::fs::read(assets.join("top.num.bundle")).unwrap(), top);
+}
+
 /// A root's configured excludes keep files out of the default layer; a
 /// configuration dropping them imports the files, one adding them back
 /// orphans those outputs (kept on disk).

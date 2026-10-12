@@ -636,12 +636,13 @@ impl StoreReader {
     pub fn bundle_at(&self, root_name: &str, path: &str) -> Result<Option<BundleMeta>, StoreError> {
         let bundle = self
             .conn
-            .query_row(
+            .prepare_cached(
                 "SELECT b.bundle_uuid FROM bundles b JOIN roots r USING (root_id)
                  WHERE r.name = ?1 AND b.path = ?2",
-                rusqlite::params![root_name, path],
-                |r| r.get::<_, Vec<u8>>(0),
-            )
+            )?
+            .query_row(rusqlite::params![root_name, path], |r| {
+                r.get::<_, Vec<u8>>(0)
+            })
             .optional()?;
         match bundle {
             Some(bundle) => self.bundle(BundleUuid(blob16(bundle))),

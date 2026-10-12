@@ -3057,26 +3057,28 @@ Each rule has a fixed id (`ENGINE_DEFAULT_IMPORTS` in `newgameplus-pipeline/src/
   committed bundle whose own UUID equals one would be attributed to the
   default layer's origin space. A source-claim check (§13 namespace
   collision) is not implemented.
-- Whole-layer revalidation (configuration or capability change, a rules
-  source changed, on any rules bundle) checks the task of every default
-  group (`directory_task_needs_run`, which reads each group's prior bundle),
-  as revalidating every authored rule does. Measured 2026-10-12 on
-  deferred-ngp's `tools/distill/distill.toml` roots with the `test` root's
-  `["**"]` exclude removed (2,479 default bundles, 247 MB, beside about
-  2,500 sources; 50 first attempts failed): a pass adding a `none` rules
-  bundle that matches nothing took 10.4 s (10.39, 10.39, 10.29 s), against
-  0.12 s with `test` excluded; warm startup (also whole) 65 s against 16 s.
-  Whether to narrow it (revalidate only the groups a changed rules source
-  can claim or release, or decide a task's staleness without parsing its
-  bundle) is open.
-- Removing a rules bundle that generated nothing (a `none`-only bundle, or
-  rules whose files are all claimed elsewhere) does not revalidate the
-  default layer: `refresh_dirty_import_index` reports no changed rules for a
-  removed source and the bundle is not among the generating rules bundles,
-  so the files it claimed import by default only at the next whole pass
-  (startup, configuration or capability change). Seen 2026-10-12 with
-  `a_none_rule_opts_files_out_of_the_default_layer` once its earlier file
-  work is acknowledged; not fixed.
+- Startup re-reads bundles it has no need to: a warm start scans every file
+  twice (the configuration candidate's scan, then `reconcile_rescan`'s),
+  hashing each, and `refine_tag_index` re-refines every asset holding a tag
+  poison, re-reading its bundle. On deferred-ngp with `test` unexcluded
+  5,976 of 10,388 assets hold one (`tag extraction: WrongShape { path:
+  "$.data", expected: "object" }`, likewise `$.positions`, `$.trimesh`,
+  `$.ozz`, `$.samples`: the tag walk in `distill-schema/src/tags.rs` expects
+  an object where the loaded value of a blob-backed field is a blob). After
+  the fixes below a warm start took 36.8 s, against 72 s before (16 s with
+  `test` excluded); blake3 over the two scans was a third of it, tag
+  refinement a sixth. Merging the scans touches the startup protocol (the
+  watcher arms before the scan); fixing the tag walk changes which tags
+  extract. Both open.
+- Revalidating a default task re-reads the sources its read set names, to
+  hash them (`revalidate_read_set`): a third of a whole-layer pass after the
+  fixes below. Trusting the scanned row's hash instead would change what
+  drift a pass notices; open.
+- An import's controls (`$record`, `$settings`) are cached by the bundle
+  file's content hash once parsed (`ImportControlsCache`), and a pass checks
+  the file row's hash against the bundle row's before using them, so a
+  cached bundle is not re-read from disk: drift of an unchanged bundle's
+  file is then noticed by the watcher, not by that pass's read.
 
 Resolved (2026-10-08): defaults are on for every root with per-root
 excludes; the opt-out is the reserved importer id `none` (no schema change);
@@ -3092,6 +3094,34 @@ Resolved (2026-10-12):
   rules bundle or rule is gone, when the default rule's importer made it,
   keeping its UUIDs; deleting a redundant rules bundle no longer costs new
   UUIDs (Precedence, above).
+
+Resolved (2026-10-12, branch `recheck-perf`):
+
+- Whole-layer revalidation cost (configuration or capability change, or
+  any rules source changed). Measured on deferred-ngp's
+  `tools/distill/distill.toml` roots with the `test` root's `["**"]` exclude
+  removed: 2,552 default bundles (2.35 GB) beside about 5,000 sources. A
+  pass adding a `none` rules bundle that matches nothing took 10.76 s
+  (4.2 ms per bundle), against 0.12 s with `test` excluded. Profiled:
+  `directory_task_needs_run` reading every prior bundle was 55% of the
+  pass, the rest mostly read-set revalidation and listing; each default
+  bundle was read and blake3-hashed twice (`read_published_bundle`,
+  `scanned_bundle`; 35% of the pass), its container CRC-32C ran on a table
+  at 0.45 GB/s (31% with the JSON parse), and its entry data was cloned to
+  decode `$record`/`$settings` (7%). Fixed within the design: hardware
+  CRC-32C (SSE4.2, AArch64 CRC), one hash per read, controls cached by file
+  hash and seeded from a full scan's parse, per-pass listing memo, cached
+  statements. A whole pass now takes 1.3-1.8 s (0.5-0.7 ms per bundle).
+- A rules source that changed or went revalidates the default layer only
+  under the listing directories of the rules it held (from the committed
+  import index) and holds, plus the origin groups of the outputs its
+  previous rules generated; a listing of a whole root still revalidates the
+  layer whole. Adding, editing or removing that rules bundle: 22, 13, 9 ms.
+- Removing a rules bundle that generated nothing (a `none`-only bundle, or
+  rules whose files are all claimed elsewhere) revalidates the files its
+  rules listed, which import by default in that pass
+  (`removing_a_none_only_rules_bundle_imports_its_files_by_default`,
+  `a_subdirectory_rules_change_claims_and_releases_its_files`).
 
 ### Build import (pure)
 

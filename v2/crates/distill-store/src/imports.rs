@@ -131,32 +131,31 @@ impl StoreReader {
         bundle: BundleUuid,
     ) -> Result<Option<WatchedImportFailure>, StoreError> {
         self.conn
-            .query_row(
+            .prepare_cached(
                 "SELECT attempted_input_version, basis, terminal_kind,
                         terminal_code, message, memo_seq
                  FROM watched_import_failures WHERE bundle_uuid = ?1",
-                [bundle.0.as_slice()],
-                |row| {
-                    let kind = row.get::<_, i64>(2)?;
-                    let code = row.get::<_, Option<i64>>(3)?;
-                    let terminal = match (kind, code) {
-                        (1, None) => WatchedImportTerminal::Dependency,
-                        (2, Some(code)) if (1..=i64::from(u32::MAX)).contains(&code) => {
-                            WatchedImportTerminal::Importer { code: code as u32 }
-                        }
-                        (3, None) => WatchedImportTerminal::DirectoryOrphan,
-                        _ => return Err(rusqlite::Error::InvalidQuery),
-                    };
-                    Ok(WatchedImportFailure {
-                        bundle,
-                        attempted_input_version: InputVersion(row.get::<_, i64>(0)? as u64),
-                        basis: row.get(1)?,
-                        terminal,
-                        message: row.get(4)?,
-                        memo_seq: MemoSeq(row.get::<_, i64>(5)? as u64),
-                    })
-                },
-            )
+            )?
+            .query_row([bundle.0.as_slice()], |row| {
+                let kind = row.get::<_, i64>(2)?;
+                let code = row.get::<_, Option<i64>>(3)?;
+                let terminal = match (kind, code) {
+                    (1, None) => WatchedImportTerminal::Dependency,
+                    (2, Some(code)) if (1..=i64::from(u32::MAX)).contains(&code) => {
+                        WatchedImportTerminal::Importer { code: code as u32 }
+                    }
+                    (3, None) => WatchedImportTerminal::DirectoryOrphan,
+                    _ => return Err(rusqlite::Error::InvalidQuery),
+                };
+                Ok(WatchedImportFailure {
+                    bundle,
+                    attempted_input_version: InputVersion(row.get::<_, i64>(0)? as u64),
+                    basis: row.get(1)?,
+                    terminal,
+                    message: row.get(4)?,
+                    memo_seq: MemoSeq(row.get::<_, i64>(5)? as u64),
+                })
+            })
             .optional()
             .map_err(StoreError::from)
     }
@@ -693,6 +692,29 @@ impl StoreReader {
                  WHERE r.name = ?1 AND b.path = ?2 AND k.kind = 4",
                 rusqlite::params![root, path],
                 |row| parse_explicit_source_key(&row.get::<_, String>(0)?),
+            )?);
+        }
+        found.sort();
+        found.dedup();
+        Ok(found)
+    }
+
+    /// The listing directories of the directory-import rules assets the
+    /// bundles at `sources` (bundle files, by root and path) hold, as the
+    /// index holds them: every path those rules may list or claim is under
+    /// one of them.
+    pub fn directory_rule_dirs_of(
+        &self,
+        sources: &[(String, String)],
+    ) -> Result<Vec<String>, StoreError> {
+        let mut found = Vec::new();
+        for (root, path) in sources {
+            found.extend(self.query_rows(
+                "SELECT k.key FROM import_keys k JOIN bundles b USING (bundle_uuid)
+                 JOIN roots r ON r.root_id = b.root_id
+                 WHERE r.name = ?1 AND b.path = ?2 AND k.kind = 3",
+                rusqlite::params![root, path],
+                |row| row.get::<_, String>(0),
             )?);
         }
         found.sort();

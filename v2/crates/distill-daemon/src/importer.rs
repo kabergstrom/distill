@@ -131,6 +131,12 @@ pub(crate) struct IndexRefresh {
     /// bundles gained or lost: default imports may now select them or no
     /// longer may (§8 "Default imports").
     explicit: BTreeSet<(String, String)>,
+    /// The listing directories of the directory rules the reindexed sources
+    /// held before this refresh or hold after it (`listing_dir`; a source
+    /// removed with its rules counts): every file those rules claimed or
+    /// now claim is under one of them, so the default layer's groups that
+    /// can change are there (§8 "Default imports").
+    rule_dirs: BTreeSet<String>,
 }
 
 /// Rules bundles by UUID, as the pass's scan read them.
@@ -138,6 +144,9 @@ pub(crate) type FreshRules = BTreeMap<BundleUuid, Bundle>;
 
 /// A rules listing's sources by (rule index, group).
 type DirectoryGroups = BTreeMap<(usize, RootedPath), BTreeSet<RootedPath>>;
+
+/// The listings a pass enumerated for default groups, by (prefix, glob).
+type DefaultListings = BTreeMap<(Option<String>, Option<String>), Vec<RootedPath>>;
 
 impl RegisteredImporter {
     pub(crate) fn validate(importer: Arc<dyn AuthoringImporter>) -> Result<Self, RpcFailure> {
@@ -243,7 +252,7 @@ impl AuthoringService {
                         )
                     }
                 };
-                let Ok(bundle) = source.parsed.clone() else {
+                let Ok(bundle) = source.parsed.as_ref() else {
                     continue;
                 };
                 if bundle
@@ -260,6 +269,7 @@ impl AuthoringService {
                         path.clone(),
                         root.clone(),
                         bundle,
+                        source.file_hash.0,
                     )?);
                     continue;
                 }
@@ -267,12 +277,24 @@ impl AuthoringService {
                     continue;
                 };
                 // The published bundle of this UUID may be another source's.
-                let (root_name, bundle) = if meta.path == *path && meta.root == *root_id {
-                    (root.clone(), bundle)
+                if meta.path == *path && meta.root == *root_id {
+                    rows.push(self.index_import_bundle(
+                        store,
+                        meta.path,
+                        root.clone(),
+                        bundle,
+                        source.file_hash.0,
+                    )?);
                 } else {
-                    self.published_bundle(store, &meta)?
-                };
-                rows.push(self.index_import_bundle(store, meta.path, root_name, bundle)?);
+                    let (root_name, bundle) = self.published_bundle(store, &meta)?;
+                    rows.push(self.index_import_bundle(
+                        store,
+                        meta.path,
+                        root_name,
+                        &bundle,
+                        meta.content_hash.0,
+                    )?);
+                }
             }
             if keys.is_empty() {
                 return Ok(IndexRefresh {
@@ -281,6 +303,7 @@ impl AuthoringService {
                     previous: Vec::new(),
                     rules,
                     explicit: BTreeSet::new(),
+                    rule_dirs: BTreeSet::new(),
                 });
             }
             // The rows replace every row of these sources: one of them
@@ -307,14 +330,27 @@ impl AuthoringService {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
+            let committed = self.opener.open_reader().map_err(invalid)?;
             if !removed.is_empty() {
-                let committed = self.opener.open_reader().map_err(invalid)?;
                 before.extend(
                     committed
                         .explicit_import_sources_of(&removed)
                         .map_err(invalid)?,
                 );
             }
+            // The rules these sources held, from the committed index (a
+            // removed or replaced bundle's rows are gone from this input),
+            // and the rules they hold now.
+            let mut rule_dirs = committed
+                .directory_rule_dirs_of(&sources)
+                .map_err(invalid)?
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            drop(committed);
+            rule_dirs.extend(
+                rows.iter()
+                    .flat_map(|row| row.directory_rules.iter().map(|(_, dir)| dir.clone())),
+            );
             store
                 .replace_import_index(&sources, &rows)
                 .map_err(invalid)?;
@@ -348,6 +384,7 @@ impl AuthoringService {
                 previous,
                 rules,
                 explicit,
+                rule_dirs,
             })
         })
     }
@@ -359,7 +396,8 @@ impl AuthoringService {
         store: &StoreReader,
         path: String,
         root_name: String,
-        bundle: Bundle,
+        bundle: &Bundle,
+        file_hash: [u8; 32],
     ) -> Result<ImportIndexSource, RpcFailure> {
         let uuid = bundle.uuid;
         let mut directory_rules = Vec::new();
@@ -374,12 +412,19 @@ impl AuthoringService {
         let record = bundle.assets.get("$record").map(|entry| entry.uuid);
         let mut watched = None;
         let mut explicit = None;
-        if let (Ok(prior), Some(record)) = (decode_prior_import(bundle), record) {
-            if prior.model.record.origin.is_none() {
+        let controls = match self.import_controls.get(&file_hash) {
+            Some(controls) => Ok(controls),
+            None => decode_import_controls(bundle).map(|controls| {
+                let controls = Arc::new(controls);
+                self.import_controls.insert(file_hash, controls.clone());
+                controls
+            }),
+        };
+        if let (Ok(prior), Some(record)) = (controls, record) {
+            if prior.record.origin.is_none() {
                 explicit = Some(ExplicitImport {
                     record,
                     sources: prior
-                        .model
                         .record
                         .sources
                         .iter()
@@ -387,13 +432,13 @@ impl AuthoringService {
                         .collect(),
                 });
             }
-            if prior.model.record.watch {
+            if prior.record.watch {
                 let basis = match store.watched_import_failure(uuid).map_err(invalid)? {
                     Some(failure) if failure.terminal == WatchedImportTerminal::DirectoryOrphan => {
                         Vec::new()
                     }
                     Some(failure) => decode_attempt_basis(&failure.basis)?,
-                    None => prior.model.record.read_set,
+                    None => prior.record.read_set.clone(),
                 };
                 if !basis.is_empty() {
                     watched = Some(WatchedImport {
@@ -628,18 +673,19 @@ impl AuthoringService {
             None => BTreeSet::new(),
         };
         // The default layer is revalidated whole when what decides it may
-        // have moved: with no work, a capability or configuration change, or
-        // a rules source that changed or went (its rules may claim or
-        // release any file). Otherwise its groups at the dirty paths, at the
-        // explicit sources gained or lost and of its affected failures are
-        // touched.
+        // have moved everywhere: with no work, or a capability or
+        // configuration change. Otherwise its groups at the dirty paths, at
+        // the explicit sources gained or lost and of its affected failures
+        // are touched; and, for a rules source that changed or went, those of
+        // every file under the listing directories of the rules it held or
+        // holds, which are all the files those rules can claim or release
+        // (a listing of the whole root revalidates the layer whole), and of
+        // the outputs its previous rules generated, which the layer may
+        // adopt once orphaned.
         let defaults_whole = defaults.is_some()
-            && (work.is_none()
-                || capabilities_changed
-                || refreshed.changed_rules
-                || !previous.is_empty());
+            && (work.is_none() || capabilities_changed || refreshed.rule_dirs.contains(""));
         let default_paths = if defaults.is_some() && !defaults_whole {
-            paths
+            let mut default_paths = paths
                 .iter()
                 .cloned()
                 .chain(refreshed.explicit.iter().cloned())
@@ -649,7 +695,34 @@ impl AuthoringService {
                         .filter(|origin| is_default(origin.rules_bundle))
                         .map(|origin| (origin.group_root.clone(), origin.group_path.clone())),
                 )
-                .collect::<BTreeSet<_>>()
+                .collect::<BTreeSet<_>>();
+            if !refreshed.rule_dirs.is_empty() {
+                let backend =
+                    RootedImportBackend::over(compiled.scanner(), &store, &capabilities, overlay);
+                for dir in &refreshed.rule_dirs {
+                    for row in backend
+                        .rows
+                        .observed_files_in(PathSelection::Prefix(dir))
+                        .map_err(invalid)?
+                    {
+                        if matches!(row.file.state.kind, FileKind::File | FileKind::Symlink) {
+                            default_paths.insert((row.root_name, row.path));
+                        }
+                    }
+                }
+            }
+            for rules in &previous {
+                for bundle in store.bundles_owned_by(*rules).map_err(invalid)? {
+                    if let Some(origin) = store
+                        .bundle(bundle)
+                        .map_err(invalid)?
+                        .and_then(|meta| meta.origin)
+                    {
+                        default_paths.insert((origin.group_root, origin.group_path));
+                    }
+                }
+            }
+            default_paths
         } else {
             BTreeSet::new()
         };
@@ -726,6 +799,7 @@ impl AuthoringService {
         let mut backend =
             RootedImportBackend::over(compiled.scanner(), &store, &capabilities, overlay);
         let mut groups = BTreeMap::new();
+        let mut listings = DefaultListings::new();
         let mut touched = BTreeSet::<(BundleUuid, AssetUuid, usize, RootedPath)>::new();
         let mut touched_origins = BTreeSet::<StoredDirectoryOrigin>::new();
         if work.is_some() {
@@ -770,6 +844,7 @@ impl AuthoringService {
                     for entry in &entries[authored..] {
                         let groups = default_entry_groups(
                             &mut groups,
+                            &mut listings,
                             defaults,
                             claims,
                             entry,
@@ -845,8 +920,14 @@ impl AuthoringService {
             }
             if let Some((defaults, claims)) = layer {
                 for entry in &entries[authored..] {
-                    let groups =
-                        default_entry_groups(&mut groups, defaults, claims, entry, &mut backend)?;
+                    let groups = default_entry_groups(
+                        &mut groups,
+                        &mut listings,
+                        defaults,
+                        claims,
+                        entry,
+                        &mut backend,
+                    )?;
                     touch_all_directory_groups(entry, groups, &mut touched, &mut touched_origins);
                 }
             }
@@ -865,9 +946,15 @@ impl AuthoringService {
                 continue;
             };
             let sources = match (entry.default_rule, layer) {
-                (Some(_), Some((defaults, claims))) => {
-                    default_group_sources(&groups, defaults, claims, entry, group, &mut backend)?
-                }
+                (Some(_), Some((defaults, claims))) => default_group_sources(
+                    &groups,
+                    &mut listings,
+                    defaults,
+                    claims,
+                    entry,
+                    group,
+                    &mut backend,
+                )?,
                 (Some(_), None) => None,
                 (None, _) => entry_groups(&mut groups, &explicit, entry, &mut backend)?
                     .get(&(*rule_index, group.clone()))
@@ -1051,8 +1138,8 @@ impl AuthoringService {
                 return Ok(false);
             }
         }
-        let recorded = self.read_prior_import_published(store, meta)?;
-        Ok(recorded.model.record.importer == task.importer)
+        let recorded = self.published_import_controls(store, meta)?;
+        Ok(recorded.record.importer == task.importer)
     }
 
     /// The bundle-less directory-import failures a pass's work may heal or
@@ -1168,9 +1255,8 @@ impl AuthoringService {
                 let Some(origin) = &meta.origin else {
                     continue;
                 };
-                let prior = self.read_prior_import_published(store, meta)?;
+                let prior = self.published_import_controls(store, meta)?;
                 let current_basis = prior
-                    .model
                     .record
                     .read_set
                     .iter()
@@ -1444,8 +1530,8 @@ impl AuthoringService {
             .bundle(bundle)
             .map_err(invalid)?
             .ok_or_else(|| invalid(format!("cannot reimport unknown bundle {bundle}")))?;
-        let prior = self.read_prior_import_published(store, &meta)?;
-        Ok((prior.model.record.importer.clone(), meta.path.clone()))
+        let prior = self.published_import_controls(store, &meta)?;
+        Ok((prior.record.importer.clone(), meta.path.clone()))
     }
 
     fn defer_reimport<T>(
@@ -1563,17 +1649,17 @@ impl AuthoringService {
                 RootedImportBackend::over(compiled.scanner(), store, capabilities, overlay);
             return Ok(!revalidate_read_set(&basis, &mut backend));
         };
-        let prior = self.read_prior_import_published(store, &meta)?;
+        let prior = self.published_import_controls(store, &meta)?;
         let expected_origin = DirectoryOrigin {
             rules_bundle: task.rules_bundle,
             rule: task.rule.clone(),
             group: task.group.clone(),
         };
-        if prior.model.record.origin.as_ref() != Some(&expected_origin) {
+        if prior.record.origin.as_ref() != Some(&expected_origin) {
             // An authored rule takes over a default output at its own output
             // path, and a default rule an orphan its importer made, keeping
             // its identities (§8 "Default imports").
-            if adopts_default_output(&compiled, task, prior.model.record.origin.as_ref())
+            if adopts_default_output(&compiled, task, prior.record.origin.as_ref())
                 || task.adopts == Some(meta.bundle)
             {
                 return Ok(true);
@@ -1583,10 +1669,10 @@ impl AuthoringService {
                 task.destination_root, task.destination_path
             )));
         }
-        if prior.model.record.importer != task.importer
-            || prior.model.record.sources != task.sources
-            || prior.model.settings != task.settings
-            || !prior.model.record.watch
+        if prior.record.importer != task.importer
+            || prior.record.sources != task.sources
+            || prior.settings != task.settings
+            || !prior.record.watch
         {
             return Ok(true);
         }
@@ -1597,7 +1683,7 @@ impl AuthoringService {
                 return Ok(true);
             }
             Some(failure) => decode_attempt_basis(&failure.basis)?,
-            None => prior.model.record.read_set.clone(),
+            None => prior.record.read_set.clone(),
         };
         Ok(!revalidate_read_set(&basis, &mut backend))
     }
@@ -2324,7 +2410,13 @@ impl AuthoringService {
         meta: &BundleMeta,
     ) -> Result<(), RpcFailure> {
         let (root_name, bundle) = self.published_bundle(store, meta)?;
-        let row = self.index_import_bundle(store, meta.path.clone(), root_name, bundle)?;
+        let row = self.index_import_bundle(
+            store,
+            meta.path.clone(),
+            root_name,
+            &bundle,
+            meta.content_hash.0,
+        )?;
         let source = [(row.root_name.clone(), row.path.clone())];
         store
             .replace_import_index(&source, &[row])
@@ -2545,19 +2637,101 @@ impl AuthoringService {
             .root_name(meta.root)
             .map_err(invalid)?
             .ok_or_else(|| invalid("bundle root identity is missing"))?;
-        let source = match self
-            .compiled(store)?
-            .scanner()
-            .read_published_bundle(store, &root, &meta.path)
+        // The version's bytes are the ones `meta` was published from.
+        match store
+            .file_content_hash(&root, &meta.path)
+            .map_err(invalid)?
         {
-            Ok(source) if source.file_hash.0 == meta.content_hash.0 => source,
-            Ok(_) | Err(StoreError::Drifted { .. }) => return Ok(None),
-            Err(error) => return Err(invalid(error)),
+            Some(hash) if hash.0 == meta.content_hash.0 => {}
+            _ => return Ok(None),
+        }
+        let controls = match self.import_controls.get(&meta.content_hash.0) {
+            Some(controls) => Some(controls),
+            None => {
+                let source = match self
+                    .compiled(store)?
+                    .scanner()
+                    .read_published_bundle(store, &root, &meta.path)
+                {
+                    Ok(source) if source.file_hash.0 == meta.content_hash.0 => source,
+                    Ok(_) | Err(StoreError::Drifted { .. }) => return Ok(None),
+                    Err(error) => return Err(invalid(error)),
+                };
+                self.cache_import_controls(&source)
+            }
         };
-        Ok(Some(match source.parsed.map(decode_prior_import) {
-            Ok(Ok(prior)) if prior.model.record.watch => prior.model.record.read_set,
+        Ok(Some(match controls {
+            Some(controls) if controls.record.watch => controls.record.read_set.clone(),
             _ => Vec::new(),
         }))
+    }
+
+    /// Remember the import controls of the import bundles in `bundles`,
+    /// parsed already (a full scan's), by their file hashes.
+    pub(crate) fn remember_import_controls<'a>(
+        &self,
+        bundles: impl Iterator<Item = &'a ScannedBundle>,
+    ) {
+        for bundle in bundles {
+            if bundle
+                .parsed
+                .as_ref()
+                .is_ok_and(|parsed| parsed.assets.contains_key("$record"))
+            {
+                self.cache_import_controls(bundle);
+            }
+        }
+    }
+
+    /// `source`'s decoded controls, remembered by its file hash; `None` when
+    /// it does not parse or holds no valid import controls.
+    fn cache_import_controls(&self, source: &ScannedBundle) -> Option<Arc<ImportControls>> {
+        if let Some(controls) = self.import_controls.get(&source.file_hash.0) {
+            return Some(controls);
+        }
+        let controls = Arc::new(decode_import_controls(source.parsed.as_ref().ok()?).ok()?);
+        self.import_controls
+            .insert(source.file_hash.0, controls.clone());
+        Some(controls)
+    }
+
+    /// `meta`'s import controls (`$record`, `$settings`): decoded from the
+    /// published bundle's bytes, which `meta.content_hash` names, the first
+    /// time these bytes are asked for, and remembered by that hash after.
+    fn published_import_controls(
+        &self,
+        store: &StoreReader,
+        meta: &BundleMeta,
+    ) -> Result<Arc<ImportControls>, RpcFailure> {
+        let root = store
+            .root_name(meta.root)
+            .map_err(invalid)?
+            .ok_or_else(|| invalid("bundle root identity is missing"))?;
+        match store
+            .file_content_hash(&root, &meta.path)
+            .map_err(invalid)?
+        {
+            None => {
+                return Err(invalid(StoreError::Drifted {
+                    root,
+                    path: meta.path.clone(),
+                }))
+            }
+            Some(hash) if hash.0 != meta.content_hash.0 => {
+                return Err(invalid(
+                    "published scan does not match durable bundle metadata",
+                ));
+            }
+            Some(_) => {}
+        }
+        if let Some(controls) = self.import_controls.get(&meta.content_hash.0) {
+            return Ok(controls);
+        }
+        let (_, bundle) = self.published_bundle(store, meta)?;
+        let controls = Arc::new(decode_import_controls(&bundle)?);
+        self.import_controls
+            .insert(meta.content_hash.0, controls.clone());
+        Ok(controls)
     }
 
     /// `published_bundle` without its root, or `None` when its file changed
@@ -2612,15 +2786,6 @@ impl AuthoringService {
         Ok(Ok((root, bundle)))
     }
 
-    /// `meta`'s import record, from the published scan.
-    fn read_prior_import_published(
-        &self,
-        store: &StoreReader,
-        meta: &BundleMeta,
-    ) -> Result<PriorImport, RpcFailure> {
-        decode_prior_import(self.published_bundle(store, meta)?.1)
-    }
-
     fn read_prior_import(
         &self,
         store: &StoreReader,
@@ -2648,18 +2813,7 @@ impl AuthoringService {
 }
 
 fn decode_prior_import(bundle: Bundle) -> Result<PriorImport, RpcFailure> {
-    let settings = bundle
-        .assets
-        .get("$settings")
-        .ok_or_else(|| invalid("existing import bundle has no $settings entry"))?;
-    let record = bundle
-        .assets
-        .get("$record")
-        .ok_or_else(|| invalid("existing destination is not an imported bundle"))?;
-    if record.type_uuid != IMPORT_RECORD_TYPE_UUID || !record.authoring_only {
-        return Err(invalid("existing $record entry has the wrong type or role"));
-    }
-    let record = decode_import_record(&record.data)?;
+    let ImportControls { record, settings } = decode_import_controls(&bundle)?;
     let entries = bundle
         .assets
         .iter()
@@ -2675,8 +2829,7 @@ fn decode_prior_import(bundle: Bundle) -> Result<PriorImport, RpcFailure> {
             )
         })
         .collect();
-    let settings_type_uuid = settings.type_uuid;
-    let settings = settings.data.clone();
+    let settings_type_uuid = bundle.assets["$settings"].type_uuid;
     Ok(PriorImport {
         model: ImportedBundle {
             bundle_uuid: bundle.uuid,
@@ -2925,6 +3078,7 @@ fn default_rule_entries(defaults: &DefaultImports) -> Vec<DirectoryRuleEntry> {
 /// that nothing claims first, enumerated once per call.
 fn default_entry_groups<'a>(
     cache: &'a mut BTreeMap<(BundleUuid, AssetUuid), DirectoryGroups>,
+    listings: &mut DefaultListings,
     defaults: &DefaultImports,
     claims: &DefaultClaims,
     entry: &DirectoryRuleEntry,
@@ -2933,12 +3087,27 @@ fn default_entry_groups<'a>(
     match cache.entry((entry.rules_bundle, entry.rules_asset)) {
         std::collections::btree_map::Entry::Occupied(groups) => Ok(groups.into_mut()),
         std::collections::btree_map::Entry::Vacant(slot) => {
-            let listed = backend
-                .enumerate(&entry.rules.listing)
-                .map_err(|error| invalid(format!("default import listing failed: {error:?}")))?;
+            let listed = default_listing(listings, backend, &entry.rules.listing)?;
             let groups = default_groups(defaults, claims, entry, listed, None)?;
             Ok(slot.insert(groups))
         }
+    }
+}
+
+/// The files `listing` enumerates, once per pass: every root's entry of a
+/// default rule lists the same, and so do the groups of one directory.
+fn default_listing<'l>(
+    listings: &'l mut DefaultListings,
+    backend: &mut RootedImportBackend<'_>,
+    listing: &FileQuery,
+) -> Result<&'l [RootedPath], RpcFailure> {
+    match listings.entry((listing.path_prefix.clone(), listing.path_glob.clone())) {
+        std::collections::btree_map::Entry::Occupied(listed) => Ok(listed.into_mut()),
+        std::collections::btree_map::Entry::Vacant(slot) => Ok(slot.insert(
+            backend
+                .enumerate(listing)
+                .map_err(|error| invalid(format!("default import listing failed: {error:?}")))?,
+        )),
     }
 }
 
@@ -2948,7 +3117,7 @@ fn default_groups(
     defaults: &DefaultImports,
     claims: &DefaultClaims,
     entry: &DirectoryRuleEntry,
-    listed: Vec<RootedPath>,
+    listed: &[RootedPath],
     only: Option<&RootedPath>,
 ) -> Result<DirectoryGroups, RpcFailure> {
     let index = entry.default_rule.expect("a default layer entry");
@@ -2961,21 +3130,24 @@ fn default_groups(
         if source.root.0 != entry.root_name || !rule.matches(&source.path) {
             continue;
         }
-        let group = directory_group(rule.rule.group, &source)?;
+        let group = directory_group(rule.rule.group, source)?;
         if only.is_some_and(|only| *only != group)
-            || claims.claimed(defaults, root, index, &source)?
+            || claims.claimed(defaults, root, index, source)?
         {
             continue;
         }
-        groups.entry((0, group)).or_default().insert(source);
+        groups.entry((0, group)).or_default().insert(source.clone());
     }
     Ok(groups)
 }
 
 /// The sources of one default group: from the entry's enumerated groups when
-/// the pass has them, else from a listing narrowed to the group's directory.
+/// the pass has them, else from a listing narrowed to the group's directory,
+/// enumerated once per pass (`listings`, by prefix and glob): the groups of
+/// one directory share it.
 fn default_group_sources(
     cache: &BTreeMap<(BundleUuid, AssetUuid), DirectoryGroups>,
+    listings: &mut DefaultListings,
     defaults: &DefaultImports,
     claims: &DefaultClaims,
     entry: &DirectoryRuleEntry,
@@ -2995,9 +3167,7 @@ fn default_group_sources(
             .or_else(|| (!parent.is_empty()).then(|| parent.to_owned())),
         path_glob: entry.rules.listing.path_glob.clone(),
     };
-    let listed = backend
-        .enumerate(&listing)
-        .map_err(|error| invalid(format!("default import listing failed: {error:?}")))?;
+    let listed = default_listing(listings, backend, &listing)?;
     Ok(
         default_groups(defaults, claims, entry, listed, Some(group))?
             .into_values()
@@ -3486,8 +3656,14 @@ impl<'a> RootedImportBackend<'a> {
     }
 }
 
-impl ImportBackend for RootedImportBackend<'_> {
-    fn read(&mut self, path: &str) -> Result<(RootedPath, Vec<u8>), RawFileFailureClass> {
+impl RootedImportBackend<'_> {
+    /// The bytes at `path` as the pass observes them, with their blake3
+    /// hash: one file, read through the scan's identity checks, whose hash
+    /// is its row's content hash.
+    fn read_checked(
+        &mut self,
+        path: &str,
+    ) -> Result<(RootedPath, Vec<u8>, [u8; 32]), RawFileFailureClass> {
         let matches = self
             .files_at(path)?
             .into_iter()
@@ -3500,13 +3676,12 @@ impl ImportBackend for RootedImportBackend<'_> {
                 RawFileFailureClass::OtherStable
             });
         };
+        let rooted =
+            RootedPath::new(&row.root_name, path).map_err(|_| RawFileFailureClass::OtherStable)?;
         if let Some(bytes) = self.rows.output(&row.root_name, path) {
             // An earlier import of the pass publishes these bytes here.
-            return Ok((
-                RootedPath::new(&row.root_name, path)
-                    .map_err(|_| RawFileFailureClass::OtherStable)?,
-                bytes.to_vec(),
-            ));
+            let hash = *blake3::hash(bytes).as_bytes();
+            return Ok((rooted, bytes.to_vec(), hash));
         }
         let physical = self
             .scanner
@@ -3516,13 +3691,25 @@ impl ImportBackend for RootedImportBackend<'_> {
             .scanner
             .read_identity_checked(&physical)
             .map_err(scan_failure)?;
-        if Some(ContentHash(*blake3::hash(&bytes).as_bytes())) != row.file.state.content_hash {
+        let hash = *blake3::hash(&bytes).as_bytes();
+        if Some(ContentHash(hash)) != row.file.state.content_hash {
             return Err(RawFileFailureClass::OtherStable);
         }
-        Ok((
-            RootedPath::new(&row.root_name, path).map_err(|_| RawFileFailureClass::OtherStable)?,
-            bytes,
-        ))
+        Ok((rooted, bytes, hash))
+    }
+}
+
+impl ImportBackend for RootedImportBackend<'_> {
+    fn read(&mut self, path: &str) -> Result<(RootedPath, Vec<u8>), RawFileFailureClass> {
+        self.read_checked(path)
+            .map(|(path, bytes, _)| (path, bytes))
+    }
+
+    fn read_hashed(
+        &mut self,
+        path: &str,
+    ) -> Result<(RootedPath, Vec<u8>, [u8; 32]), RawFileFailureClass> {
+        self.read_checked(path)
     }
 
     fn probe(&mut self, path: &str) -> Result<Option<RootName>, RawFileFailureClass> {
@@ -3651,11 +3838,10 @@ fn observe_file_dep(dep: &FileDep, backend: &mut impl ImportBackend) -> FileDep 
     match dep {
         FileDep::Read { path, .. } => FileDep::Read {
             path: path.clone(),
-            observed: match backend.read(path) {
-                Ok((path, bytes)) => Observed::Ok(distill_build::import::FileContentObservation {
-                    path,
-                    hash: *blake3::hash(&bytes).as_bytes(),
-                }),
+            observed: match backend.read_hash(path) {
+                Ok((path, hash)) => {
+                    Observed::Ok(distill_build::import::FileContentObservation { path, hash })
+                }
                 Err(class) => Observed::Err(StableFailureFingerprint::RawFile {
                     op: RawFileOp::Read,
                     subject: RawFileSubject::Path(path.clone()),
@@ -4802,6 +4988,68 @@ struct PriorImport {
     model: ImportedBundle,
     settings_type_uuid: TypeUuid,
     bundle: Bundle,
+}
+
+/// A published import bundle's controls: its `$record` and `$settings`,
+/// decoded. All that revalidating a watched or directory import, and
+/// deciding who owns a bundle, read of it.
+#[derive(Debug)]
+pub(crate) struct ImportControls {
+    record: ImportRecord,
+    settings: AuthoredValue,
+}
+
+/// Decoded `ImportControls` by the blake3 hash of their bundle file's bytes
+/// (`BundleFileHash`, the file's content hash). Decoding is a function of
+/// the bytes, so an entry never goes stale; a pass revalidating thousands
+/// of bundles reads none whose bytes it decoded before, where it would
+/// read, hash and parse every file whole for two small entries. Bounded:
+/// cleared when it reaches `IMPORT_CONTROLS_LIMIT` entries.
+#[derive(Default)]
+pub(crate) struct ImportControlsCache(
+    std::sync::Mutex<std::collections::HashMap<[u8; 32], Arc<ImportControls>>>,
+);
+
+const IMPORT_CONTROLS_LIMIT: usize = 1 << 16;
+
+impl ImportControlsCache {
+    fn get(&self, hash: &[u8; 32]) -> Option<Arc<ImportControls>> {
+        self.lock().get(hash).cloned()
+    }
+
+    fn insert(&self, hash: [u8; 32], controls: Arc<ImportControls>) {
+        let mut map = self.lock();
+        if map.len() >= IMPORT_CONTROLS_LIMIT {
+            map.clear();
+        }
+        map.insert(hash, controls);
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<[u8; 32], Arc<ImportControls>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+fn decode_import_controls(bundle: &Bundle) -> Result<ImportControls, RpcFailure> {
+    let settings = bundle
+        .assets
+        .get("$settings")
+        .ok_or_else(|| invalid("existing import bundle has no $settings entry"))?;
+    let record = bundle
+        .assets
+        .get("$record")
+        .ok_or_else(|| invalid("existing destination is not an imported bundle"))?;
+    if record.type_uuid != IMPORT_RECORD_TYPE_UUID || !record.authoring_only {
+        return Err(invalid("existing $record entry has the wrong type or role"));
+    }
+    Ok(ImportControls {
+        record: decode_import_record(&record.data)?,
+        settings: settings.data.clone(),
+    })
 }
 
 /// One import a reconciliation pass runs: a directory-import output, or a

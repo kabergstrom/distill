@@ -643,8 +643,7 @@ impl ScanSnapshot {
             snapshot.files.insert(key, file);
         }
         for (root_name, path, hash) in bundles {
-            let mut bundle = scanned_bundle(&root_name, &path, Vec::new());
-            bundle.file_hash = BundleFileHash(hash);
+            let bundle = scanned_bundle(&root_name, &path, Vec::new(), BundleFileHash(hash));
             snapshot.bundles.insert((root_name, path), Arc::new(bundle));
         }
         rebuild_reverse_indexes(&mut snapshot).map_err(|error| {
@@ -815,10 +814,13 @@ fn scanned_file_row(row: ObservedFile) -> (ScannedFile, Option<PathBuf>) {
     (file, alias)
 }
 
+/// A scanned bundle file: `bytes` parsed, with `file_hash`, their blake3
+/// hash (`BundleFileHash::of_observed_bytes`), which the caller computed.
 pub(crate) fn scanned_bundle(
     root_name: &str,
     normalized_path: &str,
     bytes: Vec<u8>,
+    file_hash: BundleFileHash,
 ) -> ScannedBundle {
     let parsed = distill_bundle::parse_bundle(&bytes);
     let namespace_skeleton = parsed
@@ -828,7 +830,7 @@ pub(crate) fn scanned_bundle(
     ScannedBundle {
         root_name: root_name.to_owned(),
         normalized_path: normalized_path.to_owned(),
-        file_hash: BundleFileHash::of_observed_bytes(&bytes),
+        file_hash,
         parsed,
         namespace_skeleton,
         bytes,
@@ -1276,10 +1278,11 @@ impl RootedScanner {
         let bytes = self
             .read_identity_checked(&physical)
             .map_err(|_| drifted())?;
-        if ContentHash(*blake3::hash(&bytes).as_bytes()) != expected {
+        let hash = *blake3::hash(&bytes).as_bytes();
+        if ContentHash(hash) != expected {
             return Err(drifted());
         }
-        Ok(scanned_bundle(root, path, bytes))
+        Ok(scanned_bundle(root, path, bytes, BundleFileHash(hash)))
     }
 
     pub fn read_identity_checked(&self, path: &Path) -> Result<Vec<u8>, ScanError> {
@@ -1679,7 +1682,9 @@ fn observe_opened_file(
     revalidate_entry_guards(std::slice::from_ref(&guard), roots, daemon_owned)?;
     let normalized_path = relative.join("/");
     let raw_relative_path = raw_relative_path(roots, root_name, &physical);
-    let file_hash = BundleFileHash::of_observed_bytes(&bytes);
+    // One hash of the bytes: the file content hash, a bundle's file hash.
+    let hash = *blake3::hash(&bytes).as_bytes();
+    let file_hash = BundleFileHash(hash);
     if let Some(existing) = snapshot
         .files
         .get(&(root_name.to_owned(), normalized_path.clone()))
@@ -1713,7 +1718,7 @@ fn observe_opened_file(
         },
         modified_nanos: modified_nanos(&metadata),
         size: metadata.len(),
-        content_hash: Some(ContentHash(*blake3::hash(&bytes).as_bytes())),
+        content_hash: Some(ContentHash(hash)),
         raw_relative_path,
         canonical_path: None,
     };
@@ -1734,7 +1739,7 @@ fn observe_opened_file(
         .and_then(|extension| extension.to_str())
         == Some("bundle")
     {
-        let bundle = scanned_bundle(root_name, &normalized_path, bytes);
+        let bundle = scanned_bundle(root_name, &normalized_path, bytes, file_hash);
         snapshot
             .bundles
             .insert((root_name.to_owned(), normalized_path), Arc::new(bundle));

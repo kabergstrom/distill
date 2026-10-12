@@ -156,6 +156,15 @@ impl ScanStep {
             _ => None,
         }
     }
+
+    /// Every bundle a full step's scan read (none for another step).
+    fn full_scan_bundles(&self) -> impl Iterator<Item = &ScannedBundle> {
+        let bundles = match self {
+            ScanStep::Full(step) => Some(step.candidate.scan.bundles.values()),
+            _ => None,
+        };
+        bundles.into_iter().flatten().map(|bundle| &**bundle)
+    }
 }
 
 pub(super) struct IncrementalStep {
@@ -826,6 +835,10 @@ impl DaemonCoordinator {
         outputs: Option<&FileOverlay>,
     ) -> Result<Vec<PassImport>, String> {
         let failure = |error: RpcFailure| format!("{error:?}");
+        // A full scan read and parsed every bundle: what revalidating them
+        // reads of each (`ImportControls`) is taken from there, not read again.
+        self.authoring
+            .remember_import_controls(step.full_scan_bundles());
         // The index is refreshed once, for both kinds: the bundle sources
         // `work` names, parsed once each.
         let refreshed = self
