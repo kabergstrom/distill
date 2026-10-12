@@ -71,6 +71,11 @@ pub(crate) struct DirectoryImportTask {
     settings: AuthoredValue,
     destination_root: String,
     destination_path: String,
+    /// The orphan at the output a default task adopts (§8 "Default
+    /// imports"): a bundle whose authored rule is gone, made by the same
+    /// importer. Its import rewrites it under the default origin, keeping
+    /// its identities.
+    adopts: Option<BundleUuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -285,11 +290,31 @@ impl AuthoringService {
                     && keys.contains_key(&(row.root_name.clone(), row.path.clone()))
             });
             let sources = keys.keys().cloned().collect::<Vec<_>>();
-            let before = store
+            let mut before = store
                 .explicit_import_sources_of(&sources)
                 .map_err(invalid)?
                 .into_iter()
                 .collect::<BTreeSet<_>>();
+            // A removed bundle's rows went with its bundle row in this
+            // input: what it named as explicit sources is read from the
+            // committed index, which is current but for this work.
+            let removed = keys
+                .keys()
+                .filter(|(root, path)| {
+                    !rows
+                        .iter()
+                        .any(|row| row.root_name == *root && row.path == *path)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !removed.is_empty() {
+                let committed = self.opener.open_reader().map_err(invalid)?;
+                before.extend(
+                    committed
+                        .explicit_import_sources_of(&removed)
+                        .map_err(invalid)?,
+                );
+            }
             store
                 .replace_import_index(&sources, &rows)
                 .map_err(invalid)?;
@@ -300,7 +325,9 @@ impl AuthoringService {
                 .collect::<BTreeSet<_>>();
             let explicit = before.symmetric_difference(&after).cloned().collect();
             // A changed rules source may have dropped rules, or the rules
-            // bundle itself may be gone.
+            // bundle itself may be gone. A rules bundle goes only with a
+            // source this work removes: one gone earlier left its outputs
+            // orphaned then, and is not rechecked by every later pass.
             let changed_ids = keys
                 .iter()
                 .map(|((_, path), root)| (*root, path.as_str()))
@@ -309,10 +336,9 @@ impl AuthoringService {
                 .generating_rules_bundles()
                 .map_err(invalid)?
                 .into_iter()
-                .filter(|(_, source)| {
-                    source
-                        .as_ref()
-                        .is_none_or(|(root, path)| changed_ids.contains(&(*root, path.as_str())))
+                .filter(|(_, source)| match source {
+                    Some((root, path)) => changed_ids.contains(&(*root, path.as_str())),
+                    None => !removed.is_empty(),
                 })
                 .map(|(rules, _)| rules)
                 .collect();
@@ -645,6 +671,7 @@ impl AuthoringService {
                 &store,
                 paths
                     .iter()
+                    .chain(&refreshed.explicit)
                     .chain(&default_paths)
                     .map(|(_, path)| path.as_str()),
                 &refreshed.rules,
@@ -681,12 +708,15 @@ impl AuthoringService {
             entries.extend(self.directory_rule_entries(&store, sources, &refreshed.rules)?);
             entries.sort_by_key(|entry| (entry.rules_bundle, entry.rules_asset));
         }
+        // The files explicit imports name as sources: claimed before every
+        // rule layer (§8 "Default imports" precedence).
+        let explicit = store.explicit_import_sources().map_err(invalid)?;
         // The default layer's rules, one entry per (root, rule), after every
         // authored one; and what claims a file before them.
         let authored = entries.len();
         let claims = match defaults {
             Some(defaults) => {
-                let claims = DefaultClaims::new(store, &entries)?;
+                let claims = DefaultClaims::new(explicit.clone(), &entries)?;
                 entries.extend(default_rule_entries(defaults));
                 Some(claims)
             }
@@ -713,14 +743,18 @@ impl AuthoringService {
                 }
             }
             for entry in &entries[..authored] {
-                if capabilities_changed
-                    || changed.contains(&(entry.root_name.clone(), entry.source_path.clone()))
-                {
-                    let groups = entry_groups(&mut groups, entry, &mut backend)?;
+                // The groups of the explicit sources gained or lost are
+                // touched whatever else is: an explicit import claims its
+                // sources from authored rules (§8 "Default imports"), so
+                // those groups may have lost or regained a file.
+                let all = capabilities_changed
+                    || changed.contains(&(entry.root_name.clone(), entry.source_path.clone()));
+                if all {
+                    let groups = entry_groups(&mut groups, &explicit, entry, &mut backend)?;
                     touch_all_directory_groups(entry, groups, &mut touched, &mut touched_origins);
-                    continue;
                 }
-                for (root, path) in &paths {
+                let touched_paths = if all { &[][..] } else { &paths[..] };
+                for (root, path) in touched_paths.iter().chain(&refreshed.explicit) {
                     touch_directory_path(
                         entry,
                         &backend,
@@ -806,7 +840,7 @@ impl AuthoringService {
             }
         } else {
             for entry in &entries[..authored] {
-                let groups = entry_groups(&mut groups, entry, &mut backend)?;
+                let groups = entry_groups(&mut groups, &explicit, entry, &mut backend)?;
                 touch_all_directory_groups(entry, groups, &mut touched, &mut touched_origins);
             }
             if let Some((defaults, claims)) = layer {
@@ -835,7 +869,7 @@ impl AuthoringService {
                     default_group_sources(&groups, defaults, claims, entry, group, &mut backend)?
                 }
                 (Some(_), None) => None,
-                (None, _) => entry_groups(&mut groups, entry, &mut backend)?
+                (None, _) => entry_groups(&mut groups, &explicit, entry, &mut backend)?
                     .get(&(*rule_index, group.clone()))
                     .cloned(),
             };
@@ -863,8 +897,25 @@ impl AuthoringService {
                 // A default import yields to whatever holds its output: a
                 // bundle another origin or no origin owns, or a file that is
                 // not a bundle.
+                // It adopts an orphan of a removed authored rule that its
+                // own importer made.
                 let occupied = match &at_output {
-                    Some(meta) => meta.origin.as_ref() != Some(&origin),
+                    Some(meta) if meta.origin.as_ref() != Some(&origin) => {
+                        if self.default_adopts_orphan(
+                            &*store,
+                            &compiled,
+                            &refreshed.rules,
+                            &task,
+                            meta,
+                        )? {
+                            task.adopts = Some(meta.bundle);
+                            adopted.insert(meta.bundle);
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    Some(_) => false,
                     None => std::fs::symlink_metadata(
                         compiled
                             .scanner()
@@ -966,6 +1017,42 @@ impl AuthoringService {
             )?;
         }
         Ok(tasks)
+    }
+
+    /// Whether the default task `task` adopts `meta`, the bundle at its
+    /// output that another origin owns (§8 "Default imports"): an orphan of
+    /// an authored rule that is gone (its rules bundle, or the rule in it)
+    /// whose `$record` names the task's importer. A default origin's output
+    /// is never adopted (a removed or renamed default rule orphans its
+    /// outputs), nor an orphan another importer made.
+    fn default_adopts_orphan(
+        &self,
+        store: &StoreReader,
+        compiled: &Compiled,
+        fresh: &FreshRules,
+        task: &DirectoryImportTask,
+        meta: &BundleMeta,
+    ) -> Result<bool, RpcFailure> {
+        let Some(prior) = &meta.origin else {
+            return Ok(false);
+        };
+        if compiled.default_layer_root(prior.rules_bundle).is_some() {
+            return Ok(false);
+        }
+        if store.bundle(prior.rules_bundle).map_err(invalid)?.is_some() {
+            let sources = store
+                .directory_rule_sources_of(prior.rules_bundle)
+                .map_err(invalid)?;
+            let rule_kept = self
+                .directory_rule_entries(store, sources, fresh)?
+                .iter()
+                .any(|entry| entry.rules.rules.iter().any(|rule| rule.id.0 == prior.rule.0));
+            if rule_kept {
+                return Ok(false);
+            }
+        }
+        let recorded = self.read_prior_import_published(store, meta)?;
+        Ok(recorded.model.record.importer == task.importer)
     }
 
     /// The bundle-less directory-import failures a pass's work may heal or
@@ -1420,6 +1507,7 @@ impl AuthoringService {
         if prior.as_ref().is_some_and(|prior| {
             prior.model.record.origin.as_ref() != Some(&origin)
                 && !adopts_default_output(&compiled, task, prior.model.record.origin.as_ref())
+                && task.adopts != Some(prior.model.bundle_uuid)
         }) {
             return Err(invalid(format!(
                 "directory import destination {}:{} is owned by another origin",
@@ -1483,8 +1571,11 @@ impl AuthoringService {
         };
         if prior.model.record.origin.as_ref() != Some(&expected_origin) {
             // An authored rule takes over a default output at its own output
-            // path, keeping its identities (§8 "Default imports").
-            if adopts_default_output(&compiled, task, prior.model.record.origin.as_ref()) {
+            // path, and a default rule an orphan its importer made, keeping
+            // its identities (§8 "Default imports").
+            if adopts_default_output(&compiled, task, prior.model.record.origin.as_ref())
+                || task.adopts == Some(meta.bundle)
+            {
                 return Ok(true);
             }
             return Err(invalid(format!(
@@ -1633,26 +1724,31 @@ impl AuthoringService {
             .as_ref()
             .map(|meta| self.read_prior_import(store, meta))
             .transpose()?;
-        // An explicit import over a default import's output takes it over
-        // (§8 "Default imports": explicit imports come first): its
-        // identities stay, its origin goes.
-        if let Some(prior) = &mut prior {
-            if prior
-                .model
-                .record
-                .origin
-                .as_ref()
-                .is_some_and(|origin| compiled.default_layer_root(origin.rules_bundle).is_some())
-            {
-                prior.model.record.origin = None;
-            }
-        }
-
         let capabilities = self.importer_capabilities(&compiled);
         let mut backend =
             RootedImportBackend::open(compiled.scanner(), &self.opener, &capabilities, None)?;
         let sources = root_explicit_sources(&mut backend, &destination.root, &request.sources)?;
         drop(backend);
+        // An explicit import over a directory import's output takes it over
+        // (§8 "Default imports": explicit imports come first): its
+        // identities stay, its origin goes. That is a default import's
+        // output, or an authored rule's output for a file this import reads
+        // (which the import claims from the rule); an authored output of
+        // other files keeps its origin.
+        if let Some(prior) = &mut prior {
+            let taken_over = prior.model.record.origin.as_ref().is_some_and(|origin| {
+                compiled.default_layer_root(origin.rules_bundle).is_some()
+                    || prior
+                        .model
+                        .record
+                        .sources
+                        .iter()
+                        .any(|source| sources.contains(source))
+            });
+            if taken_over {
+                prior.model.record.origin = None;
+            }
+        }
         Ok((
             importer,
             ImportInvocation {
@@ -2734,7 +2830,10 @@ struct DefaultClaims {
 impl DefaultClaims {
     /// Over `entries`, which hold every authored rule that may match the
     /// files the pass asks about.
-    fn new(store: &StoreReader, entries: &[DirectoryRuleEntry]) -> Result<Self, RpcFailure> {
+    fn new(
+        explicit: BTreeSet<(String, String)>,
+        entries: &[DirectoryRuleEntry],
+    ) -> Result<Self, RpcFailure> {
         let mut authored = Vec::with_capacity(entries.len());
         for entry in entries {
             let listing = PathMatcher::new(&entry.rules.listing).map_err(invalid)?;
@@ -2747,7 +2846,7 @@ impl DefaultClaims {
             authored.push((listing, rules));
         }
         Ok(Self {
-            explicit: store.explicit_import_sources().map_err(invalid)?,
+            explicit,
             authored,
         })
     }
@@ -2927,9 +3026,12 @@ fn touch_default_path(
     Ok(())
 }
 
-/// The groups of `entry`'s listing, enumerated once per call.
+/// The groups of `entry`'s listing, enumerated once per call, without the
+/// files an explicit import names as sources (`explicit`, by root and path):
+/// those belong to it before any rule (§8 "Default imports" precedence).
 fn entry_groups<'a>(
     cache: &'a mut BTreeMap<(BundleUuid, AssetUuid), DirectoryGroups>,
+    explicit: &BTreeSet<(String, String)>,
     entry: &DirectoryRuleEntry,
     backend: &mut RootedImportBackend<'_>,
 ) -> Result<&'a DirectoryGroups, RpcFailure> {
@@ -2939,6 +3041,11 @@ fn entry_groups<'a>(
             let mut listed = backend
                 .enumerate(&entry.rules.listing)
                 .map_err(|error| invalid(format!("directory listing failed: {error:?}")))?;
+            if !explicit.is_empty() {
+                listed.retain(|source| {
+                    !explicit.contains(&(source.root.0.clone(), source.path.clone()))
+                });
+            }
             listed.sort_unstable();
             listed.dedup();
             let listed = listed.into_iter().collect::<BTreeSet<_>>();
@@ -2981,6 +3088,7 @@ fn indexed_directory_task(
         settings: rule.settings.clone(),
         destination_root: group.root.0.clone(),
         destination_path,
+        adopts: None,
     })
 }
 

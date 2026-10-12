@@ -2709,7 +2709,8 @@ never transactional across files. When the listing loses a group, the
 generated bundle is **orphaned, never auto-deleted** — authored files are
 sacred (§2): it enters the same error state as a watched import whose
 source vanished, is listed by `doctor`, and is deleted only by explicit
-user action. Output paths are deterministic (`<stem>.bundle`,
+user action (an orphan whose rule is gone may instead be adopted in place by
+the default layer, §8 "Default imports"). Output paths are deterministic (`<stem>.bundle`,
 `<name>.glsl.bundle`, beside their sources); a naming collision is a rules
 error, never a tiebreak. Every generated bundle also persists its
 **directory origin** in the daemon-owned `$record` entry
@@ -2764,11 +2765,15 @@ pub enum Grouping { PerFile, ByStem }   // ByStem: group key is
 > **Implemented** (decisions of 2026-10-08: the mapping is registered by the
 > pipeline module and part of its epoch; defaults are on for every root,
 > with per-root excludes; the folder opt-out is a `none` rule; an authored
-> rule adopts a default output at its own output path). Code:
+> rule adopts a default output at its own output path; decisions of
+> 2026-10-12: explicit imports claim their sources against every rule layer,
+> and the default layer adopts an orphan its own importer made). Code:
 > `distill-daemon/src/default_imports.rs` (the layer of one compiled state),
 > `importer.rs` `directory_import_tasks` (precedence, step-aside, adoption,
-> orphans), `distill-pipeline-api/src/import.rs` (`DefaultImportRule`,
-> `NO_IMPORTER`), `distill-store/src/imports.rs` (`import_keys` kind 4).
+> orphans), `entry_groups` (explicit claims against authored rules),
+> `default_adopts_orphan`, `import_invocation` (explicit takeover),
+> `distill-pipeline-api/src/import.rs` (`DefaultImportRule`, `NO_IMPORTER`),
+> `distill-store/src/imports.rs` (`import_keys` kind 4).
 
 A file under an asset root imports with no rules bundle written for it: the
 pipeline module declares **default import rules** that pick an importer by
@@ -2880,14 +2885,16 @@ Options considered for where the mapping lives:
 For one file, first that applies:
 
 1. **Explicit import.** A file that is a source of any bundle whose `$record`
-   has no origin (an explicit `ImportRequest`) is never default-selected,
-   wherever that bundle lives. The import index holds a source row per
+   has no origin (an explicit `ImportRequest`) belongs to that import,
+   wherever the bundle lives: no authored rule (a `none` rule included) and
+   no default rule selects it. The import index holds a source row per
    imported bundle (`import_keys` kind 4, key `{root len}:{root}{path}`),
-   derived at publication like the other kinds; a pass touches the default
-   groups of sources gained or lost, so a default output whose file is now
-   explicitly imported orphans in the pass that publishes the import.
-   Explicit imports claim against the default layer only: authored rules
-   keep matching a file an explicit import also reads, as before defaults.
+   derived at publication like the other kinds; a pass touches the authored
+   and default groups of sources gained or lost, so a directory output whose
+   file is now explicitly imported orphans in the pass that publishes the
+   import, and a file whose explicit import is removed returns to the rule
+   layers in the pass that sees the removal (the removed bundle's sources
+   are read from the committed index, since its rows go with its row).
 2. **Authored rules.** A file matched by any rule of any rules bundle (first
    match within that bundle, §8) belongs to that rule; a `none` rule claims
    without importing. A rules bundle that *lists* a file but has no matching
@@ -2909,6 +2916,31 @@ For one file, first that applies:
 - An explicit import whose destination is a default output takes it over
   the same way: the prior's origin is dropped, the bundle becomes explicit
   and keeps its UUIDs.
+- An authored rule's output for a file an explicit import now reads orphans
+  (§8). When the explicit import's destination is that output, it takes it
+  over as it takes over a default output (origin dropped, UUIDs kept; not
+  orphaned): `import_invocation` drops an authored prior origin when the
+  prior's `$record` sources include one of the import's sources. An
+  explicit import over an authored output of other files keeps the prior's
+  origin, as before.
+- The default layer **adopts an orphan** at a default output path: a bundle
+  whose origin names an authored rules bundle that is gone, or a rule id
+  that bundle no longer holds, and whose `$record` importer equals the
+  default rule's. Its import runs as a reimport of that bundle under the
+  default origin (rewritten by the fold), at the default rule's completed
+  settings, keeping bundle and entry UUIDs through the prior; it is not
+  orphaned (`default_adopts_orphan`, `DirectoryImportTask::adopts`). An
+  orphan another importer made, an orphan whose rule still exists (listing
+  loss) and a default-origin orphan (a removed or renamed default rule) stay
+  orphaned, and the default steps aside.
+- Deleting a redundant rules bundle (rules whose importer, completed
+  settings and output equal the defaults') therefore hands its outputs to
+  the default layer in the pass that sees the deletion: same paths, same
+  bundle and entry UUIDs, only the `$record` origin changes. A rules bundle
+  gone in an earlier pass is not rechecked by every later pass: its
+  orphans were recorded when it went (`refresh_dirty_import_index`
+  includes rules bundles with no source only when the work removes a
+  bundle source).
 
 #### Origin and reconstruction (§2)
 
@@ -3022,18 +3054,10 @@ Each rule has a fixed id (`ENGINE_DEFAULT_IMPORTS` in `newgameplus-pipeline/src/
 
 #### Open questions
 
-- An explicit import does not claim a file from authored rules (precedence
-  1 applies against the default layer only, as authored rules and explicit
-  imports coexisted before defaults). Whether it should.
 - The reserved default-rules UUIDs are not checked against bundle files: a
   committed bundle whose own UUID equals one would be attributed to the
   default layer's origin space. A source-claim check (§13 namespace
   collision) is not implemented.
-- Deleting a redundant rules bundle (one whose rules match what the
-  defaults would do) orphans its outputs, which then hold the default
-  outputs' paths: defaults step aside until the orphans are deleted, and
-  the regenerated bundles get new UUIDs. Whether the default layer should
-  adopt an orphan of a removed rules bundle at its output path.
 - Whole-layer revalidation (configuration or capability change, a rules
   source changed, on any rules bundle) checks the task of every default
   group (`directory_task_needs_run`), as revalidating every authored rule
@@ -3042,6 +3066,18 @@ Each rule has a fixed id (`ENGINE_DEFAULT_IMPORTS` in `newgameplus-pipeline/src/
 Resolved (2026-10-08): defaults are on for every root with per-root
 excludes; the opt-out is the reserved importer id `none` (no schema change);
 an authored rule adopts a default output at its own output path.
+
+Resolved (2026-10-12):
+
+- An explicit import claims its sources against every rule layer
+  (precedence explicit > authored > default everywhere); an authored output
+  for a claimed file orphans, unless the explicit import writes to it, which
+  takes it over like a default output (Precedence, above).
+- The default layer adopts an orphan at its output path whose authored
+  rules bundle or rule is gone, when the default rule's importer made it,
+  keeping its UUIDs; deleting a redundant rules bundle no longer costs new
+  UUIDs (Precedence, above).
+
 ### Build import (pure)
 
 For every bundle in the tree, the daemon validates each entry against its
@@ -5290,7 +5326,7 @@ that published it, never copied into a table.
 | `files` | **(root id, normalized root-relative path)** → mtime, size, kind, content hash — last-known tree state — and, for a traversed directory, its canonical path, unique across roots (`files_by_canonical`; a root's own directory is its configuration's): two observed directories with one canonical path are an inconsistent table, not an alias to choose between. Physical tracking is per root: multiple roots form one *logical* namespace (§18), and a single-path key could hold only one of two same-path observations, silently choosing a root. The logical path index derives as a multimap with three states — `Missing`, `Unique(root)`, `Ambiguous(roots)` — and ambiguity is representable, not pre-collapsed |
 | `source_claims` | what each scanned source claims, keyed by the claimant: bundle and asset uuids, primary paths, malformed skeletons, and its derived outputs (kind 2: child uuid → parent uuid, output key and the child's terminal type, from the source's assets × the pinned pipeline map, §9). A derived child is its one claim while neither it nor its parent is withheld by a collision — read by point lookups, the only authority for child resolution. A subject with more than one distinct claimant collides: an asset resolves by point reads of its `assets` row, its bundle's poison, else its and its bundle's claimants here (`source_claims_by_subject` covers the claimant); the full collision listing (diagnostics, full publication, a reconfiguration's colliding sources) walks that index's bundle and asset claims. A malformed skeleton (kind 5) is its namespace error. A deleted asset is a missing one, and subscribers learn of the deletion from `change_log` |
 | `file_work` | the watcher work no pass has consumed, in one order: changed paths (root id, path, exists/deleted, observation) and renames. A transaction queues its work in memory and writes, at its commit, only what no pass consumed in it; a pass acknowledges exactly the rows it captured, by sequence range |
-| `import_keys` | the import index, one row per (bundle, asset, kind, key) indexed by (kind, key): what each watched import's basis reads (a path, a listing, an importer capability) under its `$record` entry, and each directory-import rules asset by the directory of its listing's literal prefix, so a changed path finds the rules that may list it by its ancestor directories, and (kind 4) each explicit import's sources, keyed `{root len}:{root}{path}`, which the default import layer (§8 "Default imports") never selects. A row's source is its bundle's row, and its rows go with that row (a foreign key); the basis itself is read when needed, from the failure memo or the `$record`. Derived from the committed bundles and kept by source: every bundle publication queues its paths in `file_work`, and an import pass reindexes the dirty bundle sources, parsing each once, before it acknowledges that work, so the index is current but for pending work. It is never rebuilt whole; a store starts with no bundles and an empty index |
+| `import_keys` | the import index, one row per (bundle, asset, kind, key) indexed by (kind, key): what each watched import's basis reads (a path, a listing, an importer capability) under its `$record` entry, and each directory-import rules asset by the directory of its listing's literal prefix, so a changed path finds the rules that may list it by its ancestor directories, and (kind 4) each explicit import's sources, keyed `{root len}:{root}{path}`, which no authored or default import rule selects (§8 "Default imports" precedence). A row's source is its bundle's row, and its rows go with that row (a foreign key); the basis itself is read when needed, from the failure memo or the `$record`. Derived from the committed bundles and kept by source: every bundle publication queues its paths in `file_work`, and an import pass reindexes the dirty bundle sources, parsing each once, before it acknowledges that work, so the index is current but for pending work. It is never rebuilt whole; a store starts with no bundles and an empty index |
 | `bundles` | bundle uuid → **(root id, normalized path)**, format version, content hash, primary asset (the runtime entry its path resolves to; a path's candidates are the primaries of its bundles in every root, a search of `bundles_by_path`) — the physical key, matching `files`: UUID-based access must reach the owning file without a logical-index round trip that could turn ambiguous under a same-path file in a second root; path-query ambiguity is derived separately. Directory-import ownership derives at scan from generated bundles' `DirectoryOrigin` records (§8), whose `rule` is the authored stable `ImportRuleId`, never a vector index; deleting that id re-derives the orphan state, never reassigns ownership |
 | `bundle_path_refs` | bundle uuid → each logical path its entries' asset/weak reference fields name, written with the bundle's rows at publication. Rename-with-fixups (§4) reads only the bundles that reference the moving path, plus the poisoned ones, whose references are unknown |
 | `assets` | object | `local_id → asset entry` |

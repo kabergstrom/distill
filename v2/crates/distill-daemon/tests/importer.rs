@@ -2431,6 +2431,18 @@ fn a_bundle_less_failure_survives_a_restart_and_is_rederived_from_fresh_state() 
 /// whose listing and one rule (id `[rule; 16]`) match `glob`, importing
 /// with `importer` at its default settings to `output`.
 fn rules_bundle_matching(uuid: u8, rule: u8, glob: &str, importer: &str, output: &str) -> Vec<u8> {
+    rules_bundle_matching_with(uuid, rule, glob, importer, output, &default_settings())
+}
+
+/// [`rules_bundle_matching`] with the rule settings `rule_settings`.
+fn rules_bundle_matching_with(
+    uuid: u8,
+    rule: u8,
+    glob: &str,
+    importer: &str,
+    output: &str,
+    rule_settings: &AuthoredValue,
+) -> Vec<u8> {
     let row = BootstrapControlSpecV1::embedded()
         .unwrap()
         .0
@@ -2450,7 +2462,7 @@ fn rules_bundle_matching(uuid: u8, rule: u8, glob: &str, importer: &str, output:
         ("importer", AuthoredValue::Str(importer.into())),
         ("matches", query()),
         ("output", AuthoredValue::Str(output.into())),
-        ("settings", wrapped(&default_settings())),
+        ("settings", wrapped(rule_settings)),
     ])];
     let data = object([("listing", query()), ("rules", AuthoredValue::Array(rules))]);
     distill_bundle::write_bundle(&Bundle {
@@ -2642,6 +2654,19 @@ fn explicit_imports_and_authored_rules_claim_files_before_the_default_layer() {
     assert!(outcome.imported.is_empty(), "{:?}", outcome.imported);
     assert!(orphaned(&coordinator, &assets.join("late.num.bundle")));
     assert!(!orphaned(&coordinator, &assets.join("free.num.bundle")));
+
+    // The explicit import removed: the default layer selects the file
+    // again, in the pass that sees the removal, and reimports its orphan.
+    std::fs::remove_file(assets.join("late.custom.bundle")).unwrap();
+    let outcome = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["late.custom.bundle"]), false)
+        .unwrap();
+    assert_eq!(outcome.imported.len(), 1, "{outcome:?}");
+    assert!(!orphaned(&coordinator, &assets.join("late.num.bundle")));
+    assert_eq!(
+        origin_of(&coordinator, &assets.join("late.num.bundle")),
+        default_origin()
+    );
 }
 
 /// A default import steps aside for a bundle already at its output that it
@@ -2807,6 +2832,286 @@ fn an_authored_rule_adopts_a_default_output_keeping_its_identities() {
         .is_empty());
     assert!(!orphaned(&coordinator, &path));
     assert_eq!(identities(&path), before);
+}
+
+/// Settle the file work a daemon's own writes queued, so the next batch
+/// holds only what the test changes.
+fn settle_file_work(coordinator: &DaemonCoordinator, writer: &mut distill_store::StoreWriter) {
+    let work = coordinator.pending_file_work(writer).unwrap();
+    coordinator
+        .reconcile_directory_imports_affected(writer, &work, false)
+        .unwrap();
+    coordinator.acknowledge_file_work(writer, &work).unwrap();
+}
+
+/// The `$settings` data of the bundle at `path`.
+fn settings_of(path: &std::path::Path) -> AuthoredValue {
+    distill_bundle::parse_bundle(&std::fs::read(path).unwrap())
+        .unwrap()
+        .assets["$settings"]
+        .data
+        .clone()
+}
+
+/// Precedence (§8): an explicit import claims its sources from authored
+/// rules too. The rule's output for a file an explicit import now reads
+/// orphans (kept); the rule's output an explicit import writes to is taken
+/// over (origin dropped, identities kept) and is not orphaned. Removing the
+/// explicit import hands its file back to the rule, which reimports its
+/// orphan.
+#[test]
+fn explicit_imports_claim_files_from_authored_rules() {
+    let temp = tempfile::tempdir().unwrap();
+    let (assets, coordinator) = default_import_project(
+        temp.path(),
+        &[
+            ("a.num", b"1"),
+            ("b.num", b"2"),
+            (
+                "rules.bundle",
+                &rules_bundle_matching(98, 97, "*.num", BYTE_IMPORTER, "{stem}.ruled.bundle"),
+            ),
+        ],
+        &[],
+    );
+    let mut writer = coordinator.open_writer().unwrap();
+    assert_eq!(
+        coordinator
+            .reconcile_directory_imports(&mut writer)
+            .unwrap()
+            .len(),
+        2
+    );
+    let ruled = Some((BundleUuid([98; 16]), [97; 16]));
+    let a_ruled = assets.join("a.ruled.bundle");
+    let b_ruled = assets.join("b.ruled.bundle");
+    assert_eq!(origin_of(&coordinator, &a_ruled), ruled);
+    assert_eq!(origin_of(&coordinator, &b_ruled), ruled);
+    let b_before = identities(&b_ruled);
+    settle_file_work(&coordinator, &mut writer);
+
+    // An explicit import of a.num elsewhere: the rule's output orphans.
+    import(&coordinator, BYTE_IMPORTER, &["a.num"], "a.custom.bundle");
+    let outcome = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["a.custom.bundle"]), false)
+        .unwrap();
+    assert!(outcome.imported.is_empty(), "{:?}", outcome.imported);
+    assert!(orphaned(&coordinator, &a_ruled));
+    assert_eq!(origin_of(&coordinator, &a_ruled), ruled);
+    assert!(!orphaned(&coordinator, &b_ruled));
+
+    // An explicit import of b.num into the rule's output takes it over.
+    import_with(
+        &coordinator,
+        BYTE_IMPORTER,
+        &["b.num"],
+        "b.ruled.bundle",
+        &settings([0, 0], 3),
+    );
+    let outcome = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["b.ruled.bundle"]), false)
+        .unwrap();
+    assert!(outcome.imported.is_empty(), "{:?}", outcome.imported);
+    assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+    assert_eq!(origin_of(&coordinator, &b_ruled), None);
+    assert_eq!(identities(&b_ruled), b_before);
+    assert_eq!(settings_of(&b_ruled), settings([0, 0], 3));
+    assert!(!orphaned(&coordinator, &b_ruled));
+
+    // A full revalidation agrees.
+    assert!(coordinator
+        .reconcile_directory_imports(&mut writer)
+        .unwrap()
+        .is_empty());
+    assert!(orphaned(&coordinator, &a_ruled));
+    assert_eq!(origin_of(&coordinator, &b_ruled), None);
+    assert!(!orphaned(&coordinator, &b_ruled));
+    settle_file_work(&coordinator, &mut writer);
+
+    // The explicit import of a.num removed: the rule claims a.num again.
+    std::fs::remove_file(assets.join("a.custom.bundle")).unwrap();
+    let outcome = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["a.custom.bundle"]), false)
+        .unwrap();
+    assert_eq!(outcome.imported.len(), 1, "{outcome:?}");
+    assert!(!orphaned(&coordinator, &a_ruled));
+    assert_eq!(origin_of(&coordinator, &a_ruled), ruled);
+}
+
+/// The default layer adopts an orphan at its output whose authored rule is
+/// gone, when the default rule's importer made it (§8): it is reimported
+/// under the default origin at the default settings, keeping its bundle and
+/// entry UUIDs, and is no longer orphaned. An orphan another importer made
+/// stays orphaned and unchanged; the default steps aside.
+#[test]
+fn the_default_layer_adopts_orphans_its_importer_made() {
+    let temp = tempfile::tempdir().unwrap();
+    let (assets, coordinator) = default_import_project(
+        temp.path(),
+        &[
+            ("same.num", b"5"),
+            ("other.num", b"7"),
+            (
+                "same.rules.bundle",
+                &rules_bundle_matching_with(
+                    98,
+                    97,
+                    "same.num",
+                    BYTE_IMPORTER,
+                    "{name}.bundle",
+                    &settings([0, 0], 3),
+                ),
+            ),
+            (
+                "other.rules.bundle",
+                &rules_bundle_matching(90, 92, "other.num", CHAIN_IMPORTER, "{name}.bundle"),
+            ),
+        ],
+        &[],
+    );
+    let mut writer = coordinator.open_writer().unwrap();
+    assert_eq!(
+        coordinator
+            .reconcile_directory_imports(&mut writer)
+            .unwrap()
+            .len(),
+        2
+    );
+    let same = assets.join("same.num.bundle");
+    let other = assets.join("other.num.bundle");
+    assert_eq!(
+        origin_of(&coordinator, &same),
+        Some((BundleUuid([98; 16]), [97; 16]))
+    );
+    assert_eq!(settings_of(&same), settings([0, 0], 3));
+    let same_before = identities(&same);
+    let other_bytes = std::fs::read(&other).unwrap();
+    settle_file_work(&coordinator, &mut writer);
+
+    std::fs::remove_file(assets.join("same.rules.bundle")).unwrap();
+    std::fs::remove_file(assets.join("other.rules.bundle")).unwrap();
+    let outcome = coordinator
+        .reconcile_batch(
+            &mut writer,
+            &batch(&assets, &["same.rules.bundle", "other.rules.bundle"]),
+            false,
+        )
+        .unwrap();
+    assert_eq!(outcome.imported.len(), 1, "{outcome:?}");
+    assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+    assert_eq!(identities(&same), same_before);
+    assert_eq!(origin_of(&coordinator, &same), default_origin());
+    assert_eq!(settings_of(&same), default_settings());
+    assert_eq!(imported_value(&same), Some(5));
+    assert!(!orphaned(&coordinator, &same));
+    assert!(orphaned(&coordinator, &other));
+    assert_eq!(std::fs::read(&other).unwrap(), other_bytes);
+
+    // A full revalidation has nothing to do.
+    assert!(coordinator
+        .reconcile_directory_imports(&mut writer)
+        .unwrap()
+        .is_empty());
+    assert!(!orphaned(&coordinator, &same));
+    assert!(orphaned(&coordinator, &other));
+    assert_eq!(identities(&same), same_before);
+}
+
+/// A rules bundle that stays but drops the rule an output came from hands
+/// that output to the default layer the same way.
+#[test]
+fn the_default_layer_adopts_the_orphan_of_a_dropped_rule() {
+    let temp = tempfile::tempdir().unwrap();
+    let (assets, coordinator) = default_import_project(
+        temp.path(),
+        &[
+            ("same.num", b"5"),
+            (
+                "same.rules.bundle",
+                &rules_bundle_matching_with(
+                    98,
+                    97,
+                    "same.num",
+                    BYTE_IMPORTER,
+                    "{name}.bundle",
+                    &settings([0, 0], 3),
+                ),
+            ),
+        ],
+        &[],
+    );
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator
+        .reconcile_directory_imports(&mut writer)
+        .unwrap();
+    let same = assets.join("same.num.bundle");
+    let before = identities(&same);
+    settle_file_work(&coordinator, &mut writer);
+
+    // The rules bundle now holds only a rule (another id) matching nothing.
+    std::fs::write(
+        assets.join("same.rules.bundle"),
+        rules_bundle_matching(98, 93, "elsewhere.num", BYTE_IMPORTER, "{name}.bundle"),
+    )
+    .unwrap();
+    let outcome = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["same.rules.bundle"]), false)
+        .unwrap();
+    assert_eq!(outcome.imported.len(), 1, "{outcome:?}");
+    assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+    assert_eq!(identities(&same), before);
+    assert_eq!(origin_of(&coordinator, &same), default_origin());
+    assert_eq!(settings_of(&same), default_settings());
+    assert!(!orphaned(&coordinator, &same));
+}
+
+/// A daemon on fresh state finds an orphan of a rules bundle removed while
+/// it was down and adopts it into the default layer the same way.
+#[test]
+fn the_default_layer_adopts_an_orphan_found_on_fresh_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let (assets, coordinator) = default_import_project(
+        temp.path(),
+        &[
+            ("same.num", b"5"),
+            (
+                "same.rules.bundle",
+                &rules_bundle_matching_with(
+                    98,
+                    97,
+                    "same.num",
+                    BYTE_IMPORTER,
+                    "{name}.bundle",
+                    &settings([0, 0], 3),
+                ),
+            ),
+        ],
+        &[],
+    );
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator
+        .reconcile_directory_imports(&mut writer)
+        .unwrap();
+    let same = assets.join("same.num.bundle");
+    let before = identities(&same);
+    drop(writer);
+    drop(coordinator);
+
+    std::fs::remove_file(assets.join("same.rules.bundle")).unwrap();
+    std::fs::remove_dir_all(temp.path().join(".distill")).unwrap();
+    let coordinator = open_configured(temp.path(), &assets);
+    let mut writer = coordinator.open_writer().unwrap();
+    assert_eq!(
+        coordinator
+            .reconcile_directory_imports(&mut writer)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(identities(&same), before);
+    assert_eq!(origin_of(&coordinator, &same), default_origin());
+    assert_eq!(settings_of(&same), default_settings());
+    assert!(!orphaned(&coordinator, &same));
 }
 
 /// A default import whose first attempt fails is listed with no bundle,
