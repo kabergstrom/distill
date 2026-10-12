@@ -167,7 +167,9 @@ impl DaemonCoordinator {
         // in its own transaction. A restart keeps them. The store takes the
         // state lock, so the module host empties its staging directory
         // under it.
-        let mut opened_store = Store::open(store_config.clone())?;
+        // State written under another store schema version is recreated
+        // (§13): the scan rebuilds it from the committed bundles.
+        let mut opened_store = Store::open_or_recreate(store_config.clone())?;
         let host = ModuleHost::new(&module_state_path).map_err(CoordinatorInitError::ModuleIo)?;
         let scanner = RootedScanner::new(roots.clone())?;
         scanner.retain_daemon_owned_directory(DaemonOwnedDirectoryKind::State, &state_path)?;

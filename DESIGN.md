@@ -5248,6 +5248,32 @@ Hashes in the header:
 
 All daemon state is disposable (§2) and lives under `.distill/` (gitignored).
 
+**Store schema version, no migrations.** The metadata layer records its
+schema version as SQLite's `user_version` (`distill_store::SCHEMA_VERSION`,
+`distill-store/src/db.rs`). State is never migrated in place:
+
+- The daemon's writer opening state written under another version recreates
+  it (`Store::open_or_recreate`, called by `DaemonCoordinator::open`): it
+  logs the state path and the found and supported versions at warn, removes
+  everything under the state directory but its lock while holding that lock
+  (`Store::recreate`, which re-mints the instance id), and starts on empty
+  state; the startup scan rebuilds it from the committed bundles (decision
+  of 2026-10-12).
+- Only `SchemaVersionMismatch` recreates; any other open error stays an
+  error. A `StoreReader` opened on mismatched state still fails
+  (`SchemaVersionMismatch`): readers open after the writer, which has
+  recreated it by then.
+- Migrations of daemon state are deferred until Distill is declared stable;
+  until then a schema bump costs one rebuild per checkout.
+- Measured 2026-10-12 on deferred-ngp's `tools/distill/distill.toml` roots
+  (5 roots, about 5,600 files, 102 MB of test assets, 72 rules-generated
+  bundles already on disk; port and state path moved, `[[rebuild]]` jobs
+  dropped), 3 runs each, daemon profile: start to idle (last log write
+  after startup) 16.6 s on warm state (startup pass 9.3 s), 19.0 s when the
+  writer recreates it (startup pass 11.1 s). A recreate reruns no import
+  whose bundle is in sync; artifacts cooked into the CAS before it are
+  rebuilt lazily when requested again (not measured).
+
 ### SQLite (metadata layer)
 
 The store holds 22 tables. Each holds one fact no other row or source can

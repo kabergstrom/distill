@@ -179,6 +179,46 @@ fn schema_version_mismatch_is_a_typed_error() {
     }
 }
 
+/// The writer recreates state written under an older schema version (no
+/// migrations until Distill is declared stable, §13); a reader opened on
+/// such state still fails, and other errors stay errors.
+#[test]
+fn open_or_recreate_recreates_only_a_schema_version_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = cfg(&dir);
+    let mut store = Store::open(config.clone()).unwrap();
+    store.input_transaction(|_txn| Ok(())).unwrap();
+    let old_id = store.instance_id();
+    drop(store);
+    let conn = rusqlite::Connection::open(config.state_path.join("meta.sqlite")).unwrap();
+    conn.pragma_update(None, "user_version", distill_store::SCHEMA_VERSION - 1)
+        .unwrap();
+    drop(conn);
+    std::fs::write(config.state_path.join("cas").join("stray"), b"old").unwrap();
+    assert!(matches!(
+        StoreReader::open(config.clone()),
+        Err(StoreError::SchemaVersionMismatch { .. })
+    ));
+
+    let store = Store::open_or_recreate(config.clone()).unwrap();
+    assert_ne!(store.instance_id(), old_id);
+    assert_eq!(store.input_version().unwrap().0, 0);
+    assert!(!config.state_path.join("cas").join("stray").exists());
+    let conn = rusqlite::Connection::open(config.state_path.join("meta.sqlite")).unwrap();
+    let version: u32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, distill_store::SCHEMA_VERSION);
+    drop(conn);
+    // The lock it holds is the one a second opener meets.
+    assert!(matches!(
+        Store::open_or_recreate(config.clone()),
+        Err(StoreError::StateLocked { .. })
+    ));
+    drop(store);
+    assert!(Store::open_or_recreate(config).is_ok());
+}
+
 #[test]
 fn sqlite_runs_in_wal_mode() {
     // §13 concurrency model: one writer, many snapshot readers — WAL mode.

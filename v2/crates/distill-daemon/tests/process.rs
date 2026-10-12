@@ -273,6 +273,47 @@ fn a_write_whose_rows_were_never_committed_is_adopted_on_restart() {
     );
 }
 
+/// Daemon state written under an older store schema version is recreated
+/// at startup (§13: no migrations until Distill is declared stable), and the
+/// scan rebuilds it from the tree.
+#[test]
+fn state_from_an_older_store_schema_is_recreated_and_the_daemon_starts() {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    let config = config(&temp);
+    std::fs::write(assets.join("kept.txt"), b"tree").unwrap();
+    let indexed = |process: &DaemonProcess| {
+        process
+            .coordinator()
+            .open_reader()
+            .unwrap()
+            .observed_files()
+            .unwrap()
+            .iter()
+            .any(|row| row.path == "kept.txt")
+    };
+    let process = DaemonProcess::start(config.clone()).unwrap();
+    assert!(indexed(&process));
+    let old_instance = process.coordinator().open_reader().unwrap().instance_id();
+    drop(process);
+
+    let db = temp.path().join("state").join("meta.sqlite");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.pragma_update(None, "user_version", distill_store::SCHEMA_VERSION - 1)
+        .unwrap();
+    drop(conn);
+
+    let process = DaemonProcess::start(config).unwrap();
+    let reader = process.coordinator().open_reader().unwrap();
+    assert_ne!(reader.instance_id(), old_instance, "a recreated store");
+    assert!(indexed(&process));
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let version: u32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, distill_store::SCHEMA_VERSION);
+}
+
 #[cfg(unix)]
 #[test]
 fn disabled_existing_codegen_output_is_still_excluded() {

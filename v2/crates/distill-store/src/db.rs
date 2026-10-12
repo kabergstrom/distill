@@ -18,7 +18,9 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// The metadata schema version this crate reads and writes, recorded as
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
-/// and the remedy is [`Store::recreate`].
+/// and the remedy is [`Store::recreate`], which the daemon's writer runs on
+/// its own ([`Store::open_or_recreate`]); readers still fail. Migrations are
+/// deferred until Distill is declared stable (DESIGN.md §13).
 pub const SCHEMA_VERSION: u32 = 63;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
@@ -631,12 +633,20 @@ impl Store {
     pub fn open_with_recovery(
         config: StoreConfig,
     ) -> Result<(Store, crate::cas::RecoveryReport), StoreError> {
+        create_dir(&config.state_path)?;
+        let state_lock = lock_state_dir(&config.state_path)?;
+        Self::open_locked(config, state_lock)
+    }
+
+    /// [`Store::open_with_recovery`] under the state lock the caller took.
+    fn open_locked(
+        config: StoreConfig,
+        state_lock: Arc<std::fs::File>,
+    ) -> Result<(Store, crate::cas::RecoveryReport), StoreError> {
         let state_path = &config.state_path;
         let cas_dir = state_path.join("cas");
-        create_dir(state_path)?;
         create_dir(&state_path.join("cas"))?;
         create_dir(&state_path.join("tools"))?;
-        let state_lock = lock_state_dir(state_path)?;
         crate::pipeline::open_tool_staging(state_path)?;
 
         let db_path = state_path.join("meta.sqlite");
@@ -732,15 +742,57 @@ impl Store {
 
     /// Wipe the daemon state and start over: state is disposable (§2).
     /// Re-mints the instance id, so stale version comparisons can never
-    /// alias (§13).
+    /// alias (§13). Everything under the state directory but its lock is
+    /// removed while this process holds that lock, so a daemon starting
+    /// beside it can neither wipe nor open the state half-way.
     pub fn recreate(config: StoreConfig) -> Result<Store, StoreError> {
-        if config.state_path.exists() {
-            std::fs::remove_dir_all(&config.state_path).map_err(|source| StoreError::Io {
-                path: config.state_path.clone(),
-                source,
-            })?;
+        create_dir(&config.state_path)?;
+        let state_lock = lock_state_dir(&config.state_path)?;
+        let io = |path: &Path, source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        };
+        let entries = std::fs::read_dir(&config.state_path)
+            .map_err(|source| io(&config.state_path, source))?;
+        for entry in entries {
+            let entry = entry.map_err(|source| io(&config.state_path, source))?;
+            if entry.file_name() == "lock" {
+                continue;
+            }
+            let path = entry.path();
+            let is_dir = entry
+                .file_type()
+                .map_err(|source| io(&path, source))?
+                .is_dir();
+            let removed = if is_dir {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            removed.map_err(|source| io(&path, source))?;
         }
-        Store::open(config)
+        Self::open_locked(config, state_lock).map(|(store, _)| store)
+    }
+
+    /// [`Store::open`], recreating the state ([`Store::recreate`]) when it
+    /// was written under another [`SCHEMA_VERSION`]: daemon state is
+    /// disposable (§2) and there are no migrations until Distill is
+    /// declared stable, so the rescan rebuilds it from the committed
+    /// bundles. Any other error stays an error. Only the writer recreates;
+    /// a [`StoreReader`] opened on a mismatched state still fails.
+    pub fn open_or_recreate(config: StoreConfig) -> Result<Store, StoreError> {
+        match Store::open(config.clone()) {
+            Err(StoreError::SchemaVersionMismatch { found, supported }) => {
+                tracing::warn!(
+                    path = %config.state_path.display(),
+                    found,
+                    supported,
+                    "daemon state was written under another store schema version; recreating it"
+                );
+                Store::recreate(config)
+            }
+            opened => opened,
+        }
     }
 
     /// Apply one watcher batch or authoring operation as an atomic
