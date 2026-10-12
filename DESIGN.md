@@ -757,7 +757,7 @@ pub struct AssetRuntimeDescriptor {
 
 /// The owned, type-erased form asset values take across the module
 /// boundary — game-side storage (§15) holds exactly this, never a
-/// `Box<dyn Any>`. Construction (`finalize`, placeholder thunks §15)
+/// `Box<dyn Any>`. Construction (`finalize`, §15)
 /// and destruction both go through generated no-unwind STATUS thunks —
 /// §12's ctor/drop-table vocabulary extended with a status return,
 /// because the ownership boundary must OBSERVE a drop failure.
@@ -6727,65 +6727,58 @@ mixes versions across a dependency edge.
 
 ### Deletion
 
-A deleted asset's handle keeps its last data and enters a `Dead` state —
-nothing is yanked mid-frame; the game observes the event and decides.
+A deleted asset has **no value**. The sweep that observes a deletion
+adopts it as no value: in the commit that swaps its component, each handle
+on the deleted asset turns `Dead` and its storage adoption is freed
+through `AssetStorage::free`. From that commit on, every accessor answers
+none and the status reads `Dead`; before it, the handle keeps its value and
+status (no early flip). Nothing is yanked mid-frame — the free happens at
+the swap boundary like any adoption — and the game observes `Dead` and
+decides: drop the use, or draw its own fallback. A visible stand-in (the
+magenta texture, the unit cube) is the consumer's own default for an
+absent value, never a loader-minted asset: it holds no references, so no
+strong dependency can enter a cut through it.
 **Deletion is client-relative**: *deleted* means previously resolved in
 this client's session or pack lineage and now absent. The daemon types
 it when its disposable state observed the deletion
 (`ResolveResult::Deleted`, `deleted` delta states) — a bare invalidation
 could never justify entering `Dead` — but after daemon-state loss the
 same UUID legitimately answers `Missing` (§2 forbids the tombstone that
-could remember more), so the loader applies the mapping locally: **a
-handle that was ever `Resolved` and now resolves `Missing` enters `Dead`
-exactly as a typed `Deleted` would have.** A handle that never resolved
-and sees `Missing` is a dangling reference (§4), never `Dead`. No
+could remember more), so the loader applies the mapping locally: **an
+asset that was ever `Resolved` in this session and now resolves `Missing`
+is deleted exactly as a typed `Deleted` would have made it.** An asset
+that never resolved and sees `Missing` is a dangling reference (§4), never
+`Dead`: a handle requested for it reads `Unloaded`, while a new handle
+for an asset this session saw deleted reads `Dead`. No
 daemon-side tombstone may exist — daemon state is disposable (§2), and a
 tombstone would make it precious — and authored tombstones are rejected
-(§22): deleting an authored file must not require authoring another. Types
-may register a **placeholder thunk** (the magenta texture, the unit
-cube — `register_placeholder`, below): when one exists, the swap
-replaces each dead handle's data with a freshly minted placeholder value
-instead of pinning the corpse. A per-handle mint rather than one value,
-because one non-`Clone` value cannot serve multiple handles — every
-affected handle needs its own owned `ErasedValue` (§4) through
-`AssetStorage::update` — so the deletion swap calls the thunk once per
-handle. A restored file (branch switch back) arrives as a typed
-`restored` delta and transitions the handle live again — distinguishable
-from recovery after a failed build, which resumes a frozen component at
-its next successful sweep rather than reviving a `Dead` handle.
+(§22): deleting an authored file must not require authoring another. A
+path reference (`add_ref_indirect`, `add_ref_named`) whose path stops
+naming an asset turns `Dead` and frees its value as soon as the path
+answer arrives; no component is involved.
 
 Deletion and restoration are **component transitions**, not per-handle
 side effects. A `deleted` delta invalidates the dead asset's component
 like any change, and the next sweep resolves it under the ordinary
-component rules. When no placeholder is registered for the type,
-dependents **freeze by default**: the component keeps its prior
-consistent cut, the dead member's handles `Dead` over their last data —
-the failed-member freeze, because adopting a parent over a vanished
-child would swap a live cut around a hole. When a placeholder thunk is
-registered, adoption **proceeds**: the sweep resolves every other
-member normally, mints one placeholder value per dead handle, and
-commits the whole component through the normal atomic swap —
-placeholder values are members of the adopted cut, never out-of-band
-patches. Before any placeholder value is installed, the loader runs that
-type's generated `AssetRuntimeDescriptor::encode` visitor over it with a
-reference-collecting host sink. The sink ignores every non-reference event
-for this check. Each emitted **strong** reference is resolved and terminal-
-type-checked against the sweep's same `IoBasis`, and its edge joins the
-candidate union graph. Newly discovered assets are visited the same way and
-the closure/component partition is recomputed to a fixpoint before swap;
-weak references do not gate this expansion. A missing, mistyped, drifted,
-visitor-failed, or callback-failed reference aborts the component, so a
-placeholder can never smuggle an unchecked strong dependency into an adopted
-cut. Rollback follows the standard rule: a failed placeholder mint
-(the thunk reports a contained panic) fails that member, the component
-freezes at its prior cut, and only actually-failed members are
-labeled — nothing half-adopts. Restoration is an ordinary
-**new-version adoption**: the `restored` delta invalidates the
+component rules. A deleted member is a **non-failure** outcome: the sweep
+resolves every other member normally and commits the whole component
+through the normal atomic swap, the deleted member adopted as no value in
+that same commit. Dependents never freeze on a deletion: a parent that
+keeps naming a deleted child — unchanged, or a new version built while the
+child is gone — adopts with the hole, its reference reading `Dead`. A
+dangling reference (`Missing` for an asset this session never resolved)
+still freezes its component by the failed-member rule. When a component
+freezes for another member's failure, its deleted members are freed
+anyway: the freeze keeps the last-good values of failed members, never a
+deleted one's. A `Dead` handle stays without a value through every later
+sweep of its component (a reconnect, a new dependent) and through
+storage repopulation, which has nothing to refetch for it. Restoration is
+an ordinary **new-version adoption**: the `restored` delta invalidates the
 component, the next sweep resolves the revived asset like any changed
-member, and the swap that commits it revives the `Dead` handles — the
-typed delta states (Watch, above) are what keep it distinguishable
-from recovery after a failed build, which resumes a frozen component
-instead.
+member, and the swap that commits it gives the `Dead` handles a value
+again — the typed delta states (Watch, above) are what keep it
+distinguishable from recovery after a failed build, which resumes a
+frozen component instead.
 
 ### Plumbing
 
@@ -7005,9 +6998,7 @@ impl Loader {
     /// for the epoch's types; each `process()` sweep frees every storage
     /// adoption of those types through `AssetStorage::free`, which destroys
     /// any constructed value or transient staging state still retained
-    /// (running module drop thunks while its code is still resident), frees
-    /// every placeholder value the epoch's thunks minted the
-    /// same way and forgets the thunks themselves,
+    /// (running module drop thunks while its code is still resident),
     /// drops the epoch's compiled fixup plans, fails its in-flight
     /// fetches, and finally forgets its descriptors. Handles go `Dead`
     /// (Deletion semantics) unless the successor module re-registers the
@@ -7015,8 +7006,7 @@ impl Loader {
     /// values built through the new descriptors — asset reload composing
     /// with module reload is exactly drain + re-register + re-resolve.
     pub fn begin_module_drain(&mut self, epoch: GameModuleEpoch);
-    /// True once no value (placeholder values included), plan, fetch,
-    /// thunk, or descriptor of the epoch
+    /// True once no value, plan, fetch, or descriptor of the epoch
     /// remains — and never true for a poisoned epoch (a failed drop
     /// thunk, including failure returned by `AssetStorage::free` or the
     /// consumed-on-Err `update` cleanup, §4's ErasedValue): new work is
@@ -7033,26 +7023,6 @@ impl Loader {
     /// glTF's skeleton beside its clips "Walk", "Run" — each addressed
     /// by (path, type, name). Late-bound like `add_ref_indirect`.
     pub fn add_ref_named<T: AssetType>(&mut self, path: &str, name: &str) -> Handle<T>;
-    /// Placeholder thunk for deletion swaps (Deletion, above). A
-    /// generated constructor thunk, never a bare `fn() -> T`: the
-    /// module-side `placeholder!` macro (the `migration_fn!` pattern,
-    /// §11 — a bare fn is not registrable, so containment cannot be
-    /// forgotten) wraps the body in catch_unwind and returns an owned
-    /// `ErasedValue` (§4) status — a bare fn could neither catch a
-    /// panic inside the module nor suppress automatic drop on the
-    /// crossing value. Per-handle minting, never a single value: one
-    /// non-Clone value cannot serve multiple handles, each of which
-    /// needs its own owned `ErasedValue` through
-    /// `AssetStorage::update` — deletion swaps mint one value per
-    /// handle through `make`. A thunk that reports a contained panic
-    /// fails that handle's swap member (the component freeze rule,
-    /// Deletion above). Epoch-scoped like every
-    /// registration: `begin_module_drain` frees every value the thunk
-    /// produced through the module's still-resident drop thunks and
-    /// forgets the thunk itself; `drain_complete` covers both — no
-    /// placeholder vtable or drop glue can outlive dlclose.
-    pub fn register_placeholder<T: AssetType>(&mut self, epoch: GameModuleEpoch,
-                                              make: &'static PlaceholderThunk);
     pub fn status<T: AssetType>(&self, h: &Handle<T>) -> LoadStatus;
     /// Once per frame on the engine thread: drain IoEvents, advance handle
     /// state machines, run the adoption sweep, commit the swap batch.
@@ -7069,19 +7039,6 @@ impl Loader {
     /// must be delivered again to repopulate empty storage.
     pub fn begin_storage_repopulation(&mut self,
                                       storage: &mut dyn AssetStorage);
-}
-
-/// Generated by the module-side `placeholder!` macro — not
-/// constructible from a bare fn, so panic containment and automatic-
-/// drop suppression cannot be forgotten (§3's thunk rule, §4's
-/// ErasedValue contract).
-pub struct PlaceholderThunk {
-    pub type_uuid: TypeUuid,
-    /// The host supplies the registered epoch's token explicitly. The thunk
-    /// embeds that exact token in the returned ErasedValue; a missing or
-    /// mismatched token is an error, never ambient epoch inference.
-    pub make: fn(owner_epoch: ModuleEpochToken)
-        -> Result<ErasedValue, CallbackPanic>,
 }
 
 pub struct Handle<T: AssetType> { /* ref-counted; clone = add ref, drop = release */ }
@@ -8542,9 +8499,9 @@ put production image codecs, mesh optimization, or shader compilers in core.
 - **Target** (§18): schema-described struct; named instances in config.
 - **Sparse authoring** (§6): adoption materializes omitted fields; the
   canonical on-disk form is always total.
-- **Deletion** (§15): handles go `Dead` keeping last data; optional
-  per-type placeholder factory (epoch-scoped, minting per-handle
-  values); restored files revive.
+- **Deletion** (§15): a deleted asset has no value — its handles go
+  `Dead` and their values are freed in the commit that adopts the
+  deletion; dependents adopt around the hole; restored files revive.
 - **References policy** (§4): tools prefer the UUID form; path-ref fixups
   run as long-running operations, never silently.
 - **Lazy migration** (§11): migration executes inside build import; disk
@@ -10400,6 +10357,19 @@ put production image codecs, mesh optimization, or shader compilers in core.
   rename-aside protocol; there is no separate exchange/Windows publication
   implementation. R35's fully incremental post-startup workload invariant is unchanged.
 <!-- R37_LEDGER_END -->
+
+<!-- R38_LEDGER_BEGIN count=1 -->
+- **A deleted asset has no value** (§§4, 15): the commit that adopts a
+  deletion turns its handles `Dead` and frees their values; status does not
+  flip before it. A deleted member is a non-failure outcome, so its component
+  adopts around the hole, a frozen component frees its deleted members anyway,
+  and a new parent naming a child this session saw deleted adopts too; a
+  never-resolved `Missing` still freezes. `Dead` without a value survives
+  re-sweeps and storage repopulation. Placeholder thunks
+  (`register_placeholder`, `PlaceholderThunk`, `placeholder!`) and their
+  reference expansion are removed: a stand-in is the consumer's own default
+  for an absent value.
+<!-- R38_LEDGER_END -->
 
 ### Open — remaining
 

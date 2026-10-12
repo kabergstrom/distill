@@ -15,10 +15,9 @@ pub enum CandidateOutcome {
         error: String,
     },
     Missing,
-    /// Deletion can adopt only when a placeholder was minted successfully.
-    Deleted {
-        placeholder_ready: bool,
-    },
+    /// Resolved earlier in this session and now absent: adopts as no value
+    /// (DESIGN.md "Deletion"), never a component failure.
+    Deleted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,7 +33,6 @@ pub enum MemberFailure {
     Unresolved,
     Failed(String),
     Missing,
-    DeletedWithoutPlaceholder,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,15 +218,9 @@ pub fn decide(
             continue;
         };
         let failure = match &candidate.outcome {
-            CandidateOutcome::Ready { .. }
-            | CandidateOutcome::Deleted {
-                placeholder_ready: true,
-            } => None,
+            CandidateOutcome::Ready { .. } | CandidateOutcome::Deleted => None,
             CandidateOutcome::Failed { error } => Some(MemberFailure::Failed(error.clone())),
             CandidateOutcome::Missing => Some(MemberFailure::Missing),
-            CandidateOutcome::Deleted {
-                placeholder_ready: false,
-            } => Some(MemberFailure::DeletedWithoutPlaceholder),
         };
         if let Some(failure) = failure {
             failures.push((*uuid, failure));

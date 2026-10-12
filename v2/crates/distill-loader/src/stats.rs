@@ -218,6 +218,8 @@ pub enum Outcome {
     Failed,
     /// Its last handle was released before it finished.
     Abandoned,
+    /// Deleted: committed as no value (DESIGN.md "Deletion").
+    Deleted,
 }
 
 impl Outcome {
@@ -228,6 +230,7 @@ impl Outcome {
             Outcome::Unchanged => "unchanged",
             Outcome::Failed => "failed",
             Outcome::Abandoned => "abandoned",
+            Outcome::Deleted => "deleted",
         }
     }
 }
@@ -340,6 +343,7 @@ pub struct LoaderTotals {
     pub unchanged: u64,
     pub failed: u64,
     pub abandoned: u64,
+    pub deleted: u64,
     /// Timelines not tracked because the active table was full.
     pub dropped: u64,
 }
@@ -531,6 +535,7 @@ impl LoaderStats {
                 Outcome::Unchanged => self.totals.unchanged += 1,
                 Outcome::Failed => self.totals.failed += 1,
                 Outcome::Abandoned => self.totals.abandoned += 1,
+                Outcome::Deleted => self.totals.deleted += 1,
                 Outcome::Active => {}
             }
             if matches!(outcome, Outcome::Resident | Outcome::Unchanged) {

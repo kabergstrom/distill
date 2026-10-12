@@ -1,9 +1,8 @@
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
-use distill_asset::{AssetRuntimeDescriptor, AssetType, EncodeSink, ErasedValue, ModuleEpochToken};
+use distill_asset::{AssetType, ErasedValue, ModuleEpochToken};
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash, TypeUuid};
 use distill_loader::{
     AdoptionId, AssetPath, AssetStorage, CompletionDisposition, FetchedArtifact, GameModuleEpoch,
@@ -38,80 +37,12 @@ impl Drop for Counted {
     }
 }
 
-const PLACEHOLDER_TYPE: TypeUuid = TypeUuid([0x43; 16]);
-
 fn blob(bytes: Vec<u8>) -> distill_wire::exec::Blob {
     let len = bytes.len();
     let backing: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(bytes);
     distill_wire::exec::Blob::new(backing, 0, len)
 }
 
-struct RefPlaceholder;
-
-#[derive(Clone, Default)]
-struct PlaceholderConfig {
-    references: Vec<(bool, AssetUuid, TypeUuid)>,
-    panic_while_visiting: bool,
-}
-
-thread_local! {
-    static PLACEHOLDER_CONFIG: RefCell<PlaceholderConfig> = RefCell::default();
-}
-
-fn configure_placeholder(references: Vec<(bool, AssetUuid, TypeUuid)>, panic_while_visiting: bool) {
-    PLACEHOLDER_CONFIG.with(|config| {
-        *config.borrow_mut() = PlaceholderConfig {
-            references,
-            panic_while_visiting,
-        };
-    });
-}
-
-unsafe fn encode_ref_placeholder(
-    value_ptr: *const u8,
-    sink: &mut dyn EncodeSink,
-) -> Result<(), CallbackPanic> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = value_ptr;
-        PLACEHOLDER_CONFIG.with(|config| {
-            let config = config.borrow();
-            assert!(!config.panic_while_visiting, "test visitor panic");
-            for (strong, target, expected) in &config.references {
-                sink.reference(*strong, *target, *expected)?;
-            }
-            Ok(())
-        })
-    })) {
-        Ok(result) => result,
-        Err(_) => Err(CallbackPanic),
-    }
-}
-
-unsafe impl AssetType for RefPlaceholder {
-    const TYPE_UUID: TypeUuid = PLACEHOLDER_TYPE;
-
-    fn descriptor() -> &'static AssetRuntimeDescriptor {
-        static DESCRIPTOR: OnceLock<AssetRuntimeDescriptor> = OnceLock::new();
-        DESCRIPTOR.get_or_init(|| {
-            let base = A::descriptor();
-            AssetRuntimeDescriptor {
-                type_uuid: PLACEHOLDER_TYPE,
-                logical_hash: base.logical_hash,
-                build_only: false,
-                native_layout: base.native_layout,
-                size: base.size,
-                align: base.align,
-                ctors: base.ctors,
-                drops: base.drops,
-                skip_writers: base.skip_writers,
-                finalize: base.finalize,
-                encode: encode_ref_placeholder,
-            }
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
 enum Command {
     BindTarget,
     Resolve(ReqId, AssetUuid, IoBasis),
@@ -425,22 +356,12 @@ fn register(loader: &mut Loader<MockIo>, epoch: u64, token: &ModuleEpochToken) {
             &[
                 A::descriptor(),
                 B::descriptor(),
-                RefPlaceholder::descriptor(),
                 BuildOnly::descriptor(),
                 Counted::descriptor(),
             ],
         )
         .unwrap();
     assert_eq!(loader.target_binding_state(), TargetBindingState::Required);
-}
-
-fn register_ref_placeholder(loader: &mut Loader<MockIo>, epoch: u64) {
-    loader
-        .register_placeholder(
-            GameModuleEpoch(epoch),
-            distill_asset::placeholder!(RefPlaceholder, RefPlaceholder),
-        )
-        .unwrap();
 }
 
 #[test]
@@ -474,22 +395,6 @@ fn fetched(loader: &mut Loader<MockIo>, hash: ContentHash, artifact: FetchedArti
         artifact,
         basis: request_basis,
     });
-}
-
-fn load_placeholder_root(
-    loader: &mut Loader<MockIo>,
-    storage: &mut Storage,
-    root: AssetUuid,
-) -> distill_loader::Handle<RefPlaceholder> {
-    let handle = loader.add_ref::<RefPlaceholder>(root).unwrap();
-    loader.process(storage).unwrap();
-    let (hash, root_artifact) = artifact::<RefPlaceholder>(root, &[]);
-    resolve(loader, root, hash);
-    loader.process(storage).unwrap();
-    fetched(loader, hash, root_artifact);
-    loader.process(storage).unwrap();
-    assert_eq!(loader.status(&handle), LoadStatus::Loaded);
-    handle
 }
 
 fn begin_deletion(loader: &mut Loader<MockIo>, storage: &mut Storage, root: AssetUuid) {
@@ -527,6 +432,7 @@ fn a_returning_asset_is_a_valid_transition_and_reloads() {
     loader.process(&mut storage).unwrap();
     begin_deletion(&mut loader, &mut storage, asset_uuid);
     assert_eq!(loader.status(&handle), LoadStatus::Dead);
+    assert!(storage.values.is_empty(), "a deleted asset holds no value until it returns");
     let _ = loader.take_diagnostics();
     let (deleted_req, _) = loader.io().resolve_for(asset_uuid);
 
@@ -1474,6 +1380,7 @@ fn reconnect_missing_detaches_loaded_indirect_uuid_and_subscription() {
         "the stale UUID must not be resolved again while its path says Missing"
     );
     assert_eq!(loader.status(&handle), LoadStatus::Dead);
+    assert!(storage.values.is_empty(), "a path naming no asset releases the value");
 }
 
 #[test]
@@ -1862,114 +1769,6 @@ fn shared_subscription_owners_release_only_after_the_last_slot() {
 }
 
 #[test]
-fn placeholder_strong_reference_expands_and_gates_the_component() {
-    let token = ModuleEpochToken::new(20);
-    let mut loader = Loader::new(mock_io());
-    register(&mut loader, 20, &token);
-    let root = uuid(20);
-    let target = uuid(21);
-    configure_placeholder(vec![(true, target, B::TYPE_UUID)], false);
-    register_ref_placeholder(&mut loader, 20);
-    let mut storage = Storage::default();
-    let handle = load_placeholder_root(&mut loader, &mut storage, root);
-    assert_eq!(storage.updates.len(), 1);
-    begin_deletion(&mut loader, &mut storage, root);
-
-    assert_eq!(storage.updates.len(), 1, "placeholder must not half-adopt");
-    loader.process(&mut storage).unwrap();
-    let (_, target_basis) = loader.io().resolve_for(target);
-    assert_eq!(target_basis, basis());
-
-    let (target_hash, target_artifact) = artifact::<B>(target, &[]);
-    resolve(&mut loader, target, target_hash);
-    loader.process(&mut storage).unwrap();
-    assert_eq!(storage.updates.len(), 1, "fetch is still part of the gate");
-    fetched(&mut loader, target_hash, target_artifact);
-    loader.process(&mut storage).unwrap();
-
-    assert_eq!(storage.updates.len(), 3);
-    assert_eq!(storage.commits.len(), 3);
-    assert_eq!(loader.status(&handle), LoadStatus::Dead);
-}
-
-#[test]
-fn placeholder_weak_reference_does_not_expand_the_component() {
-    let token = ModuleEpochToken::new(21);
-    let mut loader = Loader::new(mock_io());
-    register(&mut loader, 21, &token);
-    let root = uuid(22);
-    let weak_target = uuid(23);
-    configure_placeholder(vec![(false, weak_target, B::TYPE_UUID)], false);
-    register_ref_placeholder(&mut loader, 21);
-    let mut storage = Storage::default();
-    let _handle = load_placeholder_root(&mut loader, &mut storage, root);
-    begin_deletion(&mut loader, &mut storage, root);
-
-    assert_eq!(storage.updates.len(), 2);
-    assert!(!loader.io().commands.iter().any(
-        |command| matches!(command, Command::Resolve(_, candidate, _) if *candidate == weak_target)
-    ));
-}
-
-#[test]
-fn placeholder_terminal_type_mismatch_poisons_without_partial_swap() {
-    let token = ModuleEpochToken::new(22);
-    let mut loader = Loader::new(mock_io());
-    register(&mut loader, 22, &token);
-    let root = uuid(24);
-    let target = uuid(25);
-    configure_placeholder(vec![(true, target, A::TYPE_UUID)], false);
-    register_ref_placeholder(&mut loader, 22);
-    let mut storage = Storage::default();
-    let _handle = load_placeholder_root(&mut loader, &mut storage, root);
-    begin_deletion(&mut loader, &mut storage, root);
-    loader.process(&mut storage).unwrap();
-    let (target_hash, target_artifact) = artifact::<B>(target, &[]);
-    resolve(&mut loader, target, target_hash);
-    loader.process(&mut storage).unwrap();
-    fetched(&mut loader, target_hash, target_artifact);
-    loader.process(&mut storage).unwrap();
-
-    assert_eq!(storage.updates.len(), 1);
-    assert!(loader.take_diagnostics().iter().any(|diagnostic| {
-        matches!(diagnostic, LoaderDiagnostic::ComponentPoisoned { failures, .. }
-            if failures.iter().any(|(_, failure)| format!("{failure:?}").contains("terminal type")))
-    }));
-}
-
-#[test]
-fn placeholder_resolution_failure_poisons_without_partial_swap() {
-    let token = ModuleEpochToken::new(23);
-    let mut loader = Loader::new(mock_io());
-    register(&mut loader, 23, &token);
-    let root = uuid(26);
-    let target = uuid(27);
-    configure_placeholder(vec![(true, target, B::TYPE_UUID)], false);
-    register_ref_placeholder(&mut loader, 23);
-    let mut storage = Storage::default();
-    let _handle = load_placeholder_root(&mut loader, &mut storage, root);
-    begin_deletion(&mut loader, &mut storage, root);
-    loader.process(&mut storage).unwrap();
-    let (req, request_basis) = loader.io().resolve_for(target);
-    loader.io_mut().push(IoEvent::Resolved {
-        req,
-        uuid: target,
-        result: ResolveResult::Failed {
-            error: "placeholder target failed".into(),
-        },
-        basis: request_basis,
-    });
-    loader.process(&mut storage).unwrap();
-
-    assert_eq!(storage.updates.len(), 1);
-    let diagnostics = loader.take_diagnostics();
-    assert!(diagnostics.iter().any(|diagnostic| {
-        matches!(diagnostic, LoaderDiagnostic::ComponentPoisoned { failures, .. }
-            if failures.iter().any(|(_, failure)| format!("{failure:?}").contains("placeholder target failed")))
-    }), "{diagnostics:?}");
-}
-
-#[test]
 fn role_ineligible_is_a_typed_failure_not_a_missing_asset() {
     let token = ModuleEpochToken::new(26);
     let mut loader = Loader::new(mock_io());
@@ -1999,76 +1798,6 @@ fn role_ineligible_is_a_typed_failure_not_a_missing_asset() {
         } if *uuid == asset
     )));
     assert!(storage.updates.is_empty());
-}
-
-#[test]
-fn minted_placeholder_visitor_failure_poisons_the_component() {
-    let token = ModuleEpochToken::new(26);
-    let mut loader = Loader::new(mock_io());
-    register(&mut loader, 26, &token);
-    configure_placeholder(Vec::new(), true);
-    register_ref_placeholder(&mut loader, 26);
-    let root = uuid(31);
-    let mut storage = Storage::default();
-    let _handle = load_placeholder_root(&mut loader, &mut storage, root);
-
-    begin_deletion(&mut loader, &mut storage, root);
-
-    assert_eq!(storage.updates.len(), 1);
-    assert!(token.is_poisoned());
-    assert!(loader.take_diagnostics().iter().any(|diagnostic| {
-        matches!(diagnostic, LoaderDiagnostic::ComponentPoisoned { failures, .. }
-            if failures.iter().any(|(_, failure)| format!("{failure:?}").contains("placeholder visitor failed")))
-    }));
-}
-
-#[test]
-fn placeholder_edges_restart_and_resolve_as_one_fresh_basis() {
-    const TARGET: AssetUuid = AssetUuid([30; 16]);
-    let token = ModuleEpochToken::new(25);
-    let mut loader = Loader::new(mock_io());
-    register(&mut loader, 25, &token);
-    configure_placeholder(vec![(true, TARGET, B::TYPE_UUID)], false);
-    register_ref_placeholder(&mut loader, 25);
-    let root = uuid(29);
-    let mut storage = Storage::default();
-    let _handle = load_placeholder_root(&mut loader, &mut storage, root);
-    begin_deletion(&mut loader, &mut storage, root);
-    loader.process(&mut storage).unwrap();
-    let (old_req, old_basis) = loader.io().resolve_for(TARGET);
-
-    let fresh_basis = basis_with(10);
-    loader.io_mut().basis = fresh_basis.clone();
-    loader.io_mut().push(IoEvent::Resolved {
-        req: old_req,
-        uuid: TARGET,
-        result: ResolveResult::Drifted {
-            input: distill_loader::DriftedInput::Asset(TARGET),
-            current: stamp(2),
-        },
-        basis: old_basis,
-    });
-    loader.process(&mut storage).unwrap();
-
-    assert_eq!(storage.updates.len(), 1);
-    assert_eq!(loader.io().resolve_for(root).1, fresh_basis);
-    assert_eq!(loader.io().resolve_for(TARGET).1, fresh_basis);
-
-    let (root_req, root_basis) = loader.io().resolve_for(root);
-    loader.io_mut().push(IoEvent::Resolved {
-        req: root_req,
-        uuid: root,
-        result: ResolveResult::Deleted { at: stamp(2) },
-        basis: root_basis,
-    });
-    let (target_hash, target_artifact) = artifact::<B>(TARGET, &[]);
-    resolve(&mut loader, TARGET, target_hash);
-    loader.process(&mut storage).unwrap();
-    fetched(&mut loader, target_hash, target_artifact);
-    loader.process(&mut storage).unwrap();
-
-    assert_eq!(storage.updates.len(), 3);
-    assert_eq!(storage.commits.len(), 3);
 }
 
 #[test]
@@ -2578,4 +2307,266 @@ fn a_handle_joining_a_fetched_candidate_builds_from_the_kept_payload() {
     assert_eq!(loader.status(&by_path), LoadStatus::Loaded);
     assert_eq!(storage.commits.len(), 4, "parent, sibling and both child handles");
     assert!(loader.take_diagnostics().is_empty());
+}
+
+fn has_value(storage: &Storage, handle: HandleId) -> bool {
+    storage.values.keys().any(|(held, _)| *held == handle)
+}
+
+/// Load `a_uuid` (an `A` naming `b_uuid` through a strong load edge) and
+/// `b_uuid` (a `B`), each held directly.
+fn load_pair(
+    loader: &mut Loader<MockIo>,
+    storage: &mut Storage,
+    a_uuid: AssetUuid,
+    b_uuid: AssetUuid,
+) -> (distill_loader::Handle<A>, distill_loader::Handle<B>) {
+    let a = loader.add_ref::<A>(a_uuid).unwrap();
+    let b = loader.add_ref::<B>(b_uuid).unwrap();
+    loader.process(storage).unwrap();
+    let (a_hash, a_artifact) = artifact_with_edges::<A>(a_uuid, &[(b_uuid, B::TYPE_UUID)]);
+    let (b_hash, b_artifact) = artifact::<B>(b_uuid, &[]);
+    resolve(loader, a_uuid, a_hash);
+    resolve(loader, b_uuid, b_hash);
+    loader.process(storage).unwrap();
+    fetched(loader, a_hash, a_artifact);
+    fetched(loader, b_hash, b_artifact);
+    loader.process(storage).unwrap();
+    assert_eq!(loader.status(&a), LoadStatus::Loaded);
+    assert_eq!(loader.status(&b), LoadStatus::Loaded);
+    (a, b)
+}
+
+fn answer(loader: &mut Loader<MockIo>, asset_uuid: AssetUuid, result: ResolveResult) {
+    let (req, request_basis) = loader.io().resolve_for(asset_uuid);
+    loader.io_mut().push(IoEvent::Resolved {
+        req,
+        uuid: asset_uuid,
+        result,
+        basis: request_basis,
+    });
+}
+
+fn delta(loader: &mut Loader<MockIo>, version: u64, assets: Vec<(AssetUuid, distill_loader::AssetDeltaState)>) {
+    loader.io_mut().push(IoEvent::Delta {
+        stamp: stamp(version),
+        assets,
+        paths: Vec::new(),
+    });
+}
+
+/// DESIGN.md "Deletion": a re-import that deletes a held asset adopts the
+/// rest of its component; the deleted asset's handle holds no value and
+/// reads Dead from that same commit, never before it.
+#[test]
+fn a_deleted_member_adopts_as_no_value_with_its_component() {
+    let token = ModuleEpochToken::new(70);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 70, &token);
+    let mut storage = Storage::default();
+    let (a_uuid, b_uuid) = (uuid(70), uuid(71));
+    let (a, b) = load_pair(&mut loader, &mut storage, a_uuid, b_uuid);
+
+    use distill_loader::AssetDeltaState::{Changed, Deleted};
+    delta(&mut loader, 1, vec![(a_uuid, Changed), (b_uuid, Deleted)]);
+    loader.process(&mut storage).unwrap();
+    assert_ne!(loader.status(&b), LoadStatus::Dead, "Dead only once the deletion commits");
+    assert!(has_value(&storage, b.id()));
+    let (new_hash, new_artifact) = artifact::<A>(a_uuid, &[]);
+    resolve(&mut loader, a_uuid, new_hash);
+    answer(&mut loader, b_uuid, ResolveResult::Deleted { at: stamp(1) });
+    loader.process(&mut storage).unwrap();
+    assert!(has_value(&storage, b.id()), "the component waits for the parent's fetch");
+    fetched(&mut loader, new_hash, new_artifact);
+    loader.process(&mut storage).unwrap();
+
+    assert_eq!(loader.status(&a), LoadStatus::Loaded);
+    assert_eq!(storage.commits.len(), 3, "the parent's new version adopted");
+    assert_eq!(loader.status(&b), LoadStatus::Dead);
+    assert!(!has_value(&storage, b.id()), "the deleted asset's value is released");
+    assert_eq!(loader.manifest_entry(b_uuid).unwrap().state, ManifestState::Dead);
+    assert!(!loader
+        .take_diagnostics()
+        .iter()
+        .any(|d| matches!(d, LoaderDiagnostic::ComponentPoisoned { .. })));
+}
+
+/// A deleted handle stays Dead without a value whenever its component is
+/// swept again (a reconnect re-resolves everything held), and a daemon that
+/// lost its state answers Missing for it: still a deletion, since it
+/// resolved in this session.
+#[test]
+fn a_deleted_handle_stays_dead_when_swept_again() {
+    let token = ModuleEpochToken::new(72);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 72, &token);
+    let mut storage = Storage::default();
+    let asset_uuid = uuid(72);
+    let handle = loader.add_ref::<A>(asset_uuid).unwrap();
+    loader.process(&mut storage).unwrap();
+    let (hash, bytes) = artifact::<A>(asset_uuid, &[]);
+    resolve(&mut loader, asset_uuid, hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, hash, bytes);
+    loader.process(&mut storage).unwrap();
+    begin_deletion(&mut loader, &mut storage, asset_uuid);
+    assert_eq!(loader.status(&handle), LoadStatus::Dead);
+    assert!(storage.values.is_empty());
+
+    loader.io_mut().push(IoEvent::ReconnectRequired {
+        reason: distill_loader::ReconnectReason::PipelineEpochChanged,
+    });
+    loader.process(&mut storage).unwrap();
+    loader.process(&mut storage).unwrap();
+    answer(&mut loader, asset_uuid, ResolveResult::Missing);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.status(&handle), LoadStatus::Dead);
+    assert!(storage.values.is_empty());
+    assert_eq!(loader.manifest_entry(asset_uuid).unwrap().state, ManifestState::Dead);
+}
+
+/// A new request for an asset this session saw deleted reads Dead; one
+/// for an asset that never resolved here is a dangling reference and stays
+/// Unloaded (a late joiner naming a deleted UUID).
+#[test]
+fn a_request_for_a_deleted_asset_reads_dead_and_a_never_resolved_one_unloaded() {
+    let token = ModuleEpochToken::new(73);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 73, &token);
+    let mut storage = Storage::default();
+    let seen = uuid(73);
+    let handle = loader.add_ref::<A>(seen).unwrap();
+    loader.process(&mut storage).unwrap();
+    let (hash, bytes) = artifact::<A>(seen, &[]);
+    resolve(&mut loader, seen, hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, hash, bytes);
+    loader.process(&mut storage).unwrap();
+    begin_deletion(&mut loader, &mut storage, seen);
+    drop(handle);
+    loader.process(&mut storage).unwrap();
+
+    let again = loader.add_ref::<A>(seen).unwrap();
+    let never = loader.add_ref::<A>(uuid(74)).unwrap();
+    loader.process(&mut storage).unwrap();
+    answer(&mut loader, seen, ResolveResult::Deleted { at: stamp(1) });
+    answer(&mut loader, uuid(74), ResolveResult::Missing);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.status(&again), LoadStatus::Dead);
+    assert_eq!(loader.status(&never), LoadStatus::Unloaded);
+    assert!(storage.values.is_empty());
+}
+
+/// A deleted member of a component that freezes for another member's
+/// failure is released anyway; the failed member keeps its last good value.
+#[test]
+fn a_deleted_member_is_released_when_its_component_freezes() {
+    let token = ModuleEpochToken::new(75);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 75, &token);
+    let mut storage = Storage::default();
+    let (a_uuid, b_uuid) = (uuid(75), uuid(76));
+    let (a, b) = load_pair(&mut loader, &mut storage, a_uuid, b_uuid);
+
+    use distill_loader::AssetDeltaState::{Changed, Deleted};
+    delta(&mut loader, 1, vec![(a_uuid, Changed), (b_uuid, Deleted)]);
+    loader.process(&mut storage).unwrap();
+    answer(&mut loader, a_uuid, ResolveResult::Failed { error: "importer failed".into() });
+    answer(&mut loader, b_uuid, ResolveResult::Deleted { at: stamp(1) });
+    loader.process(&mut storage).unwrap();
+
+    assert_eq!(loader.status(&a), LoadStatus::Loaded);
+    assert!(has_value(&storage, a.id()), "the failed member keeps its last good value");
+    assert_eq!(loader.status(&b), LoadStatus::Dead);
+    assert!(!has_value(&storage, b.id()));
+}
+
+/// An unchanged parent keeps naming a deleted child (the hole is legal),
+/// and a newly built parent that names it adopts with the hole too.
+#[test]
+fn a_parent_naming_a_deleted_child_adopts_with_the_hole() {
+    let token = ModuleEpochToken::new(77);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 77, &token);
+    let mut storage = Storage::default();
+    let (a_uuid, b_uuid) = (uuid(77), uuid(78));
+    let (a, b) = load_pair(&mut loader, &mut storage, a_uuid, b_uuid);
+
+    begin_deletion(&mut loader, &mut storage, b_uuid);
+    let (a_hash, _) = artifact_with_edges::<A>(a_uuid, &[(b_uuid, B::TYPE_UUID)]);
+    resolve(&mut loader, a_uuid, a_hash);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.status(&a), LoadStatus::Loaded);
+    assert_eq!(loader.status(&b), LoadStatus::Dead);
+    assert!(!has_value(&storage, b.id()));
+    let commits = storage.commits.len();
+
+    // A new version of the parent, still naming the deleted child.
+    use distill_loader::AssetDeltaState::Changed;
+    delta(&mut loader, 2, vec![(a_uuid, Changed)]);
+    loader.process(&mut storage).unwrap();
+    let (new_hash, new_artifact) =
+        artifact_with_edges::<A>(a_uuid, &[(b_uuid, B::TYPE_UUID), (uuid(79), B::TYPE_UUID)]);
+    resolve(&mut loader, a_uuid, new_hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, new_hash, new_artifact);
+    loader.process(&mut storage).unwrap();
+    answer(&mut loader, b_uuid, ResolveResult::Missing);
+    loader.process(&mut storage).unwrap();
+    let (c_hash, c_artifact) = artifact::<B>(uuid(79), &[]);
+    resolve(&mut loader, uuid(79), c_hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, c_hash, c_artifact);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.status(&a), LoadStatus::Loaded);
+    assert_eq!(storage.commits.len(), commits + 2, "the new parent and its new child");
+    assert_eq!(loader.status(&b), LoadStatus::Dead);
+    assert!(!has_value(&storage, b.id()));
+}
+
+/// A path that stops naming an asset releases the reference's value.
+#[test]
+fn a_path_that_names_no_asset_releases_its_value() {
+    let token = ModuleEpochToken::new(80);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 80, &token);
+    let mut storage = Storage::default();
+    let path = "models/gone.glb.bundle";
+    let handle = loader.add_ref_indirect::<A>(path).unwrap();
+    loader.process(&mut storage).unwrap();
+    let (req, basis) = loader.io().path_for(path);
+    loader.io_mut().push(IoEvent::PathResolved {
+        req,
+        path: path.into(),
+        result: PathResolveResult::Resolved(uuid(80)),
+        basis,
+    });
+    loader.process(&mut storage).unwrap();
+    let (hash, bytes) = artifact::<A>(uuid(80), &[]);
+    resolve(&mut loader, uuid(80), hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, hash, bytes);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.status(&handle), LoadStatus::Loaded);
+
+    loader.io_mut().push(IoEvent::Delta {
+        stamp: stamp(1),
+        assets: vec![(uuid(80), distill_loader::AssetDeltaState::Deleted)],
+        paths: vec![path.to_owned()],
+    });
+    loader.process(&mut storage).unwrap();
+    let (req, basis) = loader.io().path_for(path);
+    loader.io_mut().push(IoEvent::PathResolved {
+        req,
+        path: path.into(),
+        result: PathResolveResult::Missing,
+        basis,
+    });
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.status(&handle), LoadStatus::Dead);
+    assert!(storage.values.is_empty());
+
+    // Device loss: a Dead handle without a value stays Dead.
+    loader.begin_storage_repopulation(&mut storage);
+    assert_eq!(loader.status(&handle), LoadStatus::Dead);
 }

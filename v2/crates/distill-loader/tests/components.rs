@@ -99,34 +99,23 @@ fn mixed_basis_component_is_reresolved_whole() {
 }
 
 #[test]
-fn deletion_without_a_placeholder_is_a_component_failure() {
-    let policy = basis(1, &[2]);
-    let mut deleted = ready(3, &[], &policy);
-    deleted.outcome = CandidateOutcome::Deleted {
-        placeholder_ready: false,
-    };
-    let candidates = map(vec![
-        ready(1, &[2, 3], &policy),
-        ready(2, &[], &policy),
-        deleted,
-    ]);
+fn a_deleted_member_adopts_and_a_dangling_one_freezes() {
+    let basis = basis(1, &[]);
+    let mut deleted = ready(3, &[], &basis);
+    deleted.outcome = CandidateOutcome::Deleted;
+    let candidates = map(vec![ready(1, &[2, 3], &basis), ready(2, &[], &basis), deleted]);
     let decisions = ComponentPlanner::default().plan(&BTreeSet::from([id(1)]), &candidates);
-    assert!(
-        matches!(&decisions[0], AdoptionDecision::Poisoned { failures, .. }
-        if failures.contains(&(id(3), MemberFailure::DeletedWithoutPlaceholder)))
-    );
-
-    let clean = basis(2, &[]);
-    let mut placeholder = ready(2, &[], &clean);
-    placeholder.outcome = CandidateOutcome::Deleted {
-        placeholder_ready: true,
-    };
     assert!(matches!(
-        &ComponentPlanner::default().plan(
-            &BTreeSet::from([id(1)]),
-            &map(vec![ready(1, &[2], &clean), placeholder]),
-        )[0],
-        AdoptionDecision::Ready { .. }
+        &decisions[0],
+        AdoptionDecision::Ready { members, .. } if members == &vec![id(1), id(2), id(3)]
+    ));
+
+    let mut missing = ready(3, &[], &basis);
+    missing.outcome = CandidateOutcome::Missing;
+    let candidates = map(vec![ready(1, &[3], &basis), missing]);
+    assert!(matches!(
+        &ComponentPlanner::default().plan(&BTreeSet::from([id(1)]), &candidates)[0],
+        AdoptionDecision::Poisoned { failures, .. } if failures == &vec![(id(3), MemberFailure::Missing)]
     ));
 }
 

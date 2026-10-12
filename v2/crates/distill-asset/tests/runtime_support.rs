@@ -7,7 +7,7 @@ use std::sync::{
 };
 
 use distill_asset::{
-    default_table, placeholder, AssetHashMap, AssetReflect, DeterministicState, EncodeContainer,
+    default_table, AssetHashMap, AssetReflect, DeterministicState, EncodeContainer,
     EncodeSink, EpochToken, ErasedValue, ModuleEpochPoisonCause,
 };
 use distill_core::id::{AssetUuid, TypeUuid};
@@ -110,18 +110,6 @@ fn module_epoch_token_latches_the_first_typed_poison_cause() {
         owner.poison_cause(),
         Some(ModuleEpochPoisonCause::CallbackRejected)
     );
-}
-
-#[test]
-fn placeholder_contains_panics_and_binds_minted_values_to_the_caller_epoch() {
-    let okay = placeholder!(Plain, Plain);
-    let owner = EpochToken::new(91);
-    let value = (okay.make)(owner.clone()).unwrap();
-    assert_eq!(value.owner_epoch(), 91);
-    value.destroy().unwrap();
-
-    let bad = placeholder!(Plain, panic!("constructor failed"));
-    assert!((bad.make)(owner).is_err());
 }
 
 #[test]

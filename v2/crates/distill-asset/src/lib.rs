@@ -1,7 +1,6 @@
 //! distill-asset: the asset-types support crate — the §4 runtime
 //! declarations (`AssetType`, `AssetRuntimeDescriptor`, `ErasedValue`,
-//! `EncodeSink`, `AssetRef`/`WeakAssetRef` native forms), the §15
-//! `PlaceholderThunk` + `placeholder!` macro, the §3 `DefaultTable`
+//! `EncodeSink`, `AssetRef`/`WeakAssetRef` native forms), the §3 `DefaultTable`
 //! vocabulary, the §5 deterministic `BuildHasher`, and the reflection/
 //! builder machinery `#[asset]`-generated code (distill-asset-macro)
 //! runs against.
@@ -28,7 +27,7 @@ pub use hasher::{AssetHashMap, AssetHashSet, DeterministicState};
 pub use reflect::AssetReflect;
 pub use types::{
     AssetRef, AssetRuntimeDescriptor, AssetType, EncodeContainer, EncodeSink, EpochToken,
-    ErasedValue, ModuleEpochPoisonCause, ModuleEpochToken, PlaceholderThunk, WeakAssetRef,
+    ErasedValue, ModuleEpochPoisonCause, ModuleEpochToken, WeakAssetRef,
 };
 
 // The §12 vocabulary, re-exported for generated code and consumers —
@@ -42,33 +41,3 @@ pub use distill_wire::native::{
 
 pub use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
 pub use distill_json::AuthoredValue;
-
-/// Constructs a `&'static PlaceholderThunk` from a type and a value
-/// expression (§15): the body runs under `catch_unwind` inside the
-/// module and the crossing value is an owned `ErasedValue` — a bare
-/// `fn() -> T` could neither catch an inside-module panic nor suppress
-/// automatic drop on the crossing value (§3's thunk rule, §4's
-/// `ErasedValue` contract). The `migration_fn!` pattern (§11): a bare fn
-/// is not registrable, so containment cannot be forgotten.
-#[macro_export]
-macro_rules! placeholder {
-    ($ty:ty, $body:expr) => {{
-        fn __make(
-            owner: $crate::EpochToken,
-        ) -> ::core::result::Result<$crate::ErasedValue, $crate::CallbackPanic> {
-            match ::std::panic::catch_unwind(|| -> $ty { $body }) {
-                ::core::result::Result::Ok(v) => {
-                    ::core::result::Result::Ok($crate::ErasedValue::new_in::<$ty>(v, owner))
-                }
-                ::core::result::Result::Err(_) => {
-                    ::core::result::Result::Err($crate::CallbackPanic)
-                }
-            }
-        }
-        static __THUNK: $crate::PlaceholderThunk = $crate::PlaceholderThunk {
-            type_uuid: <$ty as $crate::AssetType>::TYPE_UUID,
-            make: __make,
-        };
-        &__THUNK
-    }};
-}

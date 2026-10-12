@@ -89,7 +89,6 @@ struct EpochRecord {
     draining: bool,
     stored: BTreeSet<StoredAdoption>,
     descriptors: usize,
-    placeholders: usize,
 }
 
 #[derive(Debug, Default)]
@@ -117,7 +116,6 @@ impl RuntimeEpochs {
                 draining: false,
                 stored: BTreeSet::new(),
                 descriptors,
-                placeholders: 0,
             },
         );
         Ok(())
@@ -160,28 +158,8 @@ impl RuntimeEpochs {
         Ok(record.stored.remove(&adoption))
     }
 
-    pub fn record_placeholder(&mut self, epoch: GameModuleEpoch) -> Result<(), RuntimeEpochError> {
-        self.resource(epoch, |record| record.placeholders += 1)
-    }
-
-    fn resource(
-        &mut self,
-        epoch: GameModuleEpoch,
-        add: impl FnOnce(&mut EpochRecord),
-    ) -> Result<(), RuntimeEpochError> {
-        let record = self
-            .records
-            .get_mut(&epoch)
-            .ok_or(RuntimeEpochError::UnknownEpoch(epoch))?;
-        if record.draining || record.token.is_poisoned() {
-            return Err(RuntimeEpochError::Fenced(epoch));
-        }
-        add(record);
-        Ok(())
-    }
-
     /// Fence new work immediately. Ephemeral fixup plans and fetched bytes do
-    /// not own module code; descriptors and placeholder thunks stay until all
+    /// not own module code; descriptors stay until all
     /// constructed values have been freed.
     pub fn begin_module_drain(&mut self, epoch: GameModuleEpoch) -> Result<(), RuntimeEpochError> {
         let record = self
@@ -230,7 +208,6 @@ impl RuntimeEpochs {
         let record = self.records.get_mut(&epoch).expect("epoch checked above");
         if record.stored.is_empty() && !record.token.is_poisoned() {
             record.descriptors = 0;
-            record.placeholders = 0;
         }
         if let Some(adoption) = first_failure {
             Err(RuntimeEpochError::FreeFailed { epoch, adoption })
@@ -245,7 +222,6 @@ impl RuntimeEpochs {
                 && !record.token.is_poisoned()
                 && record.stored.is_empty()
                 && record.descriptors == 0
-                && record.placeholders == 0
         })
     }
 

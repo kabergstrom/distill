@@ -8,12 +8,10 @@
 use std::alloc::{alloc, dealloc, Layout};
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Weak};
 
 use distill_asset::{
-    AssetRuntimeDescriptor, AssetType, CallbackPanic, EncodeContainer, EncodeSink, ErasedValue,
-    ModuleEpochPoisonCause, ModuleEpochToken, PlaceholderThunk,
+    AssetRuntimeDescriptor, AssetType, ErasedValue, ModuleEpochPoisonCause, ModuleEpochToken,
 };
 use distill_core::id::{AssetUuid, ContentHash, TypeUuid};
 use distill_store::state::SnapshotStamp;
@@ -64,8 +62,6 @@ pub enum TargetBindingState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistrationError {
     DuplicateType(TypeUuid),
-    DuplicatePlaceholder(TypeUuid),
-    PlaceholderTypeMismatch,
     InvalidDescriptor { type_uuid: TypeUuid, detail: String },
     Epoch(RuntimeEpochError),
 }
@@ -82,8 +78,6 @@ pub enum LoaderError {
     MissingDescriptor(TypeUuid),
     EpochFenced(GameModuleEpoch),
     OwnerEpochMismatch,
-    PlaceholderHostCallbackFailed(TypeUuid),
-    PlaceholderVisitorFailed(TypeUuid),
     RuntimeEpoch(RuntimeEpochError),
     Artifact(String),
 }
@@ -201,132 +195,8 @@ struct DescriptorRecord {
     token: ModuleEpochToken,
 }
 
-struct PlaceholderRecord {
-    thunk: &'static PlaceholderThunk,
-    epoch: GameModuleEpoch,
-    token: ModuleEpochToken,
-}
-
-type PlaceholderReferences = BTreeMap<AssetUuid, BTreeSet<TypeUuid>>;
-
-struct InspectedPlaceholder {
-    value: ErasedValue,
-    strong_references: PlaceholderReferences,
-}
-
-#[derive(Default)]
-struct ReferenceOnlySink {
-    strong_references: PlaceholderReferences,
-}
-
-impl EncodeSink for ReferenceOnlySink {
-    fn flat(&mut self, _bytes: &[u8]) -> Result<(), CallbackPanic> {
-        Ok(())
-    }
-
-    fn begin(&mut self, _kind: EncodeContainer, _len: u32) -> Result<(), CallbackPanic> {
-        Ok(())
-    }
-
-    fn push(&mut self) -> Result<(), CallbackPanic> {
-        Ok(())
-    }
-
-    fn finish(&mut self) -> Result<(), CallbackPanic> {
-        Ok(())
-    }
-
-    fn blob(&mut self, _bytes: &[u8]) -> Result<(), CallbackPanic> {
-        Ok(())
-    }
-
-    fn reference(
-        &mut self,
-        strong: bool,
-        target: AssetUuid,
-        expected_terminal: TypeUuid,
-    ) -> Result<(), CallbackPanic> {
-        if strong {
-            self.strong_references
-                .entry(target)
-                .or_default()
-                .insert(expected_terminal);
-        }
-        Ok(())
-    }
-}
-
-/// Host-owned reverse-ABI adapter for generated encode visitors. Each sink
-/// entry catches a panic before returning through module code and latches the
-/// failure so a visitor cannot hide it by ignoring the returned status.
-struct ContainedEncodeSink<'a> {
-    inner: &'a mut dyn EncodeSink,
-    failed: bool,
-}
-
-impl<'a> ContainedEncodeSink<'a> {
-    fn new(inner: &'a mut dyn EncodeSink) -> Self {
-        Self {
-            inner,
-            failed: false,
-        }
-    }
-
-    fn failed(&self) -> bool {
-        self.failed
-    }
-
-    fn call(
-        &mut self,
-        callback: impl FnOnce(&mut dyn EncodeSink) -> Result<(), CallbackPanic>,
-    ) -> Result<(), CallbackPanic> {
-        if self.failed {
-            return Err(CallbackPanic);
-        }
-        match catch_unwind(AssertUnwindSafe(|| callback(self.inner))) {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => {
-                self.failed = true;
-                Err(error)
-            }
-            Err(_) => {
-                self.failed = true;
-                Err(CallbackPanic)
-            }
-        }
-    }
-}
-
-impl EncodeSink for ContainedEncodeSink<'_> {
-    fn flat(&mut self, bytes: &[u8]) -> Result<(), CallbackPanic> {
-        self.call(|sink| sink.flat(bytes))
-    }
-
-    fn begin(&mut self, kind: EncodeContainer, len: u32) -> Result<(), CallbackPanic> {
-        self.call(|sink| sink.begin(kind, len))
-    }
-
-    fn push(&mut self) -> Result<(), CallbackPanic> {
-        self.call(|sink| sink.push())
-    }
-
-    fn finish(&mut self) -> Result<(), CallbackPanic> {
-        self.call(|sink| sink.finish())
-    }
-
-    fn blob(&mut self, bytes: &[u8]) -> Result<(), CallbackPanic> {
-        self.call(|sink| sink.blob(bytes))
-    }
-
-    fn reference(
-        &mut self,
-        strong: bool,
-        target: AssetUuid,
-        expected_terminal: TypeUuid,
-    ) -> Result<(), CallbackPanic> {
-        self.call(|sink| sink.reference(strong, target, expected_terminal))
-    }
-}
+/// Each strong load reference's target with the terminal types expected of it.
+type LoadReferences = BTreeMap<AssetUuid, BTreeSet<TypeUuid>>;
 
 enum CandidateTerminal {
     Pending,
@@ -347,10 +217,9 @@ enum CandidateTerminal {
     },
     Failed(String),
     Missing,
-    Deleted {
-        values: BTreeMap<HandleId, ErasedValue>,
-        strong_references: PlaceholderReferences,
-    },
+    /// Resolved earlier in this session and now absent: it adopts as no
+    /// value (DESIGN.md "Deletion").
+    Deleted,
 }
 
 /// A fetched payload and what its values are built from: the artifact's
@@ -371,7 +240,7 @@ struct CandidateRecord {
     /// its content hash.
     unverified: bool,
     expected_terminal_types: BTreeSet<TypeUuid>,
-    load_expectations: PlaceholderReferences,
+    load_expectations: LoadReferences,
     terminal: CandidateTerminal,
 }
 
@@ -390,12 +259,13 @@ struct PendingUpdate {
     load_deps: Vec<AssetUuid>,
     owner_epoch: GameModuleEpoch,
     token: Option<PendingToken>,
-    dead: bool,
 }
 
 struct PendingComponent {
     adoption: AdoptionId,
     updates: Vec<PendingUpdate>,
+    /// Deleted members: adopted as no value at commit.
+    removals: Vec<AssetUuid>,
     members: Vec<AssetUuid>,
     basis: IoBasis,
 }
@@ -410,7 +280,6 @@ pub struct Loader<I: LoaderIO> {
     requests: RequestTracker,
     epochs: RuntimeEpochs,
     descriptors: BTreeMap<TypeUuid, DescriptorRecord>,
-    placeholders: BTreeMap<TypeUuid, PlaceholderRecord>,
     slots: BTreeMap<HandleId, Slot>,
     direct_slots: BTreeMap<(AssetUuid, TypeUuid), HandleId>,
     path_slots: BTreeMap<(AssetPath, TypeUuid), HandleId>,
@@ -452,7 +321,6 @@ impl<I: LoaderIO> Loader<I> {
             requests: RequestTracker::new(),
             epochs: RuntimeEpochs::default(),
             descriptors: BTreeMap::new(),
-            placeholders: BTreeMap::new(),
             slots: BTreeMap::new(),
             direct_slots: BTreeMap::new(),
             path_slots: BTreeMap::new(),
@@ -555,34 +423,6 @@ impl<I: LoaderIO> Loader<I> {
         }
         self.registered_target = Some(RuntimeTarget::new(epoch, target_definition_hash));
         self.block_for_target_binding();
-        Ok(())
-    }
-
-    pub fn register_placeholder(
-        &mut self,
-        epoch: GameModuleEpoch,
-        thunk: &'static PlaceholderThunk,
-    ) -> Result<(), RegistrationError> {
-        let Some(descriptor) = self.descriptors.get(&thunk.type_uuid) else {
-            return Err(RegistrationError::PlaceholderTypeMismatch);
-        };
-        if descriptor.epoch != epoch {
-            return Err(RegistrationError::PlaceholderTypeMismatch);
-        }
-        if self.placeholders.contains_key(&thunk.type_uuid) {
-            return Err(RegistrationError::DuplicatePlaceholder(thunk.type_uuid));
-        }
-        self.epochs
-            .record_placeholder(epoch)
-            .map_err(RegistrationError::Epoch)?;
-        self.placeholders.insert(
-            thunk.type_uuid,
-            PlaceholderRecord {
-                thunk,
-                epoch,
-                token: descriptor.token.clone(),
-            },
-        );
         Ok(())
     }
 
@@ -783,8 +623,12 @@ impl<I: LoaderIO> Loader<I> {
                 Err(_) => self.poison_epoch(epoch),
             }
         }
+        // A Dead handle without a value (deleted, or its path names no
+        // asset) is not re-swept: it stays Dead until a delta revives it.
         for slot in self.slots.values_mut() {
-            slot.status = LoadStatus::Unloaded;
+            if !(slot.status == LoadStatus::Dead && slot.current.is_none()) {
+                slot.status = LoadStatus::Unloaded;
+            }
         }
     }
 
@@ -794,7 +638,6 @@ impl<I: LoaderIO> Loader<I> {
             .map_err(LoaderError::RuntimeEpoch)?;
         self.draining.insert(epoch);
         self.descriptors.retain(|_, record| record.epoch != epoch);
-        self.placeholders.retain(|_, record| record.epoch != epoch);
         self.block_for_target_binding();
         Ok(())
     }
@@ -812,55 +655,6 @@ impl<I: LoaderIO> Loader<I> {
             return Err(LoaderError::EpochFenced(record.epoch));
         }
         Ok(record)
-    }
-
-    fn validate_value_owner(
-        &self,
-        type_uuid: TypeUuid,
-        value: &ErasedValue,
-    ) -> Result<(), LoaderError> {
-        if value.type_uuid() != type_uuid {
-            return Err(LoaderError::TypeMismatch {
-                expected: type_uuid,
-                actual: value.type_uuid(),
-            });
-        }
-        let record = self.ensure_descriptor(type_uuid)?;
-        if !record.token.same_epoch(value.owner_token()) {
-            return Err(LoaderError::OwnerEpochMismatch);
-        }
-        Ok(())
-    }
-
-    fn inspect_placeholder_value(
-        &self,
-        type_uuid: TypeUuid,
-        value: &ErasedValue,
-    ) -> Result<PlaceholderReferences, LoaderError> {
-        self.validate_value_owner(type_uuid, value)?;
-        let descriptor = self.ensure_descriptor(type_uuid)?;
-        let mut sink = ReferenceOnlySink::default();
-        let (visited, host_callback_failed) = {
-            let mut contained = ContainedEncodeSink::new(&mut sink);
-            // Safety: value ownership/type were checked against this descriptor;
-            // encode is the descriptor's generated no-unwind visitor.
-            let visited = catch_unwind(AssertUnwindSafe(|| unsafe {
-                (descriptor.descriptor.encode)(value.as_ptr(), &mut contained)
-            }));
-            (visited, contained.failed())
-        };
-        if host_callback_failed {
-            return Err(LoaderError::PlaceholderHostCallbackFailed(type_uuid));
-        }
-        match visited {
-            Ok(Ok(())) => Ok(sink.strong_references),
-            Ok(Err(_)) | Err(_) => {
-                descriptor
-                    .token
-                    .poison_with(ModuleEpochPoisonCause::CallbackPanic);
-                Err(LoaderError::PlaceholderVisitorFailed(type_uuid))
-            }
-        }
     }
 
     fn new_slot(
@@ -1198,7 +992,7 @@ impl<I: LoaderIO> Loader<I> {
                     resolve_issued: false,
                     unverified: false,
                     expected_terminal_types: BTreeSet::new(),
-                    load_expectations: PlaceholderReferences::new(),
+                    load_expectations: LoadReferences::new(),
                     terminal: CandidateTerminal::Pending,
                 },
             );
@@ -1233,7 +1027,7 @@ impl<I: LoaderIO> Loader<I> {
                         resolve_issued: false,
                         unverified: false,
                         expected_terminal_types: BTreeSet::new(),
-                        load_expectations: PlaceholderReferences::new(),
+                        load_expectations: LoadReferences::new(),
                         terminal: CandidateTerminal::Pending,
                     });
                 }
@@ -1469,16 +1263,9 @@ impl<I: LoaderIO> Loader<I> {
                     });
                     entry.apply_delta(delta);
                     self.stats.begin(uuid, self.stats.now());
+                    // A deletion turns its handles Dead when the sweep
+                    // adopts it, freeing their values in the same commit.
                     self.dirty.insert(uuid);
-                    if delta == crate::AssetDeltaState::Deleted {
-                        for handle in self.handles_for_uuid(uuid) {
-                            if let Some(slot) = self.slots.get_mut(&handle) {
-                                if slot.current.is_some() {
-                                    slot.status = LoadStatus::Dead;
-                                }
-                            }
-                        }
-                    }
                 }
                 // A changed path re-resolves every reference into it: its
                 // primary and the names imported there.
@@ -1678,11 +1465,20 @@ impl<I: LoaderIO> Loader<I> {
         result: ResolveResult,
         event_basis: IoBasis,
     ) -> Result<(), LoaderError> {
-        let was_live = self.handles_for_uuid(uuid).iter().any(|handle| {
-            self.slots
-                .get(handle)
-                .is_some_and(|slot| slot.current.is_some())
-        });
+        // Resolved earlier in this session (DESIGN.md "Deletion" is
+        // client-relative): its manifest entry left `Missing`. A deleted
+        // asset's handles hold no value, so the manifest, not the slots,
+        // remembers it; a handle that never resolved sees a dangling
+        // reference.
+        let was_live = self
+            .manifest
+            .get(&uuid)
+            .is_some_and(|entry| !matches!(entry.state, ManifestState::Missing))
+            || self.handles_for_uuid(uuid).iter().any(|handle| {
+                self.slots
+                    .get(handle)
+                    .is_some_and(|slot| slot.current.is_some())
+            });
         let unchanged = match &result {
             ResolveResult::Built { content_hash } => self
                 .manifest
@@ -1796,27 +1592,12 @@ impl<I: LoaderIO> Loader<I> {
                     role,
                 });
             }
-            ResolveResult::Missing => {
+            ResolveResult::Missing | ResolveResult::Deleted { .. } => {
                 candidate.terminal = if was_live {
-                    CandidateTerminal::Deleted {
-                        values: BTreeMap::new(),
-                        strong_references: BTreeMap::new(),
-                    }
+                    CandidateTerminal::Deleted
                 } else {
                     CandidateTerminal::Missing
                 };
-                self.mint_placeholders(uuid);
-            }
-            ResolveResult::Deleted { .. } => {
-                candidate.terminal = if was_live {
-                    CandidateTerminal::Deleted {
-                        values: BTreeMap::new(),
-                        strong_references: BTreeMap::new(),
-                    }
-                } else {
-                    CandidateTerminal::Missing
-                };
-                self.mint_placeholders(uuid);
             }
         }
         Ok(())
@@ -1862,6 +1643,7 @@ impl<I: LoaderIO> Loader<I> {
         let mut retired = BTreeSet::new();
         let mut rebound = BTreeSet::new();
         let mut unsubscribe = Vec::new();
+        let mut freed = Vec::new();
         let now = self.stats.now();
         for id in ids {
             let slot = self.slots.get_mut(&id).expect("collected existing slot");
@@ -1894,13 +1676,21 @@ impl<I: LoaderIO> Loader<I> {
                 PathResolveResult::Missing
                 | PathResolveResult::Unsupported
                 | PathResolveResult::Failed { .. } => {
-                    slot.status = if definite {
-                        LoadStatus::Dead
+                    if definite {
+                        // The path names no asset now: a reference into it
+                        // holds no value (DESIGN.md "Deletion").
+                        slot.status = LoadStatus::Dead;
+                        if let Some(current) = slot.current.take() {
+                            freed.push((id, current));
+                        }
                     } else {
-                        LoadStatus::Unloaded
-                    };
+                        slot.status = LoadStatus::Unloaded;
+                    }
                 }
             }
+        }
+        for (id, current) in freed {
+            self.release_current(storage, id, current);
         }
         self.add_to_live_sweep(rebound);
         for uuid in unsubscribe {
@@ -2015,7 +1805,7 @@ impl<I: LoaderIO> Loader<I> {
             .load_edges
             .iter()
             .map(|edge| (edge.asset, BTreeSet::from([edge.expected_terminal])))
-            .collect::<PlaceholderReferences>();
+            .collect::<LoadReferences>();
         if parsed.content_hash != content_hash {
             self.reject_fetched(
                 uuid,
@@ -2194,72 +1984,7 @@ impl<I: LoaderIO> Loader<I> {
         }
     }
 
-    fn mint_placeholders(&mut self, uuid: AssetUuid) {
-        let handles = self.handles_for_uuid(uuid);
-        for handle in handles {
-            let type_uuid = self
-                .slots
-                .get(&handle)
-                .and_then(|slot| slot.current.as_ref().map(|current| current.type_uuid))
-                .or_else(|| self.slots.get(&handle).and_then(|slot| slot.expected_type));
-            let Some(type_uuid) = type_uuid else {
-                continue;
-            };
-            let inspected = self.placeholders.get(&type_uuid).map(|placeholder| {
-                if !self.epochs.can_issue_work(placeholder.epoch) {
-                    return Err("placeholder epoch is fenced".to_owned());
-                }
-                let value = (placeholder.thunk.make)(placeholder.token.clone()).map_err(|_| {
-                    placeholder
-                        .token
-                        .poison_with(ModuleEpochPoisonCause::CallbackPanic);
-                    "placeholder factory callback failed".to_owned()
-                })?;
-                match self.inspect_placeholder_value(type_uuid, &value) {
-                    Ok(strong_references) => Ok(InspectedPlaceholder {
-                        value,
-                        strong_references,
-                    }),
-                    Err(error) => {
-                        let _ = value.destroy();
-                        Err(format!("placeholder visitor failed: {error:?}"))
-                    }
-                }
-            });
-            match inspected {
-                Some(Ok(inspected)) => {
-                    if let Some(candidate) = self
-                        .sweep
-                        .as_mut()
-                        .and_then(|sweep| sweep.candidates.get_mut(&uuid))
-                    {
-                        if let CandidateTerminal::Deleted {
-                            values,
-                            strong_references,
-                        } = &mut candidate.terminal
-                        {
-                            merge_placeholder_references(
-                                strong_references,
-                                inspected.strong_references,
-                            );
-                            values.insert(handle, inspected.value);
-                        } else {
-                            let _ = inspected.value.destroy();
-                        }
-                    } else {
-                        let _ = inspected.value.destroy();
-                    }
-                }
-                Some(Err(error)) => {
-                    self.fail_placeholder_candidate(uuid, error);
-                    break;
-                }
-                None => {}
-            }
-        }
-    }
-
-    fn fail_placeholder_candidate(&mut self, uuid: AssetUuid, error: String) {
+    fn fail_candidate_terminal(&mut self, uuid: AssetUuid, error: String) {
         let Some(candidate) = self
             .sweep
             .as_mut()
@@ -2276,17 +2001,10 @@ impl<I: LoaderIO> Loader<I> {
             return Ok(());
         };
         let basis = sweep.basis.clone();
-        let mut dependencies = PlaceholderReferences::new();
+        let mut dependencies = LoadReferences::new();
         for candidate in sweep.candidates.values() {
-            match &candidate.terminal {
-                CandidateTerminal::Built { .. } => merge_placeholder_references(
-                    &mut dependencies,
-                    candidate.load_expectations.clone(),
-                ),
-                CandidateTerminal::Deleted {
-                    strong_references, ..
-                } => merge_placeholder_references(&mut dependencies, strong_references.clone()),
-                _ => {}
+            if let CandidateTerminal::Built { .. } = &candidate.terminal {
+                merge_load_references(&mut dependencies, candidate.load_expectations.clone());
             }
         }
         let current = self.current_graph();
@@ -2331,7 +2049,7 @@ impl<I: LoaderIO> Loader<I> {
                     resolve_issued: false,
                     unverified: false,
                     expected_terminal_types: BTreeSet::new(),
-                    load_expectations: PlaceholderReferences::new(),
+                    load_expectations: LoadReferences::new(),
                     terminal: CandidateTerminal::Pending,
                 });
             candidate
@@ -2416,7 +2134,7 @@ impl<I: LoaderIO> Loader<I> {
         };
         for cycle in load_cycles(&graph) {
             let failed = cycle[0];
-            self.fail_placeholder_candidate(
+            self.fail_candidate_terminal(
                 failed,
                 format!("strong-reference load cycle: {cycle:?}"),
             );
@@ -2435,7 +2153,7 @@ impl<I: LoaderIO> Loader<I> {
                             uuid: *uuid,
                             basis: candidate.basis.clone(),
                             load_deps: self.candidate_deps(candidate),
-                            outcome: self.candidate_outcome(*uuid, candidate),
+                            outcome: self.candidate_outcome(candidate),
                         },
                     ))
                 })
@@ -2460,7 +2178,7 @@ impl<I: LoaderIO> Loader<I> {
                         Ok(StageComponentOutcome::Staged) => {}
                         Ok(StageComponentOutcome::Failed { uuid, error }) => {
                             let failures = vec![(uuid, MemberFailure::Failed(error))];
-                            self.freeze_component(&mut sweep, &members, &failures);
+                            self.freeze_component(storage, &mut sweep, &members, &failures);
                             self.diagnostics.push(LoaderDiagnostic::ComponentPoisoned {
                                 members: members.clone(),
                                 failures,
@@ -2474,7 +2192,7 @@ impl<I: LoaderIO> Loader<I> {
                     members
                 }
                 AdoptionDecision::Poisoned { members, failures } => {
-                    self.freeze_component(&mut sweep, &members, &failures);
+                    self.freeze_component(storage, &mut sweep, &members, &failures);
                     self.diagnostics.push(LoaderDiagnostic::ComponentPoisoned {
                         members: members.clone(),
                         failures,
@@ -2542,11 +2260,9 @@ impl<I: LoaderIO> Loader<I> {
                         .iter()
                         .all(|handle| values.contains_key(handle))
             }
-            CandidateTerminal::Failed(_) | CandidateTerminal::Missing => true,
-            CandidateTerminal::Deleted { values, .. } => {
-                let handles = self.handles_for_candidate(candidate);
-                values.is_empty() || handles.iter().all(|handle| values.contains_key(handle))
-            }
+            CandidateTerminal::Failed(_)
+            | CandidateTerminal::Missing
+            | CandidateTerminal::Deleted => true,
         }
     }
 
@@ -2570,14 +2286,11 @@ impl<I: LoaderIO> Loader<I> {
                 load_deps: Some(load_deps),
                 ..
             } => load_deps.clone(),
-            CandidateTerminal::Deleted {
-                strong_references, ..
-            } => strong_references.keys().copied().collect(),
             _ => Vec::new(),
         }
     }
 
-    fn candidate_outcome(&self, uuid: AssetUuid, candidate: &CandidateRecord) -> CandidateOutcome {
+    fn candidate_outcome(&self, candidate: &CandidateRecord) -> CandidateOutcome {
         match &candidate.terminal {
             CandidateTerminal::Unchanged {
                 type_uuid: actual, ..
@@ -2592,7 +2305,7 @@ impl<I: LoaderIO> Loader<I> {
             {
                 CandidateOutcome::Failed {
                     error: format!(
-                        "placeholder reference terminal type mismatch: expected {:?}, got {actual}",
+                        "load reference terminal type mismatch: expected {:?}, got {actual}",
                         candidate.expected_terminal_types
                     ),
                 }
@@ -2605,13 +2318,7 @@ impl<I: LoaderIO> Loader<I> {
                 error: error.clone(),
             },
             CandidateTerminal::Missing => CandidateOutcome::Missing,
-            CandidateTerminal::Deleted { values, .. } => CandidateOutcome::Deleted {
-                placeholder_ready: !values.is_empty()
-                    && self
-                        .handles_for_uuid(uuid)
-                        .iter()
-                        .all(|handle| values.contains_key(handle)),
-            },
+            CandidateTerminal::Deleted => CandidateOutcome::Deleted,
             CandidateTerminal::Pending => unreachable!("completeness checked"),
         }
     }
@@ -2639,6 +2346,7 @@ impl<I: LoaderIO> Loader<I> {
         }
         let adoption = self.mint_adoption()?;
         let mut updates = Vec::new();
+        let mut removals = Vec::new();
         for uuid in members.iter().copied() {
             let Some(candidate) = sweep.candidates.get_mut(&uuid) else {
                 continue;
@@ -2705,78 +2413,10 @@ impl<I: LoaderIO> Loader<I> {
                             load_deps: load_deps.clone(),
                             owner_epoch: epoch,
                             token,
-                            dead: false,
                         });
                     }
                 }
-                CandidateTerminal::Deleted {
-                    values,
-                    strong_references,
-                } => {
-                    for handle in self.handles_for_uuid(uuid) {
-                        let Some(value) = values.remove(&handle) else {
-                            continue;
-                        };
-                        let type_uuid = self
-                            .slots
-                            .get(&handle)
-                            .and_then(|slot| slot.current.as_ref())
-                            .map(|current| current.type_uuid)
-                            .expect("placeholder applies only to a prior live value");
-                        let epoch = match self.ensure_descriptor(type_uuid) {
-                            Ok(descriptor) => descriptor.epoch,
-                            Err(error) => {
-                                let _ = value.destroy();
-                                self.rollback_updates(storage, adoption, &updates);
-                                return Err(error);
-                            }
-                        };
-                        let stored = StoredAdoption {
-                            type_uuid,
-                            handle,
-                            adoption,
-                        };
-                        if let Err(error) = self.epochs.record_adoption(epoch, stored) {
-                            let _ = value.destroy();
-                            self.rollback_updates(storage, adoption, &updates);
-                            return Err(LoaderError::RuntimeEpoch(error));
-                        }
-                        let update_began = self.stats.now();
-                        let update_result = storage.update(type_uuid, handle, value, adoption);
-                        let staging_ns = storage.take_upload_ns();
-                        let update_ns = self.stats.now() - update_began;
-                        self.stats.updated(uuid, update_began, update_ns, staging_ns);
-                        let token = match update_result {
-                            Ok(UpdateResult::Ready) => None,
-                            Ok(UpdateResult::Pending(token)) => Some(token),
-                            Err(error) => {
-                                self.observe_storage_error(&error, epoch);
-                                if matches!(error, StorageError::Engine(_)) {
-                                    let _ = self.epochs.release_adoption(epoch, stored);
-                                }
-                                self.rollback_updates(storage, adoption, &updates);
-                                self.diagnostics.push(LoaderDiagnostic::Storage {
-                                    handle,
-                                    error: error.clone(),
-                                });
-                                return Ok(StageComponentOutcome::Failed {
-                                    uuid,
-                                    error: format!("asset storage update failed: {error:?}"),
-                                });
-                            }
-                        };
-                        updates.push(PendingUpdate {
-                            handle,
-                            uuid,
-                            type_uuid,
-                            content_hash: None,
-                            load_deps: strong_references.keys().copied().collect(),
-                            owner_epoch: epoch,
-                            token,
-                            dead: true,
-                        });
-                    }
-                }
+                CandidateTerminal::Deleted => removals.push(uuid),
                 CandidateTerminal::Pending
                 | CandidateTerminal::Unchanged { .. }
                 | CandidateTerminal::Failed(_)
@@ -2785,11 +2425,12 @@ impl<I: LoaderIO> Loader<I> {
             }
         }
         if updates.iter().all(|update| update.token.is_none()) {
-            self.commit_updates(storage, adoption, updates);
+            self.commit_updates(storage, adoption, updates, removals);
         } else {
             self.pending.push(PendingComponent {
                 adoption,
                 updates,
+                removals,
                 members: members.to_vec(),
                 basis: sweep.basis.clone(),
             });
@@ -2830,6 +2471,9 @@ impl<I: LoaderIO> Loader<I> {
                     MemberFailure::Failed(format!("asset storage readiness failed: {error:?}")),
                 )];
                 self.apply_component_failure(&pending.members, &failures, &pending.basis);
+                // A deleted member holds no value even when the rest of its
+                // component freezes.
+                self.adopt_removals(storage, None, &pending.removals);
                 self.diagnostics
                     .push(LoaderDiagnostic::Storage { handle, error });
                 self.diagnostics.push(LoaderDiagnostic::ComponentPoisoned {
@@ -2838,7 +2482,7 @@ impl<I: LoaderIO> Loader<I> {
                 });
             } else if all_ready {
                 let pending = self.pending.remove(index);
-                self.commit_updates(storage, pending.adoption, pending.updates);
+                self.commit_updates(storage, pending.adoption, pending.updates, pending.removals);
             } else {
                 index += 1;
             }
@@ -2850,10 +2494,12 @@ impl<I: LoaderIO> Loader<I> {
         storage: &mut dyn AssetStorage,
         adoption: AdoptionId,
         updates: Vec<PendingUpdate>,
+        removals: Vec<AssetUuid>,
     ) {
         for update in &updates {
             storage.commit(update.type_uuid, update.handle, adoption);
         }
+        self.adopt_removals(storage, Some(adoption), &removals);
         let now = self.stats.now();
         for update in &updates {
             self.stats.finish(update.uuid, Outcome::Resident, now);
@@ -2885,21 +2531,73 @@ impl<I: LoaderIO> Loader<I> {
                     adoption: Some(adoption),
                     epoch: update.owner_epoch,
                 });
-                slot.status = if update.dead {
-                    LoadStatus::Dead
-                } else {
-                    LoadStatus::Loaded
-                };
+                slot.status = LoadStatus::Loaded;
             }
             let entry = self.manifest.entry(update.uuid).or_insert(ManifestEntry {
                 state: ManifestState::Missing,
                 adopted_at: AdoptionId(0),
             });
             entry.adopted_at = adoption;
-            entry.state = match update.content_hash {
-                Some(content_hash) => ManifestState::Current { content_hash },
-                None => ManifestState::Dead,
-            };
+            if let Some(content_hash) = update.content_hash {
+                entry.state = ManifestState::Current { content_hash };
+            }
+        }
+    }
+
+    /// Adopt each of `uuids` (deleted, DESIGN.md "Deletion") as no value:
+    /// its handles' values are released through storage and the handles
+    /// read `Dead`, as before their first load. `adoption` is the commit's
+    /// own; a member released inside a frozen component has none.
+    fn adopt_removals(
+        &mut self,
+        storage: &mut dyn AssetStorage,
+        adoption: Option<AdoptionId>,
+        uuids: &[AssetUuid],
+    ) {
+        let now = self.stats.now();
+        for &uuid in uuids {
+            self.stats.finish(uuid, Outcome::Deleted, now);
+            for handle in self.handles_for_uuid(uuid) {
+                let Some(slot) = self.slots.get_mut(&handle) else {
+                    continue;
+                };
+                slot.status = LoadStatus::Dead;
+                if let Some(current) = slot.current.take() {
+                    self.release_current(storage, handle, current);
+                }
+            }
+            let entry = self.manifest.entry(uuid).or_insert(ManifestEntry {
+                state: ManifestState::Missing,
+                adopted_at: AdoptionId(0),
+            });
+            if let Some(adoption) = adoption {
+                entry.adopted_at = adoption;
+            }
+            entry.state = ManifestState::Dead;
+        }
+    }
+
+    /// Release a handle's committed value (taken out of its slot) through
+    /// storage.
+    fn release_current(
+        &mut self,
+        storage: &mut dyn AssetStorage,
+        handle: HandleId,
+        current: CurrentValue,
+    ) {
+        let Some(adoption) = current.adoption else {
+            return;
+        };
+        let stored = StoredAdoption {
+            type_uuid: current.type_uuid,
+            handle,
+            adoption,
+        };
+        match storage.free(current.type_uuid, handle, adoption) {
+            Ok(()) => {
+                let _ = self.epochs.release_adoption(current.epoch, stored);
+            }
+            Err(_) => self.poison_epoch(current.epoch),
         }
     }
 
@@ -2926,17 +2624,26 @@ impl<I: LoaderIO> Loader<I> {
 
     fn freeze_component(
         &mut self,
+        storage: &mut dyn AssetStorage,
         sweep: &mut Sweep,
         members: &[AssetUuid],
         failures: &[(AssetUuid, MemberFailure)],
     ) {
         let basis = sweep.basis.clone();
+        let mut deleted = Vec::new();
         for uuid in members {
             if let Some(candidate) = sweep.candidates.remove(uuid) {
+                if matches!(candidate.terminal, CandidateTerminal::Deleted) {
+                    deleted.push(*uuid);
+                }
                 destroy_candidate_values(candidate.terminal);
             }
         }
         self.apply_component_failure(members, failures, &basis);
+        // A deleted member holds no value even when the rest of its
+        // component freezes: a handle without a value is a state every
+        // holder already handles (before the first load).
+        self.adopt_removals(storage, None, &deleted);
     }
 
     fn apply_component_failure(
@@ -2950,6 +2657,11 @@ impl<I: LoaderIO> Loader<I> {
             self.stats.finish(*uuid, Outcome::Failed, now);
         }
         for uuid in members {
+            // A deleted asset stays Dead (it has no value to keep).
+            let dead = self
+                .manifest
+                .get(uuid)
+                .is_some_and(|entry| entry.state == ManifestState::Dead);
             for handle in self.handles_for_uuid(*uuid) {
                 if let Some(slot) = self.slots.get_mut(&handle) {
                     slot.status = if slot
@@ -2958,6 +2670,8 @@ impl<I: LoaderIO> Loader<I> {
                         .is_some_and(|current| current.adoption.is_some())
                     {
                         LoadStatus::Loaded
+                    } else if dead {
+                        LoadStatus::Dead
                     } else {
                         LoadStatus::Unloaded
                     };
@@ -2981,16 +2695,9 @@ impl<I: LoaderIO> Loader<I> {
                         }
                     }
                 }
-                MemberFailure::Missing | MemberFailure::DeletedWithoutPlaceholder => {
-                    entry.observe_absence();
-                    for handle in self.handles_for_uuid(*uuid) {
-                        if let Some(slot) = self.slots.get_mut(&handle) {
-                            if slot.current.is_some() {
-                                slot.status = LoadStatus::Dead;
-                            }
-                        }
-                    }
-                }
+                // A dangling reference: never resolved in this session
+                // (a once-resolved asset that goes absent is `Deleted`).
+                MemberFailure::Missing => entry.observe_absence(),
                 MemberFailure::Unresolved => {}
             }
         }
@@ -3097,14 +2804,6 @@ impl<I: LoaderIO> Loader<I> {
             record
                 .token
                 .poison_with(ModuleEpochPoisonCause::CallbackPanic);
-        } else if let Some(record) = self
-            .placeholders
-            .values()
-            .find(|record| record.epoch == epoch)
-        {
-            record
-                .token
-                .poison_with(ModuleEpochPoisonCause::CallbackPanic);
         }
     }
 
@@ -3194,13 +2893,12 @@ fn construct_handle_values<'a>(
 
 fn destroy_candidate_values(terminal: CandidateTerminal) {
     let values = match terminal {
-        CandidateTerminal::Built { values, .. } | CandidateTerminal::Deleted { values, .. } => {
-            values
-        }
+        CandidateTerminal::Built { values, .. } => values,
         CandidateTerminal::Pending
         | CandidateTerminal::Unchanged { .. }
         | CandidateTerminal::Failed(_)
-        | CandidateTerminal::Missing => {
+        | CandidateTerminal::Missing
+        | CandidateTerminal::Deleted => {
             return;
         }
     };
@@ -3215,9 +2913,9 @@ fn destroy_sweep_values(sweep: Sweep) {
     }
 }
 
-fn merge_placeholder_references(
-    into: &mut PlaceholderReferences,
-    references: PlaceholderReferences,
+fn merge_load_references(
+    into: &mut LoadReferences,
+    references: LoadReferences,
 ) {
     for (target, expected_types) in references {
         into.entry(target).or_default().extend(expected_types);
@@ -3301,61 +2999,4 @@ fn last_good_hash(state: &ManifestState) -> Option<ContentHash> {
 #[allow(dead_code)]
 fn _snapshot_for_failure(basis: &IoBasis) -> Option<SnapshotStamp> {
     basis.rpc_snapshot()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct PanickingEncodeSink;
-
-    impl EncodeSink for PanickingEncodeSink {
-        fn flat(&mut self, _bytes: &[u8]) -> Result<(), CallbackPanic> {
-            panic!("flat panicked")
-        }
-
-        fn begin(&mut self, _kind: EncodeContainer, _len: u32) -> Result<(), CallbackPanic> {
-            panic!("begin panicked")
-        }
-
-        fn push(&mut self) -> Result<(), CallbackPanic> {
-            panic!("push panicked")
-        }
-
-        fn finish(&mut self) -> Result<(), CallbackPanic> {
-            panic!("finish panicked")
-        }
-
-        fn blob(&mut self, _bytes: &[u8]) -> Result<(), CallbackPanic> {
-            panic!("blob panicked")
-        }
-
-        fn reference(
-            &mut self,
-            _strong: bool,
-            _target: AssetUuid,
-            _expected_terminal: TypeUuid,
-        ) -> Result<(), CallbackPanic> {
-            panic!("reference panicked")
-        }
-    }
-
-    #[test]
-    fn contained_encode_sink_contains_every_host_callback_entry() {
-        fn assert_contained(
-            callback: impl FnOnce(&mut ContainedEncodeSink<'_>) -> Result<(), CallbackPanic>,
-        ) {
-            let mut inner = PanickingEncodeSink;
-            let mut sink = ContainedEncodeSink::new(&mut inner);
-            assert_eq!(callback(&mut sink), Err(CallbackPanic));
-            assert!(sink.failed());
-        }
-
-        assert_contained(|sink| sink.flat(&[1]));
-        assert_contained(|sink| sink.begin(EncodeContainer::Vec, 1));
-        assert_contained(|sink| sink.push());
-        assert_contained(|sink| sink.finish());
-        assert_contained(|sink| sink.blob(&[2]));
-        assert_contained(|sink| sink.reference(true, AssetUuid([3; 16]), TypeUuid([4; 16])));
-    }
 }

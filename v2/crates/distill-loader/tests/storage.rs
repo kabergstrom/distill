@@ -59,7 +59,6 @@ fn successful_drain_frees_values_before_forgetting_module_resources() {
     let epoch = GameModuleEpoch(7);
     let mut epochs = RuntimeEpochs::default();
     epochs.register(epoch, token, 2).unwrap();
-    epochs.record_placeholder(epoch).unwrap();
     epochs.record_adoption(epoch, stored(1)).unwrap();
     epochs.record_adoption(epoch, stored(2)).unwrap();
     epochs.begin_module_drain(epoch).unwrap();
@@ -106,7 +105,7 @@ fn published_runtime_failure_fences_new_work_even_before_drain() {
     token.poison();
     assert!(!epochs.can_issue_work(epoch));
     assert_eq!(
-        epochs.record_placeholder(epoch),
+        epochs.record_adoption(epoch, stored(1)),
         Err(RuntimeEpochError::Fenced(epoch))
     );
 }
