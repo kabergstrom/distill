@@ -3060,8 +3060,24 @@ Each rule has a fixed id (`ENGINE_DEFAULT_IMPORTS` in `newgameplus-pipeline/src/
   collision) is not implemented.
 - Whole-layer revalidation (configuration or capability change, a rules
   source changed, on any rules bundle) checks the task of every default
-  group (`directory_task_needs_run`), as revalidating every authored rule
-  does; its cost on a large tree is not measured.
+  group (`directory_task_needs_run`, which reads each group's prior bundle),
+  as revalidating every authored rule does. Measured 2026-10-12 on
+  deferred-ngp's `tools/distill/distill.toml` roots with the `test` root's
+  `["**"]` exclude removed (2,479 default bundles, 247 MB, beside about
+  2,500 sources; 50 first attempts failed): a pass adding a `none` rules
+  bundle that matches nothing took 10.4 s (10.39, 10.39, 10.29 s), against
+  0.12 s with `test` excluded; warm startup (also whole) 65 s against 16 s.
+  Whether to narrow it (revalidate only the groups a changed rules source
+  can claim or release, or decide a task's staleness without parsing its
+  bundle) is open.
+- Removing a rules bundle that generated nothing (a `none`-only bundle, or
+  rules whose files are all claimed elsewhere) does not revalidate the
+  default layer: `refresh_dirty_import_index` reports no changed rules for a
+  removed source and the bundle is not among the generating rules bundles,
+  so the files it claimed import by default only at the next whole pass
+  (startup, configuration or capability change). Seen 2026-10-12 with
+  `a_none_rule_opts_files_out_of_the_default_layer` once its earlier file
+  work is acknowledged; not fixed.
 
 Resolved (2026-10-08): defaults are on for every root with per-root
 excludes; the opt-out is the reserved importer id `none` (no schema change);
