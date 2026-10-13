@@ -14,7 +14,9 @@ use crate::capnp_transport::{
     schema, RemoteConnectOutcome, RemoteMetadataOutcome,
 };
 use crate::{
-    ArtifactChunk, ArtifactChunkKind, AssetDeltaState, AssetEvent, AssetQuery, AuthoringEntryRole,
+    ArtifactChunk, ArtifactChunkKind, AssetDeltaState, AssetEvent, AssetQuery, AuthoringEntry,
+    AuthoringEntryRole, AuthoringOp, AuthoringProgressEvent, AuthoringProgressState, LongRunningOp,
+    WriteReceipt,
     AuthoringInspectResult, ConfigurationError, Delta, DescribableTypesResult, DescribeTypeResult, DriftedInput, ImportFailure, ImportRequest,
     MetadataEntry, PathResolveFailure, PathResolveResult, ReconnectReason, ResolveResult, RpcBasis,
     RuntimeTypePolicy, ServedLoadEdge, StreamEvent, TerminalEvent,
@@ -262,10 +264,90 @@ impl RemoteHub {
             }
         }
     }
+
+    /// Write `ops` at `base` (§17 `Hub.write`): one bundle file. The receipt
+    /// names the files written; the store follows them through the watcher,
+    /// so the version reflecting them comes later (`AuthoringSnapshot.file`).
+    /// A stale `base` answers `StaleInputVersion` without writing.
+    pub async fn write(
+        &self,
+        base: InputVersion,
+        ops: &[AuthoringOp],
+        force_lossy: bool,
+    ) -> Result<RemoteCall<WriteReceipt>, capnp::Error> {
+        let mut request = self.client.write_request();
+        {
+            let mut params = request.get();
+            params.set_base(base.0);
+            params.set_force_lossy(force_lossy);
+            let mut wire = params.init_ops(ops.len() as u32);
+            for (index, op) in ops.iter().enumerate() {
+                let output = wire.reborrow().get(index as u32);
+                match op {
+                    AuthoringOp::Set(entry) => write_authoring_entry(output.init_set(), entry),
+                    AuthoringOp::Remove { uuid } => output.init_remove().set_bytes(&uuid.0),
+                }
+            }
+        }
+        let response = request.send().promise.await?;
+        let result = response.get()?.get_result()?;
+        match result.which()? {
+            schema::data_call::Which::Success(value) => Ok(RemoteCall::Success(
+                WriteReceipt::decode(value?).map_err(|error| capnp::Error::failed(error.to_string()))?,
+            )),
+            schema::data_call::Which::ReconnectRequired(value) => Ok(
+                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
+            ),
+            schema::data_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
+            ),
+            schema::data_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
+            schema::data_call::Which::Error(value) => {
+                Ok(RemoteCall::Error(decode_rpc_error(value?)?))
+            }
+        }
+    }
+
+    /// Start a long-running operation at `base` (§17 `Hub.operation`). It
+    /// runs as its progress stream is read: a rename completes when its
+    /// `Completed` event (payload: the `WriteReceipt`) is delivered.
+    pub async fn operation(
+        &self,
+        base: InputVersion,
+        operation: &LongRunningOp,
+    ) -> Result<RemoteCall<RemoteProgress>, capnp::Error> {
+        let mut request = self.client.operation_request();
+        {
+            let mut params = request.get();
+            params.set_base(base.0);
+            let mut wire = params.init_operation();
+            match operation {
+                LongRunningOp::RenameWithFixups(payload) => wire.set_rename_with_fixups(payload),
+                LongRunningOp::Doctor(payload) => wire.set_doctor(payload),
+            }
+        }
+        let response = request.send().promise.await?;
+        let result = response.get()?.get_result()?;
+        match result.which()? {
+            schema::progress_call::Which::Success(client) => {
+                Ok(RemoteCall::Success(RemoteProgress { client: client? }))
+            }
+            schema::progress_call::Which::ReconnectRequired(value) => Ok(
+                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
+            ),
+            schema::progress_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
+            ),
+            schema::progress_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
+            schema::progress_call::Which::Error(value) => {
+                Ok(RemoteCall::Error(decode_rpc_error(value?)?))
+            }
+        }
+    }
 }
 
-/// A hub's authoring view at one version: game type descriptions (§17
-/// "Type descriptions").
+/// A hub's authoring view at one version: authored entries, observed files
+/// and game type descriptions (§17).
 #[derive(Clone)]
 pub struct RemoteAuthoringSnapshot {
     client: schema::authoring_snapshot::Client,
@@ -326,6 +408,186 @@ impl RemoteAuthoringSnapshot {
             schema::describable_types_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
             schema::describable_types_call::Which::Error(value) => Ok(RemoteCall::Error(decode_rpc_error(value?)?)),
         }
+    }
+
+    /// The input version this snapshot reads.
+    pub async fn version(&self) -> Result<RemoteCall<InputVersion>, capnp::Error> {
+        let response = self.client.version_request().send().promise.await?;
+        let result = response.get()?.get_result()?;
+        match result.which()? {
+            schema::u_int64_call::Which::Success(value) => Ok(RemoteCall::Success(InputVersion(value))),
+            schema::u_int64_call::Which::ReconnectRequired(value) => Ok(
+                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
+            ),
+            schema::u_int64_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
+            ),
+            schema::u_int64_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
+            schema::u_int64_call::Which::Error(value) => Ok(RemoteCall::Error(decode_rpc_error(value?)?)),
+        }
+    }
+
+    /// The authored entries `query` selects (authoring-only ones included),
+    /// UUID-sorted.
+    pub async fn query(&self, query: &AssetQuery) -> Result<RemoteCall<Vec<AssetUuid>>, capnp::Error> {
+        let mut request = self.client.query_request();
+        write_asset_query(request.get().init_query(), query);
+        let response = request.send().promise.await?;
+        let result = response.get()?.get_result()?;
+        match result.which()? {
+            schema::uuid_list_call::Which::Success(values) => {
+                let mut assets = Vec::new();
+                for value in values?.iter() {
+                    assets.push(AssetUuid(fixed::<16>(value.get_bytes()?, "query.uuid")?));
+                }
+                Ok(RemoteCall::Success(assets))
+            }
+            schema::uuid_list_call::Which::ReconnectRequired(value) => Ok(
+                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
+            ),
+            schema::uuid_list_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
+            ),
+            schema::uuid_list_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
+            schema::uuid_list_call::Which::Error(value) => Ok(RemoteCall::Error(decode_rpc_error(value?)?)),
+        }
+    }
+
+    /// The authored entry of `uuid` with its value, authenticated against
+    /// its logical schema, stamped with this snapshot's version.
+    pub async fn inspect(&self, uuid: AssetUuid) -> Result<RemoteCall<AuthoringInspectResult>, capnp::Error> {
+        let mut request = self.client.inspect_request();
+        request.get().set_uuid(&uuid.0);
+        let response = request.send().promise.await?;
+        let result = response.get()?.get_result()?;
+        match result.which()? {
+            schema::authoring_inspect_call::Which::Success(value) => Ok(RemoteCall::Success(
+                AuthoringInspectResult::Inspection(decode_authoring_inspection(value?)?),
+            )),
+            schema::authoring_inspect_call::Which::Missing(()) => {
+                Ok(RemoteCall::Success(AuthoringInspectResult::Missing))
+            }
+            schema::authoring_inspect_call::Which::RoleIneligible(value) => {
+                Ok(RemoteCall::Success(AuthoringInspectResult::RoleIneligible {
+                    observed: decode_role(value?.get_observed()?),
+                }))
+            }
+            schema::authoring_inspect_call::Which::Drifted(value) => {
+                let (input, current) = decode_drifted(value?)?;
+                Ok(RemoteCall::Success(AuthoringInspectResult::Drifted { input, current }))
+            }
+            schema::authoring_inspect_call::Which::ReconnectRequired(value) => Ok(
+                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
+            ),
+            schema::authoring_inspect_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
+            ),
+            schema::authoring_inspect_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
+            schema::authoring_inspect_call::Which::Error(value) => Ok(RemoteCall::Error(decode_rpc_error(value?)?)),
+        }
+    }
+
+    /// The content hash of the file the snapshot observed at `path` in
+    /// `root`; `None` for no file there. A `WriteReceipt` is reflected at
+    /// the first version whose answers match it.
+    pub async fn file(&self, root: &str, path: &str) -> Result<RemoteCall<Option<ContentHash>>, capnp::Error> {
+        let mut request = self.client.file_request();
+        request.get().set_root(root);
+        request.get().set_path(path);
+        let response = request.send().promise.await?;
+        let result = response.get()?.get_result()?;
+        match result.which()? {
+            schema::data_call::Which::Success(value) => {
+                let value = value?;
+                Ok(RemoteCall::Success(if value.is_empty() {
+                    None
+                } else {
+                    Some(ContentHash(fixed::<32>(value, "file.content_hash")?))
+                }))
+            }
+            schema::data_call::Which::ReconnectRequired(value) => Ok(
+                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
+            ),
+            schema::data_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
+            ),
+            schema::data_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
+            schema::data_call::Which::Error(value) => Ok(RemoteCall::Error(decode_rpc_error(value?)?)),
+        }
+    }
+}
+
+/// The progress of a long-running operation (`Hub.operation`). Reading it
+/// drives the operation.
+pub struct RemoteProgress {
+    client: schema::progress_stream::Client,
+}
+
+impl std::fmt::Debug for RemoteProgress {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("RemoteProgress").finish_non_exhaustive()
+    }
+}
+
+impl RemoteProgress {
+    /// The next event; `None` once the stream is done.
+    pub async fn next(&mut self) -> Result<Option<AuthoringProgressEvent>, capnp::Error> {
+        let response = self.client.next_request().send().promise.await?;
+        let results = response.get()?;
+        if results.get_done() {
+            return Ok(None);
+        }
+        let progress = results.get_progress()?;
+        Ok(Some(AuthoringProgressEvent {
+            sequence: progress.get_sequence(),
+            state: match progress.get_state()? {
+                schema::AuthoringProgressState::Started => AuthoringProgressState::Started,
+                schema::AuthoringProgressState::Running => AuthoringProgressState::Running,
+                schema::AuthoringProgressState::Completed => AuthoringProgressState::Completed,
+                schema::AuthoringProgressState::Cancelled => AuthoringProgressState::Cancelled,
+                schema::AuthoringProgressState::Failed => AuthoringProgressState::Failed,
+            },
+            payload: Arc::from(progress.get_payload()?.to_vec()),
+        }))
+    }
+}
+
+/// Encode `entry` as `Hub.write`'s `AuthoringEntryValue`.
+pub fn write_authoring_entry(mut output: schema::authoring_entry_value::Builder<'_>, entry: &AuthoringEntry) {
+    output.reborrow().init_uuid().set_bytes(&entry.uuid.0);
+    output.reborrow().init_bundle().set_bytes(&entry.bundle.0);
+    output.set_local_id(entry.local_id.as_str());
+    output.set_normalized_path(entry.normalized_path.as_str());
+    output.reborrow().init_type_uuid().set_bytes(&entry.type_uuid.0);
+    output.reborrow().init_terminal_type().set_bytes(&entry.terminal_type.0);
+    output.set_schema_hash(&entry.schema_hash.0);
+    output.set_logical_schema(&entry.logical_schema);
+    output.set_role(match entry.role {
+        AuthoringEntryRole::Runtime => schema::AuthoringEntryRole::Runtime,
+        AuthoringEntryRole::AuthoringOnly => schema::AuthoringEntryRole::AuthoringOnly,
+    });
+    let mut tags = output.reborrow().init_tags(entry.tags.len() as u32);
+    for (index, (tag, value)) in entry.tags.iter().enumerate() {
+        let mut row = tags.reborrow().get(index as u32);
+        row.set_tag(tag.as_str());
+        if let Some(value) = value {
+            row.set_has_value(true);
+            row.set_value(value.as_str());
+        }
+    }
+    let mut value = output.init_value();
+    value.set_canonical_value(&entry.value.canonical_value);
+    let mut blobs = value.reborrow().init_blobs(entry.value.blobs.len() as u32);
+    for (index, blob) in entry.value.blobs.iter().enumerate() {
+        blobs.set(index as u32, blob);
+    }
+    let mut types = value.init_types(entry.value.types.len() as u32);
+    for (index, ty) in entry.value.types.iter().enumerate() {
+        let mut row = types.reborrow().get(index as u32);
+        row.set_path(ty.path.as_str());
+        row.reborrow().init_type_uuid().set_bytes(&ty.type_uuid.0);
+        row.set_schema_hash(&ty.schema_hash.0);
+        row.set_logical_schema(&ty.logical_schema);
     }
 }
 

@@ -6,6 +6,7 @@
 //! observable at the storage boundary.
 
 pub mod admission;
+pub mod authoring;
 pub mod basis;
 pub mod capnp_io;
 pub mod component;
@@ -17,6 +18,7 @@ pub mod stats;
 pub mod storage;
 
 pub use admission::{Admit, FetchAdmission, Reservation};
+pub use authoring::{AuthoringAnswer, AuthoringChange, AuthoringRequest};
 pub use basis::{IoBasis, ManifestHash};
 pub use capnp_io::{RpcIo, RpcIoConfig, RpcIoInitError, RpcIoStats, StepStats, TypeName};
 pub use component::{

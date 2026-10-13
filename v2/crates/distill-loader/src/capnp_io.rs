@@ -91,6 +91,7 @@ use distill_store::state::{InputVersion, SnapshotStamp};
 use tokio::task::{AbortHandle, LocalSet};
 
 use crate::admission::{FetchAdmission, Reservation};
+use crate::authoring::{AuthoringAnswer, AuthoringChange, AuthoringRequest};
 use crate::io::{
     AssetDeltaState, AssetPath, DriftedInput, IoEvent, LoaderIO, PathResolveResult,
     ReconnectReason, ReqId, ResolveResult, RuntimeTarget,
@@ -324,6 +325,60 @@ impl RpcIo {
         self.shared.descriptions.borrow_mut().remove(&ticket)
     }
 
+    /// Run an authoring call (`crate::authoring`) on the current
+    /// connection; its answer is taken with [`Self::take_authoring`] under
+    /// the returned ticket.
+    pub fn authoring(&mut self, request: AuthoringRequest) -> u64 {
+        let ticket = self.shared.next_description.get();
+        self.shared.next_description.set(ticket + 1);
+        let Some(connection) = self.shared.connection() else {
+            self.shared
+                .authoring_answers
+                .borrow_mut()
+                .insert(ticket, Err("not connected to the daemon".to_owned()));
+            return ticket;
+        };
+        let shared = Rc::clone(&self.shared);
+        let _local = self.local.enter();
+        drop(self.shared.spawn(async move {
+            let answer = crate::authoring::run(&connection.hub, request).await;
+            shared.authoring_answers.borrow_mut().insert(ticket, answer);
+        }));
+        ticket
+    }
+
+    /// The answer to [`Self::authoring`]'s `ticket`, once it arrived.
+    pub fn take_authoring(&mut self, ticket: u64) -> Option<Result<AuthoringAnswer, String>> {
+        self.shared.authoring_answers.borrow_mut().remove(&ticket)
+    }
+
+    /// Report changes of `uuid`'s authored entry ([`Self::take_authoring_changes`]).
+    /// Shares the connection's subscription with the loader: an asset
+    /// watched only here never reaches the loader's deltas.
+    pub fn watch_authoring(&mut self, uuid: AssetUuid) {
+        let mut subscriptions = self.shared.subscriptions.borrow_mut();
+        if subscriptions.authoring.insert(uuid) && !subscriptions.assets.contains(&uuid) {
+            drop(subscriptions);
+            let _local = self.local.enter();
+            self.shared.subscribe(vec![uuid], Vec::new());
+        }
+    }
+
+    pub fn unwatch_authoring(&mut self, uuid: AssetUuid) {
+        let mut subscriptions = self.shared.subscriptions.borrow_mut();
+        if subscriptions.authoring.remove(&uuid) && !subscriptions.assets.contains(&uuid) {
+            drop(subscriptions);
+            let _local = self.local.enter();
+            self.shared.unsubscribe(vec![uuid], Vec::new());
+        }
+    }
+
+    /// Changes of watched entries since the last call, in stream order. After
+    /// a reconnect every watched entry is reported changed.
+    pub fn take_authoring_changes(&mut self) -> Vec<AuthoringChange> {
+        std::mem::take(&mut *self.shared.authoring_changes.borrow_mut())
+    }
+
     /// What the last [`Self::step`] (or `poll`) did.
     pub fn last_step(&self) -> StepStats {
         self.last_step
@@ -555,14 +610,18 @@ impl LoaderIO for RpcIo {
     }
 
     fn subscribe(&mut self, uuid: AssetUuid) {
-        if self.shared.subscriptions.borrow_mut().assets.insert(uuid) {
+        let mut subscriptions = self.shared.subscriptions.borrow_mut();
+        if subscriptions.assets.insert(uuid) && !subscriptions.authoring.contains(&uuid) {
+            drop(subscriptions);
             let _local = self.local.enter();
             self.shared.subscribe(vec![uuid], Vec::new());
         }
     }
 
     fn unsubscribe(&mut self, uuid: AssetUuid) {
-        if self.shared.subscriptions.borrow_mut().assets.remove(&uuid) {
+        let mut subscriptions = self.shared.subscriptions.borrow_mut();
+        if subscriptions.assets.remove(&uuid) && !subscriptions.authoring.contains(&uuid) {
+            drop(subscriptions);
             let _local = self.local.enter();
             self.shared.unsubscribe(vec![uuid], Vec::new());
         }
@@ -625,7 +684,7 @@ pub enum TypeName {
     Uuid(TypeUuid),
 }
 
-fn remote<T>(call: Result<RemoteCall<T>, impl std::fmt::Display>) -> Result<T, String> {
+pub(crate) fn remote<T>(call: Result<RemoteCall<T>, impl std::fmt::Display>) -> Result<T, String> {
     match call {
         Ok(RemoteCall::Success(value)) => Ok(value),
         Ok(RemoteCall::ReconnectRequired(reason)) => Err(format!("reconnect required: {reason:?}")),
@@ -637,7 +696,7 @@ fn remote<T>(call: Result<RemoteCall<T>, impl std::fmt::Display>) -> Result<T, S
 }
 
 /// One authoring snapshot: the type index (for a path), then the type.
-async fn describe(hub: &RemoteHub, name: TypeName) -> Result<TypeDescription, String> {
+pub(crate) async fn describe(hub: &RemoteHub, name: TypeName) -> Result<TypeDescription, String> {
     let snapshot = remote(hub.authoring_snapshot().await)?;
     let type_uuid = match name {
         TypeName::Uuid(type_uuid) => type_uuid,
@@ -680,6 +739,10 @@ struct Shared {
     import_failures_changed: Cell<bool>,
     /// Answers of `RpcIo::describe_type` by ticket, until taken.
     descriptions: RefCell<HashMap<u64, Result<TypeDescription, String>>>,
+    /// Answers of `RpcIo::authoring` by ticket, until taken.
+    authoring_answers: RefCell<HashMap<u64, Result<AuthoringAnswer, String>>>,
+    /// Changes of watched entries, until taken.
+    authoring_changes: RefCell<Vec<AuthoringChange>>,
     next_description: Cell<u64>,
     /// Signalled whenever a snapshot refresh ends.
     refreshed: tokio::sync::Notify,
@@ -796,14 +859,18 @@ enum Need {
 
 #[derive(Default)]
 struct Subscriptions {
+    /// The loader's.
     assets: BTreeSet<AssetUuid>,
     paths: BTreeSet<String>,
+    /// Watched authored entries (`RpcIo::watch_authoring`).
+    authoring: BTreeSet<AssetUuid>,
 }
 
 impl Subscriptions {
+    /// What the connection subscribes: the loader's and the watched.
     fn lists(&self) -> (Vec<AssetUuid>, Vec<String>) {
         (
-            self.assets.iter().copied().collect(),
+            self.assets.union(&self.authoring).copied().collect(),
             self.paths.iter().cloned().collect(),
         )
     }
@@ -892,6 +959,8 @@ impl Shared {
             import_failures: RefCell::new(None),
             import_failures_changed: Cell::new(false),
             descriptions: RefCell::new(HashMap::new()),
+            authoring_answers: RefCell::new(HashMap::new()),
+            authoring_changes: RefCell::new(Vec::new()),
             next_description: Cell::new(1),
             refreshed: tokio::sync::Notify::new(),
             next_serial: Cell::new(1),
@@ -1202,10 +1271,8 @@ async fn delta_stream(
     loop {
         match subscription.next().await {
             Ok(Some(event)) => {
-                let events = {
-                    let subscriptions = shared.subscriptions.borrow();
-                    stream_events(event, &subscriptions.assets, &subscriptions.paths)
-                };
+                let (events, changes) = stream_events(event, &shared.subscriptions.borrow());
+                shared.authoring_changes.borrow_mut().extend(changes);
                 let newest = events
                     .iter()
                     .filter_map(|event| match event {
@@ -1283,6 +1350,14 @@ async fn rebind(shared: Rc<Shared>, target: RuntimeTarget) {
         let message = match attempt {
             Ok(Ok(opened)) => {
                 let basis = shared.commit(opened);
+                // Changes while disconnected are unknown.
+                let version = basis.rpc_snapshot().map_or(InputVersion(0), |stamp| stamp.version);
+                let watched = shared.subscriptions.borrow().authoring.clone();
+                shared.authoring_changes.borrow_mut().extend(watched.into_iter().map(|uuid| AuthoringChange {
+                    uuid,
+                    version,
+                    deleted: false,
+                }));
                 shared.push(IoEvent::TargetBound { target, basis });
                 return;
             }
@@ -1675,42 +1750,54 @@ fn connect_request(target: &str, binding: &RuntimeTarget) -> ConnectRequest {
     )
 }
 
-fn stream_events(
-    event: StreamEvent,
-    subscribed_assets: &BTreeSet<AssetUuid>,
-    subscribed_paths: &BTreeSet<String>,
-) -> Vec<IoEvent> {
-    match event {
-        StreamEvent::InitialDelta { deltas, .. } => deltas
-            .into_iter()
-            .map(|delta| IoEvent::Delta {
-                stamp: delta.basis.snapshot,
-                assets: delta
-                    .assets
-                    .into_iter()
-                    .map(|(asset, state)| (asset, delta_state(state)))
-                    .collect(),
-                paths: delta.paths,
-            })
-            .collect(),
-        StreamEvent::Delta(delta) => vec![IoEvent::Delta {
+/// The loader's events of one stream event, and the changes of watched
+/// authored entries it names. An asset only watched for authoring is not
+/// the loader's.
+fn stream_events(event: StreamEvent, subscriptions: &Subscriptions) -> (Vec<IoEvent>, Vec<AuthoringChange>) {
+    let mut changes = Vec::new();
+    let mut delta = |delta: distill_rpc::Delta| {
+        let version = delta.basis.snapshot.version;
+        let mut assets = Vec::with_capacity(delta.assets.len());
+        for (asset, state) in delta.assets {
+            let state = delta_state(state);
+            if subscriptions.authoring.contains(&asset) {
+                changes.push(AuthoringChange {
+                    uuid: asset,
+                    version,
+                    deleted: state == AssetDeltaState::Deleted,
+                });
+                if !subscriptions.assets.contains(&asset) {
+                    continue;
+                }
+            }
+            assets.push((asset, state));
+        }
+        IoEvent::Delta {
             stamp: delta.basis.snapshot,
-            assets: delta
-                .assets
-                .into_iter()
-                .map(|(asset, state)| (asset, delta_state(state)))
-                .collect(),
+            assets,
             paths: delta.paths,
-        }],
-        StreamEvent::ResyncRequired { basis, .. } => vec![IoEvent::Delta {
-            stamp: basis.snapshot,
-            assets: subscribed_assets
-                .iter()
-                .copied()
-                .map(|asset| (asset, AssetDeltaState::Changed))
-                .collect(),
-            paths: subscribed_paths.iter().cloned().collect(),
-        }],
+        }
+    };
+    let events = match event {
+        StreamEvent::InitialDelta { deltas, .. } => deltas.into_iter().map(&mut delta).collect(),
+        StreamEvent::Delta(value) => vec![delta(value)],
+        StreamEvent::ResyncRequired { basis, .. } => {
+            changes.extend(subscriptions.authoring.iter().map(|&uuid| AuthoringChange {
+                uuid,
+                version: basis.snapshot.version,
+                deleted: false,
+            }));
+            vec![IoEvent::Delta {
+                stamp: basis.snapshot,
+                assets: subscriptions
+                    .assets
+                    .iter()
+                    .copied()
+                    .map(|asset| (asset, AssetDeltaState::Changed))
+                    .collect(),
+                paths: subscriptions.paths.iter().cloned().collect(),
+            }]
+        }
         StreamEvent::Asset { event, .. } => match event {
             AssetEvent::ReconnectRequired { reason } => vec![IoEvent::ReconnectRequired {
                 reason: reconnect_reason(reason),
@@ -1719,7 +1806,8 @@ fn stream_events(
             AssetEvent::Error { message, .. } => vec![IoEvent::ConnectionError { message }],
             _ => Vec::new(),
         },
-    }
+    };
+    (events, changes)
 }
 
 fn reconnect_reason(reason: distill_rpc::ReconnectReason) -> ReconnectReason {

@@ -27,36 +27,6 @@ fn target_hash(hex: &str) -> TargetDefinitionHash {
     TargetDefinitionHash(out)
 }
 
-fn write_entry(mut output: schema::authoring_entry_value::Builder<'_>, entry: &AuthoringEntry) {
-    output.reborrow().init_uuid().set_bytes(&entry.uuid.0);
-    output.reborrow().init_bundle().set_bytes(&entry.bundle.0);
-    output.set_local_id(entry.local_id.as_str());
-    output.set_normalized_path(entry.normalized_path.as_str());
-    output.reborrow().init_type_uuid().set_bytes(&entry.type_uuid.0);
-    output.reborrow().init_terminal_type().set_bytes(&entry.terminal_type.0);
-    output.set_schema_hash(&entry.schema_hash.0);
-    output.set_logical_schema(&entry.logical_schema);
-    output.set_role(match entry.role {
-        AuthoringEntryRole::Runtime => schema::AuthoringEntryRole::Runtime,
-        AuthoringEntryRole::AuthoringOnly => schema::AuthoringEntryRole::AuthoringOnly,
-    });
-    output.reborrow().init_tags(0);
-    let mut value = output.init_value();
-    value.set_canonical_value(&entry.value.canonical_value);
-    let mut blobs = value.reborrow().init_blobs(entry.value.blobs.len() as u32);
-    for (index, blob) in entry.value.blobs.iter().enumerate() {
-        blobs.set(index as u32, blob);
-    }
-    let mut types = value.init_types(entry.value.types.len() as u32);
-    for (index, ty) in entry.value.types.iter().enumerate() {
-        let mut row = types.reborrow().get(index as u32);
-        row.set_path(ty.path.as_str());
-        row.reborrow().init_type_uuid().set_bytes(&ty.type_uuid.0);
-        row.set_schema_hash(&ty.schema_hash.0);
-        row.set_logical_schema(&ty.logical_schema);
-    }
-}
-
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "edits a running daemon's asset; see the module docs"]
 async fn edit_asset_through_hub_write() {
@@ -106,7 +76,7 @@ async fn edit_asset_through_hub_write() {
             {
                 let mut params = write.get();
                 params.set_base(inspection.stamp.version.0);
-                write_entry(params.reborrow().init_ops(1).get(0).init_set(), &entry);
+                distill_rpc::capnp_loader::write_authoring_entry(params.reborrow().init_ops(1).get(0).init_set(), &entry);
             }
             let written = write.send().promise.await.unwrap();
             match written.get().unwrap().get_result().unwrap().which().unwrap() {

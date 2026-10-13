@@ -7,18 +7,19 @@ use std::time::{Duration, Instant};
 
 use distill_asset::{AssetType, ErasedValue, ModuleEpochToken};
 use distill_build::keys::target_definition_hash;
+use distill_store::state::InputVersion;
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, TypeUuid};
 use distill_daemon::config::DaemonConfig;
 use distill_daemon::pack_command::{build_configured_pack, PackCommandError};
 use distill_daemon::process::DaemonProcess;
 use distill_schema::ngp_schema::Value;
 use distill_loader::{
-    AdoptionId, AssetStorage, GameModuleEpoch, HandleId, LoadStatus, Loader, LoaderDiagnostic,
+    AdoptionId, AuthoringAnswer, AuthoringRequest, AssetStorage, GameModuleEpoch, HandleId, LoadStatus, Loader, LoaderDiagnostic,
     PendingState, PendingToken, RpcIo, StorageError, UpdateResult,
 };
 use distill_pack::{PackfileIO, RuntimeTarget as PackRuntimeTarget};
 use distill_rpc::{
-    AuthoringValue, ConnectOutcome, ConnectRequest, ImportRequest, ResolveResult,
+    AuthoringEntry, AuthoringEntryRole, AuthoringOp, AuthoringValue, RenameWithFixupsRequest, ConnectOutcome, ConnectRequest, ImportRequest, ResolveResult,
     TargetDefinitionHash,
 };
 use distill_schema::ngp_schema::{
@@ -968,4 +969,172 @@ cache_limit = "16MiB"
     let path = temp.path().join("distill.toml");
     std::fs::write(&path, config).unwrap();
     DaemonConfig::load(path).unwrap()
+}
+
+/// Drive an `RpcIo` until the authoring call `ticket` answers.
+fn authoring_answer(io: &mut RpcIo, ticket: u64) -> distill_loader::AuthoringAnswer {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        io.step();
+        if let Some(answer) = io.take_authoring(ticket) {
+            return answer.unwrap();
+        }
+        assert!(Instant::now() < deadline, "authoring call {ticket} did not answer");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Write at the newest version: a base that went stale meanwhile (the
+/// watched import publishes) is retried at the version it names.
+fn write_confirmed(
+    io: &mut RpcIo,
+    mut base: InputVersion,
+    ops: Vec<AuthoringOp>,
+) -> (distill_rpc::WriteReceipt, InputVersion) {
+    loop {
+        let ticket = io.authoring(AuthoringRequest::Write {
+            base,
+            ops: ops.clone(),
+            force_lossy: false,
+        });
+        match authoring_answer(io, ticket) {
+            AuthoringAnswer::Written { receipt, version } => return (receipt, version),
+            AuthoringAnswer::Stale { current } => base = current,
+            other => panic!("write answered {other:?}"),
+        }
+    }
+}
+
+fn inspected(io: &mut RpcIo, uuid: AssetUuid) -> (InputVersion, distill_rpc::AuthoringInspection) {
+    let ticket = io.authoring(AuthoringRequest::Inspect(vec![uuid]));
+    match authoring_answer(io, ticket) {
+        AuthoringAnswer::Entries { version, mut entries, missing } => {
+            assert!(missing.is_empty(), "{uuid} has no authored entry");
+            (version, entries.remove(0))
+        }
+        other => panic!("inspect answered {other:?}"),
+    }
+}
+
+/// `RpcIo`'s authoring calls against a live daemon: write a new bundle and
+/// get the version reflecting it, watch its entry (the loader never hears
+/// of it), refuse a stale base, rename the bundle with fixups.
+#[test]
+fn rpc_io_authoring_writes_watches_and_renames_through_a_live_daemon() {
+    let module = build_pipeline_fixture();
+    let source_identity = fixture_source_identity(&module);
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(assets.join("shaders")).unwrap();
+    std::fs::write(assets.join("pixel.ppm"), b"P6\n1 1\n255\n\xff\x00\x00").unwrap();
+    std::fs::write(assets.join("triangle.obj"), b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").unwrap();
+    std::fs::write(
+        assets.join("shaders/basic.comp"),
+        b"#version 450\n#include \"shaders/common.inc\"\nlayout(local_size_x=1, local_size_y=1, local_size_z=1) in;\nvoid main() { uint value = VALUE; }\n",
+    )
+    .unwrap();
+    std::fs::write(assets.join("shaders/common.inc"), b"const uint VALUE = 1;\n").unwrap();
+    let schema = fixture_schema(source_identity);
+    let authority = ProjectSchemaAuthority::from_schema(schema.clone(), [0x51; 32]).unwrap();
+    std::fs::write(temp.path().join("schema.json"), serde_json::to_vec(&schema).unwrap()).unwrap();
+    let config = write_config(&temp, &module, authority.identity());
+    let process = DaemonProcess::start(config.clone()).unwrap();
+    let [_, _, shader] = import_assets(&process, &config, &assets);
+    let coordinator = process.coordinator();
+    let reader = coordinator.open_reader().unwrap();
+    let target = coordinator.compiled_at(&reader).unwrap().build_target("dev").unwrap();
+    drop(reader);
+    let request = ConnectRequest::new("dev", TargetDefinitionHash(target_definition_hash(&target)));
+    let mut io = RpcIo::connect(process.rpc_address(), request).unwrap();
+
+    // A copy of the imported shader source entry, in a bundle of its own.
+    let (version, source) = inspected(&mut io, shader);
+    let copy = AssetUuid([0xc1; 16]);
+    let entry = AuthoringEntry {
+        uuid: copy,
+        bundle: BundleUuid([0xc0; 16]),
+        local_id: "copy".into(),
+        normalized_path: "copy.bundle".into(),
+        type_uuid: source.type_uuid,
+        terminal_type: source.type_uuid,
+        schema_hash: source.schema_hash,
+        logical_schema: source.logical_schema.clone(),
+        role: AuthoringEntryRole::Runtime,
+        tags: Default::default(),
+        value: source.value.clone(),
+    };
+    let (receipt, written) = write_confirmed(&mut io, version, vec![AuthoringOp::Set(entry.clone())]);
+    assert_eq!(receipt.files.len(), 1);
+    assert_eq!((receipt.files[0].root.as_str(), receipt.files[0].path.as_str()), ("main", "copy.bundle"));
+    assert!(written > version);
+    let (at, copied) = inspected(&mut io, copy);
+    assert!(at >= written);
+    assert_eq!(copied.value, source.value);
+    assert_eq!(copied.normalized_path, "copy.bundle");
+
+    // A stale base writes nothing and names the current version.
+    let ticket = io.authoring(AuthoringRequest::Write {
+        base: InputVersion(0),
+        ops: vec![AuthoringOp::Set(entry.clone())],
+        force_lossy: false,
+    });
+    assert!(matches!(authoring_answer(&mut io, ticket), AuthoringAnswer::Stale { current } if current >= written));
+
+    // A watched entry's change is reported to the watcher, not the loader.
+    io.watch_authoring(copy);
+    // The subscription's initial delta may name it: not this change.
+    let settled = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < settled {
+        io.step();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    io.take_authoring_changes();
+    let text = std::str::from_utf8(&source.value.canonical_value).unwrap().replacen("#version 450", "#version 460", 1);
+    assert_ne!(text.as_bytes(), &*source.value.canonical_value);
+    let edited = AuthoringEntry {
+        value: AuthoringValue { canonical_value: Arc::from(text.as_bytes()), ..source.value.clone() },
+        ..entry
+    };
+    let (_, rewritten) = write_confirmed(&mut io, at, vec![AuthoringOp::Set(edited)]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let change = loop {
+        let events = distill_loader::LoaderIO::poll(&mut io);
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                distill_loader::IoEvent::Delta { assets, .. } if assets.iter().any(|(asset, _)| *asset == copy)
+            )),
+            "an asset watched only for authoring reached the loader"
+        );
+        if let Some(change) = io.take_authoring_changes().into_iter().find(|change| change.version >= rewritten) {
+            break change;
+        }
+        assert!(Instant::now() < deadline, "the watched entry's change was not reported");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(change.uuid, copy);
+    assert!(!change.deleted);
+
+    // Rename the bundle: answered once the move is reflected.
+    let ticket = io.authoring(AuthoringRequest::Rename {
+        base: rewritten,
+        request: RenameWithFixupsRequest {
+            bundle: BundleUuid([0xc0; 16]),
+            destination_root: "main".into(),
+            destination_path: "moved/copy.bundle".into(),
+        },
+    });
+    let renamed = match authoring_answer(&mut io, ticket) {
+        AuthoringAnswer::Written { receipt, version } => {
+            assert!(receipt.files.iter().any(|file| file.path == "moved/copy.bundle" && file.content_hash.is_some()));
+            assert!(receipt.files.iter().any(|file| file.path == "copy.bundle" && file.content_hash.is_none()));
+            version
+        }
+        AuthoringAnswer::Stale { current } => panic!("rename base went stale (now {current:?})"),
+        other => panic!("rename answered {other:?}"),
+    };
+    let (at, moved) = inspected(&mut io, copy);
+    assert!(at >= renamed);
+    assert_eq!(moved.normalized_path, "moved/copy.bundle");
+    assert!(!assets.join("copy.bundle").exists());
 }
