@@ -1588,3 +1588,113 @@ fn a_full_rescan_logs_only_what_changed() {
         ]
     );
 }
+
+/// `describeType` and `describableTypes` (§17 "Type descriptions") read the
+/// type files of the one root holding the marker, at the snapshot: a file
+/// edited after it answers `Drifted`, a type the index does not list
+/// `Missing`. The default is the default file's, no pipeline involved.
+#[test]
+fn type_descriptions_read_the_type_files_at_the_snapshot() {
+    use distill_rpc::{DescribableTypesResult, DescribeTypeResult, DriftedInput, RpcResult, TypeDefault};
+    use distill_schema::ngp_schema::build::{field, SchemaBuilder};
+    use distill_schema::ngp_schema::{prefab_types, AnnotationValue, PrimitiveType};
+
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    let types = temp.path().join("types");
+    std::fs::create_dir_all(&assets).unwrap();
+    let mut b = SchemaBuilder::new();
+    let f32_t = b.primitive(PrimitiveType::F32);
+    let spinner = b.struct_type("game", "Spinner", vec![field("rate", f32_t)]);
+    let mut schema = b.finish();
+    schema.source_hashes.insert("game".into(), "0".into());
+    schema.types[spinner.0].has_default = true;
+    schema.types[spinner.0].attrs.doc = Some("Turns.".into());
+    let rate = &mut schema.types[spinner.0].fields[0].attrs;
+    rate.doc = Some("Degrees per second.".into());
+    rate.annotations.insert(
+        "editor".into(),
+        AnnotationValue::Nested(
+            [(
+                "range".to_owned(),
+                AnnotationValue::List(vec![AnnotationValue::Int(-720), AnnotationValue::Int(720)]),
+            )]
+            .into(),
+        ),
+    );
+    for (path, contents) in prefab_types::files(&schema) {
+        let path = types.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+    let projected = distill_schema::ngp_schema::project_values(&schema, spinner).unwrap().0;
+    let default = distill_schema::ngp_schema::Value::Struct(Box::new([distill_schema::ngp_schema::Value::F32(1.5)]));
+    let default_file = types.join(prefab_types::default_file("game::Spinner"));
+    std::fs::create_dir_all(default_file.parent().unwrap()).unwrap();
+    std::fs::write(default_file, prefab_types::write_default(&projected.root, &default).unwrap()).unwrap();
+    let type_uuid = schema.types[spinner.0].stable_type_uuid();
+
+    let coordinator = DaemonCoordinator::open(
+        StoreConfig::new(temp.path().join(".distill")),
+        vec![AssetRoot::new("main", &assets), AssetRoot::new("types", &types)],
+        vec![target()],
+        64,
+    )
+    .unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    let hub = match coordinator
+        .server()
+        .root()
+        .connect(ConnectRequest::new("dev", TargetDefinitionHash([4; 32])))
+    {
+        ConnectOutcome::Connected(connected) => connected.hub,
+        outcome => panic!("target connection failed: {outcome:?}"),
+    };
+    let RpcResult::Success(snapshot) = hub.authoring_snapshot() else {
+        panic!("an authoring snapshot")
+    };
+
+    let RpcResult::Success(DescribableTypesResult::Types { index_hash, types: listed, .. }) =
+        snapshot.describable_types()
+    else {
+        panic!("the index")
+    };
+    assert!(index_hash.is_some());
+    assert_eq!(listed.len(), 1);
+    assert_eq!((listed[0].type_uuid, listed[0].path.as_str()), (type_uuid, "game::Spinner"));
+
+    let RpcResult::Success(DescribeTypeResult::Description(description)) = snapshot.describe_type(type_uuid)
+    else {
+        panic!("a description")
+    };
+    assert_eq!(description.path, "game::Spinner");
+    assert_eq!(description.schema_hash, node_hash(&projected.root).unwrap());
+    assert_eq!(&*description.logical_schema, snapshot_to_json(&projected).unwrap().as_bytes());
+    match &description.default {
+        TypeDefault::Value(value) => assert_eq!(&*value.canonical_value, br#"{"rate":1.5}"#),
+        other => panic!("expected the default file's value, got {other:?}"),
+    }
+    let members: Vec<_> = description
+        .members
+        .iter()
+        .map(|m| (m.path.as_str(), m.doc.as_deref(), m.type_doc.as_deref(), m.range))
+        .collect();
+    assert_eq!(
+        members,
+        [
+            ("$", None, Some("Turns."), None),
+            ("$.rate", Some("Degrees per second."), None, Some([-720.0, 720.0])),
+        ]
+    );
+    assert_eq!(snapshot.describe_type(TypeUuid([9; 16])), RpcResult::Success(DescribeTypeResult::Missing));
+
+    // Edited on disk, not yet observed: the snapshot's bytes are gone.
+    let description_file = prefab_types::description_file("game::Spinner");
+    std::fs::write(types.join(&description_file), r#"{"members":{}}"#).unwrap();
+    assert!(matches!(
+        snapshot.describe_type(type_uuid),
+        RpcResult::Success(DescribeTypeResult::Drifted { input: DriftedInput::File(path), .. })
+            if path == description_file
+    ));
+}

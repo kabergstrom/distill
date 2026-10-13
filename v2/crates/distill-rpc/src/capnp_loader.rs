@@ -9,12 +9,13 @@ use distill_store::state::{InputVersion, SnapshotStamp, StoreInstanceId};
 
 pub use crate::capnp_transport::RemoteError;
 use crate::capnp_transport::{
-    decode_authoring_inspection, decode_configuration_error, decode_rpc_basis, decode_rpc_error,
+    decode_authoring_inspection, decode_configuration_error, decode_describable_types, decode_rpc_basis,
+    decode_rpc_error, decode_type_description,
     schema, RemoteConnectOutcome, RemoteMetadataOutcome,
 };
 use crate::{
     ArtifactChunk, ArtifactChunkKind, AssetDeltaState, AssetEvent, AssetQuery, AuthoringEntryRole,
-    AuthoringInspectResult, ConfigurationError, Delta, DriftedInput, ImportFailure, ImportRequest,
+    AuthoringInspectResult, ConfigurationError, Delta, DescribableTypesResult, DescribeTypeResult, DriftedInput, ImportFailure, ImportRequest,
     MetadataEntry, PathResolveFailure, PathResolveResult, ReconnectReason, ResolveResult, RpcBasis,
     RuntimeTypePolicy, ServedLoadEdge, StreamEvent, TerminalEvent,
 };
@@ -84,6 +85,28 @@ impl RemoteHub {
             ),
             schema::snapshot_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
             schema::snapshot_call::Which::Error(value) => {
+                Ok(RemoteCall::Error(decode_rpc_error(value?)?))
+            }
+        }
+    }
+
+    /// Pin an authoring view at the current version (§17 "Type
+    /// descriptions" reads through it).
+    pub async fn authoring_snapshot(&self) -> Result<RemoteCall<RemoteAuthoringSnapshot>, capnp::Error> {
+        let response = self.client.authoring_snapshot_request().send().promise.await?;
+        let result = response.get()?.get_result()?;
+        match result.which()? {
+            schema::authoring_snapshot_call::Which::Success(client) => {
+                Ok(RemoteCall::Success(RemoteAuthoringSnapshot { client: client? }))
+            }
+            schema::authoring_snapshot_call::Which::ReconnectRequired(value) => Ok(
+                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
+            ),
+            schema::authoring_snapshot_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
+            ),
+            schema::authoring_snapshot_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
+            schema::authoring_snapshot_call::Which::Error(value) => {
                 Ok(RemoteCall::Error(decode_rpc_error(value?)?))
             }
         }
@@ -237,6 +260,71 @@ impl RemoteHub {
             schema::uuid_call::Which::Error(value) => {
                 Ok(RemoteCall::Error(decode_rpc_error(value?)?))
             }
+        }
+    }
+}
+
+/// A hub's authoring view at one version: game type descriptions (§17
+/// "Type descriptions").
+#[derive(Clone)]
+pub struct RemoteAuthoringSnapshot {
+    client: schema::authoring_snapshot::Client,
+}
+
+impl std::fmt::Debug for RemoteAuthoringSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("RemoteAuthoringSnapshot").finish_non_exhaustive()
+    }
+}
+
+impl RemoteAuthoringSnapshot {
+    /// The description of `type_uuid` at this snapshot, its schema and
+    /// default authenticated.
+    pub async fn describe_type(&self, type_uuid: TypeUuid) -> Result<RemoteCall<DescribeTypeResult>, capnp::Error> {
+        let mut request = self.client.describe_type_request();
+        request.get().set_type_uuid(&type_uuid.0);
+        let response = request.send().promise.await?;
+        let result = response.get()?.get_result()?;
+        match result.which()? {
+            schema::describe_type_call::Which::Success(value) => {
+                Ok(RemoteCall::Success(DescribeTypeResult::Description(decode_type_description(value?)?)))
+            }
+            schema::describe_type_call::Which::Missing(()) => Ok(RemoteCall::Success(DescribeTypeResult::Missing)),
+            schema::describe_type_call::Which::Drifted(value) => {
+                let (input, current) = decode_drifted(value?)?;
+                Ok(RemoteCall::Success(DescribeTypeResult::Drifted { input, current }))
+            }
+            schema::describe_type_call::Which::ReconnectRequired(value) => Ok(
+                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
+            ),
+            schema::describe_type_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
+            ),
+            schema::describe_type_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
+            schema::describe_type_call::Which::Error(value) => Ok(RemoteCall::Error(decode_rpc_error(value?)?)),
+        }
+    }
+
+    /// The types this snapshot's type index lists.
+    pub async fn describable_types(&self) -> Result<RemoteCall<DescribableTypesResult>, capnp::Error> {
+        let response = self.client.describable_types_request().send().promise.await?;
+        let result = response.get()?.get_result()?;
+        match result.which()? {
+            schema::describable_types_call::Which::Success(value) => {
+                Ok(RemoteCall::Success(decode_describable_types(value?)?))
+            }
+            schema::describable_types_call::Which::Drifted(value) => {
+                let (input, current) = decode_drifted(value?)?;
+                Ok(RemoteCall::Success(DescribableTypesResult::Drifted { input, current }))
+            }
+            schema::describable_types_call::Which::ReconnectRequired(value) => Ok(
+                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
+            ),
+            schema::describable_types_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
+            ),
+            schema::describable_types_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
+            schema::describable_types_call::Which::Error(value) => Ok(RemoteCall::Error(decode_rpc_error(value?)?)),
         }
     }
 }

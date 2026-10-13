@@ -32,8 +32,10 @@ pub use distill_store::state::{
 /// decode) instead of a numeric code, and `importFailures` moves from the hub
 /// to the snapshot, naming each failure's bundle at that snapshot. 19:
 /// `importFailures` also lists the directory imports whose attempt failed
-/// before any bundle existed at their output, with an empty `bundle`.
-pub const PROTOCOL_VERSION: u32 = 19;
+/// before any bundle existed at their output, with an empty `bundle`. 20:
+/// `AuthoringSnapshot` gains `describeType` and `describableTypes` (§17
+/// "Type descriptions").
+pub const PROTOCOL_VERSION: u32 = 20;
 
 /// A watched import whose latest attempt failed. The bundle keeps serving its
 /// last good contents; the failure clears when a later import succeeds.
@@ -1114,6 +1116,95 @@ pub enum AuthoringInspectResult {
     },
     /// The entry's bundle file no longer holds the bytes the snapshot
     /// published; a fresher snapshot (`current` or later) inspects it.
+    Drifted {
+        input: DriftedInput,
+        current: SnapshotStamp,
+    },
+}
+
+/// What an editor knows about a game type without loading game code (§17
+/// "Type descriptions"): read from the type files a schema walk writes
+/// (`ngp_schema::prefab_types`), the default included, all at one
+/// snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeDescription {
+    pub stamp: SnapshotStamp,
+    pub type_uuid: TypeUuid,
+    /// The type's path (`game::Spinner`), as prefabs name it.
+    pub path: String,
+    /// The hash of `logical_schema`.
+    pub schema_hash: LogicalHash,
+    /// Canonical §5 logical-schema snapshot bytes of the type's value
+    /// projection, as [`AuthoringInspection::logical_schema`].
+    pub logical_schema: Arc<[u8]>,
+    pub default: TypeDefault,
+    /// Docs and editor hints by planner path (`$`, `$.rate`,
+    /// `$.shape{Ring}`), path-sorted; paths with neither are absent.
+    pub members: Vec<TypeMember>,
+}
+
+/// A described type's default value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeDefault {
+    /// The value, canonical, conforming to the description's schema.
+    Value(AuthoringValue),
+    /// No default file: the type has no `Default` thunk in the game
+    /// module, or its defaults were not written yet.
+    Absent,
+    /// The default file was written under another value projection (this
+    /// logical hash): the module build and the schema files come from
+    /// different walks (one is being rebuilt).
+    SchemaMismatch { written: LogicalHash },
+    /// The default file does not decode under the schema.
+    Invalid(String),
+}
+
+/// One described path of a type ([`TypeDescription::members`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeMember {
+    pub path: String,
+    /// The field's or variant's doc comment.
+    pub doc: Option<String>,
+    /// The doc comment of the struct or enum at the path.
+    pub type_doc: Option<String>,
+    /// `#[ngp(editor(range = (min, max)))]`.
+    pub range: Option<[f64; 2]>,
+    pub color: bool,
+    pub slider: bool,
+    pub hidden: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)] // Mirrors the typed result union.
+pub enum DescribeTypeResult {
+    Description(TypeDescription),
+    /// No type file describes the UUID at this snapshot.
+    Missing,
+    /// A type file no longer holds the bytes the snapshot observed; a
+    /// fresher snapshot (`current` or later) describes it.
+    Drifted {
+        input: DriftedInput,
+        current: SnapshotStamp,
+    },
+}
+
+/// One describable type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescribableType {
+    pub type_uuid: TypeUuid,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DescribableTypesResult {
+    /// The types of the snapshot's type index, path-sorted, and the index
+    /// file's content hash (`None`: no index): a changed hash at a later
+    /// snapshot is a changed list.
+    Types {
+        stamp: SnapshotStamp,
+        index_hash: Option<ContentHash>,
+        types: Vec<DescribableType>,
+    },
     Drifted {
         input: DriftedInput,
         current: SnapshotStamp,

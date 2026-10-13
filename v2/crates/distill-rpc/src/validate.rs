@@ -178,7 +178,7 @@ pub fn decode_settings_payload(
     Ok(value)
 }
 
-fn verified_schema(
+pub(crate) fn verified_schema(
     schema_hash: LogicalHash,
     logical_schema: &[u8],
 ) -> Result<LogicalSchema, AuthoringValueError> {

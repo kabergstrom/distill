@@ -500,6 +500,8 @@ fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
         "PathResolveCall",
         "ChunkStreamCall",
         "RuntimeTypePolicyCall",
+        "DescribeTypeCall",
+        "DescribableTypesCall",
     ] {
         let marker = format!("struct {name} {{");
         let body = source
@@ -2365,4 +2367,144 @@ fn invalid_request(error: schema::rpc_error::Reader<'_>) -> Option<schema::Inval
         schema::rpc_error::failure::Which::InvalidRequest(kind) => Some(kind.unwrap()),
         _ => None,
     }
+}
+
+/// Reads the project's type files from disk; never writes.
+struct TypeFilesBackend {
+    roots: std::path::PathBuf,
+}
+
+impl AuthoringBackend for TypeFilesBackend {
+    fn read_file(&self, _: &distill_store::StoreReader, root: &str, path: &str) -> Result<Vec<u8>, String> {
+        std::fs::read(self.roots.join(root).join(path)).map_err(|error| error.to_string())
+    }
+
+    fn write_files(
+        &self,
+        _: &mut distill_store::Store,
+        _: InputVersion,
+        _: &[AuthoringOp],
+        _: bool,
+    ) -> Result<WriteReceipt, RpcFailure> {
+        unreachable!("never writes")
+    }
+
+    fn prepare_import(
+        &self,
+        _: &mut distill_store::Store,
+        _: InputVersion,
+        _: &ImportRequest,
+    ) -> Result<PreparedImportCommit, RpcFailure> {
+        unreachable!("never imports")
+    }
+
+    fn prepare_reimport(
+        &self,
+        _: &mut distill_store::Store,
+        _: InputVersion,
+        _: BundleUuid,
+    ) -> Result<PreparedImportCommit, RpcFailure> {
+        unreachable!("never imports")
+    }
+
+    fn prepare_operation(
+        &self,
+        _: &mut distill_store::Store,
+        _: InputVersion,
+        _: &LongRunningOp,
+    ) -> Result<PreparedOperationCommit, RpcFailure> {
+        unreachable!("never operates")
+    }
+}
+
+/// `describeType` and `describableTypes` over TCP: the description's schema
+/// and default authenticate on decode, and every default arm crosses, each
+/// read from the default file at its snapshot.
+#[tokio::test(flavor = "current_thread")]
+async fn type_descriptions_round_trip_over_tcp() {
+    use distill_schema::ngp_schema::build::{field, SchemaBuilder};
+    use distill_schema::ngp_schema::{prefab_types, PrimitiveType};
+    LocalSet::new()
+        .run_until(async {
+            let mut project = TestProject::with_roots(vec![target()], &[ROOT, "types"]);
+            let mut b = SchemaBuilder::new();
+            let u32_t = b.primitive(PrimitiveType::U32);
+            let spinner = b.struct_type("game", "Spinner", vec![field("rate", u32_t)]);
+            let mut schema = b.finish();
+            schema.source_hashes.insert("game".into(), "0".into());
+            schema.types[spinner.0].has_default = true;
+            schema.types[spinner.0].fields[0].attrs.doc = Some("Degrees per second.".into());
+            for (path, contents) in prefab_types::files(&schema) {
+                project.write_in("types", &path, contents);
+            }
+            let type_uuid = schema.types[spinner.0].stable_type_uuid();
+            let projected = distill_schema::ngp_schema::project_values(&schema, spinner).unwrap().0;
+            let schema_hash = node_hash(&projected.root).unwrap();
+            let default_file = prefab_types::default_file("game::Spinner");
+            let rate = |rate: u32| Value::Struct(Box::new([Value::U32(rate)]));
+            project.write_in("types", &default_file, prefab_types::write_default(&projected.root, &rate(90)).unwrap());
+            let stamp = project.publish();
+
+            let backend = Arc::new(TypeFilesBackend { roots: project.path().to_owned() });
+            let handle = ServerHandle::open(backend.clone(), Arc::clone(project.coordinator().server_handle().opener()));
+            let server = Server::open(&handle);
+            let listener = Rc::new(StagedListener::bind(server.root(), "127.0.0.1:0").await.unwrap());
+            let address = listener.local_addr().unwrap();
+            let serving = Rc::clone(&listener);
+            let server_task = tokio::task::spawn_local(async move { serving.serve_one().await });
+            let client = CapnpClient::connect_local(address).await.unwrap();
+            let hub = RemoteHub::connected(client.connect(&request()).await.unwrap()).unwrap();
+            let snapshot = || async { hub.authoring_snapshot().await.unwrap().success().unwrap() };
+
+            match snapshot().await.describable_types().await.unwrap().success().unwrap() {
+                DescribableTypesResult::Types { stamp: at, index_hash, types } => {
+                    assert_eq!(at, stamp);
+                    assert!(index_hash.is_some());
+                    assert_eq!(types, [DescribableType { type_uuid, path: "game::Spinner".into() }]);
+                }
+                other => panic!("expected the index, got {other:?}"),
+            }
+            let describe = || async {
+                match snapshot().await.describe_type(type_uuid).await.unwrap().success().unwrap() {
+                    DescribeTypeResult::Description(description) => description,
+                    other => panic!("expected a description, got {other:?}"),
+                }
+            };
+            let description = describe().await;
+            assert_eq!(description.stamp, stamp);
+            assert_eq!(description.schema_hash, schema_hash);
+            match &description.default {
+                TypeDefault::Value(value) => assert_eq!(&*value.canonical_value, br#"{"rate":90}"#),
+                other => panic!("expected the default, got {other:?}"),
+            }
+            assert_eq!(description.members.len(), 1);
+            assert_eq!(description.members[0].path, "$.rate");
+            assert_eq!(description.members[0].doc.as_deref(), Some("Degrees per second."));
+            assert_eq!(description.members[0].range, None);
+
+            // Another walk's default names its own schema hash.
+            let mut other = SchemaBuilder::new();
+            let u64_t = other.primitive(PrimitiveType::U64);
+            let other_spinner = other.struct_type("game", "Spinner", vec![field("rate", u64_t)]);
+            let other = other.finish();
+            let other_root = distill_schema::ngp_schema::project_values(&other, other_spinner).unwrap().0.root;
+            let other_default = Value::Struct(Box::new([Value::U64(90)]));
+            project.write_in("types", &default_file, prefab_types::write_default(&other_root, &other_default).unwrap());
+            project.publish();
+            let written = node_hash(&other_root).unwrap();
+            assert_eq!(describe().await.default, TypeDefault::SchemaMismatch { written });
+            project.write_in("types", &default_file, format!(r#"{{"schema_hash":"{schema_hash}","value":{{"rate":-1}}}}"#));
+            project.publish();
+            assert!(matches!(describe().await.default, TypeDefault::Invalid(_)));
+            project.remove_in("types", &default_file);
+            project.publish();
+            assert_eq!(describe().await.default, TypeDefault::Absent);
+            assert!(matches!(
+                snapshot().await.describe_type(TypeUuid([9; 16])).await.unwrap().success(),
+                Some(DescribeTypeResult::Missing)
+            ));
+            drop(client);
+            server_task.abort();
+        })
+        .await;
 }

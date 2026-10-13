@@ -7574,6 +7574,8 @@ interface AuthoringSnapshot {
   inspect @2 (uuid :Data) -> (result :AuthoringInspectCall);
   refresh @3 () -> (result :AuthoringSnapshotCall);
   file @4 (root :Text, path :Text) -> (result :DataCall);
+  describeType @5 (typeUuid :Data) -> (result :DescribeTypeCall);
+  describableTypes @6 () -> (result :DescribableTypesCall);
 }
 ```
 
@@ -7617,6 +7619,33 @@ any bundle existed at their output (§8): `bundle` is empty, and root and
 path name the output the import would write. One is listed while the
 snapshot has its rules bundle and no bundle at that output; nothing is
 served at the output until the import succeeds.
+
+**Type descriptions** (protocol 20). An editor edits component values
+without loading game code; what it needs per type comes from the project's
+type files: the per-type files a schema walk writes (New Game Plus
+`ngp_schema::prefab_types`: `schemas/<path>.json`,
+`descriptions/<path>.json`, `type-index.json`) and the default files the
+game's build writes (`defaults/<path>.json`, from the built module's
+`Default` impls). They live in the one asset root holding the marker file
+`prefab-types.root` (two such roots are an error); no importer reads the
+descriptions, defaults or index, so editing them re-imports nothing.
+- `describeType(typeUuid)` answers a `TypeDescription`: the type's path,
+  the canonical logical schema of its value projection with its hash, its
+  default, and its members: per planner path (`$`, `$.rate`,
+  `$.shape{Ring}`), the doc comment, the doc of the type there, and the
+  editor hints (`range`, `color`, `slider`, `hidden`). The default is a
+  canonical `AuthoringValue` under that schema, `absent` (no default file),
+  `schemaMismatch` (the file was written under another projection, whose
+  hash it names: the module and the schema files come from different walks)
+  or `invalid`. `missing`: the index lists no such type, or its schema file
+  is a rename redirect.
+- `describableTypes()` answers the index's types (UUID, path), path-sorted,
+  with the index file's content hash: a changed hash at a later snapshot is
+  a changed list.
+- Every file is read at the snapshot: its bytes must hash to the content
+  hash the snapshot observed, else the call answers `drifted` with a fresher
+  stamp. A description and the prefab entries edited against it therefore
+  come from one input version.
 
 Subscriptions are cursor-bound and one connection owns one ordered delta
 stream. Its first installation at `installed >= since` atomically returns the

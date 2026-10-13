@@ -16,6 +16,7 @@ use std::time::Instant;
 
 use unicode_normalization::UnicodeNormalization;
 
+use distill_schema::ngp_schema::prefab_types;
 use distill_store::bundles::{AssetAnswer, AssetFilter};
 use distill_store::files::GlobKeys;
 use distill_store::served::{AssetResolution, ServedEntryMeta};
@@ -610,6 +611,169 @@ fn inspect_authoring(
         role: entry.role,
         value: entry.value,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Type descriptions (§17)
+
+enum TypeFileError {
+    /// The file no longer holds the bytes the snapshot observed.
+    Drifted(String),
+    Failure(RpcFailure),
+}
+
+impl From<RpcFailure> for TypeFileError {
+    fn from(error: RpcFailure) -> Self {
+        Self::Failure(error)
+    }
+}
+
+/// The type files (`ngp_schema::prefab_types`) as a snapshot observed
+/// them: under the one root holding the marker file, each read verified
+/// against the snapshot's content hash.
+struct TypeFiles<'a> {
+    server: &'a Server,
+    snapshot: &'a StoreReader,
+}
+
+impl TypeFiles<'_> {
+    /// The root holding [`prefab_types::MARKER`]; `None` without one. Two
+    /// such roots are an error: types would be ambiguous.
+    fn root(&self) -> Result<Option<String>, RpcFailure> {
+        let rows = self.snapshot.observed_files_at(prefab_types::MARKER).map_err(store_failure)?;
+        let mut roots = rows.into_iter().map(|row| row.root_name);
+        let Some(root) = roots.next() else {
+            return Ok(None);
+        };
+        if let Some(other) = roots.next() {
+            return Err(RpcFailure::InvalidQuery {
+                detail: format!("roots {root:?} and {other:?} both hold type files ({})", prefab_types::MARKER),
+            });
+        }
+        Ok(Some(root))
+    }
+
+    /// The bytes of `path` and their hash as the snapshot observed them;
+    /// `None` for no file there.
+    fn read(&self, root: &str, path: &str) -> Result<Option<(ContentHash, Vec<u8>)>, TypeFileError> {
+        let Some(hash) = self.snapshot.file_content_hash(root, path).map_err(store_failure)? else {
+            return Ok(None);
+        };
+        match self.server.inner.handle.authoring_backend().read_file(self.snapshot, root, path) {
+            Ok(bytes) if ContentHash(*blake3::hash(&bytes).as_bytes()) == hash => Ok(Some((hash, bytes))),
+            _ => Err(TypeFileError::Drifted(path.to_owned())),
+        }
+    }
+
+    /// The index's hash and rows; `None` without type files.
+    fn index(&self) -> Result<Option<(ContentHash, TypeIndex)>, TypeFileError> {
+        let Some(root) = self.root()? else {
+            return Ok(None);
+        };
+        let Some((hash, bytes)) = self.read(&root, prefab_types::INDEX)? else {
+            return Ok(None);
+        };
+        let index = prefab_types::read_index(&bytes).map_err(|error| invalid_type_file(prefab_types::INDEX, error))?;
+        let mut types = Vec::with_capacity(index.types.len());
+        for row in index.types {
+            let type_uuid = row
+                .uuid
+                .parse()
+                .map_err(|error| invalid_type_file(prefab_types::INDEX, format!("uuid {:?}: {error:?}", row.uuid)))?;
+            types.push(DescribableType { type_uuid, path: row.path });
+        }
+        Ok(Some((hash, TypeIndex { root, types })))
+    }
+}
+
+struct TypeIndex {
+    root: String,
+    types: Vec<DescribableType>,
+}
+
+fn invalid_type_file(path: &str, detail: impl fmt::Display) -> TypeFileError {
+    TypeFileError::Failure(RpcFailure::InvalidQuery {
+        detail: format!("type file {path}: {detail}"),
+    })
+}
+
+fn describe_type_in(
+    server: &Server,
+    snapshot: &StoreReader,
+    stamp: SnapshotStamp,
+    type_uuid: TypeUuid,
+) -> Result<DescribeTypeResult, RpcFailure> {
+    let files = TypeFiles { server, snapshot };
+    let described = (|| -> Result<Option<TypeDescription>, TypeFileError> {
+        let Some((_, index)) = files.index()? else {
+            return Ok(None);
+        };
+        let Some(entry) = index.types.into_iter().find(|t| t.type_uuid == type_uuid) else {
+            return Ok(None);
+        };
+        let schema_path = prefab_types::schema_file(&entry.path);
+        let Some((_, bytes)) = files.read(&index.root, &schema_path)? else {
+            return Ok(None);
+        };
+        let schema = match prefab_types::read_file(&bytes).map_err(|error| invalid_type_file(&schema_path, error))? {
+            prefab_types::Contents::Type { schema, .. } => schema,
+            prefab_types::Contents::RenamedTo(_) => return Ok(None),
+        };
+        let description_path = prefab_types::description_file(&entry.path);
+        let members = match files.read(&index.root, &description_path)? {
+            Some((_, bytes)) => {
+                prefab_types::read_description(&bytes).map_err(|error| invalid_type_file(&description_path, error))?.members
+            }
+            None => Default::default(),
+        };
+        let schema_hash = distill_schema::ngp_schema::node_hash(&schema.root)
+            .map_err(|error| invalid_type_file(&schema_path, format!("{error:?}")))?;
+        let logical_schema = distill_schema::ngp_schema::snapshot_to_json(&schema)
+            .map_err(|error| invalid_type_file(&schema_path, error))?;
+        let default = match files.read(&index.root, &prefab_types::default_file(&entry.path))? {
+            None => TypeDefault::Absent,
+            Some((_, bytes)) => match prefab_types::read_default(&bytes, &schema.root) {
+                Ok(prefab_types::DefaultFile::OtherSchema(written)) => TypeDefault::SchemaMismatch { written },
+                Ok(prefab_types::DefaultFile::Value(value)) => {
+                    match crate::validate::authoring_value(&schema.root, &value) {
+                        Ok(value) => TypeDefault::Value(value),
+                        Err(error) => TypeDefault::Invalid(error),
+                    }
+                }
+                Err(error) => TypeDefault::Invalid(error),
+            },
+        };
+        let members = members
+            .into_iter()
+            .map(|(path, member)| TypeMember {
+                path,
+                doc: member.doc,
+                type_doc: member.type_doc,
+                range: member.editor.range,
+                color: member.editor.color,
+                slider: member.editor.slider,
+                hidden: member.editor.hidden,
+            })
+            .collect();
+        Ok(Some(TypeDescription {
+            stamp,
+            type_uuid,
+            path: entry.path,
+            schema_hash,
+            logical_schema: Arc::from(logical_schema.into_bytes()),
+            default,
+            members,
+        }))
+    })();
+    match described {
+        Ok(Some(description)) => Ok(DescribeTypeResult::Description(description)),
+        Ok(None) => Ok(DescribeTypeResult::Missing),
+        Err(TypeFileError::Drifted(path)) => Ok(DescribeTypeResult::Drifted {
+            input: DriftedInput::File(path),
+            current: server.inner.current_stamp().map_err(store_failure)?,
+        }),
+        Err(TypeFileError::Failure(error)) => Err(error),
+    }
 }
 
 /// What a generation fence answers in place of the call, if anything: a
@@ -2222,6 +2386,46 @@ impl AuthoringSnapshot {
             Err(result) => return result,
         };
         RpcResult::Success(rpc_try!(txn.snapshot().file_content_hash(root, path)))
+    }
+
+    /// What the snapshot's type files say about `type_uuid`, with the
+    /// default the serving pipeline registered (§17 "Type descriptions").
+    pub fn describe_type(&self, type_uuid: TypeUuid) -> RpcResult<DescribeTypeResult> {
+        let txn = match self.preflight() {
+            Ok(txn) => txn,
+            Err(result) => return result,
+        };
+        match describe_type_in(&self.server, txn.snapshot(), self.basis.snapshot, type_uuid) {
+            Ok(result) => RpcResult::Success(result),
+            Err(error) => RpcResult::Failure(error),
+        }
+    }
+
+    /// The types the snapshot's type index lists (§17 "Type descriptions").
+    pub fn describable_types(&self) -> RpcResult<DescribableTypesResult> {
+        let txn = match self.preflight() {
+            Ok(txn) => txn,
+            Err(result) => return result,
+        };
+        let types = TypeFiles { server: &self.server, snapshot: txn.snapshot() };
+        let result = match types.index() {
+            Ok(Some((index_hash, index))) => DescribableTypesResult::Types {
+                stamp: self.basis.snapshot,
+                index_hash: Some(index_hash),
+                types: index.types,
+            },
+            Ok(None) => DescribableTypesResult::Types {
+                stamp: self.basis.snapshot,
+                index_hash: None,
+                types: Vec::new(),
+            },
+            Err(TypeFileError::Drifted(path)) => DescribableTypesResult::Drifted {
+                input: DriftedInput::File(path),
+                current: rpc_try!(self.server.inner.current_stamp()),
+            },
+            Err(TypeFileError::Failure(error)) => return RpcResult::Failure(error),
+        };
+        RpcResult::Success(result)
     }
 
     pub fn refresh(&self) -> RpcResult<AuthoringSnapshot> {
