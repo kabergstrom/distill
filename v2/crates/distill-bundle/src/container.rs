@@ -262,12 +262,14 @@ pub(crate) fn write(bundle: &Bundle) -> Result<Vec<u8>, BundleError> {
         }
     }
 
+    let table = bundle.type_table()?;
+
     // ---- pass A: validate data against schemas, collect blob lengths ----
     let mut collected: Vec<(&str, Vec<u8>, u64)> = Vec::new(); // (local_id, path, len)
     for (local_id, entry) in &bundle.assets {
         let schema = &bundle.schemas[&entry.schema_hash]; // presence checked above
         let sites =
-            blob_sites(&schema.root, &entry.data).map_err(|e| map_error(local_id, e, None))?;
+            blob_sites(&schema.root, &entry.data, Some(&mut &table)).map_err(|e| map_error(local_id, e, None))?;
         for (path, len) in sites {
             collected.push((local_id.as_str(), encode_path(&path), len));
         }
@@ -302,7 +304,7 @@ pub(crate) fn write(bundle: &Bundle) -> Result<Vec<u8>, BundleError> {
             &entry.data,
             WriteOptions {
                 blobs: Some(&mut sink),
-                types: None,
+                types: Some(&mut &table),
             },
         )
         .map_err(|e| map_error(local_id, e, None))?;

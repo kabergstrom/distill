@@ -633,6 +633,7 @@ fn authoring_entry(byte: u8, role: AuthoringEntryRole) -> AuthoringEntry {
         value: AuthoringValue {
             canonical_value: Arc::from(&b"{\"len\":1,\"offset\":0}"[..]),
             blobs: vec![Arc::from([byte.wrapping_add(2)])],
+            types: Vec::new(),
         },
     }
 }

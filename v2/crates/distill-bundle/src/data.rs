@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use distill_json::Lexer;
 use ngp_schema::{
     display_path, encode_path, read_value, BlobSink, BlobSource, Options, PathComponent,
-    SchemaNode, TextError, TextErrorKind, Value,
+    SchemaNode, TextError, TextErrorKind, TypeTable, Value,
 };
 
 use crate::error::BundleError;
@@ -93,9 +93,10 @@ pub(crate) fn parse_entry(
     root: &SchemaNode,
     lex: &mut Lexer<'_>,
     blobs: &mut Blobs<'_>,
+    mut types: &TypeTable,
 ) -> Result<Value, BundleError> {
     match blobs {
-        Blobs::Plain => read_value(lex, root, Options::canonical())
+        Blobs::Plain => read_value(lex, root, Options::canonical().types(&mut types))
             .map_err(|e| map_error(local_id, e, None)),
         Blobs::Container { chunk, sites } => {
             let mut source = ChunkSource {
@@ -104,7 +105,11 @@ pub(crate) fn parse_entry(
                 sites,
                 failed: None,
             };
-            let out = read_value(lex, root, Options::canonical().blobs(&mut source));
+            let out = read_value(
+                lex,
+                root,
+                Options::canonical().blobs(&mut source).types(&mut types),
+            );
             let failed = source.failed.take();
             out.map_err(|e| map_error(local_id, e, failed))
         }

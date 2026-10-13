@@ -609,6 +609,7 @@ mod reference_tests {
             uuid: BundleUuid([2; 16]),
             primary: None,
             schemas: BTreeMap::from([(hash, schema)]),
+            types: Default::default(),
             assets: BTreeMap::from([(
                 "main".to_owned(),
                 AssetEntry {

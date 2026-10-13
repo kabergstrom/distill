@@ -278,6 +278,7 @@ impl AuthoringService {
                     uuid: bundle_id,
                     primary: None,
                     schemas: BTreeMap::new(),
+                    types: Default::default(),
                     assets: BTreeMap::new(),
                 },
             )
@@ -303,6 +304,10 @@ impl AuthoringService {
             self.apply_set(store, &compiled, &mut bundle, entry, force_lossy)?;
         }
         infer_primary(&mut bundle)?;
+        let used_types = distill_bundle::referenced_types(&bundle);
+        bundle
+            .types
+            .retain(|_, ty| used_types.contains(&ty.type_uuid));
         let used_schemas = distill_bundle::referenced_schema_hashes(&bundle);
         bundle.schemas.retain(|hash, _| used_schemas.contains(hash));
         let proposed = if bundle.assets.is_empty() {
@@ -359,14 +364,32 @@ impl AuthoringService {
             .map_err(|_| invalid("logical schema is not UTF-8"))?;
         let schema = distill_schema::ngp_schema::verify_snapshot(schema_text, entry.schema_hash)
             .map_err(invalid)?;
-        let data = decode_authoring_payload(entry.schema_hash, &entry.logical_schema, &entry.value)
-            .map_err(|error| invalid(format!("invalid authored value: {error:?}")))?;
+        let (data, types) =
+            decode_authoring_payload(entry.schema_hash, &entry.logical_schema, &entry.value)
+                .map_err(|error| invalid(format!("invalid authored value: {error:?}")))?;
         if !force_lossy {
             if let Some(existing) = bundle.assets.get(&entry.local_id) {
                 self.check_lossless(compiled, bundle, existing, &schema, entry.schema_hash)?;
             }
         }
         bundle.schemas.insert(entry.schema_hash, schema);
+        // The written types replace the bundle's by path and UUID; an entry
+        // this write leaves naming one must still conform (the bundle write
+        // checks it).
+        for ty in types.types() {
+            let schema_hash = distill_schema::ngp_schema::node_hash(&ty.schema.root).map_err(invalid)?;
+            bundle
+                .types
+                .retain(|path, existing| *path != ty.path && existing.type_uuid != ty.uuid);
+            bundle.types.insert(
+                ty.path.clone(),
+                distill_bundle::BundleType {
+                    type_uuid: ty.uuid,
+                    schema_hash,
+                },
+            );
+            bundle.schemas.insert(schema_hash, (*ty.schema).clone());
+        }
         bundle.assets.insert(
             entry.local_id.clone(),
             AssetEntry {

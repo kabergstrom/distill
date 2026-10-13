@@ -452,6 +452,19 @@ pub struct AuthoringValue {
     /// not a `ContentHash` and cannot be fetched as an artifact.
     pub canonical_value: Arc<[u8]>,
     pub blobs: Vec<Arc<[u8]>>,
+    /// The types its dynamic values name (newgameplus GAP 23 §3), each
+    /// once, in path order.
+    pub types: Vec<AuthoringType>,
+}
+
+/// A type a carried value's dynamic values name: the path its text
+/// spells and its verified schema snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoringType {
+    pub path: String,
+    pub type_uuid: TypeUuid,
+    pub schema_hash: LogicalHash,
+    pub logical_schema: Arc<[u8]>,
 }
 
 /// Closed authoring mutation grammar accepted by `Hub.write`.
@@ -1508,4 +1521,9 @@ pub enum AuthoringValueError {
     BlobIndexOutOfRange { index: u32, blob_count: u32 },
     DuplicateBlobIndex { index: u32 },
     UnusedBlobIndex { index: u32 },
+    /// A carried type is malformed, listed twice, or its schema does not
+    /// verify.
+    TypeInvalid(String),
+    /// A carried type no dynamic value names.
+    UnusedType { path: String },
 }

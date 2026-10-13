@@ -529,6 +529,7 @@ fn import_assets(process: &DaemonProcess, config: &DaemonConfig, assets: &Path) 
             settings: AuthoringValue {
                 canonical_value: Arc::from(&b"{\"value\":0}"[..]),
                 blobs: Vec::new(),
+                types: Vec::new(),
             },
             watch: true,
             root: "main".into(),

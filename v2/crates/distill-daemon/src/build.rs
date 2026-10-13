@@ -45,7 +45,7 @@ use distill_build::trace::{
 };
 use distill_bundle::{AssetEntry, Bundle};
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
-use distill_schema::ngp_schema::{AssetRefValue, Value};
+use distill_schema::ngp_schema::{AssetRefValue, TypeTable, Value};
 use distill_migrate::{
     conforms, execute_ops, plan_automatic_renamed, validate_plan, DefaultProvider, EdgeKind,
     FieldPath, MigrationError, MigrationOp,
@@ -72,8 +72,8 @@ use distill_wire::artifact::{parse_artifact, ArtifactError, ARTIFACT_FORMAT_VERS
 use distill_wire::encode::EncodeError;
 
 use crate::callbacks::{
-    CallbackInvokeError, DiagnosticSeverity, PipelineProcessContext, ProcessArtifact,
-    ProcessContextError, ProcessOutputs,
+    AuthoredAsset, CallbackInvokeError, DiagnosticSeverity, PipelineProcessContext,
+    ProcessArtifact, ProcessContextError, ProcessOutputs,
 };
 use crate::compiled::Compiled;
 use crate::coordinator::DaemonCoordinator;
@@ -873,6 +873,8 @@ struct LoadedAsset {
     meta: EntryMeta,
     bundle_bytes: Vec<u8>,
     entry: AssetEntry,
+    /// The bundle's dynamic-type closure (GAP 23 §3).
+    types: TypeTable,
 }
 
 /// The ToolEpoch visible at a build's view, read one key at a time as
@@ -1090,6 +1092,9 @@ fn artifact_bytes(context: &BuildContext, hash: ContentHash) -> Result<Arc<[u8]>
 struct BuildProcessContext<'a, 's> {
     context: &'a mut BuildContext<'s>,
     origin_bundle: BundleUuid,
+    /// The processed asset and its bundle's dynamic types.
+    input: AssetUuid,
+    input_types: TypeTable,
     outputs: ProcessOutputs,
     trace: Vec<TraceOp>,
     stopped: bool,
@@ -1103,11 +1108,14 @@ impl<'a, 's> BuildProcessContext<'a, 's> {
         context: &'a mut BuildContext<'s>,
         origin_bundle: BundleUuid,
         parent: AssetUuid,
+        input_types: TypeTable,
         declarations: distill_build::outputs::OutputDecls,
     ) -> Self {
         Self {
             context,
             origin_bundle,
+            input: parent,
+            input_types,
             outputs: ProcessOutputs::new(parent, declarations),
             trace: Vec::new(),
             stopped: false,
@@ -1307,6 +1315,59 @@ impl PipelineProcessContext for BuildProcessContext<'_, '_> {
             Ok((_, results)) => Ok(results),
             Err(failure) => Err(self.abort_observed(failure)),
         }
+    }
+
+    fn input_types(&mut self) -> Result<TypeTable, ProcessContextError> {
+        self.ensure_active()?;
+        let asset = self.input;
+        let observed = self.ask(|source| source.authoring_read(asset))?;
+        self.trace.push(TraceOp::AuthoringRead { asset, observed });
+        Ok(self.input_types.clone())
+    }
+
+    fn read_authored(
+        &mut self,
+        reference: &AssetRefValue,
+        expected_terminal: TypeUuid,
+    ) -> Result<AuthoredAsset, ProcessContextError> {
+        self.ensure_active()?;
+        let origin = self.origin_bundle;
+        let mut trace = Vec::new();
+        let resolved = self.ask(|source| {
+            resolve_reference(source, origin, reference, expected_terminal, true, &mut trace)
+        })?;
+        self.trace.append(&mut trace);
+        let asset = match resolved {
+            Ok(asset) => asset,
+            Err(detail) => {
+                return Err(self.abort(
+                    BuildError::Failed(detail.clone()),
+                    ProcessContextError::Failed(detail),
+                ))
+            }
+        };
+        let observed = self.ask(|source| source.authoring_read(asset))?;
+        self.trace.push(TraceOp::AuthoringRead { asset, observed });
+        let loaded = (|| {
+            let store = lock_build_store(self.context)?;
+            load_asset(&store, &self.context.scanner, asset)
+        })()
+        .map_err(|error| self.abort_build(error))?;
+        let project = match self.context.env.authority.project_type(loaded.entry.type_uuid) {
+            Some(project) => project.clone(),
+            None => {
+                let detail = format!("type {} has no project schema authority", loaded.entry.type_uuid);
+                return Err(self.abort(BuildError::Failed(detail.clone()), ProcessContextError::Failed(detail)));
+            }
+        };
+        let current_load = &self.context.env.current_load;
+        let value = load_current_value(self.context, &loaded, &project, current_load, &mut self.trace)
+            .map_err(|error| self.abort_build(error))?;
+        Ok(AuthoredAsset {
+            asset,
+            value,
+            types: loaded.types,
+        })
     }
 
     fn target(&self) -> Result<&Target, ProcessContextError> {
@@ -2445,6 +2506,7 @@ fn run_processor_stage(
         context,
         loaded.meta.bundle,
         loaded.entry.uuid,
+        loaded.types.clone(),
         stage.registration.outputs.clone(),
     );
     if verify_fresh {
@@ -2837,6 +2899,7 @@ fn encode_processor_products(
                     schema: &project.logical_schema.root,
                     wire: &project.wire,
                     value,
+                    types: None,
                 },
                 &mut resolver,
             )
@@ -3547,6 +3610,7 @@ fn artifact_encoding_failure(error: &ArtifactEncodeError) -> Option<ArtifactEnco
         ArtifactEncodeError::Value(
             EncodeError::Shape { .. }
             | EncodeError::InvalidReference { .. }
+            | EncodeError::InvalidDynamic { .. }
             | EncodeError::Bounds { .. }
             | EncodeError::DepthExceeded,
         )
@@ -3968,6 +4032,7 @@ fn encode_or_hydrate(
                 schema: &project.logical_schema.root,
                 wire: &project.wire,
                 value: &current_value,
+                types: Some(&loaded.types),
             },
             &mut resolver,
         )
@@ -4170,6 +4235,7 @@ fn load_asset(
         meta,
         bundle_bytes: canonical,
         entry: entry.clone(),
+        types: bundle.type_table().map_err(BuildError::failed)?,
     })
 }
 
@@ -4837,6 +4903,7 @@ mod tests {
             uuid: BUNDLE,
             primary: Some("entry".to_owned()),
             schemas: BTreeMap::from([(old_hash, old_schema.clone())]),
+            types: Default::default(),
             assets: BTreeMap::from([(
                 "entry".to_owned(),
                 AssetEntry {
@@ -5028,6 +5095,7 @@ mod tests {
             uuid: BUNDLE,
             primary: Some("entry".to_owned()),
             schemas: BTreeMap::from([(project.logical_hash, project.logical_schema.clone())]),
+            types: Default::default(),
             assets: BTreeMap::from([(
                 "entry".to_owned(),
                 AssetEntry {
@@ -5247,6 +5315,7 @@ mod tests {
             uuid: BundleUuid([89; 16]),
             primary: None,
             schemas: BTreeMap::from([(project.logical_hash, project.logical_schema.clone())]),
+            types: Default::default(),
             assets: many
                 .iter()
                 .enumerate()
@@ -5344,6 +5413,7 @@ mod tests {
             uuid: BUNDLE,
             primary: Some("entry".to_owned()),
             schemas: BTreeMap::from([(project.logical_hash, project.logical_schema.clone())]),
+            types: Default::default(),
             assets: BTreeMap::from([(
                 "entry".to_owned(),
                 AssetEntry {
@@ -5362,6 +5432,7 @@ mod tests {
             uuid: DEPENDENCY_BUNDLE,
             primary: Some("dependency".to_owned()),
             schemas: BTreeMap::from([(project.logical_hash, project.logical_schema.clone())]),
+            types: Default::default(),
             assets: BTreeMap::from([(
                 "dependency".to_owned(),
                 AssetEntry {

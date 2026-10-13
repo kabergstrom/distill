@@ -238,6 +238,7 @@ impl Cells {
             uuid: bundle(uuid.0[0]),
             primary: Some("entry".to_owned()),
             schemas: BTreeMap::from([(project.logical_hash, project.logical_schema.clone())]),
+            types: Default::default(),
             assets: BTreeMap::from([(
                 "entry".to_owned(),
                 AssetEntry {

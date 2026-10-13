@@ -45,6 +45,7 @@ pub fn pack_definition_bundle(
         uuid: bundle,
         primary: None,
         schemas: BTreeMap::from([(row.logical_hash, schema)]),
+        types: Default::default(),
         assets: BTreeMap::from([(
             "pack".to_owned(),
             AssetEntry {

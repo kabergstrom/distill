@@ -3,9 +3,10 @@
 //! Top-level keys: `format_version` (pinned = 1), `uuid`, `primary`
 //! (optional, must name an existing entry), `schemas` (64-hex LogicalHash →
 //! schema snapshot JSON, key verified to equal the snapshot's own hash),
-//! `assets` (local_id → {uuid, type_uuid, schema_hash, authoring_only,
-//! data}). Unknown keys at either level are errors — the canonical writer
-//! never emits them. Bundles are schema-closed: every entry's
+//! `types` (optional, the dynamic-type closure: type path →
+//! {schema_hash, type_uuid}, each schema in `schemas`), `assets` (local_id →
+//! {uuid, type_uuid, schema_hash, authoring_only, data}). Unknown keys at
+//! either level are errors — the canonical writer never emits them. Bundles are schema-closed: every entry's
 //! `schema_hash` resolves in `schemas`. The `$` local_id namespace is
 //! reserved for exactly `$settings` and `$record`.
 //!
@@ -122,7 +123,7 @@ pub(crate) fn parse(
     for key in top.keys() {
         if !matches!(
             key.as_str(),
-            "assets" | "format_version" | "primary" | "schemas" | "uuid"
+            "assets" | "format_version" | "primary" | "schemas" | "types" | "uuid"
         ) && strictness == Strictness::Full
         {
             return Err(BundleError::UnknownEnvelopeKey { key: key.clone() });
@@ -203,6 +204,46 @@ pub(crate) fn parse(
             }
         }
     }
+
+    // The dynamic-type closure (GAP 23 §3): path → {schema_hash, type_uuid}.
+    let mut types = BTreeMap::new();
+    if let Some(span) = top.remove("types") {
+        let mut lex = span.lexer(text);
+        if lex.peek().map_err(json)? != Kind::Object {
+            return Err(BundleError::BadType {
+                path: String::new(),
+                detail: format!("types must be a JSON object, found {}", found(&mut lex)?),
+            });
+        }
+        for (path, span) in members(&mut lex)? {
+            let mut lex = span.lexer(text);
+            if lex.peek().map_err(json)? != Kind::Object {
+                return Err(BundleError::BadType {
+                    detail: format!("must be an object, found {}", found(&mut lex)?),
+                    path,
+                });
+            }
+            let mut entry = members(&mut lex)?;
+            if let Some(key) = entry
+                .keys()
+                .find(|key| !matches!(key.as_str(), "schema_hash" | "type_uuid"))
+            {
+                return Err(BundleError::BadType {
+                    detail: format!("unknown key {key:?}"),
+                    path,
+                });
+            }
+            let type_uuid: TypeUuid = take_id(text, &mut entry, &path, "type_uuid")
+                .map_err(|error| BundleError::BadType { path: path.clone(), detail: error.to_string() })?;
+            let schema_hash: LogicalHash = take_id(text, &mut entry, &path, "schema_hash")
+                .map_err(|error| BundleError::BadType { path: path.clone(), detail: error.to_string() })?;
+            if !schemas.contains_key(&schema_hash) {
+                return Err(BundleError::MissingTypeSchema { path, schema_hash });
+            }
+            types.insert(path, crate::BundleType { type_uuid, schema_hash });
+        }
+    }
+    let table = crate::type_table(&types, &schemas)?;
 
     let mut assets = BTreeMap::new();
     let mut data_spans = BTreeMap::new();
@@ -308,7 +349,7 @@ pub(crate) fn parse(
     for (local_id, entry) in assets.iter_mut() {
         let span = &data_spans[local_id];
         let root = &schemas[&entry.schema_hash].root;
-        entry.data = parse_entry(local_id, root, &mut span.lexer(text), &mut blobs)?;
+        entry.data = parse_entry(local_id, root, &mut span.lexer(text), &mut blobs, &table)?;
     }
 
     Ok(Bundle {
@@ -316,6 +357,7 @@ pub(crate) fn parse(
         uuid,
         primary,
         schemas,
+        types,
         assets,
     })
 }
@@ -452,7 +494,23 @@ pub(crate) fn write(
             snapshot_to_json(schema).map_err(|error| BundleError::Schema { hash: *hash, error })?;
         out.push_str(&text);
     }
-    out.push_str("},\"uuid\":");
+    out.push('}');
+    if !bundle.types.is_empty() {
+        out.push_str(",\"types\":{");
+        for (i, (path, ty)) in bundle.types.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            write_str(path, &mut out);
+            out.push_str(":{\"schema_hash\":");
+            write_str(&ty.schema_hash.to_string(), &mut out);
+            out.push_str(",\"type_uuid\":");
+            write_str(&ty.type_uuid.to_string(), &mut out);
+            out.push('}');
+        }
+        out.push('}');
+    }
+    out.push_str(",\"uuid\":");
     write_str(&bundle.uuid.to_string(), &mut out);
     out.push('}');
     Ok(out)

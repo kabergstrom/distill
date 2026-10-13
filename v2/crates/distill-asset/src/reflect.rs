@@ -736,3 +736,21 @@ impl EncodeSink for CanonicalSink {
 pub fn type_id<T: 'static>() -> TypeId {
     TypeId::of::<T>()
 }
+
+unsafe impl AssetReflect for crate::types::DynamicPatch {
+    fn layout(builder: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {
+        <String as AssetReflect>::layout(builder, offset)
+    }
+    fn logical(builder: &mut LogicalBuilder) {
+        builder.byte(0x0F);
+        builder.byte(1);
+    }
+    fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
+        self.0.encode(sink)
+    }
+    /// Unsupported: the text reads only through its bundle's type closure
+    /// (see [`crate::types::DynamicPatch`]).
+    fn to_value(&self) -> Value {
+        panic!("a DynamicPatch has no value without its bundle's type closure; build the value as ngp_schema::Value")
+    }
+}

@@ -175,6 +175,18 @@ pub enum BundleError {
         local_id: String,
         detail: &'static str,
     },
+    /// `types` (the dynamic-type closure) is not an object of
+    /// `{"schema_hash", "type_uuid"}` entries keyed by type path.
+    BadType {
+        path: String,
+        detail: String,
+    },
+    /// Schema closure of a dynamic type: its `schema_hash` does not
+    /// resolve in `schemas`.
+    MissingTypeSchema {
+        path: String,
+        schema_hash: LogicalHash,
+    },
 
     // ---- schema-directed walk ----
     /// The data value has the wrong JSON shape for the schema node at
@@ -467,6 +479,11 @@ impl fmt::Display for BundleError {
             E::EntryRole { local_id, detail } => {
                 write!(f, "asset {local_id:?} has an invalid entry role: {detail}")
             }
+            E::BadType { path, detail } => write!(f, "types: {path:?}: {detail}"),
+            E::MissingTypeSchema { path, schema_hash } => write!(
+                f,
+                "type {path:?}: schema_hash {schema_hash} does not resolve in this bundle's schemas (bundles are schema-closed)"
+            ),
             E::Shape {
                 local_id,
                 path,

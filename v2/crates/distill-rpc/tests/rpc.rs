@@ -860,6 +860,7 @@ fn authoring_entry(byte: u8, role: AuthoringEntryRole) -> AuthoringEntry {
         value: AuthoringValue {
             canonical_value: Arc::from(&b"{\"len\":1,\"offset\":0}"[..]),
             blobs: vec![Arc::from([byte.wrapping_add(2)])],
+            types: Vec::new(),
         },
     }
 }
@@ -875,7 +876,7 @@ fn authoring_snapshot(hub: &Hub) -> AuthoringSnapshot {
 fn authoring_payload_decoder_materializes_authenticated_blob_bytes() {
     let entry = authoring_entry(9, AuthoringEntryRole::AuthoringOnly);
     assert_eq!(
-        decode_authoring_payload(entry.schema_hash, &entry.logical_schema, &entry.value).unwrap(),
+        decode_authoring_payload(entry.schema_hash, &entry.logical_schema, &entry.value).unwrap().0,
         Value::Blob(vec![11])
     );
 }
@@ -915,6 +916,7 @@ fn authoring_payload_decoder_reenters_an_enum_from_its_variant_payload() {
             &br#"{"Link":{"blob":{"len":1,"offset":0},"next":{"Link":{"blob":{"len":1,"offset":1},"next":{"End":{}}}}}}"#[..],
         ),
         blobs: vec![Arc::from([1u8]), Arc::from([2u8])],
+        types: Vec::new(),
     };
     // Variants by name: End = 0, Link = 1; Link fields: blob, next.
     let link = |byte: u8, next: Value| Value::Enum {
@@ -931,7 +933,8 @@ fn authoring_payload_decoder_reenters_an_enum_from_its_variant_payload() {
             snapshot_to_json(&schema).unwrap().as_bytes(),
             &value,
         )
-        .unwrap(),
+        .unwrap()
+        .0,
         link(1, link(2, end))
     );
 }
@@ -958,8 +961,10 @@ fn decode_plain(root: SchemaNode, canonical: &str) -> Result<Value, AuthoringVal
         &AuthoringValue {
             canonical_value: Arc::from(canonical.as_bytes()),
             blobs: Vec::new(),
+            types: Vec::new(),
         },
     )
+    .map(|(value, _)| value)
 }
 
 #[test]
@@ -2664,6 +2669,7 @@ fn hub_authoring_and_wire_tree_surface_is_versioned_typed_and_generation_first()
         settings: AuthoringValue {
             canonical_value: Arc::from(&b"{}"[..]),
             blobs: vec![Arc::from(&b"settings-blob"[..])],
+            types: Vec::new(),
         },
         watch: true,
         root: "assets".to_owned(),
@@ -2804,6 +2810,7 @@ fn an_unregistered_importer_is_typed_and_never_advances_the_input_version() {
         settings: AuthoringValue {
             canonical_value: Arc::from(&b"{}"[..]),
             blobs: vec![],
+            types: Vec::new(),
         },
         watch: false,
         root: String::new(),

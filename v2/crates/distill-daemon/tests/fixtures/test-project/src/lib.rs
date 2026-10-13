@@ -107,6 +107,7 @@ pub fn bundle_bytes(uuid: BundleUuid, primary: Option<&str>, assets: &[Asset]) -
         uuid,
         primary: primary.map(str::to_owned),
         schemas,
+        types: Default::default(),
         assets: entries,
     })
     .unwrap()

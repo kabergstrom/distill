@@ -485,6 +485,7 @@ fn typed_bundle(authority: &ProjectSchemaAuthority, type_uuid: TypeUuid, index: 
         uuid: BundleUuid(uuid),
         primary: Some("entry".into()),
         schemas: BTreeMap::from([(project.logical_hash, project.logical_schema.clone())]),
+        types: Default::default(),
         assets: BTreeMap::from([(
             "entry".into(),
             AssetEntry {
@@ -961,6 +962,7 @@ fn a_complete_publication_revalidates_a_poisoned_skeleton_after_a_schema_edit() 
         uuid: bundle,
         primary: Some("entry".into()),
         schemas: BTreeMap::from([(project.logical_hash, project.logical_schema.clone())]),
+        types: Default::default(),
         assets: BTreeMap::from([(
             "entry".into(),
             AssetEntry {
@@ -1051,6 +1053,7 @@ fn labeled_bundle(bundle: u8, asset: u8, category: &str, malformed: bool) -> Vec
         uuid: BundleUuid([bundle; 16]),
         primary: Some("entry".into()),
         schemas: BTreeMap::from([(project.logical_hash, project.logical_schema.clone())]),
+        types: Default::default(),
         assets: BTreeMap::from([(
             "entry".into(),
             AssetEntry {

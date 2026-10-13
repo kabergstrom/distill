@@ -984,6 +984,7 @@ mod tests {
             uuid: bundle_uuid,
             primary: Some("shader".into()),
             schemas: BTreeMap::from([(logical_hash, schema)]),
+            types: Default::default(),
             assets: BTreeMap::from([(
                 "shader".into(),
                 AssetEntry {

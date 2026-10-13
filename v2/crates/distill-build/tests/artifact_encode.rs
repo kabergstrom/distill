@@ -89,6 +89,7 @@ fn composite_encoder_binds_refs_blobs_headers_and_split_transport() {
             schema: &schema,
             wire: &wire,
             value: &value,
+            types: None,
         },
         &mut resolver,
     )

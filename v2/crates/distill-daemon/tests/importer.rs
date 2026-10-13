@@ -42,6 +42,7 @@ fn ordinary_bundle() -> (Vec<u8>, LogicalSchema, distill_core::id::LogicalHash) 
             uuid: BundleUuid([73; 16]),
             primary: Some("entry".into()),
             schemas: BTreeMap::from([(schema_hash, schema.clone())]),
+            types: Default::default(),
             assets: BTreeMap::from([("entry".into(), entry)]),
         })
         .unwrap(),
@@ -112,6 +113,7 @@ fn import_with(
         settings: AuthoringValue {
             canonical_value: Arc::from(settings.as_bytes()),
             blobs: Vec::new(),
+            types: Vec::new(),
         },
         watch: true,
         root: "main".into(),
@@ -302,6 +304,7 @@ fn directory_rules_bundle_for(
         uuid: BundleUuid([98; 16]),
         primary: None,
         schemas: BTreeMap::from([(row.logical_hash, schema)]),
+        types: Default::default(),
         assets: BTreeMap::from([(
             "rules".into(),
             AssetEntry {
@@ -1824,6 +1827,7 @@ fn import_index_pages(filler: usize) -> u64 {
             uuid: BundleUuid(uuid),
             primary: Some("entry".into()),
             schemas: BTreeMap::from([(schema_hash, schema.clone())]),
+            types: Default::default(),
             assets: BTreeMap::from([("entry".into(), entry)]),
         })
         .unwrap();
@@ -1939,6 +1943,7 @@ fn import_if_changed(
         settings: AuthoringValue {
             canonical_value: Arc::from(settings.as_bytes()),
             blobs: Vec::new(),
+            types: Vec::new(),
         },
         watch: true,
         root: "main".into(),
@@ -2511,6 +2516,7 @@ fn rules_bundle_matching_with(
         uuid: BundleUuid([uuid; 16]),
         primary: None,
         schemas: BTreeMap::from([(row.logical_hash, schema)]),
+        types: Default::default(),
         assets: BTreeMap::from([(
             "rules".into(),
             AssetEntry {

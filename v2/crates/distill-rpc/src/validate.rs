@@ -9,7 +9,7 @@ use unicode_normalization::UnicodeNormalization;
 use distill_schema::ngp_schema::{
     display_path, parse_patch, parse_value, verify_snapshot, write_value, AssetRefValue,
     Blob, BlobSink, BlobSource, Frames, LogicalSchema, Options, Patch, PathComponent, SchemaNode,
-    TextError, Value, WriteOptions,
+    TextError, TypeTable, Value, WriteOptions,
 };
 
 use crate::*;
@@ -129,24 +129,38 @@ pub(crate) fn validate_authoring_entry(entry: &AuthoringEntry) -> Result<(), Aut
 /// Authenticate and decode an RPC authored-value carrier into the exact
 /// schema-shaped value stored in a bundle: canonical text parsed against
 /// the schema (`ngp_schema::parse_value`), blobs as `{"len","offset"}`
-/// placements whose `offset` indexes the carrier's blob table.
+/// placements whose `offset` indexes the carrier's blob table, dynamic
+/// values (GAP 23 §3) through the carrier's types, each named by the value.
+/// Returns the value and those types.
 pub fn decode_authoring_payload(
     schema_hash: LogicalHash,
     logical_schema: &[u8],
     authored_value: &AuthoringValue,
-) -> Result<Value, AuthoringValueError> {
+) -> Result<(Value, TypeTable), AuthoringValueError> {
     let schema = verified_schema(schema_hash, logical_schema)?;
+    let types = carried_types(&authored_value.types)?;
     let text = value_text(authored_value)?;
     let mut table = BlobTable::new(&authored_value.blobs);
-    let value = parse_value(text, &schema.root, Options::canonical().blobs(&mut table))
-        .map_err(|error| table.error(error))?;
+    let value = parse_value(
+        text,
+        &schema.root,
+        Options::canonical().blobs(&mut table).types(&mut &types),
+    )
+    .map_err(|error| table.error(error))?;
     table.all_used()?;
+    let mut named = BTreeSet::new();
+    distill_schema::ngp_schema::dynamic_type_uuids(&value, &mut named);
+    if let Some(unused) = types.types().iter().find(|ty| !named.contains(&ty.uuid)) {
+        return Err(AuthoringValueError::UnusedType {
+            path: unused.path.clone(),
+        });
+    }
     let written = write_value(
         &schema.root,
         &value,
         WriteOptions {
             blobs: Some(&mut table),
-            types: None,
+            types: Some(&mut &types),
         },
     )
     .map_err(|error| AuthoringValueError::ValueInvalid(error.render("data")))?;
@@ -154,7 +168,24 @@ pub fn decode_authoring_payload(
         return Err(AuthoringValueError::ValueNotCanonical);
     }
     validate_references(&value)?;
-    Ok(value)
+    Ok((value, types))
+}
+
+/// A carrier's types as a table, each schema verified against its hash.
+fn carried_types(types: &[AuthoringType]) -> Result<TypeTable, AuthoringValueError> {
+    let mut out = Vec::with_capacity(types.len());
+    for ty in types {
+        let schema = verified_schema(ty.schema_hash, &ty.logical_schema).map_err(|error| {
+            AuthoringValueError::TypeInvalid(format!("{}: {error:?}", ty.path))
+        })?;
+        out.push(distill_schema::ngp_schema::DynamicType {
+            uuid: ty.type_uuid,
+            path: ty.path.clone(),
+            schema: Arc::new(schema),
+            renames: Arc::default(),
+        });
+    }
+    TypeTable::new(out).map_err(AuthoringValueError::TypeInvalid)
 }
 
 /// An importer's settings as an import request carries them: authored text
@@ -273,8 +304,13 @@ impl BlobSink for BlobTable<'_> {
 
 /// An RPC authored value carrying `value` (a value of `schema`):
 /// canonical text, each blob a `{"len","offset"}` placement indexing the
-/// blob table in placement order.
-pub fn authoring_value(schema: &SchemaNode, value: &Value) -> Result<AuthoringValue, String> {
+/// blob table in placement order, and the types of `types` its dynamic
+/// values name.
+pub fn authoring_value(
+    schema: &SchemaNode,
+    value: &Value,
+    types: &TypeTable,
+) -> Result<AuthoringValue, String> {
     struct Table(Vec<Arc<[u8]>>);
     impl BlobSink for Table {
         fn place(&mut self, _: &[PathComponent], blob: &[u8]) -> Result<(u64, u64), String> {
@@ -288,13 +324,28 @@ pub fn authoring_value(schema: &SchemaNode, value: &Value) -> Result<AuthoringVa
         value,
         WriteOptions {
             blobs: Some(&mut table),
-            types: None,
+            types: Some(&mut &*types),
         },
     )
     .map_err(|error| format!("cannot write authored value: {}", error.render("data")))?;
+    let mut named = BTreeSet::new();
+    distill_schema::ngp_schema::dynamic_type_uuids(value, &mut named);
+    let mut carried = Vec::with_capacity(named.len());
+    for ty in types.subset(&named)?.types() {
+        let snapshot = distill_schema::ngp_schema::snapshot_to_json(&ty.schema)
+            .map_err(|error| format!("cannot serialize the schema of {}: {error}", ty.path))?;
+        carried.push(AuthoringType {
+            path: ty.path.clone(),
+            type_uuid: ty.uuid,
+            schema_hash: distill_schema::ngp_schema::node_hash(&ty.schema.root)
+                .map_err(|error| format!("cannot hash the schema of {}: {error}", ty.path))?,
+            logical_schema: Arc::from(snapshot.into_bytes()),
+        });
+    }
     Ok(AuthoringValue {
         canonical_value: Arc::from(text.into_bytes()),
         blobs: table.0,
+        types: carried,
     })
 }
 
@@ -702,7 +753,7 @@ mod tests {
             ],
         };
         let value = Value::Struct(Box::new([Value::Blob(vec![1, 2]), Value::Blob(vec![3])]));
-        let carried = authoring_value(&schema, &value).unwrap();
+        let carried = authoring_value(&schema, &value, &Default::default()).unwrap();
         assert_eq!(
             &*carried.canonical_value,
             br#"{"a":{"len":2,"offset":0},"b":{"len":1,"offset":1}}"#

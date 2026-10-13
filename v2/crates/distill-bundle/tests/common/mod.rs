@@ -274,6 +274,7 @@ pub fn bundle(
         uuid: BUNDLE_UUID.parse().expect("fixture bundle uuid"),
         primary: primary.map(str::to_string),
         schemas: schemas.iter().map(|s| (lh(s), (*s).clone())).collect(),
+        types: Default::default(),
         assets: assets
             .into_iter()
             .map(|(id, e)| (id.to_string(), e))

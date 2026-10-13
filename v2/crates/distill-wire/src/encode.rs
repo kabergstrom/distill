@@ -5,7 +5,7 @@ use distill_bundle::{encode_path, PathComponent};
 use distill_core::frames::{reenter, resolve_backref};
 use distill_core::id::{AssetUuid, TypeUuid};
 use ngp_schema::node::{PrimitiveKind, SchemaNode};
-use ngp_schema::{write_value, AssetRefValue, Value, WriteOptions};
+use ngp_schema::{write_value, AssetRefValue, TypeTable, Value, WriteOptions};
 use unicode_normalization::{is_nfc, UnicodeNormalization};
 
 use crate::wire::{SlotKind, WireEnumForm, WireNode, WireVariant};
@@ -102,6 +102,11 @@ pub enum EncodeError {
     BackRefMismatch {
         path: String,
     },
+    /// A dynamic value its type table cannot write.
+    InvalidDynamic {
+        path: String,
+        detail: String,
+    },
     DepthExceeded,
 }
 
@@ -120,6 +125,19 @@ pub fn encode_value(
     wire: &WireNode,
     value: &Value,
     references: &mut impl ReferenceResolver,
+) -> Result<EncodedWireValue, EncodeError> {
+    encode_value_with_types(schema, wire, value, references, None)
+}
+
+/// [`encode_value`] for a value holding dynamic values (GAP 23 §3): each
+/// is a string slot holding its canonical text, its type named through
+/// `types` (the bundle's type closure).
+pub fn encode_value_with_types(
+    schema: &SchemaNode,
+    wire: &WireNode,
+    value: &Value,
+    references: &mut impl ReferenceResolver,
+    types: Option<&TypeTable>,
 ) -> Result<EncodedWireValue, EncodeError> {
     if wire.offset() != 0 {
         return Err(EncodeError::InvalidWireShape {
@@ -141,6 +159,7 @@ pub fn encode_value(
         blobs: Vec::new(),
         references: Vec::new(),
         resolver: references,
+        types,
         path: Vec::new(),
         logical_frames: Vec::new(),
         wire_frames: Vec::new(),
@@ -216,6 +235,7 @@ struct Encoder<'a, R: ReferenceResolver + ?Sized> {
     blobs: Vec<PendingBlob>,
     references: Vec<EncodedReference>,
     resolver: &'a mut R,
+    types: Option<&'a TypeTable>,
     path: Vec<PathComponent>,
     logical_frames: Vec<&'a SchemaNode>,
     wire_frames: Vec<&'a WireNode>,
@@ -372,10 +392,11 @@ impl<'a, R: ReferenceResolver + ?Sized> Encoder<'a, R> {
                 };
                 self.reference(wire, query, location, offset, *expected, false)
             }
-            // Engine-only value nodes (GAP 23 §2–§3): no asset type holds
+            SchemaNode::Dynamic { .. } => self.dynamic(schema, wire, value, location, offset),
+            // Engine-only value nodes (GAP 23 §2): no asset type holds
             // them, so they have no wire form.
-            SchemaNode::Dynamic { .. } | SchemaNode::NodeRef { .. } | SchemaNode::Handle { .. } => {
-                self.invalid_wire("dynamic values, node references and engine handles have no wire form")
+            SchemaNode::NodeRef { .. } | SchemaNode::Handle { .. } => {
+                self.invalid_wire("node references and engine handles have no wire form")
             }
             SchemaNode::Blob => self.blob(wire, value, location, offset),
             SchemaNode::Option(inner) => self.option(inner, wire, value, location, offset),
@@ -486,6 +507,33 @@ impl<'a, R: ReferenceResolver + ?Sized> Encoder<'a, R> {
         let variable = self.reserve_variable(value.len(), 1)?;
         self.write(Location::variable(variable), value.as_bytes())?;
         self.write_var_ref(location.shifted(offset)?, variable, value.len())
+    }
+
+    /// A dynamic value: a string slot holding its canonical text.
+    fn dynamic(
+        &mut self,
+        schema: &SchemaNode,
+        wire: &WireNode,
+        value: &Value,
+        location: Location,
+        offset: u32,
+    ) -> Result<(), EncodeError> {
+        let Some(mut types) = self.types else {
+            return self.invalid_wire("a dynamic value without a type table");
+        };
+        let text = write_value(
+            schema,
+            value,
+            WriteOptions {
+                blobs: None,
+                types: Some(&mut types),
+            },
+        )
+        .map_err(|error| EncodeError::InvalidDynamic {
+            path: self.path_string(),
+            detail: error.render("value"),
+        })?;
+        self.slot_string(wire, &Value::String(text), location, offset)
     }
 
     fn blob(

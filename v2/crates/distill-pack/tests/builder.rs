@@ -275,6 +275,7 @@ fn pack_definition_authoring(root: AssetUuid) -> AuthoringValue {
     AuthoringValue {
         canonical_value: Arc::from(text.into_bytes()),
         blobs: Vec::new(),
+        types: Vec::new(),
     }
 }
 

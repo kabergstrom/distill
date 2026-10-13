@@ -14,7 +14,7 @@ use std::sync::Arc;
 use distill_core::callback::CallbackPanic;
 use distill_core::id::{AssetUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_core::tool::ToolCwdPolicy;
-use ngp_schema::Value;
+use ngp_schema::{AssetRefValue, TypeTable, Value};
 use distill_migrate::FieldPath;
 use ngp_schema::{LogicalSchema, SchemaNode};
 
@@ -212,6 +212,16 @@ pub struct ProcessArtifact {
     pub blobs: Vec<Arc<[u8]>>,
 }
 
+/// An authored asset a processor reads ([`PipelineProcessContext::read_authored`]).
+#[derive(Debug, Clone)]
+pub struct AuthoredAsset {
+    pub asset: AssetUuid,
+    /// Migrated to its type's current schema.
+    pub value: Value,
+    /// Its bundle's dynamic-type closure (GAP 23 §3).
+    pub types: TypeTable,
+}
+
 /// One exact authored source entry exposed to an authoring-side generator.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodegenAsset {
@@ -326,6 +336,25 @@ pub trait PipelineProcessContext {
         _expected_terminal: TypeUuid,
     ) -> Result<ProcessArtifact, ProcessContextError> {
         Err(ProcessContextError::Unavailable("read_path"))
+    }
+
+    /// The dynamic-type closure (GAP 23 §3) of the processed asset's
+    /// bundle: the types the input's dynamic values name. Observes that
+    /// bundle.
+    fn input_types(&mut self) -> Result<TypeTable, ProcessContextError> {
+        Err(ProcessContextError::Unavailable("input_types"))
+    }
+
+    /// The authored value of the asset `reference` names, resolved from
+    /// the processed asset's bundle as a strong `AssetRef` to
+    /// `expected_terminal`. Observes that asset's bundle: editing it
+    /// reruns the processor.
+    fn read_authored(
+        &mut self,
+        _reference: &AssetRefValue,
+        _expected_terminal: TypeUuid,
+    ) -> Result<AuthoredAsset, ProcessContextError> {
+        Err(ProcessContextError::Unavailable("read_authored"))
     }
 
     fn query(&mut self, _query: &AssetQuery) -> Result<Vec<AssetUuid>, ProcessContextError> {

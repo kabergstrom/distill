@@ -2,13 +2,13 @@
 //! processor outputs.
 
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
-use ngp_schema::Value;
+use ngp_schema::{TypeTable, Value};
 use distill_schema::ngp_schema::SchemaNode;
 use distill_wire::artifact::{
     content_hash, parse_artifact, write_artifact, ArtifactError, ArtifactHeader,
 };
 use distill_wire::encode::{
-    encode_value, ReferenceResolver, EncodeError, EncodedReference,
+    encode_value_with_types, ReferenceResolver, EncodeError, EncodedReference,
 };
 use distill_wire::wire::WireNode;
 
@@ -23,6 +23,9 @@ pub struct ArtifactValueSpec<'a> {
     pub schema: &'a SchemaNode,
     pub wire: &'a WireNode,
     pub value: &'a Value,
+    /// The type closure of the bundle the value came from, for its
+    /// dynamic values (GAP 23 §3).
+    pub types: Option<&'a TypeTable>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +71,7 @@ pub fn encode_artifact_value(
     spec: ArtifactValueSpec<'_>,
     resolver: &mut impl ReferenceResolver,
 ) -> Result<EncodedArtifact, ArtifactEncodeError> {
-    let encoded = encode_value(spec.schema, spec.wire, spec.value, resolver)?;
+    let encoded = encode_value_with_types(spec.schema, spec.wire, spec.value, resolver, spec.types)?;
     let mut load_deps = encoded
         .references
         .iter()

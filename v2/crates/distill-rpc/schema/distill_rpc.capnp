@@ -600,6 +600,15 @@ struct MetadataDiagnostics {
 struct AuthoringValue {
   canonicalValue @0 :Data;
   blobs @1 :List(Data);
+  # The types its dynamic values name (newgameplus GAP 23 §3).
+  types @2 :List(AuthoringType);
+}
+
+struct AuthoringType {
+  path @0 :Text;
+  typeUuid @1 :Uuid;
+  schemaHash @2 :Data;
+  logicalSchema @3 :Data;
 }
 
 struct AuthoringEntryValue {

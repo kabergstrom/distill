@@ -1615,7 +1615,66 @@ fn decode_authoring_value(
                     .map_err(authoring_decode_error)
             })
             .collect::<Result<Vec<_>, _>>()?,
+        types: decode_authoring_types(value.get_types().map_err(authoring_decode_error)?)?,
     })
+}
+
+/// A carrier's types (GAP 23 §3); their schemas verify when the value is
+/// decoded.
+fn decode_authoring_types(
+    types: capnp::struct_list::Reader<'_, schema::authoring_type::Owned>,
+) -> Result<Vec<crate::AuthoringType>, String> {
+    types
+        .iter()
+        .map(|ty| {
+            Ok(crate::AuthoringType {
+                path: decode_text(ty.get_path().map_err(authoring_decode_error)?, "authoringType.path")
+                    .map_err(|error| error.message)?,
+                type_uuid: TypeUuid(
+                    decode_uuid(
+                        ty.get_type_uuid()
+                            .map_err(authoring_decode_error)?
+                            .get_bytes()
+                            .map_err(authoring_decode_error)?,
+                        "authoringType.typeUuid",
+                    )
+                    .map_err(|error| error.message)?,
+                ),
+                schema_hash: crate::LogicalHash(
+                    decode_hash(
+                        ty.get_schema_hash().map_err(authoring_decode_error)?,
+                        "authoringType.schemaHash",
+                    )
+                    .map_err(|error| error.message)?,
+                ),
+                logical_schema: ty
+                    .get_logical_schema()
+                    .map_err(authoring_decode_error)?
+                    .to_vec()
+                    .into(),
+            })
+        })
+        .collect()
+}
+
+/// Write a carrier: canonical text, blobs, types.
+pub(crate) fn write_authoring_value(
+    mut output: schema::authoring_value::Builder<'_>,
+    value: &crate::AuthoringValue,
+) {
+    output.set_canonical_value(&value.canonical_value);
+    let mut blobs = output.reborrow().init_blobs(value.blobs.len() as u32);
+    for (index, blob) in value.blobs.iter().enumerate() {
+        blobs.set(index as u32, blob);
+    }
+    let mut types = output.init_types(value.types.len() as u32);
+    for (index, ty) in value.types.iter().enumerate() {
+        let mut row = types.reborrow().get(index as u32);
+        row.set_path(ty.path.as_str());
+        row.reborrow().init_type_uuid().set_bytes(&ty.type_uuid.0);
+        row.set_schema_hash(&ty.schema_hash.0);
+        row.set_logical_schema(&ty.logical_schema);
+    }
 }
 
 fn decode_authoring_entry(
@@ -2294,6 +2353,7 @@ pub fn decode_authoring_inspection(
             .iter()
             .map(|blob| blob.map(|bytes| bytes.to_vec().into()))
             .collect::<Result<Vec<_>, _>>()?,
+        types: decode_authoring_types(wire_value.get_types()?).map_err(capnp::Error::failed)?,
     };
     let logical_schema: std::sync::Arc<[u8]> = value.get_logical_schema()?.to_vec().into();
     crate::validate::decode_authoring_payload(schema_hash, &logical_schema, &authored_value)
@@ -3010,12 +3070,7 @@ fn write_authoring_inspection(
     output.set_schema_hash(&inspection.schema_hash.0);
     output.set_logical_schema(&inspection.logical_schema);
     output.set_role(wire_authoring_role(inspection.role));
-    let mut value = output.init_value();
-    value.set_canonical_value(&inspection.value.canonical_value);
-    let mut blobs = value.init_blobs(inspection.value.blobs.len() as u32);
-    for (index, blob) in inspection.value.blobs.iter().enumerate() {
-        blobs.set(index as u32, blob);
-    }
+    write_authoring_value(output.init_value(), &inspection.value);
 }
 
 fn wire_authoring_role(role: AuthoringEntryRole) -> schema::AuthoringEntryRole {

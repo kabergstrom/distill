@@ -3994,6 +3994,7 @@ fn build_import_bundle(
         uuid: imported.bundle_uuid,
         primary: imported.primary.clone(),
         schemas,
+        types: Default::default(),
         assets,
     };
     distill_bundle::write_bundle(&bundle).map_err(invalid)

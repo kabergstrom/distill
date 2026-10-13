@@ -315,3 +315,13 @@ macro_rules! ref_impls {
 
 ref_impls!(AssetRef);
 ref_impls!(WeakAssetRef);
+
+/// A sparse dynamic value (newgameplus GAP 23 §3): a patch of a type its
+/// data names, logically `SchemaNode::Dynamic { sparse: true }`. Natively
+/// and on the wire its canonical text, `{"type": "<type path>", "value":
+/// …}`, which reads only through the type closure of the bundle it came
+/// from: values of asset types holding it are built as `ngp_schema::Value`s
+/// (importer output, authoring writes), never from native data.
+#[repr(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicPatch(pub String);

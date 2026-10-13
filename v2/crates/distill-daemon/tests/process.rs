@@ -399,6 +399,7 @@ fn colliding_directory_rules_bundle() -> Vec<u8> {
         uuid: distill_core::id::BundleUuid([31; 16]),
         primary: None,
         schemas: [(row.logical_hash, schema)].into_iter().collect(),
+        types: Default::default(),
         assets: [(
             "rules".to_owned(),
             distill_bundle::AssetEntry {
@@ -1412,6 +1413,7 @@ fn start_gate_daemon(temp: &tempfile::TempDir, variant: &GateVariant) -> DaemonP
             settings: distill_rpc::AuthoringValue {
                 canonical_value: std::sync::Arc::from(&b"{\"value\":0}"[..]),
                 blobs: Vec::new(),
+                types: Vec::new(),
             },
             watch: true,
             root: "main".into(),

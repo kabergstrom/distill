@@ -30,6 +30,7 @@ fn bundle(
         uuid: bundle,
         primary: Some("entry".into()),
         schemas: BTreeMap::from([(hash, schema)]),
+        types: Default::default(),
         assets: BTreeMap::from([(
             "entry".into(),
             AssetEntry {

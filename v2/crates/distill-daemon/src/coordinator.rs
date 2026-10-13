@@ -3983,6 +3983,7 @@ mod projection_tests {
                 uuid: BundleUuid([4; 16]),
                 primary: Some("entry".into()),
                 schemas: BTreeMap::from([(schema_hash, schema)]),
+                types: Default::default(),
                 assets: BTreeMap::from([(
                     "entry".into(),
                     AssetEntry {

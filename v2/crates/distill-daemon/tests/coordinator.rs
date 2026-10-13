@@ -51,6 +51,7 @@ fn ordinary_bundle_with(
             uuid: bundle,
             primary: Some("entry".into()),
             schemas: BTreeMap::from([(schema_hash, schema)]),
+            types: Default::default(),
             assets: BTreeMap::from([("entry".into(), entry)]),
         })
         .unwrap(),
@@ -515,6 +516,7 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
         value: RpcAuthoringValue {
             canonical_value: Arc::from(&b"9"[..]),
             blobs: Vec::new(),
+            types: Vec::new(),
         },
     });
     let (receipt, version) = write_and_publish(
@@ -1004,6 +1006,7 @@ fn rewrite_under_a_new_schema(
         uuid: bundle_uuid,
         primary: Some("entry".into()),
         schemas: BTreeMap::from([(schema_hash, schema)]),
+        types: Default::default(),
         assets: BTreeMap::from([(
             "entry".into(),
             AssetEntry {
@@ -1038,6 +1041,7 @@ fn rewrite_under_a_new_schema(
                     .into_bytes(),
             ),
             blobs: Vec::new(),
+            types: Vec::new(),
         },
     });
     let (_, version) = write_and_publish(
@@ -1209,6 +1213,7 @@ fn a_pending_scan_rejection_survives_an_authoring_write_and_a_rescan() {
             value: RpcAuthoringValue {
                 canonical_value: Arc::from(&b"9"[..]),
                 blobs: Vec::new(),
+                types: Vec::new(),
             },
         });
         let base = coordinator.server().current_stamp().unwrap().version;

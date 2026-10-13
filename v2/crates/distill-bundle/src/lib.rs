@@ -17,9 +17,10 @@
 //! for canonically written files of either encoding.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
-use ngp_schema::{LogicalSchema, Value};
+use ngp_schema::{DynamicType, LogicalSchema, TypeTable, Value};
 
 mod container;
 mod crc32c;
@@ -65,7 +66,51 @@ pub struct Bundle {
     /// an existing entry.
     pub primary: Option<String>,
     pub schemas: BTreeMap<LogicalHash, LogicalSchema>,
+    /// The dynamic-type closure (GAP 23 §3): every type a dynamic value
+    /// in an entry names, keyed by the path its text spells, its schema in
+    /// `schemas`. Envelope key `types`, absent when empty.
+    pub types: BTreeMap<String, BundleType>,
     pub assets: BTreeMap<String, AssetEntry>,
+}
+
+/// A type the bundle's dynamic values name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BundleType {
+    pub type_uuid: TypeUuid,
+    pub schema_hash: LogicalHash,
+}
+
+impl Bundle {
+    /// The dynamic types as the text codec resolves them. `Err`: a type
+    /// listed under two paths, or a schema outside the closure.
+    pub fn type_table(&self) -> Result<TypeTable, BundleError> {
+        type_table(&self.types, &self.schemas)
+    }
+}
+
+pub(crate) fn type_table(
+    types: &BTreeMap<String, BundleType>,
+    schemas: &BTreeMap<LogicalHash, LogicalSchema>,
+) -> Result<TypeTable, BundleError> {
+    let mut out = Vec::with_capacity(types.len());
+    for (path, ty) in types {
+        let schema = schemas
+            .get(&ty.schema_hash)
+            .ok_or_else(|| BundleError::MissingTypeSchema {
+                path: path.clone(),
+                schema_hash: ty.schema_hash,
+            })?;
+        out.push(DynamicType {
+            uuid: ty.type_uuid,
+            path: path.clone(),
+            schema: Arc::new(schema.clone()),
+            renames: Arc::default(),
+        });
+    }
+    TypeTable::new(out).map_err(|detail| BundleError::BadType {
+        path: String::new(),
+        detail,
+    })
 }
 
 /// One asset entry (§6). `data` is the typed value of its schema; blob
@@ -82,14 +127,33 @@ pub struct AssetEntry {
 }
 
 /// Return the complete set of schema snapshots the bundle must retain:
-/// every entry schema. Callers that compact a bundle's schema table use this
-/// rather than walking entries themselves.
+/// every entry schema and the schema of every type in
+/// [`referenced_types`]. Callers that compact a bundle's schema table use
+/// this rather than walking entries themselves.
 pub fn referenced_schema_hashes(bundle: &Bundle) -> BTreeSet<LogicalHash> {
+    let types = referenced_types(bundle);
     bundle
         .assets
         .values()
         .flat_map(envelope::schema_references)
+        .chain(
+            bundle
+                .types
+                .values()
+                .filter(|ty| types.contains(&ty.type_uuid))
+                .map(|ty| ty.schema_hash),
+        )
         .collect()
+}
+
+/// Every type the entries' dynamic values name: the `types` a compacted
+/// bundle keeps.
+pub fn referenced_types(bundle: &Bundle) -> BTreeSet<TypeUuid> {
+    let mut out = BTreeSet::new();
+    for entry in bundle.assets.values() {
+        ngp_schema::dynamic_type_uuids(&entry.data, &mut out);
+    }
+    out
 }
 
 /// The namespace-bearing portion of malformed bundle bytes. This is returned

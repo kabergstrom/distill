@@ -26,8 +26,8 @@ pub use distill_asset_macro::asset;
 pub use hasher::{AssetHashMap, AssetHashSet, DeterministicState};
 pub use reflect::AssetReflect;
 pub use types::{
-    AssetRef, AssetRuntimeDescriptor, AssetType, EncodeContainer, EncodeSink, EpochToken,
-    ErasedValue, ModuleEpochPoisonCause, ModuleEpochToken, WeakAssetRef,
+    AssetRef, AssetRuntimeDescriptor, AssetType, DynamicPatch, EncodeContainer, EncodeSink,
+    EpochToken, ErasedValue, ModuleEpochPoisonCause, ModuleEpochToken, WeakAssetRef,
 };
 
 // The §12 vocabulary, re-exported for generated code and consumers —

@@ -124,6 +124,7 @@ fn import(args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
         settings: AuthoringValue {
             canonical_value: Arc::from(settings.as_bytes()),
             blobs: Vec::new(),
+            types: Vec::new(),
         },
         watch,
         root,

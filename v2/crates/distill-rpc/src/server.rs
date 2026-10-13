@@ -1012,7 +1012,7 @@ pub fn bundle_authoring_entry(
         logical_schema: Arc::from(logical_schema.into_bytes()),
         role: entry_role(entry.authoring_only),
         tags: BTreeMap::new(),
-        value: crate::validate::authoring_value(&schema.root, &entry.data)?,
+        value: crate::validate::authoring_value(&schema.root, &entry.data, &bundle.type_table().map_err(|error| error.to_string())?)?,
     })
 }
 
