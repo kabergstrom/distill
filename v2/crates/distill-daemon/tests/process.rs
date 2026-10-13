@@ -1305,6 +1305,7 @@ fn write_gate_schema(temp: &tempfile::TempDir, variant: &GateVariant) {
         containing_type: None,
         modules: Vec::new(),
         krate: krate.into(),
+        version: None,
     };
     let type_def = |id, kind, path, uuid, attrs, fields| TypeDef {
         id: SchemaTypeId(id),

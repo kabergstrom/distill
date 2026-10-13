@@ -34,6 +34,7 @@ fn path(krate: &str, name: &str) -> TypePath {
         containing_type: None,
         modules: Vec::new(),
         krate: krate.to_owned(),
+        version: None,
     }
 }
 

@@ -403,6 +403,7 @@ fn typed_authority(edited: bool) -> Arc<ProjectSchemaAuthority> {
         containing_type: None,
         modules: Vec::new(),
         krate: krate.to_owned(),
+        version: None,
     };
     let def = |id: usize, kind, path, uuid, fields| TypeDef {
         id: SchemaTypeId(id),
@@ -880,6 +881,7 @@ fn labeled_authority(tagged: bool) -> Arc<ProjectSchemaAuthority> {
         containing_type: None,
         modules: Vec::new(),
         krate: krate.to_owned(),
+        version: None,
     };
     let def = |id: usize, kind, path, uuid, fields| TypeDef {
         id: SchemaTypeId(id),

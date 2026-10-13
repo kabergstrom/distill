@@ -645,6 +645,7 @@ fn fixture_schema(source_identity: (String, String)) -> Schema {
                 containing_type: None,
                 modules: vec!["vec".into()],
                 krate: "alloc".into(),
+                version: None,
             },
             uuid: None,
             attrs: TypeAttrs::default(),
@@ -894,6 +895,7 @@ fn type_path(krate: &str, name: &str) -> TypePath {
         containing_type: None,
         modules: Vec::new(),
         krate: krate.into(),
+        version: None,
     }
 }
 

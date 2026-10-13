@@ -344,6 +344,7 @@ pub fn ty(id: usize, kind: PrimitiveType, name: Option<&str>, krate: &str) -> Ty
             containing_type: None,
             modules: vec![],
             krate: krate.to_string(),
+            version: None,
         },
         uuid: None,
         attrs: TypeAttrs::default(),
