@@ -143,6 +143,25 @@ impl PackfileIO {
         Self::mount_backings(manifest, expected_manifest_hash, archives, runtime)
     }
 
+    /// Mount a pack held in memory for the life of the process: a manifest
+    /// and its archives' bytes, e.g. embedded in the executable. The manifest
+    /// selects the archives by hash, as from a directory; `archives` may be
+    /// in any order. Blobs borrow the bytes, so they should be aligned as a
+    /// file mapping would be if a consumer reads them in place as typed data.
+    pub fn mount_static(
+        manifest_bytes: &'static [u8],
+        archives: &[&'static [u8]],
+        runtime: &RuntimeTarget,
+    ) -> Result<Self, MountError> {
+        let manifest_hash = manifest_hash(manifest_bytes);
+        let manifest = decode_manifest(manifest_bytes)?;
+        let archives = archives
+            .iter()
+            .map(|bytes| Arc::new(*bytes) as ArchiveBacking)
+            .collect();
+        Self::mount_backings(manifest, manifest_hash, archives, runtime)
+    }
+
     fn mount_backings(
         manifest: PackManifest,
         manifest_hash: [u8; 32],

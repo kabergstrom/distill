@@ -201,6 +201,37 @@ fn current_mount_keeps_blob_ranges_alive_after_io_drops() {
 }
 
 #[test]
+fn static_mount_serves_the_same_pack_as_a_directory() {
+    let (manifest, archive, runtime, asset_uuid, content_hash) = fixture(true);
+    let manifest: &'static [u8] = Vec::leak(manifest);
+    let archive: &'static [u8] = Vec::leak(archive);
+    let mut io = PackfileIO::mount_static(manifest, &[archive], &runtime).unwrap();
+    let basis = io.begin_sweep();
+    assert!(matches!(&basis, IoBasis::Pack { manifest: got } if got.0 == manifest_hash(manifest)));
+    io.resolve(ReqId(1), asset_uuid, &basis);
+    io.fetch(ReqId(2), content_hash, &basis);
+    let events = io.poll();
+    assert!(matches!(&events[0], IoEvent::Resolved {
+        req: ReqId(1), result: ResolveResult::Built { content_hash: got }, ..
+    } if *got == content_hash));
+    assert!(matches!(&events[1], IoEvent::Fetched { req: ReqId(2), artifact, .. }
+        if artifact.blobs[0].as_bytes() == b"blob"));
+
+    let wrong = RuntimeTarget {
+        target: "other".into(),
+        ..runtime.clone()
+    };
+    assert!(matches!(
+        PackfileIO::mount_static(manifest, &[archive], &wrong),
+        Err(MountError::TargetMismatch)
+    ));
+    assert!(matches!(
+        PackfileIO::mount_static(manifest, &[], &runtime),
+        Err(MountError::MissingArchive(_))
+    ));
+}
+
+#[test]
 fn target_binding_checks_only_the_module_target_definition_hash() {
     let (manifest, archive, runtime, _, _) = fixture(true);
     let mut io = mount_pack(&manifest, &archive, &runtime).unwrap();
