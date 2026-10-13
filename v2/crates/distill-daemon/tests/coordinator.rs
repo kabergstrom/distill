@@ -503,6 +503,7 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
     let original = &parsed.assets["entry"];
     let logical_schema = snapshot_to_json(&parsed.schemas[&original.schema_hash]).unwrap();
     let operation = AuthoringOp::Set(AuthoringEntry {
+        root: String::new(),
         uuid: asset_uuid,
         bundle: bundle_uuid,
         local_id: "entry".into(),
@@ -560,6 +561,84 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
 /// A direct write changes the file and commits nothing: the store keeps
 /// the old version until the watcher publishes the file. A write that fails
 /// changes no file.
+
+/// A write creating a bundle names its root when several are configured;
+/// a write to an existing bundle may name only the bundle's own root.
+#[test]
+fn a_new_bundle_is_created_in_the_root_it_names() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("assets");
+    let aux = temp.path().join("aux");
+    std::fs::create_dir_all(&main).unwrap();
+    std::fs::create_dir_all(&aux).unwrap();
+    let coordinator = DaemonCoordinator::open(
+        StoreConfig::new(temp.path().join(".distill")),
+        vec![AssetRoot::new("main", &main), AssetRoot::new("aux", &aux)],
+        vec![target()],
+        64,
+    )
+    .unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    let (bytes, bundle_uuid, asset_uuid) = ordinary_bundle();
+    std::fs::write(main.join("ordinary.bundle"), &bytes).unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    let parsed = distill_bundle::parse_bundle(&bytes).unwrap();
+    let original = &parsed.assets["entry"];
+    let entry = |uuid: AssetUuid, bundle: BundleUuid, path: &str, root: &str| {
+        AuthoringOp::Set(AuthoringEntry {
+            root: root.into(),
+            uuid,
+            bundle,
+            local_id: "entry".into(),
+            normalized_path: path.into(),
+            type_uuid: original.type_uuid,
+            terminal_type: original.type_uuid,
+            schema_hash: original.schema_hash,
+            logical_schema: Arc::from(
+                snapshot_to_json(&parsed.schemas[&original.schema_hash]).unwrap().into_bytes(),
+            ),
+            role: AuthoringEntryRole::Runtime,
+            tags: BTreeMap::new(),
+            value: RpcAuthoringValue {
+                canonical_value: Arc::from(&b"5"[..]),
+                blobs: Vec::new(),
+                types: Vec::new(),
+            },
+        })
+    };
+    let fresh = |root: &str| entry(AssetUuid([90; 16]), BundleUuid([91; 16]), "fresh.bundle", root);
+
+    let unnamed = write_files(&coordinator, &mut writer, InputVersion(1), &[fresh("")], false);
+    assert!(
+        format!("{unnamed:?}").contains("names its root"),
+        "{unnamed:?}"
+    );
+    let unknown = write_files(&coordinator, &mut writer, InputVersion(1), &[fresh("other")], false);
+    assert!(format!("{unknown:?}").contains("no configured asset root"), "{unknown:?}");
+    let moved = write_files(
+        &coordinator,
+        &mut writer,
+        InputVersion(1),
+        &[entry(asset_uuid, bundle_uuid, "ordinary.bundle", "aux")],
+        false,
+    );
+    assert!(format!("{moved:?}").contains("cannot relocate"), "{moved:?}");
+
+    let (receipt, _) =
+        write_and_publish(&coordinator, &mut writer, InputVersion(1), &[fresh("aux")], false).unwrap();
+    assert_eq!(receipt.files[0].root, "aux");
+    assert!(aux.join("fresh.bundle").exists());
+    assert!(!main.join("fresh.bundle").exists());
+    let (receipt, _) = write_and_publish(
+        &coordinator,
+        &mut writer,
+        InputVersion(2),
+        &[entry(asset_uuid, bundle_uuid, "ordinary.bundle", "main")],
+        false,
+    )
+    .unwrap();
+    assert_eq!(receipt.files[0].root, "main");
+}
 #[test]
 fn a_direct_write_changes_the_file_and_commits_nothing() {
     let temp = tempfile::tempdir().unwrap();
@@ -1024,6 +1103,7 @@ fn rewrite_under_a_new_schema(
 
     let (schema, value) = written;
     let operation = AuthoringOp::Set(AuthoringEntry {
+        root: String::new(),
         uuid: asset_uuid,
         bundle: bundle_uuid,
         local_id: "entry".into(),
@@ -1200,6 +1280,7 @@ fn a_pending_scan_rejection_survives_an_authoring_write_and_a_rescan() {
         let original = &parsed.assets["entry"];
         let logical_schema = snapshot_to_json(&parsed.schemas[&original.schema_hash]).unwrap();
         let operation = AuthoringOp::Set(AuthoringEntry {
+            root: String::new(),
             uuid: asset_uuid,
             bundle: bundle_uuid,
             local_id: "entry".into(),

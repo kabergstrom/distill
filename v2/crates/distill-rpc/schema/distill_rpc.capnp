@@ -623,6 +623,9 @@ struct AuthoringEntryValue {
   role @8 :AuthoringEntryRole;
   tags @9 :List(EntryTag);
   value @10 :AuthoringValue;
+  # The root of the bundle: empty for the bundle's own root, or, creating a
+  # bundle, the one configured root (protocol 22).
+  root @11 :Text;
 }
 
 struct AuthoringOp {
@@ -665,6 +668,8 @@ struct AuthoringInspection {
   role @7 :AuthoringEntryRole;
   value @8 :AuthoringValue;
   logicalSchema @9 :Data;
+  # The root holding the entry's bundle (protocol 22).
+  root @10 :Text;
 }
 
 struct AuthoringRoleFailure {

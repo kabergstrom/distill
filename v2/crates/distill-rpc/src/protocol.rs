@@ -36,8 +36,10 @@ pub use distill_store::state::{
 /// `AuthoringValue` carries `types`, the types its dynamic values name
 /// (newgameplus GAP 23 §3; a value naming one fails to parse without it). 21:
 /// `AuthoringSnapshot` gains `describeType` and `describableTypes` (§17
-/// "Type descriptions").
-pub const PROTOCOL_VERSION: u32 = 21;
+/// "Type descriptions"). 22: an authoring entry names its bundle's `root`
+/// (a write creates a bundle in the root it names) and an inspection the
+/// root it read the bundle from.
+pub const PROTOCOL_VERSION: u32 = 22;
 
 /// A watched import whose latest attempt failed. The bundle keeps serving its
 /// last good contents; the failure clears when a later import succeeds.
@@ -1105,6 +1107,9 @@ pub struct AuthoringEntry {
     pub role: AuthoringEntryRole,
     pub tags: BTreeMap<String, Option<String>>,
     pub value: AuthoringValue,
+    /// The asset root of the bundle, by name. Empty: the bundle's own root;
+    /// creating a bundle, the one configured root.
+    pub root: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1119,6 +1124,8 @@ pub struct AuthoringInspection {
     pub logical_schema: Arc<[u8]>,
     pub role: AuthoringEntryRole,
     pub value: AuthoringValue,
+    /// The asset root holding the bundle, by name.
+    pub root: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

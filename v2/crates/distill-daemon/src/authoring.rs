@@ -238,6 +238,11 @@ impl AuthoringService {
                             "direct write cannot relocate a bundle; use rename-with-fixups",
                         ));
                     }
+                    if !entry.root.is_empty() && entry.root != root {
+                        return Err(invalid(
+                            "direct write cannot relocate a bundle; use rename-with-fixups",
+                        ));
+                    }
                 }
             }
             (root, meta.path, target, Some(observed), bundle)
@@ -259,10 +264,28 @@ impl AuthoringService {
                 return Err(invalid("new bundle entries must name one destination path"));
             }
             let path = *paths.first().expect("one destination path");
-            let [root] = compiled.roots() else {
-                return Err(invalid(
-                    "direct bundle creation requires exactly one configured asset root; import supplies an explicit root",
-                ));
+            let named = operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    AuthoringOp::Set(entry) if !entry.root.is_empty() => Some(entry.root.as_str()),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            let root = match (named.len(), compiled.roots()) {
+                (0, [root]) => root,
+                (0, _) => {
+                    return Err(invalid(
+                        "direct bundle creation names its root when more than one asset root is configured",
+                    ))
+                }
+                (1, roots) => {
+                    let name = *named.first().expect("one named root");
+                    roots
+                        .iter()
+                        .find(|root| root.name == name)
+                        .ok_or_else(|| invalid(format!("no configured asset root {name:?}")))?
+                }
+                _ => return Err(invalid("new bundle entries must name one root")),
             };
             let target = scanner.physical_path(&root.name, path).map_err(invalid)?;
             if fs::symlink_metadata(&target).is_ok() {

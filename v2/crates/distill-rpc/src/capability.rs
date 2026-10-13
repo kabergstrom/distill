@@ -610,6 +610,7 @@ fn inspect_authoring(
         logical_schema: entry.logical_schema,
         role: entry.role,
         value: entry.value,
+        root,
     }))
 }
 

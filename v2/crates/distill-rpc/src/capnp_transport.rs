@@ -1814,6 +1814,8 @@ fn decode_authoring_entry(
         },
         tags,
         value: decode_authoring_value(value.get_value().map_err(authoring_decode_error)?)?,
+        root: decode_text(value.get_root().map_err(authoring_decode_error)?, "authoringOp.root")
+            .map_err(|error| error.message)?,
     })
 }
 
@@ -2412,6 +2414,8 @@ pub fn decode_authoring_inspection(
             schema::AuthoringEntryRole::AuthoringOnly => AuthoringEntryRole::AuthoringOnly,
         },
         value: authored_value,
+        root: decode_text(value.get_root()?, "authoringInspection.root")
+            .map_err(|error| capnp::Error::failed(error.message))?,
     })
 }
 
@@ -3275,6 +3279,7 @@ fn write_authoring_inspection(
     output.set_schema_hash(&inspection.schema_hash.0);
     output.set_logical_schema(&inspection.logical_schema);
     output.set_role(wire_authoring_role(inspection.role));
+    output.set_root(inspection.root.as_str());
     write_authoring_value(output.init_value(), &inspection.value);
 }
 

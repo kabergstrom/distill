@@ -7707,6 +7707,11 @@ for the first version whose `AuthoringSnapshot.file(root, path)` answers
 every receipt entry; a failure means no file changed. A second write
 planned against the same base before the store has caught up finds the
 file changed under it and fails without writing.
+A batch changes one bundle. An entry names its bundle's `root`: empty for
+an existing bundle's own (another root is a relocation, refused: use
+rename-with-fixups); a new bundle is created in the root its entries name,
+or, unnamed, in the one configured root (several configured: refused).
+An inspection names the root it read the bundle from (protocol 22).
 
 Long-running operations expose ordered, cancellable progress. A
 rename-with-fixups (`operation`) is planned when it is asked for and

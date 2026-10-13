@@ -1013,6 +1013,8 @@ pub fn bundle_authoring_entry(
         role: entry_role(entry.authoring_only),
         tags: BTreeMap::new(),
         value: crate::validate::authoring_value(&schema.root, &entry.data, &bundle.type_table().map_err(|error| error.to_string())?)?,
+        // The caller knows the root when it needs it (an inspection).
+        root: String::new(),
     })
 }
 

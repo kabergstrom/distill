@@ -59,6 +59,7 @@ async fn edit_asset_through_hub_write() {
             assert_eq!(text.matches(from.as_str()).count(), 1, "DISTILL_EDIT_FROM must occur once in {text}");
             let edited = text.replacen(from.as_str(), &to, 1);
             let entry = AuthoringEntry {
+                root: String::new(),
                 uuid: inspection.uuid,
                 bundle: inspection.bundle,
                 local_id: inspection.local_id,

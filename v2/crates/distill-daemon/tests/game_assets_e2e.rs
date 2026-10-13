@@ -1051,6 +1051,7 @@ fn rpc_io_authoring_writes_watches_and_renames_through_a_live_daemon() {
     let (version, source) = inspected(&mut io, shader);
     let copy = AssetUuid([0xc1; 16]);
     let entry = AuthoringEntry {
+        root: String::new(),
         uuid: copy,
         bundle: BundleUuid([0xc0; 16]),
         local_id: "copy".into(),
@@ -1092,6 +1093,7 @@ fn rpc_io_authoring_writes_watches_and_renames_through_a_live_daemon() {
     let text = std::str::from_utf8(&source.value.canonical_value).unwrap().replacen("#version 450", "#version 460", 1);
     assert_ne!(text.as_bytes(), &*source.value.canonical_value);
     let edited = AuthoringEntry {
+        root: String::new(),
         value: AuthoringValue { canonical_value: Arc::from(text.as_bytes()), ..source.value.clone() },
         ..entry
     };

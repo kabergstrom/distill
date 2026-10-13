@@ -622,6 +622,7 @@ fn schema_reconnect_reason_is_the_pipeline_epoch_alone() {
 fn authoring_entry(byte: u8, role: AuthoringEntryRole) -> AuthoringEntry {
     let schema_hash = node_hash(&SchemaNode::Blob).unwrap();
     AuthoringEntry {
+        root: String::new(),
         uuid: AssetUuid([byte; 16]),
         bundle: BundleUuid([byte.wrapping_add(1); 16]),
         local_id: format!("entry-{byte}"),
@@ -648,6 +649,7 @@ fn write_authoring_entry_value(
     output.reborrow().init_bundle().set_bytes(&entry.bundle.0);
     output.set_local_id(entry.local_id.as_str());
     output.set_normalized_path(entry.normalized_path.as_str());
+    output.set_root(entry.root.as_str());
     output
         .reborrow()
         .init_type_uuid()

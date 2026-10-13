@@ -558,6 +558,7 @@ pub fn write_authoring_entry(mut output: schema::authoring_entry_value::Builder<
     output.reborrow().init_bundle().set_bytes(&entry.bundle.0);
     output.set_local_id(entry.local_id.as_str());
     output.set_normalized_path(entry.normalized_path.as_str());
+    output.set_root(entry.root.as_str());
     output.reborrow().init_type_uuid().set_bytes(&entry.type_uuid.0);
     output.reborrow().init_terminal_type().set_bytes(&entry.terminal_type.0);
     output.set_schema_hash(&entry.schema_hash.0);
