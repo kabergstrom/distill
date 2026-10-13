@@ -80,12 +80,12 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
 use distill_build::trace::EntryRole;
-use distill_core::id::{AssetUuid, ContentHash};
+use distill_core::id::{AssetUuid, ContentHash, TypeUuid};
 use distill_rpc::capnp_loader::{RemoteCall, RemoteHub, RemoteSnapshot, RemoteSubscription};
 use distill_rpc::capnp_transport::{CapnpClient, RemoteConnectOutcome, RemoteError};
 use distill_rpc::{
-    AssetEvent, ConnectRequest, DriftedInput as RpcDriftedInput, ImportFailure, RpcFailure,
-    StreamEvent,
+    AssetEvent, ConnectRequest, DescribableTypesResult, DescribeTypeResult, DriftedInput as RpcDriftedInput,
+    ImportFailure, RpcFailure, StreamEvent, TypeDescription,
 };
 use distill_store::state::{InputVersion, SnapshotStamp};
 use tokio::task::{AbortHandle, LocalSet};
@@ -294,6 +294,34 @@ impl RpcIo {
             return None;
         }
         self.shared.import_failures.borrow().clone()
+    }
+
+    /// Ask the daemon to describe a game type (§17 "Type descriptions") at
+    /// its current version, by path (through the type index) or UUID. The
+    /// call runs as the IO steps; its answer is taken with
+    /// [`Self::take_type_description`] under the returned ticket.
+    pub fn describe_type(&mut self, name: TypeName) -> u64 {
+        let ticket = self.shared.next_description.get();
+        self.shared.next_description.set(ticket + 1);
+        let Some(connection) = self.shared.connection() else {
+            self.shared
+                .descriptions
+                .borrow_mut()
+                .insert(ticket, Err("not connected to the daemon".to_owned()));
+            return ticket;
+        };
+        let shared = Rc::clone(&self.shared);
+        let _local = self.local.enter();
+        drop(self.shared.spawn(async move {
+            let answer = describe(&connection.hub, name).await;
+            shared.descriptions.borrow_mut().insert(ticket, answer);
+        }));
+        ticket
+    }
+
+    /// The answer to [`Self::describe_type`]'s `ticket`, once it arrived.
+    pub fn take_type_description(&mut self, ticket: u64) -> Option<Result<TypeDescription, String>> {
+        self.shared.descriptions.borrow_mut().remove(&ticket)
     }
 
     /// What the last [`Self::step`] (or `poll`) did.
@@ -589,6 +617,48 @@ impl Wake for TurnWaker {
     }
 }
 
+/// A type to describe ([`RpcIo::describe_type`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeName {
+    /// As prefabs name it (`game::Spinner`).
+    Path(String),
+    Uuid(TypeUuid),
+}
+
+fn remote<T>(call: Result<RemoteCall<T>, impl std::fmt::Display>) -> Result<T, String> {
+    match call {
+        Ok(RemoteCall::Success(value)) => Ok(value),
+        Ok(RemoteCall::ReconnectRequired(reason)) => Err(format!("reconnect required: {reason:?}")),
+        Ok(RemoteCall::ConfigurationFailed(error)) => Err(format!("configuration failed: {error:?}")),
+        Ok(RemoteCall::SnapshotExpired) => Err("snapshot expired; ask again".to_owned()),
+        Ok(RemoteCall::Error(error)) => Err(format!("{error:?}")),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// One authoring snapshot: the type index (for a path), then the type.
+async fn describe(hub: &RemoteHub, name: TypeName) -> Result<TypeDescription, String> {
+    let snapshot = remote(hub.authoring_snapshot().await)?;
+    let type_uuid = match name {
+        TypeName::Uuid(type_uuid) => type_uuid,
+        TypeName::Path(path) => match remote(snapshot.describable_types().await)? {
+            DescribableTypesResult::Types { types, .. } => types
+                .into_iter()
+                .find(|described| described.path == path)
+                .map(|described| described.type_uuid)
+                .ok_or_else(|| format!("no describable type {path}"))?,
+            DescribableTypesResult::Drifted { input, .. } => {
+                return Err(format!("{input:?} changed while it was read; ask again"))
+            }
+        },
+    };
+    match remote(snapshot.describe_type(type_uuid).await)? {
+        DescribeTypeResult::Description(description) => Ok(description),
+        DescribeTypeResult::Missing => Err(format!("no description of type {type_uuid}")),
+        DescribeTypeResult::Drifted { input, .. } => Err(format!("{input:?} changed while it was read; ask again")),
+    }
+}
+
 /// State shared by `RpcIo` and its tasks. Every borrow is short and never
 /// held across an `.await` or a turn.
 struct Shared {
@@ -608,6 +678,9 @@ struct Shared {
     control: RefCell<Vec<AbortHandle>>,
     import_failures: RefCell<Option<Vec<ImportFailure>>>,
     import_failures_changed: Cell<bool>,
+    /// Answers of `RpcIo::describe_type` by ticket, until taken.
+    descriptions: RefCell<HashMap<u64, Result<TypeDescription, String>>>,
+    next_description: Cell<u64>,
     /// Signalled whenever a snapshot refresh ends.
     refreshed: tokio::sync::Notify,
     next_serial: Cell<u64>,
@@ -818,6 +891,8 @@ impl Shared {
             control: RefCell::new(Vec::new()),
             import_failures: RefCell::new(None),
             import_failures_changed: Cell::new(false),
+            descriptions: RefCell::new(HashMap::new()),
+            next_description: Cell::new(1),
             refreshed: tokio::sync::Notify::new(),
             next_serial: Cell::new(1),
             task_polls: Rc::new(Cell::new(0)),

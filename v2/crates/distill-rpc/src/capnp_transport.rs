@@ -52,7 +52,8 @@ use crate::{
     MetadataNamespaceCall, MetadataSnapshot, NamespaceError, NamespaceErrorV1, PathResolveFailure,
     PathResolveResult, ProgressStream, PureMetadataEntry, PureMetadataQuery, ReconnectReason,
     ResolveResult, Root, RpcBasis, RpcFailure, RpcResult, Snapshot, SnapshotStamp, StoreInstanceId,
-    TagSelector, TargetDefinitionHash, TypeUuid,
+    TagSelector, TargetDefinitionHash, TypeUuid, DescribeTypeResult, DescribableType,
+    DescribableTypesResult, TypeDefault, TypeDescription, TypeMember,
 };
 
 pub use crate::distill_rpc_capnp as schema;
@@ -1245,6 +1246,37 @@ impl schema::authoring_snapshot::Server for AuthoringSnapshotService {
         async move {
             generation_gate!(self.snapshot.generation_reconnect(), results);
             write_authoring_snapshot_result(results.get().init_result(), self.snapshot.refresh());
+            Ok(())
+        }
+    }
+
+    fn describe_type(
+        self: capnp::capability::Rc<Self>,
+        params: schema::authoring_snapshot::DescribeTypeParams,
+        mut results: schema::authoring_snapshot::DescribeTypeResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
+        async move {
+            generation_gate!(self.snapshot.generation_reconnect(), results);
+            let type_uuid = match decode_uuid(params.get()?.get_type_uuid()?, "typeUuid") {
+                Ok(uuid) => TypeUuid(uuid),
+                Err(error) => {
+                    write_wire_error(results.get().init_result().init_error(), &error);
+                    return Ok(());
+                }
+            };
+            write_describe_type_result(results.get().init_result(), self.snapshot.describe_type(type_uuid));
+            Ok(())
+        }
+    }
+
+    fn describable_types(
+        self: capnp::capability::Rc<Self>,
+        _params: schema::authoring_snapshot::DescribableTypesParams,
+        mut results: schema::authoring_snapshot::DescribableTypesResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
+        async move {
+            generation_gate!(self.snapshot.generation_reconnect(), results);
+            write_describable_types_result(results.get().init_result(), self.snapshot.describable_types());
             Ok(())
         }
     }
@@ -3055,6 +3087,194 @@ fn write_authoring_inspect_result(
         RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
         RpcResult::Failure(error) => write_failure(result.init_error(), &error),
     }
+}
+
+fn write_describe_type_result(
+    mut result: schema::describe_type_call::Builder<'_>,
+    outcome: RpcResult<DescribeTypeResult>,
+) {
+    match outcome {
+        RpcResult::Success(DescribeTypeResult::Description(description)) => {
+            write_type_description(result.reborrow().init_success(), &description)
+        }
+        RpcResult::Success(DescribeTypeResult::Missing) => result.set_missing(()),
+        RpcResult::Success(DescribeTypeResult::Drifted { input, current }) => {
+            write_drifted(result.init_drifted(), &input, current)
+        }
+        RpcResult::ReconnectRequired { reason } => {
+            write_reconnect(result.init_reconnect_required(), reason)
+        }
+        RpcResult::ConfigurationFailed(error) => {
+            write_configuration_error(result.init_configuration_failed(), &error)
+        }
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
+        RpcResult::Failure(error) => write_failure(result.init_error(), &error),
+    }
+}
+
+fn write_type_description(
+    mut output: schema::type_description::Builder<'_>,
+    description: &TypeDescription,
+) {
+    write_authoring_stamp(output.reborrow().init_stamp(), description.stamp);
+    output.set_type_uuid(&description.type_uuid.0);
+    output.set_path(description.path.as_str());
+    output.set_schema_hash(&description.schema_hash.0);
+    output.set_logical_schema(&description.logical_schema);
+    let mut default = output.reborrow().init_default_value();
+    match &description.default {
+        TypeDefault::Value(value) => {
+            let mut wire = default.init_value();
+            wire.set_canonical_value(&value.canonical_value);
+            let mut blobs = wire.init_blobs(value.blobs.len() as u32);
+            for (index, blob) in value.blobs.iter().enumerate() {
+                blobs.set(index as u32, blob);
+            }
+        }
+        TypeDefault::Absent => default.set_absent(()),
+        TypeDefault::SchemaMismatch { written } => default.set_schema_mismatch(&written.0),
+        TypeDefault::Invalid(detail) => default.set_invalid(detail.as_str()),
+    }
+    let mut members = output.init_members(description.members.len() as u32);
+    for (index, member) in description.members.iter().enumerate() {
+        let mut wire = members.reborrow().get(index as u32);
+        wire.set_path(member.path.as_str());
+        wire.set_doc(member.doc.as_deref().unwrap_or(""));
+        wire.set_type_doc(member.type_doc.as_deref().unwrap_or(""));
+        if let Some([min, max]) = member.range {
+            wire.set_has_range(true);
+            wire.set_range_min(min);
+            wire.set_range_max(max);
+        }
+        wire.set_color(member.color);
+        wire.set_slider(member.slider);
+        wire.set_hidden(member.hidden);
+    }
+}
+
+fn write_describable_types_result(
+    mut result: schema::describable_types_call::Builder<'_>,
+    outcome: RpcResult<DescribableTypesResult>,
+) {
+    match outcome {
+        RpcResult::Success(DescribableTypesResult::Types { stamp, index_hash, types }) => {
+            let mut output = result.reborrow().init_success();
+            write_authoring_stamp(output.reborrow().init_stamp(), stamp);
+            output.set_index_hash(index_hash.as_ref().map_or(&[][..], |hash| &hash.0[..]));
+            let mut list = output.init_types(types.len() as u32);
+            for (index, described) in types.iter().enumerate() {
+                let mut wire = list.reborrow().get(index as u32);
+                wire.set_type_uuid(&described.type_uuid.0);
+                wire.set_path(described.path.as_str());
+            }
+        }
+        RpcResult::Success(DescribableTypesResult::Drifted { input, current }) => {
+            write_drifted(result.init_drifted(), &input, current)
+        }
+        RpcResult::ReconnectRequired { reason } => {
+            write_reconnect(result.init_reconnect_required(), reason)
+        }
+        RpcResult::ConfigurationFailed(error) => {
+            write_configuration_error(result.init_configuration_failed(), &error)
+        }
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
+        RpcResult::Failure(error) => write_failure(result.init_error(), &error),
+    }
+}
+
+fn decode_stamp_value(
+    stamp: schema::snapshot_stamp_value::Reader<'_>,
+    field: &str,
+) -> Result<SnapshotStamp, capnp::Error> {
+    Ok(SnapshotStamp {
+        instance: StoreInstanceId(
+            decode_instance(stamp.get_instance()?, field).map_err(|error| capnp::Error::failed(error.message))?,
+        ),
+        version: InputVersion(stamp.get_input_version()),
+    })
+}
+
+/// Decode a wire type description, authenticating its logical schema
+/// against its hash and its default value against the schema, as
+/// [`decode_authoring_inspection`] does for an entry.
+pub fn decode_type_description(
+    value: schema::type_description::Reader<'_>,
+) -> Result<TypeDescription, capnp::Error> {
+    let failed = |error: WireFailure| capnp::Error::failed(error.message);
+    let stamp = decode_stamp_value(value.get_stamp()?, "typeDescription.stamp.instance")?;
+    let type_uuid = TypeUuid(decode_uuid(value.get_type_uuid()?, "typeDescription.typeUuid").map_err(failed)?);
+    let schema_hash =
+        crate::LogicalHash(decode_hash(value.get_schema_hash()?, "typeDescription.schemaHash").map_err(failed)?);
+    let logical_schema: Arc<[u8]> = value.get_logical_schema()?.to_vec().into();
+    crate::validate::verified_schema(schema_hash, &logical_schema)
+        .map_err(|error| capnp::Error::failed(format!("invalid type description: {error:?}")))?;
+    let default = match value.get_default_value()?.which()? {
+        schema::type_default::Which::Value(wire) => {
+            let wire = wire?;
+            let authored = crate::AuthoringValue {
+                canonical_value: wire.get_canonical_value()?.to_vec().into(),
+                blobs: wire
+                    .get_blobs()?
+                    .iter()
+                    .map(|blob| blob.map(|bytes| bytes.to_vec().into()))
+                    .collect::<Result<Vec<_>, _>>()?,
+            };
+            crate::validate::decode_authoring_payload(schema_hash, &logical_schema, &authored)
+                .map_err(|error| capnp::Error::failed(format!("invalid type default: {error:?}")))?;
+            TypeDefault::Value(authored)
+        }
+        schema::type_default::Which::Absent(()) => TypeDefault::Absent,
+        schema::type_default::Which::SchemaMismatch(hash) => TypeDefault::SchemaMismatch {
+            written: crate::LogicalHash(
+                decode_hash(hash?, "typeDescription.defaultValue.schemaMismatch").map_err(failed)?,
+            ),
+        },
+        schema::type_default::Which::Invalid(detail) => {
+            TypeDefault::Invalid(decode_text(detail?, "typeDescription.defaultValue.invalid").map_err(failed)?)
+        }
+    };
+    let optional = |text: String| (!text.is_empty()).then_some(text);
+    let mut members = Vec::new();
+    for member in value.get_members()? {
+        members.push(TypeMember {
+            path: decode_text(member.get_path()?, "typeMember.path").map_err(failed)?,
+            doc: optional(decode_text(member.get_doc()?, "typeMember.doc").map_err(failed)?),
+            type_doc: optional(decode_text(member.get_type_doc()?, "typeMember.typeDoc").map_err(failed)?),
+            range: member.get_has_range().then(|| [member.get_range_min(), member.get_range_max()]),
+            color: member.get_color(),
+            slider: member.get_slider(),
+            hidden: member.get_hidden(),
+        });
+    }
+    Ok(TypeDescription {
+        stamp,
+        type_uuid,
+        path: decode_text(value.get_path()?, "typeDescription.path").map_err(failed)?,
+        schema_hash,
+        logical_schema,
+        default,
+        members,
+    })
+}
+
+/// Decode a wire describable-types answer (its success arm).
+pub fn decode_describable_types(
+    value: schema::describable_types::Reader<'_>,
+) -> Result<DescribableTypesResult, capnp::Error> {
+    let failed = |error: WireFailure| capnp::Error::failed(error.message);
+    let stamp = decode_stamp_value(value.get_stamp()?, "describableTypes.stamp.instance")?;
+    let index_hash = match value.get_index_hash()? {
+        [] => None,
+        hash => Some(ContentHash(decode_hash(hash, "describableTypes.indexHash").map_err(failed)?)),
+    };
+    let mut types = Vec::new();
+    for row in value.get_types()? {
+        types.push(DescribableType {
+            type_uuid: TypeUuid(decode_uuid(row.get_type_uuid()?, "describableType.typeUuid").map_err(failed)?),
+            path: decode_text(row.get_path()?, "describableType.path").map_err(failed)?,
+        });
+    }
+    Ok(DescribableTypesResult::Types { stamp, index_hash, types })
 }
 
 fn write_authoring_inspection(

@@ -600,7 +600,7 @@ struct MetadataDiagnostics {
 struct AuthoringValue {
   canonicalValue @0 :Data;
   blobs @1 :List(Data);
-  # The types its dynamic values name (newgameplus GAP 23 §3).
+  # The types its dynamic values name (newgameplus GAP 23 §3; protocol 20).
   types @2 :List(AuthoringType);
 }
 
@@ -681,6 +681,77 @@ struct AuthoringInspectCall {
     missing @5 :Void;
     roleIneligible @6 :AuthoringRoleFailure;
     drifted @7 :DriftedResolve;
+  }
+}
+
+# §17 "Type descriptions" (protocol 21).
+struct TypeMember {
+  # Planner path: `$`, `$.rate`, `$.shape{Ring}`.
+  path @0 :Text;
+  # Empty: none.
+  doc @1 :Text;
+  typeDoc @2 :Text;
+  hasRange @3 :Bool;
+  rangeMin @4 :Float64;
+  rangeMax @5 :Float64;
+  color @6 :Bool;
+  slider @7 :Bool;
+  hidden @8 :Bool;
+}
+
+struct TypeDefault {
+  union {
+    value @0 :AuthoringValue;
+    # No default file for the type.
+    absent @1 :Void;
+    # The logical hash the default file was written under.
+    schemaMismatch @2 :Data;
+    invalid @3 :Text;
+  }
+}
+
+struct TypeDescription {
+  stamp @0 :SnapshotStampValue;
+  typeUuid @1 :Data;
+  path @2 :Text;
+  schemaHash @3 :Data;
+  logicalSchema @4 :Data;
+  defaultValue @5 :TypeDefault;
+  members @6 :List(TypeMember);
+}
+
+struct DescribeTypeCall {
+  union {
+    success @0 :TypeDescription;
+    reconnectRequired @1 :ReconnectRequired;
+    configurationFailed @2 :ConfigurationError;
+    snapshotExpired @3 :Void;
+    error @4 :RpcError;
+    missing @5 :Void;
+    drifted @6 :DriftedResolve;
+  }
+}
+
+struct DescribableType {
+  typeUuid @0 :Data;
+  path @1 :Text;
+}
+
+struct DescribableTypes {
+  stamp @0 :SnapshotStampValue;
+  # The index file's content hash; empty without one.
+  indexHash @1 :Data;
+  types @2 :List(DescribableType);
+}
+
+struct DescribableTypesCall {
+  union {
+    success @0 :DescribableTypes;
+    reconnectRequired @1 :ReconnectRequired;
+    configurationFailed @2 :ConfigurationError;
+    snapshotExpired @3 :Void;
+    error @4 :RpcError;
+    drifted @5 :DriftedResolve;
   }
 }
 
@@ -895,6 +966,12 @@ interface AuthoringSnapshot {
   # empty for no file there. A WriteReceipt is reflected at the first
   # version whose answers match it. Protocol 13.
   file @4 (root :Text, path :Text) -> (result :DataCall);
+  # A game type's description, read at this snapshot from the type files
+  # a schema walk and the game module build write (ngp_schema::prefab_types;
+  # §17 "Type descriptions"). Protocol 20.
+  describeType @5 (typeUuid :Data) -> (result :DescribeTypeCall);
+  # The types the snapshot's type index lists. Protocol 20.
+  describableTypes @6 () -> (result :DescribableTypesCall);
 }
 
 interface ChunkStream {
