@@ -171,6 +171,7 @@ fn cook_shader(value: &str) -> Result<AuthoredValue, ProcessorError> {
             virtual_path: "assets/basic.comp",
             source: value,
         }],
+        &BTreeMap::new(),
         false,
     )
     .map_err(|error| ProcessorError::new(30, error.to_string()))?;
