@@ -735,7 +735,9 @@ fn describe_type_in(
             Some((_, bytes)) => match prefab_types::read_default(&bytes, &schema.root) {
                 Ok(prefab_types::DefaultFile::OtherSchema(written)) => TypeDefault::SchemaMismatch { written },
                 Ok(prefab_types::DefaultFile::Value(value)) => {
-                    match crate::validate::authoring_value(&schema.root, &value) {
+                    // A default file is read without a type table (`read_default`),
+                    // so it holds no dynamic value and carries no types.
+                    match crate::validate::authoring_value(&schema.root, &value, &Default::default()) {
                         Ok(value) => TypeDefault::Value(value),
                         Err(error) => TypeDefault::Invalid(error),
                     }

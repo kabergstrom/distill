@@ -3123,14 +3123,7 @@ fn write_type_description(
     output.set_logical_schema(&description.logical_schema);
     let mut default = output.reborrow().init_default_value();
     match &description.default {
-        TypeDefault::Value(value) => {
-            let mut wire = default.init_value();
-            wire.set_canonical_value(&value.canonical_value);
-            let mut blobs = wire.init_blobs(value.blobs.len() as u32);
-            for (index, blob) in value.blobs.iter().enumerate() {
-                blobs.set(index as u32, blob);
-            }
-        }
+        TypeDefault::Value(value) => write_authoring_value(default.init_value(), value),
         TypeDefault::Absent => default.set_absent(()),
         TypeDefault::SchemaMismatch { written } => default.set_schema_mismatch(&written.0),
         TypeDefault::Invalid(detail) => default.set_invalid(detail.as_str()),
@@ -3210,15 +3203,7 @@ pub fn decode_type_description(
         .map_err(|error| capnp::Error::failed(format!("invalid type description: {error:?}")))?;
     let default = match value.get_default_value()?.which()? {
         schema::type_default::Which::Value(wire) => {
-            let wire = wire?;
-            let authored = crate::AuthoringValue {
-                canonical_value: wire.get_canonical_value()?.to_vec().into(),
-                blobs: wire
-                    .get_blobs()?
-                    .iter()
-                    .map(|blob| blob.map(|bytes| bytes.to_vec().into()))
-                    .collect::<Result<Vec<_>, _>>()?,
-            };
+            let authored = decode_authoring_value(wire?).map_err(capnp::Error::failed)?;
             crate::validate::decode_authoring_payload(schema_hash, &logical_schema, &authored)
                 .map_err(|error| capnp::Error::failed(format!("invalid type default: {error:?}")))?;
             TypeDefault::Value(authored)
