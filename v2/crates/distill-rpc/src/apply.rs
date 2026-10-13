@@ -70,11 +70,27 @@ pub fn apply_commit<W: ServedWrite>(txn: &mut W, commit: &Commit) -> Result<(), 
     if version.0 <= 1 {
         return Ok(());
     }
+    let paths = commit
+        .paths
+        .iter()
+        .map(|mutation| match mutation {
+            PathMutation::Set { path, .. } | PathMutation::Remove { path } => path.clone(),
+        })
+        .chain(commit.new_entry_paths.iter().cloned())
+        .collect::<BTreeSet<_>>();
     let mut asset_deltas = commit
         .assets
         .iter()
         .map(|mutation| (mutation.uuid, mutation.delta))
         .collect::<Vec<_>>();
+    // A build that read what changed may build something else now (§15):
+    // each dependent is told as changed. Its own bundle did not change, so
+    // the commit does not name it.
+    let changed = asset_deltas.iter().map(|(uuid, _)| *uuid).collect::<Vec<_>>();
+    let changed_paths = paths.iter().cloned().collect::<Vec<_>>();
+    for asset in txn.build_dependents(&changed, &changed_paths)? {
+        asset_deltas.push((asset, AssetDeltaState::Changed));
+    }
     asset_deltas.sort_by_key(|(uuid, _)| *uuid);
     for (asset, state) in asset_deltas {
         txn.append_change(
@@ -85,14 +101,6 @@ pub fn apply_commit<W: ServedWrite>(txn: &mut W, commit: &Commit) -> Result<(), 
             },
         )?;
     }
-    let paths = commit
-        .paths
-        .iter()
-        .map(|mutation| match mutation {
-            PathMutation::Set { path, .. } | PathMutation::Remove { path } => path.clone(),
-        })
-        .chain(commit.new_entry_paths.iter().cloned())
-        .collect::<BTreeSet<_>>();
     for path in paths {
         txn.append_change(version, &Change::Path { path })?;
     }

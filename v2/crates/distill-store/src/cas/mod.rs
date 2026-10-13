@@ -28,6 +28,6 @@ pub mod store;
 pub use gc::{CompactionReport, EvictionSweep, SegmentSweeper};
 pub use recovery::RecoveryReport;
 pub use store::{
-    AuxSpec, BuildCommit, Candidate, CandidateRow, CommitOutcome, CommitReceipt, OutputSpec,
+    AuxSpec, BuildCommit, BuildRead, Candidate, CandidateRow, CommitOutcome, CommitReceipt, OutputSpec,
     SegmentKind,
 };

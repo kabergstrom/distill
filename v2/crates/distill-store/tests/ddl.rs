@@ -57,7 +57,8 @@ fn every_section_13_table_exists() {
     // results / result_outputs / derived_outputs /
     // cas_extents / cas_segments (the three roles of §13's `artifacts`
     // row), cas_refs (what keeps each extent indexed), bundle_path_refs
-    // (the reference fields a rename rewrites).
+    // (the reference fields a rename rewrites), result_reads (what each
+    // result read, for the dependents a publication tells its subscribers of).
     let expected: BTreeSet<String> = [
         "files",
         "source_claims",
@@ -70,6 +71,7 @@ fn every_section_13_table_exists() {
         "tag_epochs",
         "results",
         "result_outputs",
+        "result_reads",
         "cas_extents",
         "cas_segments",
         "cas_refs",

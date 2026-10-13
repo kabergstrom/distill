@@ -40,7 +40,7 @@ use distill_build::pipeline::{
 use distill_build::query::{asset_query_result_hash, normalize_path, AssetQuery};
 use distill_build::tool::{ProcessContext, ToolEpochSnapshot, ToolRuntimeBinding};
 use distill_build::trace::{
-    decode_trace_payload_bytes, revalidate, trace_digest, trace_payload_bytes, CapabilityKey,
+    decode_trace_payload_bytes, revalidate, trace_digest, trace_payload_bytes, trace_reads, CapabilityKey,
     EntryRole, Observed, StableFailureFingerprint, TraceOp, TraceSource,
 };
 use distill_bundle::{AssetEntry, Bundle};
@@ -1315,6 +1315,11 @@ impl PipelineProcessContext for BuildProcessContext<'_, '_> {
             Ok((_, results)) => Ok(results),
             Err(failure) => Err(self.abort_observed(failure)),
         }
+    }
+
+    fn input_asset(&self) -> Result<AssetUuid, ProcessContextError> {
+        self.ensure_active()?;
+        Ok(self.input)
     }
 
     fn input_types(&mut self) -> Result<TypeTable, ProcessContextError> {
@@ -2985,6 +2990,7 @@ fn commit_processor_stage(
             static_input_key: static_inputs_digest(static_inputs),
             asset_uuid: loaded.entry.uuid,
             trace: trace_payload_bytes(trace),
+            reads: trace_reads(trace),
             outcome: CommitOutcome::Success {
                 outputs: outputs
                     .iter()
@@ -3022,6 +3028,7 @@ fn commit_processor_failure(
             static_input_key: static_inputs_digest(static_inputs),
             asset_uuid: loaded.entry.uuid,
             trace: trace_payload_bytes(trace),
+            reads: trace_reads(trace),
             outcome: CommitOutcome::Failure { cause },
             wire_trees: Vec::new(),
         }),
@@ -3226,6 +3233,7 @@ fn assemble_pending(
                 static_input_key: key.digest,
                 asset_uuid: asset,
                 trace: trace_payload_bytes(&trace),
+                reads: trace_reads(&trace),
                 outcome: CommitOutcome::Success {
                     outputs: pending
                         .iter()
@@ -3644,6 +3652,7 @@ fn commit_build_import_failure(
             static_input_key: key,
             asset_uuid: loaded.entry.uuid,
             trace: trace_payload_bytes(trace),
+            reads: trace_reads(trace),
             outcome: CommitOutcome::Failure { cause },
             wire_trees: Vec::new(),
         }),
@@ -3989,6 +3998,7 @@ fn encode_or_hydrate(
                         static_input_key: key,
                         asset_uuid: loaded.entry.uuid,
                         trace: trace_payload_bytes(&trace),
+                        reads: trace_reads(&trace),
                         outcome: CommitOutcome::Failure {
                             cause: StoreFailureCause::Local(StoreFailureFingerprint::Local {
                                 class: StoreLocalFailureClass::Validator,
@@ -4074,6 +4084,7 @@ fn encode_or_hydrate(
                 static_input_key: key,
                 asset_uuid: loaded.entry.uuid,
                 trace: trace_payload_bytes(&trace),
+                reads: trace_reads(&trace),
                 outcome: CommitOutcome::Success {
                     outputs: vec![OutputSpec {
                         output_key: String::new(),

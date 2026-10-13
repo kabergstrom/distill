@@ -13,8 +13,7 @@ use distill_wire::dswl::{dswl_bytes, dswl_hash};
 use distill_wire::wire::WireNode;
 use ngp_schema::classify::{classify, Class};
 use ngp_schema::{
-    ExtractionError, LayoutIdentity, Schema, SchemaTypeId, ASSET_REF_UUID, FIXED_STATE_UUID,
-    WEAK_ASSET_REF_UUID,
+    framework_uuid, ExtractionError, LayoutIdentity, Schema, SchemaTypeId,
 };
 
 use crate::SchemaRegistry;
@@ -217,13 +216,6 @@ impl From<ExtractionError> for SchemaAuthorityError {
     fn from(error: ExtractionError) -> Self {
         Self::Extraction(error.to_string())
     }
-}
-
-fn framework_uuid(type_uuid: TypeUuid) -> bool {
-    matches!(
-        type_uuid,
-        ASSET_REF_UUID | WEAK_ASSET_REF_UUID | FIXED_STATE_UUID
-    )
 }
 
 fn validate_model(schema: &Schema) -> Result<(), SchemaAuthorityError> {

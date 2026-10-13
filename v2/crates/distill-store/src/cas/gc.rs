@@ -543,6 +543,7 @@ mod tests {
         key[..4].copy_from_slice(&index.to_le_bytes());
         store
             .commit_build(BuildCommit {
+                reads: Vec::new(),
                 wire_trees: Vec::new(),
                 key_kind: KeyKind::Processor,
                 static_input_key: key,
@@ -822,6 +823,7 @@ mod tests {
         ));
         let receipt = a
             .commit_build(BuildCommit {
+                reads: Vec::new(),
                 wire_trees: vec![wire_bytes.clone()],
                 key_kind: KeyKind::Processor,
                 static_input_key: [1; 32],
@@ -904,6 +906,7 @@ mod tests {
         let second = vec![8u8; 300];
         let second_hash = *blake3::hash(&second).as_bytes();
         b.commit_build(BuildCommit {
+            reads: Vec::new(),
             wire_trees: Vec::new(),
             key_kind: KeyKind::Processor,
             static_input_key: [1; 32],

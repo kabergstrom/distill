@@ -247,6 +247,34 @@ pub fn trace_payload_bytes(trace: &[TraceOp]) -> Vec<u8> {
     encoder.into_bytes()
 }
 
+/// The namespace subjects `trace` read, each once, for the store's
+/// reverse index (`BuildCommit::reads`): the asset of every authored
+/// read, artifact read, reference and role check, and every resolved
+/// path, whatever each observed (a miss that later resolves changes the
+/// build too). An asset query has no one subject and is not indexed;
+/// tools, capabilities and control reads are not the namespace.
+pub fn trace_reads(trace: &[TraceOp]) -> Vec<distill_store::cas::BuildRead> {
+    use distill_store::cas::BuildRead;
+    let mut reads: Vec<BuildRead> = trace
+        .iter()
+        .filter_map(|op| match op {
+            TraceOp::AuthoringRead { asset, .. }
+            | TraceOp::Read { asset, .. }
+            | TraceOp::RefCheck { asset, .. }
+            | TraceOp::RoleCheck { asset, .. } => Some(BuildRead::Asset(*asset)),
+            TraceOp::Resolve { path, .. } => Some(BuildRead::Path(path.clone())),
+            TraceOp::Query { .. }
+            | TraceOp::Tool { .. }
+            | TraceOp::Capability { .. }
+            | TraceOp::Control { .. }
+            | TraceOp::ControlRead { .. } => None,
+        })
+        .collect();
+    reads.sort();
+    reads.dedup();
+    reads
+}
+
 fn observed<T>(
     e: &mut CanonicalEncoder,
     value: &Observed<T>,

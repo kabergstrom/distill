@@ -6,8 +6,7 @@ use std::collections::BTreeMap;
 
 use distill_core::id::{LogicalHash, TypeUuid};
 use ngp_schema::{
-    node_hash, project, ExtractionError, LogicalSchema, NodeError, Schema, ASSET_REF_UUID,
-    FIXED_STATE_UUID, WEAK_ASSET_REF_UUID,
+    framework_uuid, node_hash, project, ExtractionError, LogicalSchema, NodeError, Schema,
 };
 
 #[derive(Debug, Default)]
@@ -18,8 +17,8 @@ pub struct SchemaRegistry {
 
 impl SchemaRegistry {
     /// Build from an extracted schema: every type carrying a stable UUID
-    /// registers (framework types — AssetRef/WeakAssetRef/the fixed-seed
-    /// hasher state — never project standalone and are excluded). A
+    /// registers (framework types (`ngp_schema::framework_uuid`) never
+    /// project standalone and are excluded). A
     /// duplicate UUID is an error naming both types (§7).
     pub fn from_schema(schema: &Schema) -> Result<Self, ExtractionError> {
         let mut current: BTreeMap<TypeUuid, (LogicalSchema, LogicalHash)> = BTreeMap::new();
@@ -30,7 +29,7 @@ impl SchemaRegistry {
             // Framework types are recognized by identity and skipped BEFORE
             // the duplicate check — every AssetRef<T> instantiation carries
             // the same framework UUID by construction.
-            if uuid == ASSET_REF_UUID || uuid == WEAK_ASSET_REF_UUID || uuid == FIXED_STATE_UUID {
+            if framework_uuid(uuid) {
                 continue;
             }
             if let Some(first) = owners.get(&uuid) {

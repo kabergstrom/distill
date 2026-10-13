@@ -1166,6 +1166,7 @@ mod cas_pass_tests {
     fn commit(store: &mut Store, key: u8) {
         store
             .commit_build(BuildCommit {
+                reads: Vec::new(),
                 wire_trees: Vec::new(),
                 key_kind: KeyKind::Processor,
                 static_input_key: [key; 32],

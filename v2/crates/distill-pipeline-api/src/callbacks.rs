@@ -338,6 +338,11 @@ pub trait PipelineProcessContext {
         Err(ProcessContextError::Unavailable("read_path"))
     }
 
+    /// The processed asset.
+    fn input_asset(&self) -> Result<AssetUuid, ProcessContextError> {
+        Err(ProcessContextError::Unavailable("input_asset"))
+    }
+
     /// The dynamic-type closure (GAP 23 §3) of the processed asset's
     /// bundle: the types the input's dynamic values name. Observes that
     /// bundle.

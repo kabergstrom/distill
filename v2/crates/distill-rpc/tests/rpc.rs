@@ -3246,3 +3246,50 @@ fn coordinated<T>(
 fn announce_restart(project: &TestProject, changes: &[RestartOnlyChange]) {
     project.coordinator().set_restart_required(changes).unwrap();
 }
+
+/// A commit tells subscribers of what changed and of every asset a build
+/// read it for (§15): a result that read one asset logs its own asset as
+/// changed when the other changes.
+#[test]
+fn a_commit_logs_the_assets_whose_builds_read_what_changed() {
+    use distill_store::cas::record::KeyKind;
+    use distill_store::cas::{BuildCommit, BuildRead, CommitOutcome, OutputSpec};
+    use distill_store::served::Change;
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = distill_store::Store::open(distill_store::StoreConfig::new(dir.path().join(".distill"))).unwrap();
+    let (read, reader) = (asset_id(1), asset_id(2));
+    store
+        .commit_build(BuildCommit {
+            key_kind: KeyKind::Processor,
+            static_input_key: [7; 32],
+            asset_uuid: reader,
+            trace: vec![7],
+            reads: vec![BuildRead::Asset(read)],
+            outcome: CommitOutcome::Success {
+                outputs: vec![OutputSpec { output_key: String::new(), type_uuids: vec![], bytes: vec![7; 64] }],
+                aux: vec![],
+            },
+            wire_trees: vec![],
+        })
+        .unwrap();
+    let commit = Commit {
+        assets: vec![AssetMutation { uuid: read, delta: AssetDeltaState::Changed }],
+        ..Commit::default()
+    };
+    // The first publication logs nothing; the second logs both.
+    for _ in 0..2 {
+        store
+            .input_transaction(|txn| apply_commit(txn, &commit).map_err(Into::into))
+            .unwrap();
+    }
+    let logged = store
+        .change_log_after(0)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.change)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        logged,
+        [read, reader].map(|asset| Change::Asset { asset, state: 0 })
+    );
+}

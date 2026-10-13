@@ -16,7 +16,7 @@ use distill_build::query::AssetQuery;
 use distill_build::tool::{ToolOutput, ToolRunError};
 use distill_build::trace::{CapabilityKey, StableFailureFingerprint};
 use distill_core::id::{AssetUuid, TypeUuid};
-use distill_schema::ngp_schema::Value;
+use distill_schema::ngp_schema::{AssetRefValue, TypeTable, Value};
 use distill_schema::ngp_schema::LogicalSchema;
 
 pub use distill_pipeline_api::callbacks::*;
@@ -157,6 +157,34 @@ impl PipelineProcessContext for ContainedProcessContext<'_> {
         }
         catch_unwind(AssertUnwindSafe(|| {
             self.inner.read_path(path, expected_terminal)
+        }))
+        .unwrap_or_else(|_| self.failed())
+    }
+
+    fn input_asset(&self) -> Result<AssetUuid, ProcessContextError> {
+        if self.panicked.get() {
+            return self.failed();
+        }
+        catch_unwind(AssertUnwindSafe(|| self.inner.input_asset())).unwrap_or_else(|_| self.failed())
+    }
+
+    fn input_types(&mut self) -> Result<TypeTable, ProcessContextError> {
+        if self.panicked.get() {
+            return self.failed();
+        }
+        catch_unwind(AssertUnwindSafe(|| self.inner.input_types())).unwrap_or_else(|_| self.failed())
+    }
+
+    fn read_authored(
+        &mut self,
+        reference: &AssetRefValue,
+        expected_terminal: TypeUuid,
+    ) -> Result<AuthoredAsset, ProcessContextError> {
+        if self.panicked.get() {
+            return self.failed();
+        }
+        catch_unwind(AssertUnwindSafe(|| {
+            self.inner.read_authored(reference, expected_terminal)
         }))
         .unwrap_or_else(|_| self.failed())
     }

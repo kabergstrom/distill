@@ -30,6 +30,14 @@ pub(crate) const SET_RPC_TARGET: &str =
 /// A pipeline fence row at version `?1` (kind `?2`: [`CHANGE_RECONNECT_ALL`]).
 pub(crate) const APPEND_RECONNECT_ALL: &str =
     "INSERT INTO change_log(version, kind) VALUES (?1, ?2)";
+/// The parent and output keys of every result that read subject `?2` of
+/// kind `?1` (`result_reads`; NULL output: a failure).
+pub(crate) const BUILD_DEPENDENTS: &str = "SELECT DISTINCT r.asset_uuid, o.name FROM result_reads d
+     CROSS JOIN results r ON r.key_kind = d.key_kind AND r.static_key = d.static_key
+         AND r.trace_digest = d.trace_digest
+     LEFT JOIN result_outputs o ON o.key_kind = r.key_kind AND o.static_key = r.static_key
+         AND o.trace_digest = r.trace_digest AND o.role = 0
+     WHERE d.kind = ?1 AND d.subject = ?2";
 /// Drop an artifact's load edges ahead of recording its latest install's.
 pub(crate) const DELETE_LOAD_EDGES: &str =
     "DELETE FROM artifact_load_edges WHERE content_hash = ?1";
@@ -596,6 +604,44 @@ pub trait ServedWrite {
                 .execute(rusqlite::params![version, CHANGE_RECONNECT_ALL])?,
         };
         Ok(())
+    }
+
+    /// The assets whose builds read what a publication changed (§15 "Watch
+    /// and client-side staleness"): every committed result whose trace read
+    /// one of `assets` or resolved one of `paths` names its parent asset and
+    /// each of its derived outputs, and those are read in turn, to a
+    /// fixpoint. Ascending, `assets` themselves left out. Over-approximate
+    /// by design: a result of an older trace counts too, and a client's
+    /// re-resolve that finds the hash it holds does nothing.
+    fn build_dependents(&self, assets: &[AssetUuid], paths: &[String]) -> Result<Vec<AssetUuid>, StoreError> {
+        let mut statement = self.served_conn().prepare_cached(BUILD_DEPENDENTS)?;
+        let mut seen: BTreeSet<AssetUuid> = assets.iter().copied().collect();
+        let mut found = BTreeSet::new();
+        let mut queue: Vec<(i64, Vec<u8>)> = assets
+            .iter()
+            .map(|asset| (crate::cas::store::READ_ASSET, asset.0.to_vec()))
+            .chain(paths.iter().map(|path| (crate::cas::store::READ_PATH, path.as_bytes().to_vec())))
+            .collect();
+        while let Some((kind, subject)) = queue.pop() {
+            let rows = statement.query_map(rusqlite::params![kind, subject], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            for row in rows {
+                let (parent, output) = row?;
+                let parent = AssetUuid(blob16(parent));
+                let named = match output.as_deref() {
+                    None | Some("") => parent,
+                    Some(key) => AssetUuid::v5(parent, key),
+                };
+                for asset in [parent, named] {
+                    if seen.insert(asset) {
+                        found.insert(asset);
+                        queue.push((crate::cas::store::READ_ASSET, asset.0.to_vec()));
+                    }
+                }
+            }
+        }
+        Ok(found.into_iter().collect())
     }
 
     /// Keep at most `retained` versions of history before `current`; older

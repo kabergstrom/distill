@@ -6,6 +6,7 @@ use distill_schema::SchemaRegistry;
 use ngp_schema::build::{field, SchemaBuilder};
 use ngp_schema::{
     logical_hash, node_hash, project, ExtractionError, PointerKind, PrimitiveType, ASSET_REF_UUID,
+    DYNAMIC_PATCH_UUID,
 };
 
 fn uuid(n: u8) -> TypeUuid {
@@ -53,7 +54,10 @@ fn framework_uuids_never_register() {
     let target = b.struct_type("game", "Tex", vec![field("w", u32_t)]);
     b.def_mut(target).uuid = Some(uuid(9));
     let r = b.asset_ref(target);
-    let holder = b.struct_type("game", "Mat", vec![field("tex", r)]);
+    let text = b.string();
+    let patch = b.struct_type("distill_asset", "DynamicPatch", vec![field("0", text)]);
+    b.def_mut(patch).uuid = Some(DYNAMIC_PATCH_UUID);
+    let holder = b.struct_type("game", "Mat", vec![field("tex", r), field("tuning", patch)]);
     b.def_mut(holder).uuid = Some(uuid(4));
     let schema = b.finish();
 
@@ -63,6 +67,7 @@ fn framework_uuids_never_register() {
     // The AssetRef struct itself carries the framework UUID but never
     // projects standalone (§5).
     assert!(reg.current(ASSET_REF_UUID).is_none());
+    assert!(reg.current(DYNAMIC_PATCH_UUID).is_none());
 }
 
 #[test]

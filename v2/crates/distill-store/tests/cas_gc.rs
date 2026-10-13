@@ -27,6 +27,7 @@ fn commit_with_aux(
 ) -> ([u8; 32], [u8; 32], [u8; 32]) {
     let receipt = store
         .commit_build(BuildCommit {
+            reads: Vec::new(),
             wire_trees: Vec::new(),
             key_kind: KeyKind::Processor,
             static_input_key: [key; 32],
@@ -60,6 +61,7 @@ fn commit_artifact(
 ) -> ([u8; 32], [u8; 32]) {
     let receipt = store
         .commit_build(BuildCommit {
+            reads: Vec::new(),
             wire_trees,
             key_kind: KeyKind::Processor,
             static_input_key: [key; 32],
@@ -196,6 +198,7 @@ fn a_commit_naming_an_absent_wire_tree_is_refused() {
     let mut store = Store::open(cfg(&dir)).unwrap();
     let (_, layout) = unit_layout();
     let result = store.commit_build(BuildCommit {
+        reads: Vec::new(),
         wire_trees: Vec::new(),
         key_kind: KeyKind::Processor,
         static_input_key: [1; 32],
@@ -384,6 +387,7 @@ fn compaction_leaves_failure_results() {
     let mut store = Store::open(cfg(&dir)).unwrap();
     store
         .commit_build(BuildCommit {
+            reads: Vec::new(),
             wire_trees: Vec::new(),
             key_kind: KeyKind::Processor,
             static_input_key: [5u8; 32],

@@ -133,3 +133,67 @@ fn an_artifacts_load_edges_are_its_latest_installs_and_go_with_it() {
         "load edges outlived their artifact"
     );
 }
+
+/// Commit a processor result for `parent` with outputs `keys` whose trace
+/// read `reads`.
+fn commit_reading(
+    store: &mut Store,
+    key: u8,
+    parent: AssetUuid,
+    keys: &[&str],
+    reads: Vec<distill_store::cas::BuildRead>,
+) {
+    use distill_store::cas::record::KeyKind;
+    use distill_store::cas::{BuildCommit, CommitOutcome, OutputSpec};
+    store
+        .commit_build(BuildCommit {
+            key_kind: KeyKind::Processor,
+            static_input_key: [key; 32],
+            asset_uuid: parent,
+            trace: vec![key],
+            reads,
+            outcome: CommitOutcome::Success {
+                outputs: keys
+                    .iter()
+                    .map(|output_key| OutputSpec {
+                        output_key: (*output_key).to_owned(),
+                        type_uuids: vec![],
+                        bytes: vec![key; 64],
+                    })
+                    .collect(),
+                aux: vec![],
+            },
+            wire_trees: vec![],
+        })
+        .unwrap();
+}
+
+/// A result's reads name its parent and derived outputs as dependents of
+/// what it read, transitively; a path read names them for that path.
+#[test]
+fn build_dependents_follow_result_reads_to_a_fixpoint() {
+    use distill_store::cas::BuildRead;
+    let (_dir, mut store) = store();
+    let leaf = AssetUuid([10; 16]);
+    let middle = AssetUuid([11; 16]);
+    let top = AssetUuid([12; 16]);
+    let by_path = AssetUuid([13; 16]);
+    // middle reads leaf and has an extra output; top reads middle's extra.
+    commit_reading(&mut store, 1, middle, &["", "extra"], vec![BuildRead::Asset(leaf)]);
+    let extra = AssetUuid::v5(middle, "extra");
+    commit_reading(&mut store, 2, top, &[""], vec![BuildRead::Asset(extra)]);
+    commit_reading(&mut store, 3, by_path, &[""], vec![BuildRead::Path("a/b.bundle".into())]);
+
+    let dependents = |store: &mut Store, assets: &[AssetUuid], paths: &[String]| {
+        let (assets, paths) = (assets.to_vec(), paths.to_vec());
+        store
+            .served_transaction(move |txn| txn.build_dependents(&assets, &paths))
+            .unwrap()
+    };
+    let mut expected = vec![middle, extra, top];
+    expected.sort();
+    assert_eq!(dependents(&mut store, &[leaf], &[]), expected);
+    assert_eq!(dependents(&mut store, &[middle], &[]), Vec::<AssetUuid>::new());
+    assert_eq!(dependents(&mut store, &[], &["a/b.bundle".into()]), [by_path]);
+    assert_eq!(dependents(&mut store, &[], &["a/c.bundle".into()]), Vec::<AssetUuid>::new());
+}

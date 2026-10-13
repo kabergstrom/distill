@@ -95,9 +95,21 @@ pub struct BuildCommit {
     /// failing op for failures).
     pub trace: Vec<u8>,
     pub outcome: CommitOutcome,
+    /// What the trace read of the namespace (its asset and path subjects,
+    /// each once), indexed so a publication changing one finds the
+    /// result's assets (§15, [`crate::served::ServedWrite::build_dependents`]).
+    pub reads: Vec<BuildRead>,
     /// Canonical DSWL bodies of the wire trees the outputs name, committed
     /// with the result. A tree already in the CAS may be left out.
     pub wire_trees: Vec<Vec<u8>>,
+}
+
+/// One namespace subject a build read (§10): an asset (authored or
+/// artifact read, reference or role check) or a resolved path.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BuildRead {
+    Asset(AssetUuid),
+    Path(String),
 }
 
 /// What a commit returns.
@@ -138,6 +150,10 @@ pub(crate) const CANDIDATE: &str =
 pub(crate) const ROLE_OUTPUT: i64 = 0;
 pub(crate) const ROLE_AUX: i64 = 1;
 pub(crate) const ROLE_WIRE_TREE: i64 = 2;
+/// `result_reads.kind`: an asset subject (its uuid bytes) or a path (its
+/// text bytes).
+pub(crate) const READ_ASSET: i64 = 0;
+pub(crate) const READ_PATH: i64 = 1;
 
 /// One bucket candidate, most-recently-committed-first (§13).
 #[derive(Debug, Clone)]
@@ -685,6 +701,23 @@ impl Store {
                 }
                 for (output_key, layout) in &layouts {
                     name(ROLE_WIRE_TREE, output_key, None, layout)?;
+                }
+                let mut read = txn.prepare_cached(
+                    "INSERT OR IGNORE INTO result_reads(key_kind, static_key, trace_digest, kind, subject)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?;
+                for subject in &commit.reads {
+                    let (kind, subject) = match subject {
+                        BuildRead::Asset(asset) => (READ_ASSET, asset.0.as_slice()),
+                        BuildRead::Path(path) => (READ_PATH, path.as_bytes()),
+                    };
+                    read.execute(rusqlite::params![
+                        key_kind as i64,
+                        static_key.as_slice(),
+                        trace_digest.as_slice(),
+                        kind,
+                        subject,
+                    ])?;
                 }
                 index_segments(txn, &appended.touched)?;
                 Ok(())

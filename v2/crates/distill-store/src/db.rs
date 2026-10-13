@@ -21,7 +21,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// and the remedy is [`Store::recreate`], which the daemon's writer runs on
 /// its own ([`Store::open_or_recreate`]); readers still fail. Migrations are
 /// deferred until Distill is declared stable (DESIGN.md §13).
-pub const SCHEMA_VERSION: u32 = 64;
+pub const SCHEMA_VERSION: u32 = 65;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -265,6 +265,23 @@ CREATE TABLE result_outputs (
         REFERENCES results(key_kind, static_key, trace_digest) ON DELETE CASCADE
 ) WITHOUT ROWID;
 CREATE INDEX result_outputs_by_hash ON result_outputs(content_hash);
+-- Schema 65: what a result's trace read of the namespace (§10): kind 0
+-- an asset (`subject` its uuid: an authored or artifact read, a reference
+-- or role check), kind 1 a path resolution (`subject` the path). A
+-- publication changing one changes what the result builds, and its
+-- assets' subscribers are told (§15; `ServedWrite::build_dependents`).
+-- Goes with the result.
+CREATE TABLE result_reads (
+    key_kind     INTEGER NOT NULL,
+    static_key   BLOB NOT NULL,
+    trace_digest BLOB NOT NULL,
+    kind         INTEGER NOT NULL CHECK (kind IN (0, 1)),
+    subject      BLOB NOT NULL,
+    PRIMARY KEY (key_kind, static_key, trace_digest, kind, subject),
+    FOREIGN KEY (key_kind, static_key, trace_digest)
+        REFERENCES results(key_kind, static_key, trace_digest) ON DELETE CASCADE
+) WITHOUT ROWID;
+CREATE INDEX result_reads_by_subject ON result_reads(kind, subject);
 CREATE TABLE cas_extents (
     content_hash BLOB NOT NULL PRIMARY KEY,
     segment      INTEGER NOT NULL,

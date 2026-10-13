@@ -1717,7 +1717,8 @@ artifact format's `DSTL` (§12).
 | `format_version` | number | Bundle file format version |
 | `uuid` | string | The bundle's own stable UUID |
 | `primary` | string? | Local ID resolved by plain-path references. Optional; inference is over runtime content entries only — every `authoring_only` entry is ineligible, including daemon-owned `$` entries (§8): defaults to the sole eligible entry; multiple eligible entries with no declaration and no prior primary are an error (§8's fold rule). |
-| `schemas` | object | `logical_hash → LogicalSchema` for every logical hash the bundle references — entry `schema_hash`es, migration endpoints (§11). Bundles are **schema-closed**: any hash mentioned in the file resolves within the file. |
+| `schemas` | object | `logical_hash → LogicalSchema` for every logical hash the bundle references — entry `schema_hash`es, migration endpoints (§11)., `types` entries. Bundles are **schema-closed**: any hash mentioned in the file resolves within the file. |
+| `types` | object? | The dynamic-type closure (§5 `Dynamic`, newgameplus GAP 23 §3): `type path → { "schema_hash", "type_uuid" }` for every type a dynamic value in an entry names, keyed by the path its text spells, each schema in `schemas`. Absent when empty. Parse and write reject a dynamic value naming a type outside it, and a type listed under two paths; compaction keeps only the types still named. Processors read it through `PipelineProcessContext::input_types` (§9). |
 | `assets` | object | `local_id → asset entry` |
 
 ### Asset entry
@@ -1740,7 +1741,13 @@ pub struct Bundle {
     pub uuid: BundleUuid,
     pub primary: Option<String>,
     pub schemas: BTreeMap<LogicalHash, LogicalSchema>,
+    pub types: BTreeMap<String, BundleType>,           // dynamic-type closure
     pub assets: BTreeMap<String, AssetEntry>,          // local_id → entry
+}
+
+pub struct BundleType {
+    pub type_uuid: TypeUuid,
+    pub schema_hash: LogicalHash,
 }
 
 pub struct AssetEntry {
@@ -3443,6 +3450,18 @@ impl ProcessContext {
     pub fn read_path<T: AssetType>(&mut self, path: &str) -> Result<Artifact<T>, BuildError>;
     /// Query dep over the asset namespace.
     pub fn query(&mut self, q: &AssetQuery) -> Result<Vec<AssetUuid>, BuildError>;
+    /// The input entry's own asset.
+    pub fn input_asset(&self) -> Result<AssetUuid, BuildError>;
+    /// The input's dynamic-type closure (§6 `types`), its dynamic values
+    /// read against it. Traced as an authoring read of the input.
+    pub fn input_types(&mut self) -> Result<TypeTable, BuildError>;
+    /// Another entry's authored value and type closure, unprocessed,
+    /// through a reference (uuid, or path: a resolution dep too). Traced
+    /// as an authoring read: an edit of its bundle rebuilds this result
+    /// and tells its subscribers (§15). For processors that compose
+    /// authored sources (newgameplus GAP 23 §4.2, the prefab cook).
+    pub fn read_authored(&mut self, r: &AssetRefValue, expected: TypeUuid)
+        -> Result<AuthoredAsset, BuildError>;
     pub fn target(&self) -> Result<&Target, HostCallbackError>;       // §18
     /// The only way to obtain an Outputs: bound at creation to this
     /// job's (parent uuid, declared output set).
@@ -5412,6 +5431,7 @@ that published it, never copied into a table.
 | `tag_epochs` | authored type → the tag epoch its rows were refined under (a digest of what the schema authority says about the type); a changed epoch marks the type's rows pending in the input that changes it |
 | `results` | static-input-key digest → candidate bucket: (trace digest → trace, deterministic failure or success), revalidated most-recent-first on lookup (§9 — the build-cache lookup; the full input hash is never stored; a re-commit of one key and trace replaces its result, others append) |
 | `result_outputs` | a result's output table, one row per entry: its outputs (output key → type uuids, ContentHash), aux payloads and wire tree. The rows are the result's pins in the CAS and go with the result |
+| `result_reads` | what a result's trace read of the namespace, one row per subject: assets (authoring and artifact reads, reference and role checks) and resolved paths. The build reverse index §15's deltas walk; goes with the result |
 | `cas_extents` | ContentHash → segment, offset, length: the CAS extent index. Segments hold raw bytes; an extent is its row, and live bytes are covering-index sums |
 | `cas_refs` | what an install holds: an installed artifact or wire tree holds itself and the wire tree an artifact names. Releasing a holder (or a result) deletes in its transaction each extent nothing else references; a foreign key refuses to drop one still referenced |
 | `cas_segments` | every segment file and its state (open, sealed, dead); a writer's one open segment is unique, and a dead file is deleted only once no read can reach it |
@@ -6638,7 +6658,16 @@ resolved at (`since`), installation happens atomically at a returned
 delta covering `(since, installed]` for the named assets and paths — a
 commit landing between a client's initial resolves and subscription
 installation is delivered, never permanently missed. On every commit the daemon
-re-hashes changed inputs and walks the reverse-dep indexes; affected manifest
+re-hashes changed inputs and walks the reverse-dep indexes; the build reverse index is
+`result_reads` (§13): each committed result's asset and path subjects,
+taken from its trace (`AuthoringRead`, `Read`, `RefCheck`, `RoleCheck`
+assets; `Resolve` paths), so a publication that changes an asset or a
+path also logs, as changed, the parent and derived outputs of every
+result that read it, transitively (`ServedWrite::build_dependents`,
+applied by `distill_rpc::apply_commit`). Results of older traces count
+too; the over-approximation costs a re-resolve that finds the hash the
+client holds. Asset queries are not indexed (no one subject): a query
+result's change reaches a build only on that build's next pull; affected manifest
 entries flip `Current(content_hash) → Invalidated(last_content_hash)` and subscribers receive
 a **delta**: `(stamp, affected entries)` — each entry carrying a
 typed state (changed / deleted / restored, the `IoEvent::Delta` grammar

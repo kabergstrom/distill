@@ -243,6 +243,7 @@ fn a_failed_inline_build_flush_commits_no_partial_node() {
         )
         .unwrap();
         BuildCommit {
+            reads: Vec::new(),
             wire_trees: vec![dswl_bytes(&node).unwrap()],
             key_kind: KeyKind::Node,
             static_input_key: [key; 32],

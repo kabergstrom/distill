@@ -40,6 +40,7 @@ fn namespace_error(message: &str) -> NamespaceError {
 
 fn success_commit(static_key: [u8; 32], trace: &[u8]) -> BuildCommit {
     BuildCommit {
+        reads: Vec::new(),
         wire_trees: Vec::new(),
         key_kind: KeyKind::Processor,
         static_input_key: static_key,
@@ -331,6 +332,7 @@ fn build_import_results_carry_exactly_one_output_row() {
 
     // Exactly one output row commits and is bucket-indexed by DSBI digest.
     let commit = BuildCommit {
+        reads: Vec::new(),
         wire_trees: Vec::new(),
         key_kind: KeyKind::BuildImport,
         static_input_key: [2u8; 32],
@@ -362,6 +364,7 @@ fn failure_records_commit_index_and_carry_no_outputs() {
     // the trace.
     let (_d, mut store) = store();
     let commit = BuildCommit {
+        reads: Vec::new(),
         wire_trees: Vec::new(),
         key_kind: KeyKind::Processor,
         static_input_key: [3u8; 32],
@@ -398,6 +401,7 @@ fn a_capability_miss_memoizes_with_its_requested_key() {
     let (_d, mut store) = store();
     let key = CapabilityKey::MigrationFn("v2-to-v3".to_owned());
     let commit = BuildCommit {
+        reads: Vec::new(),
         wire_trees: Vec::new(),
         key_kind: KeyKind::Processor,
         static_input_key: [4u8; 32],
@@ -428,6 +432,7 @@ fn a_deterministic_local_failure_memoizes_with_an_empty_trace() {
     // operation — trace empty, cause Local, memoized like any failure.
     let (_d, mut store) = store();
     let commit = BuildCommit {
+        reads: Vec::new(),
         wire_trees: Vec::new(),
         key_kind: KeyKind::Processor,
         static_input_key: [5u8; 32],
@@ -532,6 +537,7 @@ fn segments_roll_at_the_size_cap() {
 
     for i in 0..4u8 {
         let commit = BuildCommit {
+            reads: Vec::new(),
             wire_trees: Vec::new(),
             key_kind: KeyKind::Processor,
             static_input_key: [i; 32],
@@ -588,6 +594,7 @@ fn a_record_larger_than_the_cap_gets_one_typed_dedicated_oversize_segment() {
     let payload = vec![0x5au8; 4096];
     let receipt = store
         .commit_build(BuildCommit {
+            reads: Vec::new(),
             wire_trees: Vec::new(),
             key_kind: KeyKind::Processor,
             static_input_key: [0x33; 32],

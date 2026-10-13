@@ -2121,7 +2121,7 @@ fn cas_statements_search_their_indexes() {
         SEGMENTS_IN_STATE, SEGMENT_EXTENTS,
     };
     use crate::cas::store::{ACTIVE_SEGMENT, SEAL_ACTIVE_SEGMENT, SEAL_SEGMENT};
-    use crate::served::DELETE_LOAD_EDGES;
+    use crate::served::{BUILD_DEPENDENTS, DELETE_LOAD_EDGES};
     let (_dir, store) = store_with(10);
     let cases: &[(&str, &[&str])] = &[
         // One open regular segment per writer: `cas_segments_open` is
@@ -2135,7 +2135,7 @@ fn cas_statements_search_their_indexes() {
         // searches their primary key), whose extents it reads first.
         (
             EVICT_RESULT_ROW,
-            &["SEARCH results USING INDEX sqlite_autoindex_results_1 (key_kind=? AND static_key=? AND trace_digest=?)", "SEARCH result_outputs USING PRIMARY KEY (key_kind=? AND static_key=? AND trace_digest=?)"],
+            &["SEARCH results USING INDEX sqlite_autoindex_results_1 (key_kind=? AND static_key=? AND trace_digest=?)", "SEARCH result_reads USING PRIMARY KEY (key_kind=? AND static_key=? AND trace_digest=?)", "SEARCH result_outputs USING PRIMARY KEY (key_kind=? AND static_key=? AND trace_digest=?)"],
         ),
         (
             RESULT_EXTENTS,
@@ -2193,6 +2193,15 @@ fn cas_statements_search_their_indexes() {
             DELETE_LOAD_EDGES,
             &["SEARCH artifact_load_edges USING COVERING INDEX sqlite_autoindex_artifact_load_edges_1 (content_hash=?)"],
         ),
+        (
+            BUILD_DEPENDENTS,
+            &[
+                "SEARCH d USING COVERING INDEX result_reads_by_subject (kind=? AND subject=?)",
+                "SEARCH r USING INDEX sqlite_autoindex_results_1 (key_kind=? AND static_key=? AND trace_digest=?)",
+                "SEARCH o USING PRIMARY KEY (key_kind=? AND static_key=? AND trace_digest=? AND role=?) LEFT-JOIN",
+                "USE TEMP B-TREE FOR DISTINCT",
+            ],
+        ),
     ];
     for (sql, expected) in cases {
         assert_eq!(&store.query_plan_details(sql).unwrap(), expected, "{sql}");
@@ -2217,6 +2226,7 @@ fn cas_verification_reads_per_segment() {
         key[..4].copy_from_slice(&index.to_le_bytes());
         store
             .commit_build(BuildCommit {
+                reads: Vec::new(),
                 wire_trees: Vec::new(),
                 key_kind: crate::cas::record::KeyKind::Processor,
                 static_input_key: key,
@@ -2457,6 +2467,7 @@ fn cas_and_served_point_statements_search_their_keys() {
     let key = [3; 32];
     store
         .commit_build(BuildCommit {
+            reads: Vec::new(),
             wire_trees: Vec::new(),
             key_kind: crate::cas::record::KeyKind::Processor,
             static_input_key: key,
@@ -2664,6 +2675,7 @@ fn cas_and_served_point_statements_search_their_keys() {
             "DELETE FROM results WHERE key_kind = ? AND static_key = ? AND trace_digest = ? RETURNING ?",
             &[
                 "SEARCH results USING INDEX sqlite_autoindex_results_1 (key_kind=? AND static_key=? AND trace_digest=?)",
+                "SEARCH result_reads USING PRIMARY KEY (key_kind=? AND static_key=? AND trace_digest=?)",
                 "SEARCH result_outputs USING PRIMARY KEY (key_kind=? AND static_key=? AND trace_digest=?)",
             ],
         ),
