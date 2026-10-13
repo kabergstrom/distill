@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use distill_core::id::TypeUuid;
-use distill_json::AuthoredValue;
+use ngp_schema::Value;
 
 use crate::failure::StableFailureFingerprint;
 use crate::query::{normalize_identifier, FileQuery, IntakeError};
@@ -56,7 +56,7 @@ pub struct ImportError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImportEntry {
     pub type_uuid: TypeUuid,
-    pub value: AuthoredValue,
+    pub value: Value,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -89,7 +89,7 @@ impl ImportOutput {
         &mut self,
         local_id: &str,
         type_uuid: TypeUuid,
-        value: AuthoredValue,
+        value: Value,
     ) -> Result<(), ImportOutputError> {
         let local_id =
             normalize_identifier(local_id).map_err(ImportOutputError::InvalidIdentifier)?;

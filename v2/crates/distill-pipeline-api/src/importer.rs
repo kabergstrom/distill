@@ -1,8 +1,7 @@
 //! The authoring importer interface (§8).
 
 use distill_core::id::TypeUuid;
-use distill_json::AuthoredValue;
-use ngp_schema::LogicalSchema;
+use ngp_schema::{LogicalSchema, SchemaNode, Value};
 
 use crate::import::{ImportError, ImportOutput};
 use crate::query::{FileQuery, RootedPath};
@@ -12,11 +11,11 @@ pub trait AuthoringImporter: Send + Sync {
     fn version(&self) -> u32;
     fn settings_type_uuid(&self) -> TypeUuid;
     fn settings_schema(&self) -> &LogicalSchema;
-    fn default_settings(&self) -> AuthoredValue;
+    fn default_settings(&self) -> Value;
     fn import(
         &self,
         context: &mut dyn AuthoringImportContext,
-        settings: &AuthoredValue,
+        settings: &Value,
     ) -> Result<ImportOutput, AuthoringImporterError>;
 }
 
@@ -69,12 +68,14 @@ pub trait AuthoringImportContext {
     /// The `$settings` of the import of `path`: the bundle at
     /// `{path}.bundle` whose `$record` names `path` among its sources.
     /// `None` when that file is missing, is not a bundle, or is not an
-    /// import of `path`.
+    /// import of `path`. The value is typed against the returned schema:
+    /// the one the bundle embeds, which may be an older shape of the
+    /// importer's settings type.
     ///
     /// Reads the bundle through [`read`](Self::read), so the read set holds
     /// the whole bundle file: any re-publish of it (a settings edit, or a
     /// re-import after its source changed) re-runs the reading import.
-    fn read_settings(&mut self, path: &str) -> Result<Option<AuthoredValue>, ImportError> {
+    fn read_settings(&mut self, path: &str) -> Result<Option<(LogicalSchema, Value)>, ImportError> {
         let path = crate::query::normalize_path(path).unwrap_or_else(|_| path.to_owned());
         let bundle_path = format!("{path}.bundle");
         if !self.probe(&bundle_path)? {
@@ -87,7 +88,7 @@ pub trait AuthoringImportContext {
 
 /// `$settings` of the bundle `bytes` when its `$record` lists `path` as a
 /// source.
-fn import_settings(bytes: &[u8], path: &str) -> Option<AuthoredValue> {
+fn import_settings(bytes: &[u8], path: &str) -> Option<(LogicalSchema, Value)> {
     let mut bundle = distill_bundle::parse_bundle(bytes).ok()?;
     let record = bundle.assets.get("$record")?;
     if record.type_uuid != distill_core::bootstrap::IMPORT_RECORD_TYPE_UUID
@@ -95,20 +96,24 @@ fn import_settings(bytes: &[u8], path: &str) -> Option<AuthoredValue> {
     {
         return None;
     }
-    let AuthoredValue::Object(fields) = &record.data else {
+    let record_schema = &bundle.schemas.get(&record.schema_hash)?.root;
+    let SchemaNode::Struct { fields, .. } = record_schema else {
         return None;
     };
-    let Some(AuthoredValue::Array(sources)) = fields.get("sources") else {
+    let (_, _, SchemaNode::Vec(source_node)) = fields.iter().find(|(name, _, _)| name == "sources")?
+    else {
         return None;
     };
-    let names_path = sources.iter().any(|source| match source {
-        AuthoredValue::Object(source) => {
-            matches!(source.get("path"), Some(AuthoredValue::Str(source)) if source == path)
-        }
-        _ => false,
-    });
+    let Some(Value::Seq(sources)) = record.data.field(record_schema, "sources") else {
+        return None;
+    };
+    let names_path = sources
+        .iter()
+        .any(|source| source.field(source_node, "path").and_then(Value::as_str) == Some(path));
     if !names_path {
         return None;
     }
-    bundle.assets.remove("$settings").map(|entry| entry.data)
+    let settings = bundle.assets.remove("$settings")?;
+    let schema = bundle.schemas.remove(&settings.schema_hash)?;
+    Some((schema, settings.data))
 }

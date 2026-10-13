@@ -2,7 +2,7 @@
 
 use distill_core::canonical::{CanonicalEncoder, DSTR};
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
-use distill_json::AuthoredValue;
+use ngp_schema::Value;
 
 use crate::dslf::{DslfError, DslfV1};
 use crate::import::ImportRuleId;
@@ -46,7 +46,7 @@ pub struct DirectoryImportRule {
     pub matches: FileQuery,
     pub group: DirectoryGrouping,
     pub importer: String,
-    pub settings: AuthoredValue,
+    pub settings: Value,
     pub output: String,
 }
 
@@ -57,7 +57,7 @@ pub struct DirectoryImportRulesControlValue {
 }
 
 /// Branded, schema-validated import settings. There is intentionally no
-/// generic `AuthoredValue` accessor; the importer bridge consumes these
+/// generic `Value` accessor; the importer bridge consumes these
 /// canonical bytes only after matching the two exposed schema identities.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportSettingsControlValue {
@@ -85,7 +85,7 @@ impl ImportSettingsControlValue {
 }
 
 /// Closed decoded control values. The variant brands otherwise opaque
-/// canonical metadata without exposing `AuthoredValue`, artifacts, or any
+/// canonical metadata without exposing `Value`, artifacts, or any
 /// dependency carrier to control-plane consumers.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ControlValue {

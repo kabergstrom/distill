@@ -14,7 +14,7 @@ use distill_store::state::InputVersion;
 use super::*;
 use crate::epoch::ModuleAbiIdentity;
 use distill_bundle::AssetEntry;
-use distill_json::AuthoredValue;
+use distill_schema::ngp_schema::Value;
 
 type Hook = Box<dyn FnMut() -> Result<(), String>>;
 
@@ -492,10 +492,7 @@ fn typed_bundle(authority: &ProjectSchemaAuthority, type_uuid: TypeUuid, index: 
                 type_uuid,
                 schema_hash: project.logical_hash,
                 authoring_only: false,
-                data: AuthoredValue::Object(BTreeMap::from([(
-                    "value".to_owned(),
-                    AuthoredValue::UInt(u128::from(index % 7)),
-                )])),
+                data: Value::Struct(Box::new([Value::U8((index % 7) as u8)])),
             },
         )]),
     })
@@ -747,14 +744,9 @@ fn assert_reconfiguration_matches_oracle(before: &Configuration, after: &Configu
     // A malformed bundle whose skeleton validates only under an authority
     // knowing its type.
     let malformed = typed_bundle(&authority, EDITED_TYPE, 7);
-    let mut value = distill_json::parse(std::str::from_utf8(&malformed).unwrap()).unwrap();
-    let AuthoredValue::Object(envelope) = &mut value else {
-        panic!("a bundle envelope is an object");
-    };
-    envelope.insert("future-extension".to_owned(), AuthoredValue::UInt(1));
     std::fs::write(
         assets.join("malformed.bundle"),
-        distill_json::write(&value).unwrap(),
+        with_unknown_envelope_key(&malformed),
     )
     .unwrap();
     // Two bundles claiming one asset.
@@ -976,22 +968,14 @@ fn a_complete_publication_revalidates_a_poisoned_skeleton_after_a_schema_edit() 
                 type_uuid: LABEL_TYPE,
                 schema_hash: project.logical_hash,
                 authoring_only: false,
-                data: AuthoredValue::Object(BTreeMap::from([(
-                    "category".to_owned(),
-                    AuthoredValue::Str("enemy".to_owned()),
-                )])),
+                data: Value::Struct(Box::new([Value::String("enemy".to_owned())])),
             },
         )]),
     })
     .unwrap();
-    let mut value = distill_json::parse(std::str::from_utf8(&malformed).unwrap()).unwrap();
-    let AuthoredValue::Object(envelope) = &mut value else {
-        panic!("a bundle envelope is an object");
-    };
-    envelope.insert("future-extension".to_owned(), AuthoredValue::UInt(1));
     std::fs::write(
         assets.join("malformed.bundle"),
-        distill_json::write(&value).unwrap(),
+        with_unknown_envelope_key(&malformed),
     )
     .unwrap();
 
@@ -1074,10 +1058,7 @@ fn labeled_bundle(bundle: u8, asset: u8, category: &str, malformed: bool) -> Vec
                 type_uuid: LABEL_TYPE,
                 schema_hash: project.logical_hash,
                 authoring_only: false,
-                data: AuthoredValue::Object(BTreeMap::from([(
-                    "category".to_owned(),
-                    AuthoredValue::Str(category.to_owned()),
-                )])),
+                data: Value::Struct(Box::new([Value::String(category.to_owned())])),
             },
         )]),
     })
@@ -1085,12 +1066,15 @@ fn labeled_bundle(bundle: u8, asset: u8, category: &str, malformed: bool) -> Vec
     if !malformed {
         return bytes;
     }
-    let mut value = distill_json::parse(std::str::from_utf8(&bytes).unwrap()).unwrap();
-    let AuthoredValue::Object(envelope) = &mut value else {
-        panic!("a bundle envelope is an object");
-    };
-    envelope.insert("future-extension".to_owned(), AuthoredValue::UInt(1));
-    distill_json::write(&value).unwrap().into_bytes()
+    with_unknown_envelope_key(&bytes)
+}
+
+/// A plain bundle's bytes with an unknown envelope key, which poisons it to
+/// its skeleton.
+fn with_unknown_envelope_key(bytes: &[u8]) -> Vec<u8> {
+    let text = std::str::from_utf8(bytes).unwrap();
+    let rest = text.strip_prefix('{').expect("a bundle envelope is an object");
+    format!("{{\"future-extension\":1,{rest}").into_bytes()
 }
 
 /// Publish `files` into `assets`, completely, over what `store` holds,

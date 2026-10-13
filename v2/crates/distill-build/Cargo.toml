@@ -11,7 +11,7 @@ globset.workspace = true
 tempfile = "3"
 distill-core = { path = "../distill-core" }
 distill-bundle = { path = "../distill-bundle" }
-distill-json = { path = "../distill-json" }
+ngp-schema = { path = "../../../../newgameplus/ngp-schema" }
 distill-migrate = { path = "../distill-migrate" }
 distill-pipeline-api = { path = "../distill-pipeline-api" }
 distill-schema = { path = "../distill-schema" }

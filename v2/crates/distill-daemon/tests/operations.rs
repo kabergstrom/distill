@@ -5,13 +5,12 @@ use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
 use distill_daemon::coordinator::DaemonCoordinator;
 use distill_daemon::scanner::AssetRoot;
 use distill_daemon::watcher::WatcherBatch;
-use distill_json::AuthoredValue;
 use distill_rpc::{
     AuthoringBackend, AuthoringProgressState, DeferredOperationResult, InputVersion, LongRunningOp,
     PreparedOperationCommit, PreparedOperationPublication, RenameWithFixupsRequest,
     TargetDefinition, TargetDefinitionHash, WriteReceipt,
 };
-use distill_schema::ngp_schema::{node_hash, LogicalSchema, PrimitiveKind, SchemaNode};
+use distill_schema::ngp_schema::{node_hash, AssetRefValue, LogicalSchema, PrimitiveKind, SchemaNode, Value};
 use distill_store::atomic_file::{self, Expected};
 use distill_store::{Store, StoreConfig, StoreWriter};
 
@@ -23,7 +22,7 @@ fn bundle(
     asset: AssetUuid,
     type_uuid: TypeUuid,
     schema: LogicalSchema,
-    value: AuthoredValue,
+    value: Value,
 ) -> Vec<u8> {
     let hash = node_hash(&schema.root).unwrap();
     distill_bundle::write_bundle(&Bundle {
@@ -118,7 +117,7 @@ fn value_bundle() -> Vec<u8> {
         LogicalSchema {
             root: SchemaNode::Primitive(PrimitiveKind::U8),
         },
-        AuthoredValue::UInt(7),
+        Value::U8(7),
     )
 }
 
@@ -131,10 +130,10 @@ fn consumer_bundle(path: &str) -> Vec<u8> {
         LogicalSchema {
             root: SchemaNode::AssetRef(VALUE_TYPE),
         },
-        AuthoredValue::Object(BTreeMap::from([
-            ("asset".into(), AuthoredValue::Str("entry".into())),
-            ("path".into(), AuthoredValue::Str(path.into())),
-        ])),
+        Value::AssetRef(AssetRefValue::Query {
+            path: Some(path.into()),
+            asset: Some("entry".into()),
+        }),
     )
 }
 

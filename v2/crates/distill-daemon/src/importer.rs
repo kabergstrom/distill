@@ -24,7 +24,7 @@ use distill_core::bootstrap::{
     DIRECTORY_IMPORT_RULES_TYPE_UUID, IMPORT_RECORD_TYPE_UUID,
 };
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
-use distill_json::AuthoredValue;
+use distill_schema::ngp_schema::{parse_patch, write_value, Options, Value, WriteOptions};
 use distill_rpc::{
     complete_settings, decode_settings_payload, ImportRequest, InputVersion, PreparedImportCommit,
     RpcFailure,
@@ -44,6 +44,12 @@ use crate::default_imports::{DefaultImports, DefaultRoot, PathMatcher};
 use crate::scanner::{RootedScanner, ScanError, ScannedBundle};
 use distill_store::files::{FileKind, GlobKeys, ObservedFile, PathSelection, GLOBSET_META};
 
+mod controls;
+use controls::{
+    decode_attempt_basis, decode_directory_rules, decode_import_record, encode_attempt_basis,
+    encode_import_record,
+};
+
 pub use distill_pipeline_api::importer::{
     AuthoringImportContext, AuthoringImporter, AuthoringImporterError,
 };
@@ -54,7 +60,7 @@ pub(crate) struct RegisteredImporter {
     settings_type_uuid: TypeUuid,
     settings_schema: LogicalSchema,
     settings_hash: LogicalHash,
-    default_settings: AuthoredValue,
+    default_settings: Value,
     capability_hash: [u8; 32],
     executor: Arc<dyn AuthoringImporter>,
 }
@@ -68,7 +74,12 @@ pub(crate) struct DirectoryImportTask {
     group: RootedPath,
     importer: String,
     sources: Vec<RootedPath>,
-    settings: AuthoredValue,
+    /// The rule's settings as authored (JSON text).
+    settings_text: String,
+    /// The settings parsed against the importer's settings schema and
+    /// completed with its defaults ([`complete_task_settings`]), or why
+    /// not (the importer is not registered, the text does not fit).
+    settings: Result<Value, String>,
     destination_root: String,
     destination_path: String,
     /// The orphan at the output a default task adopts (§8 "Default
@@ -90,7 +101,8 @@ struct DecodedDirectoryRule {
     matches: FileQuery,
     group: DirectoryGrouping,
     importer: String,
-    settings: AuthoredValue,
+    /// JSON text, parsed against the importer's settings schema per task.
+    settings: String,
     output: String,
 }
 
@@ -164,18 +176,9 @@ impl RegisteredImporter {
         }
         let settings_schema = importer.settings_schema().clone();
         let settings_hash = node_hash(&settings_schema.root).map_err(invalid)?;
-        // Canonical, as an output's recorded `$settings` read back: settings
-        // completed from these defaults then equal the record of an
-        // unchanged output (an integral `30.0` would not, and the output
-        // would reimport on every pass).
-        let default_settings = canonical_authored(importer.default_settings());
-        validate_settings(
-            settings_type_uuid,
-            settings_hash,
-            &settings_schema,
-            &default_settings,
-        )
-        .map_err(|error| invalid(format!("invalid importer default settings: {error}")))?;
+        let default_settings = importer.default_settings();
+        distill_migrate::conforms(&default_settings, &settings_schema.root)
+            .map_err(|error| invalid(format!("invalid importer default settings: {error}")))?;
         let version = importer.version();
         let capability_hash = distill_core::canonical::domain_digest(*b"DSIC", 1, |encoder| {
             encoder.str(&id);
@@ -970,11 +973,7 @@ impl AuthoringService {
                 continue;
             }
             if let Some(importer) = compiled.pipeline_importers().get(&task.importer) {
-                complete_settings(
-                    &importer.settings_schema.root,
-                    &mut task.settings,
-                    &importer.default_settings,
-                );
+                complete_task_settings(&mut task, importer);
             }
             let origin = directory_task_origin(&task);
             let at_output = store
@@ -1560,13 +1559,7 @@ impl AuthoringService {
     ) -> Result<(RegisteredImporter, ImportInvocation), RpcFailure> {
         let compiled = self.compiled(store)?;
         let importer = self.registered_importer(&compiled, &task.importer)?;
-        validate_settings(
-            importer.settings_type_uuid,
-            importer.settings_hash,
-            &importer.settings_schema,
-            &task.settings,
-        )
-        .map_err(|error| {
+        let settings = task.settings.clone().map_err(|error| {
             invalid(format!(
                 "invalid settings for importer {} in directory rule {} of rules bundle {}: {error}",
                 task.importer,
@@ -1607,7 +1600,7 @@ impl AuthoringService {
                 destination,
                 prior,
                 sources: task.sources.clone(),
-                explicit_settings: Some(task.settings.clone()),
+                explicit_settings: Some(settings),
                 watch: true,
                 origin: Some(origin),
                 // The authored rules bundle owns the directory listing. Each
@@ -1671,7 +1664,7 @@ impl AuthoringService {
         }
         if prior.record.importer != task.importer
             || prior.record.sources != task.sources
-            || prior.settings != task.settings
+            || task.settings.as_ref().ok() != Some(&prior.settings)
             || !prior.record.watch
         {
             return Ok(true);
@@ -3063,7 +3056,7 @@ fn default_rule_entries(defaults: &DefaultImports) -> Vec<DirectoryRuleEntry> {
                         matches: rule.matches.clone(),
                         group: rule.group,
                         importer: rule.importer.clone(),
-                        settings: AuthoredValue::Object(BTreeMap::new()),
+                        settings: "{}".to_owned(),
                         output: rule.output.clone(),
                     }],
                 },
@@ -3240,6 +3233,32 @@ fn import_read_keys(read_set: &[FileDep]) -> Vec<ImportReadKey> {
     keys
 }
 
+/// Parse `task`'s authored settings against its importer's settings
+/// schema (authored spelling) and complete them with the importer's
+/// defaults. The completed value's canonical text then stands for the
+/// settings in the task digest.
+fn complete_task_settings(task: &mut DirectoryImportTask, importer: &RegisteredImporter) {
+    let schema = &importer.settings_schema.root;
+    let completed = parse_patch(&task.settings_text, schema, Options::authored())
+        .map_err(|error| error.render("settings"))
+        .and_then(|patch| {
+            complete_settings(schema, patch, &importer.default_settings)
+                .map_err(|error| format!("{error:?}"))
+        })
+        .and_then(|value| {
+            let text = write_value(schema, &value, WriteOptions::default())
+                .map_err(|error| error.render("settings"))?;
+            Ok((value, text))
+        });
+    task.settings = match completed {
+        Ok((value, text)) => {
+            task.settings_text = text;
+            Ok(value)
+        }
+        Err(error) => Err(error),
+    };
+}
+
 fn indexed_directory_task(
     entry: &DirectoryRuleEntry,
     rule_index: usize,
@@ -3255,7 +3274,8 @@ fn indexed_directory_task(
         group: group.clone(),
         importer: rule.importer.clone(),
         sources,
-        settings: rule.settings.clone(),
+        settings_text: rule.settings.clone(),
+        settings: Err(format!("importer {} is not registered", rule.importer)),
         destination_root: group.root.0.clone(),
         destination_path,
         adopts: None,
@@ -3300,7 +3320,6 @@ fn stored_origin(origin: &DirectoryOrigin) -> StoredDirectoryOrigin {
 /// digests otherwise runs again (an edited rule's settings, a group that
 /// gained a source).
 fn directory_task_digest(task: &DirectoryImportTask) -> Result<[u8; 32], RpcFailure> {
-    let settings = distill_json::write(&task.settings).map_err(invalid)?;
     Ok(distill_core::canonical::domain_digest(*b"DSDT", 1, |encoder| {
         encoder.str(&task.importer);
         encoder.u32(task.sources.len() as u32);
@@ -3308,7 +3327,7 @@ fn directory_task_digest(task: &DirectoryImportTask) -> Result<[u8; 32], RpcFail
             encoder.str(&source.root.0);
             encoder.str(&source.path);
         }
-        encoder.str(&settings);
+        encoder.str(&task.settings_text);
         encoder.str(&task.destination_root);
         encoder.str(&task.destination_path);
     }))
@@ -3998,91 +4017,6 @@ fn current_type_schema(
         .ok_or_else(|| invalid(format!("output type {type_uuid} has no current schema")))
 }
 
-/// `value` checked against an importer's settings schema, as the bundle
-/// writer checks an output's `$settings`: the error names the path.
-fn validate_settings(
-    type_uuid: TypeUuid,
-    hash: LogicalHash,
-    schema: &LogicalSchema,
-    value: &AuthoredValue,
-) -> Result<(), distill_bundle::BundleError> {
-    let bundle = Bundle {
-        format_version: BUNDLE_FORMAT_VERSION,
-        uuid: BundleUuid([0x41; 16]),
-        primary: Some("settings".into()),
-        schemas: BTreeMap::from([(hash, schema.clone())]),
-        assets: BTreeMap::from([(
-            "settings".into(),
-            AssetEntry {
-                uuid: AssetUuid([0x42; 16]),
-                type_uuid,
-                schema_hash: hash,
-                authoring_only: false,
-                data: value.clone(),
-            },
-        )]),
-    };
-    distill_bundle::write_bundle(&bundle).map(drop)
-}
-
-fn encode_import_record(record: &ImportRecord) -> Result<AuthoredValue, RpcFailure> {
-    Ok(object([
-        ("importer", AuthoredValue::Str(record.importer.clone())),
-        (
-            "origin",
-            record
-                .origin
-                .as_ref()
-                .map(encode_origin)
-                .unwrap_or(AuthoredValue::Null),
-        ),
-        (
-            "read_set",
-            AuthoredValue::Array(
-                record
-                    .read_set
-                    .iter()
-                    .map(encode_file_dep)
-                    .collect::<Result<_, _>>()?,
-            ),
-        ),
-        ("settings", AuthoredValue::Str("$settings".into())),
-        (
-            "sources",
-            AuthoredValue::Array(record.sources.iter().map(encode_rooted_path).collect()),
-        ),
-        ("watch", AuthoredValue::Bool(record.watch)),
-    ]))
-}
-
-fn decode_import_record(value: &AuthoredValue) -> Result<ImportRecord, RpcFailure> {
-    let fields = as_object(value, "ImportRecord")?;
-    let importer = as_string(field(fields, "importer")?, "ImportRecord.importer")?.to_owned();
-    let sources = as_array(field(fields, "sources")?, "ImportRecord.sources")?
-        .iter()
-        .map(decode_rooted_path)
-        .collect::<Result<_, _>>()?;
-    let watch = as_bool(field(fields, "watch")?, "ImportRecord.watch")?;
-    if as_string(field(fields, "settings")?, "ImportRecord.settings")? != "$settings" {
-        return Err(invalid("ImportRecord.settings must name $settings"));
-    }
-    let origin = match field(fields, "origin")? {
-        AuthoredValue::Null => None,
-        value => Some(decode_origin(value)?),
-    };
-    let read_set = as_array(field(fields, "read_set")?, "ImportRecord.read_set")?
-        .iter()
-        .map(decode_file_dep)
-        .collect::<Result<_, _>>()?;
-    Ok(ImportRecord {
-        importer,
-        sources,
-        watch,
-        read_set,
-        origin,
-    })
-}
-
 pub(crate) fn decoded_import_record(bundle: &Bundle) -> Result<Option<ImportRecord>, RpcFailure> {
     let Some(record) = bundle.assets.get("$record") else {
         return Ok(None);
@@ -4110,504 +4044,6 @@ pub(crate) fn decoded_record_facts(
             group_path: origin.group.path,
         });
     Ok((origin, record.watch))
-}
-
-fn decode_file_dep(value: &AuthoredValue) -> Result<FileDep, RpcFailure> {
-    let variants = as_object(value, "FileDep")?;
-    if variants.len() != 1 {
-        return Err(invalid("FileDep must contain exactly one variant"));
-    }
-    let (variant, payload) = variants.first_key_value().expect("one variant");
-    let fields = as_object(payload, "FileDep payload")?;
-    match variant.as_str() {
-        "Read" => Ok(FileDep::Read {
-            path: as_string(field(fields, "path")?, "FileDep.Read.path")?.to_owned(),
-            observed: decode_observed_content(field(fields, "observed")?)?,
-        }),
-        "Probe" => Ok(FileDep::Probe {
-            path: as_string(field(fields, "path")?, "FileDep.Probe.path")?.to_owned(),
-            observed: decode_observed_root(field(fields, "observed")?)?,
-        }),
-        "Listing" => Ok(FileDep::Listing {
-            query: decode_file_query(field(fields, "query")?)?,
-            observed: decode_observed_hash(field(fields, "observed")?)?,
-        }),
-        "Capability" => Ok(FileDep::Capability {
-            key: decode_capability_key(field(fields, "key")?)?,
-            observed: decode_observed_hash(field(fields, "observed")?)?,
-        }),
-        _ => Err(invalid(format!("unknown FileDep variant {variant:?}"))),
-    }
-}
-
-fn encode_attempt_basis(read_set: &[FileDep]) -> Result<Vec<u8>, RpcFailure> {
-    let value = object([
-        (
-            "read_set",
-            AuthoredValue::Array(
-                read_set
-                    .iter()
-                    .map(encode_attempt_file_dep)
-                    .collect::<Result<Vec<_>, _>>()?,
-            ),
-        ),
-        ("version", AuthoredValue::UInt(1)),
-    ]);
-    distill_json::write(&value)
-        .map(String::into_bytes)
-        .map_err(invalid)
-}
-
-fn decode_attempt_basis(bytes: &[u8]) -> Result<Vec<FileDep>, RpcFailure> {
-    let text = std::str::from_utf8(bytes).map_err(invalid)?;
-    let value = distill_json::parse(text).map_err(invalid)?;
-    if distill_json::write(&value).map_err(invalid)?.as_bytes() != bytes {
-        return Err(invalid(
-            "watched import failure basis is not canonical JSON",
-        ));
-    }
-    let fields = as_object(&value, "watched import failure basis")?;
-    if fields.len() != 2 || as_u128(field(fields, "version")?, "basis.version")? != 1 {
-        return Err(invalid("unsupported watched import failure basis"));
-    }
-    as_array(field(fields, "read_set")?, "basis.read_set")?
-        .iter()
-        .map(decode_attempt_file_dep)
-        .collect()
-}
-
-fn encode_attempt_file_dep(dep: &FileDep) -> Result<AuthoredValue, RpcFailure> {
-    let (variant, fields) = match dep {
-        FileDep::Read { path, observed } => (
-            "Read",
-            object([
-                ("observed", encode_attempt_content(observed)?),
-                ("path", AuthoredValue::Str(path.clone())),
-            ]),
-        ),
-        FileDep::Probe { path, observed } => (
-            "Probe",
-            object([
-                ("observed", encode_attempt_root(observed)?),
-                ("path", AuthoredValue::Str(path.clone())),
-            ]),
-        ),
-        FileDep::Listing { query, observed } => (
-            "Listing",
-            object([
-                ("observed", encode_attempt_hash(observed)?),
-                ("query", encode_file_query(query)),
-            ]),
-        ),
-        FileDep::Capability { key, observed } => (
-            "Capability",
-            object([
-                ("key", encode_capability_key(key)),
-                ("observed", encode_attempt_hash(observed)?),
-            ]),
-        ),
-    };
-    Ok(object([(variant, fields)]))
-}
-
-fn decode_attempt_file_dep(value: &AuthoredValue) -> Result<FileDep, RpcFailure> {
-    let variants = as_object(value, "attempted FileDep")?;
-    if variants.len() != 1 {
-        return Err(invalid("attempted FileDep must contain one variant"));
-    }
-    let (variant, payload) = variants.first_key_value().expect("one variant");
-    let fields = as_object(payload, "attempted FileDep payload")?;
-    match variant.as_str() {
-        "Read" => Ok(FileDep::Read {
-            path: as_string(field(fields, "path")?, "FileDep.Read.path")?.to_owned(),
-            observed: decode_attempt_content(field(fields, "observed")?)?,
-        }),
-        "Probe" => Ok(FileDep::Probe {
-            path: as_string(field(fields, "path")?, "FileDep.Probe.path")?.to_owned(),
-            observed: decode_attempt_root(field(fields, "observed")?)?,
-        }),
-        "Listing" => Ok(FileDep::Listing {
-            query: decode_file_query(field(fields, "query")?)?,
-            observed: decode_attempt_hash(field(fields, "observed")?)?,
-        }),
-        "Capability" => Ok(FileDep::Capability {
-            key: decode_capability_key(field(fields, "key")?)?,
-            observed: decode_attempt_hash(field(fields, "observed")?)?,
-        }),
-        _ => Err(invalid(format!(
-            "unknown attempted FileDep variant {variant:?}"
-        ))),
-    }
-}
-
-fn encode_attempt_content(
-    observed: &Observed<distill_build::import::FileContentObservation>,
-) -> Result<AuthoredValue, RpcFailure> {
-    match observed {
-        Observed::Ok(_) => encode_observed_content(observed),
-        Observed::Err(failure) => encode_attempt_error(failure),
-    }
-}
-
-fn encode_attempt_root(observed: &Observed<Option<RootName>>) -> Result<AuthoredValue, RpcFailure> {
-    match observed {
-        Observed::Ok(_) => encode_observed_root(observed),
-        Observed::Err(failure) => encode_attempt_error(failure),
-    }
-}
-
-fn encode_attempt_hash(observed: &Observed<[u8; 32]>) -> Result<AuthoredValue, RpcFailure> {
-    match observed {
-        Observed::Ok(_) => encode_observed_hash(observed),
-        Observed::Err(failure) => encode_attempt_error(failure),
-    }
-}
-
-fn encode_attempt_error(failure: &StableFailureFingerprint) -> Result<AuthoredValue, RpcFailure> {
-    Ok(object([(
-        "Err",
-        object([("failure", encode_import_failure(failure)?)]),
-    )]))
-}
-
-fn decode_attempt_content(
-    value: &AuthoredValue,
-) -> Result<Observed<distill_build::import::FileContentObservation>, RpcFailure> {
-    if observed_is(value, "Ok")? {
-        decode_observed_content(value)
-    } else {
-        decode_attempt_error(value).map(Observed::Err)
-    }
-}
-
-fn decode_attempt_root(value: &AuthoredValue) -> Result<Observed<Option<RootName>>, RpcFailure> {
-    if observed_is(value, "Ok")? {
-        decode_observed_root(value)
-    } else {
-        decode_attempt_error(value).map(Observed::Err)
-    }
-}
-
-fn decode_attempt_hash(value: &AuthoredValue) -> Result<Observed<[u8; 32]>, RpcFailure> {
-    if observed_is(value, "Ok")? {
-        decode_observed_hash(value)
-    } else {
-        decode_attempt_error(value).map(Observed::Err)
-    }
-}
-
-fn observed_is(value: &AuthoredValue, variant: &str) -> Result<bool, RpcFailure> {
-    let variants = as_object(value, "attempted observation")?;
-    if variants.len() != 1 || (!variants.contains_key("Ok") && !variants.contains_key("Err")) {
-        return Err(invalid(
-            "attempted observation must contain one Ok or Err variant",
-        ));
-    }
-    Ok(variants.contains_key(variant))
-}
-
-fn decode_attempt_error(value: &AuthoredValue) -> Result<StableFailureFingerprint, RpcFailure> {
-    let variants = as_object(value, "attempted observation")?;
-    let payload = variants
-        .get("Err")
-        .ok_or_else(|| invalid("attempted failure has no Err variant"))?;
-    decode_import_failure(field(as_object(payload, "Err payload")?, "failure")?)
-}
-
-fn encode_import_failure(failure: &StableFailureFingerprint) -> Result<AuthoredValue, RpcFailure> {
-    let (variant, payload) = match failure {
-        StableFailureFingerprint::RawFile { op, subject, class } => (
-            "RawFile",
-            object([
-                ("class", AuthoredValue::UInt(*class as u8 as u128)),
-                ("op", AuthoredValue::UInt(*op as u8 as u128)),
-                (
-                    "subject",
-                    match subject {
-                        RawFileSubject::Path(path) => {
-                            object([("Path", AuthoredValue::Str(path.clone()))])
-                        }
-                        RawFileSubject::Query(query) => {
-                            object([("Query", encode_file_query(query))])
-                        }
-                    },
-                ),
-            ]),
-        ),
-        StableFailureFingerprint::MissingCapability { key } => (
-            "MissingCapability",
-            object([("key", encode_capability_key(key))]),
-        ),
-        StableFailureFingerprint::Local { class, detail } => (
-            "Local",
-            object([
-                ("class", AuthoredValue::UInt(*class as u16 as u128)),
-                ("detail", byte_array(detail)),
-            ]),
-        ),
-        _ => {
-            return Err(invalid(
-                "failure fingerprint is not valid in an authoring import basis",
-            ));
-        }
-    };
-    Ok(object([(variant, payload)]))
-}
-
-fn decode_import_failure(value: &AuthoredValue) -> Result<StableFailureFingerprint, RpcFailure> {
-    let variants = as_object(value, "import failure fingerprint")?;
-    if variants.len() != 1 {
-        return Err(invalid(
-            "import failure fingerprint must contain one variant",
-        ));
-    }
-    let (variant, payload) = variants.first_key_value().expect("one variant");
-    let fields = as_object(payload, "import failure payload")?;
-    match variant.as_str() {
-        "RawFile" => {
-            let op = match as_u128(field(fields, "op")?, "RawFile.op")? {
-                0 => RawFileOp::Read,
-                1 => RawFileOp::Probe,
-                2 => RawFileOp::Enumerate,
-                value => return Err(invalid(format!("unknown raw-file op {value}"))),
-            };
-            let class = match as_u128(field(fields, "class")?, "RawFile.class")? {
-                0 => RawFileFailureClass::NotFound,
-                1 => RawFileFailureClass::PermissionDenied,
-                2 => RawFileFailureClass::ListingFailed,
-                3 => RawFileFailureClass::OtherStable,
-                value => return Err(invalid(format!("unknown raw-file failure class {value}"))),
-            };
-            let subject = as_object(field(fields, "subject")?, "RawFile.subject")?;
-            if subject.len() != 1 {
-                return Err(invalid("raw-file subject must contain one variant"));
-            }
-            let subject = if let Some(path) = subject.get("Path") {
-                RawFileSubject::Path(as_string(path, "RawFile.Path")?.to_owned())
-            } else if let Some(query) = subject.get("Query") {
-                RawFileSubject::Query(decode_file_query(query)?)
-            } else {
-                return Err(invalid("unknown raw-file subject"));
-            };
-            Ok(StableFailureFingerprint::RawFile { op, subject, class })
-        }
-        "MissingCapability" => Ok(StableFailureFingerprint::MissingCapability {
-            key: decode_capability_key(field(fields, "key")?)?,
-        }),
-        "Local" => {
-            let class = match as_u128(field(fields, "class")?, "Local.class")? {
-                1 => LocalFailureClass::Validator,
-                2 => LocalFailureClass::MigrationPlan,
-                3 => LocalFailureClass::Processor,
-                4 => LocalFailureClass::MigrationFunction,
-                5 => LocalFailureClass::OutputBinding,
-                6 => LocalFailureClass::Importer,
-                7 => LocalFailureClass::ImportIntake,
-                8 => LocalFailureClass::ArtifactEncoding,
-                value => return Err(invalid(format!("unknown local failure class {value}"))),
-            };
-            Ok(StableFailureFingerprint::Local {
-                class,
-                detail: fixed_bytes(field(fields, "detail")?, "Local.detail")?,
-            })
-        }
-        _ => Err(invalid(format!(
-            "unknown import failure fingerprint {variant:?}"
-        ))),
-    }
-}
-
-fn decode_observed_content(
-    value: &AuthoredValue,
-) -> Result<Observed<distill_build::import::FileContentObservation>, RpcFailure> {
-    let value = decode_observed_ok(value, "file content")?;
-    let fields = as_object(value, "FileContentObservation")?;
-    Ok(Observed::Ok(
-        distill_build::import::FileContentObservation {
-            path: decode_rooted_path(field(fields, "path")?)?,
-            hash: fixed_bytes(field(fields, "hash")?, "FileContentObservation.hash")?,
-        },
-    ))
-}
-
-fn decode_observed_root(value: &AuthoredValue) -> Result<Observed<Option<RootName>>, RpcFailure> {
-    Ok(Observed::Ok(
-        match decode_observed_ok(value, "root probe")? {
-            AuthoredValue::Null => None,
-            value => Some(RootName::new(as_string(value, "root probe value")?).map_err(invalid)?),
-        },
-    ))
-}
-
-fn decode_observed_hash(value: &AuthoredValue) -> Result<Observed<[u8; 32]>, RpcFailure> {
-    Ok(Observed::Ok(fixed_bytes(
-        decode_observed_ok(value, "hash observation")?,
-        "hash observation value",
-    )?))
-}
-
-fn decode_observed_ok<'a>(
-    value: &'a AuthoredValue,
-    context: &str,
-) -> Result<&'a AuthoredValue, RpcFailure> {
-    let variants = as_object(value, context)?;
-    let Some(payload) = variants.get("Ok") else {
-        return Err(invalid(format!(
-            "{context} contains a failed observation; committed import records permit only successful observations"
-        )));
-    };
-    if variants.len() != 1 {
-        return Err(invalid(format!("{context} must contain one Ok variant")));
-    }
-    field(as_object(payload, context)?, "value")
-}
-
-fn decode_capability_key(value: &AuthoredValue) -> Result<CapabilityKey, RpcFailure> {
-    let variants = as_object(value, "CapabilityKey")?;
-    if variants.len() != 1 {
-        return Err(invalid("CapabilityKey must contain exactly one variant"));
-    }
-    let (variant, payload) = variants.first_key_value().expect("one variant");
-    let fields = as_object(payload, "CapabilityKey payload")?;
-    match variant.as_str() {
-        "MigrationFn" => Ok(CapabilityKey::MigrationFn(
-            as_string(field(fields, "key")?, "MigrationFn.key")?.to_owned(),
-        )),
-        "DefaultTable" => Ok(CapabilityKey::DefaultTable(TypeUuid(fixed_bytes(
-            field(fields, "type_uuid")?,
-            "DefaultTable.type_uuid",
-        )?))),
-        "Importer" => Ok(CapabilityKey::Importer(
-            as_string(field(fields, "id")?, "Importer.id")?.to_owned(),
-        )),
-        "Processor" => Ok(CapabilityKey::Processor {
-            input: TypeUuid(fixed_bytes(field(fields, "input")?, "Processor.input")?),
-        }),
-        "Tool" => Ok(CapabilityKey::Tool(
-            as_string(field(fields, "id")?, "Tool.id")?.to_owned(),
-        )),
-        _ => Err(invalid(format!(
-            "unknown CapabilityKey variant {variant:?}"
-        ))),
-    }
-}
-
-fn decode_file_query(value: &AuthoredValue) -> Result<FileQuery, RpcFailure> {
-    let fields = as_object(value, "FileQuery")?;
-    let optional = |name: &str| -> Result<Option<String>, RpcFailure> {
-        match field(fields, name)? {
-            AuthoredValue::Null => Ok(None),
-            value => Ok(Some(as_string(value, name)?.to_owned())),
-        }
-    };
-    FileQuery::new(optional("path_prefix")?, optional("path_glob")?).map_err(invalid)
-}
-
-fn decode_directory_rules(value: &AuthoredValue) -> Result<DecodedDirectoryRules, RpcFailure> {
-    let fields = as_object(value, "DirectoryImportRules")?;
-    let listing = decode_file_query(field(fields, "listing")?)?;
-    let rules = as_array(field(fields, "rules")?, "DirectoryImportRules.rules")?
-        .iter()
-        .map(|value| {
-            let fields = as_object(value, "ImportRule")?;
-            Ok(DecodedDirectoryRule {
-                id: distill_build::import::ImportRuleId(fixed_bytes(
-                    field(fields, "id")?,
-                    "ImportRule.id",
-                )?),
-                matches: decode_file_query(field(fields, "matches")?)?,
-                group: decode_directory_grouping(field(fields, "group")?)?,
-                importer: normalize_identifier(as_string(
-                    field(fields, "importer")?,
-                    "ImportRule.importer",
-                )?)
-                .map_err(invalid)?,
-                settings: decode_wrapped_authored_value(field(fields, "settings")?, 0)?,
-                output: as_string(field(fields, "output")?, "ImportRule.output")?.to_owned(),
-            })
-        })
-        .collect::<Result<Vec<_>, RpcFailure>>()?;
-    if rules.is_empty() {
-        return Err(invalid("DirectoryImportRules.rules cannot be empty"));
-    }
-    Ok(DecodedDirectoryRules { listing, rules })
-}
-
-fn decode_directory_grouping(value: &AuthoredValue) -> Result<DirectoryGrouping, RpcFailure> {
-    let variants = as_object(value, "Grouping")?;
-    if variants.len() != 1 {
-        return Err(invalid("Grouping must contain exactly one variant"));
-    }
-    let (variant, payload) = variants.first_key_value().expect("one variant");
-    if !matches!(payload, AuthoredValue::Object(fields) if fields.is_empty()) {
-        return Err(invalid("Grouping unit payload must be an empty object"));
-    }
-    match variant.as_str() {
-        "PerFile" => Ok(DirectoryGrouping::PerFile),
-        "ByStem" => Ok(DirectoryGrouping::ByStem),
-        _ => Err(invalid(format!("unknown Grouping variant {variant:?}"))),
-    }
-}
-
-fn decode_wrapped_authored_value(
-    value: &AuthoredValue,
-    depth: usize,
-) -> Result<AuthoredValue, RpcFailure> {
-    if depth >= 1024 {
-        return Err(invalid("AuthoredValueV1 exceeds the nesting limit"));
-    }
-    let variants = as_object(value, "AuthoredValueV1")?;
-    if variants.len() != 1 {
-        return Err(invalid("AuthoredValueV1 must contain exactly one variant"));
-    }
-    let (variant, payload) = variants.first_key_value().expect("one variant");
-    let fields = as_object(payload, "AuthoredValueV1 payload")?;
-    match variant.as_str() {
-        "Null" if fields.is_empty() => Ok(AuthoredValue::Null),
-        "Bool" => Ok(AuthoredValue::Bool(as_bool(
-            field(fields, "value")?,
-            "AuthoredValueV1.Bool.value",
-        )?)),
-        "Int" => Ok(AuthoredValue::Int(as_i128(
-            field(fields, "value")?,
-            "AuthoredValueV1.Int.value",
-        )?)),
-        "UInt" => Ok(AuthoredValue::UInt(as_u128(
-            field(fields, "value")?,
-            "AuthoredValueV1.UInt.value",
-        )?)),
-        "Float" => Ok(canonical_authored(AuthoredValue::Float(as_f64(
-            field(fields, "value")?,
-            "AuthoredValueV1.Float.value",
-        )?))),
-        "Str" => Ok(AuthoredValue::Str(
-            as_string(field(fields, "value")?, "AuthoredValueV1.Str.value")?.to_owned(),
-        )),
-        "Array" => Ok(AuthoredValue::Array(
-            as_array(field(fields, "value")?, "AuthoredValueV1.Array.value")?
-                .iter()
-                .map(|value| decode_wrapped_authored_value(value, depth + 1))
-                .collect::<Result<_, _>>()?,
-        )),
-        "Object" => Ok(AuthoredValue::Object(
-            as_object(field(fields, "value")?, "AuthoredValueV1.Object.value")?
-                .iter()
-                .map(|(key, value)| {
-                    Ok((
-                        key.clone(),
-                        decode_wrapped_authored_value(value, depth + 1)?,
-                    ))
-                })
-                .collect::<Result<_, RpcFailure>>()?,
-        )),
-        "Blob" => match field(fields, "value")? {
-            AuthoredValue::Blob(bytes) => Ok(AuthoredValue::Blob(bytes.clone())),
-            _ => Err(invalid("AuthoredValueV1.Blob.value must be blob bytes")),
-        },
-        _ => Err(invalid(format!(
-            "unknown or malformed AuthoredValueV1 variant {variant:?}"
-        ))),
-    }
 }
 
 fn query_matches(query: &FileQuery, path: &str) -> bool {
@@ -4691,291 +4127,6 @@ fn uuid_text(bytes: [u8; 16]) -> String {
     AssetUuid(bytes).to_string()
 }
 
-fn encode_file_dep(dep: &FileDep) -> Result<AuthoredValue, RpcFailure> {
-    let (variant, fields) = match dep {
-        FileDep::Read { path, observed } => (
-            "Read",
-            object([
-                ("observed", encode_observed_content(observed)?),
-                ("path", AuthoredValue::Str(path.clone())),
-            ]),
-        ),
-        FileDep::Probe { path, observed } => (
-            "Probe",
-            object([
-                ("observed", encode_observed_root(observed)?),
-                ("path", AuthoredValue::Str(path.clone())),
-            ]),
-        ),
-        FileDep::Listing { query, observed } => (
-            "Listing",
-            object([
-                ("observed", encode_observed_hash(observed)?),
-                ("query", encode_file_query(query)),
-            ]),
-        ),
-        FileDep::Capability { key, observed } => (
-            "Capability",
-            object([
-                ("key", encode_capability_key(key)),
-                ("observed", encode_observed_hash(observed)?),
-            ]),
-        ),
-    };
-    Ok(object([(variant, fields)]))
-}
-
-fn encode_observed_content(
-    observed: &Observed<distill_build::import::FileContentObservation>,
-) -> Result<AuthoredValue, RpcFailure> {
-    match observed {
-        Observed::Ok(value) => Ok(object([(
-            "Ok",
-            object([(
-                "value",
-                object([
-                    ("hash", byte_array(&value.hash)),
-                    ("path", encode_rooted_path(&value.path)),
-                ]),
-            )]),
-        )])),
-        Observed::Err(_) => Err(invalid("failed import observations cannot be committed")),
-    }
-}
-
-fn encode_observed_root(
-    observed: &Observed<Option<RootName>>,
-) -> Result<AuthoredValue, RpcFailure> {
-    match observed {
-        Observed::Ok(value) => Ok(object([(
-            "Ok",
-            object([(
-                "value",
-                value
-                    .as_ref()
-                    .map(|root| AuthoredValue::Str(root.0.clone()))
-                    .unwrap_or(AuthoredValue::Null),
-            )]),
-        )])),
-        Observed::Err(_) => Err(invalid("failed import observations cannot be committed")),
-    }
-}
-
-fn encode_observed_hash(observed: &Observed<[u8; 32]>) -> Result<AuthoredValue, RpcFailure> {
-    match observed {
-        Observed::Ok(value) => Ok(object([("Ok", object([("value", byte_array(value))]))])),
-        Observed::Err(_) => Err(invalid("failed import observations cannot be committed")),
-    }
-}
-
-fn encode_capability_key(key: &CapabilityKey) -> AuthoredValue {
-    let (variant, value) = match key {
-        CapabilityKey::MigrationFn(key) => (
-            "MigrationFn",
-            object([("key", AuthoredValue::Str(key.clone()))]),
-        ),
-        CapabilityKey::DefaultTable(type_uuid) => (
-            "DefaultTable",
-            object([("type_uuid", byte_array(&type_uuid.0))]),
-        ),
-        CapabilityKey::Importer(id) => {
-            ("Importer", object([("id", AuthoredValue::Str(id.clone()))]))
-        }
-        CapabilityKey::Processor { input } => {
-            ("Processor", object([("input", byte_array(&input.0))]))
-        }
-        CapabilityKey::Tool(id) => ("Tool", object([("id", AuthoredValue::Str(id.clone()))])),
-    };
-    object([(variant, value)])
-}
-
-fn encode_file_query(query: &FileQuery) -> AuthoredValue {
-    object([
-        (
-            "path_glob",
-            query
-                .path_glob
-                .as_ref()
-                .map(|value| AuthoredValue::Str(value.clone()))
-                .unwrap_or(AuthoredValue::Null),
-        ),
-        (
-            "path_prefix",
-            query
-                .path_prefix
-                .as_ref()
-                .map(|value| AuthoredValue::Str(value.clone()))
-                .unwrap_or(AuthoredValue::Null),
-        ),
-    ])
-}
-
-fn encode_origin(origin: &DirectoryOrigin) -> AuthoredValue {
-    object([
-        ("group", encode_rooted_path(&origin.group)),
-        ("rule", byte_array(&origin.rule.0)),
-        ("rules_bundle", byte_array(&origin.rules_bundle.0)),
-    ])
-}
-
-fn decode_origin(value: &AuthoredValue) -> Result<DirectoryOrigin, RpcFailure> {
-    let fields = as_object(value, "DirectoryOrigin")?;
-    Ok(DirectoryOrigin {
-        rules_bundle: BundleUuid(fixed_bytes(field(fields, "rules_bundle")?, "rules_bundle")?),
-        rule: distill_build::import::ImportRuleId(fixed_bytes(field(fields, "rule")?, "rule")?),
-        group: decode_rooted_path(field(fields, "group")?)?,
-    })
-}
-
-fn encode_rooted_path(path: &RootedPath) -> AuthoredValue {
-    object([
-        ("path", AuthoredValue::Str(path.path.clone())),
-        ("root", AuthoredValue::Str(path.root.0.clone())),
-    ])
-}
-
-fn decode_rooted_path(value: &AuthoredValue) -> Result<RootedPath, RpcFailure> {
-    let fields = as_object(value, "RootedPath")?;
-    RootedPath::new(
-        as_string(field(fields, "root")?, "RootedPath.root")?,
-        as_string(field(fields, "path")?, "RootedPath.path")?,
-    )
-    .map_err(invalid)
-}
-
-fn object<const N: usize>(fields: [(&str, AuthoredValue); N]) -> AuthoredValue {
-    AuthoredValue::Object(
-        fields
-            .into_iter()
-            .map(|(name, value)| (name.to_owned(), value))
-            .collect(),
-    )
-}
-
-fn byte_array(bytes: &[u8]) -> AuthoredValue {
-    AuthoredValue::Array(
-        bytes
-            .iter()
-            .map(|byte| AuthoredValue::UInt(u128::from(*byte)))
-            .collect(),
-    )
-}
-
-fn fixed_bytes<const N: usize>(
-    value: &AuthoredValue,
-    context: &str,
-) -> Result<[u8; N], RpcFailure> {
-    let values = as_array(value, context)?;
-    if values.len() != N {
-        return Err(invalid(format!("{context} must contain exactly {N} bytes")));
-    }
-    let mut bytes = [0; N];
-    for (target, value) in bytes.iter_mut().zip(values) {
-        let AuthoredValue::UInt(value) = value else {
-            return Err(invalid(format!("{context} contains a non-byte value")));
-        };
-        *target = u8::try_from(*value)
-            .map_err(|_| invalid(format!("{context} contains an out-of-range byte")))?;
-    }
-    Ok(bytes)
-}
-
-fn as_object<'a>(
-    value: &'a AuthoredValue,
-    context: &str,
-) -> Result<&'a BTreeMap<String, AuthoredValue>, RpcFailure> {
-    match value {
-        AuthoredValue::Object(value) => Ok(value),
-        _ => Err(invalid(format!("{context} must be an object"))),
-    }
-}
-
-fn as_array<'a>(
-    value: &'a AuthoredValue,
-    context: &str,
-) -> Result<&'a [AuthoredValue], RpcFailure> {
-    match value {
-        AuthoredValue::Array(value) => Ok(value),
-        _ => Err(invalid(format!("{context} must be an array"))),
-    }
-}
-
-fn as_string<'a>(value: &'a AuthoredValue, context: &str) -> Result<&'a str, RpcFailure> {
-    match value {
-        AuthoredValue::Str(value) => Ok(value),
-        _ => Err(invalid(format!("{context} must be text"))),
-    }
-}
-
-fn as_bool(value: &AuthoredValue, context: &str) -> Result<bool, RpcFailure> {
-    match value {
-        AuthoredValue::Bool(value) => Ok(*value),
-        _ => Err(invalid(format!("{context} must be a boolean"))),
-    }
-}
-
-fn as_u128(value: &AuthoredValue, context: &str) -> Result<u128, RpcFailure> {
-    match value {
-        AuthoredValue::UInt(value) => Ok(*value),
-        _ => Err(invalid(format!("{context} must be an unsigned integer"))),
-    }
-}
-
-fn as_i128(value: &AuthoredValue, context: &str) -> Result<i128, RpcFailure> {
-    match value {
-        AuthoredValue::Int(value) => Ok(*value),
-        AuthoredValue::UInt(value) => {
-            i128::try_from(*value).map_err(|_| invalid(format!("{context} is outside i128 range")))
-        }
-        _ => Err(invalid(format!("{context} must be an integer"))),
-    }
-}
-
-
-/// `value` as canonical JSON reads it back: a leaf the writer spells
-/// another way parses as that spelling (an integral float such as `30.0`
-/// is written `30` and reads back as `UInt(30)`; a non-negative `Int` as
-/// `UInt`). Settings an output records in its `$settings` come back in
-/// this form, so settings compared with a record (an importer's defaults,
-/// a rule's authored floats) are put in it first. Blobs and leaves the
-/// writer rejects stay as they are.
-fn canonical_authored(value: AuthoredValue) -> AuthoredValue {
-    match value {
-        AuthoredValue::Array(items) => {
-            AuthoredValue::Array(items.into_iter().map(canonical_authored).collect())
-        }
-        AuthoredValue::Object(fields) => AuthoredValue::Object(
-            fields
-                .into_iter()
-                .map(|(name, value)| (name, canonical_authored(value)))
-                .collect(),
-        ),
-        AuthoredValue::Blob(_) => value,
-        leaf => distill_json::write(&leaf)
-            .ok()
-            .and_then(|text| distill_json::parse(&text).ok())
-            .unwrap_or(leaf),
-    }
-}
-/// A float, or an integer: canonical JSON writes an integral float as an
-/// integer, so a float field reads back as one.
-fn as_f64(value: &AuthoredValue, context: &str) -> Result<f64, RpcFailure> {
-    match value {
-        AuthoredValue::Float(value) => Ok(*value),
-        AuthoredValue::UInt(value) => Ok(*value as f64),
-        AuthoredValue::Int(value) => Ok(*value as f64),
-        _ => Err(invalid(format!("{context} must be a float"))),
-    }
-}
-
-fn field<'a>(
-    fields: &'a BTreeMap<String, AuthoredValue>,
-    name: &str,
-) -> Result<&'a AuthoredValue, RpcFailure> {
-    fields
-        .get(name)
-        .ok_or_else(|| invalid(format!("missing field {name:?}")))
-}
 
 struct ImportDestination {
     root: String,
@@ -4996,7 +4147,7 @@ struct PriorImport {
 #[derive(Debug)]
 pub(crate) struct ImportControls {
     record: ImportRecord,
-    settings: AuthoredValue,
+    settings: Value,
 }
 
 /// Decoded `ImportControls` by the blake3 hash of their bundle file's bytes
@@ -5088,7 +4239,7 @@ pub(crate) struct ImportRun {
     destination: ImportDestination,
     prior: Option<PriorImport>,
     sources: Vec<RootedPath>,
-    explicit_settings: Option<AuthoredValue>,
+    explicit_settings: Option<Value>,
     watch: bool,
     origin: Option<DirectoryOrigin>,
     read_set: Vec<FileDep>,
@@ -5151,7 +4302,7 @@ struct ImportInvocation {
     destination: ImportDestination,
     prior: Option<PriorImport>,
     sources: Vec<RootedPath>,
-    explicit_settings: Option<AuthoredValue>,
+    explicit_settings: Option<Value>,
     watch: bool,
     origin: Option<DirectoryOrigin>,
     basis_deps: Vec<FileDep>,

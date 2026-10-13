@@ -8,7 +8,7 @@ use distill_asset::{
     PathStep,
 };
 use distill_core::id::{AssetUuid, TypeUuid};
-use distill_json::AuthoredValue;
+use ngp_schema::Value;
 use distill_wire::native::NativeLayoutNode;
 
 #[derive(Default)]
@@ -164,10 +164,11 @@ fn macro_generates_logical_hash_defaults_and_deterministic_encoding() {
         .iter()
         .any(|(_, path, _)| path == &[PathStep::Field("cache")]));
     let parent = (table.parent.unwrap())().unwrap();
-    let AuthoredValue::Object(parent) = parent else {
-        panic!("object")
+    let Value::Struct(parent) = parent else {
+        panic!("struct")
     };
-    assert!(!parent.contains_key("cache"));
+    // Positional over the non-skip fields: map, name, values, z (no cache).
+    assert_eq!(parent.len(), 4);
 
     let mut value = Example {
         z: 4,

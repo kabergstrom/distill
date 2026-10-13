@@ -11,7 +11,7 @@ use distill_core::id::{AssetUuid, BundleUuid, ContentHash, TypeUuid};
 use distill_daemon::config::DaemonConfig;
 use distill_daemon::pack_command::{build_configured_pack, PackCommandError};
 use distill_daemon::process::DaemonProcess;
-use distill_json::AuthoredValue;
+use distill_schema::ngp_schema::Value;
 use distill_loader::{
     AdoptionId, AssetStorage, GameModuleEpoch, HandleId, LoadStatus, Loader, LoaderDiagnostic,
     PendingState, PendingToken, RpcIo, StorageError, UpdateResult,
@@ -201,8 +201,8 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
             .is_some_and(|reimported| {
                 matches!(
                     &reimported.assets["shader"].data,
-                    AuthoredValue::Object(fields)
-                        if matches!(fields.get("value"), Some(AuthoredValue::Str(value)) if value.contains("VALUE = 2"))
+                    Value::Struct(fields)
+                        if matches!(fields.as_ref(), [Value::String(value)] if value.contains("VALUE = 2"))
                 )
             });
         if updated {

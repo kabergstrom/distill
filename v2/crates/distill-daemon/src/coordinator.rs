@@ -3910,7 +3910,7 @@ mod projection_tests {
     use distill_build::outputs::OutputDecls;
     use distill_build::pipeline::{GraphicsApi, TargetArch, TargetOs, TargetSelector};
     use distill_bundle::AssetEntry;
-    use distill_json::AuthoredValue;
+    use distill_schema::ngp_schema::Value;
     use distill_schema::ngp_schema::{
         node_hash, LayoutIdentity, LogicalSchema, PrimitiveKind, SchemaNode,
     };
@@ -3990,7 +3990,7 @@ mod projection_tests {
                         type_uuid: SOURCE,
                         schema_hash,
                         authoring_only: false,
-                        data: AuthoredValue::UInt(7),
+                        data: Value::U8(7),
                     },
                 )]),
             })

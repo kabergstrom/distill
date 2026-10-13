@@ -28,13 +28,13 @@
 
 use std::collections::BTreeMap;
 
-use distill_json::AuthoredValue;
-use ngp_schema::{node_hash, SnapshotError};
+use ngp_schema::{blob_sites, encode_path, node_hash, write_value, SnapshotError, WriteOptions};
 
 use crate::crc32c::crc32c;
 use crate::envelope;
 use crate::error::BundleError;
-use crate::walk::{walk_entry, BlobSite, WalkMode};
+use crate::data::{display, map_error, text_depth, BlobSite, Blobs, LayoutSink, MAX_DATA_DEPTH};
+use crate::envelope::Strictness;
 use crate::{Bundle, BundleError as E, CONTAINER_MAGIC, CONTAINER_VERSION};
 
 const HEADER_LEN: u64 = 36;
@@ -64,16 +64,16 @@ fn looks_line_ending_mangled(found: &[u8; 8]) -> bool {
 }
 
 pub(crate) fn parse(bytes: &[u8]) -> Result<Bundle, BundleError> {
-    parse_with(bytes, envelope::decode)
+    parse_with(bytes, Strictness::Full)
 }
 
 pub(crate) fn parse_namespace(bytes: &[u8]) -> Result<Bundle, BundleError> {
-    parse_with(bytes, envelope::decode_namespace)
+    parse_with(bytes, Strictness::Namespace)
 }
 
 fn parse_with(
     bytes: &[u8],
-    decode: fn(AuthoredValue) -> Result<Bundle, BundleError>,
+    strictness: Strictness,
 ) -> Result<Bundle, BundleError> {
     // ---- framing: everything here runs before any allocation ----
     if bytes.len() < HEADER_LEN as usize {
@@ -141,30 +141,16 @@ fn parse_with(
 
     // ---- envelope ----
     let text = envelope::utf8(json)?;
-    let value = distill_json::parse(text).map_err(E::Json)?;
-    let mut bundle = decode(value)?;
-
-    // ---- pass A: schema-directed walk, validate placement leaves ----
+    // ---- typed parse: placement leaves bounds-checked and filled ----
     let mut sites: Vec<BlobSite> = Vec::new();
-    {
-        let Bundle {
-            schemas, assets, ..
-        } = &mut bundle;
-        for (local_id, entry) in assets.iter_mut() {
-            let schema = schemas.get(&entry.schema_hash).ok_or_else(|| E::Internal {
-                detail: format!("schema closure not upheld for {local_id:?}"),
-            })?;
-            walk_entry(
-                local_id,
-                &schema.root,
-                &mut entry.data,
-                WalkMode::ContainerValidate {
-                    blob_len,
-                    sites: &mut sites,
-                },
-            )?;
-        }
-    }
+    let bundle = envelope::parse(
+        text,
+        strictness,
+        Blobs::Container {
+            chunk,
+            sites: &mut sites,
+        },
+    )?;
 
     // ---- global placement checks, in canonical (local_id, path) order ----
     sites.sort_by(|a, b| {
@@ -216,23 +202,6 @@ fn parse_with(
         });
     }
 
-    // ---- pass B: splice the chunk bytes into the data values ----
-    {
-        let Bundle {
-            schemas, assets, ..
-        } = &mut bundle;
-        for (local_id, entry) in assets.iter_mut() {
-            let schema = schemas.get(&entry.schema_hash).ok_or_else(|| E::Internal {
-                detail: format!("schema closure not upheld for {local_id:?}"),
-            })?;
-            walk_entry(
-                local_id,
-                &schema.root,
-                &mut entry.data,
-                WalkMode::ContainerFill { chunk },
-            )?;
-        }
-    }
     Ok(bundle)
 }
 
@@ -294,34 +263,14 @@ pub(crate) fn write(bundle: &Bundle) -> Result<Vec<u8>, BundleError> {
     }
 
     // ---- pass A: validate data against schemas, collect blob lengths ----
-    let mut datas: BTreeMap<String, AuthoredValue> = BTreeMap::new();
-    let mut collected: Vec<(String, Vec<u8>, u64)> = Vec::new(); // (local_id, path, len)
+    let mut collected: Vec<(&str, Vec<u8>, u64)> = Vec::new(); // (local_id, path, len)
     for (local_id, entry) in &bundle.assets {
         let schema = &bundle.schemas[&entry.schema_hash]; // presence checked above
-                                                          // Depth-check iteratively BEFORE the recursive clone/walk/drop
-                                                          // machinery sees the value — hostile nesting must be a definite
-                                                          // error, never a stack overflow.
-        crate::walk::check_data_depth(local_id, &entry.data)?;
-        let mut data = entry.data.clone();
-        let mut sites = Vec::new();
-        walk_entry(
-            local_id,
-            &schema.root,
-            &mut data,
-            WalkMode::WriterCollect { sites: &mut sites },
-        )?;
+        let sites =
+            blob_sites(&schema.root, &entry.data).map_err(|e| map_error(local_id, e, None))?;
         for (path, len) in sites {
-            collected.push((local_id.clone(), path, len));
+            collected.push((local_id.as_str(), encode_path(&path), len));
         }
-        datas.insert(local_id.clone(), data);
-    }
-
-    // ---- plain JSON iff no blobs ----
-    if collected.is_empty() {
-        let envelope = envelope::build(bundle, datas)?;
-        let mut text = distill_json::write(&envelope).map_err(E::JsonWrite)?;
-        text.push('\n'); // the §6 whole-file byte: exactly one trailing \n
-        return Ok(text.into_bytes());
     }
 
     // ---- layout: successive 16-aligned offsets in canonical order ----
@@ -334,70 +283,45 @@ pub(crate) fn write(bundle: &Bundle) -> Result<Vec<u8>, BundleError> {
     for (local_id, path, len) in &collected {
         let offset = align16(cursor).ok_or_else(overflow)?;
         cursor = offset.checked_add(*len).ok_or_else(overflow)?;
-        layouts
-            .entry(local_id.as_str())
-            .or_default()
-            .insert(path.clone(), offset);
+        layouts.entry(local_id).or_default().insert(path.clone(), offset);
     }
-    let blob_len = cursor;
+    let blob_len = usize::try_from(cursor).map_err(|_| overflow())?;
 
-    // ---- pass B: splice {"len","offset"} leaves, move bytes out ----
+    // ---- pass B: write each entry's data, blobs placed into the chunk ----
     let empty_layout = BTreeMap::new();
-    let mut sinks: BTreeMap<&str, BTreeMap<Vec<u8>, Vec<u8>>> = BTreeMap::new();
-    for (local_id, data) in datas.iter_mut() {
-        let entry = bundle
-            .assets
-            .get(local_id.as_str())
-            .ok_or_else(|| E::Internal {
-                detail: format!("writer lost entry {local_id:?}"),
-            })?;
+    let mut chunk = vec![0u8; blob_len];
+    let mut datas: BTreeMap<&str, String> = BTreeMap::new();
+    for (local_id, entry) in &bundle.assets {
         let schema = &bundle.schemas[&entry.schema_hash];
-        let layout = layouts.get(local_id.as_str()).unwrap_or(&empty_layout);
-        let mut sink = BTreeMap::new();
-        walk_entry(
-            local_id,
+        let mut sink = LayoutSink {
+            layout: layouts.get(local_id.as_str()).unwrap_or(&empty_layout),
+            chunk: &mut chunk,
+        };
+        let text = write_value(
             &schema.root,
-            data,
-            WalkMode::WriterFill {
-                layout,
-                sink: &mut sink,
+            &entry.data,
+            WriteOptions {
+                blobs: Some(&mut sink),
+                types: None,
             },
-        )?;
-        sinks.insert(local_id.as_str(), sink);
-    }
-
-    // ---- assemble the blob chunk in canonical order, zero gaps ----
-    let mut chunk = Vec::with_capacity(blob_len as usize);
-    for (local_id, path, _) in &collected {
-        let offset = layouts
-            .get(local_id.as_str())
-            .and_then(|m| m.get(path))
-            .copied()
-            .ok_or_else(|| E::Internal {
-                detail: format!("layout lost blob for {local_id:?}"),
-            })?;
-        let bytes = sinks
-            .get_mut(local_id.as_str())
-            .and_then(|m| m.remove(path))
-            .ok_or_else(|| E::Internal {
-                detail: format!("writer pass B lost blob bytes for {local_id:?}"),
-            })?;
-        if (offset as usize) < chunk.len() {
-            return Err(E::Internal {
-                detail: "blob layout went backwards".to_string(),
+        )
+        .map_err(|e| map_error(local_id, e, None))?;
+        // The parser's nesting cap must accept what the writer emits.
+        if text_depth(&text) > MAX_DATA_DEPTH {
+            return Err(E::WalkDepth {
+                local_id: local_id.clone(),
+                path: display(&[]),
             });
         }
-        chunk.resize(offset as usize, 0);
-        chunk.extend_from_slice(&bytes);
+        datas.insert(local_id.as_str(), text);
     }
-    debug_assert_eq!(chunk.len() as u64, blob_len);
-    // `sinks` borrows keys out of `datas`, which `envelope::build` consumes.
-    drop(sinks);
 
-    // ---- envelope text: same canonical form as the plain encoding ----
-    let envelope = envelope::build(bundle, datas)?;
-    let mut text = distill_json::write(&envelope).map_err(E::JsonWrite)?;
-    text.push('\n');
+    // ---- plain JSON iff no blobs ----
+    let mut text = envelope::write(bundle, &datas)?;
+    text.push('\n'); // the §6 whole-file byte: exactly one trailing \n
+    if collected.is_empty() {
+        return Ok(text.into_bytes());
+    }
     let json = text.into_bytes();
 
     // ---- header + pad + chunk ----

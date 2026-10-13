@@ -1,8 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use distill_asset::AssetType;
+use distill_asset::{AssetReflect, AssetType};
 use distill_core::id::TypeUuid;
-use distill_json::AuthoredValue;
 use distill_pipeline_api::callbacks::{
     ImporterDescriptor, PipelineProcessContext, PipelineProcessor, ProcessorDescriptor,
     ProcessorError, ProcessorProduct, ProcessorProducts,
@@ -14,7 +13,7 @@ use distill_pipeline_api::importer::{
 use distill_pipeline_api::outputs::OutputDecls;
 use distill_pipeline_api::registration::{ModuleCallError, RegistrationArena, TargetDefinition};
 use distill_pipeline_api::target::TargetSelector;
-use distill_schema::ngp_schema::{LogicalSchema, PrimitiveKind, SchemaNode};
+use distill_schema::ngp_schema::{LogicalSchema, PrimitiveKind, SchemaNode, Value};
 
 pub const SETTINGS_TYPE: TypeUuid = TypeUuid([0x90; 16]);
 pub const TEXTURE_SOURCE_TYPE: TypeUuid = TypeUuid([0x91; 16]);
@@ -61,7 +60,7 @@ impl Kind {
 
 /// The imported pixel as a 2x2 texture with its 1x1 mip: five texels of
 /// the one colour, mip 0 then mip 1.
-fn cook_texture(value: &str) -> Result<AuthoredValue, ProcessorError> {
+fn cook_texture(value: &str) -> Result<Value, ProcessorError> {
     let Some(hex) = value.strip_prefix("1x1:") else {
         return Err(ProcessorError::new(10, "invalid imported PPM value"));
     };
@@ -76,26 +75,20 @@ fn cook_texture(value: &str) -> Result<AuthoredValue, ProcessorError> {
         );
     }
     texel.push(255);
-    let uint = |value: u32| AuthoredValue::UInt(u128::from(value));
-    Ok(AuthoredValue::Object(BTreeMap::from([
-        ("width".to_owned(), uint(2)),
-        ("height".to_owned(), uint(2)),
-        ("depth".to_owned(), uint(1)),
-        ("array_layers".to_owned(), uint(1)),
-        ("mip_count".to_owned(), uint(2)),
-        (
-            "dimension".to_owned(),
-            uint(newgameplus_assets::TEXTURE_DIMENSION_2D.into()),
-        ),
-        (
-            "format".to_owned(),
-            uint(newgameplus_assets::FORMAT_R8G8B8A8_UNORM.into()),
-        ),
-        ("data".to_owned(), AuthoredValue::Blob(texel.repeat(5))),
-    ])))
+    Ok(newgameplus_assets::TextureAsset {
+        width: 2,
+        height: 2,
+        depth: 1,
+        array_layers: 1,
+        mip_count: 2,
+        dimension: newgameplus_assets::TEXTURE_DIMENSION_2D,
+        format: newgameplus_assets::FORMAT_R8G8B8A8_UNORM,
+        data: texel.repeat(5).into(),
+    }
+    .to_value())
 }
 
-fn cook_mesh(value: &str) -> Result<AuthoredValue, ProcessorError> {
+fn cook_mesh(value: &str) -> Result<Value, ProcessorError> {
     let mut positions = Vec::<[f32; 3]>::new();
     let mut indices = Vec::<u16>::new();
     for line in value.lines() {
@@ -159,13 +152,14 @@ fn cook_mesh(value: &str) -> Result<AuthoredValue, ProcessorError> {
         .flat_map(u16::to_le_bytes)
         .collect::<Vec<_>>();
     // The triangle's u16 indices as the terminal's blob.
-    Ok(AuthoredValue::Object(BTreeMap::from([
-        ("index".to_owned(), AuthoredValue::UInt(0)),
-        ("data".to_owned(), AuthoredValue::Blob(indices)),
-    ])))
+    Ok(newgameplus_assets::FontAsset {
+        index: 0,
+        data: indices.into(),
+    }
+    .to_value())
 }
 
-fn cook_shader(value: &str) -> Result<AuthoredValue, ProcessorError> {
+fn cook_shader(value: &str) -> Result<Value, ProcessorError> {
     let cooked = rafx_shader_processor::compile_pipeline(
         &[rafx_shader_processor::ShaderStageSource {
             virtual_path: "assets/basic.comp",
@@ -175,10 +169,10 @@ fn cook_shader(value: &str) -> Result<AuthoredValue, ProcessorError> {
         false,
     )
     .map_err(|error| ProcessorError::new(30, error.to_string()))?;
-    Ok(AuthoredValue::Object(BTreeMap::from([(
-        "cooked".to_owned(),
-        AuthoredValue::Blob(cooked),
-    )])))
+    Ok(newgameplus_assets::CookedPipeline {
+        cooked: cooked.into(),
+    }
+    .to_value())
 }
 
 struct GameAssetsImporter;
@@ -203,14 +197,14 @@ impl AuthoringImporter for GameAssetsImporter {
         })
     }
 
-    fn default_settings(&self) -> AuthoredValue {
+    fn default_settings(&self) -> Value {
         settings_value()
     }
 
     fn import(
         &self,
         context: &mut dyn AuthoringImportContext,
-        _settings: &AuthoredValue,
+        _settings: &Value,
     ) -> Result<ImportOutput, AuthoringImporterError> {
         let texture = source_with_suffix(context, "pixel.ppm")?;
         let mesh = source_with_suffix(context, "triangle.obj")?;
@@ -233,10 +227,7 @@ impl AuthoringImporter for GameAssetsImporter {
                 .entry(
                     id,
                     type_uuid,
-                    AuthoredValue::Object(BTreeMap::from([(
-                        "value".to_owned(),
-                        AuthoredValue::Str(value),
-                    )])),
+                    Value::Struct(Box::new([Value::String(value)])),
                 )
                 .map_err(|error| AuthoringImporterError::rejected(1, format!("{error:?}")))?;
         }
@@ -326,13 +317,13 @@ struct FixtureCook(Kind);
 impl PipelineProcessor for FixtureCook {
     fn process(
         &self,
-        input: AuthoredValue,
+        input: Value,
         _context: &mut dyn PipelineProcessContext,
     ) -> Result<ProcessorProducts, ProcessorError> {
-        let AuthoredValue::Object(mut fields) = input else {
-            return Err(ProcessorError::new(1, "fixture source must be an object"));
+        let Value::Struct(fields) = input else {
+            return Err(ProcessorError::new(1, "fixture source must be a struct"));
         };
-        let Some(AuthoredValue::Str(value)) = fields.remove("value") else {
+        let Some(Value::String(value)) = fields.into_vec().into_iter().next() else {
             return Err(ProcessorError::new(
                 2,
                 "fixture source value must be a string",
@@ -398,11 +389,8 @@ fn settings_schema() -> SchemaNode {
     }
 }
 
-fn settings_value() -> AuthoredValue {
-    AuthoredValue::Object(BTreeMap::from([(
-        "value".to_owned(),
-        AuthoredValue::UInt(0),
-    )]))
+fn settings_value() -> Value {
+    Value::Struct(Box::new([Value::U8(0)]))
 }
 
 fn unload() -> Result<(), ModuleCallError> {

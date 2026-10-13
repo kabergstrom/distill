@@ -21,7 +21,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// and the remedy is [`Store::recreate`], which the daemon's writer runs on
 /// its own ([`Store::open_or_recreate`]); readers still fail. Migrations are
 /// deferred until Distill is declared stable (DESIGN.md §13).
-pub const SCHEMA_VERSION: u32 = 63;
+pub const SCHEMA_VERSION: u32 = 64;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts

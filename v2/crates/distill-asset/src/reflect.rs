@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::Arc;
 
-use distill_json::AuthoredValue;
+use ngp_schema::{AssetRefValue, Value};
 use distill_wire::exec::Blob;
 use distill_wire::native::{CallbackPanic, NativeLayoutNode, ScalarKind};
 
@@ -31,25 +31,19 @@ pub use crate::defaults::DefaultNode;
 /// on precisely the types and geometry named by that layout. An incorrect
 /// implementation can make the loader perform invalid raw-pointer operations.
 pub unsafe trait AssetReflect: 'static {
-    /// Whether this key type uses JSON's object form for maps. This is a
-    /// property of the type, not of the observed entries: an empty non-string
-    /// map must still use the pair-array form.
-    const STRING_KEY: bool = false;
-
     fn layout(builder: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode;
     fn logical(builder: &mut LogicalBuilder);
     fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic>;
-    fn to_authored(&self) -> AuthoredValue;
+    /// The value in the typed model (`ngp_schema::Value`): struct fields
+    /// and enum variants in schema (name-sorted) order. Map and set
+    /// entries come in no particular order; writers canonicalize.
+    fn to_value(&self) -> Value;
 
     fn default_writer() -> Option<DefaultWriter> {
         None
     }
 
     fn collect_default_nodes(_collector: &mut DefaultCollector) {}
-
-    fn string_key(&self) -> Option<&str> {
-        None
-    }
 }
 
 fn collect_child_defaults<P: AssetReflect, T: AssetReflect>(
@@ -95,7 +89,7 @@ fn logical_primitive(builder: &mut LogicalBuilder, name: &str) {
     builder.string(name);
 }
 
-macro_rules! unsigned {
+macro_rules! integer {
     ($ty:ty, $kind:ident, $name:literal) => {
         unsafe impl AssetReflect for $ty {
             fn layout(_: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {
@@ -107,8 +101,8 @@ macro_rules! unsigned {
             fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
                 sink.flat(&self.to_le_bytes())
             }
-            fn to_authored(&self) -> AuthoredValue {
-                AuthoredValue::UInt(*self as u128)
+            fn to_value(&self) -> Value {
+                Value::$kind(*self)
             }
             fn default_writer() -> Option<DefaultWriter> {
                 Some(crate::defaults::write_default::<Self>)
@@ -117,42 +111,16 @@ macro_rules! unsigned {
     };
 }
 
-macro_rules! signed {
-    ($ty:ty, $kind:ident, $name:literal) => {
-        unsafe impl AssetReflect for $ty {
-            fn layout(_: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {
-                scalar::<Self>(offset, ScalarKind::$kind)
-            }
-            fn logical(builder: &mut LogicalBuilder) {
-                logical_primitive(builder, $name)
-            }
-            fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
-                sink.flat(&self.to_le_bytes())
-            }
-            fn to_authored(&self) -> AuthoredValue {
-                if *self < 0 {
-                    AuthoredValue::Int(*self as i128)
-                } else {
-                    AuthoredValue::UInt(*self as u128)
-                }
-            }
-            fn default_writer() -> Option<DefaultWriter> {
-                Some(crate::defaults::write_default::<Self>)
-            }
-        }
-    };
-}
-
-unsigned!(u8, U8, "u8");
-unsigned!(u16, U16, "u16");
-unsigned!(u32, U32, "u32");
-unsigned!(u64, U64, "u64");
-unsigned!(u128, U128, "u128");
-signed!(i8, I8, "i8");
-signed!(i16, I16, "i16");
-signed!(i32, I32, "i32");
-signed!(i64, I64, "i64");
-signed!(i128, I128, "i128");
+integer!(u8, U8, "u8");
+integer!(u16, U16, "u16");
+integer!(u32, U32, "u32");
+integer!(u64, U64, "u64");
+integer!(u128, U128, "u128");
+integer!(i8, I8, "i8");
+integer!(i16, I16, "i16");
+integer!(i32, I32, "i32");
+integer!(i64, I64, "i64");
+integer!(i128, I128, "i128");
 
 unsafe impl AssetReflect for bool {
     fn layout(_: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {
@@ -164,8 +132,8 @@ unsafe impl AssetReflect for bool {
     fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
         sink.flat(&[u8::from(*self)])
     }
-    fn to_authored(&self) -> AuthoredValue {
-        AuthoredValue::Bool(*self)
+    fn to_value(&self) -> Value {
+        Value::Bool(*self)
     }
     fn default_writer() -> Option<DefaultWriter> {
         Some(crate::defaults::write_default::<Self>)
@@ -182,8 +150,8 @@ unsafe impl AssetReflect for char {
     fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
         sink.flat(&(*self as u32).to_le_bytes())
     }
-    fn to_authored(&self) -> AuthoredValue {
-        AuthoredValue::Str(self.to_string())
+    fn to_value(&self) -> Value {
+        Value::Char(*self)
     }
     fn default_writer() -> Option<DefaultWriter> {
         Some(crate::defaults::write_default::<Self>)
@@ -202,8 +170,8 @@ macro_rules! float {
             fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
                 sink.flat(&self.to_bits().to_le_bytes())
             }
-            fn to_authored(&self) -> AuthoredValue {
-                AuthoredValue::Float(*self as f64)
+            fn to_value(&self) -> Value {
+                Value::$kind(*self)
             }
             fn default_writer() -> Option<DefaultWriter> {
                 Some(crate::defaults::write_default::<Self>)
@@ -227,16 +195,8 @@ unsafe impl AssetReflect for f32 {
         sink.flat(&self.to_bits().to_le_bytes())
     }
 
-    fn to_authored(&self) -> AuthoredValue {
-        if !self.is_finite() {
-            return AuthoredValue::Float(f64::from(*self));
-        }
-        let canonical = distill_json::write_f32(*self)
-            .expect("finite binary32 values always have a canonical decimal");
-        let semantic = canonical
-            .parse::<f64>()
-            .expect("the canonical binary32 decimal is also a binary64 token");
-        AuthoredValue::Float(semantic)
+    fn to_value(&self) -> Value {
+        Value::F32(*self)
     }
 
     fn default_writer() -> Option<DefaultWriter> {
@@ -254,8 +214,8 @@ unsafe impl AssetReflect for () {
     fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
         sink.flat(&[])
     }
-    fn to_authored(&self) -> AuthoredValue {
-        AuthoredValue::Null
+    fn to_value(&self) -> Value {
+        Value::Unit
     }
     fn default_writer() -> Option<DefaultWriter> {
         Some(crate::defaults::write_default::<Self>)
@@ -263,8 +223,6 @@ unsafe impl AssetReflect for () {
 }
 
 unsafe impl AssetReflect for String {
-    const STRING_KEY: bool = true;
-
     fn layout(_: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {
         NativeLayoutNode::Str {
             offset,
@@ -280,16 +238,12 @@ unsafe impl AssetReflect for String {
         sink.flat(self.as_bytes())?;
         sink.finish()
     }
-    fn to_authored(&self) -> AuthoredValue {
-        AuthoredValue::Str(self.clone())
+    fn to_value(&self) -> Value {
+        Value::String(self.clone())
     }
     fn default_writer() -> Option<DefaultWriter> {
         Some(crate::defaults::write_default::<Self>)
-    }
-    fn string_key(&self) -> Option<&str> {
-        Some(self)
-    }
-}
+    }}
 
 unsafe impl AssetReflect for Blob {
     fn layout(_: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {
@@ -305,8 +259,8 @@ unsafe impl AssetReflect for Blob {
     fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
         sink.blob(self.as_bytes())
     }
-    fn to_authored(&self) -> AuthoredValue {
-        AuthoredValue::Blob(self.as_bytes().to_vec())
+    fn to_value(&self) -> Value {
+        Value::Blob(self.as_bytes().to_vec())
     }
 }
 
@@ -335,8 +289,8 @@ unsafe impl<T: AssetReflect> AssetReflect for Vec<T> {
         }
         sink.finish()
     }
-    fn to_authored(&self) -> AuthoredValue {
-        AuthoredValue::Array(self.iter().map(AssetReflect::to_authored).collect())
+    fn to_value(&self) -> Value {
+        Value::Seq(self.iter().map(AssetReflect::to_value).collect())
     }
     fn default_writer() -> Option<DefaultWriter> {
         Some(crate::defaults::write_default::<Self>)
@@ -372,8 +326,8 @@ unsafe impl<T: AssetReflect, const N: usize> AssetReflect for [T; N] {
         }
         sink.finish()
     }
-    fn to_authored(&self) -> AuthoredValue {
-        AuthoredValue::Array(self.iter().map(AssetReflect::to_authored).collect())
+    fn to_value(&self) -> Value {
+        Value::Seq(self.iter().map(AssetReflect::to_value).collect())
     }
     fn collect_default_nodes(collector: &mut DefaultCollector) {
         collect_child_defaults::<Self, T>(collector, vec![PathStep::Elem]);
@@ -410,9 +364,8 @@ unsafe impl<T: AssetReflect> AssetReflect for Option<T> {
         }
         sink.finish()
     }
-    fn to_authored(&self) -> AuthoredValue {
-        self.as_ref()
-            .map_or(AuthoredValue::Null, AssetReflect::to_authored)
+    fn to_value(&self) -> Value {
+        Value::Option(self.as_ref().map(|v| Box::new(v.to_value())))
     }
     fn default_writer() -> Option<DefaultWriter> {
         Some(crate::defaults::write_default::<Self>)
@@ -444,8 +397,8 @@ unsafe impl<T: AssetReflect> AssetReflect for Box<T> {
         (**self).encode(sink)?;
         sink.finish()
     }
-    fn to_authored(&self) -> AuthoredValue {
-        (**self).to_authored()
+    fn to_value(&self) -> Value {
+        (**self).to_value()
     }
     fn collect_default_nodes(collector: &mut DefaultCollector) {
         collect_child_defaults::<Self, T>(collector, Vec::new());
@@ -474,8 +427,8 @@ unsafe impl<T: AssetReflect> AssetReflect for Arc<T> {
         (**self).encode(sink)?;
         sink.finish()
     }
-    fn to_authored(&self) -> AuthoredValue {
-        (**self).to_authored()
+    fn to_value(&self) -> Value {
+        (**self).to_value()
     }
     fn collect_default_nodes(collector: &mut DefaultCollector) {
         collect_child_defaults::<Self, T>(collector, Vec::new());
@@ -506,8 +459,8 @@ where
     fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
         encode_set(self.iter(), self.len(), sink)
     }
-    fn to_authored(&self) -> AuthoredValue {
-        authored_set(self.iter())
+    fn to_value(&self) -> Value {
+        Value::Seq(self.iter().map(AssetReflect::to_value).collect())
     }
     fn default_writer() -> Option<DefaultWriter> {
         Some(crate::defaults::write_default::<Self>)
@@ -540,8 +493,8 @@ where
     fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
         encode_set(self.iter(), self.len(), sink)
     }
-    fn to_authored(&self) -> AuthoredValue {
-        authored_set(self.iter())
+    fn to_value(&self) -> Value {
+        Value::Seq(self.iter().map(AssetReflect::to_value).collect())
     }
     fn default_writer() -> Option<DefaultWriter> {
         Some(crate::defaults::write_default::<Self>)
@@ -581,8 +534,8 @@ where
     fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
         encode_map(self.iter(), self.len(), sink)
     }
-    fn to_authored(&self) -> AuthoredValue {
-        authored_map(self.iter())
+    fn to_value(&self) -> Value {
+        Value::Map(self.iter().map(|(k, v)| (k.to_value(), v.to_value())).collect())
     }
     fn default_writer() -> Option<DefaultWriter> {
         Some(crate::defaults::write_default::<Self>)
@@ -620,8 +573,8 @@ where
     fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
         encode_map(self.iter(), self.len(), sink)
     }
-    fn to_authored(&self) -> AuthoredValue {
-        authored_map(self.iter())
+    fn to_value(&self) -> Value {
+        Value::Map(self.iter().map(|(k, v)| (k.to_value(), v.to_value())).collect())
     }
     fn default_writer() -> Option<DefaultWriter> {
         Some(crate::defaults::write_default::<Self>)
@@ -657,8 +610,8 @@ unsafe impl<T: AssetType> AssetReflect for AssetRef<T> {
     fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
         sink.reference(true, self.uuid(), T::TYPE_UUID)
     }
-    fn to_authored(&self) -> AuthoredValue {
-        AuthoredValue::Str(self.uuid().to_string())
+    fn to_value(&self) -> Value {
+        Value::AssetRef(AssetRefValue::Path(self.uuid().to_string()))
     }
 }
 
@@ -673,8 +626,8 @@ unsafe impl<T: AssetType> AssetReflect for WeakAssetRef<T> {
     fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
         sink.reference(false, self.uuid(), T::TYPE_UUID)
     }
-    fn to_authored(&self) -> AuthoredValue {
-        AuthoredValue::Str(self.uuid().to_string())
+    fn to_value(&self) -> Value {
+        Value::WeakRef(AssetRefValue::Path(self.uuid().to_string()))
     }
 }
 
@@ -693,12 +646,6 @@ fn encode_set<'a, T: AssetReflect + 'a>(
     sink.finish()
 }
 
-fn authored_set<'a, T: AssetReflect + 'a>(values: impl Iterator<Item = &'a T>) -> AuthoredValue {
-    let mut values: Vec<_> = values.map(|v| (canonical_bytes(v), v)).collect();
-    values.sort_by(|a, b| a.0.cmp(&b.0));
-    AuthoredValue::Array(values.into_iter().map(|(_, v)| v.to_authored()).collect())
-}
-
 fn encode_map<'a, K: AssetReflect + 'a, V: AssetReflect + 'a>(
     entries: impl Iterator<Item = (&'a K, &'a V)>,
     len: usize,
@@ -713,32 +660,6 @@ fn encode_map<'a, K: AssetReflect + 'a, V: AssetReflect + 'a>(
         value.encode(sink)?;
     }
     sink.finish()
-}
-
-fn authored_map<'a, K: AssetReflect + 'a, V: AssetReflect + 'a>(
-    entries: impl Iterator<Item = (&'a K, &'a V)>,
-) -> AuthoredValue {
-    let mut entries: Vec<_> = entries.map(|(k, v)| (canonical_bytes(k), k, v)).collect();
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    if K::STRING_KEY {
-        let mut object = BTreeMap::new();
-        for (_, key, value) in entries {
-            object.insert(
-                key.string_key().expect("checked").to_owned(),
-                value.to_authored(),
-            );
-        }
-        AuthoredValue::Object(object)
-    } else {
-        AuthoredValue::Array(
-            entries
-                .into_iter()
-                .map(|(_, key, value)| {
-                    AuthoredValue::Array(vec![key.to_authored(), value.to_authored()])
-                })
-                .collect(),
-        )
-    }
 }
 
 /// A stable byte spelling of the neutral event stream. It is used only

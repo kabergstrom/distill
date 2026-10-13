@@ -2,7 +2,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use distill_json::AuthoredValue;
+use distill_schema::ngp_schema::Value;
 use distill_rpc::capnp_loader::{RemoteCall, RemoteHub};
 use distill_rpc::capnp_transport::{
     schema, CapnpClient, RemoteConnectOutcome, RemoteMetadataOutcome, StagedListener,
@@ -631,7 +631,7 @@ fn authoring_entry(byte: u8, role: AuthoringEntryRole) -> AuthoringEntry {
         role,
         tags: std::collections::BTreeMap::new(),
         value: AuthoringValue {
-            canonical_value: Arc::from(&b"{\"$distill_blob\":0}"[..]),
+            canonical_value: Arc::from(&b"{\"len\":1,\"offset\":0}"[..]),
             blobs: vec![Arc::from([byte.wrapping_add(2)])],
         },
     }
@@ -689,7 +689,7 @@ async fn authoring_snapshot_round_trips_over_real_tcp_with_exact_stamp_and_role_
                 "parent",
                 AssetUuid([5; 16]),
                 PARENT_TYPE,
-                AuthoredValue::Object([("value".to_owned(), AuthoredValue::UInt(5))].into()),
+                Value::Struct(Box::new([Value::U8(5)])),
             );
             let runtime_uuid = AssetUuid::v5(parent.uuid, REFLECTION);
             write_entry(&mut project, &entry);
@@ -2139,9 +2139,7 @@ async fn remote_snapshot_serves_the_pack_surface() {
             let backend = Arc::new(PackBackend::default());
             server.install_build_backend(backend.clone());
             let group = |value: &str| {
-                AuthoredValue::Object(
-                    [("group".to_owned(), AuthoredValue::Str(value.to_owned()))].into(),
-                )
+                Value::Struct(Box::new([Value::String(value.to_owned())]))
             };
             let entry = project.asset("entry-5", AssetUuid([5; 16]), TAGGED_TYPE, group("group-5"));
             let definition = project
@@ -2251,11 +2249,8 @@ async fn remote_snapshot_serves_the_pack_surface() {
                     assert_eq!(inspection.role, AuthoringEntryRole::AuthoringOnly);
                     assert_eq!(inspection.stamp, snapshot.basis().snapshot);
                     assert_eq!(
-                        distill_json::parse(
-                            std::str::from_utf8(&inspection.value.canonical_value).unwrap()
-                        )
-                        .unwrap(),
-                        definition.value
+                        &*inspection.value.canonical_value,
+                        br#"{"group":"group-6"}"#
                     );
                 }
                 other => panic!("expected an inspection, got {other:?}"),

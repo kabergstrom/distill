@@ -6,7 +6,6 @@ use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
 use distill_daemon::coordinator::DaemonCoordinator;
 use distill_daemon::scanner::{AssetRoot, ScanDiagnostic};
 use distill_daemon::watcher::WatcherBatch;
-use distill_json::AuthoredValue;
 use distill_rpc::{
     AuthoringBackend, AuthoringEntry, AuthoringEntryRole, AuthoringInspectResult, AuthoringOp,
     AuthoringProgressState, AuthoringValue as RpcAuthoringValue, ConfigurationStatus,
@@ -15,7 +14,8 @@ use distill_rpc::{
     WriteReceipt, WrittenFile,
 };
 use distill_schema::ngp_schema::{
-    node_hash, snapshot_to_json, LogicalSchema, PrimitiveKind, SchemaNode,
+    node_hash, snapshot_to_json, write_value, LogicalSchema, PrimitiveKind, SchemaNode, Value,
+    WriteOptions,
 };
 use distill_store::config::RestartOnlyChange;
 use distill_store::served::AssetResolution;
@@ -29,7 +29,7 @@ fn ordinary_bundle() -> (Vec<u8>, BundleUuid, AssetUuid) {
 fn ordinary_bundle_with(
     bundle_byte: u8,
     asset_byte: u8,
-    value: u64,
+    value: u8,
 ) -> (Vec<u8>, BundleUuid, AssetUuid) {
     let type_uuid = TypeUuid([71; 16]);
     let schema = LogicalSchema {
@@ -43,7 +43,7 @@ fn ordinary_bundle_with(
         type_uuid,
         schema_hash,
         authoring_only: false,
-        data: AuthoredValue::UInt(value.into()),
+        data: Value::U8(value),
     };
     (
         distill_bundle::write_bundle(&Bundle {
@@ -60,12 +60,12 @@ fn ordinary_bundle_with(
 }
 
 fn add_unknown_envelope_key(bytes: &[u8]) -> Vec<u8> {
-    let mut value = distill_json::parse(std::str::from_utf8(bytes).unwrap()).unwrap();
-    let AuthoredValue::Object(envelope) = &mut value else {
-        panic!("bundle envelope must be an object");
-    };
-    envelope.insert("future-extension".to_owned(), AuthoredValue::UInt(1));
-    distill_json::write(&value).unwrap().into_bytes()
+    // A plain bundle is its envelope object; the parser reads keys in a
+    // fixed order whatever their place in the text.
+    assert_eq!(bytes.first(), Some(&b'{'), "bundle envelope must be an object");
+    let mut edited = b"{\"future-extension\":1,".to_vec();
+    edited.extend_from_slice(&bytes[1..]);
+    edited
 }
 
 #[test]
@@ -100,7 +100,7 @@ fn incremental_bundle_edit_does_not_invalidate_an_unrelated_bundle() {
     ));
 
     let mut edited = distill_bundle::parse_bundle(&std::fs::read(&first_path).unwrap()).unwrap();
-    edited.assets.get_mut("entry").unwrap().data = AuthoredValue::UInt(9);
+    edited.assets.get_mut("entry").unwrap().data = Value::U8(9);
     std::fs::write(&first_path, distill_bundle::write_bundle(&edited).unwrap()).unwrap();
     let published = coordinator
         .reconcile_incremental(
@@ -536,7 +536,7 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
         }]
     );
     let rewritten = distill_bundle::parse_bundle(&bytes).unwrap();
-    assert_eq!(rewritten.assets["entry"].data, AuthoredValue::UInt(9));
+    assert_eq!(rewritten.assets["entry"].data, Value::U8(9));
 
     let (receipt, version) = write_and_publish(
         &coordinator,
@@ -977,22 +977,20 @@ fn u8_struct(fields: &[&str]) -> LogicalSchema {
     }
 }
 
-fn u8_object(fields: &[(&str, u64)]) -> AuthoredValue {
-    AuthoredValue::Object(
-        fields
-            .iter()
-            .map(|(name, value)| (name.to_string(), AuthoredValue::UInt((*value).into())))
-            .collect(),
-    )
+/// A `u8_struct` value: fields in name order, as the struct node lists them.
+fn u8_object(fields: &[(&str, u8)]) -> Value {
+    let mut fields = fields.to_vec();
+    fields.sort_by_key(|(name, _)| *name);
+    Value::Struct(fields.into_iter().map(|(_, value)| Value::U8(value)).collect())
 }
 
 /// Stores `stored` under its schema, then writes `written` over it under
 /// another one.
 fn rewrite_under_a_new_schema(
-    stored: (LogicalSchema, AuthoredValue),
-    written: (LogicalSchema, AuthoredValue),
+    stored: (LogicalSchema, Value),
+    written: (LogicalSchema, Value),
     force_lossy: bool,
-) -> Result<AuthoredValue, distill_rpc::RpcFailure> {
+) -> Result<Value, distill_rpc::RpcFailure> {
     let temp = tempfile::tempdir().unwrap();
     let coordinator = coordinator(&temp);
     let mut writer = coordinator.open_writer().unwrap();
@@ -1034,7 +1032,11 @@ fn rewrite_under_a_new_schema(
         role: AuthoringEntryRole::Runtime,
         tags: BTreeMap::new(),
         value: RpcAuthoringValue {
-            canonical_value: Arc::from(distill_json::write(&value).unwrap().into_bytes()),
+            canonical_value: Arc::from(
+                write_value(&schema.root, &value, WriteOptions::default())
+                    .unwrap()
+                    .into_bytes(),
+            ),
             blobs: Vec::new(),
         },
     });
@@ -1104,10 +1106,7 @@ fn a_write_the_planner_refuses_needs_a_migration_function() {
                 fields: vec![("a".into(), 0, SchemaNode::String)],
             },
         },
-        AuthoredValue::Object(BTreeMap::from([(
-            "a".to_owned(),
-            AuthoredValue::Str("one".into()),
-        )])),
+        Value::Struct(Box::new([Value::String("one".into())])),
     );
     assert!(matches!(
         rewrite_under_a_new_schema(stored, written, false),
@@ -1283,7 +1282,7 @@ fn single_edit_pages(filler: usize) -> u64 {
     coordinator.reconcile_full_scan(&mut writer).unwrap();
 
     let mut bundle = distill_bundle::parse_bundle(&std::fs::read(&edited).unwrap()).unwrap();
-    bundle.assets.get_mut("entry").unwrap().data = AuthoredValue::UInt(9);
+    bundle.assets.get_mut("entry").unwrap().data = Value::U8(9);
     std::fs::write(&edited, distill_bundle::write_bundle(&bundle).unwrap()).unwrap();
     let before = writer.pages_fetched().unwrap();
     let base = writer.input_version().unwrap();
@@ -1360,7 +1359,7 @@ fn record_edit_statement(sql: &str) {
 fn edit_cost(n: u32) -> (Vec<String>, u64) {
     let temp = tempfile::tempdir().unwrap();
     let assets = temp.path().join("assets");
-    let bundle = |index: u32, value: u64| {
+    let bundle = |index: u32, value: u8| {
         let mut bytes = [0u8; 16];
         bytes[..4].copy_from_slice(&index.to_le_bytes());
         let (data, ..) = ordinary_bundle_with(0, 0, value);

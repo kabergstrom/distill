@@ -3,7 +3,6 @@
 
 mod common;
 use common::*;
-use distill_json::AuthoredValue;
 use distill_migrate::{validate_plan, EdgeKind, MigrationOp, PlanError};
 use ngp_schema::SchemaNode;
 
@@ -63,7 +62,7 @@ fn missing_at_path_is_error_per_side() {
             at: path(&["inner"]),
             ops: vec![MigrationOp::WriteValue {
                 to: path(&["x"]),
-                value: ui(1),
+                value: Value::U32(1),
             }],
         },
     ];
@@ -125,7 +124,7 @@ fn double_covered_leaf_prefix_overlap_is_error() {
         copy(&["inner"], &["inner"]),
         MigrationOp::WriteValue {
             to: path(&["inner", "x"]),
-            value: ui(1),
+            value: Value::U32(1),
         },
     ];
     let errs = validate_plan(&ops, &from, &to, EdgeKind::Custom).unwrap_err();
@@ -173,7 +172,7 @@ fn write_value_accepted_in_custom_edge() {
     let to = from.clone();
     let ops = vec![MigrationOp::WriteValue {
         to: path(&["a"]),
-        value: ui(7),
+        value: Value::U32(7),
     }];
     validate_plan(&ops, &from, &to, EdgeKind::Custom).unwrap();
 }
@@ -305,5 +304,4 @@ fn zero_field_struct_is_trivially_covered() {
     let to = strct(0, &[]);
     let ops: Vec<MigrationOp> = vec![];
     validate_plan(&ops, &from, &to, EdgeKind::Custom).unwrap();
-    let _ = AuthoredValue::Null; // silence unused import lints in some cfgs
 }

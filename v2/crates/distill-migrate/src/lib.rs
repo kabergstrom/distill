@@ -2,7 +2,7 @@
 //!
 //! This crate holds the pieces `load_current` composes (§11): the
 //! snapshot-AST automatic planner ([`plan_automatic`]), the plan validator
-//! ([`validate_plan`]), the `AuthoredValue` executor ([`execute_ops`],
+//! ([`validate_plan`]), the typed executor ([`execute_ops`],
 //! [`execute_edge`]), the conformance checker ([`conforms`]), and the
 //! migration-graph walk ([`select_chain`]). Orchestration (LoadContext,
 //! MetadataSnapshot) belongs to a later crate.
@@ -11,7 +11,7 @@
 //! is DESIGN.md §11.
 
 use distill_core::id::{LogicalHash, TypeUuid};
-use distill_json::AuthoredValue;
+use ngp_schema::Value;
 use std::fmt;
 
 mod conform;
@@ -27,7 +27,8 @@ pub use execute::{
     execute_edge, execute_ops, execute_sparse, DefaultProvider, Exec, FnProvider, MigrationError,
 };
 pub use identical::resolve_path;
-pub use lossy::{lossy_drops, zero_value};
+pub use lossy::lossy_drops;
+pub use ngp_schema::zero_value;
 pub use plan::{plan_automatic, plan_automatic_renamed, PlanRefusal};
 pub use validate::{validate_plan, EdgeKind, PlanError};
 pub use walk::{select_chain, EdgeRef, SelectedChain, WalkError};
@@ -73,7 +74,7 @@ pub enum MigrationOp {
     /// default-shaped op legal in custom edges (§11).
     WriteValue {
         to: FieldPath,
-        value: AuthoredValue,
+        value: Value,
     },
     /// The field type's default — automatic segment only (§11).
     WriteFieldDefault {

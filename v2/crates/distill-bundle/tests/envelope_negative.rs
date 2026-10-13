@@ -9,7 +9,6 @@ use distill_bundle::{
     extract_namespace_skeleton, parse_bundle, write_bundle, Bundle, BundleError as E,
 };
 use distill_core::bootstrap::BOOTSTRAP_CONTROL_TYPE_UUIDS;
-use distill_json::AuthoredValue as V;
 use ngp_schema::{SchemaNode as N, SnapshotError};
 
 fn valid_plain() -> (Vec<u8>, Bundle) {

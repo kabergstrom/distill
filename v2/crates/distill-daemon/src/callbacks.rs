@@ -16,7 +16,7 @@ use distill_build::query::AssetQuery;
 use distill_build::tool::{ToolOutput, ToolRunError};
 use distill_build::trace::{CapabilityKey, StableFailureFingerprint};
 use distill_core::id::{AssetUuid, TypeUuid};
-use distill_json::AuthoredValue;
+use distill_schema::ngp_schema::Value;
 use distill_schema::ngp_schema::LogicalSchema;
 
 pub use distill_pipeline_api::callbacks::*;
@@ -329,14 +329,14 @@ impl AuthoringImporter for DescriptorAuthoringImporter {
         &self.descriptor.settings_schema
     }
 
-    fn default_settings(&self) -> AuthoredValue {
+    fn default_settings(&self) -> Value {
         self.descriptor.default_settings.clone()
     }
 
     fn import(
         &self,
         _context: &mut dyn AuthoringImportContext,
-        _settings: &AuthoredValue,
+        _settings: &Value,
     ) -> Result<distill_build::import::ImportOutput, AuthoringImporterError> {
         Err(AuthoringImporterError::PipelineUnavailable(
             "metadata-only importer cannot execute".to_owned(),
@@ -361,14 +361,14 @@ impl AuthoringImporter for EpochAuthoringImporter {
         &self.descriptor.settings_schema
     }
 
-    fn default_settings(&self) -> AuthoredValue {
+    fn default_settings(&self) -> Value {
         self.descriptor.default_settings.clone()
     }
 
     fn import(
         &self,
         context: &mut dyn AuthoringImportContext,
-        settings: &AuthoredValue,
+        settings: &Value,
     ) -> Result<distill_build::import::ImportOutput, AuthoringImporterError> {
         match self
             .epoch

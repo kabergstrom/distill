@@ -256,38 +256,24 @@ fn definition(root: AssetUuid) -> PackDefinitionControlValue {
     }
 }
 
-fn byte_array(bytes: &[u8]) -> distill_json::AuthoredValue {
-    distill_json::AuthoredValue::Array(
-        bytes
-            .iter()
-            .map(|byte| distill_json::AuthoredValue::UInt(u128::from(*byte)))
-            .collect(),
-    )
-}
-
 fn pack_definition_authoring(root: AssetUuid) -> AuthoringValue {
-    use distill_json::AuthoredValue as Value;
-
-    let query = Value::Object(BTreeMap::from([
-        ("authored_type".to_owned(), Value::Null),
-        ("authoring_only".to_owned(), Value::Null),
-        ("bundle_path".to_owned(), Value::Null),
-        ("bundle_uuid".to_owned(), Value::Null),
-        ("local_id".to_owned(), Value::Null),
-        ("path_glob".to_owned(), Value::Null),
-        ("path_prefix".to_owned(), Value::Null),
-        ("tag".to_owned(), Value::Null),
-        ("terminal_type".to_owned(), Value::Null),
-        ("uuid".to_owned(), byte_array(&root.0)),
-    ]));
-    let value = Value::Object(BTreeMap::from([
-        ("include_path_table".to_owned(), Value::Bool(true)),
-        ("roots".to_owned(), Value::Array(vec![query])),
-        ("target".to_owned(), Value::Str("dev".to_owned())),
-        ("zstd_level".to_owned(), Value::Int(-2)),
-    ]));
+    let uuid = root
+        .0
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let text = format!(
+        concat!(
+            r#"{{"include_path_table":true,"roots":[{{"authored_type":null,"#,
+            r#""authoring_only":null,"bundle_path":null,"bundle_uuid":null,"#,
+            r#""local_id":null,"path_glob":null,"path_prefix":null,"tag":null,"#,
+            r#""terminal_type":null,"uuid":[{}]}}],"target":"dev","zstd_level":-2}}"#
+        ),
+        uuid
+    );
     AuthoringValue {
-        canonical_value: Arc::from(distill_json::write(&value).unwrap().into_bytes()),
+        canonical_value: Arc::from(text.into_bytes()),
         blobs: Vec::new(),
     }
 }

@@ -12,7 +12,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use distill_core::id::TypeUuid;
-use distill_json::AuthoredValue;
 use distill_pipeline_api::callbacks::{
     ImporterDescriptor, PipelineImporter, PipelineProcessContext, PipelineProcessor,
     ProcessorDescriptor, ProcessorError, ProcessorProduct, ProcessorProducts,
@@ -25,7 +24,7 @@ use distill_pipeline_api::outputs::OutputDecls;
 use distill_pipeline_api::query::FileQuery;
 use distill_pipeline_api::registration::{ModuleCallError, RegistrationArena, TargetDefinition};
 use distill_pipeline_api::target::TargetSelector;
-use distill_schema::ngp_schema::{LogicalSchema, PrimitiveKind, SchemaNode};
+use distill_schema::ngp_schema::{LogicalSchema, PrimitiveKind, SchemaNode, Value};
 
 /// The processor's input: a struct of one `u8` field `value`.
 pub const PARENT_TYPE: TypeUuid = TypeUuid([0xa1; 16]);
@@ -81,90 +80,120 @@ pub const DEFAULT_RULE: [u8; 16] = [0xd5; 16];
 /// The extension [`DEFAULT_RULE`] matches.
 pub const DEFAULT_EXTENSION: &str = "num";
 
-/// A [`VALUE_TYPE`] value.
-pub fn value(value: u128) -> AuthoredValue {
-    AuthoredValue::Object(BTreeMap::from([(
-        "value".to_owned(),
-        AuthoredValue::UInt(value),
-    )]))
+/// A [`VALUE_TYPE`] value (`value` truncated to its `u8`).
+pub fn value(value: u128) -> Value {
+    Value::Struct(Box::new([Value::U8(value as u8)]))
 }
 
 /// The `u8` of a [`VALUE_TYPE`] value.
-pub fn value_of(value: &AuthoredValue) -> Option<u128> {
+pub fn value_of(value: &Value) -> Option<u128> {
     match value {
-        AuthoredValue::Object(fields) => match fields.get("value") {
-            Some(AuthoredValue::UInt(value)) => Some(*value),
+        Value::Struct(fields) => match fields.as_ref() {
+            [Value::U8(value)] => Some(u128::from(*value)),
             _ => None,
         },
         _ => None,
     }
 }
 
-/// A [`SETTINGS_TYPE`] value.
-pub fn settings(add: [u8; 2], by: u8) -> AuthoredValue {
-    let uint = |value: u8| AuthoredValue::UInt(value.into());
-    AuthoredValue::Object(BTreeMap::from([
-        (
-            "add".to_owned(),
-            AuthoredValue::Array(add.into_iter().map(uint).collect()),
-        ),
-        (
-            "scale".to_owned(),
-            AuthoredValue::Object(BTreeMap::from([("by".to_owned(), uint(by))])),
-        ),
+/// The [`SETTINGS_TYPE`] schema: `add` a `[u8; 2]`, `scale` a `{ by: u8 }`.
+pub fn settings_schema() -> SchemaNode {
+    SchemaNode::Struct {
+        rev: 0,
+        fields: vec![
+            (
+                "add".to_owned(),
+                0,
+                SchemaNode::Array {
+                    len: 2,
+                    elem: Box::new(SchemaNode::Primitive(PrimitiveKind::U8)),
+                },
+            ),
+            (
+                "scale".to_owned(),
+                0,
+                SchemaNode::Struct {
+                    rev: 0,
+                    fields: vec![(
+                        "by".to_owned(),
+                        0,
+                        SchemaNode::Primitive(PrimitiveKind::U8),
+                    )],
+                },
+            ),
+        ],
+    }
+}
+
+/// The [`FLOAT_SETTINGS_TYPE`] schema: `rate` an `f32`.
+pub fn float_settings_schema() -> SchemaNode {
+    SchemaNode::Struct {
+        rev: 0,
+        fields: vec![(
+            "rate".to_owned(),
+            0,
+            SchemaNode::Primitive(PrimitiveKind::F32),
+        )],
+    }
+}
+
+/// A [`SETTINGS_TYPE`] value (fields in node order: `add`, `scale`).
+pub fn settings(add: [u8; 2], by: u8) -> Value {
+    Value::Struct(Box::new([
+        Value::Seq(add.into_iter().map(Value::U8).collect()),
+        Value::Struct(Box::new([Value::U8(by)])),
     ]))
 }
 
 /// The importers' default settings, under which a value imports as itself.
-pub fn default_settings() -> AuthoredValue {
+pub fn default_settings() -> Value {
     settings([0, 0], 1)
 }
 
 /// A [`FLOAT_SETTINGS_TYPE`] value.
-pub fn float_settings(rate: f64) -> AuthoredValue {
-    AuthoredValue::Object(BTreeMap::from([(
-        "rate".to_owned(),
-        AuthoredValue::Float(rate),
-    )]))
+pub fn float_settings(rate: f32) -> Value {
+    Value::Struct(Box::new([Value::F32(rate)]))
 }
 
-/// [`FLOAT_IMPORTER`]'s default settings: `rate` 30.0, an integral float
-/// (canonical JSON writes it `30`, which parses back as an integer).
-pub fn float_default_settings() -> AuthoredValue {
+/// [`FLOAT_IMPORTER`]'s default settings: `rate` 30.0, an integral float.
+pub fn float_default_settings() -> Value {
     float_settings(30.0)
 }
 
 /// [`OPTIONAL_IMPORTER`]'s default settings: `skeleton` `None`.
-pub fn optional_default_settings() -> AuthoredValue {
-    AuthoredValue::Object(BTreeMap::from([(
-        "skeleton".to_owned(),
-        AuthoredValue::Null,
-    )]))
+pub fn optional_default_settings() -> Value {
+    Value::Struct(Box::new([Value::Option(None)]))
+}
+
+/// `scale.by` of a [`SETTINGS_TYPE`]-shaped value of `schema`.
+fn scale_by(schema: &SchemaNode, value: &Value) -> Option<u128> {
+    let SchemaNode::Struct { fields, .. } = schema else {
+        return None;
+    };
+    let (_, _, scale_node) = fields.iter().find(|(name, _, _)| name == "scale")?;
+    value.field(schema, "scale")?.field(scale_node, "by")?.as_u128()
 }
 
 /// `value` under `settings` (see [`SETTINGS_TYPE`]).
-fn apply(settings: &AuthoredValue, value: u128) -> Result<u128, AuthoringImporterError> {
+fn apply(settings: &Value, value: u128) -> Result<u128, AuthoringImporterError> {
     let malformed = || AuthoringImporterError::rejected(7, format!("settings {settings:?}"));
-    let AuthoredValue::Object(fields) = settings else {
+    let Value::Struct(fields) = settings else {
         return Err(malformed());
     };
-    let Some(AuthoredValue::Array(add)) = fields.get("add") else {
+    let [Value::Seq(add), Value::Struct(scale)] = fields.as_ref() else {
         return Err(malformed());
     };
-    let Some(AuthoredValue::Object(scale)) = fields.get("scale") else {
-        return Err(malformed());
-    };
-    let Some(AuthoredValue::UInt(by)) = scale.get("by") else {
+    let [Value::U8(by)] = scale.as_ref() else {
         return Err(malformed());
     };
     let mut sum = value;
     for item in add {
-        let AuthoredValue::UInt(item) = item else {
+        let Value::U8(item) = item else {
             return Err(malformed());
         };
-        sum += item;
+        sum += u128::from(*item);
     }
-    Ok(sum * by)
+    Ok(sum * u128::from(*by))
 }
 
 /// One `asset` entry holding `value`.
@@ -182,7 +211,7 @@ impl PipelineImporter for ByteImporter {
     fn import(
         &self,
         context: &mut dyn AuthoringImportContext,
-        settings: &AuthoredValue,
+        settings: &Value,
     ) -> Result<ImportOutput, AuthoringImporterError> {
         let source = context
             .sources()
@@ -220,7 +249,7 @@ impl PipelineImporter for ChainImporter {
     fn import(
         &self,
         context: &mut dyn AuthoringImportContext,
-        settings: &AuthoredValue,
+        settings: &Value,
     ) -> Result<ImportOutput, AuthoringImporterError> {
         let mut value = 0;
         for source in context.sources().to_vec() {
@@ -252,23 +281,14 @@ impl PipelineImporter for SettingsImporter {
     fn import(
         &self,
         context: &mut dyn AuthoringImportContext,
-        settings: &AuthoredValue,
+        settings: &Value,
     ) -> Result<ImportOutput, AuthoringImporterError> {
         let mut value = 0;
         for source in context.sources().to_vec() {
-            let Some(imported) = context.read_settings(&source.path)? else {
+            let Some((schema, imported)) = context.read_settings(&source.path)? else {
                 continue;
             };
-            let by = match &imported {
-                AuthoredValue::Object(fields) => match fields.get("scale") {
-                    Some(AuthoredValue::Object(scale)) => match scale.get("by") {
-                        Some(AuthoredValue::UInt(by)) => Some(*by),
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                _ => None,
-            };
+            let by = scale_by(&schema.root, &imported);
             value += by
                 .ok_or_else(|| AuthoringImporterError::rejected(8, format!("{imported:?}")))?;
         }
@@ -282,7 +302,7 @@ impl PipelineImporter for RequireImporter {
     fn import(
         &self,
         context: &mut dyn AuthoringImportContext,
-        settings: &AuthoredValue,
+        settings: &Value,
     ) -> Result<ImportOutput, AuthoringImporterError> {
         let mut value = 0;
         for source in context.sources().to_vec() {
@@ -290,19 +310,10 @@ impl PipelineImporter for RequireImporter {
             let named = String::from_utf8(bytes)
                 .map_err(|_| AuthoringImporterError::rejected(3, "not text"))?;
             let named = named.trim();
-            let imported = context.read_settings(named)?.ok_or_else(|| {
+            let (schema, imported) = context.read_settings(named)?.ok_or_else(|| {
                 AuthoringImporterError::rejected(9, format!("{named} has no import"))
             })?;
-            let by = match &imported {
-                AuthoredValue::Object(fields) => match fields.get("scale") {
-                    Some(AuthoredValue::Object(scale)) => match scale.get("by") {
-                        Some(AuthoredValue::UInt(by)) => Some(*by),
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                _ => None,
-            };
+            let by = scale_by(&schema.root, &imported);
             value += by
                 .ok_or_else(|| AuthoringImporterError::rejected(8, format!("{imported:?}")))?;
         }
@@ -316,7 +327,7 @@ impl PipelineImporter for FloatImporter {
     fn import(
         &self,
         context: &mut dyn AuthoringImportContext,
-        _settings: &AuthoredValue,
+        _settings: &Value,
     ) -> Result<ImportOutput, AuthoringImporterError> {
         let source = context
             .sources()
@@ -341,14 +352,7 @@ fn float_importer() -> ImporterDescriptor {
         version: 1,
         settings_type_uuid: FLOAT_SETTINGS_TYPE,
         settings_schema: LogicalSchema {
-            root: SchemaNode::Struct {
-                rev: 0,
-                fields: vec![(
-                    "rate".to_owned(),
-                    0,
-                    SchemaNode::Primitive(PrimitiveKind::F32),
-                )],
-            },
+            root: float_settings_schema(),
         },
         default_settings: float_default_settings(),
     }
@@ -371,8 +375,8 @@ fn optional_importer() -> ImporterDescriptor {
                     option(SchemaNode::Struct {
                         rev: 0,
                         fields: vec![
-                            ("path".to_owned(), 0, SchemaNode::String),
                             ("name".to_owned(), 0, option(SchemaNode::String)),
+                            ("path".to_owned(), 0, SchemaNode::String),
                         ],
                     }),
                 )],
@@ -389,31 +393,7 @@ fn importer(id: &str) -> ImporterDescriptor {
         version: 1,
         settings_type_uuid: SETTINGS_TYPE,
         settings_schema: LogicalSchema {
-            root: SchemaNode::Struct {
-                rev: 0,
-                fields: vec![
-                    (
-                        "add".to_owned(),
-                        0,
-                        SchemaNode::Array {
-                            len: 2,
-                            elem: Box::new(SchemaNode::Primitive(PrimitiveKind::U8)),
-                        },
-                    ),
-                    (
-                        "scale".to_owned(),
-                        0,
-                        SchemaNode::Struct {
-                            rev: 0,
-                            fields: vec![(
-                                "by".to_owned(),
-                                0,
-                                SchemaNode::Primitive(PrimitiveKind::U8),
-                            )],
-                        },
-                    ),
-                ],
-            },
+            root: settings_schema(),
         },
         default_settings: default_settings(),
     }
@@ -427,7 +407,7 @@ struct Reflect;
 impl PipelineProcessor for Reflect {
     fn process(
         &self,
-        input: AuthoredValue,
+        input: Value,
         _context: &mut dyn PipelineProcessContext,
     ) -> Result<ProcessorProducts, ProcessorError> {
         Ok(ProcessorProducts {

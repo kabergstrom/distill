@@ -45,7 +45,7 @@ use distill_build::trace::{
 };
 use distill_bundle::{AssetEntry, Bundle};
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
-use distill_json::AuthoredValue;
+use distill_schema::ngp_schema::{AssetRefValue, Value};
 use distill_migrate::{
     conforms, execute_ops, plan_automatic_renamed, validate_plan, DefaultProvider, EdgeKind,
     FieldPath, MigrationError, MigrationOp,
@@ -2355,7 +2355,7 @@ type HydratedProcessorStage = (
 type EncodedBuildImport = (
     Vec<u8>,
     Vec<distill_wire::encode::EncodedReference>,
-    Option<AuthoredValue>,
+    Option<Value>,
 );
 
 #[allow(clippy::too_many_arguments)]
@@ -2365,7 +2365,7 @@ fn process_chain(
     project: &ProjectTypeAuthority,
     chain: &PipelineChain,
     imported: EncodedNodeOutput,
-    current_value: Option<AuthoredValue>,
+    current_value: Option<Value>,
     node_trace: &mut Vec<TraceOp>,
     cacheable: &mut bool,
 ) -> Result<Vec<EncodedNodeOutput>, BuildError> {
@@ -2430,9 +2430,9 @@ fn run_processor_stage(
     chain: &PipelineChain,
     stage: &PipelineStage,
     static_inputs: &StaticInputs,
-    current_value: AuthoredValue,
+    current_value: Value,
     cached: Option<HydratedProcessorStage>,
-) -> Result<(AuthoredValue, Vec<EncodedNodeOutput>, Vec<TraceOp>, bool), BuildError> {
+) -> Result<(Value, Vec<EncodedNodeOutput>, Vec<TraceOp>, bool), BuildError> {
     std::fs::create_dir_all(&context.execution_root).map_err(BuildError::infrastructure)?;
     let epoch = context
         .env
@@ -2820,7 +2820,7 @@ fn encode_processor_products(
         let source_bundle = loaded.meta.bundle;
         let encoded = ask_trace(context, |trace_source| {
             let mut resolver =
-                |query: &distill_json::AuthoredValue,
+                |query: &AssetRefValue,
                  expected: TypeUuid,
                  strong: bool,
                  _path: &[distill_bundle::PathComponent]| {
@@ -3357,7 +3357,7 @@ impl DefaultProvider for EpochDefaults<'_> {
         &self,
         to_schema: &distill_schema::ngp_schema::SchemaNode,
         at: &FieldPath,
-    ) -> Option<AuthoredValue> {
+    ) -> Option<Value> {
         match self
             .epoch
             .invoke_field_default(self.type_uuid, to_schema, at)
@@ -3374,7 +3374,7 @@ impl DefaultProvider for EpochDefaults<'_> {
         &self,
         to_schema: &distill_schema::ngp_schema::SchemaNode,
         at: &FieldPath,
-    ) -> Option<AuthoredValue> {
+    ) -> Option<Value> {
         match self
             .epoch
             .invoke_parent_default(self.type_uuid, to_schema, at)
@@ -3395,7 +3395,7 @@ impl DefaultProvider for NoMigrationDefaults {
         &self,
         _to_schema: &distill_schema::ngp_schema::SchemaNode,
         _at: &FieldPath,
-    ) -> Option<AuthoredValue> {
+    ) -> Option<Value> {
         None
     }
 
@@ -3403,7 +3403,7 @@ impl DefaultProvider for NoMigrationDefaults {
         &self,
         _to_schema: &distill_schema::ngp_schema::SchemaNode,
         _at: &FieldPath,
-    ) -> Option<AuthoredValue> {
+    ) -> Option<Value> {
         None
     }
 }
@@ -3466,12 +3466,10 @@ fn migration_plan_error(
 fn migration_execution_failure(error: &MigrationError) -> MigrationPlanFailureV1 {
     let path = match error {
         MigrationError::MissingDefault { path, .. }
-        | MigrationError::InputPathMissing { path }
         | MigrationError::InputShape { path, .. }
         | MigrationError::WidenOutOfRange { path, .. }
         | MigrationError::DuplicateSetElement { path }
         | MigrationError::MapKeyCollision { path }
-        | MigrationError::MapKeyNotString { path }
         | MigrationError::DuplicateWrite { path }
         | MigrationError::MissingWrite { path }
         | MigrationError::PlanShape { path, .. }
@@ -3595,7 +3593,7 @@ fn load_current_value(
     project: &ProjectTypeAuthority,
     current_load: &CurrentLoadSource,
     trace: &mut Vec<TraceOp>,
-) -> Result<AuthoredValue, BuildError> {
+) -> Result<Value, BuildError> {
     let bundle = distill_bundle::parse_bundle(&loaded.bundle_bytes).map_err(BuildError::failed)?;
     load_current_entry(
         &context.env.pipeline,
@@ -3618,7 +3616,7 @@ fn load_current_entry(
     renames: &distill_schema::ngp_schema::Renames,
     trace_source: &CurrentLoadSource,
     trace: &mut Vec<TraceOp>,
-) -> Result<AuthoredValue, BuildError> {
+) -> Result<Value, BuildError> {
     if entry.schema_hash == current_hash {
         return Ok(entry.data.clone());
     }
@@ -3765,8 +3763,8 @@ fn execute_migration_function(
     current_schema: &distill_schema::ngp_schema::LogicalSchema,
     current_hash: LogicalHash,
     key: &str,
-    input: AuthoredValue,
-) -> Result<AuthoredValue, BuildError> {
+    input: Value,
+) -> Result<Value, BuildError> {
     let output = match pipeline
         .epoch()
         .map_err(|failure| BuildError::Failed(failure.to_string()))?
@@ -3946,7 +3944,7 @@ fn encode_or_hydrate(
 
     let source_bundle = loaded.meta.bundle;
     let encoded = ask_trace(context, |trace_source| {
-        let mut resolver = |query: &distill_json::AuthoredValue,
+        let mut resolver = |query: &AssetRefValue,
                             expected: TypeUuid,
                             strong: bool,
                             _path: &[distill_bundle::PathComponent]| {
@@ -4029,7 +4027,7 @@ fn encode_or_hydrate(
 fn resolve_reference(
     source: &impl TraceQueries,
     source_bundle: BundleUuid,
-    value: &distill_json::AuthoredValue,
+    value: &AssetRefValue,
     expected: TypeUuid,
     strong: bool,
     trace: &mut Vec<TraceOp>,
@@ -4254,7 +4252,7 @@ mod tests {
     };
     use distill_build::outputs::OutputDecls;
     use distill_build::pipeline::{GraphicsApi, TargetArch, TargetOs, TargetSelector};
-    use distill_json::AuthoredValue;
+    use distill_schema::ngp_schema::{AssetRefValue, Value};
     use distill_rpc::{ArtifactPayload, BuildEntry, TargetDefinition, TargetDefinitionHash};
     use distill_schema::ngp_schema::{
         node_hash, Field, FieldAttrs, FieldIdentifier, FieldLayout, LayoutIdentity, LogicalSchema,
@@ -4713,7 +4711,7 @@ mod tests {
     impl PipelineProcessor for PrimaryCountingProcessor {
         fn process(
             &self,
-            input: AuthoredValue,
+            input: Value,
             _context: &mut dyn PipelineProcessContext,
         ) -> Result<ProcessorProducts, ProcessorError> {
             self.0.fetch_add(1, Ordering::SeqCst);
@@ -4730,7 +4728,7 @@ mod tests {
     impl PipelineValidator for CountingValidator {
         fn validate(
             &self,
-            _asset: &AuthoredValue,
+            _asset: &Value,
             _diagnostics: &mut Diagnostics,
         ) -> Result<(), distill_asset::CallbackPanic> {
             self.0.fetch_add(1, Ordering::SeqCst);
@@ -4747,7 +4745,7 @@ mod tests {
     impl PipelineProcessor for StoreLockProbeProcessor {
         fn process(
             &self,
-            input: AuthoredValue,
+            input: Value,
             context: &mut dyn PipelineProcessContext,
         ) -> Result<ProcessorProducts, ProcessorError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -4762,10 +4760,10 @@ mod tests {
                     .is_ok();
                 self.observed_unlocked.store(unlocked, Ordering::SeqCst);
             }
-            let AuthoredValue::Object(fields) = &input else {
+            let Value::Struct(fields) = &input else {
                 panic!("processor input is a struct");
             };
-            if fields.get("value") == Some(&AuthoredValue::UInt(7)) {
+            if fields[0].as_u128() == Some(7) {
                 assert_eq!(context.target().unwrap().os, TargetOs::Linux);
                 let outputs = context.outputs().unwrap();
                 assert_eq!(outputs.parent(), ASSET);
@@ -4846,10 +4844,7 @@ mod tests {
                     type_uuid: TYPE,
                     schema_hash: old_hash,
                     authoring_only: false,
-                    data: AuthoredValue::Object(BTreeMap::from([(
-                        "value".to_owned(),
-                        AuthoredValue::UInt(7),
-                    )])),
+                    data: Value::Struct(Box::new([Value::U8(7)])),
                 },
             )]),
         };
@@ -4979,15 +4974,15 @@ mod tests {
                             from: old_hash,
                             to: project.logical_hash,
                         },
-                        move |mut value: AuthoredValue| -> Result<
-                            AuthoredValue,
+                        move |mut value: Value| -> Result<
+                            Value,
                             crate::callbacks::MigrationFunctionError,
                         > {
                             callback_calls.fetch_add(1, Ordering::SeqCst);
-                            let AuthoredValue::Object(fields) = &mut value else {
+                            let Value::Struct(fields) = &mut value else {
                                 panic!("test migration input is a struct");
                             };
-                            fields.insert("value".to_owned(), AuthoredValue::UInt(55));
+                            fields[0] = Value::U16(55);
                             Ok(value)
                         },
                     )
@@ -5040,10 +5035,7 @@ mod tests {
                     type_uuid: TYPE,
                     schema_hash: project.logical_hash,
                     authoring_only: false,
-                    data: AuthoredValue::Object(BTreeMap::from([(
-                        "value".to_owned(),
-                        AuthoredValue::UInt(7),
-                    )])),
+                    data: Value::Struct(Box::new([Value::U8(7)])),
                 },
             )]),
         };
@@ -5266,10 +5258,7 @@ mod tests {
                             type_uuid: TYPE,
                             schema_hash: project.logical_hash,
                             authoring_only: false,
-                            data: AuthoredValue::Object(BTreeMap::from([(
-                                "value".to_owned(),
-                                AuthoredValue::UInt(index as u128),
-                            )])),
+                            data: Value::Struct(Box::new([Value::U8(index as u8)])),
                         },
                     )
                 })
@@ -5362,10 +5351,7 @@ mod tests {
                     type_uuid: TYPE,
                     schema_hash: project.logical_hash,
                     authoring_only: false,
-                    data: AuthoredValue::Object(BTreeMap::from([(
-                        "value".to_owned(),
-                        AuthoredValue::UInt(7),
-                    )])),
+                    data: Value::Struct(Box::new([Value::U8(7)])),
                 },
             )]),
         };
@@ -5383,10 +5369,7 @@ mod tests {
                     type_uuid: TYPE,
                     schema_hash: project.logical_hash,
                     authoring_only: false,
-                    data: AuthoredValue::Object(BTreeMap::from([(
-                        "value".to_owned(),
-                        AuthoredValue::UInt(8),
-                    )])),
+                    data: Value::Struct(Box::new([Value::U8(8)])),
                 },
             )]),
         };
@@ -5637,7 +5620,7 @@ mod tests {
             resolve_reference(
                 &source,
                 BUNDLE,
-                &AuthoredValue::Str("target.bundle".to_owned()),
+                &AssetRefValue::Path("target.bundle".to_owned()),
                 TYPE,
                 true,
                 &mut trace,
@@ -5679,7 +5662,7 @@ mod tests {
             content_hashes: BTreeMap::new(),
             tag_poisons: BTreeMap::new(),
         };
-        let value = AuthoredValue::Str(missing.to_string());
+        let value = AssetRefValue::Path(missing.to_string());
         let mut trace = Vec::new();
         assert_eq!(
             resolve_reference(&source, BUNDLE, &value, TYPE, false, &mut trace).unwrap(),

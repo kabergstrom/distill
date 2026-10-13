@@ -270,6 +270,14 @@ pub enum BundleError {
         distance: u32,
         frames: usize,
     },
+    /// A value the schema rejects for a reason other than its shape: a
+    /// malformed reference or handle, or a dynamic value (bundles carry no
+    /// dynamic type table yet).
+    Value {
+        local_id: String,
+        path: String,
+        detail: String,
+    },
     /// Walk nesting exceeded `MAX_WALK_DEPTH` — a definite error, never a
     /// stack overflow (§12's cap discipline).
     WalkDepth {
@@ -560,6 +568,11 @@ impl fmt::Display for BundleError {
                 f,
                 "asset {local_id:?} at {path}: backref distance {distance} exceeds {frames} open frames"
             ),
+            E::Value {
+                local_id,
+                path,
+                detail,
+            } => write!(f, "asset {local_id:?} at {path}: {detail}"),
             E::WalkDepth { local_id, path } => write!(
                 f,
                 "asset {local_id:?} at {path}: schema walk exceeded the nesting cap"

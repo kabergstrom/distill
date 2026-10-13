@@ -1,6 +1,6 @@
 use distill_core::bootstrap::BOOTSTRAP_CONTROL_COUNT;
 use distill_core::id::TypeUuid;
-use distill_json::AuthoredValue;
+use ngp_schema::Value;
 use distill_schema::ngp_schema::{
     Field, FieldAttrs, FieldIdentifier, FieldLayout, LayoutIdentity, PrimitiveType, Schema,
     SchemaLayouts, SchemaTypeId, TypeAttrs, TypeDef, TypeLayout, TypePath,
@@ -253,10 +253,7 @@ fn current_schema_tag_extraction_reads_and_validates_annotated_string_values() {
     let tags = extract_search_tags(
         &schema,
         SchemaTypeId(0),
-        &AuthoredValue::Object(BTreeMap::from([(
-            "category".to_owned(),
-            AuthoredValue::Str("enemy".to_owned()),
-        )])),
+        &Value::Struct(Box::new([Value::String("enemy".to_owned())])),
     )
     .unwrap();
     assert_eq!(
@@ -267,10 +264,7 @@ fn current_schema_tag_extraction_reads_and_validates_annotated_string_values() {
     let invalid = extract_search_tags(
         &schema,
         SchemaTypeId(0),
-        &AuthoredValue::Object(BTreeMap::from([(
-            "category".to_owned(),
-            AuthoredValue::Str("enemy\0hidden".to_owned()),
-        )])),
+        &Value::Struct(Box::new([Value::String("enemy\0hidden".to_owned())])),
     );
     assert!(invalid.is_err());
 }

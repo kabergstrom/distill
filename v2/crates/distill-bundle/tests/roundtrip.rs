@@ -8,7 +8,6 @@ use common::*;
 use distill_bundle::{
     crc32c, encode_path, parse_bundle, write_bundle, PathComponent as P, CONTAINER_MAGIC,
 };
-use distill_json::AuthoredValue as V;
 use ngp_schema::{PrimitiveKind as PK, SchemaNode as N};
 
 #[test]
@@ -272,12 +271,7 @@ fn backref_inside_a_variant_payload_reenters_the_enum() {
         b"outer",
         obj(&[("blob", blob(b"x")), ("next", obj(&[("Leaf", obj(&[]))]))]),
     );
-    let b = bundle(
-        &[&sc],
-        vec![("l", entry(UUID_A, &sc, payload_shaped))],
-        None,
-    );
-    write_bundle(&b).unwrap_err();
+    try_value(&sc, &payload_shaped).unwrap_err();
 }
 
 fn opt(inner: N) -> N {
@@ -302,8 +296,7 @@ fn backref_reentry_resolves_under_the_targets_own_ancestors() {
 
     // A B where `a` names A is refused.
     let data = a(b(V::Null, b(b(V::Null, V::Null), V::Null)));
-    let bundled = bundle(&[&sc], vec![("x", entry(UUID_A, &sc, data))], None);
-    write_bundle(&bundled).unwrap_err();
+    try_value(&sc, &data).unwrap_err();
 }
 
 #[test]
@@ -334,8 +327,7 @@ fn backref_reentry_resolves_under_the_targets_own_ancestors_three_deep() {
 
     // Inside the re-entered C, `b` names B: a C there is refused.
     let data = a(b(c(n(), n(), c(n(), c(n(), n(), n()), n()))));
-    let bundled = bundle(&[&sc], vec![("x", entry(UUID_A, &sc, data))], None);
-    write_bundle(&bundled).unwrap_err();
+    try_value(&sc, &data).unwrap_err();
 }
 
 #[test]

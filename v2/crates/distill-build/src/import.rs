@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
-use distill_json::AuthoredValue;
+use ngp_schema::Value;
 
 pub use distill_pipeline_api::import::{
     DefaultImportRule, ImportEntry, ImportError, ImportOutput, ImportOutputError, ImportRuleId,
@@ -249,7 +249,7 @@ fn raw_failure(
 pub struct ImportedEntry {
     pub uuid: AssetUuid,
     pub type_uuid: TypeUuid,
-    pub value: AuthoredValue,
+    pub value: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -266,7 +266,7 @@ pub struct ImportedBundle {
     pub bundle_uuid: BundleUuid,
     pub primary: Option<String>,
     pub entries: BTreeMap<String, ImportedEntry>,
-    pub settings: AuthoredValue,
+    pub settings: Value,
     pub record: ImportRecord,
 }
 
@@ -274,8 +274,8 @@ pub struct FoldRequest {
     pub output: ImportOutput,
     /// Explicit import over an existing destination replaces settings;
     /// watched/reimport passes `None` to preserve the recorded value.
-    pub explicit_settings: Option<AuthoredValue>,
-    pub default_settings: AuthoredValue,
+    pub explicit_settings: Option<Value>,
+    pub default_settings: Value,
     pub importer: String,
     pub sources: Vec<RootedPath>,
     pub watch: bool,

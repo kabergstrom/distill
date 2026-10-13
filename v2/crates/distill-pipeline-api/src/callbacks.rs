@@ -14,7 +14,7 @@ use std::sync::Arc;
 use distill_core::callback::CallbackPanic;
 use distill_core::id::{AssetUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_core::tool::ToolCwdPolicy;
-use distill_json::AuthoredValue;
+use ngp_schema::Value;
 use distill_migrate::FieldPath;
 use ngp_schema::{LogicalSchema, SchemaNode};
 
@@ -34,7 +34,7 @@ pub struct ImporterDescriptor {
     pub version: u32,
     pub settings_type_uuid: TypeUuid,
     pub settings_schema: LogicalSchema,
-    pub default_settings: AuthoredValue,
+    pub default_settings: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,16 +178,16 @@ impl Diagnostics {
 }
 
 /// Neutral processor result. Generated typed adapters lower their values to
-/// `AuthoredValue`; the daemon validates the closed declaration and performs
+/// `Value`; the daemon validates the closed declaration and performs
 /// the canonical wire encoding before publication.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProcessorProduct {
     pub type_uuid: TypeUuid,
-    pub value: AuthoredValue,
+    pub value: Value,
 }
 
 impl ProcessorProduct {
-    pub fn new(type_uuid: TypeUuid, value: AuthoredValue) -> Self {
+    pub fn new(type_uuid: TypeUuid, value: Value) -> Self {
         Self { type_uuid, value }
     }
 }
@@ -217,7 +217,7 @@ pub struct ProcessArtifact {
 pub struct CodegenAsset {
     pub asset: AssetUuid,
     pub type_uuid: TypeUuid,
-    pub value: AuthoredValue,
+    pub value: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,7 +297,7 @@ pub trait PipelineImporter: Send + Sync + 'static {
     fn import(
         &self,
         context: &mut dyn AuthoringImportContext,
-        settings: &AuthoredValue,
+        settings: &Value,
     ) -> Result<ImportOutput, AuthoringImporterError>;
 }
 
@@ -305,7 +305,7 @@ impl<T: AuthoringImporter + 'static> PipelineImporter for T {
     fn import(
         &self,
         context: &mut dyn AuthoringImportContext,
-        settings: &AuthoredValue,
+        settings: &Value,
     ) -> Result<ImportOutput, AuthoringImporterError> {
         AuthoringImporter::import(self, context, settings)
     }
@@ -362,7 +362,7 @@ pub trait PipelineCodegenContext {
 pub trait PipelineProcessor: Send + Sync + 'static {
     fn process(
         &self,
-        input: AuthoredValue,
+        input: Value,
         context: &mut dyn PipelineProcessContext,
     ) -> Result<ProcessorProducts, ProcessorError>;
 }
@@ -377,7 +377,7 @@ pub trait PipelineCodegen: Send + Sync + 'static {
 pub trait PipelineValidator: Send + Sync + 'static {
     fn validate(
         &self,
-        asset: &AuthoredValue,
+        asset: &Value,
         diagnostics: &mut Diagnostics,
     ) -> Result<(), CallbackPanic>;
 }
@@ -400,33 +400,33 @@ impl MigrationKey {
 }
 
 pub trait PipelineMigration: Send + Sync + 'static {
-    fn migrate(&self, value: AuthoredValue) -> Result<AuthoredValue, MigrationFunctionError>;
+    fn migrate(&self, value: Value) -> Result<Value, MigrationFunctionError>;
 }
 
 impl<F> PipelineMigration for F
 where
-    F: Fn(AuthoredValue) -> Result<AuthoredValue, MigrationFunctionError> + Send + Sync + 'static,
+    F: Fn(Value) -> Result<Value, MigrationFunctionError> + Send + Sync + 'static,
 {
-    fn migrate(&self, value: AuthoredValue) -> Result<AuthoredValue, MigrationFunctionError> {
+    fn migrate(&self, value: Value) -> Result<Value, MigrationFunctionError> {
         self(value)
     }
 }
 
 pub trait PipelineDefaults: Send + Sync + 'static {
-    fn field_default(&self, to_schema: &SchemaNode, at: &FieldPath) -> Option<AuthoredValue>;
-    fn parent_default(&self, to_schema: &SchemaNode, at: &FieldPath) -> Option<AuthoredValue>;
+    fn field_default(&self, to_schema: &SchemaNode, at: &FieldPath) -> Option<Value>;
+    fn parent_default(&self, to_schema: &SchemaNode, at: &FieldPath) -> Option<Value>;
 }
 
 pub type ImporterCall =
     unsafe fn(
         *const u8,
         &mut dyn AuthoringImportContext,
-        &AuthoredValue,
+        &Value,
     ) -> Result<Result<ImportOutput, AuthoringImporterError>, CallbackPanic>;
 pub type ProcessorCall =
     unsafe fn(
         *const u8,
-        AuthoredValue,
+        Value,
         &mut dyn PipelineProcessContext,
     ) -> Result<Result<ProcessorProducts, ProcessorError>, CallbackPanic>;
 pub type CodegenCall =
@@ -436,16 +436,16 @@ pub type CodegenCall =
     ) -> Result<Result<Vec<GeneratedFile>, CodegenFailure>, CallbackPanic>;
 pub type ValidatorCall = unsafe fn(
     *const u8,
-    &AuthoredValue,
+    &Value,
     &mut Diagnostics,
 ) -> Result<Result<(), CallbackPanic>, CallbackPanic>;
 pub type MigrationCall =
     unsafe fn(
         *const u8,
-        AuthoredValue,
-    ) -> Result<Result<AuthoredValue, MigrationFunctionError>, CallbackPanic>;
+        Value,
+    ) -> Result<Result<Value, MigrationFunctionError>, CallbackPanic>;
 pub type DefaultCall =
-    unsafe fn(*const u8, &SchemaNode, &FieldPath) -> Result<Option<AuthoredValue>, CallbackPanic>;
+    unsafe fn(*const u8, &SchemaNode, &FieldPath) -> Result<Option<Value>, CallbackPanic>;
 
 /// One registered callback: its descriptor and the erased call thunks,
 /// monomorphized in the registering module.
@@ -564,7 +564,7 @@ pub unsafe fn cleanup_callback<T>(pointer: *mut u8) -> Result<(), ModuleCallErro
 unsafe fn call_importer<T: PipelineImporter>(
     pointer: *const u8,
     context: &mut dyn AuthoringImportContext,
-    settings: &AuthoredValue,
+    settings: &Value,
 ) -> Result<Result<ImportOutput, AuthoringImporterError>, CallbackPanic> {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         (&*pointer.cast::<T>()).import(context, settings)
@@ -574,7 +574,7 @@ unsafe fn call_importer<T: PipelineImporter>(
 
 unsafe fn call_processor<T: PipelineProcessor>(
     pointer: *const u8,
-    input: AuthoredValue,
+    input: Value,
     context: &mut dyn PipelineProcessContext,
 ) -> Result<Result<ProcessorProducts, ProcessorError>, CallbackPanic> {
     catch_unwind(AssertUnwindSafe(|| unsafe {
@@ -595,7 +595,7 @@ unsafe fn call_codegen<T: PipelineCodegen>(
 
 unsafe fn call_validator<T: PipelineValidator>(
     pointer: *const u8,
-    asset: &AuthoredValue,
+    asset: &Value,
     diagnostics: &mut Diagnostics,
 ) -> Result<Result<(), CallbackPanic>, CallbackPanic> {
     catch_unwind(AssertUnwindSafe(|| unsafe {
@@ -606,8 +606,8 @@ unsafe fn call_validator<T: PipelineValidator>(
 
 unsafe fn call_migration<T: PipelineMigration>(
     pointer: *const u8,
-    value: AuthoredValue,
-) -> Result<Result<AuthoredValue, MigrationFunctionError>, CallbackPanic> {
+    value: Value,
+) -> Result<Result<Value, MigrationFunctionError>, CallbackPanic> {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         (&*pointer.cast::<T>()).migrate(value)
     }))
@@ -618,7 +618,7 @@ unsafe fn call_field_default<T: PipelineDefaults>(
     pointer: *const u8,
     schema: &SchemaNode,
     at: &FieldPath,
-) -> Result<Option<AuthoredValue>, CallbackPanic> {
+) -> Result<Option<Value>, CallbackPanic> {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         (&*pointer.cast::<T>()).field_default(schema, at)
     }))
@@ -629,7 +629,7 @@ unsafe fn call_parent_default<T: PipelineDefaults>(
     pointer: *const u8,
     schema: &SchemaNode,
     at: &FieldPath,
-) -> Result<Option<AuthoredValue>, CallbackPanic> {
+) -> Result<Option<Value>, CallbackPanic> {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         (&*pointer.cast::<T>()).parent_default(schema, at)
     }))

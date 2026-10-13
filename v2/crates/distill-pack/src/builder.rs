@@ -10,7 +10,10 @@ use distill_build::query::{
 };
 use distill_build::trace::PackDefinitionControlValue;
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, TypeUuid};
-use distill_json::AuthoredValue;
+use distill_core::bootstrap::{BootstrapControlSpecV1, PACK_DEFINITION_TYPE_UUID};
+use distill_schema::ngp_schema::{
+    node_from_bytes, parse_value, write_value, LogicalSchema, Options, SchemaNode, Value, WriteOptions,
+};
 use distill_rpc::capnp_loader::{
     RemoteCall, RemoteChunkStream, RemoteError, RemoteHub, RemoteSnapshot,
 };
@@ -139,119 +142,133 @@ impl From<PointerError> for PackBuildError {
 
 /// Decode the sealed PackDefinition authored value carried by the metadata
 /// RPC. The daemon has already authenticated its bootstrap type/schema; this
-/// function still requires canonical JSON and the exact closed value shape.
+/// function still parses the canonical text against the bootstrap
+/// PackDefinition schema and requires it to be canonical.
 pub fn decode_pack_definition(
     authored: &AuthoringValue,
 ) -> Result<PackDefinitionControlValue, PackBuildError> {
     if !authored.blobs.is_empty() {
         return Err(definition_error("PackDefinition cannot contain blobs"));
     }
+    let schema = pack_definition_schema()?;
     let text = std::str::from_utf8(&authored.canonical_value)
         .map_err(|error| definition_error(format!("PackDefinition is not UTF-8: {error}")))?;
-    let value = distill_json::parse(text)
-        .map_err(|error| definition_error(format!("PackDefinition JSON is invalid: {error}")))?;
-    if distill_json::write(&value)
+    let value = parse_value(text, &schema.root, Options::canonical()).map_err(|error| {
+        definition_error(format!(
+            "PackDefinition is invalid: {}",
+            error.render("PackDefinition")
+        ))
+    })?;
+    if write_value(&schema.root, &value, WriteOptions::default())
         .map_err(|error| definition_error(format!("PackDefinition is not writable: {error}")))?
-        .as_bytes()
-        != authored.canonical_value.as_ref()
+        != text
     {
         return Err(definition_error("PackDefinition JSON is not canonical"));
     }
-    decode_pack_definition_value(&value)
+    decode_pack_definition_value(&schema.root, &value)
+}
+
+/// The bootstrap PackDefinition logical schema.
+fn pack_definition_schema() -> Result<LogicalSchema, PackBuildError> {
+    let spec = BootstrapControlSpecV1::embedded()
+        .map_err(|error| definition_error(format!("bootstrap spec: {error}")))?;
+    let row = spec
+        .0
+        .iter()
+        .find(|row| row.type_uuid == PACK_DEFINITION_TYPE_UUID)
+        .ok_or_else(|| definition_error("bootstrap spec has no PackDefinition row"))?;
+    node_from_bytes(&row.logical_schema)
+        .map_err(|error| definition_error(format!("bootstrap PackDefinition schema: {error:?}")))
 }
 
 fn decode_pack_definition_value(
-    value: &AuthoredValue,
+    node: &SchemaNode,
+    value: &Value,
 ) -> Result<PackDefinitionControlValue, PackBuildError> {
-    let fields = exact_object(
-        value,
-        "PackDefinition",
-        &["include_path_table", "roots", "target", "zstd_level"],
-    )?;
-    let roots = as_array(field(fields, "roots")?, "PackDefinition.roots")?
+    let context = "PackDefinition";
+    let (roots_node, roots) = field(node, value, "roots", context)?;
+    let SchemaNode::Vec(query_node) = roots_node else {
+        return Err(definition_error("PackDefinition.roots must be a sequence"));
+    };
+    let Value::Seq(roots) = roots else {
+        return Err(definition_error("PackDefinition.roots must be a sequence"));
+    };
+    let roots = roots
         .iter()
         .enumerate()
-        .map(|(index, value)| decode_asset_query(value, index))
+        .map(|(index, value)| decode_asset_query(query_node, value, index))
         .collect::<Result<Vec<_>, _>>()?;
     let zstd_level = i32::try_from(as_i128(
-        field(fields, "zstd_level")?,
+        field(node, value, "zstd_level", context)?.1,
         "PackDefinition.zstd_level",
     )?)
     .map_err(|_| definition_error("PackDefinition.zstd_level is outside i32 range"))?;
     Ok(PackDefinitionControlValue {
         roots,
-        target: as_string(field(fields, "target")?, "PackDefinition.target")?.to_owned(),
+        target: as_string(field(node, value, "target", context)?.1, "PackDefinition.target")?
+            .to_owned(),
         zstd_level,
         include_path_table: as_bool(
-            field(fields, "include_path_table")?,
+            field(node, value, "include_path_table", context)?.1,
             "PackDefinition.include_path_table",
         )?,
     })
 }
 
 fn decode_asset_query(
-    value: &AuthoredValue,
+    node: &SchemaNode,
+    value: &Value,
     index: usize,
 ) -> Result<BuildAssetQuery, PackBuildError> {
     let context = format!("PackDefinition.roots[{index}]");
-    let fields = exact_object(
-        value,
-        &context,
-        &[
-            "authored_type",
-            "authoring_only",
-            "bundle_path",
-            "bundle_uuid",
-            "local_id",
-            "path_glob",
-            "path_prefix",
-            "tag",
-            "terminal_type",
-            "uuid",
-        ],
-    )?;
+    let get = |name: &str| field(node, value, name, &context).map(|(_, value)| value);
+    let tag_node = field(node, value, "tag", &context)?.0;
     Ok(BuildAssetQuery {
-        uuid: optional(field(fields, "uuid")?, |value| {
+        uuid: optional(get("uuid")?, |value| {
             fixed_bytes(value, &format!("{context}.uuid")).map(AssetUuid)
         })?,
-        bundle_path: optional(field(fields, "bundle_path")?, |value| {
+        bundle_path: optional(get("bundle_path")?, |value| {
             as_string(value, &format!("{context}.bundle_path")).map(str::to_owned)
         })?,
-        local_id: optional(field(fields, "local_id")?, |value| {
+        local_id: optional(get("local_id")?, |value| {
             as_string(value, &format!("{context}.local_id")).map(str::to_owned)
         })?,
-        bundle_uuid: optional(field(fields, "bundle_uuid")?, |value| {
+        bundle_uuid: optional(get("bundle_uuid")?, |value| {
             fixed_bytes(value, &format!("{context}.bundle_uuid")).map(BundleUuid)
         })?,
-        authored_type: optional(field(fields, "authored_type")?, |value| {
+        authored_type: optional(get("authored_type")?, |value| {
             fixed_bytes(value, &format!("{context}.authored_type")).map(TypeUuid)
         })?,
-        terminal_type: optional(field(fields, "terminal_type")?, |value| {
+        terminal_type: optional(get("terminal_type")?, |value| {
             fixed_bytes(value, &format!("{context}.terminal_type")).map(TypeUuid)
         })?,
-        tag: optional(field(fields, "tag")?, |value| {
-            decode_tag_selector(value, &format!("{context}.tag"))
+        tag: optional(get("tag")?, |value| {
+            let SchemaNode::Option(tag_node) = tag_node else {
+                return Err(definition_error(format!("{context}.tag must be an option")));
+            };
+            decode_tag_selector(tag_node, value, &format!("{context}.tag"))
         })?,
-        path_prefix: optional(field(fields, "path_prefix")?, |value| {
+        path_prefix: optional(get("path_prefix")?, |value| {
             as_string(value, &format!("{context}.path_prefix")).map(str::to_owned)
         })?,
-        path_glob: optional(field(fields, "path_glob")?, |value| {
+        path_glob: optional(get("path_glob")?, |value| {
             as_string(value, &format!("{context}.path_glob")).map(str::to_owned)
         })?,
-        authoring_only: optional(field(fields, "authoring_only")?, |value| {
+        authoring_only: optional(get("authoring_only")?, |value| {
             as_bool(value, &format!("{context}.authoring_only"))
         })?,
     })
 }
 
 fn decode_tag_selector(
-    value: &AuthoredValue,
+    node: &SchemaNode,
+    value: &Value,
     context: &str,
 ) -> Result<BuildTagSelector, PackBuildError> {
-    let fields = exact_object(value, context, &["tag", "value"])?;
     Ok(BuildTagSelector {
-        tag: as_string(field(fields, "tag")?, &format!("{context}.tag"))?.to_owned(),
-        value: optional(field(fields, "value")?, |value| {
+        tag: as_string(field(node, value, "tag", context)?.1, &format!("{context}.tag"))?
+            .to_owned(),
+        value: optional(field(node, value, "value", context)?.1, |value| {
             as_string(value, &format!("{context}.value")).map(str::to_owned)
         })?,
     })
@@ -261,79 +278,57 @@ fn definition_error(message: impl Into<String>) -> PackBuildError {
     PackBuildError::Definition(message.into())
 }
 
-fn exact_object<'a>(
-    value: &'a AuthoredValue,
-    context: &str,
-    expected: &[&str],
-) -> Result<&'a BTreeMap<String, AuthoredValue>, PackBuildError> {
-    let AuthoredValue::Object(fields) = value else {
-        return Err(definition_error(format!("{context} must be an object")));
-    };
-    if fields.len() != expected.len() || expected.iter().any(|name| !fields.contains_key(*name)) {
-        return Err(definition_error(format!(
-            "{context} does not have the sealed field set"
-        )));
-    }
-    Ok(fields)
-}
-
+/// Field `name` of the struct `value` of `node`: its node and value.
 fn field<'a>(
-    fields: &'a BTreeMap<String, AuthoredValue>,
+    node: &'a SchemaNode,
+    value: &'a Value,
     name: &str,
-) -> Result<&'a AuthoredValue, PackBuildError> {
-    fields
-        .get(name)
-        .ok_or_else(|| definition_error(format!("missing field {name:?}")))
-}
-
-fn as_array<'a>(
-    value: &'a AuthoredValue,
     context: &str,
-) -> Result<&'a [AuthoredValue], PackBuildError> {
-    match value {
-        AuthoredValue::Array(values) => Ok(values),
-        _ => Err(definition_error(format!("{context} must be an array"))),
-    }
+) -> Result<(&'a SchemaNode, &'a Value), PackBuildError> {
+    let (SchemaNode::Struct { fields, .. }, Value::Struct(values)) = (node, value) else {
+        return Err(definition_error(format!("{context} must be a struct")));
+    };
+    fields
+        .iter()
+        .zip(values.iter())
+        .find(|((field, _, _), _)| field == name)
+        .map(|((_, _, node), value)| (node, value))
+        .ok_or_else(|| definition_error(format!("{context} has no field {name:?}")))
 }
 
-fn as_string<'a>(value: &'a AuthoredValue, context: &str) -> Result<&'a str, PackBuildError> {
-    match value {
-        AuthoredValue::Str(value) => Ok(value),
-        _ => Err(definition_error(format!("{context} must be text"))),
-    }
+fn as_string<'a>(value: &'a Value, context: &str) -> Result<&'a str, PackBuildError> {
+    value
+        .as_str()
+        .ok_or_else(|| definition_error(format!("{context} must be text")))
 }
 
-fn as_bool(value: &AuthoredValue, context: &str) -> Result<bool, PackBuildError> {
-    match value {
-        AuthoredValue::Bool(value) => Ok(*value),
-        _ => Err(definition_error(format!("{context} must be a boolean"))),
-    }
+fn as_bool(value: &Value, context: &str) -> Result<bool, PackBuildError> {
+    value
+        .as_bool()
+        .ok_or_else(|| definition_error(format!("{context} must be a boolean")))
 }
 
-fn as_i128(value: &AuthoredValue, context: &str) -> Result<i128, PackBuildError> {
-    match value {
-        AuthoredValue::Int(value) => Ok(*value),
-        AuthoredValue::UInt(value) => i128::try_from(*value)
-            .map_err(|_| definition_error(format!("{context} is outside i128 range"))),
-        _ => Err(definition_error(format!("{context} must be an integer"))),
-    }
+fn as_i128(value: &Value, context: &str) -> Result<i128, PackBuildError> {
+    value
+        .as_i128()
+        .ok_or_else(|| definition_error(format!("{context} must be an integer")))
 }
 
 fn optional<T>(
-    value: &AuthoredValue,
-    decode: impl FnOnce(&AuthoredValue) -> Result<T, PackBuildError>,
+    value: &Value,
+    decode: impl FnOnce(&Value) -> Result<T, PackBuildError>,
 ) -> Result<Option<T>, PackBuildError> {
     match value {
-        AuthoredValue::Null => Ok(None),
-        value => decode(value).map(Some),
+        Value::Option(None) => Ok(None),
+        Value::Option(Some(value)) => decode(value).map(Some),
+        _ => Err(definition_error("expected an option")),
     }
 }
 
-fn fixed_bytes<const N: usize>(
-    value: &AuthoredValue,
-    context: &str,
-) -> Result<[u8; N], PackBuildError> {
-    let values = as_array(value, context)?;
+fn fixed_bytes<const N: usize>(value: &Value, context: &str) -> Result<[u8; N], PackBuildError> {
+    let Value::Seq(values) = value else {
+        return Err(definition_error(format!("{context} must be a byte array")));
+    };
     if values.len() != N {
         return Err(definition_error(format!(
             "{context} must contain exactly {N} bytes"
@@ -341,13 +336,12 @@ fn fixed_bytes<const N: usize>(
     }
     let mut bytes = [0; N];
     for (target, value) in bytes.iter_mut().zip(values) {
-        let AuthoredValue::UInt(value) = value else {
+        let Value::U8(value) = value else {
             return Err(definition_error(format!(
                 "{context} contains a non-byte value"
             )));
         };
-        *target = u8::try_from(*value)
-            .map_err(|_| definition_error(format!("{context} contains an out-of-range byte")))?;
+        *target = *value;
     }
     Ok(bytes)
 }

@@ -1,29 +1,35 @@
-//! Schema-directed authored-value encoding into canonical §12 wire sections.
+//! Schema-directed typed-value encoding into canonical §12 wire sections.
 
 mod common;
-
-use std::collections::BTreeMap;
 
 use common::*;
 use distill_bundle::PathComponent;
 use distill_core::id::{AssetUuid, TypeUuid};
-use distill_json::AuthoredValue;
-use distill_wire::encode::{encode_authored_value, EncodeError};
+use distill_wire::encode::{encode_value, EncodeError};
 use distill_wire::native::ScalarKind;
 use distill_wire::wire::{SlotKind, WireEnumForm, WireNode};
 use ngp_schema::node::{PrimitiveKind, SchemaNode};
+use ngp_schema::{parse_value, AssetRefValue, Options, Value};
 
-fn object(entries: impl IntoIterator<Item = (&'static str, AuthoredValue)>) -> AuthoredValue {
-    AuthoredValue::Object(
-        entries
-            .into_iter()
-            .map(|(key, value)| (key.to_owned(), value))
-            .collect(),
-    )
+/// A value of `schema` from its canonical text.
+fn value(schema: &SchemaNode, text: &str) -> Value {
+    parse_value(text, schema, Options::canonical()).unwrap()
+}
+
+fn record_value<const N: usize>(values: [Value; N]) -> Value {
+    Value::Struct(Box::new(values))
+}
+
+fn some(value: Value) -> Value {
+    Value::Option(Some(Box::new(value)))
+}
+
+fn none() -> Value {
+    Value::Option(None)
 }
 
 fn no_references(
-    _: &AuthoredValue,
+    _: &AssetRefValue,
     _: TypeUuid,
     _: bool,
     _: &[PathComponent],
@@ -49,13 +55,10 @@ fn struct_and_string_emit_zeroed_fixed_padding_and_variable_bytes() {
             wfield("name", 1, wstring_slot(8)),
         ],
     );
-    let encoded = encode_authored_value(
+    let encoded = encode_value(
         &schema,
         &wire,
-        &object([
-            ("count", AuthoredValue::UInt(7)),
-            ("name", AuthoredValue::Str("hi".into())),
-        ]),
+        &Value::Struct(Box::new([Value::U32(7), Value::String("hi".into())])),
         &mut no_references,
     )
     .unwrap();
@@ -76,11 +79,11 @@ fn map_entries_sort_by_canonical_key_and_use_padded_pair_stride() {
         value: Box::new(SchemaNode::Primitive(PrimitiveKind::U16)),
     };
     let wire = wmap_slot(0, wprim(0, ScalarKind::U32), wprim(0, ScalarKind::U16));
-    let value = AuthoredValue::Array(vec![
-        AuthoredValue::Array(vec![AuthoredValue::UInt(9), AuthoredValue::UInt(90)]),
-        AuthoredValue::Array(vec![AuthoredValue::UInt(2), AuthoredValue::UInt(20)]),
+    let value = Value::Map(vec![
+        (Value::U32(9), Value::U16(90)),
+        (Value::U32(2), Value::U16(20)),
     ]);
-    let encoded = encode_authored_value(&schema, &wire, &value, &mut no_references).unwrap();
+    let encoded = encode_value(&schema, &wire, &value, &mut no_references).unwrap();
 
     assert_eq!(&encoded.fixed[..8], &[0, 0, 0, 0, 2, 0, 0, 0]);
     let mut expected = vec![0; 16];
@@ -95,18 +98,18 @@ fn map_entries_sort_by_canonical_key_and_use_padded_pair_stride() {
 fn set_is_sorted_and_rejects_duplicate_canonical_elements() {
     let schema = SchemaNode::Set(Box::new(SchemaNode::Primitive(PrimitiveKind::U8)));
     let wire = wset_slot(0, wprim(0, ScalarKind::U8));
-    let encoded = encode_authored_value(
+    let encoded = encode_value(
         &schema,
         &wire,
-        &AuthoredValue::Array(vec![AuthoredValue::UInt(9), AuthoredValue::UInt(2)]),
+        &Value::Seq(vec![Value::U8(9), Value::U8(2)]),
         &mut no_references,
     )
     .unwrap();
     assert_eq!(encoded.variable, [2, 9]);
 
-    let duplicate = AuthoredValue::Array(vec![AuthoredValue::UInt(2), AuthoredValue::UInt(2)]);
+    let duplicate = Value::Seq(vec![Value::U8(2), Value::U8(2)]);
     assert!(matches!(
-        encode_authored_value(&schema, &wire, &duplicate, &mut no_references),
+        encode_value(&schema, &wire, &duplicate, &mut no_references),
         Err(EncodeError::DuplicateOrderedValue { .. })
     ));
 }
@@ -145,10 +148,13 @@ fn canonical_enum_writes_name_sorted_tag_and_payload_union() {
             ),
         ],
     );
-    let encoded = encode_authored_value(
+    let encoded = encode_value(
         &schema,
         &wire,
-        &object([("A", object([("x", AuthoredValue::UInt(77))]))]),
+        &Value::Enum {
+            variant: 0,
+            payload: Box::new([Value::U32(77)]),
+        },
         &mut no_references,
     )
     .unwrap();
@@ -182,9 +188,7 @@ fn option_some_payload_and_transparent_box_use_exact_pointee_length() {
             ),
         ],
     );
-    let encoded =
-        encode_authored_value(&schema, &wire, &AuthoredValue::UInt(42), &mut no_references)
-            .unwrap();
+    let encoded = encode_value(&schema, &wire, &some(Value::U32(42)), &mut no_references).unwrap();
     assert_eq!(&encoded.fixed[..4], &1u32.to_le_bytes());
     assert_eq!(&encoded.fixed[8..12], &0u32.to_le_bytes());
     assert_eq!(&encoded.fixed[12..16], &4u32.to_le_bytes());
@@ -223,15 +227,8 @@ fn recursive_vec_backref_reuses_the_enclosing_record_geometry() {
             wfield("value", 1, wprim(24, ScalarKind::U32)),
         ],
     );
-    let child = object([
-        ("children", AuthoredValue::Array(vec![])),
-        ("value", AuthoredValue::UInt(2)),
-    ]);
-    let root = object([
-        ("children", AuthoredValue::Array(vec![child])),
-        ("value", AuthoredValue::UInt(1)),
-    ]);
-    let encoded = encode_authored_value(&schema, &wire, &root, &mut no_references).unwrap();
+    let root = value(&schema, r#"{"children":[{"children":[],"value":2}],"value":1}"#);
+    let encoded = encode_value(&schema, &wire, &root, &mut no_references).unwrap();
     assert_eq!(&encoded.fixed[..8], &[0, 0, 0, 0, 1, 0, 0, 0]);
     assert_eq!(&encoded.fixed[24..28], &1u32.to_le_bytes());
     assert_eq!(&encoded.variable[0..8], &[32, 0, 0, 0, 0, 0, 0, 0]);
@@ -293,8 +290,8 @@ fn recursive_enum_uses_distinct_logical_and_wire_backref_distances() {
             ),
         ],
     );
-    let value = object([("Next", object([("0", object([("End", object([]))]))]))]);
-    let encoded = encode_authored_value(&schema, &wire, &value, &mut no_references).unwrap();
+    let value = value(&schema, r#"{"Next":{"0":{"End":{}}}}"#);
+    let encoded = encode_value(&schema, &wire, &value, &mut no_references).unwrap();
     assert_eq!(&encoded.fixed[..4], &1u32.to_le_bytes());
     assert_eq!(&encoded.fixed[8..12], &0u32.to_le_bytes());
     assert_eq!(&encoded.fixed[12..16], &16u32.to_le_bytes());
@@ -345,8 +342,8 @@ fn recursive_option_counts_its_two_wire_only_frames() {
         ],
     );
     let wire = wstruct(0, 16, 8, vec![wfield("next", 0, option_wire)]);
-    let value = object([("next", object([("next", AuthoredValue::Null)]))]);
-    let encoded = encode_authored_value(&schema, &wire, &value, &mut no_references).unwrap();
+    let value = value(&schema, r#"{"next":{"next":null}}"#);
+    let encoded = encode_value(&schema, &wire, &value, &mut no_references).unwrap();
     assert_eq!(&encoded.fixed[..4], &1u32.to_le_bytes());
     assert_eq!(&encoded.fixed[8..12], &0u32.to_le_bytes());
     assert_eq!(&encoded.fixed[12..16], &16u32.to_le_bytes());
@@ -403,10 +400,6 @@ fn wire_backref(distance: u32) -> WireNode {
     }
 }
 
-fn parse(text: &str) -> AuthoredValue {
-    distill_json::parse(text).unwrap()
-}
-
 #[test]
 fn backref_reentry_resolves_under_the_targets_own_ancestors() {
     // A { b: Option<Box<B>> }, B { a: Option<Box<A>>, b: Option<Box<B>> }.
@@ -429,8 +422,8 @@ fn backref_reentry_resolves_under_the_targets_own_ancestors() {
         ],
     );
     let wire = wstruct(0, 16, 8, vec![wfield("b", 0, option_box_wire(0, b_wire))]);
-    let value = parse(r#"{"b":{"a":null,"b":{"a":{"b":null},"b":null}}}"#);
-    let encoded = encode_authored_value(&schema, &wire, &value, &mut no_references).unwrap();
+    let value = value(&schema, r#"{"b":{"a":null,"b":{"a":{"b":null},"b":null}}}"#);
+    let encoded = encode_value(&schema, &wire, &value, &mut no_references).unwrap();
     // Variable section: outer B (32), inner B (32), inner A (16).
     assert_eq!(encoded.variable.len(), 80);
     assert_eq!(&encoded.variable[32..36], &1u32.to_le_bytes(), "inner B.a is Some");
@@ -438,8 +431,11 @@ fn backref_reentry_resolves_under_the_targets_own_ancestors() {
     assert_eq!(&encoded.variable[44..48], &16u32.to_le_bytes(), "of 16 bytes");
 
     // A B where `a` names A is refused.
-    let wrong = parse(r#"{"b":{"a":null,"b":{"a":{"a":null,"b":null},"b":null}}}"#);
-    encode_authored_value(&schema, &wire, &wrong, &mut no_references).unwrap_err();
+    let wrong = record_value([some(record_value([
+        none(),
+        some(record_value([some(record_value([none(), none()])), none()])),
+    ]))]);
+    encode_value(&schema, &wire, &wrong, &mut no_references).unwrap_err();
 }
 
 #[test]
@@ -469,16 +465,23 @@ fn backref_reentry_resolves_under_the_targets_own_ancestors_three_deep() {
     );
     let b_wire = wstruct(0, 16, 8, vec![wfield("c", 0, option_box_wire(0, c_wire))]);
     let wire = wstruct(0, 16, 8, vec![wfield("b", 0, option_box_wire(0, b_wire))]);
-    let value = parse(
+    let value = value(
+        &schema,
         r#"{"b":{"c":{"a":null,"b":null,"c":{"a":null,"b":{"c":{"a":{"b":{"c":null}},"b":null,"c":{"a":null,"b":null,"c":null}}},"c":null}}}}"#,
     );
-    encode_authored_value(&schema, &wire, &value, &mut no_references).unwrap();
+    encode_value(&schema, &wire, &value, &mut no_references).unwrap();
 
     // Inside the re-entered C, `b` names B: a C there is refused.
-    let wrong = parse(
-        r#"{"b":{"c":{"a":null,"b":null,"c":{"a":null,"b":{"a":null,"b":null,"c":null},"c":null}}}}"#,
-    );
-    encode_authored_value(&schema, &wire, &wrong, &mut no_references).unwrap_err();
+    let wrong = record_value([some(record_value([some(record_value([
+        none(),
+        none(),
+        some(record_value([
+            none(),
+            some(record_value([none(), none(), none()])),
+            none(),
+        ])),
+    ]))]))]);
+    encode_value(&schema, &wire, &wrong, &mut no_references).unwrap_err();
 }
 
 #[test]
@@ -499,13 +502,10 @@ fn blobs_sort_by_structural_path_and_patch_slots_after_sorting() {
             wfield("a", 1, wblob_slot(8, 8)),
         ],
     );
-    let encoded = encode_authored_value(
+    let encoded = encode_value(
         &schema,
         &wire,
-        &object([
-            ("a", AuthoredValue::Blob(vec![1])),
-            ("z", AuthoredValue::Blob(vec![2])),
-        ]),
+        &Value::Struct(Box::new([Value::Blob(vec![1]), Value::Blob(vec![2])])),
         &mut no_references,
     )
     .unwrap();
@@ -544,7 +544,7 @@ fn typed_references_are_resolved_and_recorded_in_traversal_order() {
     );
     let mut calls = Vec::new();
     let mut resolver =
-        |query: &AuthoredValue, expected: TypeUuid, strong: bool, path: &[PathComponent]| {
+        |query: &AssetRefValue, expected: TypeUuid, strong: bool, path: &[PathComponent]| {
             calls.push((query.clone(), expected, strong, path.to_vec()));
             Ok(if strong {
                 AssetUuid([7; 16])
@@ -552,13 +552,13 @@ fn typed_references_are_resolved_and_recorded_in_traversal_order() {
                 AssetUuid([8; 16])
             })
         };
-    let encoded = encode_authored_value(
+    let encoded = encode_value(
         &schema,
         &wire,
-        &object([
-            ("strong", AuthoredValue::Str("one".into())),
-            ("weak", AuthoredValue::Str("two".into())),
-        ]),
+        &Value::Struct(Box::new([
+            Value::AssetRef(AssetRefValue::Path("one".into())),
+            Value::WeakRef(AssetRefValue::Path("two".into())),
+        ])),
         &mut resolver,
     )
     .unwrap();
@@ -571,53 +571,80 @@ fn typed_references_are_resolved_and_recorded_in_traversal_order() {
 }
 
 #[test]
-fn f32_adoption_is_ties_even_and_floats_normalize_negative_zero() {
-    let wire32 = wprim(0, ScalarKind::F32);
-    let halfway = 1.0f64 + 2f64.powi(-24);
-    let encoded = encode_authored_value(
+fn floats_must_be_finite_and_normalize_negative_zero() {
+    let encoded = encode_value(
         &SchemaNode::Primitive(PrimitiveKind::F32),
-        &wire32,
-        &AuthoredValue::Float(halfway),
+        &wprim(0, ScalarKind::F32),
+        &Value::F32(-0.0),
         &mut no_references,
     )
     .unwrap();
-    assert_eq!(encoded.fixed, 1.0f32.to_bits().to_le_bytes());
+    assert_eq!(encoded.fixed, 0.0f32.to_bits().to_le_bytes());
 
-    let large = 18_446_741_324_930_481_762u128;
-    let encoded = encode_authored_value(
-        &SchemaNode::Primitive(PrimitiveKind::F32),
-        &wire32,
-        &AuthoredValue::UInt(large),
-        &mut no_references,
-    )
-    .unwrap();
-    assert_eq!(encoded.fixed, (large as f32).to_bits().to_le_bytes());
-
-    let encoded = encode_authored_value(
+    let encoded = encode_value(
         &SchemaNode::Primitive(PrimitiveKind::F64),
         &wprim(0, ScalarKind::F64),
-        &AuthoredValue::Float(-0.0),
+        &Value::F64(-0.0),
         &mut no_references,
     )
     .unwrap();
     assert_eq!(encoded.fixed, 0.0f64.to_bits().to_le_bytes());
+
+    assert!(matches!(
+        encode_value(
+            &SchemaNode::Primitive(PrimitiveKind::F64),
+            &wprim(0, ScalarKind::F64),
+            &Value::F64(f64::NAN),
+            &mut no_references,
+        ),
+        Err(EncodeError::InvalidScalar { .. })
+    ));
 }
 
 #[test]
-fn structs_reject_unknown_fields_instead_of_silently_dropping_them() {
+fn scalars_must_be_the_exact_primitive_variant() {
+    // No adoption across widths or kinds: an f64 is not an f32, nor a u8 a u32.
+    for (kind, scalar, value) in [
+        (PrimitiveKind::F32, ScalarKind::F32, Value::F64(1.0)),
+        (PrimitiveKind::U32, ScalarKind::U32, Value::U8(1)),
+    ] {
+        assert!(matches!(
+            encode_value(
+                &SchemaNode::Primitive(kind),
+                &wprim(0, scalar),
+                &value,
+                &mut no_references,
+            ),
+            Err(EncodeError::InvalidScalar { .. })
+        ));
+    }
+}
+
+#[test]
+fn dynamic_values_have_no_wire_form() {
+    assert!(matches!(
+        encode_value(
+            &SchemaNode::Dynamic { sparse: false },
+            &wstruct(0, 0, 1, vec![]),
+            &Value::Unit,
+            &mut no_references,
+        ),
+        Err(EncodeError::InvalidWireShape { .. })
+    ));
+}
+
+#[test]
+fn structs_reject_a_value_count_other_than_their_field_count() {
     let schema = SchemaNode::Struct {
         rev: 0,
         fields: vec![("x".into(), 0, SchemaNode::Primitive(PrimitiveKind::U8))],
     };
     let wire = wstruct(0, 1, 1, vec![wfield("x", 0, wprim(0, ScalarKind::U8))]);
-    let mut values = BTreeMap::new();
-    values.insert("x".into(), AuthoredValue::UInt(1));
-    values.insert("unknown".into(), AuthoredValue::UInt(2));
     assert!(matches!(
-        encode_authored_value(
+        encode_value(
             &schema,
             &wire,
-            &AuthoredValue::Object(values),
+            &Value::Struct(Box::new([Value::U8(1), Value::U8(2)])),
             &mut no_references
         ),
         Err(EncodeError::Shape { .. })

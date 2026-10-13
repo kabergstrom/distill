@@ -1,17 +1,9 @@
-//! The canonical writer: exactly one text form per value (§6, RFC 8785
-//! reference). No insignificant whitespace anywhere — bare `,` and `:`
-//! separators, no indentation; keys in BTreeMap (UTF-8 byte) order;
-//! minimal escaping; floats by ECMAScript Number-to-string (8785's
-//! shortest-round-trip rules, exponent form included). The §6 whole-file
-//! trailing `\n` is the FILE writer's byte, not this value serializer's.
+//! Canonical scalar text (§6, RFC 8785 reference): floats by ECMAScript
+//! Number-to-string (8785's shortest-round-trip rules, exponent form
+//! included), -0.0 normalized, NaN/Inf rejected; strings minimally
+//! escaped.
 
-use crate::{AuthoredValue, WriteError};
-
-pub fn write(v: &AuthoredValue) -> Result<String, WriteError> {
-    let mut out = String::new();
-    write_value(v, &mut out)?;
-    Ok(out)
-}
+use crate::WriteError;
 
 /// Canonical decimal for an IEEE-754 binary32 value. This is the
 /// schema-directed `f32` leaf formatter: shortest digits that reparse to
@@ -29,53 +21,21 @@ pub fn write_f32(value: f32) -> Result<String, WriteError> {
     Ok(out)
 }
 
-fn write_value(v: &AuthoredValue, out: &mut String) -> Result<(), WriteError> {
-    match v {
-        AuthoredValue::Null => out.push_str("null"),
-        AuthoredValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        AuthoredValue::Int(i) => out.push_str(&i.to_string()),
-        AuthoredValue::UInt(u) => out.push_str(&u.to_string()),
-        AuthoredValue::Float(f) => {
-            if !f.is_finite() {
-                return Err(WriteError::NonFiniteFloat);
-            }
-            // -0.0 normalized (§6): -0.0 == 0.0, so this catches exactly it.
-            let f = if *f == 0.0 { 0.0 } else { *f };
-            write_ecmascript_number(f, out);
-        }
-        AuthoredValue::Str(s) => write_string(s, out),
-        AuthoredValue::Array(items) => {
-            out.push('[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                write_value(item, out)?;
-            }
-            out.push(']');
-        }
-        AuthoredValue::Object(map) => {
-            out.push('{');
-            for (i, (k, val)) in map.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                write_string(k, out);
-                out.push(':');
-                write_value(val, out)?;
-            }
-            out.push('}');
-        }
-        AuthoredValue::Blob(_) => return Err(WriteError::Blob),
-    }
-    Ok(())
-}
-
 /// ECMAScript `Number::toString` (ECMA-262 §6.1.6.1.20, the form RFC 8785
 /// pins): shortest round-trip digits, decimal notation for exponents in
 /// (-6, 21], signed-exponent scientific form outside. Built on ryu's
 /// shortest digits, re-notated per the ES thresholds — ryu alone switches
 /// notation at different magnitudes and prints integral doubles as "2.0".
+/// Canonical decimal for a finite binary64 (ECMAScript Number-to-string),
+/// -0.0 normalized.
+pub fn write_f64(value: f64, out: &mut String) -> Result<(), WriteError> {
+    if !value.is_finite() {
+        return Err(WriteError::NonFiniteFloat);
+    }
+    write_ecmascript_number(if value == 0.0 { 0.0 } else { value }, out);
+    Ok(())
+}
+
 fn write_ecmascript_number(f: f64, out: &mut String) {
     debug_assert!(f.is_finite());
     let mut buf = ryu::Buffer::new();
@@ -149,7 +109,7 @@ fn write_ecmascript_digits(negative: bool, ryu_text: &str, out: &mut String) {
 /// Minimal escaping (§6): only mandatory escapes — quote, backslash, and
 /// controls (< 0x20, shorthand where JSON has one); printable characters,
 /// non-ASCII included, stay raw. `/` is not escaped.
-fn write_string(s: &str, out: &mut String) {
+pub fn write_str(s: &str, out: &mut String) {
     out.push('"');
     for c in s.chars() {
         match c {

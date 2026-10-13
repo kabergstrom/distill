@@ -358,15 +358,7 @@ fn colliding_directory_rules_bundle() -> Vec<u8> {
     use distill_core::bootstrap::{
         BootstrapControlSpecV1, BootstrapControlSymbol, DIRECTORY_IMPORT_RULES_TYPE_UUID,
     };
-    use distill_json::AuthoredValue;
-    let object = |fields: Vec<(&str, AuthoredValue)>| {
-        AuthoredValue::Object(
-            fields
-                .into_iter()
-                .map(|(name, value)| (name.to_owned(), value))
-                .collect(),
-        )
-    };
+    use distill_schema::ngp_schema::Value;
     let row = BootstrapControlSpecV1::embedded()
         .unwrap()
         .0
@@ -374,35 +366,34 @@ fn colliding_directory_rules_bundle() -> Vec<u8> {
         .find(|row| row.symbol == BootstrapControlSymbol::DirectoryImportRules)
         .unwrap();
     let schema = distill_schema::ngp_schema::node_from_bytes(&row.logical_schema).unwrap();
+    // Positional over the bootstrap schema's name-sorted fields: a query is
+    // {path_glob, path_prefix}, a rule {group, id, importer, matches,
+    // output, settings}.
     let query = || {
-        object(vec![
-            ("path_glob", AuthoredValue::Str("*.src".into())),
-            ("path_prefix", AuthoredValue::Null),
-        ])
+        Value::Struct(Box::new([
+            Value::Option(Some(Box::new(Value::String("*.src".into())))),
+            Value::Option(None),
+        ]))
     };
     let rule = |id: u8| {
-        object(vec![
-            ("group", object(vec![("PerFile", object(Vec::new()))])),
-            (
-                "id",
-                AuthoredValue::Array(vec![AuthoredValue::UInt(id.into()); 16]),
-            ),
-            ("importer", AuthoredValue::Str("missing-importer".into())),
-            ("matches", query()),
-            ("output", AuthoredValue::Str("collide.bundle".into())),
-            (
-                "settings",
-                object(vec![(
-                    "UInt",
-                    object(vec![("value", AuthoredValue::UInt(5))]),
-                )]),
-            ),
-        ])
+        Value::Struct(Box::new([
+            // PerFile
+            Value::Enum {
+                variant: 1,
+                payload: Box::new([]),
+            },
+            Value::Seq(vec![Value::U8(id); 16]),
+            Value::String("missing-importer".into()),
+            query(),
+            Value::String("collide.bundle".into()),
+            // UInt { value: 5 }
+            Value::Enum {
+                variant: 8,
+                payload: Box::new([Value::U128(5)]),
+            },
+        ]))
     };
-    let data = object(vec![
-        ("listing", query()),
-        ("rules", AuthoredValue::Array(vec![rule(1)])),
-    ]);
+    let data = Value::Struct(Box::new([query(), Value::Seq(vec![rule(1)])]));
     distill_bundle::write_bundle(&distill_bundle::Bundle {
         format_version: 1,
         uuid: distill_core::id::BundleUuid([31; 16]),
@@ -1065,17 +1056,16 @@ fn gate_fixture_source(version: u32, layout_marker: bool) -> String {
         ""
     };
     format!(
-        r#"use std::collections::{{BTreeMap, BTreeSet}};
+        r#"use std::collections::BTreeSet;
 
 use distill_core::id::TypeUuid;
-use distill_json::AuthoredValue;
 use distill_pipeline_api::callbacks::ImporterDescriptor;
 use distill_pipeline_api::import::ImportOutput;
 use distill_pipeline_api::importer::{{
     AuthoringImportContext, AuthoringImporter, AuthoringImporterError,
 }};
 use distill_pipeline_api::registration::{{ModuleCallError, RegistrationArena, TargetDefinition}};
-use distill_schema::ngp_schema::{{LogicalSchema, PrimitiveKind, SchemaNode}};
+use distill_schema::ngp_schema::{{LogicalSchema, PrimitiveKind, SchemaNode, Value}};
 
 const SETTINGS_TYPE: TypeUuid = TypeUuid([0xa0; 16]);
 const SOURCE_TYPE: TypeUuid = TypeUuid([0xa1; 16]);
@@ -1095,8 +1085,8 @@ fn settings_schema() -> SchemaNode {{
     }}
 }}
 
-fn settings_value() -> AuthoredValue {{
-    AuthoredValue::Object(BTreeMap::from([("value".to_owned(), AuthoredValue::UInt(0))]))
+fn settings_value() -> Value {{
+    Value::Struct(Box::new([Value::U8(0)]))
 }}
 
 struct GateImporter;
@@ -1119,14 +1109,14 @@ impl AuthoringImporter for GateImporter {{
         SETTINGS.get_or_init(|| LogicalSchema {{ root: settings_schema() }})
     }}
 
-    fn default_settings(&self) -> AuthoredValue {{
+    fn default_settings(&self) -> Value {{
         settings_value()
     }}
 
     fn import(
         &self,
         context: &mut dyn AuthoringImportContext,
-        _settings: &AuthoredValue,
+        _settings: &Value,
     ) -> Result<ImportOutput, AuthoringImporterError> {{
         let source = context
             .sources()
@@ -1140,10 +1130,7 @@ impl AuthoringImporter for GateImporter {{
             .entry(
                 "main",
                 SOURCE_TYPE,
-                AuthoredValue::Object(BTreeMap::from([(
-                    "value".to_owned(),
-                    AuthoredValue::Str(format!("v{{}}:{{text}}", importer_version())),
-                )])),
+                Value::Struct(Box::new([Value::String(format!("v{{}}:{{text}}", importer_version()))])),
             )
             .map_err(|error| AuthoringImporterError::rejected(2, format!("{{error:?}}")))?;
         output
@@ -1213,7 +1200,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 distill-core = {{ path = '{}' }}
-distill-json = {{ path = '{}' }}
 distill-pipeline-api = {{ path = '{}' }}
 distill-schema = {{ path = '{}' }}
 newgameplus-api-macros = {{ path = '{}' }}
@@ -1222,7 +1208,6 @@ newgameplus-api-macros = {{ path = '{}' }}
 ngp-source-hash = {{ path = '{}' }}
 "#,
                 path(crates.join("distill-core")),
-                path(crates.join("distill-json")),
                 path(crates.join("distill-pipeline-api")),
                 path(crates.join("distill-schema")),
                 path(newgameplus.join("newgameplus-api-macros")),
@@ -1463,8 +1448,8 @@ fn imported_value(temp: &tempfile::TempDir) -> Option<String> {
     let bytes = std::fs::read(temp.path().join("assets/note.bundle")).ok()?;
     let bundle = distill_bundle::parse_bundle(&bytes).ok()?;
     match &bundle.assets.get("main")?.data {
-        distill_json::AuthoredValue::Object(fields) => match fields.get("value") {
-            Some(distill_json::AuthoredValue::Str(value)) => Some(value.clone()),
+        distill_schema::ngp_schema::Value::Struct(fields) => match fields.as_ref() {
+            [distill_schema::ngp_schema::Value::String(value)] => Some(value.clone()),
             _ => None,
         },
         _ => None,

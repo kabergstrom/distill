@@ -220,8 +220,7 @@ fn placed(fields: &[(&str, u64, u64)], chunk: &[u8]) -> Vec<u8> {
             )
         })
         .collect::<Vec<_>>());
-    let b = bundle(&[&sc], vec![("x", entry(UUID_A, &sc, data))], None);
-    build_container(&plain_bytes(&b), chunk)
+    build_container(&raw_plain(&sc, "x", data), chunk)
 }
 
 #[test]

@@ -844,7 +844,7 @@ mod tests {
     use super::*;
     use distill_bundle::{AssetEntry, Bundle};
     use distill_core::id::{BundleUuid, LogicalHash, TypeUuid};
-    use distill_json::AuthoredValue;
+    use distill_schema::ngp_schema::Value;
     use distill_schema::ngp_schema::{node_hash, LogicalSchema, PrimitiveKind, SchemaNode};
     use distill_store::bundles::{AssetRecord, BundleMeta};
     use distill_store::StoreConfig;
@@ -991,7 +991,7 @@ mod tests {
                     type_uuid,
                     schema_hash: logical_hash,
                     authoring_only: false,
-                    data: AuthoredValue::UInt(7),
+                    data: Value::U8(7),
                 },
             )]),
         })
@@ -1038,7 +1038,7 @@ mod tests {
         assert_eq!(results, [asset]);
         assert_eq!(
             context.read(asset).unwrap().unwrap().value,
-            AuthoredValue::UInt(7)
+            Value::U8(7)
         );
         assert!(matches!(context.trace[0], TraceOp::Query { .. }));
         assert!(matches!(

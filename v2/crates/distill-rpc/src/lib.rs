@@ -36,6 +36,6 @@ pub use server::{
 };
 pub use target::{TargetDefinition, TargetSetError};
 pub use validate::{
-    complete_settings, decode_asset_reference_query, decode_authoring_payload,
+    authoring_value, complete_settings, decode_asset_reference_query, decode_authoring_payload,
     decode_settings_payload,
 };

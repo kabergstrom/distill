@@ -11,6 +11,7 @@ use std::sync::{Arc, OnceLock};
 
 use distill_asset::{ModuleEpochPoisonCause, ModuleEpochToken};
 use distill_core::id::TypeUuid;
+use distill_schema::ngp_schema::Value;
 use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
 use distill_pipeline_api::registration::{ErasedCallback, RegistrationArena, RegistrationHost};
 use distill_store::pipeline::ValidatedPipelineEpoch;
@@ -833,7 +834,7 @@ impl PipelineEpoch {
         &self,
         id: &str,
         context: &mut dyn crate::importer::AuthoringImportContext,
-        settings: &distill_json::AuthoredValue,
+        settings: &Value,
     ) -> Result<
         distill_build::import::ImportOutput,
         CallbackInvokeError<crate::importer::AuthoringImporterError>,
@@ -869,7 +870,7 @@ impl PipelineEpoch {
     pub fn invoke_processor(
         &self,
         id: &str,
-        input: distill_json::AuthoredValue,
+        input: Value,
         context: &mut dyn PipelineProcessContext,
     ) -> Result<ProcessorProducts, CallbackInvokeError<ProcessorError>> {
         self.ensure_healthy()?;
@@ -1009,7 +1010,7 @@ impl PipelineEpoch {
     pub fn invoke_validators(
         &self,
         asset_type: TypeUuid,
-        asset: &distill_json::AuthoredValue,
+        asset: &Value,
     ) -> Result<Vec<crate::callbacks::Diagnostic>, InfallibleCallbackError> {
         self.ensure_healthy()?;
         let callbacks = self
@@ -1036,8 +1037,8 @@ impl PipelineEpoch {
     pub fn invoke_migration(
         &self,
         key: &str,
-        value: distill_json::AuthoredValue,
-    ) -> Result<distill_json::AuthoredValue, CallbackInvokeError<MigrationFunctionError>> {
+        value: Value,
+    ) -> Result<Value, CallbackInvokeError<MigrationFunctionError>> {
         self.ensure_healthy()?;
         let Some((pointer, CallbackHandle::Migration { call, .. })) = self
             .callback_rows()
@@ -1064,7 +1065,7 @@ impl PipelineEpoch {
         type_uuid: TypeUuid,
         schema: &distill_schema::ngp_schema::SchemaNode,
         at: &distill_migrate::FieldPath,
-    ) -> Result<Option<distill_json::AuthoredValue>, InfallibleCallbackError> {
+    ) -> Result<Option<Value>, InfallibleCallbackError> {
         self.invoke_default(type_uuid, schema, at, false)
     }
 
@@ -1073,7 +1074,7 @@ impl PipelineEpoch {
         type_uuid: TypeUuid,
         schema: &distill_schema::ngp_schema::SchemaNode,
         at: &distill_migrate::FieldPath,
-    ) -> Result<Option<distill_json::AuthoredValue>, InfallibleCallbackError> {
+    ) -> Result<Option<Value>, InfallibleCallbackError> {
         self.invoke_default(type_uuid, schema, at, true)
     }
 
@@ -1083,7 +1084,7 @@ impl PipelineEpoch {
         schema: &distill_schema::ngp_schema::SchemaNode,
         at: &distill_migrate::FieldPath,
         parent: bool,
-    ) -> Result<Option<distill_json::AuthoredValue>, InfallibleCallbackError> {
+    ) -> Result<Option<Value>, InfallibleCallbackError> {
         self.ensure_healthy()?;
         let Some((pointer, CallbackHandle::Defaults { field, parent: parent_call, .. })) = self
             .callback_rows()
@@ -2319,7 +2320,7 @@ mod callback_tests {
         fn import(
             &self,
             _context: &mut dyn AuthoringImportContext,
-            settings: &distill_json::AuthoredValue,
+            settings: &Value,
         ) -> Result<ImportOutput, AuthoringImporterError> {
             let mut output = ImportOutput::new();
             output
@@ -2359,7 +2360,7 @@ mod callback_tests {
         fn import(
             &self,
             context: &mut dyn AuthoringImportContext,
-            _settings: &distill_json::AuthoredValue,
+            _settings: &Value,
         ) -> Result<ImportOutput, AuthoringImporterError> {
             let _ = context.read("source.asset");
             Ok(ImportOutput::new())
@@ -2403,7 +2404,7 @@ mod callback_tests {
                         settings_schema: LogicalSchema {
                             root: SchemaNode::Unit,
                         },
-                        default_settings: distill_json::AuthoredValue::Null,
+                        default_settings: Value::Unit,
                     },
                     ReadsImportContext,
                 )
@@ -2415,7 +2416,7 @@ mod callback_tests {
             epoch.invoke_importer(
                 "reads",
                 &mut PanickingImportContext,
-                &distill_json::AuthoredValue::Null,
+                &Value::Unit,
             ),
             Err(CallbackInvokeError::HostRejected(detail))
                 if detail.contains("import-context")
@@ -2431,7 +2432,7 @@ mod callback_tests {
     impl PipelineProcessor for Process {
         fn process(
             &self,
-            input: distill_json::AuthoredValue,
+            input: Value,
             _context: &mut dyn PipelineProcessContext,
         ) -> Result<ProcessorProducts, crate::callbacks::ProcessorError> {
             Ok(ProcessorProducts {
@@ -2446,7 +2447,7 @@ mod callback_tests {
     impl PipelineProcessor for MissingPrimary {
         fn process(
             &self,
-            _input: distill_json::AuthoredValue,
+            _input: Value,
             _context: &mut dyn PipelineProcessContext,
         ) -> Result<ProcessorProducts, crate::callbacks::ProcessorError> {
             Ok(ProcessorProducts::default())
@@ -2484,7 +2485,7 @@ mod callback_tests {
         assert!(matches!(
             epoch.invoke_processor(
                 "broken",
-                distill_json::AuthoredValue::UInt(1),
+                Value::U32(1),
                 &mut ProcessContext,
             ),
             Err(CallbackInvokeError::OutputBinding(
@@ -2498,7 +2499,7 @@ mod callback_tests {
     impl PipelineValidator for Validator {
         fn validate(
             &self,
-            _asset: &distill_json::AuthoredValue,
+            _asset: &Value,
             diagnostics: &mut Diagnostics,
         ) -> Result<(), distill_asset::CallbackPanic> {
             diagnostics.warn(FieldPath::of(&["value"]), "checked");
@@ -2535,7 +2536,7 @@ mod callback_tests {
             Ok(Some(CodegenAsset {
                 asset,
                 type_uuid: TypeUuid([2; 16]),
-                value: distill_json::AuthoredValue::UInt(17),
+                value: Value::U32(17),
             }))
         }
     }
@@ -2594,16 +2595,16 @@ mod callback_tests {
             &self,
             _to_schema: &SchemaNode,
             _at: &FieldPath,
-        ) -> Option<distill_json::AuthoredValue> {
-            Some(distill_json::AuthoredValue::UInt(7))
+        ) -> Option<Value> {
+            Some(Value::U32(7))
         }
 
         fn parent_default(
             &self,
             _to_schema: &SchemaNode,
             _at: &FieldPath,
-        ) -> Option<distill_json::AuthoredValue> {
-            Some(distill_json::AuthoredValue::UInt(8))
+        ) -> Option<Value> {
+            Some(Value::U32(8))
         }
     }
 
@@ -2622,7 +2623,7 @@ mod callback_tests {
                     version: 3,
                     settings_type_uuid: TypeUuid([1; 16]),
                     settings_schema: schema.clone(),
-                    default_settings: distill_json::AuthoredValue::UInt(1),
+                    default_settings: Value::U32(1),
                 },
                 Importer,
             )
@@ -2746,26 +2747,26 @@ mod callback_tests {
             .invoke_importer(
                 "source",
                 &mut ImportContext,
-                &distill_json::AuthoredValue::UInt(11),
+                &Value::U32(11),
             )
             .unwrap();
         assert_eq!(
             imported.entries()["main"].value,
-            distill_json::AuthoredValue::UInt(11)
+            Value::U32(11)
         );
         let processed = epoch
             .invoke_processor(
                 "cook",
-                distill_json::AuthoredValue::UInt(12),
+                Value::U32(12),
                 &mut ProcessContext,
             )
             .unwrap();
         assert_eq!(
             processed.primary.map(|product| product.value),
-            Some(distill_json::AuthoredValue::UInt(12)),
+            Some(Value::U32(12)),
         );
         let diagnostics = epoch
-            .invoke_validators(TypeUuid([2; 16]), &distill_json::AuthoredValue::Null)
+            .invoke_validators(TypeUuid([2; 16]), &Value::Unit)
             .unwrap();
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].severity, DiagnosticSeverity::Warning);
@@ -2778,16 +2779,16 @@ mod callback_tests {
                         to: distill_core::id::LogicalHash([4; 32]),
                     }
                     .id(),
-                    distill_json::AuthoredValue::UInt(13),
+                    Value::U32(13),
                 )
                 .unwrap(),
-            distill_json::AuthoredValue::UInt(13)
+            Value::U32(13)
         );
         assert_eq!(
             epoch
                 .invoke_field_default(TypeUuid([2; 16]), &schema.root, &FieldPath::root())
                 .unwrap(),
-            Some(distill_json::AuthoredValue::UInt(7))
+            Some(Value::U32(7))
         );
         assert_eq!(epoch.tool_descriptors()[0].id, "compiler");
         let generated = epoch.invoke_codegens(&mut CodegenContext).unwrap();

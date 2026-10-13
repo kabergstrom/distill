@@ -1,8 +1,7 @@
-use std::collections::BTreeMap;
 
 use distill_build::artifact_encode::{encode_artifact_value, ArtifactValueSpec};
 use distill_core::id::{AssetUuid, LayoutHash, LogicalHash, TypeUuid};
-use distill_json::AuthoredValue;
+use ngp_schema::{AssetRefValue, Value};
 use distill_schema::ngp_schema::{PrimitiveKind, SchemaNode};
 use distill_wire::artifact::{parse_artifact, parse_artifact_parts};
 use distill_wire::native::ScalarKind;
@@ -65,13 +64,13 @@ fn composite_encoder_binds_refs_blobs_headers_and_split_transport() {
             ),
         ],
     };
-    let value = AuthoredValue::Object(BTreeMap::from([
-        ("blob".into(), AuthoredValue::Blob(vec![1, 2, 3])),
-        ("reference".into(), AuthoredValue::Str("query".into())),
-        ("value".into(), AuthoredValue::UInt(44)),
+    let value = Value::Struct(Box::new([
+        Value::Blob(vec![1, 2, 3]),
+        Value::AssetRef(AssetRefValue::Path("query".into())),
+        Value::U32(44),
     ]));
     let dependency = AssetUuid([7; 16]);
-    let mut resolver = |_: &AuthoredValue,
+    let mut resolver = |_: &AssetRefValue,
                         expected: TypeUuid,
                         strong: bool,
                         _: &[distill_bundle::PathComponent]| {

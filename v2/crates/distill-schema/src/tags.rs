@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use distill_json::AuthoredValue;
+use ngp_schema::Value;
 use ngp_schema::classify::{classify, Class};
 use ngp_schema::{Field, FieldIdentifier, Schema, SchemaTypeId};
 use unicode_normalization::UnicodeNormalization;
@@ -51,7 +51,7 @@ impl std::error::Error for TagExtractionError {}
 pub fn extract_search_tags(
     schema: &Schema,
     root: SchemaTypeId,
-    value: &AuthoredValue,
+    value: &Value,
 ) -> Result<BTreeMap<String, String>, TagExtractionError> {
     let mut tags = BTreeMap::new();
     walk(schema, root, value, "$", 0, &mut tags)?;
@@ -61,7 +61,7 @@ pub fn extract_search_tags(
 fn walk(
     schema: &Schema,
     id: SchemaTypeId,
-    value: &AuthoredValue,
+    value: &Value,
     path: &str,
     depth: usize,
     tags: &mut BTreeMap<String, String>,
@@ -79,15 +79,15 @@ fn walk(
             walk(schema, child, value, path, depth + 1, tags)
         }
         Class::Option(child) => {
-            if matches!(value, AuthoredValue::Null) {
-                Ok(())
-            } else {
-                walk(schema, child, value, path, depth + 1, tags)
+            match value {
+                Value::Option(None) => Ok(()),
+                Value::Option(Some(value)) => walk(schema, child, value, path, depth + 1, tags),
+                _ => wrong_shape(path, "option"),
             }
         }
         Class::Vec(child) | Class::Array { elem: child, .. } | Class::Set { elem: child, .. } => {
-            let AuthoredValue::Array(values) = value else {
-                return wrong_shape(path, "array");
+            let Value::Seq(values) = value else {
+                return wrong_shape(path, "sequence");
             };
             for (index, value) in values.iter().enumerate() {
                 walk(
@@ -103,67 +103,39 @@ fn walk(
         }
         Class::Map {
             key, value: child, ..
-        } => match value {
-            AuthoredValue::Object(values) => {
-                for (name, value) in values {
-                    walk(
-                        schema,
-                        child,
-                        value,
-                        &format!("{path}[{name:?}]"),
-                        depth + 1,
-                        tags,
-                    )?;
-                }
-                Ok(())
+        } => {
+            let Value::Map(entries) = value else {
+                return wrong_shape(path, "map");
+            };
+            for (index, (k, v)) in entries.iter().enumerate() {
+                walk(schema, key, k, &format!("{path}[{index}].key"), depth + 1, tags)?;
+                walk(schema, child, v, &format!("{path}[{index}].value"), depth + 1, tags)?;
             }
-            AuthoredValue::Array(values) => {
-                for (index, pair) in values.iter().enumerate() {
-                    let AuthoredValue::Array(pair) = pair else {
-                        return wrong_shape(&format!("{path}[{index}]"), "map pair");
-                    };
-                    if pair.len() != 2 {
-                        return wrong_shape(&format!("{path}[{index}]"), "two-element map pair");
-                    }
-                    walk(
-                        schema,
-                        key,
-                        &pair[0],
-                        &format!("{path}[{index}].key"),
-                        depth + 1,
-                        tags,
-                    )?;
-                    walk(
-                        schema,
-                        child,
-                        &pair[1],
-                        &format!("{path}[{index}].value"),
-                        depth + 1,
-                        tags,
-                    )?;
-                }
-                Ok(())
-            }
-            _ => wrong_shape(path, "map"),
-        },
+            Ok(())
+        }
         Class::Struct | Class::Tuple => {
-            let AuthoredValue::Object(values) = value else {
-                return wrong_shape(path, "object");
+            let Value::Struct(values) = value else {
+                return wrong_shape(path, "struct");
             };
             walk_fields(schema, &ty.fields, values, path, depth, tags)
         }
         Class::Enum => {
-            let AuthoredValue::Object(variants) = value else {
-                return wrong_shape(path, "single-variant object");
+            let Value::Enum { variant, payload } = value else {
+                return wrong_shape(path, "enum");
             };
-            if variants.len() != 1 {
-                return wrong_shape(path, "single-variant object");
-            }
-            let (variant_name, payload) = variants.iter().next().expect("length checked");
-            let variant = ty
+            // Variants in logical (NFC name) order, as the value indexes them.
+            let mut variants: Vec<(String, &Field)> = ty
                 .fields
                 .iter()
-                .find(|field| matches!(&field.id, FieldIdentifier::Variant(name) if name == variant_name))
+                .filter_map(|field| match &field.id {
+                    FieldIdentifier::Variant(name) => Some((name.nfc().collect(), field)),
+                    _ => None,
+                })
+                .collect();
+            variants.sort_by(|a, b| a.0.cmp(&b.0));
+            let (variant_name, variant) = variants
+                .get(*variant as usize)
+                .map(|(name, field)| (name.clone(), *field))
                 .ok_or_else(|| TagExtractionError::WrongShape {
                     path: path.to_owned(),
                     expected: "declared enum variant",
@@ -172,16 +144,10 @@ fn walk(
                 .types
                 .get(variant.type_id.0)
                 .ok_or(TagExtractionError::MissingType(variant.type_id))?;
-            let AuthoredValue::Object(values) = payload else {
-                return wrong_shape(
-                    &format!("{path}{{{variant_name}}}"),
-                    "variant payload object",
-                );
-            };
             walk_fields(
                 schema,
                 &variant_ty.fields,
-                values,
+                payload,
                 &format!("{path}{{{variant_name}}}"),
                 depth,
                 tags,
@@ -202,30 +168,31 @@ fn walk(
 fn walk_fields(
     schema: &Schema,
     fields: &[Field],
-    values: &BTreeMap<String, AuthoredValue>,
+    values: &[Value],
     path: &str,
     depth: usize,
     tags: &mut BTreeMap<String, String>,
 ) -> Result<(), TagExtractionError> {
-    for field in fields {
-        if field.attrs.skip {
-            continue;
-        }
+    // A struct value is positional over the logical node's fields: the
+    // non-skip fields in NFC name byte order (tuples by decimal index name).
+    let mut named = Vec::with_capacity(fields.len());
+    for field in fields.iter().filter(|field| !field.attrs.skip) {
         let Some(name) = field_name(&field.id) else {
             return Err(TagExtractionError::UnsupportedType {
                 path: path.to_owned(),
                 detail: "variant identifier in record payload".to_owned(),
             });
         };
+        named.push((name.nfc().collect::<String>(), field));
+    }
+    named.sort_by(|a, b| a.0.cmp(&b.0));
+    if named.len() != values.len() {
+        return wrong_shape(path, "one value per field");
+    }
+    for ((name, field), value) in named.into_iter().zip(values) {
         let field_path = format!("{path}.{name}");
-        let value = values
-            .get(&name)
-            .ok_or_else(|| TagExtractionError::WrongShape {
-                path: field_path.clone(),
-                expected: "present field",
-            })?;
         if field.attrs.tag {
-            let AuthoredValue::Str(value) = value else {
+            let Value::String(value) = value else {
                 return wrong_shape(&field_path, "string tag value");
             };
             let name = canonical_identifier(&field_path, &name)?;

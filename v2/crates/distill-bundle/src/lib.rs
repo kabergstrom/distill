@@ -19,19 +19,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
-use distill_json::AuthoredValue;
-use ngp_schema::LogicalSchema;
+use ngp_schema::{LogicalSchema, Value};
 
 mod container;
 mod crc32c;
+mod data;
 mod envelope;
 mod error;
-mod path;
-mod walk;
 
 pub use crc32c::crc32c;
 pub use error::BundleError;
-pub use path::{encode_path, PathComponent};
+pub use ngp_schema::{encode_path, PathComponent};
 
 /// The envelope semantics version this crate reads and writes (§6): the
 /// JSON `format_version` field. Pinned to exactly 1.
@@ -70,9 +68,8 @@ pub struct Bundle {
     pub assets: BTreeMap<String, AssetEntry>,
 }
 
-/// One asset entry (§6). `data` is the schema-shaped authored value; in a
-/// parsed container bundle, blob leaves are `AuthoredValue::Blob` carrying
-/// the chunk bytes.
+/// One asset entry (§6). `data` is the typed value of its schema; blob
+/// leaves carry their bytes (the container holds them).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AssetEntry {
     pub uuid: AssetUuid,
@@ -81,7 +78,7 @@ pub struct AssetEntry {
     /// Authoring/control metadata is never eligible as a runtime primary,
     /// processor input, reference target, query result, or pack member.
     pub authoring_only: bool,
-    pub data: AuthoredValue,
+    pub data: Value,
 }
 
 /// Return the complete set of schema snapshots the bundle must retain:
@@ -151,7 +148,7 @@ pub fn parse_bundle(bytes: &[u8]) -> Result<Bundle, BundleError> {
         if bytes.first() == Some(&0x89) {
             container::parse(bytes)
         } else {
-            envelope::parse_plain(bytes)
+            envelope::parse(envelope::utf8(bytes)?, envelope::Strictness::Full, data::Blobs::Plain)
         }
     })
 }
@@ -166,7 +163,11 @@ pub fn extract_namespace_skeleton(bytes: &[u8]) -> Result<BundleNamespaceSkeleto
         let bundle = if bytes.first() == Some(&0x89) {
             container::parse_namespace(bytes)?
         } else {
-            envelope::parse_plain_namespace(bytes)?
+            envelope::parse(
+                envelope::utf8(bytes)?,
+                envelope::Strictness::Namespace,
+                data::Blobs::Plain,
+            )?
         };
         Ok(BundleNamespaceSkeleton {
             format_version: bundle.format_version,

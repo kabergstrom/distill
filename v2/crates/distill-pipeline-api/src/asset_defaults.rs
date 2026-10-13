@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use distill_asset::{AssetDefaults, DefaultTable, DefaultWriter, PathStep, SchemaNodeId};
-use distill_json::AuthoredValue;
+use ngp_schema::Value;
 use distill_migrate::FieldPath;
 use ngp_schema::{node_from_bytes, SchemaNode};
 
@@ -98,14 +98,14 @@ impl<T: AssetDefaults> Default for AssetTableDefaults<T> {
     }
 }
 
-fn call(writer: DefaultWriter) -> AuthoredValue {
+fn call(writer: DefaultWriter) -> Value {
     // Re-raise inside the callback thunk so the host records a callback
     // panic instead of a missing default.
     writer().unwrap_or_else(|_| panic!("asset default writer panicked"))
 }
 
 impl<T: AssetDefaults> PipelineDefaults for AssetTableDefaults<T> {
-    fn field_default(&self, to_schema: &SchemaNode, at: &FieldPath) -> Option<AuthoredValue> {
+    fn field_default(&self, to_schema: &SchemaNode, at: &FieldPath) -> Option<Value> {
         let (field, mut containers) = self.containers(to_schema, at)?;
         containers.find_map(|container| {
             self.table
@@ -125,13 +125,10 @@ impl<T: AssetDefaults> PipelineDefaults for AssetTableDefaults<T> {
         })
     }
 
-    fn parent_default(&self, to_schema: &SchemaNode, at: &FieldPath) -> Option<AuthoredValue> {
+    fn parent_default(&self, to_schema: &SchemaNode, at: &FieldPath) -> Option<Value> {
         let (field, mut containers) = self.containers(to_schema, at)?;
         containers.find_map(|container| {
-            let AuthoredValue::Object(mut fields) = call(container.writer?) else {
-                return None;
-            };
-            fields.remove(field)
+            call(container.writer?).field(&container.schema, field).cloned()
         })
     }
 }

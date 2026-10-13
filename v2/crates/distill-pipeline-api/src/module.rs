@@ -15,9 +15,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use distill_core::callback::CallbackPanic;
 use distill_core::canonical::{domain_digest, DSMA};
-use distill_json::AuthoredValue;
 use distill_migrate::FieldPath;
-use ngp_schema::SchemaNode;
+use ngp_schema::{Patch, SchemaNode, Value};
 use unicode_normalization::is_nfc;
 
 use crate::callbacks::{
@@ -128,7 +127,8 @@ pub fn host_module_abi_identity() -> ModuleAbiIdentity {
         encode_measurement::<*mut dyn AuthoringImportContext>(encoder);
         encode_measurement::<*mut dyn PipelineProcessContext>(encoder);
         encode_measurement::<*mut dyn PipelineCodegenContext>(encoder);
-        encode_measurement::<AuthoredValue>(encoder);
+        encode_measurement::<Value>(encoder);
+        encode_measurement::<Patch>(encoder);
         encode_measurement::<SchemaNode>(encoder);
         encode_measurement::<FieldPath>(encoder);
         encode_measurement::<ImporterDescriptor>(encoder);

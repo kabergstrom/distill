@@ -11,6 +11,5 @@ unicode-normalization.workspace = true
 distill-asset = { path = "../distill-asset" }
 distill-bundle = { path = "../distill-bundle" }
 distill-core = { path = "../distill-core" }
-distill-json = { path = "../distill-json" }
 distill-migrate = { path = "../distill-migrate" }
 ngp-schema = { path = "../../../../newgameplus/ngp-schema" }

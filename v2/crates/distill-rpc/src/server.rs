@@ -1012,45 +1012,10 @@ pub fn bundle_authoring_entry(
         logical_schema: Arc::from(logical_schema.into_bytes()),
         role: entry_role(entry.authoring_only),
         tags: BTreeMap::new(),
-        value: authoring_value(&entry.data)?,
+        value: crate::validate::authoring_value(&schema.root, &entry.data)?,
     })
 }
 
-/// An authored value as the RPC carries it: canonical JSON whose blobs are
-/// `{"$distill_blob": index}` into the blob table.
-fn authoring_value(value: &distill_json::AuthoredValue) -> Result<AuthoringValue, String> {
-    use distill_json::AuthoredValue;
-    fn rewrite(value: &AuthoredValue, blobs: &mut Vec<Arc<[u8]>>) -> AuthoredValue {
-        match value {
-            AuthoredValue::Blob(bytes) => {
-                let index = blobs.len() as u128;
-                blobs.push(Arc::from(bytes.clone()));
-                AuthoredValue::Object(BTreeMap::from([(
-                    "$distill_blob".to_owned(),
-                    AuthoredValue::UInt(index),
-                )]))
-            }
-            AuthoredValue::Array(values) => {
-                AuthoredValue::Array(values.iter().map(|value| rewrite(value, blobs)).collect())
-            }
-            AuthoredValue::Object(values) => AuthoredValue::Object(
-                values
-                    .iter()
-                    .map(|(key, value)| (key.clone(), rewrite(value, blobs)))
-                    .collect(),
-            ),
-            value => value.clone(),
-        }
-    }
-    let mut blobs = Vec::new();
-    let rewritten = rewrite(value, &mut blobs);
-    let canonical = distill_json::write(&rewritten)
-        .map_err(|error| format!("cannot serialize authored value: {error}"))?;
-    Ok(AuthoringValue {
-        canonical_value: Arc::from(canonical.into_bytes()),
-        blobs,
-    })
-}
 
 pub(crate) fn entry_role(authoring_only: bool) -> AuthoringEntryRole {
     if authoring_only {

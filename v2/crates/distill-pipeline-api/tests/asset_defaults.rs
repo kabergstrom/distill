@@ -1,6 +1,6 @@
 use distill_asset::build::logical_bytes;
 use distill_asset::AssetReflect;
-use distill_json::AuthoredValue;
+use ngp_schema::Value;
 use distill_migrate::{
     conforms, execute_ops, plan_automatic, validate_plan, DefaultProvider, EdgeKind, FieldPath,
 };
@@ -74,11 +74,11 @@ fn schema<T: AssetReflect>() -> SchemaNode {
 struct Provider<'a>(&'a dyn PipelineDefaults);
 
 impl DefaultProvider for Provider<'_> {
-    fn field_default(&self, to_schema: &SchemaNode, at: &FieldPath) -> Option<AuthoredValue> {
+    fn field_default(&self, to_schema: &SchemaNode, at: &FieldPath) -> Option<Value> {
         self.0.field_default(to_schema, at)
     }
 
-    fn parent_default(&self, to_schema: &SchemaNode, at: &FieldPath) -> Option<AuthoredValue> {
+    fn parent_default(&self, to_schema: &SchemaNode, at: &FieldPath) -> Option<Value> {
         self.0.parent_default(to_schema, at)
     }
 }
@@ -94,7 +94,7 @@ fn automatic_migration_fills_added_fields_from_the_generated_table() {
         }],
         mode: OldMode::On { level: 2 },
     }
-    .to_authored();
+    .to_value();
 
     let plan = plan_automatic(&old, &new).unwrap();
     validate_plan(&plan, &old, &new, EdgeKind::Automatic).unwrap();
@@ -110,7 +110,7 @@ fn automatic_migration_fills_added_fields_from_the_generated_table() {
         }],
         mode: Mode::On { level: 2, extra: 0 },
     }
-    .to_authored();
+    .to_value();
     assert_eq!(migrated.value, expected);
 }
 
@@ -122,11 +122,11 @@ fn field_and_parent_defaults_resolve_nested_containers() {
 
     assert_eq!(
         defaults.field_default(&inner, &added),
-        Some(AuthoredValue::UInt(0))
+        Some(Value::U32(0))
     );
     assert_eq!(
         defaults.parent_default(&inner, &added),
-        Some(AuthoredValue::UInt(5))
+        Some(Value::U32(5))
     );
 
     let SchemaNode::Enum { variants, .. } = schema::<Mode>() else {
@@ -135,7 +135,7 @@ fn field_and_parent_defaults_resolve_nested_containers() {
     let on = &variants.iter().find(|(name, _, _)| name == "On").unwrap().2;
     assert_eq!(
         defaults.field_default(on, &FieldPath::of(&["extra"])),
-        Some(AuthoredValue::UInt(0))
+        Some(Value::U32(0))
     );
 
     let outer = schema::<Outer>();

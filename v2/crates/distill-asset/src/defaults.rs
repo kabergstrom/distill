@@ -7,7 +7,7 @@ use std::any::TypeId;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use distill_json::AuthoredValue;
+use ngp_schema::Value;
 use distill_wire::native::CallbackPanic;
 
 use crate::{AssetReflect, AssetType};
@@ -21,7 +21,7 @@ pub enum PathStep {
     MapValue,
 }
 
-pub type DefaultWriter = fn() -> Result<AuthoredValue, CallbackPanic>;
+pub type DefaultWriter = fn() -> Result<Value, CallbackPanic>;
 
 /// Deterministic identity assigned on the first canonical expansion of a
 /// Rust schema node. Recursive back-references reuse the already assigned id.
@@ -92,11 +92,11 @@ pub fn default_table<T: AssetDefaults>() -> &'static DefaultTable<T> {
 }
 
 /// The generated status thunk used for parent and node defaults.
-pub fn write_default<T>() -> Result<AuthoredValue, CallbackPanic>
+pub fn write_default<T>() -> Result<Value, CallbackPanic>
 where
     T: Default + AssetReflect,
 {
-    catch_unwind(AssertUnwindSafe(|| T::default().to_authored())).map_err(|_| CallbackPanic)
+    catch_unwind(AssertUnwindSafe(|| T::default().to_value())).map_err(|_| CallbackPanic)
 }
 
 /// Convert owned path vectors collected recursively by reflection into

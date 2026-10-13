@@ -102,6 +102,9 @@ fn kind_name(n: &SchemaNode) -> &'static str {
         SchemaNode::BackRef(_) => "back-reference",
         SchemaNode::Unit => "unit",
         SchemaNode::Set(_) => "set",
+        SchemaNode::Dynamic { .. } => "dynamic value",
+        SchemaNode::NodeRef { .. } => "node reference",
+        SchemaNode::Handle { .. } => "asset handle",
     }
 }
 
@@ -308,6 +311,18 @@ impl Ctx<'_> {
                 // Same kind, different target: retargeting changes meaning
                 // and must be a deliberate custom edge (§5).
                 self.refuse(disp, format!("reference retargeted ({a} -> {b})"));
+                Vec::new()
+            }
+            (SchemaNode::NodeRef { component: a }, SchemaNode::NodeRef { component: b }) => {
+                self.refuse(disp, format!("node reference retargeted ({a:?} -> {b:?})"));
+                Vec::new()
+            }
+            (SchemaNode::Handle { kind: a }, SchemaNode::Handle { kind: b }) => {
+                self.refuse(disp, format!("asset handle kind changed ({a:?} -> {b:?})"));
+                Vec::new()
+            }
+            (SchemaNode::Dynamic { sparse: a }, SchemaNode::Dynamic { sparse: b }) => {
+                self.refuse(disp, format!("dynamic value sparseness changed ({a} -> {b})"));
                 Vec::new()
             }
             (o, n) => {

@@ -3,23 +3,29 @@
 //! Top-level keys: `format_version` (pinned = 1), `uuid`, `primary`
 //! (optional, must name an existing entry), `schemas` (64-hex LogicalHash →
 //! schema snapshot JSON, key verified to equal the snapshot's own hash),
-//! `assets` (local_id → {uuid, type_uuid, schema_hash, data}). Unknown keys
-//! at either level are errors — the canonical writer never emits them.
-//! Bundles are schema-closed: every entry's `schema_hash` resolves in
-//! `schemas`. The `$` local_id namespace is reserved for exactly
-//! `$settings` and `$record`.
+//! `assets` (local_id → {uuid, type_uuid, schema_hash, authoring_only,
+//! data}). Unknown keys at either level are errors — the canonical writer
+//! never emits them. Bundles are schema-closed: every entry's
+//! `schema_hash` resolves in `schemas`. The `$` local_id namespace is
+//! reserved for exactly `$settings` and `$record`.
+//!
+//! The envelope is lexed, not parsed into a tree: each key's value span is
+//! recorded (its syntax checked in full), then decoded in a fixed order so
+//! errors do not depend on key order. Entry data is read last, typed,
+//! against its schema (`data.rs`): `"assets"` sorts before `"schemas"`.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 use distill_core::bootstrap::{
     BootstrapControlSpecV1, BOOTSTRAP_CONTROL_TYPE_UUIDS, IMPORT_RECORD_TYPE_UUID,
 };
 use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
-use distill_json::AuthoredValue;
-use ngp_schema::{node_bytes, snapshot_to_json, verify_snapshot, LogicalSchema};
+use distill_json::{Kind, Lexer, ParseError, ParseErrorKind};
+use ngp_schema::{check_hash, node_bytes, read_snapshot, snapshot_to_json, LogicalSchema};
 
+use crate::data::{parse_entry, Blobs};
 use crate::error::BundleError;
-use crate::walk::{kind_name, walk_entry, WalkMode};
 use crate::{AssetEntry, Bundle, BUNDLE_FORMAT_VERSION};
 
 pub(crate) fn utf8(bytes: &[u8]) -> Result<&str, BundleError> {
@@ -28,254 +34,253 @@ pub(crate) fn utf8(bytes: &[u8]) -> Result<&str, BundleError> {
     })
 }
 
-/// Parse a plain-JSON bundle: the whole file is envelope text. The schema
-/// walk runs in `PlainParse` mode — reaching a Blob node is an error
-/// (blobs require the container).
-pub(crate) fn parse_plain(bytes: &[u8]) -> Result<Bundle, BundleError> {
-    let text = utf8(bytes)?;
-    let value = distill_json::parse(text).map_err(BundleError::Json)?;
-    let mut bundle = decode(value)?;
-    let Bundle {
-        schemas, assets, ..
-    } = &mut bundle;
-    for (local_id, entry) in assets.iter_mut() {
-        let schema = schemas
-            .get(&entry.schema_hash)
-            .ok_or_else(|| BundleError::Internal {
-                detail: format!("schema closure not upheld for {local_id:?}"),
-            })?;
-        walk_entry(
-            local_id,
-            &schema.root,
-            &mut entry.data,
-            WalkMode::PlainParse,
-        )?;
-    }
-    Ok(bundle)
+/// A value span the first pass skipped: where it is and the nesting it
+/// sat at.
+#[derive(Clone)]
+struct Span {
+    range: Range<usize>,
+    depth: usize,
 }
 
-pub(crate) fn parse_plain_namespace(bytes: &[u8]) -> Result<Bundle, BundleError> {
-    let text = utf8(bytes)?;
-    let value = distill_json::parse(text).map_err(BundleError::Json)?;
-    let mut bundle = decode_namespace(value)?;
-    let Bundle {
-        schemas, assets, ..
-    } = &mut bundle;
-    for (local_id, entry) in assets.iter_mut() {
-        let schema = schemas
-            .get(&entry.schema_hash)
-            .ok_or_else(|| BundleError::Internal {
-                detail: format!("schema closure not upheld for {local_id:?}"),
-            })?;
-        walk_entry(
-            local_id,
-            &schema.root,
-            &mut entry.data,
-            WalkMode::PlainParse,
-        )?;
+impl Span {
+    fn lexer<'t>(&self, text: &'t str) -> Lexer<'t> {
+        Lexer::span(text, self.range.clone(), self.depth)
     }
-    Ok(bundle)
 }
 
-/// Decode the complete namespace while discarding only fields that the v1
-/// grammar proves cannot affect it. The ordinary decoder still reports these
-/// defects; this path exists solely to decide whether their poison can be
-/// bundle-scoped.
-pub(crate) fn decode_namespace(value: AuthoredValue) -> Result<Bundle, BundleError> {
-    let AuthoredValue::Object(mut top) = value else {
-        return decode(value);
-    };
-    top.retain(|key, _| {
-        matches!(
-            key.as_str(),
-            "assets" | "format_version" | "primary" | "schemas" | "uuid"
-        )
-    });
-    // A broken primary affects path selection, but not the complete set of
-    // bundle/asset/type claims. Physical-path lookup is poisoned by the bundle
-    // row itself.
-    top.remove("primary");
-    if let Some(AuthoredValue::Object(assets)) = top.get_mut("assets") {
-        for entry in assets.values_mut() {
-            if let AuthoredValue::Object(fields) = entry {
-                fields.retain(|key, _| {
-                    matches!(
-                        key.as_str(),
-                        "authoring_only"
-                            | "data"
-                            | "lineage"
-                            | "schema_hash"
-                            | "type_uuid"
-                            | "uuid"
-                    )
-                });
+fn json(e: ParseError) -> BundleError {
+    BundleError::Json(e)
+}
+
+/// What the next value is, as the envelope errors name it.
+fn found(lex: &mut Lexer<'_>) -> Result<&'static str, BundleError> {
+    Ok(match lex.peek().map_err(json)? {
+        Kind::Number => {
+            if lex.clone().number().map_err(json)?.integer {
+                "integer"
+            } else {
+                "float"
             }
         }
-    }
-    decode(AuthoredValue::Object(top))
+        kind => kind.name(),
+    })
 }
 
-/// Decode the envelope JSON value into a `Bundle` (data left as-is; the
-/// caller runs the schema walk in its encoding's mode). Enforces key
-/// strictness, id/hash parsing, snapshot verification against map keys,
-/// reserved local_ids, schema closure, and primary resolution.
-pub(crate) fn decode(value: AuthoredValue) -> Result<Bundle, BundleError> {
-    let mut top = match value {
-        AuthoredValue::Object(m) => m,
-        other => {
-            return Err(BundleError::EnvelopeNotObject {
-                found: kind_name(&other),
-            })
+/// An object's keys and value spans; a repeated key is a JSON error (§6).
+/// The caller has peeked an object.
+fn members(lex: &mut Lexer<'_>) -> Result<BTreeMap<String, Span>, BundleError> {
+    let mut open = lex.object().map_err(json)?;
+    let mut out = BTreeMap::new();
+    while let Some((key, offset)) = lex.next_key(&mut open).map_err(json)? {
+        let depth = lex.depth();
+        let range = lex.skip().map_err(json)?;
+        if out.insert(key.into_owned(), Span { range, depth }).is_some() {
+            return Err(json(ParseError {
+                kind: ParseErrorKind::DuplicateKey,
+                offset,
+            }));
         }
-    };
+    }
+    Ok(out)
+}
+
+/// A string value, or what was found instead.
+fn string(lex: &mut Lexer<'_>) -> Result<Result<String, &'static str>, BundleError> {
+    if lex.peek().map_err(json)? == Kind::String {
+        Ok(Ok(lex.string().map_err(json)?.into_owned()))
+    } else {
+        Ok(Err(found(lex)?))
+    }
+}
+
+/// How strictly the envelope is read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Strictness {
+    /// Every defect is an error.
+    Full,
+    /// Only what can change the namespace: unknown keys and `primary` are
+    /// ignored (`extract_namespace_skeleton`).
+    Namespace,
+}
+
+/// Parse an envelope and its entries' data. `blobs` is the encoding's blob
+/// source.
+pub(crate) fn parse(
+    text: &str,
+    strictness: Strictness,
+    mut blobs: Blobs<'_>,
+) -> Result<Bundle, BundleError> {
+    let mut lex = Lexer::new(text);
+    if lex.peek().map_err(json)? != Kind::Object {
+        let found = found(&mut lex)?;
+        lex.skip().map_err(json)?;
+        lex.finish().map_err(json)?;
+        return Err(BundleError::EnvelopeNotObject { found });
+    }
+    let mut top = members(&mut lex)?;
+    lex.finish().map_err(json)?;
     for key in top.keys() {
         if !matches!(
             key.as_str(),
             "assets" | "format_version" | "primary" | "schemas" | "uuid"
-        ) {
+        ) && strictness == Strictness::Full
+        {
             return Err(BundleError::UnknownEnvelopeKey { key: key.clone() });
         }
     }
 
-    let format_version = match top.remove("format_version") {
-        None => {
-            return Err(BundleError::MissingEnvelopeKey {
-                key: "format_version",
-            })
-        }
-        Some(AuthoredValue::UInt(n)) => {
-            if n != BUNDLE_FORMAT_VERSION as u128 {
-                return Err(BundleError::UnsupportedFormatVersion { found: n });
+    let format_version = {
+        let span = top.remove("format_version").ok_or(BundleError::MissingEnvelopeKey {
+            key: "format_version",
+        })?;
+        let mut lex = span.lexer(text);
+        let n = match lex.peek().map_err(json)? {
+            Kind::Number => {
+                let n = lex.clone().number().map_err(json)?;
+                (n.integer && !n.negative()).then(|| n.u128()).flatten()
             }
-            n as u32
-        }
-        Some(other) => {
-            return Err(BundleError::FormatVersionNotUInt {
-                found: kind_name(&other),
-            })
+            _ => None,
+        };
+        match n {
+            Some(n) if n == BUNDLE_FORMAT_VERSION as u128 => n as u32,
+            Some(n) => return Err(BundleError::UnsupportedFormatVersion { found: n }),
+            None => {
+                return Err(BundleError::FormatVersionNotUInt {
+                    found: found(&mut lex)?,
+                })
+            }
         }
     };
 
-    let uuid: BundleUuid = match top.remove("uuid") {
-        None => return Err(BundleError::MissingEnvelopeKey { key: "uuid" }),
-        Some(AuthoredValue::Str(s)) => s
-            .parse()
-            .map_err(|_| BundleError::BadBundleUuid { found: s.clone() })?,
-        Some(other) => {
-            return Err(BundleError::BadBundleUuid {
-                found: kind_name(&other).to_string(),
-            })
+    let uuid: BundleUuid = {
+        let span = top
+            .remove("uuid")
+            .ok_or(BundleError::MissingEnvelopeKey { key: "uuid" })?;
+        match string(&mut span.lexer(text))? {
+            Ok(s) => s
+                .parse()
+                .map_err(|_| BundleError::BadBundleUuid { found: s.clone() })?,
+            Err(found) => {
+                return Err(BundleError::BadBundleUuid {
+                    found: found.to_string(),
+                })
+            }
         }
     };
 
     let primary = match top.remove("primary") {
         None => None,
-        Some(AuthoredValue::Str(s)) => Some(s),
-        Some(other) => {
-            return Err(BundleError::PrimaryNotString {
-                found: kind_name(&other),
-            })
-        }
+        Some(_) if strictness == Strictness::Namespace => None,
+        Some(span) => match string(&mut span.lexer(text))? {
+            Ok(s) => Some(s),
+            Err(found) => return Err(BundleError::PrimaryNotString { found }),
+        },
     };
 
-    let schemas_map = match top.remove("schemas") {
-        None => return Err(BundleError::MissingEnvelopeKey { key: "schemas" }),
-        Some(AuthoredValue::Object(m)) => m,
-        Some(other) => {
-            return Err(BundleError::SchemasNotObject {
-                found: kind_name(&other),
-            })
-        }
-    };
     let mut schemas = BTreeMap::new();
-    for (key, snapshot) in schemas_map {
-        let hash: LogicalHash = key
-            .parse()
-            .map_err(|_| BundleError::BadSchemaKey { key: key.clone() })?;
-        // The snapshot codec verifies canonical text; re-rendering the
-        // parsed subtree through the canonical writer yields exactly that
-        // text form, so a hand-reformatted envelope still verifies (and
-        // rewrites canonically).
-        let text = distill_json::write(&snapshot).map_err(BundleError::JsonWrite)?;
-        let schema =
-            verify_snapshot(&text, hash).map_err(|error| BundleError::Schema { hash, error })?;
-        if schemas.insert(hash, schema).is_some() {
-            return Err(BundleError::DuplicateSchema { hash });
+    {
+        let span = top
+            .remove("schemas")
+            .ok_or(BundleError::MissingEnvelopeKey { key: "schemas" })?;
+        let mut lex = span.lexer(text);
+        if lex.peek().map_err(json)? != Kind::Object {
+            return Err(BundleError::SchemasNotObject {
+                found: found(&mut lex)?,
+            });
+        }
+        for (key, span) in members(&mut lex)? {
+            let hash: LogicalHash = key
+                .parse()
+                .map_err(|_| BundleError::BadSchemaKey { key: key.clone() })?;
+            // The snapshot is read for structure and its hash checked: a
+            // hand-reformatted envelope still verifies (and rewrites
+            // canonically).
+            let schema = read_snapshot(&mut span.lexer(text))
+                .and_then(|schema| check_hash(&schema, hash).map(|()| schema))
+                .map_err(|error| BundleError::Schema { hash, error })?;
+            if schemas.insert(hash, schema).is_some() {
+                return Err(BundleError::DuplicateSchema { hash });
+            }
         }
     }
 
-    let assets_map = match top.remove("assets") {
-        None => return Err(BundleError::MissingEnvelopeKey { key: "assets" }),
-        Some(AuthoredValue::Object(m)) => m,
-        Some(other) => {
-            return Err(BundleError::AssetsNotObject {
-                found: kind_name(&other),
-            })
-        }
-    };
     let mut assets = BTreeMap::new();
-    for (local_id, entry_value) in assets_map {
-        check_local_id(&local_id)?;
-        let mut entry = match entry_value {
-            AuthoredValue::Object(m) => m,
-            other => {
+    let mut data_spans = BTreeMap::new();
+    {
+        let span = top
+            .remove("assets")
+            .ok_or(BundleError::MissingEnvelopeKey { key: "assets" })?;
+        let mut lex = span.lexer(text);
+        if lex.peek().map_err(json)? != Kind::Object {
+            return Err(BundleError::AssetsNotObject {
+                found: found(&mut lex)?,
+            });
+        }
+        for (local_id, span) in members(&mut lex)? {
+            check_local_id(&local_id)?;
+            let mut lex = span.lexer(text);
+            if lex.peek().map_err(json)? != Kind::Object {
                 return Err(BundleError::EntryNotObject {
                     local_id,
-                    found: kind_name(&other),
-                })
-            }
-        };
-        for key in entry.keys() {
-            if !matches!(
-                key.as_str(),
-                "authoring_only" | "data" | "lineage" | "schema_hash" | "type_uuid" | "uuid"
-            ) {
-                return Err(BundleError::UnknownEntryKey {
-                    local_id,
-                    key: key.clone(),
+                    found: found(&mut lex)?,
                 });
             }
-        }
-        let uuid: AssetUuid = take_id(&mut entry, &local_id, "uuid")?;
-        let type_uuid: TypeUuid = take_id(&mut entry, &local_id, "type_uuid")?;
-        let schema_hash: LogicalHash = take_id(&mut entry, &local_id, "schema_hash")?;
-        // Bundles written before lineage was retired carry a `lineage` key;
-        // it is accepted and ignored.
-        entry.remove("lineage");
-        let authoring_only = match entry.remove("authoring_only") {
-            None => {
-                return Err(BundleError::MissingEntryKey {
-                    local_id,
-                    key: "authoring_only",
-                })
+            let mut entry = members(&mut lex)?;
+            for key in entry.keys() {
+                if !matches!(
+                    key.as_str(),
+                    "authoring_only" | "data" | "lineage" | "schema_hash" | "type_uuid" | "uuid"
+                ) && strictness == Strictness::Full
+                {
+                    return Err(BundleError::UnknownEntryKey {
+                        local_id,
+                        key: key.clone(),
+                    });
+                }
             }
-            Some(AuthoredValue::Bool(value)) => value,
-            Some(other) => {
-                return Err(BundleError::AuthoringOnlyNotBool {
-                    local_id,
-                    found: kind_name(&other),
-                })
+            let uuid: AssetUuid = take_id(text, &mut entry, &local_id, "uuid")?;
+            let type_uuid: TypeUuid = take_id(text, &mut entry, &local_id, "type_uuid")?;
+            let schema_hash: LogicalHash = take_id(text, &mut entry, &local_id, "schema_hash")?;
+            // Bundles written before lineage was retired carry a `lineage`
+            // key; it is accepted and ignored.
+            entry.remove("lineage");
+            let authoring_only = {
+                let span = entry
+                    .remove("authoring_only")
+                    .ok_or_else(|| BundleError::MissingEntryKey {
+                        local_id: local_id.clone(),
+                        key: "authoring_only",
+                    })?;
+                let mut lex = span.lexer(text);
+                if lex.peek().map_err(json)? != Kind::Bool {
+                    return Err(BundleError::AuthoringOnlyNotBool {
+                        local_id,
+                        found: found(&mut lex)?,
+                    });
+                }
+                lex.bool().map_err(json)?
+            };
+            if local_id.starts_with('$') && !authoring_only {
+                return Err(BundleError::ReservedEntryMustBeAuthoringOnly { local_id });
             }
-        };
-        if local_id.starts_with('$') && !authoring_only {
-            return Err(BundleError::ReservedEntryMustBeAuthoringOnly { local_id });
+            let data = entry
+                .remove("data")
+                .ok_or_else(|| BundleError::MissingEntryKey {
+                    local_id: local_id.clone(),
+                    key: "data",
+                })?;
+            data_spans.insert(local_id.clone(), data);
+            assets.insert(
+                local_id,
+                AssetEntry {
+                    uuid,
+                    type_uuid,
+                    schema_hash,
+                    authoring_only,
+                    data: ngp_schema::Value::Unit,
+                },
+            );
         }
-        let data = entry
-            .remove("data")
-            .ok_or_else(|| BundleError::MissingEntryKey {
-                local_id: local_id.clone(),
-                key: "data",
-            })?;
-        assets.insert(
-            local_id,
-            AssetEntry {
-                uuid,
-                type_uuid,
-                schema_hash,
-                authoring_only,
-                data,
-            },
-        );
     }
 
     // Schema-closure (§6, §11): every entry schema resolves within the file.
@@ -288,8 +293,7 @@ pub(crate) fn decode(value: AuthoredValue) -> Result<Bundle, BundleError> {
                 });
             }
         }
-        let schema = &schemas[&entry.schema_hash];
-        validate_entry_role(local_id, format_version, entry, schema)?;
+        validate_entry_role(local_id, format_version, entry, &schemas[&entry.schema_hash])?;
     }
     if let Some(p) = &primary {
         match assets.get(p) {
@@ -299,6 +303,12 @@ pub(crate) fn decode(value: AuthoredValue) -> Result<Bundle, BundleError> {
             }
             Some(_) => {}
         }
+    }
+
+    for (local_id, entry) in assets.iter_mut() {
+        let span = &data_spans[local_id];
+        let root = &schemas[&entry.schema_hash].root;
+        entry.data = parse_entry(local_id, root, &mut span.lexer(text), &mut blobs)?;
     }
 
     Ok(Bundle {
@@ -327,26 +337,29 @@ pub(crate) fn check_local_id(local_id: &str) -> Result<(), BundleError> {
 }
 
 fn take_id<T: std::str::FromStr>(
-    entry: &mut BTreeMap<String, AuthoredValue>,
+    text: &str,
+    entry: &mut BTreeMap<String, Span>,
     local_id: &str,
     field: &'static str,
 ) -> Result<T, BundleError> {
-    match entry.remove(field) {
-        None => Err(BundleError::MissingEntryKey {
+    let span = entry
+        .remove(field)
+        .ok_or_else(|| BundleError::MissingEntryKey {
             local_id: local_id.to_string(),
             key: field,
-        }),
-        Some(AuthoredValue::Str(s)) => s.parse().map_err(|_| BundleError::BadEntryId {
-            local_id: local_id.to_string(),
-            field,
-            found: s.clone(),
-        }),
-        Some(other) => Err(BundleError::BadEntryId {
-            local_id: local_id.to_string(),
-            field,
-            found: kind_name(&other).to_string(),
-        }),
-    }
+        })?;
+    let found = match string(&mut span.lexer(text))? {
+        Ok(s) => match s.parse() {
+            Ok(id) => return Ok(id),
+            Err(_) => s,
+        },
+        Err(found) => found.to_string(),
+    };
+    Err(BundleError::BadEntryId {
+        local_id: local_id.to_string(),
+        field,
+        found,
+    })
 }
 
 /// Entry roles: `$record` is exactly the built-in ImportRecord, and a
@@ -395,62 +408,52 @@ fn role_error<T>(local_id: &str, detail: &'static str) -> Result<T, BundleError>
     })
 }
 
-/// Build the envelope JSON value for the writer. `data` carries each
-/// entry's data with blob leaves already rewritten for the target encoding
-/// (verbatim for plain — there are none — or `{"len","offset"}` for the
-/// container). Schema snapshots are spliced through the snapshot codec.
-pub(crate) fn build(
+/// Write the envelope text. `data` holds each entry's canonical data text,
+/// blob leaves already placed for the target encoding.
+pub(crate) fn write(
     bundle: &Bundle,
-    mut data: BTreeMap<String, AuthoredValue>,
-) -> Result<AuthoredValue, BundleError> {
-    let mut top = BTreeMap::new();
-    top.insert(
-        "format_version".to_string(),
-        AuthoredValue::UInt(bundle.format_version as u128),
-    );
-    top.insert(
-        "uuid".to_string(),
-        AuthoredValue::Str(bundle.uuid.to_string()),
-    );
-    if let Some(p) = &bundle.primary {
-        top.insert("primary".to_string(), AuthoredValue::Str(p.clone()));
+    data: &BTreeMap<&str, String>,
+) -> Result<String, BundleError> {
+    use distill_json::write_str;
+    let mut out = String::from("{\"assets\":{");
+    for (i, (local_id, entry)) in bundle.assets.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_str(local_id, &mut out);
+        out.push_str(":{\"authoring_only\":");
+        out.push_str(if entry.authoring_only { "true" } else { "false" });
+        out.push_str(",\"data\":");
+        out.push_str(data.get(local_id.as_str()).ok_or_else(|| BundleError::Internal {
+            detail: format!("writer lost data for entry {local_id:?}"),
+        })?);
+        out.push_str(",\"schema_hash\":");
+        write_str(&entry.schema_hash.to_string(), &mut out);
+        out.push_str(",\"type_uuid\":");
+        write_str(&entry.type_uuid.to_string(), &mut out);
+        out.push_str(",\"uuid\":");
+        write_str(&entry.uuid.to_string(), &mut out);
+        out.push('}');
     }
-
-    let mut schemas = BTreeMap::new();
-    for (hash, schema) in &bundle.schemas {
+    out.push_str("},\"format_version\":");
+    out.push_str(&bundle.format_version.to_string());
+    if let Some(p) = &bundle.primary {
+        out.push_str(",\"primary\":");
+        write_str(p, &mut out);
+    }
+    out.push_str(",\"schemas\":{");
+    for (i, (hash, schema)) in bundle.schemas.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_str(&hash.to_string(), &mut out);
+        out.push(':');
         let text =
             snapshot_to_json(schema).map_err(|error| BundleError::Schema { hash: *hash, error })?;
-        let value = distill_json::parse(&text).map_err(BundleError::Json)?;
-        schemas.insert(hash.to_string(), value);
+        out.push_str(&text);
     }
-    top.insert("schemas".to_string(), AuthoredValue::Object(schemas));
-
-    let mut assets = BTreeMap::new();
-    for (local_id, entry) in &bundle.assets {
-        let data_value = data.remove(local_id).ok_or_else(|| BundleError::Internal {
-            detail: format!("writer lost data for entry {local_id:?}"),
-        })?;
-        let mut m = BTreeMap::new();
-        m.insert(
-            "uuid".to_string(),
-            AuthoredValue::Str(entry.uuid.to_string()),
-        );
-        m.insert(
-            "type_uuid".to_string(),
-            AuthoredValue::Str(entry.type_uuid.to_string()),
-        );
-        m.insert(
-            "schema_hash".to_string(),
-            AuthoredValue::Str(entry.schema_hash.to_string()),
-        );
-        m.insert(
-            "authoring_only".to_string(),
-            AuthoredValue::Bool(entry.authoring_only),
-        );
-        m.insert("data".to_string(), data_value);
-        assets.insert(local_id.clone(), AuthoredValue::Object(m));
-    }
-    top.insert("assets".to_string(), AuthoredValue::Object(assets));
-
-    Ok(AuthoredValue::Object(top))
+    out.push_str("},\"uuid\":");
+    write_str(&bundle.uuid.to_string(), &mut out);
+    out.push('}');
+    Ok(out)
 }

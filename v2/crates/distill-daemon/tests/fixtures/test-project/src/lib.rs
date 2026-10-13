@@ -19,7 +19,7 @@ use distill_daemon::config::DaemonConfig;
 use distill_daemon::coordinator::DaemonCoordinator;
 use distill_daemon::scanner::AssetRoot;
 use distill_daemon::watcher::WatcherBatch;
-use distill_json::AuthoredValue;
+use distill_schema::ngp_schema::Value;
 use distill_rpc::{
     ArtifactPayload, BuildAnswer, BuildBackend, BuildCompletion, BuildRequest, BuildStart,
     BuildTicket, BuildView, RpcFailure, Server, ServerHandle, SnapshotStamp, TargetDefinition,
@@ -42,7 +42,7 @@ pub struct Asset {
     pub uuid: AssetUuid,
     pub type_uuid: TypeUuid,
     pub schema: SchemaNode,
-    pub value: AuthoredValue,
+    pub value: Value,
     pub authoring_only: bool,
 }
 
@@ -54,7 +54,7 @@ impl Asset {
             uuid,
             type_uuid,
             schema: SchemaNode::Blob,
-            value: AuthoredValue::Blob(bytes.to_vec()),
+            value: Value::Blob(bytes.to_vec()),
             authoring_only: false,
         }
     }
@@ -66,7 +66,7 @@ impl Asset {
             uuid,
             type_uuid,
             schema: SchemaNode::Primitive(distill_schema::ngp_schema::PrimitiveKind::U8),
-            value: AuthoredValue::UInt(value.into()),
+            value: Value::U8(value),
             authoring_only: false,
         }
     }
@@ -215,7 +215,7 @@ impl TestProject {
         local_id: &str,
         uuid: AssetUuid,
         type_uuid: TypeUuid,
-        value: AuthoredValue,
+        value: Value,
     ) -> Asset {
         let authority = self.authority.as_ref().expect("the project is configured");
         Asset {

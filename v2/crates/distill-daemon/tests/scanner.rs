@@ -5,8 +5,7 @@ use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
 use distill_daemon::scanner::{
     AssetRoot, RootedScanner, ScanDiagnostic, ScanError, ScannedFileKind,
 };
-use distill_json::AuthoredValue;
-use distill_schema::ngp_schema::{node_hash, LogicalSchema, PrimitiveKind, SchemaNode};
+use distill_schema::ngp_schema::{node_hash, LogicalSchema, PrimitiveKind, SchemaNode, Value};
 use distill_store::state::{PlatformPathBytes, ScanSubject};
 
 fn ordinary_bundle() -> Vec<u8> {
@@ -20,7 +19,7 @@ fn ordinary_bundle() -> Vec<u8> {
         type_uuid,
         schema_hash,
         authoring_only: false,
-        data: AuthoredValue::UInt(7),
+        data: Value::U8(7),
     };
     distill_bundle::write_bundle(&Bundle {
         format_version: 1,

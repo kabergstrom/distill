@@ -1,13 +1,148 @@
-//! Shared fixtures: schemas built directly from `SchemaNode` values, value
-//! builders, and a raw container builder for crafting corrupt files.
+//! Shared fixtures: schemas built directly from `SchemaNode` values, a
+//! small JSON tree (`V`) for spelling data and envelopes as text, typed
+//! entries converted from it through the canonical codec, and a raw
+//! container builder for crafting corrupt files.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
 
 use distill_bundle::{crc32c, AssetEntry, Bundle, CONTAINER_MAGIC, CONTAINER_VERSION};
 use distill_core::id::{LogicalHash, TypeUuid};
-use distill_json::AuthoredValue as V;
-use ngp_schema::{node_hash, LogicalSchema, PrimitiveKind, SchemaNode as N};
+use distill_json::{Kind, Lexer};
+use ngp_schema::{
+    node_hash, parse_value, write_value, BlobSource, LogicalSchema, Options, PathComponent,
+    PrimitiveKind, SchemaNode as N, TextError, Value, WriteOptions,
+};
+
+// ---- the JSON tree ----
+
+/// A JSON value as text spells it, plus blob bytes (written as
+/// `{"len","offset"}` placements when converted to a typed value).
+#[derive(Debug, Clone, PartialEq)]
+pub enum V {
+    Null,
+    Bool(bool),
+    Int(i128),
+    UInt(u128),
+    Float(f64),
+    Str(String),
+    Array(Vec<V>),
+    Object(BTreeMap<String, V>),
+    Blob(Vec<u8>),
+}
+
+/// Canonical text of `v`; blobs are placed into `chunk` (16-aligned) or,
+/// without one, panic.
+fn write_json(v: &V, out: &mut String, chunk: &mut Option<&mut Vec<u8>>) {
+    match v {
+        V::Null => out.push_str("null"),
+        V::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        V::Int(i) => out.push_str(&i.to_string()),
+        V::UInt(u) => out.push_str(&u.to_string()),
+        V::Float(f) => distill_json::write_f64(*f, out).expect("finite fixture float"),
+        V::Str(s) => distill_json::write_str(s, out),
+        V::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json(item, out, chunk);
+            }
+            out.push(']');
+        }
+        V::Object(map) => {
+            out.push('{');
+            for (i, (k, item)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                distill_json::write_str(k, out);
+                out.push(':');
+                write_json(item, out, chunk);
+            }
+            out.push('}');
+        }
+        V::Blob(bytes) => {
+            let chunk = chunk.as_mut().expect("blob outside a typed conversion");
+            let offset = (chunk.len() + 15) & !15;
+            chunk.resize(offset, 0);
+            chunk.extend_from_slice(bytes);
+            out.push_str(&format!("{{\"len\":{},\"offset\":{offset}}}", bytes.len()));
+        }
+    }
+}
+
+/// Canonical text of a blob-free tree.
+pub fn json_text(v: &V) -> String {
+    let mut out = String::new();
+    write_json(v, &mut out, &mut None);
+    out
+}
+
+/// Parse JSON text into the tree.
+pub fn parse_json(text: &str) -> V {
+    fn read(lex: &mut Lexer<'_>) -> V {
+        match lex.peek().expect("JSON") {
+            Kind::Null => {
+                lex.null().unwrap();
+                V::Null
+            }
+            Kind::Bool => V::Bool(lex.bool().unwrap()),
+            Kind::Number => {
+                let n = lex.number().unwrap();
+                if !n.integer {
+                    V::Float(n.f64().unwrap())
+                } else if n.negative() {
+                    V::Int(n.i128().unwrap())
+                } else {
+                    V::UInt(n.u128().unwrap())
+                }
+            }
+            Kind::String => V::Str(lex.string().unwrap().into_owned()),
+            Kind::Array => {
+                let mut open = lex.array().unwrap();
+                let mut items = Vec::new();
+                while lex.next_item(&mut open).unwrap() {
+                    items.push(read(lex));
+                }
+                V::Array(items)
+            }
+            Kind::Object => {
+                let mut open = lex.object().unwrap();
+                let mut map = BTreeMap::new();
+                while let Some((k, _)) = lex.next_key(&mut open).unwrap() {
+                    let item = read(lex);
+                    assert!(map.insert(k.into_owned(), item).is_none(), "duplicate key");
+                }
+                V::Object(map)
+            }
+        }
+    }
+    let mut lex = Lexer::new(text);
+    let v = read(&mut lex);
+    lex.finish().unwrap();
+    v
+}
+
+/// Typed value of `data` under `schema` through the canonical codec.
+pub fn try_value(schema: &LogicalSchema, data: &V) -> Result<Value, TextError> {
+    struct Chunk(Vec<u8>);
+    impl BlobSource for Chunk {
+        fn blob(&mut self, _: &[PathComponent], len: u64, offset: u64) -> Result<Vec<u8>, String> {
+            Ok(self.0[offset as usize..(offset + len) as usize].to_vec())
+        }
+    }
+    let mut chunk = Vec::new();
+    let mut text = String::new();
+    write_json(data, &mut text, &mut Some(&mut chunk));
+    let mut source = Chunk(chunk);
+    parse_value(&text, &schema.root, Options::canonical().blobs(&mut source))
+}
+
+pub fn value(schema: &LogicalSchema, data: &V) -> Value {
+    try_value(schema, data).unwrap_or_else(|e| panic!("fixture data: {e}"))
+}
 
 // ---- value builders ----
 
@@ -114,6 +249,10 @@ pub const TYPE_A: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 pub const BUNDLE_UUID: &str = "01234567-89ab-cdef-0123-456789abcdef";
 
 pub fn entry(uuid: &str, schema: &LogicalSchema, data: V) -> AssetEntry {
+    typed_entry(uuid, schema, value(schema, &data))
+}
+
+pub fn typed_entry(uuid: &str, schema: &LogicalSchema, data: Value) -> AssetEntry {
     let type_uuid: TypeUuid = TYPE_A.parse().expect("fixture type uuid");
     let schema_hash = lh(schema);
     AssetEntry {
@@ -193,10 +332,7 @@ pub fn fix_blob_crc(bytes: &mut [u8]) {
 
 // ---- reference envelope builder (bypasses write_bundle validation) ----
 
-/// Build the envelope JSON value exactly as the canonical writer lays it
-/// out, but with `data` spliced verbatim — no schema walk, no blob
-/// handling. Lets tests construct files write_bundle would refuse.
-pub fn envelope_value(b: &Bundle) -> V {
+fn envelope_with(b: &Bundle, data: impl Fn(&str, &AssetEntry) -> V) -> V {
     let mut top = BTreeMap::new();
     top.insert(
         "format_version".to_string(),
@@ -209,10 +345,7 @@ pub fn envelope_value(b: &Bundle) -> V {
     let mut schemas = BTreeMap::new();
     for (h, sc) in &b.schemas {
         let text = ngp_schema::snapshot_to_json(sc).expect("fixture snapshot");
-        schemas.insert(
-            h.to_string(),
-            distill_json::parse(&text).expect("snapshot is JSON"),
-        );
+        schemas.insert(h.to_string(), parse_json(&text));
     }
     top.insert("schemas".to_string(), V::Object(schemas));
     let mut assets = BTreeMap::new();
@@ -222,19 +355,44 @@ pub fn envelope_value(b: &Bundle) -> V {
         m.insert("type_uuid".to_string(), V::Str(e.type_uuid.to_string()));
         m.insert("schema_hash".to_string(), V::Str(e.schema_hash.to_string()));
         m.insert("authoring_only".to_string(), V::Bool(e.authoring_only));
-        m.insert("data".to_string(), e.data.clone());
+        m.insert("data".to_string(), data(id, e));
         assets.insert(id.clone(), V::Object(m));
     }
     top.insert("assets".to_string(), V::Object(assets));
     V::Object(top)
 }
 
+/// The envelope JSON value exactly as the canonical writer lays it out, a
+/// blob-free bundle's data written by the codec.
+pub fn envelope_value(b: &Bundle) -> V {
+    envelope_with(b, |_, e| {
+        let sc = &b.schemas[&e.schema_hash];
+        parse_json(&write_value(&sc.root, &e.data, WriteOptions::default()).expect("data writable"))
+    })
+}
+
+fn with_newline(v: &V) -> Vec<u8> {
+    let mut text = json_text(v);
+    text.push('\n');
+    text.into_bytes()
+}
+
 /// Plain-encoding bytes of the reference envelope (canonical text plus the
 /// single trailing newline).
 pub fn plain_bytes(b: &Bundle) -> Vec<u8> {
-    let mut text = distill_json::write(&envelope_value(b)).expect("envelope writable");
-    text.push('\n');
-    text.into_bytes()
+    with_newline(&envelope_value(b))
+}
+
+/// Plain-encoding bytes of a one-entry bundle (`local_id` "a", `UUID_A`)
+/// whose `data` is spliced verbatim — no schema check: files write_bundle
+/// cannot produce.
+pub fn raw_plain(schema: &LogicalSchema, local_id: &str, data: V) -> Vec<u8> {
+    let b = bundle(
+        &[schema],
+        vec![(local_id, typed_entry(UUID_A, schema, Value::Unit))],
+        None,
+    );
+    with_newline(&envelope_with(&b, |_, _| data.clone()))
 }
 
 // ---- envelope mutation (plain text) ----
@@ -243,14 +401,12 @@ pub fn plain_bytes(b: &Bundle) -> Vec<u8> {
 /// re-serialize (canonical text + trailing newline).
 pub fn mutate_envelope(plain: &[u8], f: impl FnOnce(&mut V)) -> Vec<u8> {
     let text = std::str::from_utf8(plain).expect("plain bundle is UTF-8");
-    let mut v = distill_json::parse(text).expect("plain bundle is JSON");
+    let mut v = parse_json(text);
     f(&mut v);
-    let mut out = distill_json::write(&v).expect("mutated envelope writable");
-    out.push('\n');
-    out.into_bytes()
+    with_newline(&v)
 }
 
-/// Navigate to a mutable object map inside an AuthoredValue.
+/// Navigate to a mutable object map inside a tree.
 pub fn as_obj(v: &mut V) -> &mut BTreeMap<String, V> {
     match v {
         V::Object(m) => m,

@@ -4,7 +4,7 @@ use distill_build::import::*;
 use distill_build::query::{FileQuery, RootName, RootedPath};
 use distill_build::trace::{CapabilityKey, Observed, RawFileFailureClass};
 use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
-use distill_json::AuthoredValue;
+use ngp_schema::Value;
 
 #[derive(Default)]
 struct Fs {
@@ -88,14 +88,14 @@ fn successful_read_records_root_and_raw_byte_hash() {
 fn importer_output_rejects_reserved_and_normalized_duplicates() {
     let mut out = ImportOutput::new();
     assert!(out
-        .entry("$settings", TypeUuid([1; 16]), AuthoredValue::Null)
+        .entry("$settings", TypeUuid([1; 16]), Value::Unit)
         .is_err());
-    out.entry("e\u{301}", TypeUuid([1; 16]), AuthoredValue::UInt(1))
+    out.entry("e\u{301}", TypeUuid([1; 16]), Value::U32(1))
         .unwrap();
     assert!(out
-        .entry("\u{e9}", TypeUuid([1; 16]), AuthoredValue::UInt(2))
+        .entry("\u{e9}", TypeUuid([1; 16]), Value::U32(2))
         .is_err());
-    assert_eq!(out.entries()["\u{e9}"].value, AuthoredValue::UInt(1));
+    assert_eq!(out.entries()["\u{e9}"].value, Value::U32(1));
     out.primary("\u{e9}").unwrap();
     assert!(out.primary("\u{e9}").is_err());
 }
@@ -119,7 +119,7 @@ fn request(output: ImportOutput) -> FoldRequest {
     FoldRequest {
         output,
         explicit_settings: None,
-        default_settings: AuthoredValue::UInt(1),
+        default_settings: Value::U32(1),
         importer: "test".into(),
         sources: vec![RootedPath::new("assets", "x.src").unwrap()],
         watch: true,
@@ -132,10 +132,10 @@ fn request(output: ImportOutput) -> FoldRequest {
 fn fold_reuses_matched_ids_retires_absent_entries_and_preserves_settings() {
     let mut first = ImportOutput::new();
     first
-        .entry("a", TypeUuid([1; 16]), AuthoredValue::UInt(1))
+        .entry("a", TypeUuid([1; 16]), Value::U32(1))
         .unwrap();
     first
-        .entry("b", TypeUuid([1; 16]), AuthoredValue::UInt(2))
+        .entry("b", TypeUuid([1; 16]), Value::U32(2))
         .unwrap();
     first.primary("a").unwrap();
     let mut ids = Ids {
@@ -144,21 +144,21 @@ fn fold_reuses_matched_ids_retires_absent_entries_and_preserves_settings() {
     };
     let mut bundle = fold_import(None, request(first), &mut ids).unwrap();
     let a_id = bundle.entries["a"].uuid;
-    bundle.settings = AuthoredValue::UInt(99);
+    bundle.settings = Value::U32(99);
 
     let mut second = ImportOutput::new();
     second
-        .entry("a", TypeUuid([1; 16]), AuthoredValue::UInt(3))
+        .entry("a", TypeUuid([1; 16]), Value::U32(3))
         .unwrap();
     second
-        .entry("c", TypeUuid([1; 16]), AuthoredValue::UInt(4))
+        .entry("c", TypeUuid([1; 16]), Value::U32(4))
         .unwrap();
     second.primary("c").unwrap();
     let next = fold_import(Some(&bundle), request(second), &mut ids).unwrap();
     assert_eq!(next.bundle_uuid, bundle.bundle_uuid);
     assert_eq!(next.entries["a"].uuid, a_id);
     assert!(!next.entries.contains_key("b"));
-    assert_eq!(next.settings, AuthoredValue::UInt(99));
+    assert_eq!(next.settings, Value::U32(99));
 }
 
 #[test]
@@ -171,14 +171,14 @@ fn vanished_prior_primary_requires_explicit_replacement() {
             ImportedEntry {
                 uuid: AssetUuid([2; 16]),
                 type_uuid: TypeUuid([3; 16]),
-                value: AuthoredValue::Null,
+                value: Value::Unit,
             },
         )]),
-        settings: AuthoredValue::Null,
+        settings: Value::Unit,
         record: ImportRecord::default(),
     };
     let mut out = ImportOutput::new();
-    out.entry("new", TypeUuid([3; 16]), AuthoredValue::Null)
+    out.entry("new", TypeUuid([3; 16]), Value::Unit)
         .unwrap();
     let mut ids = Ids {
         assets: 0,

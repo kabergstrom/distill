@@ -2,13 +2,13 @@
 //! processor outputs.
 
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
-use distill_json::AuthoredValue;
+use ngp_schema::Value;
 use distill_schema::ngp_schema::SchemaNode;
 use distill_wire::artifact::{
     content_hash, parse_artifact, write_artifact, ArtifactError, ArtifactHeader,
 };
 use distill_wire::encode::{
-    encode_authored_value, AuthoredReferenceResolver, EncodeError, EncodedReference,
+    encode_value, ReferenceResolver, EncodeError, EncodedReference,
 };
 use distill_wire::wire::WireNode;
 
@@ -22,7 +22,7 @@ pub struct ArtifactValueSpec<'a> {
     pub layout_hash: LayoutHash,
     pub schema: &'a SchemaNode,
     pub wire: &'a WireNode,
-    pub value: &'a AuthoredValue,
+    pub value: &'a Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,9 +66,9 @@ impl From<ArtifactError> for ArtifactEncodeError {
 
 pub fn encode_artifact_value(
     spec: ArtifactValueSpec<'_>,
-    resolver: &mut impl AuthoredReferenceResolver,
+    resolver: &mut impl ReferenceResolver,
 ) -> Result<EncodedArtifact, ArtifactEncodeError> {
-    let encoded = encode_authored_value(spec.schema, spec.wire, spec.value, resolver)?;
+    let encoded = encode_value(spec.schema, spec.wire, spec.value, resolver)?;
     let mut load_deps = encoded
         .references
         .iter()

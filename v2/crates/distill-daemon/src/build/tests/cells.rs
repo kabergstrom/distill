@@ -93,16 +93,16 @@ struct ScriptedProcessor(Arc<Shared>);
 impl PipelineProcessor for ScriptedProcessor {
     fn process(
         &self,
-        input: AuthoredValue,
+        input: Value,
         context: &mut dyn PipelineProcessContext,
     ) -> Result<ProcessorProducts, ProcessorError> {
-        let AuthoredValue::Object(fields) = &input else {
+        let Value::Struct(fields) = &input else {
             panic!("processor input is a struct");
         };
-        let Some(AuthoredValue::UInt(value)) = fields.get("value") else {
+        let Some(value) = fields.first().and_then(Value::as_u128) else {
             panic!("processor input has a value");
         };
-        let value = u64::try_from(*value).unwrap();
+        let value = u64::try_from(value).unwrap();
         self.0.calls.lock().unwrap().push(value);
         let (reads, gate, fails) = {
             let script = self.0.script.lock().unwrap();
@@ -245,10 +245,7 @@ impl Cells {
                     type_uuid: TYPE,
                     schema_hash: project.logical_hash,
                     authoring_only: false,
-                    data: AuthoredValue::Object(BTreeMap::from([(
-                        "value".to_owned(),
-                        AuthoredValue::UInt(u128::from(value)),
-                    )])),
+                    data: Value::Struct(Box::new([Value::U8(value)])),
                 },
             )]),
         };

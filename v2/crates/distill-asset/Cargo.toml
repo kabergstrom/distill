@@ -12,7 +12,7 @@ distill-core = { path = "../distill-core" }
 # NativeLayoutNode, CallbackPanic, Blob) is declared once in distill-wire
 # and REUSED here — one declaration, never two.
 distill-wire = { path = "../distill-wire" }
-# DefaultTable writers produce AuthoredValue (§3, §6) — the bundle data
-# model declared in distill-json.
-distill-json = { path = "../distill-json" }
+# The typed value model (`to_value`, default writers) is the shared schema
+# crate's.
+ngp-schema = { path = "../../../../newgameplus/ngp-schema" }
 distill-asset-macro = { path = "../distill-asset-macro" }

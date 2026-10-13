@@ -3,7 +3,6 @@
 
 mod common;
 use common::*;
-use distill_json::AuthoredValue;
 use distill_migrate::{
     execute_edge, execute_ops, FieldPath, MigrationError, MigrationKind, MigrationOp,
 };
@@ -16,15 +15,20 @@ fn copy(fp: &[&str], tp: &[&str]) -> MigrationOp {
     }
 }
 
+/// Run `ops` on `input` (text of `from`), returning the output's text.
+fn run(ops: &[MigrationOp], input: &str, from: &SchemaNode, to: &SchemaNode) -> String {
+    let out = execute_ops(ops, &val(from, input), from, to, &NoDefaults).unwrap();
+    txt(to, &out.value)
+}
+
 #[test]
 fn copy_twice_from_one_source_proves_immutable_input() {
     // CopyField COPIES — the source stays readable to later ops (§11).
     let from = strct(0, &[("a", 0, p(PK::U32))]);
     let to = strct(0, &[("x", 0, p(PK::U32)), ("y", 0, p(PK::U32))]);
     let ops = vec![copy(&["a"], &["x"]), copy(&["a"], &["y"])];
-    let input = obj(&[("a", ui(41))]);
-    let out = execute_ops(&ops, &input, &from, &to, &NoDefaults).unwrap();
-    assert_eq!(out.value, obj(&[("x", ui(41)), ("y", ui(41))]));
+    let out = execute_ops(&ops, &val(&from, r#"{"a":41}"#), &from, &to, &NoDefaults).unwrap();
+    assert_eq!(txt(&to, &out.value), r#"{"x":41,"y":41}"#);
     assert!(out.defaulted.is_empty());
 }
 
@@ -56,58 +60,69 @@ fn op_order_shuffle_produces_identical_output() {
     ];
     let mut ops2 = ops1.clone();
     ops2.reverse();
-    let input = obj(&[("a", ui(1)), ("b", st("hi")), ("c", ui(9))]);
+    let input = val(&from, r#"{"a":1,"b":"hi","c":9}"#);
     let r1 = execute_ops(&ops1, &input, &from, &to, &NoDefaults).unwrap();
     let r2 = execute_ops(&ops2, &input, &from, &to, &NoDefaults).unwrap();
     assert_eq!(r1.value, r2.value);
 }
 
 #[test]
-fn widen_passes_value_through_with_normalization() {
+fn widen_converts_to_the_new_leaf_kind() {
     let from = strct(0, &[("a", 0, p(PK::I8))]);
     let to = strct(0, &[("a", 0, p(PK::I64))]);
     let ops = vec![MigrationOp::Widen {
         from: path(&["a"]),
         to: path(&["a"]),
     }];
-    // Negative stays Int.
-    let out = execute_ops(&ops, &obj(&[("a", int(-3))]), &from, &to, &NoDefaults).unwrap();
-    assert_eq!(out.value, obj(&[("a", int(-3))]));
-    // Non-negative normalizes to UInt (the pinned parse-variant split).
-    let out = execute_ops(&ops, &obj(&[("a", int(5))]), &from, &to, &NoDefaults).unwrap();
-    assert_eq!(out.value, obj(&[("a", ui(5))]));
-    // UInt stays UInt.
-    let out = execute_ops(&ops, &obj(&[("a", ui(7))]), &from, &to, &NoDefaults).unwrap();
-    assert_eq!(out.value, obj(&[("a", ui(7))]));
+    for n in [-3i8, 5] {
+        let out = execute_ops(
+            &ops,
+            &Value::Struct(Box::new([Value::I8(n)])),
+            &from,
+            &to,
+            &NoDefaults,
+        )
+        .unwrap();
+        assert_eq!(out.value, Value::Struct(Box::new([Value::I64(n as i64)])));
+    }
 }
 
 #[test]
-fn widen_float_passes_through() {
+fn widen_float_converts_to_f64() {
     let from = strct(0, &[("a", 0, p(PK::F32))]);
     let to = strct(0, &[("a", 0, p(PK::F64))]);
     let ops = vec![MigrationOp::Widen {
         from: path(&["a"]),
         to: path(&["a"]),
     }];
-    let out = execute_ops(&ops, &obj(&[("a", fl(1.5))]), &from, &to, &NoDefaults).unwrap();
-    assert_eq!(out.value, obj(&[("a", fl(1.5))]));
+    let out = execute_ops(&ops, &val(&from, r#"{"a":1.5}"#), &from, &to, &NoDefaults).unwrap();
+    assert_eq!(out.value, Value::Struct(Box::new([Value::F64(1.5)])));
 }
 
 #[test]
-fn widen_value_outside_old_range_is_corrupt_input() {
+fn widen_value_not_of_the_old_leaf_is_corrupt_input() {
     let from = strct(0, &[("a", 0, p(PK::U8))]);
     let to = strct(0, &[("a", 0, p(PK::U32))]);
     let ops = vec![MigrationOp::Widen {
         from: path(&["a"]),
         to: path(&["a"]),
     }];
-    let err = execute_ops(&ops, &obj(&[("a", ui(300))]), &from, &to, &NoDefaults).unwrap_err();
-    assert!(
-        matches!(err, MigrationError::WidenOutOfRange { .. }),
-        "{err:?}"
-    );
-    // Negative into an unsigned old leaf: same class.
-    let err = execute_ops(&ops, &obj(&[("a", int(-1))]), &from, &to, &NoDefaults).unwrap_err();
+    // A typed value cannot hold 300 as a u8; a u16 there is the wrong leaf.
+    let input = Value::Struct(Box::new([Value::U16(300)]));
+    let err = execute_ops(&ops, &input, &from, &to, &NoDefaults).unwrap_err();
+    assert!(matches!(err, MigrationError::InputShape { .. }), "{err:?}");
+}
+
+#[test]
+fn widen_value_outside_the_new_range_is_corrupt_input() {
+    // An unvalidated signed → unsigned "widening": -1 does not fit.
+    let from = strct(0, &[("a", 0, p(PK::I8))]);
+    let to = strct(0, &[("a", 0, p(PK::U32))]);
+    let ops = vec![MigrationOp::Widen {
+        from: path(&["a"]),
+        to: path(&["a"]),
+    }];
+    let err = execute_ops(&ops, &val(&from, r#"{"a":-1}"#), &from, &to, &NoDefaults).unwrap_err();
     assert!(
         matches!(err, MigrationError::WidenOutOfRange { .. }),
         "{err:?}"
@@ -125,14 +140,10 @@ fn write_none_and_write_value() {
         MigrationOp::WriteNone { to: path(&["o"]) },
         MigrationOp::WriteValue {
             to: path(&["v"]),
-            value: st("lit"),
+            value: Value::String("lit".into()),
         },
     ];
-    let out = execute_ops(&ops, &obj(&[]), &from, &to, &NoDefaults).unwrap();
-    assert_eq!(
-        out.value,
-        obj(&[("o", AuthoredValue::Null), ("v", st("lit"))])
-    );
+    assert_eq!(run(&ops, "{}", &from, &to), r#"{"o":null,"v":"lit"}"#);
 }
 
 #[test]
@@ -142,7 +153,7 @@ fn missing_default_fails_hard() {
     let from = strct(0, &[]);
     let to = strct(0, &[("b", 0, p(PK::U32))]);
     let ops = vec![MigrationOp::WriteFieldDefault { to: path(&["b"]) }];
-    let err = execute_ops(&ops, &obj(&[]), &from, &to, &NoDefaults).unwrap_err();
+    let err = execute_ops(&ops, &val(&from, "{}"), &from, &to, &NoDefaults).unwrap_err();
     assert!(
         matches!(&err, MigrationError::MissingDefault { path, .. } if path.contains('b')),
         "{err:?}"
@@ -154,14 +165,14 @@ fn defaults_populate_value_and_defaulted_list() {
     let from = strct(0, &[]);
     let to = strct(0, &[("b", 0, p(PK::U32)), ("c", 0, p(PK::U32))]);
     let mut defaults = TableDefaults::default();
-    defaults.field.insert(path(&["b"]), ui(11));
-    defaults.parent.insert(path(&["c"]), ui(22));
+    defaults.field.insert(path(&["b"]), Value::U32(11));
+    defaults.parent.insert(path(&["c"]), Value::U32(22));
     let ops = vec![
         MigrationOp::WriteFieldDefault { to: path(&["b"]) },
         MigrationOp::WriteParentDefault { to: path(&["c"]) },
     ];
-    let out = execute_ops(&ops, &obj(&[]), &from, &to, &defaults).unwrap();
-    assert_eq!(out.value, obj(&[("b", ui(11)), ("c", ui(22))]));
+    let out = execute_ops(&ops, &val(&from, "{}"), &from, &to, &defaults).unwrap();
+    assert_eq!(txt(&to, &out.value), r#"{"b":11,"c":22}"#);
     let mut defaulted = out.defaulted.clone();
     defaulted.sort();
     assert_eq!(defaulted, vec![path(&["b"]), path(&["c"])]);
@@ -174,7 +185,7 @@ fn defaulted_paths_from_element_frames_are_reported() {
     let from = strct(0, &[("items", 0, vec_of(elem_old))]);
     let to = strct(0, &[("items", 0, vec_of(elem_new))]);
     let mut defaults = TableDefaults::default();
-    defaults.field.insert(path(&["y"]), ui(0));
+    defaults.field.insert(path(&["y"]), Value::U8(0));
     let ops = vec![MigrationOp::MigrateElements {
         at: path(&["items"]),
         element: vec![
@@ -182,20 +193,11 @@ fn defaulted_paths_from_element_frames_are_reported() {
             MigrationOp::WriteFieldDefault { to: path(&["y"]) },
         ],
     }];
-    let input = obj(&[(
-        "items",
-        arr_v(&[obj(&[("x", ui(1))]), obj(&[("x", ui(2))])]),
-    )]);
+    let input = val(&from, r#"{"items":[{"x":1},{"x":2}]}"#);
     let out = execute_ops(&ops, &input, &from, &to, &defaults).unwrap();
     assert_eq!(
-        out.value,
-        obj(&[(
-            "items",
-            arr_v(&[
-                obj(&[("x", ui(1)), ("y", ui(0))]),
-                obj(&[("x", ui(2)), ("y", ui(0))])
-            ])
-        )])
+        txt(&to, &out.value),
+        r#"{"items":[{"x":1,"y":0},{"x":2,"y":0}]}"#
     );
     // One defaulted path per element, with diagnostic pseudo-segments.
     assert_eq!(out.defaulted.len(), 2);
@@ -208,15 +210,15 @@ fn map_variant_renames_and_transforms_payload() {
     let old_e = enm(
         0,
         &[
-            ("Old", 0, strct(0, &[("n", 0, p(PK::U32))])),
             ("Keep", 0, unit_payload()),
+            ("Old", 0, strct(0, &[("n", 0, p(PK::U32))])),
         ],
     );
     let new_e = enm(
         0,
         &[
-            ("New", 0, strct(0, &[("n", 0, p(PK::U64))])),
             ("Keep", 0, unit_payload()),
+            ("New", 0, strct(0, &[("n", 0, p(PK::U64))])),
         ],
     );
     let from = strct(0, &[("e", 0, old_e)]);
@@ -230,16 +232,39 @@ fn map_variant_renames_and_transforms_payload() {
             to: path(&["n"]),
         }],
     }];
-    let input = obj(&[("e", obj(&[("Old", obj(&[("n", ui(5))]))]))]);
-    let out = execute_ops(&ops, &input, &from, &to, &NoDefaults).unwrap();
     assert_eq!(
-        out.value,
-        obj(&[("e", obj(&[("New", obj(&[("n", ui(5))]))]))])
+        run(&ops, r#"{"e":{"Old":{"n":5}}}"#, &from, &to),
+        r#"{"e":{"New":{"n":5}}}"#
     );
     // A variant no MapVariant names passes through unchanged.
-    let input = obj(&[("e", obj(&[("Keep", obj(&[]))]))]);
-    let out = execute_ops(&ops, &input, &from, &to, &NoDefaults).unwrap();
-    assert_eq!(out.value, obj(&[("e", obj(&[("Keep", obj(&[]))]))]));
+    assert_eq!(
+        run(&ops, r#"{"e":{"Keep":{}}}"#, &from, &to),
+        r#"{"e":{"Keep":{}}}"#
+    );
+}
+
+#[test]
+fn passthrough_variant_follows_its_name_to_a_new_index() {
+    // "Keep" is variant 0 before and 1 after ("Added" sorts first).
+    let from = strct(0, &[("e", 0, enm(0, &[("Keep", 0, unit_payload())]))]);
+    let to = strct(
+        0,
+        &[(
+            "e",
+            0,
+            enm(0, &[("Added", 0, unit_payload()), ("Keep", 0, unit_payload())]),
+        )],
+    );
+    let ops = vec![MigrationOp::MapVariant {
+        at: path(&["e"]),
+        from: "Gone".to_string(),
+        to: "Added".to_string(),
+        payload: vec![],
+    }];
+    assert_eq!(
+        run(&ops, r#"{"e":{"Keep":{}}}"#, &from, &to),
+        r#"{"e":{"Keep":{}}}"#
+    );
 }
 
 #[test]
@@ -253,9 +278,7 @@ fn migrate_elements_over_vec() {
             to: root(),
         }],
     }];
-    let input = obj(&[("v", arr_v(&[ui(1), ui(2), ui(3)]))]);
-    let out = execute_ops(&ops, &input, &from, &to, &NoDefaults).unwrap();
-    assert_eq!(out.value, obj(&[("v", arr_v(&[ui(1), ui(2), ui(3)]))]));
+    assert_eq!(run(&ops, r#"{"v":[1,2,3]}"#, &from, &to), r#"{"v":[1,2,3]}"#);
 }
 
 #[test]
@@ -269,17 +292,8 @@ fn migrate_elements_over_option_null_and_some() {
             to: root(),
         }],
     }];
-    let out = execute_ops(
-        &ops,
-        &obj(&[("o", AuthoredValue::Null)]),
-        &from,
-        &to,
-        &NoDefaults,
-    )
-    .unwrap();
-    assert_eq!(out.value, obj(&[("o", AuthoredValue::Null)]));
-    let out = execute_ops(&ops, &obj(&[("o", ui(6))]), &from, &to, &NoDefaults).unwrap();
-    assert_eq!(out.value, obj(&[("o", ui(6))]));
+    assert_eq!(run(&ops, r#"{"o":null}"#, &from, &to), r#"{"o":null}"#);
+    assert_eq!(run(&ops, r#"{"o":6}"#, &from, &to), r#"{"o":6}"#);
 }
 
 #[test]
@@ -293,11 +307,9 @@ fn migrate_elements_over_map_values() {
             to: root(),
         }],
     }];
-    let input = obj(&[("m", obj(&[("k1", ui(1)), ("k2", ui(2))]))]);
-    let out = execute_ops(&ops, &input, &from, &to, &NoDefaults).unwrap();
     assert_eq!(
-        out.value,
-        obj(&[("m", obj(&[("k1", ui(1)), ("k2", ui(2))]))])
+        run(&ops, r#"{"m":{"k1":1,"k2":2}}"#, &from, &to),
+        r#"{"m":{"k1":1,"k2":2}}"#
     );
 }
 
@@ -311,10 +323,10 @@ fn set_duplicate_after_migration_is_error() {
         at: path(&["s"]),
         element: vec![MigrationOp::WriteValue {
             to: root(),
-            value: ui(1),
+            value: Value::U32(1),
         }],
     }];
-    let input = obj(&[("s", arr_v(&[ui(1), ui(2)]))]);
+    let input = val(&from, r#"{"s":[1,2]}"#);
     let err = execute_ops(&ops, &input, &from, &to, &NoDefaults).unwrap_err();
     assert!(
         matches!(err, MigrationError::DuplicateSetElement { .. }),
@@ -330,10 +342,10 @@ fn map_key_collision_after_migrate_map_keys_is_error() {
         at: path(&["m"]),
         key: vec![MigrationOp::WriteValue {
             to: root(),
-            value: st("same"),
+            value: Value::String("same".into()),
         }],
     }];
-    let input = obj(&[("m", obj(&[("a", ui(1)), ("b", ui(2))]))]);
+    let input = val(&from, r#"{"m":{"a":1,"b":2}}"#);
     let err = execute_ops(&ops, &input, &from, &to, &NoDefaults).unwrap_err();
     assert!(
         matches!(err, MigrationError::MapKeyCollision { .. }),
@@ -353,17 +365,9 @@ fn migrate_map_keys_widens_nonstring_keys() {
         }],
     }];
     // Non-string-key maps are [k, v] pair arrays (§6).
-    let input = obj(&[(
-        "m",
-        arr_v(&[arr_v(&[ui(1), st("one")]), arr_v(&[ui(2), st("two")])]),
-    )]);
-    let out = execute_ops(&ops, &input, &from, &to, &NoDefaults).unwrap();
     assert_eq!(
-        out.value,
-        obj(&[(
-            "m",
-            arr_v(&[arr_v(&[ui(1), st("one")]), arr_v(&[ui(2), st("two")])])
-        )])
+        run(&ops, r#"{"m":[[1,"one"],[2,"two"]]}"#, &from, &to),
+        r#"{"m":[[1,"one"],[2,"two"]]}"#
     );
 }
 
@@ -378,9 +382,20 @@ fn migrate_inline_runs_nested_frame() {
             to: path(&["x"]),
         }],
     }];
-    let input = obj(&[("inner", obj(&[("x", ui(3))]))]);
-    let out = execute_ops(&ops, &input, &from, &to, &NoDefaults).unwrap();
-    assert_eq!(out.value, obj(&[("inner", obj(&[("x", ui(3))]))]));
+    assert_eq!(
+        run(&ops, r#"{"inner":{"x":3}}"#, &from, &to),
+        r#"{"inner":{"x":3}}"#
+    );
+}
+
+#[test]
+fn input_struct_of_the_wrong_arity_is_corrupt_input() {
+    let from = strct(0, &[("a", 0, p(PK::U32)), ("b", 0, p(PK::U32))]);
+    let to = strct(0, &[("a", 0, p(PK::U32))]);
+    let ops = vec![copy(&["a"], &["a"])];
+    let input = Value::Struct(Box::new([Value::U32(1)]));
+    let err = execute_ops(&ops, &input, &from, &to, &NoDefaults).unwrap_err();
+    assert!(matches!(err, MigrationError::InputShape { .. }), "{err:?}");
 }
 
 // NOTE: `MigrationOp::Custom` was removed from the vocabulary (R20/M21);
@@ -396,7 +411,7 @@ fn edge_ops_are_validated_before_execution() {
     let kind = MigrationKind::Ops(vec![MigrationOp::WriteFieldDefault { to: path(&["a"]) }]);
     let err = execute_edge(
         &kind,
-        &obj(&[("a", ui(1))]),
+        &val(&from, r#"{"a":1}"#),
         &from,
         &to,
         &NoDefaults,
@@ -416,14 +431,14 @@ fn edge_ops_happy_path_runs_and_conforms() {
     }]);
     let out = execute_edge(
         &kind,
-        &obj(&[("a", ui(9))]),
+        &val(&from, r#"{"a":9}"#),
         &from,
         &to,
         &NoDefaults,
         &Fns::default(),
     )
     .unwrap();
-    assert_eq!(out.value, obj(&[("a", ui(9))]));
+    assert_eq!(txt(&to, &out.value), r#"{"a":9}"#);
 }
 
 #[test]
@@ -432,18 +447,17 @@ fn function_edge_runs() {
     let to = strct(0, &[("a", 0, p(PK::U32))]);
     let mut fns = Fns::default();
     fns.table.insert("bump".to_string(), |v| {
-        let AuthoredValue::Object(mut m) = v else {
-            return Err("not an object".into());
+        let Value::Struct(fields) = v else {
+            return Err("not a struct".into());
         };
-        let AuthoredValue::UInt(n) = m["a"] else {
-            return Err("a not uint".into());
+        let [Value::U32(n)] = *fields else {
+            return Err("a not u32".into());
         };
-        m.insert("a".to_string(), AuthoredValue::UInt(n + 1));
-        Ok(AuthoredValue::Object(m))
+        Ok(Value::Struct(Box::new([Value::U32(n + 1)])))
     });
     let kind = MigrationKind::Function("bump".to_string());
-    let out = execute_edge(&kind, &obj(&[("a", ui(1))]), &from, &to, &NoDefaults, &fns).unwrap();
-    assert_eq!(out.value, obj(&[("a", ui(2))]));
+    let out = execute_edge(&kind, &val(&from, r#"{"a":1}"#), &from, &to, &NoDefaults, &fns).unwrap();
+    assert_eq!(txt(&to, &out.value), r#"{"a":2}"#);
     assert!(out.defaulted.is_empty());
 }
 
@@ -453,10 +467,10 @@ fn function_edge_bad_output_caught_by_conformance_naming_edge() {
     let to = strct(0, &[("a", 0, p(PK::U32))]);
     let mut fns = Fns::default();
     fns.table
-        .insert("bad".to_string(), |_| Ok(AuthoredValue::Str("nope".into())));
+        .insert("bad".to_string(), |_| Ok(Value::String("nope".into())));
     let kind = MigrationKind::Function("bad".to_string());
-    let err =
-        execute_edge(&kind, &obj(&[("a", ui(1))]), &from, &to, &NoDefaults, &fns).unwrap_err();
+    let err = execute_edge(&kind, &val(&from, r#"{"a":1}"#), &from, &to, &NoDefaults, &fns)
+        .unwrap_err();
     let MigrationError::NonConforming { edge, .. } = &err else {
         panic!("expected NonConforming, got {err:?}");
     };
@@ -465,8 +479,8 @@ fn function_edge_bad_output_caught_by_conformance_naming_edge() {
 
 #[test]
 fn ops_edge_bad_output_caught_by_conformance() {
-    // A validated plan can still produce a non-conforming value (a literal
-    // of the wrong shape reaches a mismatched leaf via CopyField).
+    // A validated plan can still produce a non-conforming value (a value
+    // of the wrong kind reaches a mismatched leaf via CopyField).
     let from = strct(0, &[("a", 0, SchemaNode::String)]);
     let to = strct(0, &[("a", 0, p(PK::U32))]);
     let kind = MigrationKind::Ops(vec![MigrationOp::CopyField {
@@ -475,7 +489,7 @@ fn ops_edge_bad_output_caught_by_conformance() {
     }]);
     let err = execute_edge(
         &kind,
-        &obj(&[("a", st("not a number"))]),
+        &val(&from, r#"{"a":"not a number"}"#),
         &from,
         &to,
         &NoDefaults,
@@ -495,7 +509,7 @@ fn unknown_fn_key_is_error() {
     let kind = MigrationKind::Function("ghost".to_string());
     let err = execute_edge(
         &kind,
-        &obj(&[("a", ui(1))]),
+        &val(&from, r#"{"a":1}"#),
         &from,
         &to,
         &NoDefaults,

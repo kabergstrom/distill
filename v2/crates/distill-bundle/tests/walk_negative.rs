@@ -6,14 +6,12 @@ mod common;
 
 use common::*;
 use distill_bundle::{parse_bundle, write_bundle, BundleError as E};
-use distill_json::AuthoredValue as V;
-use ngp_schema::{PrimitiveKind as PK, SchemaNode as N};
+use ngp_schema::{PrimitiveKind as PK, SchemaNode as N, Value};
 
 /// Parse a plain bundle whose single entry "a" carries `data` under the
 /// given schema, expecting an error.
 fn walk_err(sc: &ngp_schema::LogicalSchema, data: V) -> E {
-    let b = bundle(&[sc], vec![("a", entry(UUID_A, sc, data))], None);
-    parse_bundle(&plain_bytes(&b)).unwrap_err()
+    parse_bundle(&raw_plain(sc, "a", data)).unwrap_err()
 }
 
 #[test]
@@ -52,7 +50,7 @@ fn nested_shape_error_names_full_path() {
     );
     assert!(
         matches!(&err, E::Shape { path, expected, found, .. }
-            if path == "data.outer.items[1]" && expected.contains("string") && found.contains("integer")),
+            if path == "data.outer.items[1]" && expected.contains("string") && found == "number"),
         "got {err:?}"
     );
 }
@@ -183,9 +181,10 @@ fn f32_canonicality_is_shortest_ties_even_roundtrip() {
 
     let cases = [
         (V::Float(0.10000000149011612), "0.1"),
-        // Exact midpoint between 1.0 and its next binary32 neighbour;
-        // ties-to-even selects 1.0.
-        (V::Float(1.0000000596046448), "1"),
+        // Just above the midpoint between 1.0 and its next binary32
+        // neighbour: the text is parsed straight to binary32 (no binary64
+        // step), so it rounds up.
+        (V::Float(1.0000000596046448), "1.0000001"),
         (V::UInt(16_777_217), "16777216"),
         // Below half the smallest subnormal, so ties-even parsing yields 0.
         (V::Float(7.0e-46), "0"),
@@ -341,12 +340,7 @@ fn bad_blob_object_keys() {
         s("blob"),                                            // not an object
     ];
     for data in cases {
-        let b = bundle(
-            &[&sc],
-            vec![("a", entry(UUID_A, &sc, obj(&[("p", data.clone())])))],
-            None,
-        );
-        let bytes = build_container(&plain_bytes(&b), &[]);
+        let bytes = build_container(&raw_plain(&sc, "a", obj(&[("p", data.clone())])), &[]);
         let err = parse_bundle(&bytes).unwrap_err();
         assert!(
             matches!(&err, E::BadBlobObject { local_id, path, .. }
@@ -356,22 +350,22 @@ fn bad_blob_object_keys() {
     }
 }
 
-// ---- writer-side walk negatives ----
+// ---- writer-side negatives: typed values the schema does not take ----
+
+fn one(sc: &ngp_schema::LogicalSchema, data: Value) -> distill_bundle::Bundle {
+    bundle(&[sc], vec![("a", typed_entry(UUID_A, sc, data))], None)
+}
+
+fn fields(values: Vec<Value>) -> Value {
+    Value::Struct(values.into_boxed_slice())
+}
 
 #[test]
 fn write_rejects_blob_value_at_non_blob_position() {
     let sc = simple_schema();
-    let b = bundle(
-        &[&sc],
-        vec![(
-            "a",
-            entry(
-                UUID_A,
-                &sc,
-                obj(&[("count", blob(b"zz")), ("name", s("n"))]),
-            ),
-        )],
-        None,
+    let b = one(
+        &sc,
+        fields(vec![Value::Blob(b"zz".to_vec()), Value::String("n".into())]),
     );
     let err = write_bundle(&b).unwrap_err();
     assert!(
@@ -383,11 +377,7 @@ fn write_rejects_blob_value_at_non_blob_position() {
 #[test]
 fn write_rejects_non_blob_value_at_blob_position() {
     let sc = schema(st(&[("p", N::Blob)]));
-    let b = bundle(
-        &[&sc],
-        vec![("a", entry(UUID_A, &sc, obj(&[("p", s("not bytes"))])))],
-        None,
-    );
+    let b = one(&sc, fields(vec![Value::String("not bytes".into())]));
     let err = write_bundle(&b).unwrap_err();
     assert!(
         matches!(&err, E::Shape { path, expected, .. } if path == "data.p" && expected.contains("blob")),
@@ -398,11 +388,7 @@ fn write_rejects_non_blob_value_at_blob_position() {
 #[test]
 fn write_rejects_non_finite_float_with_path() {
     let sc = schema(st(&[("f", N::Primitive(PK::F64))]));
-    let b = bundle(
-        &[&sc],
-        vec![("a", entry(UUID_A, &sc, obj(&[("f", V::Float(f64::NAN))])))],
-        None,
-    );
+    let b = one(&sc, fields(vec![Value::F64(f64::NAN)]));
     let err = write_bundle(&b).unwrap_err();
     assert!(
         matches!(&err, E::NonFiniteFloat { path, .. } if path == "data.f"),
@@ -412,14 +398,10 @@ fn write_rejects_non_finite_float_with_path() {
 
 #[test]
 fn write_rejects_backref_past_outermost_frame() {
-    // Snapshot decoding rejects this statically; the walker still guards
+    // Snapshot decoding rejects this statically; the writer still guards
     // programmatic input.
     let sc = schema(st(&[("x", N::BackRef(3))]));
-    let b = bundle(
-        &[&sc],
-        vec![("a", entry(UUID_A, &sc, obj(&[("x", obj(&[]))])))],
-        None,
-    );
+    let b = one(&sc, fields(vec![fields(vec![])]));
     let err = write_bundle(&b).unwrap_err();
     assert!(
         matches!(&err, E::BadBackRef { path, distance: 3, frames: 1, .. } if path == "data.x"),
@@ -429,18 +411,15 @@ fn write_rejects_backref_past_outermost_frame() {
 
 #[test]
 fn walk_depth_is_capped_never_a_stack_overflow() {
-    // A recursive tree nested far past any legitimate bundle: the walk
-    // reports a definite error instead of overflowing the stack. Built by
-    // move (obj() clones, and cloning a deep value would itself recurse).
+    // A recursive tree nested far past any legitimate bundle: the writer
+    // reports a definite error instead of overflowing the stack or writing
+    // text the parser's depth cap would refuse.
     let sc = tree_schema();
-    let mut node = obj(&[("children", arr(vec![])), ("payload", blob(b"x"))]);
+    let mut node = fields(vec![Value::Seq(vec![]), Value::Blob(b"x".to_vec())]);
     for _ in 0..600 {
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("children".to_string(), arr(vec![node]));
-        m.insert("payload".to_string(), blob(b"x"));
-        node = V::Object(m);
+        node = fields(vec![Value::Seq(vec![node]), Value::Blob(b"x".to_vec())]);
     }
-    let b = bundle(&[&sc], vec![("t", entry(UUID_A, &sc, node))], None);
+    let b = one(&sc, node);
     let err = write_bundle(&b).unwrap_err();
     assert!(matches!(err, E::WalkDepth { .. }), "got {err:?}");
 }
@@ -449,7 +428,7 @@ fn walk_depth_is_capped_never_a_stack_overflow() {
 fn hostile_option_chain_schema_hits_walk_cap_on_parse() {
     // Option and BackRef steps consume no data nesting, so a hand-crafted
     // schema can multiply walk depth per data level far past the JSON
-    // depth cap. The walker's own cap must fire as a definite error before
+    // depth cap. The codec's own cap must fire as a definite error before
     // the stack is at risk.
     let mut chain = N::BackRef(0);
     for _ in 0..300 {
@@ -463,22 +442,22 @@ fn hostile_option_chain_schema_hits_walk_cap_on_parse() {
         m.insert("x".to_string(), node);
         node = V::Object(m);
     }
-    let b = bundle(&[&sc], vec![("a", entry(UUID_A, &sc, node))], None);
-    let err = parse_bundle(&plain_bytes(&b)).unwrap_err();
+    let err = walk_err(&sc, node);
     assert!(matches!(err, E::WalkDepth { .. }), "got {err:?}");
 }
 
 #[test]
-fn write_rejects_unsorted_set() {
+fn writer_sorts_sets_and_rejects_duplicates() {
+    // A typed set holds its elements in any order: the writer emits them
+    // canonically sorted, and refuses a repeated element.
     let sc = schema(st(&[("s", N::Set(Box::new(N::String)))]));
-    let b = bundle(
-        &[&sc],
-        vec![(
-            "a",
-            entry(UUID_A, &sc, obj(&[("s", arr(vec![s("b"), s("a")]))])),
-        )],
-        None,
-    );
-    let err = write_bundle(&b).unwrap_err();
+    let set = |items: &[&str]| {
+        fields(vec![Value::Seq(
+            items.iter().map(|s| Value::String(s.to_string())).collect(),
+        )])
+    };
+    let bytes = write_bundle(&one(&sc, set(&["b", "a"]))).unwrap();
+    assert_eq!(parse_bundle(&bytes).unwrap(), one(&sc, set(&["a", "b"])));
+    let err = write_bundle(&one(&sc, set(&["a", "a"]))).unwrap_err();
     assert!(matches!(err, E::NotSorted { .. }), "got {err:?}");
 }

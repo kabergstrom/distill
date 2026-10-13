@@ -3,7 +3,6 @@
 
 mod common;
 use common::*;
-use distill_json::AuthoredValue;
 use distill_migrate::{
     execute_ops, lossy_drops, plan_automatic_renamed, validate_plan, EdgeKind, MigrationOp,
 };
@@ -29,10 +28,10 @@ fn a_renamed_field_is_copied_from_its_old_name() {
         .iter()
         .any(|op| matches!(op, MigrationOp::DropField { .. })));
     validate_plan(&ops, &old, &new, EdgeKind::Automatic).unwrap();
-    let input = obj(&[("a", ui(1)), ("hp", ui(40))]);
+    let input = val(&old, r#"{"a":1,"hp":40}"#);
     assert!(lossy_drops(&ops, &old, &input).is_empty());
     let out = execute_ops(&ops, &input, &old, &new, &NoDefaults).unwrap();
-    assert_eq!(out.value, obj(&[("a", ui(1)), ("health", ui(40))]));
+    assert_eq!(txt(&new, &out.value), r#"{"a":1,"health":40}"#);
 }
 
 #[test]
@@ -47,8 +46,8 @@ fn a_renamed_field_may_also_widen() {
             to: path(&["health"])
         }]
     );
-    let out = execute_ops(&ops, &obj(&[("hp", ui(7))]), &old, &new, &NoDefaults).unwrap();
-    assert_eq!(out.value, obj(&[("health", ui(7))]));
+    let out = execute_ops(&ops, &val(&old, r#"{"hp":7}"#), &old, &new, &NoDefaults).unwrap();
+    assert_eq!(txt(&new, &out.value), r#"{"health":7}"#);
 }
 
 #[test]
@@ -79,23 +78,11 @@ fn renames_apply_inside_elements_and_variant_payloads() {
     let table = renames(&[("$.items[].name", "label"), ("$.shape{Circle}.radius", "r")]);
     let ops = plan_automatic_renamed(&old, &new, &table).unwrap();
     validate_plan(&ops, &old, &new, EdgeKind::Automatic).unwrap();
-    let input = obj(&[
-        (
-            "items",
-            arr_v(&[obj(&[("label", AuthoredValue::Str("one".into()))])]),
-        ),
-        ("shape", obj(&[("Circle", obj(&[("r", fl(2.0))]))])),
-    ]);
+    let input = val(&old, r#"{"items":[{"label":"one"}],"shape":{"Circle":{"r":2}}}"#);
     let out = execute_ops(&ops, &input, &old, &new, &NoDefaults).unwrap();
     assert_eq!(
-        out.value,
-        obj(&[
-            (
-                "items",
-                arr_v(&[obj(&[("name", AuthoredValue::Str("one".into()))])])
-            ),
-            ("shape", obj(&[("Circle", obj(&[("radius", fl(2.0))]))])),
-        ])
+        txt(&new, &out.value),
+        r#"{"items":[{"name":"one"}],"shape":{"Circle":{"radius":2}}}"#
     );
 }
 
@@ -192,20 +179,12 @@ fn sparse_values_migrate_only_their_present_fields() {
         ],
     );
     let ops = plan_automatic_renamed(&old, &new, &renames(&[("$.health", "hp")])).unwrap();
-    let input = obj(&[
-        ("hp", ui(7)),
-        ("inner", obj(&[("gone", ui(1)), ("keep", ui(3))])),
-        ("mode", st("B")),
-    ]);
+    let input = patch(&old, r#"{"hp":7,"inner":{"gone":1,"keep":3},"mode":"B"}"#);
     let out = distill_migrate::execute_sparse(&ops, &input, &old, &new).unwrap();
     assert_eq!(
-        out,
-        obj(&[
-            ("health", ui(7)),
-            ("inner", obj(&[("keep", ui(3))])),
-            ("mode", st("B"))
-        ])
+        ptxt(&new, &out),
+        r#"{"health":7,"inner":{"keep":3},"mode":{"B":{}}}"#
     );
-    let empty = distill_migrate::execute_sparse(&ops, &obj(&[]), &old, &new).unwrap();
-    assert_eq!(empty, obj(&[]));
+    let empty = distill_migrate::execute_sparse(&ops, &patch(&old, "{}"), &old, &new).unwrap();
+    assert_eq!(ptxt(&new, &empty), "{}");
 }

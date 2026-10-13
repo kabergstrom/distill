@@ -40,4 +40,4 @@ pub use distill_wire::native::{
 };
 
 pub use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
-pub use distill_json::AuthoredValue;
+pub use ngp_schema::{AssetRefValue, Value};

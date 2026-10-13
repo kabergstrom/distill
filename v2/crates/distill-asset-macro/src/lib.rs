@@ -337,12 +337,9 @@ fn struct_reflect(ident: &Ident, fields: &[FieldInfo], rev: u32) -> syn::Result<
             ::distill_asset::AssetReflect::encode(&self.#member, sink)?;
         }
     });
-    let authored_fields = logical.iter().map(|field| {
+    let value_fields = logical.iter().map(|field| {
         let member = &field.member;
-        let name = &field.name;
-        quote! {
-            object.insert(#name.to_owned(), ::distill_asset::AssetReflect::to_authored(&self.#member));
-        }
+        quote! { ::distill_asset::AssetReflect::to_value(&self.#member) }
     });
     let defaults = logical.iter().map(default_collect_field);
     let serializable_count = logical.len() as u32;
@@ -390,10 +387,8 @@ fn struct_reflect(ident: &Ident, fields: &[FieldInfo], rev: u32) -> syn::Result<
                 sink.finish()
             }
 
-            fn to_authored(&self) -> ::distill_asset::AuthoredValue {
-                let mut object = ::std::collections::BTreeMap::new();
-                #(#authored_fields)*
-                ::distill_asset::AuthoredValue::Object(object)
+            fn to_value(&self) -> ::distill_asset::Value {
+                ::distill_asset::Value::Struct(::std::vec![#(#value_fields),*].into_boxed_slice())
             }
 
             fn default_writer() -> Option<::distill_asset::DefaultWriter> {
@@ -653,7 +648,10 @@ fn enum_reflect(
         .iter()
         .enumerate()
         .map(|(wire_index, variant)| enum_encode_arm(variant, wire_index as u32));
-    let authored_arms = variants.iter().map(enum_authored_arm);
+    let value_arms = logical
+        .iter()
+        .enumerate()
+        .map(|(index, variant)| enum_value_arm(variant, index as u32));
     let default_collect = variants.iter().map(enum_default_collect);
     let variant_count = variants.len() as u32;
     let tag_encoding = if variants.len() == 1 {
@@ -706,8 +704,8 @@ fn enum_reflect(
                 match self { #(#encode_arms),* }
             }
 
-            fn to_authored(&self) -> ::distill_asset::AuthoredValue {
-                match self { #(#authored_arms),* }
+            fn to_value(&self) -> ::distill_asset::Value {
+                match self { #(#value_arms),* }
             }
 
             fn default_writer() -> Option<::distill_asset::DefaultWriter> {
@@ -852,23 +850,18 @@ fn enum_encode_arm(variant: &&VariantInfo, wire_index: u32) -> TokenStream2 {
     }
 }
 
-fn enum_authored_arm(variant: &VariantInfo) -> TokenStream2 {
+fn enum_value_arm(variant: &VariantInfo, index: u32) -> TokenStream2 {
     let (pattern, _) = enum_pattern(variant);
-    let name = variant.ident.to_string();
-    let fields = variant.fields.iter().filter(|field| !field.args.skip).map(|field| {
-        let field_name = &field.name;
+    let mut fields: Vec<_> = variant.fields.iter().filter(|field| !field.args.skip).collect();
+    fields.sort_by_key(|field| field.name.nfc().collect::<String>().into_bytes());
+    let values = fields.iter().map(|field| {
         let binding = &field.binding;
-        quote! {
-            __distill_authored_payload.insert(#field_name.to_owned(), ::distill_asset::AssetReflect::to_authored(#binding));
-        }
+        quote! { ::distill_asset::AssetReflect::to_value(#binding) }
     });
     quote! {
-        #pattern => {
-            let mut __distill_authored_payload = ::std::collections::BTreeMap::new();
-            #(#fields)*
-            let mut value = ::std::collections::BTreeMap::new();
-            value.insert(#name.to_owned(), ::distill_asset::AuthoredValue::Object(__distill_authored_payload));
-            ::distill_asset::AuthoredValue::Object(value)
+        #pattern => ::distill_asset::Value::Enum {
+            variant: #index,
+            payload: ::std::vec![#(#values),*].into_boxed_slice(),
         }
     }
 }

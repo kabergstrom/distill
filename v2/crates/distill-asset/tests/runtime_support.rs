@@ -11,7 +11,7 @@ use distill_asset::{
     EncodeSink, EpochToken, ErasedValue, ModuleEpochPoisonCause,
 };
 use distill_core::id::{AssetUuid, TypeUuid};
-use distill_json::AuthoredValue;
+use ngp_schema::Value;
 
 #[distill_asset::asset(uuid = "00112233-4455-6677-8899-aabbccddeeff")]
 struct Counted {
@@ -32,20 +32,20 @@ struct Plain;
 struct PanickingDrop;
 
 #[test]
-fn empty_map_authored_shape_is_selected_by_key_type_not_vacuous_entries() {
-    let binary = BTreeMap::<[u8; 16], u32>::new().to_authored();
-    let strings = BTreeMap::<String, u32>::new().to_authored();
-    assert_eq!(binary, AuthoredValue::Array(Vec::new()));
-    assert_eq!(strings, AuthoredValue::Object(BTreeMap::new()));
+fn maps_reflect_as_map_values_whatever_their_key_type() {
+    let binary = BTreeMap::<[u8; 16], u32>::new().to_value();
+    let strings = BTreeMap::<String, u32>::new().to_value();
+    assert_eq!(binary, Value::Map(Vec::new()));
+    assert_eq!(strings, Value::Map(Vec::new()));
 }
 
 #[test]
-fn f32_reflection_emits_the_shortest_binary32_authored_decimal() {
-    let authored = 0.1_f32.to_authored();
-    assert_eq!(distill_json::write(&authored).unwrap(), "0.1");
-
-    let negative_zero = (-0.0_f32).to_authored();
-    assert_eq!(distill_json::write(&negative_zero).unwrap(), "0");
+fn f32_reflection_keeps_the_binary32_value() {
+    assert_eq!(0.1_f32.to_value(), Value::F32(0.1));
+    let Value::F32(negative_zero) = (-0.0_f32).to_value() else {
+        panic!("f32")
+    };
+    assert_eq!(negative_zero.to_bits(), (-0.0_f32).to_bits());
 }
 
 impl Drop for PanickingDrop {

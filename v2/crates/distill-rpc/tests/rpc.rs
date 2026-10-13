@@ -2,10 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use distill_json::AuthoredValue;
 use distill_rpc::*;
 use distill_schema::ngp_schema::{
-    node_hash, snapshot_to_json, LogicalSchema, PrimitiveKind, SchemaNode,
+    node_hash, parse_value, snapshot_to_json, AssetRefValue, LogicalSchema, Options, PrimitiveKind,
+    SchemaNode, Value,
 };
 use distill_store::config::RestartOnlyChange;
 use distill_test_project::{
@@ -492,7 +492,7 @@ fn derived_child_resolution_builds_the_parent_and_selects_the_declared_output() 
         "parent",
         parent,
         PARENT_TYPE,
-        object("value", AuthoredValue::UInt(5)),
+        object("value", Value::U8(5)),
     );
     project.write_bundle(
         "parent.bundle",
@@ -732,9 +732,10 @@ fn connect_to(server: &Server, target: &TargetDefinition) -> Hub {
     }
 }
 
-/// The authored value of a configured project type of one field.
-fn object(field: &str, value: AuthoredValue) -> AuthoredValue {
-    AuthoredValue::Object(BTreeMap::from([(field.to_owned(), value)]))
+/// The value of a configured project type of one field (`field` names it
+/// for the reader; a value is positional).
+fn object(_field: &str, value: Value) -> Value {
+    Value::Struct(Box::new([value]))
 }
 
 fn snapshot(hub: &Hub) -> Snapshot {
@@ -857,7 +858,7 @@ fn authoring_entry(byte: u8, role: AuthoringEntryRole) -> AuthoringEntry {
         role,
         tags: BTreeMap::new(),
         value: AuthoringValue {
-            canonical_value: Arc::from(&b"{\"$distill_blob\":0}"[..]),
+            canonical_value: Arc::from(&b"{\"len\":1,\"offset\":0}"[..]),
             blobs: vec![Arc::from([byte.wrapping_add(2)])],
         },
     }
@@ -875,7 +876,7 @@ fn authoring_payload_decoder_materializes_authenticated_blob_bytes() {
     let entry = authoring_entry(9, AuthoringEntryRole::AuthoringOnly);
     assert_eq!(
         decode_authoring_payload(entry.schema_hash, &entry.logical_schema, &entry.value).unwrap(),
-        AuthoredValue::Blob(vec![11])
+        Value::Blob(vec![11])
     );
 }
 
@@ -911,23 +912,19 @@ fn authoring_payload_decoder_reenters_an_enum_from_its_variant_payload() {
     };
     let value = AuthoringValue {
         canonical_value: Arc::from(
-            &br#"{"Link":{"blob":{"$distill_blob":0},"next":{"Link":{"blob":{"$distill_blob":1},"next":{"End":{}}}}}}"#[..],
+            &br#"{"Link":{"blob":{"len":1,"offset":0},"next":{"Link":{"blob":{"len":1,"offset":1},"next":{"End":{}}}}}}"#[..],
         ),
         blobs: vec![Arc::from([1u8]), Arc::from([2u8])],
     };
-    let link = |byte: u8, next: AuthoredValue| {
-        AuthoredValue::Object(BTreeMap::from([(
-            "Link".to_owned(),
-            AuthoredValue::Object(BTreeMap::from([
-                ("blob".to_owned(), AuthoredValue::Blob(vec![byte])),
-                ("next".to_owned(), next),
-            ])),
-        )]))
+    // Variants by name: End = 0, Link = 1; Link fields: blob, next.
+    let link = |byte: u8, next: Value| Value::Enum {
+        variant: 1,
+        payload: Box::new([Value::Blob(vec![byte]), next]),
     };
-    let end = AuthoredValue::Object(BTreeMap::from([(
-        "End".to_owned(),
-        AuthoredValue::Object(BTreeMap::new()),
-    )]));
+    let end = Value::Enum {
+        variant: 0,
+        payload: Box::new([]),
+    };
     assert_eq!(
         decode_authoring_payload(
             node_hash(&schema.root).unwrap(),
@@ -953,7 +950,7 @@ fn record(fields: Vec<(&str, SchemaNode)>) -> SchemaNode {
     }
 }
 
-fn decode_plain(root: SchemaNode, canonical: &str) -> Result<AuthoredValue, AuthoringValueError> {
+fn decode_plain(root: SchemaNode, canonical: &str) -> Result<Value, AuthoringValueError> {
     let schema = LogicalSchema { root };
     decode_authoring_payload(
         node_hash(&schema.root).unwrap(),
@@ -981,7 +978,7 @@ fn authoring_payload_decoder_reenters_a_backref_under_its_own_ancestors() {
     let text = r#"{"b":{"a":null,"b":{"a":{"b":null},"b":null}}}"#;
     assert_eq!(
         decode_plain(schema(), text).unwrap(),
-        distill_json::parse(text).unwrap()
+        parse_value(text, &schema(), Options::canonical()).unwrap()
     );
     // A B where `a` names A is refused.
     decode_plain(
@@ -1011,7 +1008,7 @@ fn authoring_payload_decoder_reenters_a_backref_under_its_own_ancestors_three_de
     let text = r#"{"b":{"c":{"a":null,"b":null,"c":{"a":null,"b":{"c":{"a":{"b":{"c":null}},"b":null,"c":{"a":null,"b":null,"c":null}}},"c":null}}}}"#;
     assert_eq!(
         decode_plain(schema(), text).unwrap(),
-        distill_json::parse(text).unwrap()
+        parse_value(text, &schema(), Options::canonical()).unwrap()
     );
     // Inside the re-entered C, `b` names B: a C there is refused.
     decode_plain(
@@ -1102,7 +1099,7 @@ fn authoring_commit_authenticates_schema_and_exact_blob_index_coverage() {
     })
     .unwrap();
     duplicate.value.canonical_value =
-        Arc::from(&b"[{\"$distill_blob\":0},{\"$distill_blob\":0}]"[..]);
+        Arc::from(&b"[{\"len\":1,\"offset\":0},{\"len\":1,\"offset\":0}]"[..]);
     assert!(matches!(
         offer(
             &server,
@@ -1146,7 +1143,7 @@ fn authoring_schema_walk_type_checks_primitive_and_reference_leaves() {
             .unwrap()
             .into_bytes(),
     );
-    entry.value.canonical_value = Arc::from(&b"{\"$distill_blob\":0}"[..]);
+    entry.value.canonical_value = Arc::from(&b"{\"len\":1,\"offset\":0}"[..]);
     entry.value.blobs.clear();
     assert!(matches!(
         offer(
@@ -1169,7 +1166,7 @@ fn authoring_schema_walk_type_checks_primitive_and_reference_leaves() {
             .unwrap()
             .into_bytes(),
     );
-    entry.value.canonical_value = Arc::from(&b"{\"$distill_blob\":0}"[..]);
+    entry.value.canonical_value = Arc::from(&b"{\"len\":1,\"offset\":0}"[..]);
     assert!(matches!(
         offer(
             &server,
@@ -1189,24 +1186,18 @@ fn authoring_schema_walk_type_checks_primitive_and_reference_leaves() {
 fn asset_reference_query_uses_uuid_precedence_and_rejects_noncanonical_selectors() {
     let canonical = "abababab-abab-abab-abab-abababababab";
     assert_eq!(
-        decode_asset_reference_query(&AuthoredValue::Str(canonical.to_owned())).unwrap(),
+        decode_asset_reference_query(&AssetRefValue::Path(canonical.to_owned())).unwrap(),
         AssetReferenceQuery::Uuid(AssetUuid([0xab; 16]))
     );
-    assert!(decode_asset_reference_query(&AuthoredValue::Str(canonical.to_uppercase())).is_err());
-    assert!(decode_asset_reference_query(&AuthoredValue::Str("a/../b".to_owned())).is_err());
+    assert!(decode_asset_reference_query(&AssetRefValue::Path(canonical.to_uppercase())).is_err());
+    assert!(decode_asset_reference_query(&AssetRefValue::Path("a/../b".to_owned())).is_err());
     assert!(
-        decode_asset_reference_query(&AuthoredValue::Str("e\u{301}.asset".to_owned())).is_err()
+        decode_asset_reference_query(&AssetRefValue::Path("e\u{301}.asset".to_owned())).is_err()
     );
 
-    let selector = |path: Option<&str>, asset: Option<&str>| {
-        let mut fields = BTreeMap::new();
-        if let Some(path) = path {
-            fields.insert("path".to_owned(), AuthoredValue::Str(path.to_owned()));
-        }
-        if let Some(asset) = asset {
-            fields.insert("asset".to_owned(), AuthoredValue::Str(asset.to_owned()));
-        }
-        AuthoredValue::Object(fields)
+    let selector = |path: Option<&str>, asset: Option<&str>| AssetRefValue::Query {
+        path: path.map(str::to_owned),
+        asset: asset.map(str::to_owned),
     };
     assert_eq!(
         decode_asset_reference_query(&selector(Some("folder/a.asset"), Some("mesh"))).unwrap(),
@@ -1415,7 +1406,7 @@ fn authoring_snapshot_pins_role_inclusive_metadata_without_runtime_escape() {
             &format!("entry-{byte}"),
             asset_id(byte),
             TAGGED_TYPE,
-            object("group", AuthoredValue::Str(group.to_owned())),
+            object("group", Value::String(group.to_owned())),
         )
     };
     // The asset 99 the namespace deleted is missing, as if never published.
@@ -1433,7 +1424,7 @@ fn authoring_snapshot_pins_role_inclusive_metadata_without_runtime_escape() {
         "entry-3",
         asset_id(3),
         PARENT_TYPE,
-        object("value", AuthoredValue::UInt(3)),
+        object("value", Value::U8(3)),
     );
     write(&mut project, 3, parent);
     let derived = AssetUuid::v5(asset_id(3), REFLECTION);
@@ -1493,11 +1484,8 @@ fn authoring_snapshot_pins_role_inclusive_metadata_without_runtime_escape() {
             assert_eq!(inspection.uuid, asset_id(2));
             assert_eq!(inspection.role, AuthoringEntryRole::AuthoringOnly);
             assert_eq!(
-                distill_json::parse(
-                    std::str::from_utf8(&inspection.value.canonical_value).unwrap()
-                )
-                .unwrap(),
-                object("group", AuthoredValue::Str("group-2".to_owned()))
+                &*inspection.value.canonical_value,
+                br#"{"group":"group-2"}"#
             );
         }
         other => panic!("expected pinned inspection, got {other:?}"),

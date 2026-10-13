@@ -12,7 +12,6 @@ publish = false
 distill-bundle = { path = "../../../../distill-bundle" }
 distill-core = { path = "../../../../distill-core" }
 distill-daemon = { path = "../../..", features = ["test-hooks"] }
-distill-json = { path = "../../../../distill-json" }
 distill-rpc = { path = "../../../../distill-rpc" }
 distill-schema = { path = "../../../../distill-schema" }
 distill-store = { path = "../../../../distill-store" }

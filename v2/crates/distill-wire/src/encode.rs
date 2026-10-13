@@ -1,10 +1,11 @@
-//! Schema-directed `AuthoredValue` to canonical wire sections (§12).
+//! Schema-directed typed values (`ngp_schema::Value`) to canonical wire
+//! sections (§12).
 
 use distill_bundle::{encode_path, PathComponent};
 use distill_core::frames::{reenter, resolve_backref};
 use distill_core::id::{AssetUuid, TypeUuid};
-use distill_json::AuthoredValue;
 use ngp_schema::node::{PrimitiveKind, SchemaNode};
+use ngp_schema::{write_value, AssetRefValue, Value, WriteOptions};
 use unicode_normalization::{is_nfc, UnicodeNormalization};
 
 use crate::wire::{SlotKind, WireEnumForm, WireNode, WireVariant};
@@ -34,23 +35,23 @@ pub struct EncodedWireValue {
     pub references: Vec<EncodedReference>,
 }
 
-pub trait AuthoredReferenceResolver {
+pub trait ReferenceResolver {
     fn resolve(
         &mut self,
-        query: &AuthoredValue,
+        query: &AssetRefValue,
         expected_terminal: TypeUuid,
         strong: bool,
         path: &[PathComponent],
     ) -> Result<AssetUuid, String>;
 }
 
-impl<F> AuthoredReferenceResolver for F
+impl<F> ReferenceResolver for F
 where
-    F: FnMut(&AuthoredValue, TypeUuid, bool, &[PathComponent]) -> Result<AssetUuid, String>,
+    F: FnMut(&AssetRefValue, TypeUuid, bool, &[PathComponent]) -> Result<AssetUuid, String>,
 {
     fn resolve(
         &mut self,
-        query: &AuthoredValue,
+        query: &AssetRefValue,
         expected_terminal: TypeUuid,
         strong: bool,
         path: &[PathComponent],
@@ -114,11 +115,11 @@ impl std::error::Error for EncodeError {}
 
 /// Encode one schema-conforming value. The caller supplies the exact DSWL
 /// tree selected for the target and a snapshot-bound reference resolver.
-pub fn encode_authored_value(
+pub fn encode_value(
     schema: &SchemaNode,
     wire: &WireNode,
-    value: &AuthoredValue,
-    references: &mut impl AuthoredReferenceResolver,
+    value: &Value,
+    references: &mut impl ReferenceResolver,
 ) -> Result<EncodedWireValue, EncodeError> {
     if wire.offset() != 0 {
         return Err(EncodeError::InvalidWireShape {
@@ -209,7 +210,7 @@ struct PendingBlob {
     slot: Location,
 }
 
-struct Encoder<'a, R: AuthoredReferenceResolver + ?Sized> {
+struct Encoder<'a, R: ReferenceResolver + ?Sized> {
     fixed: Vec<u8>,
     variable: Vec<u8>,
     blobs: Vec<PendingBlob>,
@@ -221,7 +222,7 @@ struct Encoder<'a, R: AuthoredReferenceResolver + ?Sized> {
     depth: usize,
 }
 
-impl<'a, R: AuthoredReferenceResolver + ?Sized> Encoder<'a, R> {
+impl<'a, R: ReferenceResolver + ?Sized> Encoder<'a, R> {
     fn finish(mut self) -> Result<EncodedWireValue, EncodeError> {
         self.blobs
             .sort_by(|left, right| encode_path(&left.path).cmp(&encode_path(&right.path)));
@@ -261,7 +262,7 @@ impl<'a, R: AuthoredReferenceResolver + ?Sized> Encoder<'a, R> {
         &mut self,
         schema: &'a SchemaNode,
         wire: &'a WireNode,
-        value: &AuthoredValue,
+        value: &Value,
         location: Location,
         placement: Option<u32>,
         frame_mode: FrameMode,
@@ -279,7 +280,7 @@ impl<'a, R: AuthoredReferenceResolver + ?Sized> Encoder<'a, R> {
         &mut self,
         schema: &'a SchemaNode,
         wire: &'a WireNode,
-        value: &AuthoredValue,
+        value: &Value,
         location: Location,
         placement: Option<u32>,
         frame_mode: FrameMode,
@@ -354,16 +355,27 @@ impl<'a, R: AuthoredReferenceResolver + ?Sized> Encoder<'a, R> {
             SchemaNode::Primitive(kind) => self.primitive(*kind, wire, value, location, offset),
             SchemaNode::String => self.slot_string(wire, value, location, offset),
             SchemaNode::Unit => {
-                if !matches!(value, AuthoredValue::Null) || !matches!(wire, WireNode::Unit { .. }) {
-                    return self.shape("unit/null");
+                if !matches!(value, Value::Unit) || !matches!(wire, WireNode::Unit { .. }) {
+                    return self.shape("unit");
                 }
                 Ok(())
             }
             SchemaNode::AssetRef(expected) => {
-                self.reference(wire, value, location, offset, *expected, true)
+                let Value::AssetRef(query) = value else {
+                    return self.shape("asset reference");
+                };
+                self.reference(wire, query, location, offset, *expected, true)
             }
             SchemaNode::WeakRef(expected) => {
-                self.reference(wire, value, location, offset, *expected, false)
+                let Value::WeakRef(query) = value else {
+                    return self.shape("weak reference");
+                };
+                self.reference(wire, query, location, offset, *expected, false)
+            }
+            // Engine-only value nodes (GAP 23 §2–§3): no asset type holds
+            // them, so they have no wire form.
+            SchemaNode::Dynamic { .. } | SchemaNode::NodeRef { .. } | SchemaNode::Handle { .. } => {
+                self.invalid_wire("dynamic values, node references and engine handles have no wire form")
             }
             SchemaNode::Blob => self.blob(wire, value, location, offset),
             SchemaNode::Option(inner) => self.option(inner, wire, value, location, offset),
@@ -380,7 +392,10 @@ impl<'a, R: AuthoredReferenceResolver + ?Sized> Encoder<'a, R> {
                 self.map(key, item, wire, value, location, offset)
             }
             SchemaNode::Struct { fields, .. } => {
-                self.record(schema, fields, wire, value, location, offset, frame_mode)
+                let Value::Struct(values) = value else {
+                    return self.shape("struct");
+                };
+                self.record(schema, fields, wire, values, location, offset, frame_mode)
             }
             SchemaNode::Enum { variants, .. } => {
                 self.enumeration(schema, variants, wire, value, location, offset, frame_mode)
@@ -393,7 +408,7 @@ impl<'a, R: AuthoredReferenceResolver + ?Sized> Encoder<'a, R> {
         &mut self,
         kind: PrimitiveKind,
         wire: &WireNode,
-        value: &AuthoredValue,
+        value: &Value,
         location: Location,
         offset: u32,
     ) -> Result<(), EncodeError> {
@@ -421,7 +436,7 @@ impl<'a, R: AuthoredReferenceResolver + ?Sized> Encoder<'a, R> {
     fn reference(
         &mut self,
         wire: &WireNode,
-        value: &AuthoredValue,
+        value: &AssetRefValue,
         location: Location,
         offset: u32,
         expected_terminal: TypeUuid,
@@ -453,11 +468,11 @@ impl<'a, R: AuthoredReferenceResolver + ?Sized> Encoder<'a, R> {
     fn slot_string(
         &mut self,
         wire: &WireNode,
-        value: &AuthoredValue,
+        value: &Value,
         location: Location,
         offset: u32,
     ) -> Result<(), EncodeError> {
-        let AuthoredValue::Str(value) = value else {
+        let Value::String(value) = value else {
             return self.shape("string");
         };
         let (size, _, kind, pointee) =
@@ -476,11 +491,11 @@ impl<'a, R: AuthoredReferenceResolver + ?Sized> Encoder<'a, R> {
     fn blob(
         &mut self,
         wire: &WireNode,
-        value: &AuthoredValue,
+        value: &Value,
         location: Location,
         offset: u32,
     ) -> Result<(), EncodeError> {
-        let AuthoredValue::Blob(bytes) = value else {
+        let Value::Blob(bytes) = value else {
             return self.shape("blob bytes");
         };
         let (size, _, kind, pointee) =
@@ -505,13 +520,13 @@ impl<'a, R: AuthoredReferenceResolver + ?Sized> Encoder<'a, R> {
         &mut self,
         element_schema: &'a SchemaNode,
         wire: &'a WireNode,
-        value: &AuthoredValue,
+        value: &Value,
         location: Location,
         offset: u32,
         expected_kind: SlotKind,
     ) -> Result<(), EncodeError> {
-        let AuthoredValue::Array(items) = value else {
-            return self.shape("array");
+        let Value::Seq(items) = value else {
+            return self.shape("sequence");
         };
         let (size, _, kind, pointee) =
             slot_parts(wire).ok_or_else(|| EncodeError::InvalidWireShape {
@@ -526,7 +541,7 @@ impl<'a, R: AuthoredReferenceResolver + ?Sized> Encoder<'a, R> {
             let mut keyed = ordered
                 .into_iter()
                 .map(|item| {
-                    canonical_value_bytes(item)
+                    canonical_value_bytes(element_schema, item)
                         .map(|bytes| (bytes, item))
                         .ok_or_else(|| EncodeError::KeyNotEncodable {
                             path: self.path_string(),
@@ -587,11 +602,11 @@ impl<'a, R: AuthoredReferenceResolver + ?Sized> Encoder<'a, R> {
         expected_len: u64,
         element_schema: &'a SchemaNode,
         wire: &'a WireNode,
-        value: &AuthoredValue,
+        value: &Value,
         location: Location,
         offset: u32,
     ) -> Result<(), EncodeError> {
-        let AuthoredValue::Array(items) = value else {
+        let Value::Seq(items) = value else {
             return self.shape("fixed-size array");
         };
         let WireNode::Array {
@@ -653,7 +668,7 @@ impl<'a, R: AuthoredReferenceResolver + ?Sized> Encoder<'a, R> {
         key_schema: &'a SchemaNode,
         value_schema: &'a SchemaNode,
         wire: &'a WireNode,
-        value: &AuthoredValue,
+        value: &Value,
         location: Location,
         offset: u32,
     ) -> Result<(), EncodeError> {
@@ -665,37 +680,20 @@ impl<'a, R: AuthoredReferenceResolver + ?Sized> Encoder<'a, R> {
         if size < 8 || kind != SlotKind::Map || pointee.len() != 2 {
             return self.invalid_wire("map slot has the wrong kind/pointee count");
         }
-        let mut entries: Vec<(AuthoredValue, &AuthoredValue, Vec<u8>)> = match value {
-            AuthoredValue::Object(map) if matches!(key_schema, SchemaNode::String) => map
-                .iter()
-                .map(|(key, value)| {
-                    let key = AuthoredValue::Str(key.clone());
-                    let encoded = canonical_value_bytes(&key).ok_or_else(|| {
-                        EncodeError::KeyNotEncodable {
-                            path: self.path_string(),
-                        }
-                    })?;
-                    Ok((key, value, encoded))
-                })
-                .collect::<Result<_, EncodeError>>()?,
-            AuthoredValue::Array(pairs) if !matches!(key_schema, SchemaNode::String) => pairs
-                .iter()
-                .map(|pair| {
-                    let AuthoredValue::Array(pair) = pair else {
-                        return self.shape("[key, value] map pair");
-                    };
-                    let [key, value] = pair.as_slice() else {
-                        return self.shape("[key, value] map pair");
-                    };
-                    let encoded =
-                        canonical_value_bytes(key).ok_or_else(|| EncodeError::KeyNotEncodable {
-                            path: self.path_string(),
-                        })?;
-                    Ok((key.clone(), value, encoded))
-                })
-                .collect::<Result<_, EncodeError>>()?,
-            _ => return self.shape("canonical map"),
+        let Value::Map(pairs) = value else {
+            return self.shape("map");
         };
+        let mut entries: Vec<(&Value, &Value, Vec<u8>)> = pairs
+            .iter()
+            .map(|(key, value)| {
+                let encoded = canonical_value_bytes(key_schema, key).ok_or_else(|| {
+                    EncodeError::KeyNotEncodable {
+                        path: self.path_string(),
+                    }
+                })?;
+                Ok((key, value, encoded))
+            })
+            .collect::<Result<_, EncodeError>>()?;
         entries.sort_by(|left, right| left.2.cmp(&right.2));
         for pair in entries.windows(2) {
             if pair[0].2 == pair[1].2 {
@@ -775,14 +773,11 @@ impl<'a, R: AuthoredReferenceResolver + ?Sized> Encoder<'a, R> {
         schema_root: &'a SchemaNode,
         fields: &'a [(String, u32, SchemaNode)],
         wire: &'a WireNode,
-        value: &AuthoredValue,
+        values: &[Value],
         location: Location,
         offset: u32,
         frame_mode: FrameMode,
     ) -> Result<(), EncodeError> {
-        let AuthoredValue::Object(values) = value else {
-            return self.shape("struct object");
-        };
         let WireNode::Struct {
             fields: wire_fields,
             ..
@@ -806,11 +801,7 @@ impl<'a, R: AuthoredReferenceResolver + ?Sized> Encoder<'a, R> {
         self.wire_frames.push(wire);
         let base = location.shifted(offset)?;
         let mut result = Ok(());
-        for (name, _, field_schema) in fields {
-            let Some(field_value) = values.get(name) else {
-                result = self.shape("struct with every declared field");
-                break;
-            };
+        for ((name, _, field_schema), field_value) in fields.iter().zip(values) {
             let Some(field_wire) = wire_fields.iter().find(|field| field.name == *name) else {
                 result = Err(EncodeError::MissingWireField {
                     path: self.path_string(),
@@ -846,19 +837,15 @@ impl<'a, R: AuthoredReferenceResolver + ?Sized> Encoder<'a, R> {
         schema_root: &'a SchemaNode,
         variants: &'a [(String, u32, SchemaNode)],
         wire: &'a WireNode,
-        value: &AuthoredValue,
+        value: &Value,
         location: Location,
         offset: u32,
         frame_mode: FrameMode,
     ) -> Result<(), EncodeError> {
-        let AuthoredValue::Object(values) = value else {
-            return self.shape("single-variant enum object");
+        let Value::Enum { variant, payload } = value else {
+            return self.shape("enum");
         };
-        let Some((name, payload)) = values.iter().next().filter(|_| values.len() == 1) else {
-            return self.shape("single-variant enum object");
-        };
-        let Some((_, _, payload_schema)) = variants.iter().find(|variant| variant.0 == *name)
-        else {
+        let Some((name, _, payload_schema)) = variants.get(*variant as usize) else {
             return self.shape("known enum variant");
         };
         let WireNode::Enum {
@@ -887,14 +874,29 @@ impl<'a, R: AuthoredReferenceResolver + ?Sized> Encoder<'a, R> {
         }
         self.wire_frames.push(wire);
         self.path.push(PathComponent::Variant(name.clone()));
-        let result = self.node(
-            payload_schema,
-            &variant.node,
-            payload,
-            base,
-            None,
-            FrameMode::WireOnly,
-        );
+        // The payload is a struct node folded into the enum frame
+        // logically, but its own record in DSWL.
+        let result = match payload_schema {
+            SchemaNode::Struct { fields, .. } => {
+                if self.depth >= MAX_ENCODE_DEPTH {
+                    Err(EncodeError::DepthExceeded)
+                } else {
+                    self.depth += 1;
+                    let encoded = self.record(
+                        payload_schema,
+                        fields,
+                        &variant.node,
+                        payload,
+                        base,
+                        variant.node.offset(),
+                        FrameMode::WireOnly,
+                    );
+                    self.depth -= 1;
+                    encoded
+                }
+            }
+            _ => self.invalid_wire("enum variant payload is not a struct node"),
+        };
         self.path.pop();
         self.wire_frames.pop();
         if matches!(frame_mode, FrameMode::Both) {
@@ -907,17 +909,17 @@ impl<'a, R: AuthoredReferenceResolver + ?Sized> Encoder<'a, R> {
         &mut self,
         inner: &'a SchemaNode,
         wire: &'a WireNode,
-        value: &AuthoredValue,
+        value: &Value,
         location: Location,
         offset: u32,
     ) -> Result<(), EncodeError> {
         let WireNode::Enum { form, variants, .. } = wire else {
             return self.invalid_wire("logical option is not a wire enum");
         };
-        let name = if matches!(value, AuthoredValue::Null) {
-            "None"
-        } else {
-            "Some"
+        let (name, inner_value) = match value {
+            Value::Option(None) => ("None", None),
+            Value::Option(Some(inner_value)) => ("Some", Some(&**inner_value)),
+            _ => return self.shape("option"),
         };
         let Some((_, variant)) = variants
             .iter()
@@ -932,9 +934,9 @@ impl<'a, R: AuthoredReferenceResolver + ?Sized> Encoder<'a, R> {
         let base = location.shifted(offset)?;
         let index = self.canonical_variant_index(variants, name)?;
         self.write_enum_tag(form, index, variant, base)?;
-        if name == "None" {
+        let Some(inner_value) = inner_value else {
             return Ok(());
-        }
+        };
         let WireNode::Struct { fields, .. } = &variant.node else {
             return self.invalid_wire("Some payload is not a wire record");
         };
@@ -949,7 +951,7 @@ impl<'a, R: AuthoredReferenceResolver + ?Sized> Encoder<'a, R> {
         let result = self.node(
             inner,
             &field.node,
-            value,
+            inner_value,
             base.shifted(variant.node.offset())?,
             None,
             FrameMode::Both,
@@ -1168,14 +1170,18 @@ fn nfc(value: &str) -> String {
     }
 }
 
-fn canonical_value_bytes(value: &AuthoredValue) -> Option<Vec<u8>> {
-    distill_json::write(value).ok().map(String::into_bytes)
+/// The canonical JSON text of a map key or set element (§6): what both
+/// sorts by and the `MapKey` path payload. Key and element nodes are
+/// blob-free (§5) and walked with no frames open.
+fn canonical_value_bytes(schema: &SchemaNode, value: &Value) -> Option<Vec<u8>> {
+    write_value(schema, value, WriteOptions::default())
+        .ok()
+        .map(String::into_bytes)
 }
 
-fn entries_len(value: &AuthoredValue) -> usize {
+fn entries_len(value: &Value) -> usize {
     match value {
-        AuthoredValue::Object(values) => values.len(),
-        AuthoredValue::Array(values) => values.len(),
+        Value::Map(entries) => entries.len(),
         _ => 0,
     }
 }
@@ -1224,76 +1230,34 @@ fn primitive_grammar_id(kind: PrimitiveKind) -> u8 {
     .grammar_id()
 }
 
-fn scalar_bytes(kind: PrimitiveKind, value: &AuthoredValue) -> Option<Vec<u8>> {
-    macro_rules! unsigned {
-        ($ty:ty) => {{
-            let value = match value {
-                AuthoredValue::UInt(value) => <$ty>::try_from(*value).ok()?,
-                AuthoredValue::Int(value) => <$ty>::try_from(*value).ok()?,
-                _ => return None,
-            };
-            value.to_le_bytes().to_vec()
-        }};
+fn scalar_bytes(kind: PrimitiveKind, value: &Value) -> Option<Vec<u8>> {
+    if !value.is_primitive(kind) {
+        return None;
     }
-    macro_rules! signed {
-        ($ty:ty) => {{
-            let value = match value {
-                AuthoredValue::UInt(value) => <$ty>::try_from(*value).ok()?,
-                AuthoredValue::Int(value) => <$ty>::try_from(*value).ok()?,
-                _ => return None,
-            };
-            value.to_le_bytes().to_vec()
-        }};
-    }
-    Some(match kind {
-        PrimitiveKind::Bool => vec![match value {
-            AuthoredValue::Bool(false) => 0,
-            AuthoredValue::Bool(true) => 1,
-            _ => return None,
-        }],
-        PrimitiveKind::Char => {
-            let AuthoredValue::Str(value) = value else {
-                return None;
-            };
-            let mut chars = value.chars();
-            let value = chars.next()?;
-            if chars.next().is_some() {
+    Some(match *value {
+        Value::Bool(value) => vec![u8::from(value)],
+        Value::Char(value) => (value as u32).to_le_bytes().to_vec(),
+        Value::U8(value) => value.to_le_bytes().to_vec(),
+        Value::U16(value) => value.to_le_bytes().to_vec(),
+        Value::U32(value) => value.to_le_bytes().to_vec(),
+        Value::U64(value) => value.to_le_bytes().to_vec(),
+        Value::U128(value) => value.to_le_bytes().to_vec(),
+        Value::I8(value) => value.to_le_bytes().to_vec(),
+        Value::I16(value) => value.to_le_bytes().to_vec(),
+        Value::I32(value) => value.to_le_bytes().to_vec(),
+        Value::I64(value) => value.to_le_bytes().to_vec(),
+        Value::I128(value) => value.to_le_bytes().to_vec(),
+        Value::F32(mut value) => {
+            if !value.is_finite() {
                 return None;
             }
-            (value as u32).to_le_bytes().to_vec()
+            // -0 normalized, as the canonical text writes it.
+            if value == 0.0 {
+                value = 0.0;
+            }
+            value.to_bits().to_le_bytes().to_vec()
         }
-        PrimitiveKind::U8 => unsigned!(u8),
-        PrimitiveKind::U16 => unsigned!(u16),
-        PrimitiveKind::U32 => unsigned!(u32),
-        PrimitiveKind::U64 => unsigned!(u64),
-        PrimitiveKind::U128 => unsigned!(u128),
-        PrimitiveKind::I8 => signed!(i8),
-        PrimitiveKind::I16 => signed!(i16),
-        PrimitiveKind::I32 => signed!(i32),
-        PrimitiveKind::I64 => signed!(i64),
-        PrimitiveKind::I128 => signed!(i128),
-        PrimitiveKind::F32 => {
-            let mut adopted = match value {
-                AuthoredValue::Float(value) => *value as f32,
-                AuthoredValue::UInt(value) => *value as f32,
-                AuthoredValue::Int(value) => *value as f32,
-                _ => return None,
-            };
-            if !adopted.is_finite() {
-                return None;
-            }
-            if adopted == 0.0 {
-                adopted = 0.0;
-            }
-            adopted.to_bits().to_le_bytes().to_vec()
-        }
-        PrimitiveKind::F64 => {
-            let mut value = match value {
-                AuthoredValue::Float(value) => *value,
-                AuthoredValue::UInt(value) => *value as f64,
-                AuthoredValue::Int(value) => *value as f64,
-                _ => return None,
-            };
+        Value::F64(mut value) => {
             if !value.is_finite() {
                 return None;
             }
@@ -1302,5 +1266,6 @@ fn scalar_bytes(kind: PrimitiveKind, value: &AuthoredValue) -> Option<Vec<u8>> {
             }
             value.to_bits().to_le_bytes().to_vec()
         }
+        _ => return None,
     })
 }

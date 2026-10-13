@@ -19,4 +19,4 @@ blake3 = { workspace = true }
 distill-asset = { path = "../distill-asset" }
 distill-core = { path = "../distill-core" }
 distill-wire = { path = "../distill-wire" }
-distill-json = { path = "../distill-json" }
+ngp-schema = { path = "../../../../newgameplus/ngp-schema" }

@@ -115,8 +115,8 @@ fn import(args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
     }
-    // The hub takes canonical authored-value text.
-    let settings = distill_json::write(&distill_json::parse(&settings)?)?;
+    // The hub parses the settings against the importer's settings schema
+    // (authored spelling, fields left out take the defaults).
     let request = ImportRequest {
         importer,
         sources: vec![source.to_owned()],
