@@ -203,6 +203,42 @@ fn grown_array_plans_grow_array() {
     );
 }
 
+/// Handles, node references and dynamic values compare by their own
+/// fields: an unchanged one inside a changed type copies (newgameplus
+/// Body's parts array growing around `ShapeDesc::Asset`'s collision handle
+/// was refused as "asset handle kind changed").
+#[test]
+fn unchanged_handle_noderef_dynamic_copy_inside_grown_array() {
+    let elem = strct(
+        0,
+        &[
+            ("h", 0, SchemaNode::Handle { kind: "collision".into() }),
+            ("n", 0, SchemaNode::NodeRef { component: None }),
+            ("d", 0, SchemaNode::Dynamic { sparse: true }),
+        ],
+    );
+    let old = strct(0, &[("a", 0, arr(4, elem.clone()))]);
+    let new = strct(0, &[("a", 0, arr(8, elem))]);
+    let ops = plan_automatic(&old, &new).unwrap();
+    assert_eq!(
+        ops,
+        vec![MigrationOp::GrowArray {
+            at: path(&["a"]),
+            element: vec![MigrationOp::CopyField {
+                from: root(),
+                to: root()
+            }]
+        }]
+    );
+}
+
+#[test]
+fn changed_handle_kind_refused() {
+    let old = strct(0, &[("h", 0, SchemaNode::Handle { kind: "collision".into() })]);
+    let new = strct(0, &[("h", 0, SchemaNode::Handle { kind: "mesh".into() })]);
+    refuses_at(&old, &new, "h", "handle kind changed");
+}
+
 #[test]
 fn shrunk_array_refused() {
     let old = strct(0, &[("a", 0, arr(4, p(PK::U8)))]);

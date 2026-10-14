@@ -65,6 +65,9 @@ fn ident(
         (Primitive(a), Primitive(b)) => a == b,
         (String, String) | (Blob, Blob) | (Unit, Unit) => true,
         (AssetRef(a), AssetRef(b)) | (WeakRef(a), WeakRef(b)) => a == b,
+        (NodeRef { component: a }, NodeRef { component: b }) => a == b,
+        (Handle { kind: a }, Handle { kind: b }) => a == b,
+        (Dynamic { sparse: a }, Dynamic { sparse: b }) => a == b,
         (
             Struct {
                 rev: r1,
