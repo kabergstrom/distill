@@ -25,6 +25,7 @@
 //! Client side: [`CapnpClient`] runs its `RpcSystem` as a task on the
 //! caller's `LocalSet`; callers drive it on that one thread.
 
+use std::collections::BTreeMap;
 use std::cell::RefCell;
 use std::fmt;
 use std::future::Future;
@@ -3225,7 +3226,7 @@ fn write_type_description(
         TypeDefault::SchemaMismatch { written } => default.set_schema_mismatch(&written.0),
         TypeDefault::Invalid(detail) => default.set_invalid(detail.as_str()),
     }
-    let mut members = output.init_members(description.members.len() as u32);
+    let mut members = output.reborrow().init_members(description.members.len() as u32);
     for (index, member) in description.members.iter().enumerate() {
         let mut wire = members.reborrow().get(index as u32);
         wire.set_path(member.path.as_str());
@@ -3239,6 +3240,12 @@ fn write_type_description(
         wire.set_color(member.color);
         wire.set_slider(member.slider);
         wire.set_hidden(member.hidden);
+    }
+    let mut renames = output.init_renames(description.renames.len() as u32);
+    for (index, (at, from)) in description.renames.iter().enumerate() {
+        let mut wire = renames.reborrow().get(index as u32);
+        wire.set_at(at.as_str());
+        wire.set_from(from.as_str());
     }
 }
 
@@ -3543,6 +3550,13 @@ pub fn decode_type_description(
             hidden: member.get_hidden(),
         });
     }
+    let mut renames = BTreeMap::new();
+    for rename in value.get_renames()? {
+        renames.insert(
+            decode_text(rename.get_at()?, "typeRename.at").map_err(failed)?,
+            decode_text(rename.get_from()?, "typeRename.from").map_err(failed)?,
+        );
+    }
     Ok(TypeDescription {
         stamp,
         type_uuid,
@@ -3551,6 +3565,7 @@ pub fn decode_type_description(
         logical_schema,
         default,
         members,
+        renames,
     })
 }
 

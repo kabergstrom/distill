@@ -707,6 +707,13 @@ struct TypeMember {
   hidden @8 :Bool;
 }
 
+struct TypeRename {
+  # Planner path in the current schema.
+  at @0 :Text;
+  # The field name it was renamed from.
+  from @1 :Text;
+}
+
 struct TypeDefault {
   union {
     value @0 :AuthoringValue;
@@ -726,6 +733,9 @@ struct TypeDescription {
   logicalSchema @4 :Data;
   defaultValue @5 :TypeDefault;
   members @6 :List(TypeMember);
+  # Renamed fields (`#[asset(renamed_from)]`) by planner path, path-sorted
+  # (protocol 25): what an automatic migration to `logicalSchema` needs.
+  renames @7 :List(TypeRename);
 }
 
 struct DescribeTypeCall {

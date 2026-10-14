@@ -44,8 +44,9 @@ pub use distill_store::state::{
 /// claiming each) and `references`; `Hub` gains `release` (an explicit
 /// import's bundle follows the rule claiming its sources again). 24: an
 /// `AuthoringRow` says whether its entry is its bundle's primary asset (what
-/// a reference to the bundle's path without a name resolves to).
-pub const PROTOCOL_VERSION: u32 = 24;
+/// a reference to the bundle's path without a name resolves to). 25: a
+/// `TypeDescription` names its renamed fields (`renames`).
+pub const PROTOCOL_VERSION: u32 = 25;
 
 /// A watched import whose latest attempt failed. The bundle keeps serving its
 /// last good contents; the failure clears when a later import succeeds.
@@ -1275,6 +1276,11 @@ pub struct TypeDescription {
     /// Docs and editor hints by planner path (`$`, `$.rate`,
     /// `$.shape{Ring}`), path-sorted; paths with neither are absent.
     pub members: Vec<TypeMember>,
+    /// The renamed fields of the projection (`#[asset(renamed_from)]`):
+    /// planner path → the name it was renamed from (protocol 25). An
+    /// automatic migration of a value to `logical_schema` follows them
+    /// (`distill_migrate::plan_automatic_renamed`).
+    pub renames: BTreeMap<String, String>,
 }
 
 /// A described type's default value.

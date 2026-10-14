@@ -7694,9 +7694,13 @@ game's build writes (`defaults/<path>.json`, from the built module's
 descriptions, defaults or index, so editing them re-imports nothing.
 - `describeType(typeUuid)` answers a `TypeDescription`: the type's path,
   the canonical logical schema of its value projection with its hash, its
-  default, and its members: per planner path (`$`, `$.rate`,
+  default, its members: per planner path (`$`, `$.rate`,
   `$.shape{Ring}`), the doc comment, the doc of the type there, and the
-  editor hints (`range`, `color`, `slider`, `hidden`). The default is a
+  editor hints (`range`, `color`, `slider`, `hidden`); and (protocol 25)
+  its renamed fields (`renames`: planner path → the name it was renamed
+  from, the schema file's `renames`), so an editor migrating a value
+  written under an older schema follows renames as the automatic planner
+  does (`plan_automatic_renamed`). The default is a
   canonical `AuthoringValue` under that schema, `absent` (no default file),
   `schemaMismatch` (the file was written under another projection, whose
   hash it names: the module and the schema files come from different walks)

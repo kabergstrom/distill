@@ -872,8 +872,8 @@ fn describe_type_in(
         let Some((_, bytes)) = files.read(&index.root, &schema_path)? else {
             return Ok(None);
         };
-        let schema = match prefab_types::read_file(&bytes).map_err(|error| invalid_type_file(&schema_path, error))? {
-            prefab_types::Contents::Type { schema, .. } => schema,
+        let (schema, renames) = match prefab_types::read_file(&bytes).map_err(|error| invalid_type_file(&schema_path, error))? {
+            prefab_types::Contents::Type { schema, renames } => (schema, renames),
             prefab_types::Contents::RenamedTo(_) => return Ok(None),
         };
         let description_path = prefab_types::description_file(&entry.path);
@@ -922,6 +922,7 @@ fn describe_type_in(
             logical_schema: Arc::from(logical_schema.into_bytes()),
             default,
             members,
+            renames,
         }))
     })();
     match described {

@@ -2428,14 +2428,14 @@ impl AuthoringBackend for TypeFilesBackend {
 /// read from the default file at its snapshot.
 #[tokio::test(flavor = "current_thread")]
 async fn type_descriptions_round_trip_over_tcp() {
-    use distill_schema::ngp_schema::build::{field, SchemaBuilder};
+    use distill_schema::ngp_schema::build::{field, field_renamed, SchemaBuilder};
     use distill_schema::ngp_schema::{prefab_types, PrimitiveType};
     LocalSet::new()
         .run_until(async {
             let mut project = TestProject::with_roots(vec![target()], &[ROOT, "types"]);
             let mut b = SchemaBuilder::new();
             let u32_t = b.primitive(PrimitiveType::U32);
-            let spinner = b.struct_type("game", "Spinner", vec![field("rate", u32_t)]);
+            let spinner = b.struct_type("game", "Spinner", vec![field_renamed("rate", u32_t, "speed")]);
             let mut schema = b.finish();
             schema.source_hashes.insert("game".into(), "0".into());
             schema.types[spinner.0].has_default = true;
@@ -2487,6 +2487,7 @@ async fn type_descriptions_round_trip_over_tcp() {
             assert_eq!(description.members[0].path, "$.rate");
             assert_eq!(description.members[0].doc.as_deref(), Some("Degrees per second."));
             assert_eq!(description.members[0].range, None);
+            assert_eq!(description.renames, [("$.rate".to_owned(), "speed".to_owned())].into());
 
             // Another walk's default names its own schema hash.
             let mut other = SchemaBuilder::new();
