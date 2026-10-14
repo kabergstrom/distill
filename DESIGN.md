@@ -3061,8 +3061,6 @@ Each rule has a fixed id (`ENGINE_DEFAULT_IMPORTS` in `newgameplus-pipeline/src/
 | `ngp.raw` | `RawTextureSettings` (format, width, height, depth, mip_count) | none | No format in the file |
 | `ngp.font` | `FontImportSettings` (`face`) | `**/*.{ttf,otf,ttc}` | Explicit imports today (`Roboto-Regular.ttf.bundle`): precedence 1 keeps them. `NotoSansSC-Regular.otf` is CFF, which `ngp.font` rejects (TrueType only): excluded in `example-module/assets/distill.toml` |
 | `ngp.sound` | none | `**/*.{wav,ogg,flac}` | |
-| `ngp.cue` | none | `**/*.cue` | |
-| `ngp.mix` | none | `**/*.mix` | `audio.mix.bundle` is an explicit import today: precedence 1 keeps it |
 | `ngp.prefab` | none | `**/*.prefab` | |
 | `ngp.glsl` | `GlslSettings` | `**/*.{vert,frag,comp}` | Includes (`.glsl`) have no rule. deferred-ngp excludes its `glsl` root (`["**"]`): its stages are cooked by `compile_shaders.sh` and embedded, but the explicitly imported ones |
 
