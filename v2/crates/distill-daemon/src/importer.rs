@@ -74,7 +74,10 @@ pub(crate) struct DirectoryImportTask {
     group: RootedPath,
     importer: String,
     sources: Vec<RootedPath>,
-    /// The rule's settings as authored (JSON text).
+    /// The Settings type the rule's settings name (`None`: a default
+    /// rule's, the importer's defaults).
+    settings_type: Option<TypeUuid>,
+    /// The rule's settings as authored (patch text), then completed.
     settings_text: String,
     /// The settings parsed against the importer's settings schema and
     /// completed with its defaults ([`complete_task_settings`]), or why
@@ -101,7 +104,10 @@ struct DecodedDirectoryRule {
     matches: FileQuery,
     group: DirectoryGrouping,
     importer: String,
-    /// JSON text, parsed against the importer's settings schema per task.
+    /// The Settings type the settings patch names (`None`: a default rule).
+    settings_type: Option<TypeUuid>,
+    /// The settings patch as text, parsed against the importer's settings
+    /// schema per task.
     settings: String,
     output: String,
 }
@@ -409,7 +415,7 @@ impl AuthoringService {
             .values()
             .filter(|entry| entry.type_uuid == DIRECTORY_IMPORT_RULES_TYPE_UUID)
         {
-            let rules = decode_directory_rules(&entry.data)?;
+            let rules = decode_directory_rules(&entry.data, &bundle.type_table().map_err(invalid)?)?;
             directory_rules.push((entry.uuid, listing_dir(&rules.listing)));
         }
         let record = bundle.assets.get("$record").map(|entry| entry.uuid);
@@ -502,11 +508,12 @@ impl AuthoringService {
                     slot.insert(bundle)
                 }
             };
-            let Some(entry) = bundle.as_ref().and_then(|bundle| {
+            let Some((bundle, entry)) = bundle.as_ref().and_then(|bundle| {
                 bundle
                     .assets
                     .values()
                     .find(|entry| entry.uuid == source.rules_asset)
+                    .map(|entry| (bundle, entry))
             }) else {
                 continue;
             };
@@ -515,7 +522,10 @@ impl AuthoringService {
                 source_path: source.path,
                 rules_bundle: source.rules_bundle,
                 rules_asset: source.rules_asset,
-                rules: decode_directory_rules(&entry.data)?,
+                rules: decode_directory_rules(
+                    &entry.data,
+                    &bundle.type_table().map_err(invalid)?,
+                )?,
                 default_rule: None,
             });
         }
@@ -3056,6 +3066,7 @@ fn default_rule_entries(defaults: &DefaultImports) -> Vec<DirectoryRuleEntry> {
                         matches: rule.matches.clone(),
                         group: rule.group,
                         importer: rule.importer.clone(),
+                        settings_type: None,
                         settings: "{}".to_owned(),
                         output: rule.output.clone(),
                     }],
@@ -3236,8 +3247,16 @@ fn import_read_keys(read_set: &[FileDep]) -> Vec<ImportReadKey> {
 /// Parse `task`'s authored settings against its importer's settings
 /// schema (authored spelling) and complete them with the importer's
 /// defaults. The completed value's canonical text then stands for the
-/// settings in the task digest.
+/// settings in the task digest. A rule's settings must name the importer's
+/// Settings type.
 fn complete_task_settings(task: &mut DirectoryImportTask, importer: &RegisteredImporter) {
+    if let Some(ty) = task.settings_type.filter(|ty| *ty != importer.settings_type_uuid) {
+        task.settings = Err(format!(
+            "the rule's settings are a {ty} value; importer {} takes {}",
+            importer.id, importer.settings_type_uuid
+        ));
+        return;
+    }
     let schema = &importer.settings_schema.root;
     let completed = parse_patch(&task.settings_text, schema, Options::authored())
         .map_err(|error| error.render("settings"))
@@ -3274,6 +3293,7 @@ fn indexed_directory_task(
         group: group.clone(),
         importer: rule.importer.clone(),
         sources,
+        settings_type: rule.settings_type,
         settings_text: rule.settings.clone(),
         settings: Err(format!("importer {} is not registered", rule.importer)),
         destination_root: group.root.0.clone(),
@@ -3355,6 +3375,26 @@ fn listing_dir(listing: &FileQuery) -> String {
 /// `""` and each directory `path` is under, ending in `/`.
 fn ancestor_dirs(path: &str) -> impl Iterator<Item = &str> {
     std::iter::once("").chain(path.match_indices('/').map(|(slash, _)| &path[..=slash]))
+}
+
+/// A written `DirectoryImportRules` value: it decodes (settings a sparse
+/// value of a type in `types`) and names each rule id once. Ids unique
+/// across rules bundles are checked where the rules are indexed.
+pub(crate) fn validate_directory_rules(
+    value: &Value,
+    types: &distill_schema::ngp_schema::TypeTable,
+) -> Result<(), RpcFailure> {
+    let rules = decode_directory_rules(value, types)?;
+    let mut ids = BTreeSet::new();
+    for rule in &rules.rules {
+        if !ids.insert(rule.id.0) {
+            return Err(invalid(format!(
+                "directory import rule {} is listed twice",
+                uuid_text(rule.id.0)
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_directory_rule_ids(entries: &[DirectoryRuleEntry]) -> Result<(), RpcFailure> {

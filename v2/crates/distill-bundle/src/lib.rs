@@ -32,9 +32,31 @@ pub use crc32c::crc32c;
 pub use error::BundleError;
 pub use ngp_schema::{encode_path, PathComponent};
 
-/// The envelope semantics version this crate reads and writes (§6): the
-/// JSON `format_version` field. Pinned to exactly 1.
+/// The envelope semantics versions this crate reads and writes (§6): the
+/// JSON `format_version` field. A bundle's version is
+/// [`format_version_for`] its entries, one spelling per content:
+/// - 1: every bundle without directory import rules;
+/// - 2 ([`RULES_FORMAT_VERSION`]): a bundle holding a `DirectoryImportRules`
+///   entry. Version 2 changed that sealed schema (rule settings are a
+///   sparse dynamic value of the importer's Settings type, newgameplus
+///   GAP 23 §12.2); version 1 rules, settings spelled as a JSON tree, no
+///   longer read.
 pub const BUNDLE_FORMAT_VERSION: u32 = 1;
+
+/// The format version of a bundle holding directory import rules.
+pub const RULES_FORMAT_VERSION: u32 = 2;
+
+/// The format version a bundle with `assets` is written at.
+pub fn format_version_for(assets: &BTreeMap<String, AssetEntry>) -> u32 {
+    if assets
+        .values()
+        .any(|entry| entry.type_uuid == distill_core::bootstrap::DIRECTORY_IMPORT_RULES_TYPE_UUID)
+    {
+        RULES_FORMAT_VERSION
+    } else {
+        BUNDLE_FORMAT_VERSION
+    }
+}
 
 /// The container encoding version this crate reads and writes (§6): the
 /// header `version` field. Pinned to exactly 1.

@@ -1,6 +1,7 @@
 //! The envelope (§6): the JSON structure both physical encodings share.
 //!
-//! Top-level keys: `format_version` (pinned = 1), `uuid`, `primary`
+//! Top-level keys: `format_version` (1, or 2 with directory import rules:
+//! `format_version_for`), `uuid`, `primary`
 //! (optional, must name an existing entry), `schemas` (64-hex LogicalHash →
 //! schema snapshot JSON, key verified to equal the snapshot's own hash),
 //! `types` (optional, the dynamic-type closure: type path →
@@ -19,7 +20,8 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use distill_core::bootstrap::{
-    BootstrapControlSpecV1, BOOTSTRAP_CONTROL_TYPE_UUIDS, IMPORT_RECORD_TYPE_UUID,
+    BootstrapControlSpecV1, BOOTSTRAP_CONTROL_TYPE_UUIDS, DIRECTORY_IMPORT_RULES_TYPE_UUID,
+    IMPORT_RECORD_TYPE_UUID,
 };
 use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
 use distill_json::{Kind, Lexer, ParseError, ParseErrorKind};
@@ -27,7 +29,9 @@ use ngp_schema::{check_hash, node_bytes, read_snapshot, snapshot_to_json, Logica
 
 use crate::data::{parse_entry, Blobs};
 use crate::error::BundleError;
-use crate::{AssetEntry, Bundle, BUNDLE_FORMAT_VERSION};
+use crate::{
+    format_version_for, AssetEntry, Bundle, BUNDLE_FORMAT_VERSION, RULES_FORMAT_VERSION,
+};
 
 pub(crate) fn utf8(bytes: &[u8]) -> Result<&str, BundleError> {
     std::str::from_utf8(bytes).map_err(|e| BundleError::NotUtf8 {
@@ -143,7 +147,9 @@ pub(crate) fn parse(
             _ => None,
         };
         match n {
-            Some(n) if n == BUNDLE_FORMAT_VERSION as u128 => n as u32,
+            Some(n) if n == BUNDLE_FORMAT_VERSION as u128 || n == RULES_FORMAT_VERSION as u128 => {
+                n as u32
+            }
             Some(n) => return Err(BundleError::UnsupportedFormatVersion { found: n }),
             None => {
                 return Err(BundleError::FormatVersionNotUInt {
@@ -336,6 +342,7 @@ pub(crate) fn parse(
         }
         validate_entry_role(local_id, format_version, entry, &schemas[&entry.schema_hash])?;
     }
+    check_format_version(format_version, &assets)?;
     if let Some(p) = &primary {
         match assets.get(p) {
             None => return Err(BundleError::PrimaryNotFound { primary: p.clone() }),
@@ -424,8 +431,15 @@ pub(crate) fn validate_entry_role(
     else {
         return Ok(());
     };
-    if format_version != BUNDLE_FORMAT_VERSION || !entry.authoring_only {
+    if !entry.authoring_only {
         return role_error(local_id, "bootstrap control has invalid version or role");
+    }
+    if entry.type_uuid == DIRECTORY_IMPORT_RULES_TYPE_UUID && format_version != RULES_FORMAT_VERSION
+    {
+        return role_error(
+            local_id,
+            "DirectoryImportRules needs bundle format_version 2 (typed rule settings): convert this rules bundle",
+        );
     }
     let expected = &BootstrapControlSpecV1::embedded()
         .map_err(|_| BundleError::EntryRole {
@@ -439,6 +453,22 @@ pub(crate) fn validate_entry_role(
     })?;
     if entry.schema_hash != expected.logical_hash || actual_schema != expected.logical_schema {
         return role_error(local_id, "bootstrap schema hash does not match DSB");
+    }
+    Ok(())
+}
+
+/// A bundle's `format_version` is the one its entries take
+/// ([`format_version_for`]): one spelling per content.
+pub(crate) fn check_format_version(
+    format_version: u32,
+    assets: &BTreeMap<String, AssetEntry>,
+) -> Result<(), BundleError> {
+    let expected = format_version_for(assets);
+    if format_version != expected {
+        return Err(BundleError::FormatVersionMismatch {
+            found: format_version,
+            expected,
+        });
     }
     Ok(())
 }

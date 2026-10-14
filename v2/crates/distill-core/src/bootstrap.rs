@@ -1,4 +1,8 @@
-//! The sealed logical bootstrap for bundle format v1.
+//! The sealed logical bootstrap of the bundle formats (spec encoding v1).
+//! `ImportRecord` and `PackDefinition` are as format 1 sealed them;
+//! `DirectoryImportRules` is format 2's, its rule settings a sparse dynamic
+//! value (`Dynamic { sparse: true }`) where format 1 spelled a JSON tree
+//! (`distill_bundle::format_version_for`).
 //!
 //! These three rows are the only bootstrap authority. They deliberately carry
 //! no target-native layout, compiled registry projection, or consumer brand.

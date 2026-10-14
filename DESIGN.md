@@ -1714,7 +1714,7 @@ artifact format's `DSTL` (§12).
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `format_version` | number | Bundle file format version |
+| `format_version` | number | Bundle file format version: 2 iff an entry is `DirectoryImportRules` (typed rule settings, newgameplus GAP 23 §12.2), else 1. One spelling per content: parse and write reject the other (`BundleError::FormatVersionMismatch`, `distill_bundle::format_version_for`), so imported bundles stay format 1 and keep their content hashes. |
 | `uuid` | string | The bundle's own stable UUID |
 | `primary` | string? | Local ID resolved by plain-path references. Optional; inference is over runtime content entries only — every `authoring_only` entry is ineligible, including daemon-owned `$` entries (§8): defaults to the sole eligible entry; multiple eligible entries with no declaration and no prior primary are an error (§8's fold rule). |
 | `schemas` | object | `logical_hash → LogicalSchema` for every logical hash the bundle references — entry `schema_hash`es, migration endpoints (§11)., `types` entries. Bundles are **schema-closed**: any hash mentioned in the file resolves within the file. |
@@ -1777,7 +1777,10 @@ pub enum EntryLineageV1 {
 `EntryLineageV1::Bootstrap` is legal and mandatory iff `type_uuid` is one of
 the five closed `BootstrapControlSpecV1` TypeUuids: `SchemaLineageManifest`,
 `Migration`, `ImportRecord`, `DirectoryImportRules`, or `PackDefinition`.
-It requires both the enclosing bundle and arm to say format version 1,
+It requires both the enclosing bundle and arm to say the type's format
+version (1; 2 for `DirectoryImportRules`, whose sealed row's
+`ImportRule.settings` is `Dynamic { sparse: true }`, the one row format 2
+changed),
 `schema_hash` to equal that type's sealed table-row DSLH, and the bundle's
 `schemas[schema_hash]` canonical logical graph to equal the DSB-sealed logical
 graph, not merely hash to caller-supplied bytes. It also enforces that type's
@@ -2777,12 +2780,17 @@ pub struct ImportRule {
     pub matches: FileQuery,
     pub group: Grouping,                // one fold per group
     pub importer: String,               // Importer::ID
-    /// Settings template, validated against the importer's Settings schema.
-    /// The bootstrap type spells it as a self-describing JSON tree (an
-    /// enum: Null, Bool, Int, UInt, Float, Str, Array, Object, Blob),
-    /// rendered to text and parsed against the importer's settings schema
-    /// per task.
-    pub settings: Value,
+    /// Settings template: a sparse dynamic value (§5 `Dynamic { sparse:
+    /// true }`) of the importer's Settings type, that type in the rules
+    /// bundle's `types` closure (bundle format 2, §6 Envelope). Per task
+    /// the daemon writes the patch as canonical text with the bundle's
+    /// schema, parses it against the importer's current Settings schema
+    /// and completes it with the importer's defaults
+    /// (`complete_task_settings`); a patch of another type than the
+    /// importer's settings type fails the task. Format 1 spelled it as a
+    /// self-describing JSON-tree enum; such bundles are refused ("convert
+    /// this rules bundle").
+    pub settings: Dynamic,
     /// Naming template over {stem} / {name}: "{stem}.bundle",
     /// "{name}.glsl.bundle" — output lands beside its sources.
     pub output: String,

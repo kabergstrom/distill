@@ -210,7 +210,9 @@ fn parse_with(
 /// zero-blob container).
 pub(crate) fn write(bundle: &Bundle) -> Result<Vec<u8>, BundleError> {
     // ---- envelope-level validation, mirroring the parser's ----
-    if bundle.format_version != crate::BUNDLE_FORMAT_VERSION {
+    if bundle.format_version != crate::BUNDLE_FORMAT_VERSION
+        && bundle.format_version != crate::RULES_FORMAT_VERSION
+    {
         return Err(E::UnsupportedFormatVersion {
             found: bundle.format_version as u128,
         });
@@ -252,6 +254,7 @@ pub(crate) fn write(bundle: &Bundle) -> Result<Vec<u8>, BundleError> {
             &bundle.schemas[&entry.schema_hash],
         )?;
     }
+    envelope::check_format_version(bundle.format_version, &bundle.assets)?;
     if let Some(p) = &bundle.primary {
         match bundle.assets.get(p) {
             None => return Err(E::PrimaryNotFound { primary: p.clone() }),

@@ -94,9 +94,15 @@ pub enum BundleError {
         found: &'static str,
     },
     /// `format_version` parsed but is not a version this crate supports
-    /// (supported: exactly 1).
+    /// (supported: 1 and 2).
     UnsupportedFormatVersion {
         found: u128,
+    },
+    /// `format_version` is not the one the entries take
+    /// (`format_version_for`).
+    FormatVersionMismatch {
+        found: u32,
+        expected: u32,
     },
     BadBundleUuid {
         found: String,
@@ -413,8 +419,12 @@ impl fmt::Display for BundleError {
                 "format_version must be an unsigned integer, found {found}"
             ),
             E::UnsupportedFormatVersion { found } => {
-                write!(f, "unsupported format_version {found} (supported: 1)")
+                write!(f, "unsupported format_version {found} (supported: 1, 2)")
             }
+            E::FormatVersionMismatch { found, expected } => write!(
+                f,
+                "format_version {found} where the entries take {expected} (2 iff the bundle holds DirectoryImportRules)"
+            ),
             E::BadBundleUuid { found } => {
                 write!(f, "bundle uuid {found:?} is not a hyphenated uuid")
             }

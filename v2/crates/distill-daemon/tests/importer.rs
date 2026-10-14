@@ -12,12 +12,16 @@ use distill_daemon::watcher::WatcherBatch;
 use distill_pipeline_fixture::{
     default_settings, settings, value as byte, value_of as byte_of, BYTE_IMPORTER, CHAIN_IMPORTER,
     SETTINGS_IMPORTER, FLOAT_IMPORTER, OPTIONAL_IMPORTER, REQUIRE_IMPORTER, float_settings,
-    float_settings_schema, settings_schema,
+    float_settings_schema, settings_schema, FLOAT_SETTINGS_TYPE, OPTIONAL_SETTINGS_TYPE,
+    SETTINGS_TYPE,
 };
 use distill_rpc::{
     AuthoringValue, ImportRequest, InputVersion, TargetDefinition, TargetDefinitionHash,
 };
-use distill_schema::ngp_schema::{write_value, LogicalSchema, Value, WriteOptions};
+use distill_schema::ngp_schema::{
+    parse_patch, write_value, DynamicPayload, DynamicValue, LogicalSchema, Options, SchemaNode,
+    Value, WriteOptions,
+};
 use distill_store::StoreConfig;
 
 /// The output type of the pipeline fixture's importers, a project type of
@@ -184,9 +188,11 @@ fn glob_query(glob: &str) -> Value {
 }
 
 /// A bootstrap rule (fields in node order: `group` (`PerFile`), `id`,
-/// `importer`, `matches`, `output`, `settings`), its settings `settings`
-/// text spelled as the rules' JSON tree.
+/// `importer`, `matches`, `output`, `settings`), its settings the patch
+/// `settings` (text) of `importer`'s Settings type, a sparse dynamic value.
 fn rule(id: [u8; 16], importer: &str, matches: Value, output: &str, settings: &str) -> Value {
+    let (ty, _, schema) = settings_type(importer);
+    let patch = parse_patch(settings, &schema, Options::authored()).unwrap();
     record([
         Value::Enum {
             variant: 1,
@@ -196,70 +202,78 @@ fn rule(id: [u8; 16], importer: &str, matches: Value, output: &str, settings: &s
         Value::String(importer.into()),
         matches,
         Value::String(output.into()),
-        wrapped(settings),
+        Value::Dynamic(Box::new(DynamicValue {
+            ty,
+            value: DynamicPayload::Sparse(patch),
+        })),
     ])
 }
 
-/// Settings text as a rules asset spells it: a self-describing JSON tree,
-/// the bootstrap enum `Array`, `Blob`, `Bool`, `Float`, `Int`, `Null`,
-/// `Object`, `Str`, `UInt` (variant indices in that order), each payload
-/// `{ value }`.
-fn wrapped(settings: &str) -> Value {
-    let mut lexer = distill_json::Lexer::new(settings);
-    let value = tree(&mut lexer);
-    lexer.finish().unwrap();
-    value
+/// The Settings type `importer` takes: its UUID, the path a rules bundle's
+/// type closure names it by, its schema (the test project's).
+fn settings_type(importer: &str) -> (TypeUuid, &'static str, SchemaNode) {
+    let (ty, path) = match importer {
+        FLOAT_IMPORTER => (FLOAT_SETTINGS_TYPE, "fixture::FloatSettings"),
+        OPTIONAL_IMPORTER => (OPTIONAL_SETTINGS_TYPE, "fixture::OptionalSettings"),
+        _ => (SETTINGS_TYPE, "fixture::Settings"),
+    };
+    let authority = distill_test_project::project_authority();
+    let schema = authority.project_type(ty).unwrap().logical_schema.root.clone();
+    (ty, path, schema)
 }
 
-fn tree(lexer: &mut distill_json::Lexer<'_>) -> Value {
-    let node = |variant, value| Value::Enum {
-        variant,
-        payload: Box::new([value]),
-    };
-    match lexer.peek().unwrap() {
-        distill_json::Kind::Null => {
-            lexer.null().unwrap();
-            Value::Enum {
-                variant: 5,
-                payload: Box::new([]),
-            }
-        }
-        distill_json::Kind::Bool => node(2, Value::Bool(lexer.bool().unwrap())),
-        distill_json::Kind::Number => {
-            let number = lexer.number().unwrap();
-            match (number.integer, number.negative()) {
-                (false, _) => node(3, Value::F64(number.f64().unwrap())),
-                (true, true) => node(4, Value::I128(number.i128().unwrap())),
-                (true, false) => node(8, Value::U128(number.u128().unwrap())),
-            }
-        }
-        distill_json::Kind::String => node(7, Value::String(lexer.string().unwrap().into_owned())),
-        distill_json::Kind::Array => {
-            let mut open = lexer.array().unwrap();
-            let mut items = Vec::new();
-            while lexer.next_item(&mut open).unwrap() {
-                items.push(tree(lexer));
-            }
-            node(0, Value::Seq(items))
-        }
-        distill_json::Kind::Object => {
-            let mut open = lexer.object().unwrap();
-            let mut entries = Vec::new();
-            while let Some((key, _)) = lexer.next_key(&mut open).unwrap() {
-                entries.push((key.into_owned(), tree(lexer)));
-            }
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            node(
-                6,
-                Value::Map(
-                    entries
-                        .into_iter()
-                        .map(|(key, value)| (Value::String(key), value))
-                        .collect(),
-                ),
-            )
-        }
+/// A rules bundle (format 2) holding one `DirectoryImportRules` entry
+/// `rules` with `listing` and `rules`, the type closure its rules' settings
+/// name.
+fn rules_bundle(
+    uuid: BundleUuid,
+    asset: AssetUuid,
+    listing: Value,
+    rules: Vec<(Value, &str)>,
+) -> Vec<u8> {
+    let row = BootstrapControlSpecV1::embedded()
+        .unwrap()
+        .0
+        .into_iter()
+        .find(|row| row.symbol == BootstrapControlSymbol::DirectoryImportRules)
+        .unwrap();
+    let schema = distill_schema::ngp_schema::node_from_bytes(&row.logical_schema).unwrap();
+    let mut schemas = BTreeMap::from([(row.logical_hash, schema)]);
+    let mut types = BTreeMap::new();
+    for (_, importer) in &rules {
+        let (type_uuid, path, settings) = settings_type(importer);
+        let schema_hash = distill_schema::ngp_schema::node_hash(&settings).unwrap();
+        schemas.insert(schema_hash, LogicalSchema { root: settings });
+        types.insert(
+            path.to_owned(),
+            distill_bundle::BundleType {
+                type_uuid,
+                schema_hash,
+            },
+        );
     }
+    let data = record([
+        listing,
+        Value::Seq(rules.into_iter().map(|(rule, _)| rule).collect()),
+    ]);
+    distill_bundle::write_bundle(&Bundle {
+        format_version: distill_bundle::RULES_FORMAT_VERSION,
+        uuid,
+        primary: None,
+        schemas,
+        types,
+        assets: BTreeMap::from([(
+            "rules".into(),
+            AssetEntry {
+                uuid: asset,
+                type_uuid: DIRECTORY_IMPORT_RULES_TYPE_UUID,
+                schema_hash: row.logical_hash,
+                authoring_only: true,
+                data,
+            },
+        )]),
+    })
+    .unwrap()
 }
 
 /// A rules bundle whose one rule imports each `*.src` file with
@@ -285,38 +299,17 @@ fn directory_rules_bundle_for(
     importer: &str,
     settings: &str,
 ) -> Vec<u8> {
-    let row = BootstrapControlSpecV1::embedded()
-        .unwrap()
-        .0
-        .into_iter()
-        .find(|row| row.symbol == BootstrapControlSymbol::DirectoryImportRules)
-        .unwrap();
-    let schema = distill_schema::ngp_schema::node_from_bytes(&row.logical_schema).unwrap();
     let (id, matches) = if include_rule {
         ([97; 16], glob_query("*.src"))
     } else {
         ([100; 16], glob_query("*.other"))
     };
-    let rules = vec![rule(id, importer, matches, "{stem}.bundle", settings)];
-    let data = record([glob_query("*.src"), Value::Seq(rules)]);
-    distill_bundle::write_bundle(&Bundle {
-        format_version: 1,
-        uuid: BundleUuid([98; 16]),
-        primary: None,
-        schemas: BTreeMap::from([(row.logical_hash, schema)]),
-        types: Default::default(),
-        assets: BTreeMap::from([(
-            "rules".into(),
-            AssetEntry {
-                uuid: AssetUuid([99; 16]),
-                type_uuid: DIRECTORY_IMPORT_RULES_TYPE_UUID,
-                schema_hash: row.logical_hash,
-                authoring_only: true,
-                data,
-            },
-        )]),
-    })
-    .unwrap()
+    rules_bundle(
+        BundleUuid([98; 16]),
+        AssetUuid([99; 16]),
+        glob_query("*.src"),
+        vec![(rule(id, importer, matches, "{stem}.bundle", settings), importer)],
+    )
 }
 
 #[test]
@@ -2502,33 +2495,15 @@ fn rules_bundle_matching_with(
     output: &str,
     rule_settings: &str,
 ) -> Vec<u8> {
-    let row = BootstrapControlSpecV1::embedded()
-        .unwrap()
-        .0
-        .into_iter()
-        .find(|row| row.symbol == BootstrapControlSymbol::DirectoryImportRules)
-        .unwrap();
-    let schema = distill_schema::ngp_schema::node_from_bytes(&row.logical_schema).unwrap();
-    let rules = vec![rule([rule_id; 16], importer, glob_query(glob), output, rule_settings)];
-    let data = record([glob_query(glob), Value::Seq(rules)]);
-    distill_bundle::write_bundle(&Bundle {
-        format_version: 1,
-        uuid: BundleUuid([uuid; 16]),
-        primary: None,
-        schemas: BTreeMap::from([(row.logical_hash, schema)]),
-        types: Default::default(),
-        assets: BTreeMap::from([(
-            "rules".into(),
-            AssetEntry {
-                uuid: AssetUuid([uuid + 1; 16]),
-                type_uuid: DIRECTORY_IMPORT_RULES_TYPE_UUID,
-                schema_hash: row.logical_hash,
-                authoring_only: true,
-                data,
-            },
-        )]),
-    })
-    .unwrap()
+    rules_bundle(
+        BundleUuid([uuid; 16]),
+        AssetUuid([uuid + 1; 16]),
+        glob_query(glob),
+        vec![(
+            rule([rule_id; 16], importer, glob_query(glob), output, rule_settings),
+            importer,
+        )],
+    )
 }
 
 /// Configure the project at `dir` (root "main" at `root`) as [`configure`]

@@ -358,7 +358,9 @@ fn colliding_directory_rules_bundle() -> Vec<u8> {
     use distill_core::bootstrap::{
         BootstrapControlSpecV1, BootstrapControlSymbol, DIRECTORY_IMPORT_RULES_TYPE_UUID,
     };
-    use distill_schema::ngp_schema::Value;
+    use distill_schema::ngp_schema::{
+        DynamicPayload, DynamicValue, LogicalSchema, Patch, PrimitiveKind, SchemaNode, Value,
+    };
     let row = BootstrapControlSpecV1::embedded()
         .unwrap()
         .0
@@ -386,20 +388,35 @@ fn colliding_directory_rules_bundle() -> Vec<u8> {
             Value::String("missing-importer".into()),
             query(),
             Value::String("collide.bundle".into()),
-            // UInt { value: 5 }
-            Value::Enum {
-                variant: 8,
-                payload: Box::new([Value::U128(5)]),
-            },
+            // A `u8` 5 of a settings type no importer takes.
+            Value::Dynamic(Box::new(DynamicValue {
+                ty: distill_core::id::TypeUuid([33; 16]),
+                value: DynamicPayload::Sparse(Patch::Replace(Value::U8(5))),
+            })),
         ]))
     };
     let data = Value::Struct(Box::new([query(), Value::Seq(vec![rule(1)])]));
+    let settings = SchemaNode::Primitive(PrimitiveKind::U8);
+    let settings_hash = distill_schema::ngp_schema::node_hash(&settings).unwrap();
     distill_bundle::write_bundle(&distill_bundle::Bundle {
-        format_version: 1,
+        format_version: distill_bundle::RULES_FORMAT_VERSION,
         uuid: distill_core::id::BundleUuid([31; 16]),
         primary: None,
-        schemas: [(row.logical_hash, schema)].into_iter().collect(),
-        types: Default::default(),
+        schemas: [
+            (row.logical_hash, schema),
+            (settings_hash, LogicalSchema { root: settings }),
+        ]
+        .into_iter()
+        .collect(),
+        types: [(
+            "test::Settings".to_owned(),
+            distill_bundle::BundleType {
+                type_uuid: distill_core::id::TypeUuid([33; 16]),
+                schema_hash: settings_hash,
+            },
+        )]
+        .into_iter()
+        .collect(),
         assets: [(
             "rules".to_owned(),
             distill_bundle::AssetEntry {

@@ -348,11 +348,11 @@ fn duplicate_json_keys_rejected() {
 fn unsupported_format_version() {
     let (plain, _) = valid_plain();
     let bytes = mutate_envelope(&plain, |env| {
-        as_obj(env).insert("format_version".to_string(), u(2));
+        as_obj(env).insert("format_version".to_string(), u(3));
     });
     let err = parse_bundle(&bytes).unwrap_err();
     assert!(
-        matches!(err, E::UnsupportedFormatVersion { found: 2 }),
+        matches!(err, E::UnsupportedFormatVersion { found: 3 }),
         "got {err:?}"
     );
 }
@@ -367,8 +367,20 @@ fn format_version_must_be_uint() {
     assert!(matches!(err, E::FormatVersionNotUInt { .. }), "got {err:?}");
 }
 
+/// Version 2 is for bundles holding directory import rules: one spelling
+/// per content, on parse and on write.
 #[test]
-fn unsupported_format_version_rejected_on_write() {
+fn format_version_is_the_one_the_entries_take() {
+    let (plain, _) = valid_plain();
+    let bytes = mutate_envelope(&plain, |env| {
+        as_obj(env).insert("format_version".to_string(), u(2));
+    });
+    let err = parse_bundle(&bytes).unwrap_err();
+    assert!(
+        matches!(err, E::FormatVersionMismatch { found: 2, expected: 1 }),
+        "got {err:?}"
+    );
+
     let sc = simple_schema();
     let mut b = bundle(
         &[&sc],
@@ -381,7 +393,30 @@ fn unsupported_format_version_rejected_on_write() {
     b.format_version = 2;
     let err = write_bundle(&b).unwrap_err();
     assert!(
-        matches!(err, E::UnsupportedFormatVersion { found: 2 }),
+        matches!(err, E::FormatVersionMismatch { found: 2, expected: 1 }),
+        "got {err:?}"
+    );
+    b.format_version = 3;
+    let err = write_bundle(&b).unwrap_err();
+    assert!(
+        matches!(err, E::UnsupportedFormatVersion { found: 3 }),
+        "got {err:?}"
+    );
+}
+
+/// Version 1 rules (settings spelled as a JSON tree) no longer read: the
+/// error says to convert them.
+#[test]
+fn directory_import_rules_need_format_version_2() {
+    let sc = simple_schema();
+    let mut rules = entry(UUID_A, &sc, obj(&[("count", u(1)), ("name", s("n"))]));
+    rules.type_uuid = distill_core::bootstrap::DIRECTORY_IMPORT_RULES_TYPE_UUID;
+    rules.authoring_only = true;
+    let b = bundle(&[&sc], vec![("rules", rules)], None);
+    let err = write_bundle(&b).unwrap_err();
+    assert!(
+        matches!(&err, E::EntryRole { local_id, detail }
+            if local_id == "rules" && detail.contains("convert")),
         "got {err:?}"
     );
 }

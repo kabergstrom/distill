@@ -9,7 +9,8 @@
 use std::sync::OnceLock;
 
 use distill_schema::ngp_schema::{
-    parse_value, write_value, Options, PrimitiveKind, SchemaNode, Value, WriteOptions,
+    parse_value, write_patch, write_value, DynamicPayload, Options, PrimitiveKind, SchemaNode,
+    TypeTable, Value, WriteOptions,
 };
 
 use super::*;
@@ -20,10 +21,6 @@ const CAPABILITY: &[&str] = &["DefaultTable", "Importer", "MigrationFn", "Proces
 const GROUPING: &[&str] = &["ByStem", "PerFile"];
 const FAILURE: &[&str] = &["Local", "MissingCapability", "RawFile"];
 const SUBJECT: &[&str] = &["Path", "Query"];
-/// The bootstrap rules' settings: a JSON tree spelled as an enum.
-const SETTINGS_TREE: &[&str] = &[
-    "Array", "Blob", "Bool", "Float", "Int", "Null", "Object", "Str", "UInt",
-];
 
 // ---- record ----------------------------------------------------------
 
@@ -564,7 +561,10 @@ fn node_enum(variants: Vec<(&str, SchemaNode)>) -> SchemaNode {
 
 // ---- directory rules -------------------------------------------------
 
-pub(super) fn decode_directory_rules(value: &Value) -> Result<DecodedDirectoryRules, RpcFailure> {
+pub(super) fn decode_directory_rules(
+    value: &Value,
+    types: &TypeTable,
+) -> Result<DecodedDirectoryRules, RpcFailure> {
     let [listing, rules] = fields(value, ["listing", "rules"], "DirectoryImportRules")?;
     let listing = decode_file_query(listing)?;
     let rules = seq(rules, "DirectoryImportRules.rules")?
@@ -575,15 +575,15 @@ pub(super) fn decode_directory_rules(value: &Value) -> Result<DecodedDirectoryRu
                 ["group", "id", "importer", "matches", "output", "settings"],
                 "ImportRule",
             )?;
-            let mut text = String::new();
-            settings_text(settings, 0, &mut text)?;
+            let (settings_type, settings) = settings_text(settings, types)?;
             Ok(DecodedDirectoryRule {
                 id: distill_build::import::ImportRuleId(bytes(id, "ImportRule.id")?),
                 matches: decode_file_query(matches)?,
                 group: decode_directory_grouping(group)?,
                 importer: normalize_identifier(string(importer, "ImportRule.importer")?)
                     .map_err(invalid)?,
-                settings: text,
+                settings_type: Some(settings_type),
+                settings,
                 output: string(output, "ImportRule.output")?.to_owned(),
             })
         })
@@ -605,66 +605,28 @@ fn decode_directory_grouping(value: &Value) -> Result<DirectoryGrouping, RpcFail
     })
 }
 
-/// A rule's settings as JSON text: the bootstrap type spells them as a
-/// JSON tree (`{"Object":{"value":{"k":{"Bool":{"value":true}}}}}`), which
-/// the daemon parses against the rule's importer settings schema.
-fn settings_text(value: &Value, depth: usize, out: &mut String) -> Result<(), RpcFailure> {
-    if depth >= 512 {
-        return Err(invalid("rule settings exceed the nesting limit"));
-    }
-    let (name, payload) = variant_of(value, SETTINGS_TREE, "rule settings")?;
-    let leaf = || -> Result<&Value, RpcFailure> {
-        match payload {
-            [value] => Ok(value),
-            _ => Err(invalid(format!("rule settings {name} must hold one value"))),
-        }
+/// A rule's settings: a sparse dynamic value of its importer's Settings
+/// type (newgameplus GAP 23 §12.2), as the type and the patch's canonical
+/// text against the schema the rules bundle wrote it with. Per task the
+/// text is parsed against the importer's current settings schema and
+/// completed with its defaults (`complete_task_settings`), so a field the
+/// importer added since reads its default.
+fn settings_text(value: &Value, types: &TypeTable) -> Result<(TypeUuid, String), RpcFailure> {
+    let Value::Dynamic(dynamic) = value else {
+        return Err(invalid("ImportRule.settings must be a dynamic value"));
     };
-    match name {
-        "Null" => out.push_str("null"),
-        "Bool" => out.push_str(if boolean(leaf()?, "Bool")? { "true" } else { "false" }),
-        "Int" | "UInt" => {
-            let value = leaf()?;
-            match value {
-                Value::I128(v) => out.push_str(&v.to_string()),
-                Value::U128(v) => out.push_str(&v.to_string()),
-                _ => return Err(invalid("rule settings integer has the wrong kind")),
-            }
-        }
-        "Float" => {
-            let Value::F64(value) = leaf()? else {
-                return Err(invalid("rule settings float must be f64"));
-            };
-            distill_json::write_f64(*value, out).map_err(invalid)?;
-        }
-        "Str" => distill_json::write_str(string(leaf()?, "Str")?, out),
-        "Array" => {
-            out.push('[');
-            for (index, item) in seq(leaf()?, "Array")?.iter().enumerate() {
-                if index > 0 {
-                    out.push(',');
-                }
-                settings_text(item, depth + 1, out)?;
-            }
-            out.push(']');
-        }
-        "Object" => {
-            let Value::Map(entries) = leaf()? else {
-                return Err(invalid("rule settings object must be a map"));
-            };
-            out.push('{');
-            for (index, (key, item)) in entries.iter().enumerate() {
-                if index > 0 {
-                    out.push(',');
-                }
-                distill_json::write_str(string(key, "Object key")?, out);
-                out.push(':');
-                settings_text(item, depth + 1, out)?;
-            }
-            out.push('}');
-        }
-        _ => return Err(invalid("rule settings cannot hold blobs")),
-    }
-    Ok(())
+    let DynamicPayload::Sparse(patch) = &dynamic.value else {
+        return Err(invalid("ImportRule.settings must be a sparse dynamic value"));
+    };
+    let ty = types.get(dynamic.ty).ok_or_else(|| {
+        invalid(format!(
+            "ImportRule.settings names type {} outside the bundle's types",
+            dynamic.ty
+        ))
+    })?;
+    let text = write_patch(&ty.schema.root, patch, WriteOptions::default())
+        .map_err(|error| invalid(error.render("ImportRule.settings")))?;
+    Ok((dynamic.ty, text))
 }
 
 // ---- helpers ---------------------------------------------------------
@@ -787,6 +749,7 @@ fn optional_string(value: Option<&String>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use distill_schema::ngp_schema::DynamicType;
     use distill_build::import::{FileContentObservation, ImportRuleId};
 
     fn rooted(root: &str, path: &str) -> RootedPath {
@@ -972,63 +935,52 @@ mod tests {
         assert!(encode_attempt_basis(&read_set).is_err());
     }
 
-    fn tree(name: &str, fields: Vec<Value>) -> Value {
-        variant(SETTINGS_TREE, name, Value::Struct(fields.into()))
+    fn rules_schema() -> SchemaNode {
+        let spec = BootstrapControlSpecV1::embedded().unwrap();
+        let row = spec
+            .0
+            .iter()
+            .find(|row| row.symbol == BootstrapControlSymbol::DirectoryImportRules)
+            .unwrap();
+        distill_schema::ngp_schema::node_from_bytes(&row.logical_schema)
+            .unwrap()
+            .root
     }
 
-    fn render(value: &Value) -> Result<String, RpcFailure> {
-        let mut text = String::new();
-        settings_text(value, 0, &mut text).map(|()| text)
-    }
-
-    #[test]
-    fn rule_settings_render_their_json_tree_as_text() {
-        let settings = tree(
-            "Object",
-            vec![Value::Map(
-                vec![
-                    (
-                        Value::String("flag".into()),
-                        tree("Bool", vec![Value::Bool(true)]),
-                    ),
-                    (
-                        Value::String("list".into()),
-                        tree(
-                            "Array",
-                            vec![Value::Seq(
-                                vec![
-                                    tree("Int", vec![Value::I128(-4)]),
-                                    tree("UInt", vec![Value::U128(u128::MAX)]),
-                                    tree("Float", vec![Value::F64(1.5)]),
-                                    tree("Str", vec![Value::String("a\"b".into())]),
-                                    tree("Null", vec![]),
-                                ]
-                                .into(),
-                            )],
-                        ),
-                    ),
-                    (
-                        Value::String("nested".into()),
-                        tree("Object", vec![Value::Map(Vec::new().into())]),
-                    ),
-                ]
-                .into(),
-            )],
-        );
-        assert_eq!(
-            render(&settings).unwrap(),
-            format!(
-                r#"{{"flag":true,"list":[-4,{},1.5,"a\"b",null],"nested":{{}}}}"#,
-                u128::MAX
-            )
-        );
+    fn settings_types() -> TypeTable {
+        TypeTable::new(vec![DynamicType {
+            uuid: TypeUuid([4; 16]),
+            path: "pipeline::ImageSettings".into(),
+            schema: std::sync::Arc::new(distill_schema::ngp_schema::LogicalSchema {
+                root: node_struct(vec![
+                    ("color", SchemaNode::String),
+                    ("mips", SchemaNode::Primitive(PrimitiveKind::Bool)),
+                ]),
+            }),
+            renames: Default::default(),
+        }])
+        .unwrap()
     }
 
     #[test]
-    fn rule_settings_refuse_blobs_and_mismatched_leaves() {
-        assert!(render(&tree("Blob", vec![Value::Blob(vec![1, 2].into())])).is_err());
-        assert!(render(&tree("Float", vec![Value::F32(1.0)])).is_err());
-        assert!(render(&tree("Int", vec![Value::U8(1)])).is_err());
-        assert!(render(&tree("Bool", vec![])).is_err());
+    fn rule_settings_are_a_sparse_patch_of_the_importer_settings_type() {
+        let mut types = settings_types();
+        let text = r#"{"listing":{"path_glob":"**/*.png","path_prefix":null},"rules":[{"group":{"PerFile":{}},"id":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"importer":"ngp.image","matches":{"path_glob":"**/n_*.png","path_prefix":null},"output":"{name}.bundle","settings":{"type":"pipeline::ImageSettings","value":{"color":"normal"}}}]}"#;
+        let value =
+            parse_value(text, &rules_schema(), Options::canonical().types(&mut types)).unwrap();
+        let rules = decode_directory_rules(&value, &types).unwrap();
+        assert_eq!(rules.rules[0].settings_type, Some(TypeUuid([4; 16])));
+        assert_eq!(rules.rules[0].settings, r#"{"color":"normal"}"#);
+
+        // The type must be in the bundle's closure, the value sparse.
+        assert!(decode_directory_rules(&value, &TypeTable::default()).is_err());
+        let Value::Struct(mut fields) = value else { unreachable!() };
+        let Value::Seq(rules) = &mut fields[1] else { unreachable!() };
+        let Value::Struct(rule) = &mut rules[0] else { unreachable!() };
+        let Value::Dynamic(settings) = &mut rule[5] else { unreachable!() };
+        settings.value = DynamicPayload::Full(Value::Struct(
+            vec![Value::String("normal".into()), Value::Bool(true)].into(),
+        ));
+        assert!(decode_directory_rules(&Value::Struct(fields), &types).is_err());
     }
 }

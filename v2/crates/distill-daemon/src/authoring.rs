@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, Weak};
 
 use distill_bundle::{AssetEntry, Bundle, BUNDLE_FORMAT_VERSION};
-use distill_core::bootstrap::is_bootstrap_control_type;
+use distill_core::bootstrap::{is_bootstrap_control_type, DIRECTORY_IMPORT_RULES_TYPE_UUID};
 use distill_core::id::{BundleUuid, ContentHash, LogicalHash};
 use distill_migrate::{lossy_drops, plan_automatic_renamed};
 use distill_pipeline_api::callbacks::MigrationKey;
@@ -333,6 +333,7 @@ impl AuthoringService {
             .retain(|_, ty| used_types.contains(&ty.type_uuid));
         let used_schemas = distill_bundle::referenced_schema_hashes(&bundle);
         bundle.schemas.retain(|hash, _| used_schemas.contains(hash));
+        bundle.format_version = distill_bundle::format_version_for(&bundle.assets);
         let proposed = if bundle.assets.is_empty() {
             None
         } else {
@@ -355,10 +356,18 @@ impl AuthoringService {
         entry: &AuthoringEntry,
         force_lossy: bool,
     ) -> Result<(), RpcFailure> {
-        if entry.local_id.starts_with('$') || is_bootstrap_control_type(entry.type_uuid) {
+        // Directory import rules are the one human-owned control type
+        // (newgameplus GAP 23 §12.1): authoring-only, under the sealed
+        // schema (the bundle writer checks it), a value the importer reads.
+        let rules = entry.type_uuid == DIRECTORY_IMPORT_RULES_TYPE_UUID;
+        if entry.local_id.starts_with('$') || (is_bootstrap_control_type(entry.type_uuid) && !rules)
+        {
             return Err(invalid(
                 "daemon-owned control entries cannot be written through direct CRUD",
             ));
+        }
+        if rules && entry.role != AuthoringEntryRole::AuthoringOnly {
+            return Err(invalid("DirectoryImportRules entries are authoring-only"));
         }
         if entry.terminal_type != entry.type_uuid {
             return Err(invalid(
@@ -412,6 +421,9 @@ impl AuthoringService {
                 },
             );
             bundle.schemas.insert(schema_hash, (*ty.schema).clone());
+        }
+        if rules {
+            crate::importer::validate_directory_rules(&data, &types)?;
         }
         bundle.assets.insert(
             entry.local_id.clone(),
