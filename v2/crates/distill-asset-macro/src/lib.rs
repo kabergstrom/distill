@@ -795,7 +795,10 @@ fn enum_layout_variant(variant: &VariantInfo, repr: &Ident, single: bool) -> Tok
             let mut cursor = if #single { 0u32 } else { #repr_size };
             let mut payload_align = 1u32;
             let mut fields = Vec::new();
+            // The payload is a frame of its own (§12 backref distances).
+            builder.push_payload_frame();
             #(#field_layouts)*
+            builder.pop_payload_frame();
             let payload_size = ::distill_asset::build::align_up(cursor, payload_align);
             let fields = builder.leak_fields(fields);
             let node = builder.leak_node(::distill_asset::NativeLayoutNode::Struct {

@@ -5351,7 +5351,21 @@ Derived recursively from the native layout; these rules are normative:
   Recursion terminates exactly as §5's grammar does: re-entering a type
   on the current expansion path emits a back-reference node (its own
   kind tag) carrying the frame distance instead of recursing — recursive
-  asset types hash finite and position-independent.
+  asset types hash finite and position-independent. This holds wherever
+  the type is reached: a slot's pointee, or inline as a field of another
+  record (`Node { children: Vec<Child> }`, `Child { node: Node }`).
+  - An inline back-reference occupies the referenced frame's size and
+    alignment; DSWL infers them from that frame. The deriver takes them
+    from the frame's geometry derived without expanding slot pointees
+    (a slot's geometry is its own).
+  - Frames counted, each tree on its own: wire — records, enums,
+    variant payloads (an `Option` is two: the enum and its `Some`
+    payload); native — struct, enum and `Option` nodes, variant
+    payloads; logical — struct and enum types (§5).
+  - The fixup compiler resolves a back-reference pair to the plan of
+    the frames it names: a slot constructs its pointee through it, an
+    inline one `Recurse`s into it. A named frame walked inline has no
+    plan yet; it compiles origin-rooted under its own ancestors.
   Reordering two same-typed fields or reassigning explicit discriminants
   therefore changes the layout hash even when every size and offset stays
   put. source-walk

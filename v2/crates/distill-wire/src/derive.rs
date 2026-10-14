@@ -18,6 +18,10 @@
 //! - Enums take exactly three forms: single-variant (no tag), fully flat
 //!   (integer discriminant and every variant payload wire == native — the
 //!   whole payload image, offsets included), or the canonical tagged form.
+//! - Re-entering a struct/enum on the expansion path emits a
+//!   back-reference wherever it is reached, slot pointee or inline field
+//!   (§5) — as the logical schema and the native layout do. An inline
+//!   one takes the referenced frame's geometry.
 //! - u32 bounds are enforced here, where the u32 grammars begin: any
 //!   size, offset, stride, or length beyond u32 is a typed error naming
 //!   the type — never truncated, never wrapped.
@@ -27,6 +31,7 @@ use crate::wire::{SlotKind, WireEnumForm, WireField, WireNode, WireVariant};
 use ngp_schema::classify::{classify, Class};
 use ngp_schema::node::PrimitiveKind;
 use ngp_schema::{FieldIdentifier, LayoutView, SchemaTypeId, TagEncoding};
+use std::collections::HashMap;
 
 /// Expansion-depth cap: recursion terminates through backrefs, so only a
 /// pathologically deep non-recursive nesting can hit this.
@@ -114,6 +119,8 @@ pub fn derive_wire(view: LayoutView<'_>, root: SchemaTypeId) -> Result<WireNode,
         view,
         path: Vec::new(),
         depth: 0,
+        shape_only: false,
+        shapes: HashMap::new(),
     };
     Ok(derive_type(&mut ctx, root, false)?.node)
 }
@@ -125,6 +132,21 @@ struct Ctx<'a> {
     /// DSWL hasher counts.
     path: Vec<SchemaTypeId>,
     depth: u32,
+    /// Deriving a frame's geometry only ([`shape`]): slot pointees are
+    /// not expanded, since a slot's geometry is its own.
+    shape_only: bool,
+    /// Geometry of the frames re-entered inline, by (type, `in_key`).
+    shapes: HashMap<(SchemaTypeId, bool), Shape>,
+}
+
+/// A derived node's geometry, without the node.
+#[derive(Clone, Copy)]
+struct Shape {
+    native_size: u32,
+    native_align: u32,
+    wire_size: u32,
+    wire_align: u32,
+    diverged: bool,
 }
 
 struct Derived {
@@ -302,8 +324,15 @@ fn derive_type_inner(
             slot(ctx, id, SlotKind::Map, vec![key, value])
         }
         Class::Array { len, elem } => derive_array(ctx, id, len, elem, in_key),
-        Class::Option(_) | Class::Enum => derive_enum(ctx, id, in_key),
-        Class::Struct | Class::Tuple => derive_record(ctx, id, in_key, false),
+        Class::Option(_) | Class::Enum | Class::Struct | Class::Tuple => {
+            if let Some(distance) = reentry(ctx, id) {
+                return inline_backref(ctx, id, distance, in_key);
+            }
+            match class {
+                Class::Struct | Class::Tuple => derive_record(ctx, id, in_key, false),
+                _ => derive_enum(ctx, id, in_key),
+            }
+        }
         Class::AssetRef(_) | Class::WeakRef(_) => derive_reference(ctx, id),
         Class::EnumVariant => Err(DeriveError::Unsupported {
             type_path: type_path(ctx, id),
@@ -352,19 +381,82 @@ fn check_hasher(
 
 /// A slot pointee: a fresh element frame at offset 0. The expansion path
 /// persists through indirection — that is what terminates recursion.
+/// Deriving a shape, the pointee is not expanded: a placeholder stands in.
 fn derive_pointee(
     ctx: &mut Ctx<'_>,
     id: SchemaTypeId,
     in_key: bool,
 ) -> Result<WireNode, DeriveError> {
-    if let Some(pos) = ctx.path.iter().position(|p| *p == id) {
-        let distance = (ctx.path.len() - 1 - pos) as u32;
+    if ctx.shape_only {
+        return Ok(WireNode::Unit { offset: 0 });
+    }
+    if let Some(distance) = reentry(ctx, id) {
         return Ok(WireNode::BackRef {
             distance,
             offset: 0,
         });
     }
     Ok(derive_type(ctx, id, in_key)?.node)
+}
+
+/// §5's backref rule: the distance to `id`'s frame when expansion
+/// re-enters a type on the current expansion path, wherever it is
+/// reached — a slot pointee or inline, as a field of another record
+/// (`Vec<Child>` → `Child { node: Node }` inside `Node`).
+fn reentry(ctx: &Ctx<'_>, id: SchemaTypeId) -> Option<u32> {
+    ctx.path
+        .iter()
+        .rposition(|p| *p == id)
+        .map(|pos| (ctx.path.len() - 1 - pos) as u32)
+}
+
+/// A frame re-entered inline: a back-reference occupying the frame's
+/// geometry (DSWL infers it from the referenced frame), so the enclosing
+/// record lays it out like the expanded frame.
+fn inline_backref(
+    ctx: &mut Ctx<'_>,
+    id: SchemaTypeId,
+    distance: u32,
+    in_key: bool,
+) -> Result<Derived, DeriveError> {
+    let shape = shape(ctx, id, in_key)?;
+    Ok(Derived {
+        node: WireNode::BackRef {
+            distance,
+            offset: 0,
+        },
+        native_size: shape.native_size,
+        native_align: shape.native_align,
+        wire_size: shape.wire_size,
+        wire_align: shape.wire_align,
+        diverged: shape.diverged,
+    })
+}
+
+/// The geometry of `id`'s frame while that frame is still being derived.
+/// Geometry never depends on what a slot points at, so it derives `id`
+/// without expanding slot pointees, on an empty path: inline nesting
+/// without a slot between is finite (Rust has no infinitely sized type),
+/// so nothing re-enters.
+fn shape(ctx: &mut Ctx<'_>, id: SchemaTypeId, in_key: bool) -> Result<Shape, DeriveError> {
+    if let Some(shape) = ctx.shapes.get(&(id, in_key)) {
+        return Ok(*shape);
+    }
+    let path = std::mem::take(&mut ctx.path);
+    let shape_only = std::mem::replace(&mut ctx.shape_only, true);
+    let derived = derive_type(ctx, id, in_key);
+    ctx.shape_only = shape_only;
+    ctx.path = path;
+    let derived = derived?;
+    let shape = Shape {
+        native_size: derived.native_size,
+        native_align: derived.native_align,
+        wire_size: derived.wire_size,
+        wire_align: derived.wire_align,
+        diverged: derived.diverged,
+    };
+    ctx.shapes.insert((id, in_key), shape);
+    Ok(shape)
 }
 
 fn slot(

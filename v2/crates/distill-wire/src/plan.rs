@@ -444,9 +444,10 @@ impl<'w, 'n> Compiler<'w, 'n> {
         Ok(id)
     }
 
-    /// A slot pointee: backref pairs resolve to the ancestor plan; fresh
-    /// pairs compile origin-rooted.
-    fn pointee_plan(
+    /// An origin-rooted plan for a slot pointee or a recursed-into value:
+    /// backref pairs resolve to the referenced frames' plan; fresh pairs
+    /// compile origin-rooted.
+    fn frame_plan(
         &mut self,
         w: &'w WireNode,
         n: &'n NativeLayoutNode,
@@ -455,31 +456,42 @@ impl<'w, 'n> Compiler<'w, 'n> {
             (
                 WireNode::BackRef { distance: dw, .. },
                 NativeLayoutNode::BackRef { distance: dn, .. },
-            ) => {
-                let wi = self
-                    .wire_frames
-                    .len()
-                    .checked_sub(1 + *dw as usize)
-                    .ok_or_else(|| mismatch(format!("wire backref distance {dw} out of range")))?;
-                let ni = self
-                    .native_frames
-                    .len()
-                    .checked_sub(1 + *dn as usize)
-                    .ok_or_else(|| {
-                        mismatch(format!("native backref distance {dn} out of range"))
-                    })?;
-                let wt = self.wire_frames[wi];
-                let nt = self.native_frames[ni];
-                let key = (wt as *const _ as usize, nt as *const _ as usize);
-                self.memo.get(&key).copied().ok_or_else(|| {
-                    mismatch("backref target frames do not name one plan root".to_string())
-                })
-            }
+            ) => self.backref_plan(*dw, *dn),
             (WireNode::BackRef { .. }, _) | (_, NativeLayoutNode::BackRef { .. }) => Err(mismatch(
                 "backref on one side only: wire and native trees disagree",
             )),
             _ => self.compile_frame(w, n),
         }
+    }
+
+    /// The plan of the frames a backref pair names, each distance counted
+    /// on its own tree's frames. A frame walked inline (a struct field)
+    /// has no plan of its own yet: it compiles here, origin-rooted, under
+    /// its own ancestors — the frames above it on the path — so backrefs
+    /// inside it count from where it sits.
+    fn backref_plan(&mut self, dw: u32, dn: u32) -> Result<PlanId, PlanError> {
+        let wi = self
+            .wire_frames
+            .len()
+            .checked_sub(1 + dw as usize)
+            .ok_or_else(|| mismatch(format!("wire backref distance {dw} out of range")))?;
+        let ni = self
+            .native_frames
+            .len()
+            .checked_sub(1 + dn as usize)
+            .ok_or_else(|| mismatch(format!("native backref distance {dn} out of range")))?;
+        let wt = self.wire_frames[wi];
+        let nt = self.native_frames[ni];
+        let key = (wt as *const _ as usize, nt as *const _ as usize);
+        if let Some(id) = self.memo.get(&key) {
+            return Ok(*id);
+        }
+        let wire_tail = self.wire_frames.split_off(wi);
+        let native_tail = self.native_frames.split_off(ni);
+        let plan = self.compile_frame(wt, nt);
+        self.wire_frames.extend(wire_tail);
+        self.native_frames.extend(native_tail);
+        plan
     }
 
     fn walk(
@@ -546,7 +558,7 @@ impl<'w, 'n> Compiler<'w, 'n> {
                     return Err(mismatch(format!("array length {wl} vs {nl}")));
                 }
                 if needs_frame(ne) {
-                    let plan = self.compile_frame(we, ne)?;
+                    let plan = self.frame_plan(we, ne)?;
                     for i in 0..*wl {
                         let wo = add32(w_at, mul32(i, *wstride, "array offset")?, "array offset")?;
                         let no = add32(n_at, mul32(i, *nstride, "array offset")?, "array offset")?;
@@ -574,8 +586,22 @@ impl<'w, 'n> Compiler<'w, 'n> {
             (WireNode::Slot { kind, pointee, .. }, _) => {
                 self.walk_slot(*kind, pointee, n, w_at, n_at, acc)
             }
+            // A frame re-entered inline (`Child { node: Node }` inside
+            // `Node`): recurse into the referenced frames' plan here.
+            (
+                WireNode::BackRef { distance: dw, .. },
+                NativeLayoutNode::BackRef { distance: dn, .. },
+            ) => {
+                let plan = self.backref_plan(*dw, *dn)?;
+                acc.constructs.push(FixupOp::Recurse {
+                    wire: w_at,
+                    native: n_at,
+                    plan,
+                });
+                Ok(())
+            }
             (WireNode::BackRef { .. }, _) | (_, NativeLayoutNode::BackRef { .. }) => Err(mismatch(
-                "backref outside an indirection pointee".to_string(),
+                "backref on one side only: wire and native trees disagree",
             )),
             _ => Err(mismatch(format!(
                 "wire {} vs native {} at wire offset {w_at}",
@@ -623,7 +649,7 @@ impl<'w, 'n> Compiler<'w, 'n> {
             }
             (SlotKind::Vec, NativeLayoutNode::Vec { elem, ctor, .. }) => {
                 expect_pointees(1)?;
-                let plan = self.pointee_plan(&pointee[0], elem)?;
+                let plan = self.frame_plan(&pointee[0], elem)?;
                 acc.constructs.push(FixupOp::ConstructVec {
                     wire_slot: w_at,
                     native: n_at,
@@ -634,7 +660,7 @@ impl<'w, 'n> Compiler<'w, 'n> {
             }
             (SlotKind::Set, NativeLayoutNode::Set { elem, ctor, .. }) => {
                 expect_pointees(1)?;
-                let plan = self.pointee_plan(&pointee[0], elem)?;
+                let plan = self.frame_plan(&pointee[0], elem)?;
                 acc.constructs.push(FixupOp::ConstructSet {
                     wire_slot: w_at,
                     native: n_at,
@@ -650,8 +676,8 @@ impl<'w, 'n> Compiler<'w, 'n> {
                 },
             ) => {
                 expect_pointees(2)?;
-                let key_plan = self.pointee_plan(&pointee[0], key)?;
-                let value_plan = self.pointee_plan(&pointee[1], value)?;
+                let key_plan = self.frame_plan(&pointee[0], key)?;
+                let value_plan = self.frame_plan(&pointee[1], value)?;
                 acc.constructs.push(FixupOp::ConstructMap {
                     wire_slot: w_at,
                     native: n_at,
@@ -663,7 +689,7 @@ impl<'w, 'n> Compiler<'w, 'n> {
             }
             (SlotKind::Box, NativeLayoutNode::BoxPtr { inner, ctor, .. }) => {
                 expect_pointees(1)?;
-                let plan = self.pointee_plan(&pointee[0], inner)?;
+                let plan = self.frame_plan(&pointee[0], inner)?;
                 acc.constructs.push(FixupOp::ConstructBox {
                     wire_slot: w_at,
                     native: n_at,
@@ -674,7 +700,7 @@ impl<'w, 'n> Compiler<'w, 'n> {
             }
             (SlotKind::Arc, NativeLayoutNode::ArcPtr { inner, ctor, .. }) => {
                 expect_pointees(1)?;
-                let plan = self.pointee_plan(&pointee[0], inner)?;
+                let plan = self.frame_plan(&pointee[0], inner)?;
                 acc.constructs.push(FixupOp::ConstructArc {
                     wire_slot: w_at,
                     native: n_at,
@@ -962,10 +988,13 @@ impl<'w, 'n> Compiler<'w, 'n> {
         let (some_wire, some_at) = option_some_payload(&variants[1].1.node)?;
         let wire_tag = wire_tag_for(form, &variants)?;
 
+        // Wire frames: the Option enum and its `Some` payload, as derived;
+        // native: the one `Option` frame.
         self.wire_frames.push(w);
+        self.wire_frames.push(&variants[1].1.node);
         self.native_frames.push(n);
-        let some = self.compile_frame(some_wire, inner);
-        self.wire_frames.pop();
+        let some = self.frame_plan(some_wire, inner);
+        self.wire_frames.truncate(self.wire_frames.len() - 2);
         self.native_frames.pop();
 
         acc.constructs.push(FixupOp::ConstructOption {

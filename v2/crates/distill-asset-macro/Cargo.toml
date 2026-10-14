@@ -18,5 +18,6 @@ trybuild = { workspace = true }
 blake3 = { workspace = true }
 distill-asset = { path = "../distill-asset" }
 distill-core = { path = "../distill-core" }
+distill-bundle = { path = "../distill-bundle" }
 distill-wire = { path = "../distill-wire" }
 ngp-schema = { path = "../../../../newgameplus/ngp-schema" }

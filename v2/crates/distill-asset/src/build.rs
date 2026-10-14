@@ -29,12 +29,15 @@ pub struct LayoutBuilder {
     skips: Vec<SkipEntry>,
     ctor_ids: HashMap<TypeId, CtorId>,
     drop_ids: HashMap<TypeId, DropId>,
-    frames: Vec<TypeId>,
+    /// Frames on the expansion path, as the native validator and the plan
+    /// compiler count them (§12): struct, enum and `Option` types, and
+    /// enum variant payloads (`None`: never re-entered).
+    frames: Vec<Option<TypeId>>,
 }
 
 impl LayoutBuilder {
     pub fn backref<T: 'static>(&self, offset: u32) -> Option<NativeLayoutNode> {
-        let id = TypeId::of::<T>();
+        let id = Some(TypeId::of::<T>());
         self.frames
             .iter()
             .rposition(|candidate| *candidate == id)
@@ -45,12 +48,23 @@ impl LayoutBuilder {
     }
 
     pub fn push_frame<T: 'static>(&mut self) {
-        self.frames.push(TypeId::of::<T>());
+        self.frames.push(Some(TypeId::of::<T>()));
     }
 
     pub fn pop_frame<T: 'static>(&mut self) {
         let popped = self.frames.pop();
-        debug_assert_eq!(popped, Some(TypeId::of::<T>()));
+        debug_assert_eq!(popped, Some(Some(TypeId::of::<T>())));
+    }
+
+    /// An enum variant's payload: a frame of its own, as its native
+    /// `Struct` node is to the validator and the plan compiler.
+    pub fn push_payload_frame(&mut self) {
+        self.frames.push(None);
+    }
+
+    pub fn pop_payload_frame(&mut self) {
+        let popped = self.frames.pop();
+        debug_assert_eq!(popped, Some(None));
     }
 
     pub fn register_ctor<T: 'static>(&mut self, entry: CtorEntry) -> CtorId {

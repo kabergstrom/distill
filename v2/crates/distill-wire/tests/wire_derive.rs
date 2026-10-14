@@ -850,6 +850,72 @@ fn mutual_recursion_counts_intervening_frames() {
     );
 }
 
+#[test]
+fn reentry_inline_through_another_record_emits_backref() {
+    // Node { children: Vec<Child> @0, value: u32 @24 },
+    // Child { node: Node @0, weight: u32 @32 }: from the Vec pointee the
+    // path is [Node, Child], and `Child.node` re-enters Node inline — a
+    // back-reference with Node's geometry, not a second expansion.
+    let s = schema(vec![
+        prim(0, PrimitiveType::U32),
+        strukt(
+            1,
+            "Node",
+            32,
+            8,
+            vec![
+                (named_field("children", 2), 0),
+                (named_field("value", 0), 24),
+            ],
+        ),
+        vec_ty(2, 3),
+        strukt(
+            3,
+            "Child",
+            40,
+            8,
+            vec![(named_field("node", 1), 0), (named_field("weight", 0), 32)],
+        ),
+    ]);
+    let wire = derive(&s, 1).unwrap();
+    assert_eq!(
+        wire,
+        wstruct(
+            0,
+            32,
+            8,
+            vec![
+                wfield(
+                    "children",
+                    0,
+                    wvec_slot(
+                        0,
+                        wstruct(
+                            0,
+                            40,
+                            8,
+                            vec![
+                                wfield(
+                                    "node",
+                                    0,
+                                    WireNode::BackRef {
+                                        distance: 1,
+                                        offset: 0
+                                    }
+                                ),
+                                wfield("weight", 1, wprim(32, ScalarKind::U32)),
+                            ]
+                        )
+                    )
+                ),
+                wfield("value", 1, wprim(24, ScalarKind::U32)),
+            ]
+        )
+    );
+    // DSWL takes the inline backref's geometry from the frame it names.
+    dswl_hash(&wire).unwrap();
+}
+
 // --- framework types --------------------------------------------------------------------
 
 #[test]
