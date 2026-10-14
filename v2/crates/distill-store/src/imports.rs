@@ -678,6 +678,26 @@ impl StoreReader {
             .collect())
     }
 
+    /// Every explicit import source with the bundle whose import names it,
+    /// by (root, path): what the explicit layer claims (§8 "Default
+    /// imports"). Of two imports naming one source, the first by bundle
+    /// UUID.
+    pub fn explicit_import_claims(
+        &self,
+    ) -> Result<std::collections::BTreeMap<(String, String), BundleUuid>, StoreError> {
+        let rows = self.query_rows(
+            "SELECT key, bundle_uuid FROM import_keys WHERE kind = 4 ORDER BY key, bundle_uuid DESC",
+            [],
+            |row| {
+                Ok((
+                    parse_explicit_source_key(&row.get::<_, String>(0)?)?,
+                    BundleUuid(crate::bundles::blob16(row.get(1)?)),
+                ))
+            },
+        )?;
+        Ok(rows.into_iter().collect())
+    }
+
     /// The explicit import sources of the bundles at `sources` (bundle
     /// files, by root and path), as the index holds them.
     pub fn explicit_import_sources_of(

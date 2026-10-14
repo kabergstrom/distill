@@ -3334,3 +3334,161 @@ fn the_default_layer_follows_the_pipeline_epoch() {
     assert_eq!(imported_value(&path), Some(6));
     assert!(!orphaned(&coordinator, &path));
 }
+
+/// The authoring snapshot of `coordinator`'s current version.
+fn authoring_snapshot(coordinator: &DaemonCoordinator) -> distill_rpc::AuthoringSnapshot {
+    match connect(coordinator).authoring_snapshot() {
+        distill_rpc::RpcResult::Success(snapshot) => snapshot,
+        other => panic!("expected an authoring snapshot, got {other:?}"),
+    }
+}
+
+/// `sourceFiles` of root "main", as (path, claim).
+fn source_claims(coordinator: &DaemonCoordinator) -> Vec<(String, distill_rpc::SourceClaim)> {
+    match authoring_snapshot(coordinator).source_files("main", None) {
+        distill_rpc::RpcResult::Success(files) => files
+            .into_iter()
+            .map(|file| {
+                assert_eq!(file.root, "main");
+                (file.path, file.claim)
+            })
+            .collect(),
+        other => panic!("expected source files, got {other:?}"),
+    }
+}
+
+/// `sourceFiles` names the layer claiming each file (§8 precedence:
+/// explicit, then rules bundle, then default; bundle files are not
+/// sources); an explicit import over a rule's output takes it over keeping
+/// its identities, and `Hub.release` hands it back to that rule (newgameplus
+/// GAP 23 §12.3), identities kept, after which a pass has nothing to do.
+#[test]
+fn source_files_name_their_claims_and_a_release_returns_an_override_to_its_rule() {
+    use distill_rpc::SourceClaim;
+    let temp = tempfile::tempdir().unwrap();
+    let (assets, coordinator) = default_import_project(
+        temp.path(),
+        &[
+            ("explicit.num", b"1"),
+            ("ruled.num", b"2"),
+            ("free.num", b"3"),
+            ("notes.txt", b"4"),
+            (
+                "rules.bundle",
+                &rules_bundle_matching(98, 97, "ruled.num", BYTE_IMPORTER, "{stem}.ruled.bundle"),
+            ),
+        ],
+        &[],
+    );
+    let mut writer = coordinator.open_writer().unwrap();
+    let explicit = import(&coordinator, BYTE_IMPORTER, &["explicit.num"], "explicit.custom.bundle");
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    coordinator.reconcile_directory_imports(&mut writer).unwrap();
+    let ruled = identities(&assets.join("ruled.ruled.bundle"));
+    let free = identities(&assets.join("free.num.bundle"));
+    let rule_claim = |bundle: BundleUuid| SourceClaim::Rule {
+        rules_bundle: Some(BundleUuid([98; 16])),
+        rule: [97; 16],
+        importer: BYTE_IMPORTER.to_owned(),
+        output: "ruled.ruled.bundle".to_owned(),
+        bundle: Some(bundle),
+    };
+    let default_claim = SourceClaim::Rule {
+        rules_bundle: None,
+        rule: DEFAULT_ORIGIN_RULE,
+        importer: BYTE_IMPORTER.to_owned(),
+        output: "free.num.bundle".to_owned(),
+        bundle: Some(free.0),
+    };
+    assert_eq!(
+        source_claims(&coordinator),
+        vec![
+            ("explicit.num".to_owned(), SourceClaim::Explicit { bundle: explicit }),
+            ("free.num".to_owned(), default_claim.clone()),
+            ("notes.txt".to_owned(), SourceClaim::Unclaimed),
+            ("ruled.num".to_owned(), rule_claim(ruled.0)),
+        ]
+    );
+
+    // `list` names each bundle's origin; the rules bundle is authored.
+    let origins = match authoring_snapshot(&coordinator).list(distill_rpc::AssetQuery {
+        path_glob: Some("*.bundle".into()),
+        ..Default::default()
+    }) {
+        distill_rpc::RpcResult::Success(rows) => rows
+            .into_iter()
+            .map(|row| (row.normalized_path, row.origin))
+            .collect::<BTreeMap<_, _>>(),
+        other => panic!("expected rows, got {other:?}"),
+    };
+    assert_eq!(
+        origins,
+        BTreeMap::from([
+            ("explicit.custom.bundle".to_owned(), distill_rpc::BundleOrigin::Explicit),
+            (
+                "free.num.bundle".to_owned(),
+                distill_rpc::BundleOrigin::Default { rule: DEFAULT_ORIGIN_RULE }
+            ),
+            ("rules.bundle".to_owned(), distill_rpc::BundleOrigin::Authored),
+            (
+                "ruled.ruled.bundle".to_owned(),
+                distill_rpc::BundleOrigin::Rule { rules_bundle: BundleUuid([98; 16]), rule: [97; 16] }
+            ),
+        ])
+    );
+
+    // Override: an explicit import at the rule's output takes it over.
+    let overridden = import(&coordinator, BYTE_IMPORTER, &["ruled.num"], "ruled.ruled.bundle");
+    assert_eq!(overridden, ruled.0);
+    assert_eq!(identities(&assets.join("ruled.ruled.bundle")), ruled);
+    assert_eq!(origin_of(&coordinator, &assets.join("ruled.ruled.bundle")), None);
+    // The import index follows the bundle in the watcher pass that sees it.
+    let seen = |writer: &mut _, path: &str| {
+        let outcome = coordinator.reconcile_batch(writer, &batch(&assets, &[path]), false).unwrap();
+        assert!(outcome.imported.is_empty(), "{outcome:?}");
+    };
+    seen(&mut writer, "ruled.ruled.bundle");
+    let claims = source_claims(&coordinator);
+    assert_eq!(claims[3], ("ruled.num".to_owned(), SourceClaim::Explicit { bundle: ruled.0 }));
+    assert!(coordinator.reconcile_directory_imports(&mut writer).unwrap().is_empty());
+
+    // Release: the rule takes it back, identities kept.
+    let base = coordinator.server().current_stamp().unwrap().version;
+    match connect(&coordinator).release(base, ruled.0) {
+        distill_rpc::RpcResult::Success(bundle) => assert_eq!(bundle, ruled.0),
+        other => panic!("expected a release, got {other:?}"),
+    }
+    assert_eq!(identities(&assets.join("ruled.ruled.bundle")), ruled);
+    assert_eq!(
+        origin_of(&coordinator, &assets.join("ruled.ruled.bundle")),
+        Some((BundleUuid([98; 16]), [97; 16]))
+    );
+    seen(&mut writer, "ruled.ruled.bundle");
+    assert_eq!(source_claims(&coordinator)[3], ("ruled.num".to_owned(), rule_claim(ruled.0)));
+    assert!(coordinator.reconcile_directory_imports(&mut writer).unwrap().is_empty());
+
+    // The default layer's output likewise.
+    assert_eq!(import(&coordinator, BYTE_IMPORTER, &["free.num"], "free.num.bundle"), free.0);
+    assert_eq!(origin_of(&coordinator, &assets.join("free.num.bundle")), None);
+    seen(&mut writer, "free.num.bundle");
+    assert_eq!(source_claims(&coordinator)[1], ("free.num".to_owned(), SourceClaim::Explicit { bundle: free.0 }));
+    let base = coordinator.server().current_stamp().unwrap().version;
+    assert!(matches!(
+        connect(&coordinator).release(base, free.0),
+        distill_rpc::RpcResult::Success(bundle) if bundle == free.0
+    ));
+    assert_eq!(identities(&assets.join("free.num.bundle")), free);
+    assert_eq!(origin_of(&coordinator, &assets.join("free.num.bundle")), default_origin());
+    seen(&mut writer, "free.num.bundle");
+    assert_eq!(source_claims(&coordinator)[1], ("free.num".to_owned(), default_claim));
+    assert!(coordinator.reconcile_directory_imports(&mut writer).unwrap().is_empty());
+
+    // An explicit import no rule claims has nothing to follow.
+    let base = coordinator.server().current_stamp().unwrap().version;
+    match connect(&coordinator).release(base, explicit) {
+        distill_rpc::RpcResult::Failure(error) => {
+            assert!(format!("{error:?}").contains("explicit.custom.bundle"), "{error:?}")
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}

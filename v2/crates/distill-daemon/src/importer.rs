@@ -44,6 +44,7 @@ use crate::default_imports::{DefaultImports, DefaultRoot, PathMatcher};
 use crate::scanner::{RootedScanner, ScanError, ScannedBundle};
 use distill_store::files::{FileKind, GlobKeys, ObservedFile, PathSelection, GLOBSET_META};
 
+mod claims;
 mod controls;
 use controls::{
     decode_attempt_basis, decode_directory_rules, decode_import_record, encode_attempt_basis,

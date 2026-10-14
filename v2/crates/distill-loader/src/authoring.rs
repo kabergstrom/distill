@@ -9,10 +9,11 @@
 
 use std::time::{Duration, Instant};
 
-use distill_core::id::AssetUuid;
+use distill_core::id::{AssetUuid, BundleUuid};
 use distill_rpc::capnp_loader::{RemoteAuthoringSnapshot, RemoteCall, RemoteHub};
 use distill_rpc::{
-    AssetQuery, AuthoringInspectResult, AuthoringInspection, AuthoringOp, AuthoringProgressState,
+    AssetQuery, AuthoringInspectResult, AuthoringInspection, AuthoringOp, AuthoringProgressState, AuthoringRow,
+    BundleReferences, ImportRequest, SourceFile,
     DescribableType, DescribableTypesResult, LongRunningOp, RenameWithFixupsRequest, RpcFailure,
     TypeDescription, WriteReceipt,
 };
@@ -44,6 +45,17 @@ pub enum AuthoringRequest {
         base: InputVersion,
         request: RenameWithFixupsRequest,
     },
+    /// The entries `query` selects as rows (`AuthoringSnapshot.list`).
+    List(AssetQuery),
+    /// The files under `root` with the layer claiming each.
+    SourceFiles { root: String, glob: Option<String> },
+    References(BundleUuid),
+    /// `Hub.import`, answered with the bundle and the version publishing
+    /// it.
+    Import { base: InputVersion, request: ImportRequest },
+    Reimport { base: InputVersion, bundle: BundleUuid },
+    /// `Hub.release`: the explicit import follows its rule again.
+    Release { base: InputVersion, bundle: BundleUuid },
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +79,24 @@ pub enum AuthoringAnswer {
     },
     /// `base` was not the current version (nothing was written).
     Stale { current: InputVersion },
+    Rows {
+        version: InputVersion,
+        rows: Vec<AuthoringRow>,
+    },
+    SourceFiles {
+        version: InputVersion,
+        files: Vec<SourceFile>,
+    },
+    References {
+        version: InputVersion,
+        references: BundleReferences,
+    },
+    /// An import, reimport or release published `bundle`; `version` is
+    /// current after it.
+    Imported {
+        bundle: BundleUuid,
+        version: InputVersion,
+    },
 }
 
 /// A watched entry changed at `version` ([`crate::RpcIo::watch_authoring`]).
@@ -115,6 +145,27 @@ pub(crate) async fn run(hub: &RemoteHub, request: AuthoringRequest) -> Result<Au
             };
             confirm(hub, receipt).await
         }
+        AuthoringRequest::List(query) => {
+            let snapshot = remote(hub.authoring_snapshot().await)?;
+            let version = remote(snapshot.version().await)?;
+            let rows = remote(snapshot.list(&query).await)?;
+            Ok(AuthoringAnswer::Rows { version, rows })
+        }
+        AuthoringRequest::SourceFiles { root, glob } => {
+            let snapshot = remote(hub.authoring_snapshot().await)?;
+            let version = remote(snapshot.version().await)?;
+            let files = remote(snapshot.source_files(&root, glob.as_deref()).await)?;
+            Ok(AuthoringAnswer::SourceFiles { version, files })
+        }
+        AuthoringRequest::References(bundle) => {
+            let snapshot = remote(hub.authoring_snapshot().await)?;
+            let version = remote(snapshot.version().await)?;
+            let references = remote(snapshot.references(bundle).await)?;
+            Ok(AuthoringAnswer::References { version, references })
+        }
+        AuthoringRequest::Import { base, request } => imported(hub, hub.import(base, &request).await).await,
+        AuthoringRequest::Reimport { base, bundle } => imported(hub, hub.reimport(base, bundle).await).await,
+        AuthoringRequest::Release { base, bundle } => imported(hub, hub.release(base, bundle).await).await,
         AuthoringRequest::Rename { base, request } => {
             let operation = LongRunningOp::RenameWithFixups(request.encode());
             let mut progress = match hub.operation(base, &operation).await {
@@ -144,6 +195,26 @@ pub(crate) async fn run(hub: &RemoteHub, request: AuthoringRequest) -> Result<Au
             }
         }
     }
+}
+
+/// An import call's answer: the bundle and the version current after it
+/// (the call publishes before it answers), or [`AuthoringAnswer::Stale`].
+async fn imported(
+    hub: &RemoteHub,
+    call: Result<RemoteCall<BundleUuid>, impl std::fmt::Display>,
+) -> Result<AuthoringAnswer, String> {
+    let bundle = match call {
+        Ok(RemoteCall::Error(error)) => match error.failure {
+            Some(RpcFailure::StaleInputVersion { expected, .. }) => {
+                return Ok(AuthoringAnswer::Stale { current: expected })
+            }
+            _ => return Err(error.message),
+        },
+        call => remote(call)?,
+    };
+    let snapshot = remote(hub.authoring_snapshot().await)?;
+    let version = remote(snapshot.version().await)?;
+    Ok(AuthoringAnswer::Imported { bundle, version })
 }
 
 async fn inspect(snapshot: &RemoteAuthoringSnapshot, uuids: Vec<AssetUuid>) -> Result<AuthoringAnswer, String> {

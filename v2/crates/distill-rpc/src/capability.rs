@@ -8,7 +8,7 @@
 //! cache miss for the client to retry.
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -611,6 +611,143 @@ fn inspect_authoring(
         role: entry.role,
         value: entry.value,
         root,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Browsing (§17 "Browsing", protocol 23)
+
+/// The rows of `query` at `snapshot`: as [`query_assets`], but
+/// `authoring_only: None` selects both roles; each row names its type and
+/// its bundle's origin. Sorted by root, path and local id.
+fn list_rows(
+    server: &Server,
+    snapshot: &StoreReader,
+    query: &AssetQuery,
+) -> Result<Result<Vec<AuthoringRow>, RpcFailure>, StoreError> {
+    let mut filter = asset_filter(query, AuthoringEntryRole::Runtime);
+    filter.authoring_only = query.authoring_only;
+    let glob = |path: &str| {
+        query
+            .path_glob
+            .as_ref()
+            .is_none_or(|pattern| path_glob_matches(pattern, path))
+    };
+    let matched = match snapshot.served_assets_matching(&filter, glob)? {
+        Ok(matched) => matched,
+        Err(bundles) => return Ok(Err(RpcFailure::TagIndexPoisoned { bundles })),
+    };
+    let backend = server.inner.handle.authoring_backend();
+    let mut bundles = BTreeMap::<BundleUuid, Option<(String, BundleOrigin)>>::new();
+    let mut names = BTreeMap::<TypeUuid, String>::new();
+    let mut rows = Vec::with_capacity(matched.len());
+    for matched in matched {
+        let Some(entry) = snapshot.served_entry_meta(matched.asset)? else {
+            continue;
+        };
+        let bundle = match bundles.entry(entry.bundle) {
+            std::collections::btree_map::Entry::Occupied(slot) => slot.into_mut(),
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(bundle_origin(snapshot, entry.bundle)?)
+            }
+        };
+        let Some((root, origin)) = bundle.clone() else {
+            continue;
+        };
+        let type_name = names
+            .entry(entry.type_uuid)
+            .or_insert_with(|| type_name(&*backend, snapshot, entry.type_uuid))
+            .clone();
+        rows.push(AuthoringRow {
+            uuid: entry.asset,
+            bundle: entry.bundle,
+            root,
+            normalized_path: entry.normalized_path,
+            local_id: entry.local_id,
+            type_uuid: entry.type_uuid,
+            type_name,
+            role: entry_role(entry.authoring_only),
+            origin,
+        });
+    }
+    rows.sort_by(|a, b| {
+        (&a.root, &a.normalized_path, &a.local_id).cmp(&(&b.root, &b.normalized_path, &b.local_id))
+    });
+    Ok(Ok(rows))
+}
+
+/// `bundle`'s root and origin at `snapshot`; `None` without a published
+/// row.
+fn bundle_origin(
+    snapshot: &StoreReader,
+    bundle: BundleUuid,
+) -> Result<Option<(String, BundleOrigin)>, StoreError> {
+    let Some(meta) = snapshot.bundle(bundle)? else {
+        return Ok(None);
+    };
+    let Some(root) = snapshot.root_name(meta.root)? else {
+        return Ok(None);
+    };
+    let origin = match meta.origin {
+        Some(origin) if origin.rules_bundle == distill_core::id::default_rules_bundle(&root) => {
+            BundleOrigin::Default { rule: origin.rule.0 }
+        }
+        Some(origin) => BundleOrigin::Rule {
+            rules_bundle: origin.rules_bundle,
+            rule: origin.rule.0,
+        },
+        None => {
+            let record = AssetFilter {
+                bundle: Some(bundle),
+                local_id: Some("$record".to_owned()),
+                authoring_only: Some(true),
+                ..AssetFilter::default()
+            };
+            match snapshot.served_assets_matching(&record, |_| true)? {
+                Ok(matched) if !matched.is_empty() => BundleOrigin::Explicit,
+                _ => BundleOrigin::Authored,
+            }
+        }
+    };
+    Ok(Some((root, origin)))
+}
+
+/// A type's path: a bootstrap control type's Distill name, else the served
+/// schema's; empty when unknown.
+fn type_name(backend: &dyn AuthoringBackend, snapshot: &StoreReader, type_uuid: TypeUuid) -> String {
+    use distill_core::bootstrap::{
+        DIRECTORY_IMPORT_RULES_TYPE_UUID, IMPORT_RECORD_TYPE_UUID, PACK_DEFINITION_TYPE_UUID,
+    };
+    match type_uuid {
+        IMPORT_RECORD_TYPE_UUID => "distill::ImportRecord".to_owned(),
+        DIRECTORY_IMPORT_RULES_TYPE_UUID => "distill::DirectoryImportRules".to_owned(),
+        PACK_DEFINITION_TYPE_UUID => "distill::PackDefinition".to_owned(),
+        _ => backend.type_name(snapshot, type_uuid).unwrap_or_default(),
+    }
+}
+
+/// `bundle`'s reference edges at `snapshot`; `None` without the bundle.
+fn bundle_references(
+    snapshot: &StoreReader,
+    bundle: BundleUuid,
+) -> Result<Option<BundleReferences>, StoreError> {
+    let Some(meta) = snapshot.bundle(bundle)? else {
+        return Ok(None);
+    };
+    let mut referenced_by = Vec::new();
+    for referrer in snapshot.bundles_referencing_path(&meta.path)? {
+        let Some(row) = snapshot.bundle(referrer)? else {
+            continue;
+        };
+        let Some(root) = snapshot.root_name(row.root)? else {
+            continue;
+        };
+        referenced_by.push((referrer, root, row.path));
+    }
+    referenced_by.sort_by(|a, b| (&a.1, &a.2).cmp(&(&b.1, &b.2)));
+    Ok(Some(BundleReferences {
+        referenced_by,
+        references: snapshot.bundle_path_refs(bundle)?.into_iter().collect(),
     }))
 }
 
@@ -1440,6 +1577,32 @@ impl Hub {
         }
     }
 
+    /// Make explicit import `bundle` follow the rule claiming its sources
+    /// again (§17 "Release"): re-imported under the rule's settings and
+    /// origin, keeping its bundle and entry UUIDs.
+    pub fn release(&self, base: InputVersion, bundle: BundleUuid) -> RpcResult<BundleUuid> {
+        match self.release_prepare(base, bundle) {
+            Ok(pending) => self.import_finish(pending.run()),
+            Err(result) => result,
+        }
+    }
+
+    /// [`Hub::import_prepare`] for a release.
+    pub fn release_prepare(
+        &self,
+        base: InputVersion,
+        bundle: BundleUuid,
+    ) -> Result<PendingImport, RpcResult<BundleUuid>> {
+        if let Some(result) = self.authoring_gate(base) {
+            return Err(result);
+        }
+        Ok(PendingImport {
+            base,
+            backend: self.server.inner.handle.authoring_backend(),
+            work: ImportWork::Release(bundle),
+        })
+    }
+
     /// Check an import request. The returned [`PendingImport`] runs the
     /// importer; transports run it off the RPC thread and hand the result
     /// to [`Hub::import_finish`].
@@ -1770,6 +1933,7 @@ pub struct PendingImport {
 enum ImportWork {
     Import(ImportRequest),
     Reimport(BundleUuid),
+    Release(BundleUuid),
 }
 
 impl fmt::Debug for PendingImport {
@@ -1787,6 +1951,9 @@ impl PendingImport {
             ImportWork::Import(request) => (None, self.backend.run_import(self.base, request)),
             ImportWork::Reimport(bundle) => {
                 (Some(bundle), self.backend.run_reimport(self.base, bundle))
+            }
+            ImportWork::Release(bundle) => {
+                (Some(bundle), self.backend.run_release(self.base, bundle))
             }
         };
         FinishedImport {
@@ -2401,6 +2568,61 @@ impl AuthoringSnapshot {
         match describe_type_in(&self.server, txn.snapshot(), self.basis.snapshot, type_uuid) {
             Ok(result) => RpcResult::Success(result),
             Err(error) => RpcResult::Failure(error),
+        }
+    }
+
+    /// The entries `query` selects, as rows with their type names and their
+    /// bundles' origins (§17 "Browsing"). Unlike [`Self::query`],
+    /// `authoring_only: None` selects both roles.
+    pub fn list(&self, query: AssetQuery) -> RpcResult<Vec<AuthoringRow>> {
+        let txn = match self.preflight() {
+            Ok(txn) => txn,
+            Err(result) => return result,
+        };
+        if let Err(detail) = validate_asset_query(&query, true) {
+            return RpcResult::Failure(RpcFailure::InvalidQuery { detail });
+        }
+        match rpc_try!(list_rows(&self.server, txn.snapshot(), &query)) {
+            Ok(rows) => RpcResult::Success(rows),
+            Err(error) => RpcResult::Failure(error),
+        }
+    }
+
+    /// The files under `root` that `glob` matches (all without one), bundle
+    /// files excepted, each with the layer claiming it (§17 "Browsing").
+    pub fn source_files(&self, root: &str, glob: Option<&str>) -> RpcResult<Vec<SourceFile>> {
+        let txn = match self.preflight() {
+            Ok(txn) => txn,
+            Err(result) => return result,
+        };
+        if root.is_empty() || glob.is_some_and(|glob| glob.is_empty() || glob.contains('\0')) {
+            return RpcResult::Failure(RpcFailure::InvalidQuery {
+                detail: "source files need a root and a nonempty glob, if any".to_owned(),
+            });
+        }
+        match self
+            .server
+            .inner
+            .handle
+            .authoring_backend()
+            .source_files(txn.snapshot(), root, glob)
+        {
+            Ok(files) => RpcResult::Success(files),
+            Err(error) => RpcResult::Failure(error),
+        }
+    }
+
+    /// `bundle`'s reference edges (§17 "Browsing").
+    pub fn references(&self, bundle: BundleUuid) -> RpcResult<BundleReferences> {
+        let txn = match self.preflight() {
+            Ok(txn) => txn,
+            Err(result) => return result,
+        };
+        match rpc_try!(bundle_references(txn.snapshot(), bundle)) {
+            Some(references) => RpcResult::Success(references),
+            None => RpcResult::Failure(RpcFailure::InvalidQuery {
+                detail: format!("no bundle {bundle} at this snapshot"),
+            }),
         }
     }
 

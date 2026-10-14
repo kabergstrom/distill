@@ -619,6 +619,33 @@ impl AuthoringBackend for AuthoringService {
     ) -> Result<PreparedOperationCommit, RpcFailure> {
         self.prepare_long_operation(store, base, operation)
     }
+
+    fn type_name(&self, snapshot: &StoreReader, type_uuid: distill_core::id::TypeUuid) -> Option<String> {
+        let authority = self.compiled(snapshot).ok()?.schema_authority()?;
+        let project = authority.project_type(type_uuid)?;
+        let def = authority.schema().types.get(project.schema_type.0)?;
+        Some(def.path.display_path())
+    }
+
+    fn source_files(
+        &self,
+        snapshot: &StoreReader,
+        root: &str,
+        glob: Option<&str>,
+    ) -> Result<Vec<distill_rpc::SourceFile>, RpcFailure> {
+        AuthoringService::source_files(self, snapshot, root, glob)
+    }
+
+    fn run_release(
+        self: Arc<Self>,
+        base: InputVersion,
+        bundle: BundleUuid,
+    ) -> Result<ImportJob, RpcFailure> {
+        let run = self.run_release_bundle(base, bundle)?;
+        Ok(Box::new(move |store| {
+            self.publish_import_run(store, base, run)
+        }))
+    }
 }
 
 struct PlannedBundleMutation {

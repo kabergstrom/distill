@@ -502,6 +502,9 @@ fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
         "RuntimeTypePolicyCall",
         "DescribeTypeCall",
         "DescribableTypesCall",
+        "AuthoringListCall",
+        "SourceFilesCall",
+        "ReferencesCall",
     ] {
         let marker = format!("struct {name} {{");
         let body = source
@@ -2506,6 +2509,177 @@ async fn type_descriptions_round_trip_over_tcp() {
                 snapshot().await.describe_type(TypeUuid([9; 16])).await.unwrap().success(),
                 Some(DescribeTypeResult::Missing)
             ));
+            drop(client);
+            server_task.abort();
+        })
+        .await;
+}
+
+/// Answers the browsing calls (newgameplus GAP 23 §12.4) with fixed
+/// listings; never writes.
+struct BrowsingBackend;
+
+impl AuthoringBackend for BrowsingBackend {
+    fn read_file(&self, _: &distill_store::StoreReader, _: &str, _: &str) -> Result<Vec<u8>, String> {
+        Err("never read".to_owned())
+    }
+
+    fn write_files(
+        &self,
+        _: &mut distill_store::Store,
+        _: InputVersion,
+        _: &[AuthoringOp],
+        _: bool,
+    ) -> Result<WriteReceipt, RpcFailure> {
+        unreachable!("never writes")
+    }
+
+    fn prepare_import(
+        &self,
+        _: &mut distill_store::Store,
+        _: InputVersion,
+        _: &ImportRequest,
+    ) -> Result<PreparedImportCommit, RpcFailure> {
+        unreachable!("never imports")
+    }
+
+    fn prepare_reimport(
+        &self,
+        _: &mut distill_store::Store,
+        _: InputVersion,
+        _: BundleUuid,
+    ) -> Result<PreparedImportCommit, RpcFailure> {
+        unreachable!("never imports")
+    }
+
+    fn prepare_operation(
+        &self,
+        _: &mut distill_store::Store,
+        _: InputVersion,
+        _: &LongRunningOp,
+    ) -> Result<PreparedOperationCommit, RpcFailure> {
+        unreachable!("never operates")
+    }
+
+    fn type_name(&self, _: &distill_store::StoreReader, type_uuid: TypeUuid) -> Option<String> {
+        (type_uuid == TypeUuid([1; 16])).then(|| "game::Blob".to_owned())
+    }
+
+    fn source_files(
+        &self,
+        _: &distill_store::StoreReader,
+        root: &str,
+        glob: Option<&str>,
+    ) -> Result<Vec<SourceFile>, RpcFailure> {
+        assert_eq!(glob, Some("**/*"));
+        Ok(browsing_files(root))
+    }
+
+    fn run_release(self: Arc<Self>, _: InputVersion, bundle: BundleUuid) -> Result<ImportJob, RpcFailure> {
+        Err(RpcFailure::InvalidAuthoringRequest {
+            detail: format!("no rule claims {bundle}"),
+        })
+    }
+}
+
+fn browsing_files(root: &str) -> Vec<SourceFile> {
+    vec![
+        SourceFile {
+            root: root.to_owned(),
+            path: "a.png".into(),
+            claim: SourceClaim::Rule {
+                rules_bundle: None,
+                rule: [5; 16],
+                importer: "ngp.image".into(),
+                output: "a.png.bundle".into(),
+                bundle: None,
+            },
+        },
+        SourceFile {
+            root: root.to_owned(),
+            path: "b.glb".into(),
+            claim: SourceClaim::Rule {
+                rules_bundle: Some(BundleUuid([6; 16])),
+                rule: [7; 16],
+                importer: "ngp.gltf".into(),
+                output: "b.glb.bundle".into(),
+                bundle: Some(BundleUuid([8; 16])),
+            },
+        },
+        SourceFile {
+            root: root.to_owned(),
+            path: "c.glb".into(),
+            claim: SourceClaim::Explicit { bundle: BundleUuid([9; 16]) },
+        },
+        SourceFile {
+            root: root.to_owned(),
+            path: "notes.txt".into(),
+            claim: SourceClaim::Unclaimed,
+        },
+    ]
+}
+
+/// `list`, `sourceFiles`, `references` and `Hub.release` over TCP (protocol
+/// 23): rows carry both roles with their type names and origins, every
+/// claim arm crosses, an unknown bundle's references and a refused release
+/// answer typed errors.
+#[tokio::test(flavor = "current_thread")]
+async fn browsing_calls_round_trip_over_tcp() {
+    LocalSet::new()
+        .run_until(async {
+            let mut project = TestProject::with_roots(vec![target()], &[ROOT]);
+            let runtime = authoring_entry(3, AuthoringEntryRole::Runtime);
+            let control = authoring_entry(11, AuthoringEntryRole::AuthoringOnly);
+            write_entry(&mut project, &runtime);
+            write_entry(&mut project, &control);
+            project.publish();
+
+            let backend = Arc::new(BrowsingBackend);
+            let handle = ServerHandle::open(backend, Arc::clone(project.coordinator().server_handle().opener()));
+            let server = Server::open(&handle);
+            let listener = Rc::new(StagedListener::bind(server.root(), "127.0.0.1:0").await.unwrap());
+            let address = listener.local_addr().unwrap();
+            let serving = Rc::clone(&listener);
+            let server_task = tokio::task::spawn_local(async move { serving.serve_one().await });
+            let client = CapnpClient::connect_local(address).await.unwrap();
+            let hub = RemoteHub::connected(client.connect(&request()).await.unwrap()).unwrap();
+            let snapshot = hub.authoring_snapshot().await.unwrap().success().unwrap();
+
+            let all = AssetQuery {
+                path_glob: Some("bundle-*".into()),
+                ..AssetQuery::default()
+            };
+            let rows = snapshot.list(&all).await.unwrap().success().unwrap();
+            let row = |entry: &AuthoringEntry| AuthoringRow {
+                uuid: entry.uuid,
+                bundle: entry.bundle,
+                root: ROOT.to_owned(),
+                normalized_path: entry.normalized_path.clone(),
+                local_id: entry.local_id.clone(),
+                type_uuid: entry.type_uuid,
+                type_name: "game::Blob".into(),
+                role: entry.role,
+                origin: BundleOrigin::Authored,
+            };
+            assert_eq!(rows, [row(&control), row(&runtime)]);
+            let runtime_only = AssetQuery { authoring_only: Some(false), ..all.clone() };
+            assert_eq!(snapshot.list(&runtime_only).await.unwrap().success().unwrap(), [row(&runtime)]);
+
+            assert_eq!(
+                snapshot.source_files(ROOT, Some("**/*")).await.unwrap().success().unwrap(),
+                browsing_files(ROOT)
+            );
+            assert_eq!(
+                snapshot.references(runtime.bundle).await.unwrap().success().unwrap(),
+                BundleReferences::default()
+            );
+            assert!(matches!(snapshot.references(BundleUuid([99; 16])).await.unwrap(), RemoteCall::Error(_)));
+
+            let base = project.server().current_stamp().unwrap().version;
+            match hub.release(base, runtime.bundle).await.unwrap() {
+                RemoteCall::Error(error) => assert!(error.message.contains("no rule claims"), "{error:?}"),
+                other => panic!("expected a refusal, got {other:?}"),
+            }
             drop(client);
             server_task.abort();
         })

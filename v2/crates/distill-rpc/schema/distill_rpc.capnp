@@ -760,6 +760,100 @@ struct DescribableTypesCall {
   }
 }
 
+# §17 "Browsing" (protocol 23).
+struct BundleOrigin {
+  union {
+    # No $record: authored by hand.
+    authored @0 :Void;
+    # An explicit import.
+    explicit @1 :Void;
+    rule :group {
+      rulesBundle @2 :Data;
+      rule @3 :Data;
+    }
+    # The root's default import layer.
+    default @4 :Data;
+  }
+}
+
+struct AuthoringRow {
+  uuid @0 :Data;
+  bundle @1 :Data;
+  root @2 :Text;
+  normalizedPath @3 :Text;
+  localId @4 :Text;
+  typeUuid @5 :Data;
+  # The authored type's path in the served schema; empty when unknown.
+  typeName @6 :Text;
+  role @7 :AuthoringEntryRole;
+  origin @8 :BundleOrigin;
+}
+
+struct AuthoringListCall {
+  union {
+    success @0 :List(AuthoringRow);
+    reconnectRequired @1 :ReconnectRequired;
+    configurationFailed @2 :ConfigurationError;
+    snapshotExpired @3 :Void;
+    error @4 :RpcError;
+  }
+}
+
+struct SourceClaim {
+  union {
+    unclaimed @0 :Void;
+    # The explicit import's bundle.
+    explicit @1 :Data;
+    rule :group {
+      # Empty: the root's default layer.
+      rulesBundle @2 :Data;
+      rule @3 :Data;
+      # "none": the rule claims the file and imports nothing.
+      importer @4 :Text;
+      output @5 :Text;
+      # Empty: no bundle at the output.
+      bundle @6 :Data;
+    }
+  }
+}
+
+struct SourceFile {
+  root @0 :Text;
+  path @1 :Text;
+  claim @2 :SourceClaim;
+}
+
+struct SourceFilesCall {
+  union {
+    success @0 :List(SourceFile);
+    reconnectRequired @1 :ReconnectRequired;
+    configurationFailed @2 :ConfigurationError;
+    snapshotExpired @3 :Void;
+    error @4 :RpcError;
+  }
+}
+
+struct BundleRef {
+  bundle @0 :Data;
+  root @1 :Text;
+  path @2 :Text;
+}
+
+struct BundleReferences {
+  referencedBy @0 :List(BundleRef);
+  references @1 :List(Text);
+}
+
+struct ReferencesCall {
+  union {
+    success @0 :BundleReferences;
+    reconnectRequired @1 :ReconnectRequired;
+    configurationFailed @2 :ConfigurationError;
+    snapshotExpired @3 :Void;
+    error @4 :RpcError;
+  }
+}
+
 struct EntryMeta {
   uuid @0 :Uuid;
   bundle @1 :Uuid;
@@ -924,6 +1018,10 @@ interface Hub {
   unsubscribe @7 (assets :List(Data), paths :List(Text))
               -> (result :VoidCall);
   authoringSnapshot @8 () -> (result :AuthoringSnapshotCall);
+  # Make explicit import `bundle` follow the rule claiming its sources
+  # again: re-imported under the rule's settings and origin, keeping its
+  # bundle and entry UUIDs (§17 "Release"). Protocol 23.
+  release @9 (base :UInt64, bundle :Uuid) -> (result :UuidCall);
 }
 
 interface Snapshot {
@@ -977,6 +1075,14 @@ interface AuthoringSnapshot {
   describeType @5 (typeUuid :Data) -> (result :DescribeTypeCall);
   # The types the snapshot's type index lists. Protocol 20.
   describableTypes @6 () -> (result :DescribableTypesCall);
+  # The entries `query` selects as rows: metadata, type name, the bundle's
+  # origin; authoringOnly unset selects both roles. Protocol 23.
+  list @7 (query :AssetQuery) -> (result :AuthoringListCall);
+  # The files under `root` matching `glob` (empty: all), bundle files
+  # excepted, each with the import layer claiming it. Protocol 23.
+  sourceFiles @8 (root :Text, glob :Text) -> (result :SourceFilesCall);
+  # A bundle's path reference edges, both ways. Protocol 23.
+  references @9 (bundle :Data) -> (result :ReferencesCall);
 }
 
 interface ChunkStream {

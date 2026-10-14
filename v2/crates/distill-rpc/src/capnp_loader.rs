@@ -10,12 +10,13 @@ use distill_store::state::{InputVersion, SnapshotStamp, StoreInstanceId};
 pub use crate::capnp_transport::RemoteError;
 use crate::capnp_transport::{
     decode_authoring_inspection, decode_configuration_error, decode_describable_types, decode_rpc_basis,
-    decode_rpc_error, decode_type_description,
+    decode_authoring_rows, decode_bundle_references, decode_rpc_error, decode_source_files,
+    decode_type_description,
     schema, RemoteConnectOutcome, RemoteMetadataOutcome,
 };
 use crate::{
     ArtifactChunk, ArtifactChunkKind, AssetDeltaState, AssetEvent, AssetQuery, AuthoringEntry,
-    AuthoringEntryRole, AuthoringOp, AuthoringProgressEvent, AuthoringProgressState, LongRunningOp,
+    AuthoringEntryRole, AuthoringOp, AuthoringRow, BundleReferences, SourceFile, AuthoringProgressEvent, AuthoringProgressState, LongRunningOp,
     WriteReceipt,
     AuthoringInspectResult, ConfigurationError, Delta, DescribableTypesResult, DescribeTypeResult, DriftedInput, ImportFailure, ImportRequest,
     MetadataEntry, PathResolveFailure, PathResolveResult, ReconnectReason, ResolveResult, RpcBasis,
@@ -265,6 +266,25 @@ impl RemoteHub {
         }
     }
 
+    /// Re-run `bundle`'s recorded import at `base` (`Hub.reimport`).
+    pub async fn reimport(&self, base: InputVersion, bundle: BundleUuid) -> Result<RemoteCall<BundleUuid>, capnp::Error> {
+        let mut call = self.client.reimport_request();
+        call.get().set_base(base.0);
+        call.get().init_bundle().set_bytes(&bundle.0);
+        let response = call.send().promise.await?;
+        decode_bundle_uuid_call(response.get()?.get_result()?, "reimport.bundle")
+    }
+
+    /// Make explicit import `bundle` follow the rule claiming its sources
+    /// again (`Hub.release`, protocol 23).
+    pub async fn release(&self, base: InputVersion, bundle: BundleUuid) -> Result<RemoteCall<BundleUuid>, capnp::Error> {
+        let mut call = self.client.release_request();
+        call.get().set_base(base.0);
+        call.get().init_bundle().set_bytes(&bundle.0);
+        let response = call.send().promise.await?;
+        decode_bundle_uuid_call(response.get()?.get_result()?, "release.bundle")
+    }
+
     /// Write `ops` at `base` (§17 `Hub.write`): one bundle file. The receipt
     /// names the files written; the store follows them through the watcher,
     /// so the version reflecting them comes later (`AuthoringSnapshot.file`).
@@ -407,6 +427,66 @@ impl RemoteAuthoringSnapshot {
             ),
             schema::describable_types_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
             schema::describable_types_call::Which::Error(value) => Ok(RemoteCall::Error(decode_rpc_error(value?)?)),
+        }
+    }
+
+    /// The entries `query` selects as rows (protocol 23); `authoring_only:
+    /// None` selects both roles.
+    pub async fn list(&self, query: &AssetQuery) -> Result<RemoteCall<Vec<AuthoringRow>>, capnp::Error> {
+        let mut request = self.client.list_request();
+        write_asset_query(request.get().init_query(), query);
+        let response = request.send().promise.await?;
+        let result = response.get()?.get_result()?;
+        match result.which()? {
+            schema::authoring_list_call::Which::Success(rows) => Ok(RemoteCall::Success(decode_authoring_rows(rows?)?)),
+            schema::authoring_list_call::Which::ReconnectRequired(value) => Ok(
+                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
+            ),
+            schema::authoring_list_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
+            ),
+            schema::authoring_list_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
+            schema::authoring_list_call::Which::Error(value) => Ok(RemoteCall::Error(decode_rpc_error(value?)?)),
+        }
+    }
+
+    /// The files under `root` matching `glob`, each with the layer claiming
+    /// it (protocol 23).
+    pub async fn source_files(&self, root: &str, glob: Option<&str>) -> Result<RemoteCall<Vec<SourceFile>>, capnp::Error> {
+        let mut request = self.client.source_files_request();
+        request.get().set_root(root);
+        request.get().set_glob(glob.unwrap_or(""));
+        let response = request.send().promise.await?;
+        let result = response.get()?.get_result()?;
+        match result.which()? {
+            schema::source_files_call::Which::Success(files) => Ok(RemoteCall::Success(decode_source_files(files?)?)),
+            schema::source_files_call::Which::ReconnectRequired(value) => Ok(
+                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
+            ),
+            schema::source_files_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
+            ),
+            schema::source_files_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
+            schema::source_files_call::Which::Error(value) => Ok(RemoteCall::Error(decode_rpc_error(value?)?)),
+        }
+    }
+
+    /// `bundle`'s path reference edges (protocol 23).
+    pub async fn references(&self, bundle: BundleUuid) -> Result<RemoteCall<BundleReferences>, capnp::Error> {
+        let mut request = self.client.references_request();
+        request.get().set_bundle(&bundle.0);
+        let response = request.send().promise.await?;
+        let result = response.get()?.get_result()?;
+        match result.which()? {
+            schema::references_call::Which::Success(value) => Ok(RemoteCall::Success(decode_bundle_references(value?)?)),
+            schema::references_call::Which::ReconnectRequired(value) => Ok(
+                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
+            ),
+            schema::references_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
+            ),
+            schema::references_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
+            schema::references_call::Which::Error(value) => Ok(RemoteCall::Error(decode_rpc_error(value?)?)),
         }
     }
 
@@ -1427,4 +1507,23 @@ fn fixed<const N: usize>(value: &[u8], field: &str) -> Result<[u8; N], capnp::Er
     value
         .try_into()
         .map_err(|_| capnp::Error::failed(format!("{field} must be exactly {N} bytes")))
+}
+
+fn decode_bundle_uuid_call(
+    result: schema::uuid_call::Reader<'_>,
+    field: &str,
+) -> Result<RemoteCall<BundleUuid>, capnp::Error> {
+    match result.which()? {
+        schema::uuid_call::Which::Success(uuid) => {
+            Ok(RemoteCall::Success(BundleUuid(fixed::<16>(uuid?.get_bytes()?, field)?)))
+        }
+        schema::uuid_call::Which::ReconnectRequired(value) => Ok(
+            RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
+        ),
+        schema::uuid_call::Which::ConfigurationFailed(value) => Ok(
+            RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
+        ),
+        schema::uuid_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
+        schema::uuid_call::Which::Error(value) => Ok(RemoteCall::Error(decode_rpc_error(value?)?)),
+    }
 }

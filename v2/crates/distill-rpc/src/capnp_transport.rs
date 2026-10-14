@@ -52,7 +52,8 @@ use crate::{
     MetadataNamespaceCall, MetadataSnapshot, NamespaceError, NamespaceErrorV1, PathResolveFailure,
     PathResolveResult, ProgressStream, PureMetadataEntry, PureMetadataQuery, ReconnectReason,
     ResolveResult, Root, RpcBasis, RpcFailure, RpcResult, Snapshot, SnapshotStamp, StoreInstanceId,
-    TagSelector, TargetDefinitionHash, TypeUuid, DescribeTypeResult, DescribableType,
+    TagSelector, TargetDefinitionHash, TypeUuid, DescribeTypeResult, AuthoringRow, BundleOrigin,
+    BundleReferences, SourceClaim, SourceFile, DescribableType,
     DescribableTypesResult, TypeDefault, TypeDescription, TypeMember,
 };
 
@@ -835,6 +836,41 @@ impl schema::hub::Server for HubService {
         }
     }
 
+    fn release(
+        self: capnp::capability::Rc<Self>,
+        params: schema::hub::ReleaseParams,
+        mut results: schema::hub::ReleaseResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
+        async move {
+            generation_gate!(self.hub.generation_reconnect(), results);
+            let params = params.get()?;
+            let bundle = match decode_uuid(params.get_bundle()?.get_bytes()?, "bundle") {
+                Ok(bundle) => BundleUuid(bundle),
+                Err(error) => {
+                    write_wire_error(results.get().init_result().init_error(), &error);
+                    return Ok(());
+                }
+            };
+            let result = match self
+                .hub
+                .release_prepare(InputVersion(params.get_base()), bundle)
+            {
+                // As a reimport: the importer runs on a blocking worker.
+                Ok(pending) => {
+                    let finished = tokio::task::spawn_blocking(move || pending.run())
+                        .await
+                        .map_err(|error| {
+                            capnp::Error::failed(format!("import worker failed: {error}"))
+                        })?;
+                    self.hub.import_finish(finished)
+                }
+                Err(result) => result,
+            };
+            write_bundle_uuid_result(results.get().init_result(), result);
+            Ok(())
+        }
+    }
+
     fn operation(
         self: capnp::capability::Rc<Self>,
         params: schema::hub::OperationParams,
@@ -1277,6 +1313,60 @@ impl schema::authoring_snapshot::Server for AuthoringSnapshotService {
         async move {
             generation_gate!(self.snapshot.generation_reconnect(), results);
             write_describable_types_result(results.get().init_result(), self.snapshot.describable_types());
+            Ok(())
+        }
+    }
+
+    fn list(
+        self: capnp::capability::Rc<Self>,
+        params: schema::authoring_snapshot::ListParams,
+        mut results: schema::authoring_snapshot::ListResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
+        async move {
+            generation_gate!(self.snapshot.generation_reconnect(), results);
+            let query = match decode_asset_query(params.get()?.get_query()?) {
+                Ok(query) => query,
+                Err(error) => {
+                    write_wire_error(results.get().init_result().init_error(), &error);
+                    return Ok(());
+                }
+            };
+            write_authoring_list_result(results.get().init_result(), self.snapshot.list(query));
+            Ok(())
+        }
+    }
+
+    fn source_files(
+        self: capnp::capability::Rc<Self>,
+        params: schema::authoring_snapshot::SourceFilesParams,
+        mut results: schema::authoring_snapshot::SourceFilesResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
+        async move {
+            generation_gate!(self.snapshot.generation_reconnect(), results);
+            let params = params.get()?;
+            let root = params.get_root()?.to_str()?;
+            let glob = params.get_glob()?.to_str()?;
+            let glob = (!glob.is_empty()).then_some(glob);
+            write_source_files_result(results.get().init_result(), self.snapshot.source_files(root, glob));
+            Ok(())
+        }
+    }
+
+    fn references(
+        self: capnp::capability::Rc<Self>,
+        params: schema::authoring_snapshot::ReferencesParams,
+        mut results: schema::authoring_snapshot::ReferencesResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
+        async move {
+            generation_gate!(self.snapshot.generation_reconnect(), results);
+            let bundle = match decode_uuid(params.get()?.get_bundle()?, "bundle") {
+                Ok(bundle) => BundleUuid(bundle),
+                Err(error) => {
+                    write_wire_error(results.get().init_result().init_error(), &error);
+                    return Ok(());
+                }
+            };
+            write_references_result(results.get().init_result(), self.snapshot.references(bundle));
             Ok(())
         }
     }
@@ -3177,6 +3267,209 @@ fn write_describable_types_result(
         RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
         RpcResult::Failure(error) => write_failure(result.init_error(), &error),
     }
+}
+
+fn write_authoring_list_result(
+    mut result: schema::authoring_list_call::Builder<'_>,
+    outcome: RpcResult<Vec<AuthoringRow>>,
+) {
+    match outcome {
+        RpcResult::Success(rows) => {
+            let mut list = result.init_success(rows.len() as u32);
+            for (index, row) in rows.iter().enumerate() {
+                let mut wire = list.reborrow().get(index as u32);
+                wire.set_uuid(&row.uuid.0);
+                wire.set_bundle(&row.bundle.0);
+                wire.set_root(row.root.as_str());
+                wire.set_normalized_path(row.normalized_path.as_str());
+                wire.set_local_id(row.local_id.as_str());
+                wire.set_type_uuid(&row.type_uuid.0);
+                wire.set_type_name(row.type_name.as_str());
+                wire.set_role(wire_authoring_role(row.role));
+                let mut origin = wire.init_origin();
+                match row.origin {
+                    BundleOrigin::Authored => origin.set_authored(()),
+                    BundleOrigin::Explicit => origin.set_explicit(()),
+                    BundleOrigin::Rule { rules_bundle, rule } => {
+                        let mut group = origin.init_rule();
+                        group.set_rules_bundle(&rules_bundle.0);
+                        group.set_rule(&rule);
+                    }
+                    BundleOrigin::Default { rule } => origin.set_default(&rule),
+                }
+            }
+        }
+        RpcResult::ReconnectRequired { reason } => {
+            write_reconnect(result.init_reconnect_required(), reason)
+        }
+        RpcResult::ConfigurationFailed(error) => {
+            write_configuration_error(result.init_configuration_failed(), &error)
+        }
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
+        RpcResult::Failure(error) => write_failure(result.init_error(), &error),
+    }
+}
+
+fn write_source_files_result(
+    mut result: schema::source_files_call::Builder<'_>,
+    outcome: RpcResult<Vec<SourceFile>>,
+) {
+    match outcome {
+        RpcResult::Success(files) => {
+            let mut list = result.init_success(files.len() as u32);
+            for (index, file) in files.iter().enumerate() {
+                let mut wire = list.reborrow().get(index as u32);
+                wire.set_root(file.root.as_str());
+                wire.set_path(file.path.as_str());
+                let mut claim = wire.init_claim();
+                match &file.claim {
+                    SourceClaim::Unclaimed => claim.set_unclaimed(()),
+                    SourceClaim::Explicit { bundle } => claim.set_explicit(&bundle.0),
+                    SourceClaim::Rule { rules_bundle, rule, importer, output, bundle } => {
+                        let mut group = claim.init_rule();
+                        group.set_rules_bundle(rules_bundle.as_ref().map_or(&[][..], |uuid| &uuid.0));
+                        group.set_rule(rule);
+                        group.set_importer(importer.as_str());
+                        group.set_output(output.as_str());
+                        group.set_bundle(bundle.as_ref().map_or(&[][..], |uuid| &uuid.0));
+                    }
+                }
+            }
+        }
+        RpcResult::ReconnectRequired { reason } => {
+            write_reconnect(result.init_reconnect_required(), reason)
+        }
+        RpcResult::ConfigurationFailed(error) => {
+            write_configuration_error(result.init_configuration_failed(), &error)
+        }
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
+        RpcResult::Failure(error) => write_failure(result.init_error(), &error),
+    }
+}
+
+fn write_references_result(
+    mut result: schema::references_call::Builder<'_>,
+    outcome: RpcResult<BundleReferences>,
+) {
+    match outcome {
+        RpcResult::Success(references) => {
+            let mut output = result.init_success();
+            let mut by = output.reborrow().init_referenced_by(references.referenced_by.len() as u32);
+            for (index, (bundle, root, path)) in references.referenced_by.iter().enumerate() {
+                let mut wire = by.reborrow().get(index as u32);
+                wire.set_bundle(&bundle.0);
+                wire.set_root(root.as_str());
+                wire.set_path(path.as_str());
+            }
+            let mut paths = output.init_references(references.references.len() as u32);
+            for (index, path) in references.references.iter().enumerate() {
+                paths.set(index as u32, path.as_str());
+            }
+        }
+        RpcResult::ReconnectRequired { reason } => {
+            write_reconnect(result.init_reconnect_required(), reason)
+        }
+        RpcResult::ConfigurationFailed(error) => {
+            write_configuration_error(result.init_configuration_failed(), &error)
+        }
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
+        RpcResult::Failure(error) => write_failure(result.init_error(), &error),
+    }
+}
+
+/// Decode wire authoring rows (an `AuthoringListCall` success).
+pub fn decode_authoring_rows(
+    rows: capnp::struct_list::Reader<'_, schema::authoring_row::Owned>,
+) -> Result<Vec<AuthoringRow>, capnp::Error> {
+    let failed = |error: WireFailure| capnp::Error::failed(error.message);
+    let mut out = Vec::with_capacity(rows.len() as usize);
+    for row in rows {
+        let origin = row.get_origin()?;
+        let origin = match origin.which()? {
+            schema::bundle_origin::Which::Authored(()) => BundleOrigin::Authored,
+            schema::bundle_origin::Which::Explicit(()) => BundleOrigin::Explicit,
+            schema::bundle_origin::Which::Rule(group) => BundleOrigin::Rule {
+                rules_bundle: BundleUuid(
+                    decode_uuid(group.get_rules_bundle()?, "authoringRow.origin.rulesBundle").map_err(failed)?,
+                ),
+                rule: decode_uuid(group.get_rule()?, "authoringRow.origin.rule").map_err(failed)?,
+            },
+            schema::bundle_origin::Which::Default(rule) => BundleOrigin::Default {
+                rule: decode_uuid(rule?, "authoringRow.origin.default").map_err(failed)?,
+            },
+        };
+        out.push(AuthoringRow {
+            uuid: AssetUuid(decode_uuid(row.get_uuid()?, "authoringRow.uuid").map_err(failed)?),
+            bundle: BundleUuid(decode_uuid(row.get_bundle()?, "authoringRow.bundle").map_err(failed)?),
+            root: decode_text(row.get_root()?, "authoringRow.root").map_err(failed)?,
+            normalized_path: decode_text(row.get_normalized_path()?, "authoringRow.normalizedPath")
+                .map_err(failed)?,
+            local_id: decode_text(row.get_local_id()?, "authoringRow.localId").map_err(failed)?,
+            type_uuid: TypeUuid(decode_uuid(row.get_type_uuid()?, "authoringRow.typeUuid").map_err(failed)?),
+            type_name: decode_text(row.get_type_name()?, "authoringRow.typeName").map_err(failed)?,
+            role: match row.get_role()? {
+                schema::AuthoringEntryRole::Runtime => AuthoringEntryRole::Runtime,
+                schema::AuthoringEntryRole::AuthoringOnly => AuthoringEntryRole::AuthoringOnly,
+            },
+            origin,
+        });
+    }
+    Ok(out)
+}
+
+/// Decode a wire source-file listing (a `SourceFilesCall` success).
+pub fn decode_source_files(
+    files: capnp::struct_list::Reader<'_, schema::source_file::Owned>,
+) -> Result<Vec<SourceFile>, capnp::Error> {
+    let failed = |error: WireFailure| capnp::Error::failed(error.message);
+    let optional = |bytes: &[u8], field: &str| -> Result<Option<BundleUuid>, capnp::Error> {
+        match bytes {
+            [] => Ok(None),
+            bytes => Ok(Some(BundleUuid(decode_uuid(bytes, field).map_err(failed)?))),
+        }
+    };
+    let mut out = Vec::with_capacity(files.len() as usize);
+    for file in files {
+        let claim = match file.get_claim()?.which()? {
+            schema::source_claim::Which::Unclaimed(()) => SourceClaim::Unclaimed,
+            schema::source_claim::Which::Explicit(bundle) => SourceClaim::Explicit {
+                bundle: BundleUuid(decode_uuid(bundle?, "sourceFile.claim.explicit").map_err(failed)?),
+            },
+            schema::source_claim::Which::Rule(group) => SourceClaim::Rule {
+                rules_bundle: optional(group.get_rules_bundle()?, "sourceFile.claim.rulesBundle")?,
+                rule: decode_uuid(group.get_rule()?, "sourceFile.claim.rule").map_err(failed)?,
+                importer: decode_text(group.get_importer()?, "sourceFile.claim.importer").map_err(failed)?,
+                output: decode_text(group.get_output()?, "sourceFile.claim.output").map_err(failed)?,
+                bundle: optional(group.get_bundle()?, "sourceFile.claim.bundle")?,
+            },
+        };
+        out.push(SourceFile {
+            root: decode_text(file.get_root()?, "sourceFile.root").map_err(failed)?,
+            path: decode_text(file.get_path()?, "sourceFile.path").map_err(failed)?,
+            claim,
+        });
+    }
+    Ok(out)
+}
+
+/// Decode wire bundle references (a `ReferencesCall` success).
+pub fn decode_bundle_references(
+    value: schema::bundle_references::Reader<'_>,
+) -> Result<BundleReferences, capnp::Error> {
+    let failed = |error: WireFailure| capnp::Error::failed(error.message);
+    let mut referenced_by = Vec::new();
+    for row in value.get_referenced_by()? {
+        referenced_by.push((
+            BundleUuid(decode_uuid(row.get_bundle()?, "bundleRef.bundle").map_err(failed)?),
+            decode_text(row.get_root()?, "bundleRef.root").map_err(failed)?,
+            decode_text(row.get_path()?, "bundleRef.path").map_err(failed)?,
+        ));
+    }
+    let mut references = Vec::new();
+    for path in value.get_references()? {
+        references.push(decode_text(path?, "bundleReferences.references").map_err(failed)?);
+    }
+    Ok(BundleReferences { referenced_by, references })
 }
 
 fn decode_stamp_value(

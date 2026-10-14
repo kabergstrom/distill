@@ -7590,6 +7590,7 @@ interface Hub {
   unsubscribe @7 (assets :List(Data), paths :List(Text))
               -> (result :VoidCall);
   authoringSnapshot @8 () -> (result :AuthoringSnapshotCall);
+  release @9 (base :UInt64, bundle :Uuid) -> (result :UuidCall);
 }
 
 interface Snapshot {
@@ -7613,6 +7614,9 @@ interface AuthoringSnapshot {
   file @4 (root :Text, path :Text) -> (result :DataCall);
   describeType @5 (typeUuid :Data) -> (result :DescribeTypeCall);
   describableTypes @6 () -> (result :DescribableTypesCall);
+  list @7 (query :AssetQuery) -> (result :AuthoringListCall);
+  sourceFiles @8 (root :Text, glob :Text) -> (result :SourceFilesCall);
+  references @9 (bundle :Data) -> (result :ReferencesCall);
 }
 ```
 
@@ -7687,6 +7691,46 @@ descriptions, defaults or index, so editing them re-imports nothing.
   hash the snapshot observed, else the call answers `drifted` with a fresher
   stamp. A description and the prefab entries edited against it therefore
   come from one input version.
+
+**Browsing** (protocol 23, newgameplus GAP 23 §12.4). An editor browses
+every bundle and the files no bundle holds yet without file APIs:
+- `list(query)` answers `query`'s entries as rows: UUID, bundle, root,
+  path, local id, type UUID, type name (the served schema's path; the
+  bootstrap control types as `distill::ImportRecord`,
+  `distill::DirectoryImportRules`, `distill::PackDefinition`; empty when
+  unknown), role and the bundle's origin: `authored` (no `$record`),
+  `explicit`, `rule { rulesBundle, rule }` or `default` (the root's default
+  layer, with the rule). Unlike `query`, `authoringOnly` unset selects both
+  roles. Rows are sorted by root, path, local id.
+- `sourceFiles(root, glob)` lists the files under `root` (bundle files
+  excepted) `glob` matches, empty for all, each with the layer claiming it
+  under §8's precedence: `explicit` (the import's bundle), `rule` (the
+  authored rules bundle, or empty for the default layer; rule id, importer,
+  the rendered output path and the bundle there, if any; importer `none`
+  claims and imports nothing) or `unclaimed`. The explicit layer is read
+  from the import index, which follows an import's bundle in the watcher
+  pass that sees it. Code: `distill-daemon/src/importer/claims.rs`.
+- `references(bundle)` answers the bundle's path reference edges (§13
+  `bundle_path_refs`): the bundles whose reference fields name its path
+  (bundle, root, path) and the paths its own fields name. An unknown bundle
+  is an error.
+
+**Release** (protocol 23, newgameplus GAP 23 §12.3). An explicit import
+over a rule's output takes the bundle over (§8 "Default imports"):
+per-bundle settings. `Hub.release(base, bundle)` undoes that: the rule
+claiming the import's first source (authored rules, then the default
+layer; the import's sources as its group) must render the bundle's own
+root and path; the bundle is re-imported under the rule's completed
+settings and origin, its bundle and entry UUIDs kept (the rule adopts it,
+as a default task adopts an orphan), and a later pass finds it up to date.
+A bundle with no rule to follow, a rule writing elsewhere or importing
+nothing, or a bundle a rule owns already is refused.
+
+**Rules bundles are authored.** `Hub.write` writes `DirectoryImportRules`
+entries (authoring-only; the rules must decode, their settings typed, and
+their rule ids be unique) and sets the bundle's `format_version` from its
+entries (§6 Envelope). Other control types and `$` local ids stay
+daemon-owned.
 
 Subscriptions are cursor-bound and one connection owns one ordered delta
 stream. Its first installation at `installed >= since` atomically returns the
