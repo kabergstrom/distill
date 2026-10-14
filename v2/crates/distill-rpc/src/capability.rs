@@ -647,6 +647,8 @@ fn list_rows(
     let backend = server.inner.handle.authoring_backend();
     let mut bundles = BTreeMap::<BundleUuid, Option<(String, BundleOrigin)>>::new();
     let mut names = BTreeMap::<TypeUuid, String>::new();
+    // The primaries of the bundles at each path (several roots may share one).
+    let mut primaries = BTreeMap::<String, std::collections::BTreeSet<AssetUuid>>::new();
     let mut rows = Vec::with_capacity(matched.len());
     for matched in matched {
         let Some(entry) = snapshot.served_entry_meta(matched.asset)? else {
@@ -665,6 +667,15 @@ fn list_rows(
             .entry(entry.type_uuid)
             .or_insert_with(|| type_name(&*backend, snapshot, entry.type_uuid))
             .clone();
+        let primary = match primaries.get(&entry.normalized_path) {
+            Some(set) => set.contains(&entry.asset),
+            None => {
+                let set = snapshot.served_path_candidates(&entry.normalized_path)?;
+                let primary = set.contains(&entry.asset);
+                primaries.insert(entry.normalized_path.clone(), set);
+                primary
+            }
+        };
         rows.push(AuthoringRow {
             uuid: entry.asset,
             bundle: entry.bundle,
@@ -675,6 +686,7 @@ fn list_rows(
             type_name,
             role: entry_role(entry.authoring_only),
             origin,
+            primary,
         });
     }
     rows.sort_by(|a, b| {

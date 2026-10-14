@@ -3289,6 +3289,7 @@ fn write_authoring_list_result(
                 wire.set_type_uuid(&row.type_uuid.0);
                 wire.set_type_name(row.type_name.as_str());
                 wire.set_role(wire_authoring_role(row.role));
+                wire.set_primary(row.primary);
                 write_bundle_origin(wire.init_origin(), &row.origin);
             }
         }
@@ -3425,6 +3426,7 @@ pub fn decode_authoring_rows(
                 schema::AuthoringEntryRole::AuthoringOnly => AuthoringEntryRole::AuthoringOnly,
             },
             origin,
+            primary: row.get_primary(),
         });
     }
     Ok(out)

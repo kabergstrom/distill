@@ -790,6 +790,9 @@ struct AuthoringRow {
   typeName @6 :Text;
   role @7 :AuthoringEntryRole;
   origin @8 :BundleOrigin;
+  # The bundle's primary asset: what a reference to the bundle's path
+  # without a name resolves to.
+  primary @9 :Bool;
 }
 
 struct AuthoringListCall {

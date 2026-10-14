@@ -7704,7 +7704,7 @@ descriptions, defaults or index, so editing them re-imports nothing.
   stamp. A description and the prefab entries edited against it therefore
   come from one input version.
 
-**Browsing** (protocol 23, newgameplus GAP 23 §12.4). An editor browses
+**Browsing** (protocol 23; `primary` 24; newgameplus GAP 23 §12.4). An editor browses
 every bundle and the files no bundle holds yet without file APIs:
 - `list(query)` answers `query`'s entries as rows: UUID, bundle, root,
   path, local id, type UUID, type name (the served schema's path; the
@@ -7712,8 +7712,10 @@ every bundle and the files no bundle holds yet without file APIs:
   `distill::DirectoryImportRules`, `distill::PackDefinition`; empty when
   unknown), role and the bundle's origin: `authored` (no `$record`),
   `explicit`, `rule { rulesBundle, rule }` or `default` (the root's default
-  layer, with the rule). Unlike `query`, `authoringOnly` unset selects both
-  roles. Rows are sorted by root, path, local id.
+  layer, with the rule), and `primary`: the entry is its bundle's primary
+  asset, what a reference to the bundle's path without a name resolves to.
+  Unlike `query`, `authoringOnly` unset selects both roles. Rows are sorted
+  by root, path, local id.
 - `sourceFiles(root, glob)` lists the files under `root` (bundle files
   excepted) `glob` matches, empty for all, each with the layer claiming it
   under §8's precedence: `explicit` (the import's bundle), `rule` (the

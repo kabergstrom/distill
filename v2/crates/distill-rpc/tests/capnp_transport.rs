@@ -2663,6 +2663,8 @@ async fn browsing_calls_round_trip_over_tcp() {
                 type_name: "game::Blob".into(),
                 role: entry.role,
                 origin: BundleOrigin::Authored,
+                // A bundle's one runtime entry is its primary.
+                primary: entry.role == AuthoringEntryRole::Runtime,
             };
             assert_eq!(rows, [row(&control), row(&runtime)]);
             let runtime_only = AssetQuery { authoring_only: Some(false), ..all.clone() };

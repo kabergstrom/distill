@@ -42,8 +42,10 @@ pub use distill_store::state::{
 /// `AuthoringSnapshot` gains `list` (entry rows with type names and their
 /// bundle's origin), `sourceFiles` (the files under a root with the layer
 /// claiming each) and `references`; `Hub` gains `release` (an explicit
-/// import's bundle follows the rule claiming its sources again).
-pub const PROTOCOL_VERSION: u32 = 23;
+/// import's bundle follows the rule claiming its sources again). 24: an
+/// `AuthoringRow` says whether its entry is its bundle's primary asset (what
+/// a reference to the bundle's path without a name resolves to).
+pub const PROTOCOL_VERSION: u32 = 24;
 
 /// A watched import whose latest attempt failed. The bundle keeps serving its
 /// last good contents; the failure clears when a later import succeeds.
@@ -1212,6 +1214,9 @@ pub struct AuthoringRow {
     pub type_name: String,
     pub role: AuthoringEntryRole,
     pub origin: BundleOrigin,
+    /// The bundle's primary asset: what a reference to the bundle's path
+    /// without a name resolves to.
+    pub primary: bool,
 }
 
 /// The import layer claiming a source file (§8 "Default imports":
