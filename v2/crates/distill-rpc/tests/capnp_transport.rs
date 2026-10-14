@@ -2516,12 +2516,14 @@ async fn type_descriptions_round_trip_over_tcp() {
 }
 
 /// Answers the browsing calls (newgameplus GAP 23 §12.4) with fixed
-/// listings; never writes.
-struct BrowsingBackend;
+/// listings and reads the project's files; never writes.
+struct BrowsingBackend {
+    roots: std::path::PathBuf,
+}
 
 impl AuthoringBackend for BrowsingBackend {
-    fn read_file(&self, _: &distill_store::StoreReader, _: &str, _: &str) -> Result<Vec<u8>, String> {
-        Err("never read".to_owned())
+    fn read_file(&self, _: &distill_store::StoreReader, root: &str, path: &str) -> Result<Vec<u8>, String> {
+        std::fs::read(self.roots.join(root).join(path)).map_err(|error| error.to_string())
     }
 
     fn write_files(
@@ -2619,7 +2621,8 @@ fn browsing_files(root: &str) -> Vec<SourceFile> {
     ]
 }
 
-/// `list`, `sourceFiles`, `references` and `Hub.release` over TCP (protocol
+/// `list`, `sourceFiles`, `references`, an inspection's origin and type
+/// name and `Hub.release` over TCP (protocol
 /// 23): rows carry both roles with their type names and origins, every
 /// claim arm crosses, an unknown bundle's references and a refused release
 /// answer typed errors.
@@ -2634,7 +2637,7 @@ async fn browsing_calls_round_trip_over_tcp() {
             write_entry(&mut project, &control);
             project.publish();
 
-            let backend = Arc::new(BrowsingBackend);
+            let backend = Arc::new(BrowsingBackend { roots: project.path().to_owned() });
             let handle = ServerHandle::open(backend, Arc::clone(project.coordinator().server_handle().opener()));
             let server = Server::open(&handle);
             let listener = Rc::new(StagedListener::bind(server.root(), "127.0.0.1:0").await.unwrap());
@@ -2664,6 +2667,14 @@ async fn browsing_calls_round_trip_over_tcp() {
             assert_eq!(rows, [row(&control), row(&runtime)]);
             let runtime_only = AssetQuery { authoring_only: Some(false), ..all.clone() };
             assert_eq!(snapshot.list(&runtime_only).await.unwrap().success().unwrap(), [row(&runtime)]);
+            // An inspection names its bundle's origin and its type's name.
+            match snapshot.inspect(control.uuid).await.unwrap().success().unwrap() {
+                AuthoringInspectResult::Inspection(inspection) => {
+                    assert_eq!(inspection.origin, BundleOrigin::Authored);
+                    assert_eq!(inspection.type_name, "game::Blob");
+                }
+                other => panic!("expected an inspection, got {other:?}"),
+            }
 
             assert_eq!(
                 snapshot.source_files(ROOT, Some("**/*")).await.unwrap().success().unwrap(),

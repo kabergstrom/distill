@@ -670,6 +670,9 @@ struct AuthoringInspection {
   logicalSchema @9 :Data;
   # The root holding the entry's bundle (protocol 22).
   root @10 :Text;
+  # The bundle's origin and the type's served schema path (protocol 23).
+  origin @11 :BundleOrigin;
+  typeName @12 :Text;
 }
 
 struct AuthoringRoleFailure {

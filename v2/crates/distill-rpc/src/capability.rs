@@ -589,6 +589,10 @@ fn inspect_authoring(
             })
         }
     };
+    let origin = bundle_origin(snapshot, meta.bundle)
+        .map_err(store_failure)?
+        .ok_or_else(unpublished)?
+        .1;
     let invalid = |detail: String| RpcFailure::InvalidQuery { detail };
     let parsed =
         distill_bundle::parse_bundle(&bytes).map_err(|error| invalid(error.to_string()))?;
@@ -599,6 +603,7 @@ fn inspect_authoring(
         meta.terminal_type,
     )
     .map_err(invalid)?;
+    let type_name = type_name(&*server.inner.handle.authoring_backend(), snapshot, entry.type_uuid);
     Ok(AuthoringInspectResult::Inspection(AuthoringInspection {
         stamp,
         uuid: entry.uuid,
@@ -611,6 +616,8 @@ fn inspect_authoring(
         role: entry.role,
         value: entry.value,
         root,
+        origin,
+        type_name,
     }))
 }
 

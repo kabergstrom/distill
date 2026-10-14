@@ -2506,6 +2506,9 @@ pub fn decode_authoring_inspection(
         value: authored_value,
         root: decode_text(value.get_root()?, "authoringInspection.root")
             .map_err(|error| capnp::Error::failed(error.message))?,
+        origin: decode_bundle_origin(value.get_origin()?, "authoringInspection.origin")?,
+        type_name: decode_text(value.get_type_name()?, "authoringInspection.typeName")
+            .map_err(|error| capnp::Error::failed(error.message))?,
     })
 }
 
@@ -3286,17 +3289,7 @@ fn write_authoring_list_result(
                 wire.set_type_uuid(&row.type_uuid.0);
                 wire.set_type_name(row.type_name.as_str());
                 wire.set_role(wire_authoring_role(row.role));
-                let mut origin = wire.init_origin();
-                match row.origin {
-                    BundleOrigin::Authored => origin.set_authored(()),
-                    BundleOrigin::Explicit => origin.set_explicit(()),
-                    BundleOrigin::Rule { rules_bundle, rule } => {
-                        let mut group = origin.init_rule();
-                        group.set_rules_bundle(&rules_bundle.0);
-                        group.set_rule(&rule);
-                    }
-                    BundleOrigin::Default { rule } => origin.set_default(&rule),
-                }
+                write_bundle_origin(wire.init_origin(), &row.origin);
             }
         }
         RpcResult::ReconnectRequired { reason } => {
@@ -3377,6 +3370,39 @@ fn write_references_result(
     }
 }
 
+fn write_bundle_origin(mut output: schema::bundle_origin::Builder<'_>, origin: &BundleOrigin) {
+    match origin {
+        BundleOrigin::Authored => output.set_authored(()),
+        BundleOrigin::Explicit => output.set_explicit(()),
+        BundleOrigin::Rule { rules_bundle, rule } => {
+            let mut group = output.init_rule();
+            group.set_rules_bundle(&rules_bundle.0);
+            group.set_rule(rule);
+        }
+        BundleOrigin::Default { rule } => output.set_default(rule),
+    }
+}
+
+fn decode_bundle_origin(
+    origin: schema::bundle_origin::Reader<'_>,
+    what: &str,
+) -> Result<BundleOrigin, capnp::Error> {
+    let failed = |error: WireFailure| capnp::Error::failed(error.message);
+    Ok(match origin.which()? {
+        schema::bundle_origin::Which::Authored(()) => BundleOrigin::Authored,
+        schema::bundle_origin::Which::Explicit(()) => BundleOrigin::Explicit,
+        schema::bundle_origin::Which::Rule(group) => BundleOrigin::Rule {
+            rules_bundle: BundleUuid(
+                decode_uuid(group.get_rules_bundle()?, &format!("{what}.rulesBundle")).map_err(failed)?,
+            ),
+            rule: decode_uuid(group.get_rule()?, &format!("{what}.rule")).map_err(failed)?,
+        },
+        schema::bundle_origin::Which::Default(rule) => BundleOrigin::Default {
+            rule: decode_uuid(rule?, &format!("{what}.default")).map_err(failed)?,
+        },
+    })
+}
+
 /// Decode wire authoring rows (an `AuthoringListCall` success).
 pub fn decode_authoring_rows(
     rows: capnp::struct_list::Reader<'_, schema::authoring_row::Owned>,
@@ -3384,20 +3410,7 @@ pub fn decode_authoring_rows(
     let failed = |error: WireFailure| capnp::Error::failed(error.message);
     let mut out = Vec::with_capacity(rows.len() as usize);
     for row in rows {
-        let origin = row.get_origin()?;
-        let origin = match origin.which()? {
-            schema::bundle_origin::Which::Authored(()) => BundleOrigin::Authored,
-            schema::bundle_origin::Which::Explicit(()) => BundleOrigin::Explicit,
-            schema::bundle_origin::Which::Rule(group) => BundleOrigin::Rule {
-                rules_bundle: BundleUuid(
-                    decode_uuid(group.get_rules_bundle()?, "authoringRow.origin.rulesBundle").map_err(failed)?,
-                ),
-                rule: decode_uuid(group.get_rule()?, "authoringRow.origin.rule").map_err(failed)?,
-            },
-            schema::bundle_origin::Which::Default(rule) => BundleOrigin::Default {
-                rule: decode_uuid(rule?, "authoringRow.origin.default").map_err(failed)?,
-            },
-        };
+        let origin = decode_bundle_origin(row.get_origin()?, "authoringRow.origin")?;
         out.push(AuthoringRow {
             uuid: AssetUuid(decode_uuid(row.get_uuid()?, "authoringRow.uuid").map_err(failed)?),
             bundle: BundleUuid(decode_uuid(row.get_bundle()?, "authoringRow.bundle").map_err(failed)?),
@@ -3573,6 +3586,8 @@ fn write_authoring_inspection(
     output.set_logical_schema(&inspection.logical_schema);
     output.set_role(wire_authoring_role(inspection.role));
     output.set_root(inspection.root.as_str());
+    output.set_type_name(inspection.type_name.as_str());
+    write_bundle_origin(output.reborrow().init_origin(), &inspection.origin);
     write_authoring_value(output.init_value(), &inspection.value);
 }
 

@@ -1162,6 +1162,10 @@ pub struct AuthoringInspection {
     pub value: AuthoringValue,
     /// The asset root holding the bundle, by name.
     pub root: String,
+    /// The bundle's origin (protocol 23).
+    pub origin: BundleOrigin,
+    /// The type's path in the served schema; empty when unknown.
+    pub type_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

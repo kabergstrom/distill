@@ -7714,6 +7714,9 @@ every bundle and the files no bundle holds yet without file APIs:
   `bundle_path_refs`): the bundles whose reference fields name its path
   (bundle, root, path) and the paths its own fields name. An unknown bundle
   is an error.
+- `inspect` answers carry the same `typeName` and the bundle's `origin`
+  (`AuthoringInspection.typeName`, `.origin`), so an editor knows which
+  entries a hand edit would survive (newgameplus GAP 23 §12.1 roles).
 
 **Release** (protocol 23, newgameplus GAP 23 §12.3). An explicit import
 over a rule's output takes the bundle over (§8 "Default imports"):
