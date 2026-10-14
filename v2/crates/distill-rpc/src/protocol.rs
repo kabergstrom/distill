@@ -45,8 +45,10 @@ pub use distill_store::state::{
 /// import's bundle follows the rule claiming its sources again). 24: an
 /// `AuthoringRow` says whether its entry is its bundle's primary asset (what
 /// a reference to the bundle's path without a name resolves to). 25: a
-/// `TypeDescription` names its renamed fields (`renames`).
-pub const PROTOCOL_VERSION: u32 = 25;
+/// `TypeDescription` names its renamed fields (`renames`). 26: `AuthoringSnapshot`
+/// gains `authorable` (§17 "Creating": the authored types the pipeline
+/// declares, with their defaults, and its importers).
+pub const PROTOCOL_VERSION: u32 = 26;
 
 /// A watched import whose latest attempt failed. The bundle keeps serving its
 /// last good contents; the failure clears when a later import succeeds.
@@ -967,6 +969,14 @@ pub trait AuthoringBackend: Send + Sync + 'static {
             detail: "this daemon releases no imports".to_owned(),
         })
     }
+
+    /// What can be created at `snapshot` (§17 "Creating"): the authored
+    /// types and importers of its compiled state's pipeline.
+    fn authorable(&self, _snapshot: &distill_store::StoreReader) -> Result<Authorable, RpcFailure> {
+        Err(RpcFailure::InvalidAuthoringRequest {
+            detail: "this daemon declares nothing authorable".to_owned(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1333,6 +1343,55 @@ pub enum DescribeTypeResult {
 pub struct DescribableType {
     pub type_uuid: TypeUuid,
     pub path: String,
+}
+
+/// What an authoring tool can create (§17 "Creating"): the authored types
+/// the serving pipeline declares and the control type
+/// `distill::DirectoryImportRules`, and the pipeline's importers.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Authorable {
+    /// Extension-sorted.
+    pub types: Vec<AuthorableType>,
+    /// Id-sorted.
+    pub importers: Vec<AuthorableImporter>,
+}
+
+/// A type a new bundle can hold: `<name>.<extension>.bundle` with one entry
+/// `local_id` of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorableType {
+    pub type_uuid: TypeUuid,
+    /// The type's path in the served schema.
+    pub path: String,
+    pub extension: String,
+    pub local_id: String,
+    /// One line on what the type is for.
+    pub doc: String,
+    pub authoring_only: bool,
+    pub schema_hash: LogicalHash,
+    pub logical_schema: Arc<[u8]>,
+    /// The pipeline's `Default` of the type, under `logical_schema`.
+    /// `Absent` for `DirectoryImportRules` (a rules bundle needs a rule);
+    /// `SchemaMismatch` while the pipeline module and the served schema
+    /// disagree on the type (one is being rebuilt).
+    pub default: TypeDefault,
+}
+
+/// A registered importer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorableImporter {
+    pub id: String,
+    pub settings_type: TypeUuid,
+    /// The settings type's path in the served schema: what a rule's
+    /// settings name (`{"type": <path>, "value": …}`).
+    pub settings_path: String,
+    pub settings_hash: LogicalHash,
+    pub settings_schema: Arc<[u8]>,
+    /// Complete default settings, under `settings_schema`.
+    pub default_settings: AuthoringValue,
+    /// The path globs of the default import rules naming this importer
+    /// (§8 "Default imports"), in registration order.
+    pub default_globs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

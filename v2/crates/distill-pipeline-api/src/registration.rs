@@ -8,7 +8,7 @@
 use distill_core::id::AssetUuid;
 
 use crate::callbacks::{
-    cleanup_callback, erase_callback, CallbackHandle, CodegenDescriptor, DefaultsDescriptor,
+    cleanup_callback, erase_callback, AuthoredDescriptor, CallbackHandle, CodegenDescriptor, DefaultsDescriptor,
     ImporterDescriptor, MigrationKey, PipelineCodegen, PipelineDefaults, PipelineImporter,
     PipelineMigration, PipelineProcessor, PipelineValidator, ProcessorDescriptor, ToolDescriptor,
     ValidatorDescriptor,
@@ -31,6 +31,7 @@ pub enum RegistrationKind {
     Defaults,
     Tool,
     DefaultImport,
+    Authored,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,5 +272,45 @@ impl<'a> RegistrationArena<'a> {
         };
         let callback = ErasedCallback::new(rule.clone(), CallbackHandle::DefaultImport(rule));
         self.host.install_callback(registration, callback)
+    }
+
+    /// Declare a type authors create bundles of (§17 "Creating"). Data
+    /// only; part of the pipeline epoch. One per type, each extension once.
+    pub fn register_authored(&mut self, descriptor: AuthoredDescriptor) -> RegistrationStatus {
+        let registration = Registration {
+            kind: RegistrationKind::Authored,
+            id: descriptor.type_uuid.to_string(),
+            version: 1,
+        };
+        let callback = ErasedCallback::new((), CallbackHandle::Authored(descriptor));
+        self.host.install_callback(registration, callback)
+    }
+
+    /// [`Self::register_authored`] for an `#[asset]` type: its default is
+    /// `T::default()`, its logical hash the type's own.
+    pub fn register_authored_asset<T>(&mut self, extension: &str, local_id: &str, doc: &str) -> RegistrationStatus
+    where
+        T: distill_asset::AssetType + distill_asset::AssetReflect + Default,
+    {
+        let default = match distill_asset::defaults::write_default::<T>() {
+            Ok(value) => value,
+            Err(_) => {
+                return RegistrationStatus {
+                    disposition: RegistrationDisposition::Consumed,
+                    result: Err(ModuleCallError::new(format!(
+                        "authored type {}: its Default panicked",
+                        T::TYPE_UUID
+                    ))),
+                }
+            }
+        };
+        self.register_authored(AuthoredDescriptor {
+            type_uuid: T::TYPE_UUID,
+            logical_hash: T::descriptor().logical_hash,
+            extension: extension.to_owned(),
+            local_id: local_id.to_owned(),
+            doc: doc.to_owned(),
+            default,
+        })
     }
 }

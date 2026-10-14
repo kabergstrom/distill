@@ -58,10 +58,10 @@ pub use distill_pipeline_api::importer::{
 #[derive(Clone)]
 pub(crate) struct RegisteredImporter {
     pub id: String,
-    settings_type_uuid: TypeUuid,
-    settings_schema: LogicalSchema,
-    settings_hash: LogicalHash,
-    default_settings: Value,
+    pub(crate) settings_type_uuid: TypeUuid,
+    pub(crate) settings_schema: LogicalSchema,
+    pub(crate) settings_hash: LogicalHash,
+    pub(crate) default_settings: Value,
     capability_hash: [u8; 32],
     executor: Arc<dyn AuthoringImporter>,
 }

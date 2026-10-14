@@ -7742,6 +7742,35 @@ every bundle and the files no bundle holds yet without file APIs:
   (`AuthoringInspection.typeName`, `.origin`), so an editor knows which
   entries a hand edit would survive (newgameplus GAP 23 §12.1 roles).
 
+**Creating** (protocol 26; newgameplus GAP 23 §9.11). An editor offers
+new bundles of the kinds the pipeline declares, without game code:
+- A pipeline module declares a type authors create with
+  `RegistrationArena::register_authored(AuthoredDescriptor)` (or
+  `register_authored_asset::<T>(extension, local_id, doc)` for an
+  `#[asset]` type, its default `T::default()`): type UUID, the logical hash
+  the module's type projects to, extension (a new bundle is
+  `<name>.<extension>.bundle`; lowercase ASCII letters, digits and `_`, not
+  `bundle`, unique per pipeline), the entry's local id (not `$`-prefixed),
+  a one-line doc and the default value. Data only; part of the pipeline
+  epoch; the type must be in the schema like every registered type.
+  Code: `distill-pipeline-api/src/registration.rs`,
+  `distill-daemon/src/epoch.rs` (`validate_authored`).
+- `authorable()` answers, at the snapshot's compiled state:
+  - `types`, extension-sorted: each authored type with its served path,
+    schema snapshot and hash, `authoringOnly` false, and its default as a
+    `TypeDefault` (`value`; `schemaMismatch` naming the module's hash when
+    the served schema projects the type otherwise, one of them being
+    rebuilt; `invalid`), plus `distill::DirectoryImportRules` (extension
+    `rules`, local id `rules`, authoring-only, default `absent`: a rules
+    bundle needs a rule).
+  - `importers`, id-sorted: id, settings type UUID and served path (what a
+    rule's settings name), settings schema and hash, complete default
+    settings, and the globs of the default import rules naming it (§8).
+  - A failed pipeline answers `pipelineUnavailable`. Code:
+    `distill-daemon/src/authoring.rs` (`authorable`).
+- Creating writes through `Hub.write` (a new bundle path in the named
+  root) or `Hub.import`; there is no create call.
+
 **Release** (protocol 23, newgameplus GAP 23 §12.3). An explicit import
 over a rule's output takes the bundle over (§8 "Default imports"):
 per-bundle settings. `Hub.release(base, bundle)` undoes that: the rule

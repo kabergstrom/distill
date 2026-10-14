@@ -2646,6 +2646,18 @@ impl AuthoringSnapshot {
         }
     }
 
+    /// What can be created at this snapshot (§17 "Creating").
+    pub fn authorable(&self) -> RpcResult<Authorable> {
+        let txn = match self.preflight() {
+            Ok(txn) => txn,
+            Err(result) => return result,
+        };
+        match self.server.inner.handle.authoring_backend().authorable(txn.snapshot()) {
+            Ok(authorable) => RpcResult::Success(authorable),
+            Err(error) => RpcResult::Failure(error),
+        }
+    }
+
     /// The types the snapshot's type index lists (§17 "Type descriptions").
     pub fn describable_types(&self) -> RpcResult<DescribableTypesResult> {
         let txn = match self.preflight() {

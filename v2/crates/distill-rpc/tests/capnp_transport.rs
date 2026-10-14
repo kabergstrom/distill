@@ -505,6 +505,7 @@ fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
         "AuthoringListCall",
         "SourceFilesCall",
         "ReferencesCall",
+        "AuthorableCall",
     ] {
         let marker = format!("struct {name} {{");
         let body = source
@@ -2583,6 +2584,56 @@ impl AuthoringBackend for BrowsingBackend {
             detail: format!("no rule claims {bundle}"),
         })
     }
+
+    fn authorable(&self, _: &distill_store::StoreReader) -> Result<Authorable, RpcFailure> {
+        Ok(browsing_authorable())
+    }
+}
+
+/// A fixed `authorable` listing: one type with its default, one with a
+/// schema mismatch, the rules type without one, one importer.
+fn browsing_authorable() -> Authorable {
+    use distill_schema::ngp_schema::{snapshot_to_json, LogicalSchema, PrimitiveKind};
+    let schema = LogicalSchema {
+        root: SchemaNode::Struct {
+            rev: 0,
+            fields: vec![("value".to_owned(), 0, SchemaNode::Primitive(PrimitiveKind::U8))],
+        },
+    };
+    let schema_hash = node_hash(&schema.root).unwrap();
+    let logical_schema: Arc<[u8]> = snapshot_to_json(&schema).unwrap().into_bytes().into();
+    let value = |text: &str| AuthoringValue {
+        canonical_value: Arc::from(text.as_bytes()),
+        blobs: Vec::new(),
+        types: Vec::new(),
+    };
+    let ty = |extension: &str, default: TypeDefault| AuthorableType {
+        type_uuid: TypeUuid([extension.len() as u8; 16]),
+        path: format!("game::{extension}"),
+        extension: extension.to_owned(),
+        local_id: "asset".into(),
+        doc: format!("A {extension}."),
+        authoring_only: extension == "rules",
+        schema_hash,
+        logical_schema: logical_schema.clone(),
+        default,
+    };
+    Authorable {
+        types: vec![
+            ty("cue", TypeDefault::Value(value(r#"{"value":3}"#))),
+            ty("rules", TypeDefault::Absent),
+            ty("stale", TypeDefault::SchemaMismatch { written: LogicalHash([2; 32]) }),
+        ],
+        importers: vec![AuthorableImporter {
+            id: "ngp.image".into(),
+            settings_type: TypeUuid([4; 16]),
+            settings_path: "game::ImageSettings".into(),
+            settings_hash: schema_hash,
+            settings_schema: logical_schema.clone(),
+            default_settings: value(r#"{"value":0}"#),
+            default_globs: vec!["**/*.png".into(), "**/*.jpg".into()],
+        }],
+    }
 }
 
 fn browsing_files(root: &str) -> Vec<SourceFile> {
@@ -2623,8 +2674,8 @@ fn browsing_files(root: &str) -> Vec<SourceFile> {
 }
 
 /// `list`, `sourceFiles`, `references`, an inspection's origin and type
-/// name and `Hub.release` over TCP (protocol
-/// 23): rows carry both roles with their type names and origins, every
+/// name and `Hub.release` over TCP (protocol 23), and `authorable`
+/// (protocol 26): rows carry both roles with their type names and origins, every
 /// claim arm crosses, an unknown bundle's references and a refused release
 /// answer typed errors.
 #[tokio::test(flavor = "current_thread")]
@@ -2688,6 +2739,7 @@ async fn browsing_calls_round_trip_over_tcp() {
                 BundleReferences::default()
             );
             assert!(matches!(snapshot.references(BundleUuid([99; 16])).await.unwrap(), RemoteCall::Error(_)));
+            assert_eq!(snapshot.authorable().await.unwrap().success().unwrap(), browsing_authorable());
 
             let base = project.server().current_stamp().unwrap().version;
             match hub.release(base, runtime.bundle).await.unwrap() {

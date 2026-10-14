@@ -3492,3 +3492,81 @@ fn source_files_name_their_claims_and_a_release_returns_an_override_to_its_rule(
         other => panic!("expected a refusal, got {other:?}"),
     }
 }
+
+/// `authorable` (§17 "Creating") lists the pipeline's authored types with
+/// their defaults under the served schema (a declaration under another
+/// schema is a mismatch), `DirectoryImportRules`, and every importer with
+/// its default settings and default-rule globs; a type's default and
+/// schema write a new bundle as they are.
+#[test]
+fn authorable_lists_the_authored_types_and_importers() {
+    use distill_pipeline_fixture::{PARENT_EXTENSION, STALE_EXTENSION};
+    use distill_rpc::{AuthoringEntry, AuthoringEntryRole, AuthoringOp, RpcResult, TypeDefault};
+
+    let temp = tempfile::tempdir().unwrap();
+    let (assets, coordinator) = default_import_project(temp.path(), &[], &[]);
+    let RpcResult::Success(authorable) = authoring_snapshot(&coordinator).authorable() else {
+        panic!("an authorable listing")
+    };
+    let extensions: Vec<_> = authorable.types.iter().map(|ty| ty.extension.as_str()).collect();
+    assert_eq!(extensions, [PARENT_EXTENSION, "rules", STALE_EXTENSION]);
+
+    let authority = distill_test_project::project_authority();
+    let parent = &authorable.types[0];
+    assert_eq!(parent.type_uuid, distill_pipeline_fixture::PARENT_TYPE);
+    assert_eq!((parent.local_id.as_str(), parent.doc.as_str()), ("asset", "A fixture parent."));
+    assert!(!parent.authoring_only);
+    assert!(!parent.path.is_empty());
+    assert_eq!(
+        parent.schema_hash,
+        authority.project_type(distill_pipeline_fixture::PARENT_TYPE).unwrap().logical_hash
+    );
+    let TypeDefault::Value(default) = &parent.default else {
+        panic!("the parent's default, got {:?}", parent.default)
+    };
+    assert_eq!(&*default.canonical_value, br#"{"value":7}"#);
+
+    let rules = &authorable.types[1];
+    assert_eq!(rules.type_uuid, DIRECTORY_IMPORT_RULES_TYPE_UUID);
+    assert_eq!((rules.path.as_str(), rules.local_id.as_str()), ("distill::DirectoryImportRules", "rules"));
+    assert!(rules.authoring_only);
+    assert_eq!(rules.default, TypeDefault::Absent);
+    assert_eq!(
+        authorable.types[2].default,
+        TypeDefault::SchemaMismatch { written: distill_core::id::LogicalHash([0; 32]) }
+    );
+
+    let ids: Vec<_> = authorable.importers.iter().map(|importer| importer.id.as_str()).collect();
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    assert_eq!(ids, sorted);
+    let byte = authorable.importers.iter().find(|importer| importer.id == BYTE_IMPORTER).unwrap();
+    assert_eq!(byte.settings_type, SETTINGS_TYPE);
+    assert!(!byte.settings_path.is_empty());
+    assert_eq!(byte.default_globs, ["**/*.num"]);
+    assert_eq!(&*byte.default_settings.canonical_value, text(&default_settings()).as_bytes());
+    let chain = authorable.importers.iter().find(|importer| importer.id == CHAIN_IMPORTER).unwrap();
+    assert!(chain.default_globs.is_empty());
+
+    let base = coordinator.server().current_stamp().unwrap().version;
+    let entry = AuthoringEntry {
+        uuid: AssetUuid([0x31; 16]),
+        bundle: BundleUuid([0x32; 16]),
+        local_id: parent.local_id.clone(),
+        normalized_path: format!("made.{}.bundle", parent.extension),
+        type_uuid: parent.type_uuid,
+        terminal_type: parent.type_uuid,
+        schema_hash: parent.schema_hash,
+        logical_schema: parent.logical_schema.clone(),
+        role: AuthoringEntryRole::Runtime,
+        tags: BTreeMap::new(),
+        value: default.clone(),
+        root: "main".into(),
+    };
+    match connect(&coordinator).write(base, vec![AuthoringOp::Set(entry)], false) {
+        RpcResult::Success(_) => {}
+        other => panic!("expected a write, got {other:?}"),
+    }
+    let written = distill_bundle::parse_bundle(&std::fs::read(assets.join("made.parent.bundle")).unwrap()).unwrap();
+    assert_eq!(byte_of(&written.assets["asset"].data), Some(7));
+}

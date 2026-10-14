@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use distill_core::id::{AssetUuid, BundleUuid};
 use distill_rpc::capnp_loader::{RemoteAuthoringSnapshot, RemoteCall, RemoteHub};
 use distill_rpc::{
-    AssetQuery, AuthoringInspectResult, AuthoringInspection, AuthoringOp, AuthoringProgressState, AuthoringRow,
+    AssetQuery, Authorable, AuthoringInspectResult, AuthoringInspection, AuthoringOp, AuthoringProgressState, AuthoringRow,
     BundleReferences, ImportRequest, SourceFile,
     DescribableType, DescribableTypesResult, LongRunningOp, RenameWithFixupsRequest, RpcFailure,
     TypeDescription, WriteReceipt,
@@ -56,6 +56,8 @@ pub enum AuthoringRequest {
     Reimport { base: InputVersion, bundle: BundleUuid },
     /// `Hub.release`: the explicit import follows its rule again.
     Release { base: InputVersion, bundle: BundleUuid },
+    /// The authored types the pipeline declares and its importers.
+    Authorable,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +98,10 @@ pub enum AuthoringAnswer {
     Imported {
         bundle: BundleUuid,
         version: InputVersion,
+    },
+    Authorable {
+        version: InputVersion,
+        authorable: Authorable,
     },
 }
 
@@ -162,6 +168,12 @@ pub(crate) async fn run(hub: &RemoteHub, request: AuthoringRequest) -> Result<Au
             let version = remote(snapshot.version().await)?;
             let references = remote(snapshot.references(bundle).await)?;
             Ok(AuthoringAnswer::References { version, references })
+        }
+        AuthoringRequest::Authorable => {
+            let snapshot = remote(hub.authoring_snapshot().await)?;
+            let version = remote(snapshot.version().await)?;
+            let authorable = remote(snapshot.authorable().await)?;
+            Ok(AuthoringAnswer::Authorable { version, authorable })
         }
         AuthoringRequest::Import { base, request } => imported(hub, hub.import(base, &request).await).await,
         AuthoringRequest::Reimport { base, bundle } => imported(hub, hub.reimport(base, bundle).await).await,

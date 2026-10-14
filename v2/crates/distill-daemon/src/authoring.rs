@@ -646,6 +646,104 @@ impl AuthoringBackend for AuthoringService {
             self.publish_import_run(store, base, run)
         }))
     }
+
+    fn authorable(&self, snapshot: &StoreReader) -> Result<distill_rpc::Authorable, RpcFailure> {
+        authorable(&*self.compiled(snapshot)?)
+    }
+}
+
+/// What can be created under `compiled` (§17 "Creating"): the pipeline's
+/// authored types under the served schema, `DirectoryImportRules`, and
+/// the registered importers.
+fn authorable(compiled: &Compiled) -> Result<distill_rpc::Authorable, RpcFailure> {
+    use distill_rpc::{AuthorableImporter, AuthorableType, TypeDefault};
+    use distill_schema::ngp_schema::{node_from_bytes, node_hash, snapshot_to_json, TypeTable};
+
+    let epoch = compiled.pipeline_epoch().map_err(|failure| {
+        RpcFailure::PipelineUnavailable(Box::new(distill_rpc::PipelineUnavailableDiagnostic::PipelineFailure(
+            failure.clone(),
+        )))
+    })?;
+    let authority = compiled.schema_authority();
+    let path_of = |type_uuid| {
+        let authority = authority.as_ref()?;
+        let project = authority.project_type(type_uuid)?;
+        Some(authority.schema().types.get(project.schema_type.0)?.path.display_path())
+    };
+    let schema_json = |schema| snapshot_to_json(schema).map(|text| Arc::<[u8]>::from(text.into_bytes())).map_err(invalid);
+    let no_types = TypeTable::default();
+
+    let mut types = Vec::new();
+    for descriptor in epoch.authored_types() {
+        // The epoch's bound check put every authored type in the schema.
+        let project = authority
+            .as_ref()
+            .and_then(|authority| authority.project_type(descriptor.type_uuid))
+            .ok_or_else(|| invalid(format!("authored type {} is not in the served schema", descriptor.type_uuid)))?;
+        let default = if descriptor.logical_hash != project.logical_hash {
+            TypeDefault::SchemaMismatch { written: descriptor.logical_hash }
+        } else {
+            match distill_rpc::authoring_value(&project.logical_schema.root, &descriptor.default, &no_types) {
+                Ok(value) => TypeDefault::Value(value),
+                Err(error) => TypeDefault::Invalid(error),
+            }
+        };
+        types.push(AuthorableType {
+            type_uuid: descriptor.type_uuid,
+            path: path_of(descriptor.type_uuid).unwrap_or_default(),
+            extension: descriptor.extension,
+            local_id: descriptor.local_id,
+            doc: descriptor.doc,
+            authoring_only: false,
+            schema_hash: project.logical_hash,
+            logical_schema: schema_json(&project.logical_schema)?,
+            default,
+        });
+    }
+    let rules = distill_core::bootstrap::BootstrapControlSpecV1::embedded()
+        .map_err(|error| invalid(format!("{error:?}")))?
+        .0
+        .into_iter()
+        .find(|row| row.symbol == distill_core::bootstrap::BootstrapControlSymbol::DirectoryImportRules)
+        .ok_or_else(|| invalid("the bootstrap spec has no DirectoryImportRules"))?;
+    let rules_schema = node_from_bytes(&rules.logical_schema).map_err(|error| invalid(format!("{error:?}")))?;
+    types.push(AuthorableType {
+        type_uuid: DIRECTORY_IMPORT_RULES_TYPE_UUID,
+        path: "distill::DirectoryImportRules".to_owned(),
+        extension: "rules".to_owned(),
+        local_id: "rules".to_owned(),
+        doc: "Directory import rules: import the files a glob matches, each rule with an importer and settings"
+            .to_owned(),
+        authoring_only: true,
+        schema_hash: node_hash(&rules_schema.root).map_err(|error| invalid(format!("{error:?}")))?,
+        logical_schema: schema_json(&rules_schema)?,
+        default: TypeDefault::Absent,
+    });
+    types.sort_by(|a, b| a.extension.cmp(&b.extension));
+
+    let default_rules = epoch.default_import_rules();
+    let mut importers = Vec::new();
+    for (id, importer) in compiled.pipeline_importers() {
+        importers.push(AuthorableImporter {
+            id: id.clone(),
+            settings_type: importer.settings_type_uuid,
+            settings_path: path_of(importer.settings_type_uuid).unwrap_or_default(),
+            settings_hash: importer.settings_hash,
+            settings_schema: schema_json(&importer.settings_schema)?,
+            default_settings: distill_rpc::authoring_value(
+                &importer.settings_schema.root,
+                &importer.default_settings,
+                &no_types,
+            )
+            .map_err(|error| invalid(format!("importer {id:?} default settings: {error}")))?,
+            default_globs: default_rules
+                .iter()
+                .filter(|rule| rule.importer == *id)
+                .filter_map(|rule| rule.matches.path_glob.clone())
+                .collect(),
+        });
+    }
+    Ok(distill_rpc::Authorable { types, importers })
 }
 
 struct PlannedBundleMutation {

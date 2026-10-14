@@ -11,12 +11,12 @@ pub use crate::capnp_transport::RemoteError;
 use crate::capnp_transport::{
     decode_authoring_inspection, decode_configuration_error, decode_describable_types, decode_rpc_basis,
     decode_authoring_rows, decode_bundle_references, decode_rpc_error, decode_source_files,
-    decode_type_description,
+    decode_type_description, decode_authorable,
     schema, RemoteConnectOutcome, RemoteMetadataOutcome,
 };
 use crate::{
     ArtifactChunk, ArtifactChunkKind, AssetDeltaState, AssetEvent, AssetQuery, AuthoringEntry,
-    AuthoringEntryRole, AuthoringOp, AuthoringRow, BundleReferences, SourceFile, AuthoringProgressEvent, AuthoringProgressState, LongRunningOp,
+    AuthoringEntryRole, AuthoringOp, AuthoringRow, Authorable, BundleReferences, SourceFile, AuthoringProgressEvent, AuthoringProgressState, LongRunningOp,
     WriteReceipt,
     AuthoringInspectResult, ConfigurationError, Delta, DescribableTypesResult, DescribeTypeResult, DriftedInput, ImportFailure, ImportRequest,
     MetadataEntry, PathResolveFailure, PathResolveResult, ReconnectReason, ResolveResult, RpcBasis,
@@ -468,6 +468,24 @@ impl RemoteAuthoringSnapshot {
             ),
             schema::source_files_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
             schema::source_files_call::Which::Error(value) => Ok(RemoteCall::Error(decode_rpc_error(value?)?)),
+        }
+    }
+
+    /// The authored types the pipeline declares, with their defaults, and
+    /// its importers (protocol 26).
+    pub async fn authorable(&self) -> Result<RemoteCall<Authorable>, capnp::Error> {
+        let response = self.client.authorable_request().send().promise.await?;
+        let result = response.get()?.get_result()?;
+        match result.which()? {
+            schema::authorable_call::Which::Success(value) => Ok(RemoteCall::Success(decode_authorable(value?)?)),
+            schema::authorable_call::Which::ReconnectRequired(value) => Ok(
+                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
+            ),
+            schema::authorable_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
+            ),
+            schema::authorable_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
+            schema::authorable_call::Which::Error(value) => Ok(RemoteCall::Error(decode_rpc_error(value?)?)),
         }
     }
 

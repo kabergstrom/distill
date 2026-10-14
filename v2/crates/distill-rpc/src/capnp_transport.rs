@@ -55,7 +55,8 @@ use crate::{
     ResolveResult, Root, RpcBasis, RpcFailure, RpcResult, Snapshot, SnapshotStamp, StoreInstanceId,
     TagSelector, TargetDefinitionHash, TypeUuid, DescribeTypeResult, AuthoringRow, BundleOrigin,
     BundleReferences, SourceClaim, SourceFile, DescribableType,
-    DescribableTypesResult, TypeDefault, TypeDescription, TypeMember,
+    DescribableTypesResult, TypeDefault, TypeDescription, TypeMember, Authorable, AuthorableImporter,
+    AuthorableType,
 };
 
 pub use crate::distill_rpc_capnp as schema;
@@ -1368,6 +1369,18 @@ impl schema::authoring_snapshot::Server for AuthoringSnapshotService {
                 }
             };
             write_references_result(results.get().init_result(), self.snapshot.references(bundle));
+            Ok(())
+        }
+    }
+
+    fn authorable(
+        self: capnp::capability::Rc<Self>,
+        _params: schema::authoring_snapshot::AuthorableParams,
+        mut results: schema::authoring_snapshot::AuthorableResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
+        async move {
+            generation_gate!(self.snapshot.generation_reconnect(), results);
+            write_authorable_result(results.get().init_result(), self.snapshot.authorable());
             Ok(())
         }
     }
@@ -3219,13 +3232,7 @@ fn write_type_description(
     output.set_path(description.path.as_str());
     output.set_schema_hash(&description.schema_hash.0);
     output.set_logical_schema(&description.logical_schema);
-    let mut default = output.reborrow().init_default_value();
-    match &description.default {
-        TypeDefault::Value(value) => write_authoring_value(default.init_value(), value),
-        TypeDefault::Absent => default.set_absent(()),
-        TypeDefault::SchemaMismatch { written } => default.set_schema_mismatch(&written.0),
-        TypeDefault::Invalid(detail) => default.set_invalid(detail.as_str()),
-    }
+    write_type_default(output.reborrow().init_default_value(), &description.default);
     let mut members = output.reborrow().init_members(description.members.len() as u32);
     for (index, member) in description.members.iter().enumerate() {
         let mut wire = members.reborrow().get(index as u32);
@@ -3246,6 +3253,54 @@ fn write_type_description(
         let mut wire = renames.reborrow().get(index as u32);
         wire.set_at(at.as_str());
         wire.set_from(from.as_str());
+    }
+}
+
+fn write_type_default(mut output: schema::type_default::Builder<'_>, default: &TypeDefault) {
+    match default {
+        TypeDefault::Value(value) => write_authoring_value(output.init_value(), value),
+        TypeDefault::Absent => output.set_absent(()),
+        TypeDefault::SchemaMismatch { written } => output.set_schema_mismatch(&written.0),
+        TypeDefault::Invalid(detail) => output.set_invalid(detail.as_str()),
+    }
+}
+
+fn write_authorable_result(mut result: schema::authorable_call::Builder<'_>, outcome: RpcResult<Authorable>) {
+    match outcome {
+        RpcResult::Success(authorable) => {
+            let mut output = result.reborrow().init_success();
+            let mut types = output.reborrow().init_types(authorable.types.len() as u32);
+            for (index, ty) in authorable.types.iter().enumerate() {
+                let mut wire = types.reborrow().get(index as u32);
+                wire.set_type_uuid(&ty.type_uuid.0);
+                wire.set_path(ty.path.as_str());
+                wire.set_extension(ty.extension.as_str());
+                wire.set_local_id(ty.local_id.as_str());
+                wire.set_doc(ty.doc.as_str());
+                wire.set_authoring_only(ty.authoring_only);
+                wire.set_schema_hash(&ty.schema_hash.0);
+                wire.set_logical_schema(&ty.logical_schema);
+                write_type_default(wire.init_default_value(), &ty.default);
+            }
+            let mut importers = output.init_importers(authorable.importers.len() as u32);
+            for (index, importer) in authorable.importers.iter().enumerate() {
+                let mut wire = importers.reborrow().get(index as u32);
+                wire.set_id(importer.id.as_str());
+                wire.set_settings_type(&importer.settings_type.0);
+                wire.set_settings_path(importer.settings_path.as_str());
+                wire.set_settings_hash(&importer.settings_hash.0);
+                wire.set_settings_schema(&importer.settings_schema);
+                write_authoring_value(wire.reborrow().init_default_settings(), &importer.default_settings);
+                let mut globs = wire.init_default_globs(importer.default_globs.len() as u32);
+                for (at, glob) in importer.default_globs.iter().enumerate() {
+                    globs.set(at as u32, glob.as_str());
+                }
+            }
+        }
+        RpcResult::ReconnectRequired { reason } => write_reconnect(result.init_reconnect_required(), reason),
+        RpcResult::ConfigurationFailed(error) => write_configuration_error(result.init_configuration_failed(), &error),
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
+        RpcResult::Failure(error) => write_failure(result.init_error(), &error),
     }
 }
 
@@ -3520,23 +3575,7 @@ pub fn decode_type_description(
     let logical_schema: Arc<[u8]> = value.get_logical_schema()?.to_vec().into();
     crate::validate::verified_schema(schema_hash, &logical_schema)
         .map_err(|error| capnp::Error::failed(format!("invalid type description: {error:?}")))?;
-    let default = match value.get_default_value()?.which()? {
-        schema::type_default::Which::Value(wire) => {
-            let authored = decode_authoring_value(wire?).map_err(capnp::Error::failed)?;
-            crate::validate::decode_authoring_payload(schema_hash, &logical_schema, &authored)
-                .map_err(|error| capnp::Error::failed(format!("invalid type default: {error:?}")))?;
-            TypeDefault::Value(authored)
-        }
-        schema::type_default::Which::Absent(()) => TypeDefault::Absent,
-        schema::type_default::Which::SchemaMismatch(hash) => TypeDefault::SchemaMismatch {
-            written: crate::LogicalHash(
-                decode_hash(hash?, "typeDescription.defaultValue.schemaMismatch").map_err(failed)?,
-            ),
-        },
-        schema::type_default::Which::Invalid(detail) => {
-            TypeDefault::Invalid(decode_text(detail?, "typeDescription.defaultValue.invalid").map_err(failed)?)
-        }
-    };
+    let default = decode_type_default(value.get_default_value()?, schema_hash, &logical_schema, "typeDescription.defaultValue")?;
     let optional = |text: String| (!text.is_empty()).then_some(text);
     let mut members = Vec::new();
     for member in value.get_members()? {
@@ -3567,6 +3606,94 @@ pub fn decode_type_description(
         members,
         renames,
     })
+}
+
+/// Decode a type default under its (verified) schema.
+fn decode_type_default(
+    value: schema::type_default::Reader<'_>,
+    schema_hash: crate::LogicalHash,
+    logical_schema: &[u8],
+    field: &str,
+) -> Result<TypeDefault, capnp::Error> {
+    let failed = |error: WireFailure| capnp::Error::failed(error.message);
+    Ok(match value.which()? {
+        schema::type_default::Which::Value(wire) => {
+            let authored = decode_authoring_value(wire?).map_err(capnp::Error::failed)?;
+            crate::validate::decode_authoring_payload(schema_hash, logical_schema, &authored)
+                .map_err(|error| capnp::Error::failed(format!("invalid {field}: {error:?}")))?;
+            TypeDefault::Value(authored)
+        }
+        schema::type_default::Which::Absent(()) => TypeDefault::Absent,
+        schema::type_default::Which::SchemaMismatch(hash) => TypeDefault::SchemaMismatch {
+            written: crate::LogicalHash(decode_hash(hash?, field).map_err(failed)?),
+        },
+        schema::type_default::Which::Invalid(detail) => {
+            TypeDefault::Invalid(decode_text(detail?, field).map_err(failed)?)
+        }
+    })
+}
+
+/// Decode a wire `authorable` answer (its success arm), authenticating
+/// each schema against its hash and each default against its schema.
+pub fn decode_authorable(value: schema::authorable::Reader<'_>) -> Result<Authorable, capnp::Error> {
+    let failed = |error: WireFailure| capnp::Error::failed(error.message);
+    let verified = |hash: &[u8], schema: &[u8], field: &str| -> Result<(crate::LogicalHash, Arc<[u8]>), capnp::Error> {
+        let hash = crate::LogicalHash(decode_hash(hash, field).map_err(failed)?);
+        let schema: Arc<[u8]> = schema.to_vec().into();
+        crate::validate::verified_schema(hash, &schema)
+            .map_err(|error| capnp::Error::failed(format!("invalid {field}: {error:?}")))?;
+        Ok((hash, schema))
+    };
+    let mut types = Vec::new();
+    for ty in value.get_types()? {
+        let (schema_hash, logical_schema) =
+            verified(ty.get_schema_hash()?, ty.get_logical_schema()?, "authorableType.schemaHash")?;
+        types.push(AuthorableType {
+            type_uuid: TypeUuid(decode_uuid(ty.get_type_uuid()?, "authorableType.typeUuid").map_err(failed)?),
+            path: decode_text(ty.get_path()?, "authorableType.path").map_err(failed)?,
+            extension: decode_text(ty.get_extension()?, "authorableType.extension").map_err(failed)?,
+            local_id: decode_text(ty.get_local_id()?, "authorableType.localId").map_err(failed)?,
+            doc: decode_text(ty.get_doc()?, "authorableType.doc").map_err(failed)?,
+            authoring_only: ty.get_authoring_only(),
+            default: decode_type_default(
+                ty.get_default_value()?,
+                schema_hash,
+                &logical_schema,
+                "authorableType.defaultValue",
+            )?,
+            schema_hash,
+            logical_schema,
+        });
+    }
+    let mut importers = Vec::new();
+    for importer in value.get_importers()? {
+        let (settings_hash, settings_schema) = verified(
+            importer.get_settings_hash()?,
+            importer.get_settings_schema()?,
+            "authorableImporter.settingsHash",
+        )?;
+        let default_settings =
+            decode_authoring_value(importer.get_default_settings()?).map_err(capnp::Error::failed)?;
+        crate::validate::decode_authoring_payload(settings_hash, &settings_schema, &default_settings)
+            .map_err(|error| capnp::Error::failed(format!("invalid authorableImporter.defaultSettings: {error:?}")))?;
+        let mut default_globs = Vec::new();
+        for glob in importer.get_default_globs()? {
+            default_globs.push(decode_text(glob?, "authorableImporter.defaultGlobs").map_err(failed)?);
+        }
+        importers.push(AuthorableImporter {
+            id: decode_text(importer.get_id()?, "authorableImporter.id").map_err(failed)?,
+            settings_type: TypeUuid(
+                decode_uuid(importer.get_settings_type()?, "authorableImporter.settingsType").map_err(failed)?,
+            ),
+            settings_path: decode_text(importer.get_settings_path()?, "authorableImporter.settingsPath")
+                .map_err(failed)?,
+            settings_hash,
+            settings_schema,
+            default_settings,
+            default_globs,
+        });
+    }
+    Ok(Authorable { types, importers })
 }
 
 /// Decode a wire describable-types answer (its success arm).

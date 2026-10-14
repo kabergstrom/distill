@@ -374,6 +374,9 @@ impl CandidateRegistrationArena {
             (RegistrationKind::DefaultImport, CallbackHandle::DefaultImport(rule)) => {
                 distill_core::id::AssetUuid(rule.id.0).to_string() == registration.id
             }
+            (RegistrationKind::Authored, CallbackHandle::Authored(descriptor)) => {
+                descriptor.type_uuid.to_string() == registration.id
+            }
             _ => false,
         };
         if !matches {
@@ -382,6 +385,24 @@ impl CandidateRegistrationArena {
             ));
         }
 
+        if let CallbackHandle::Authored(descriptor) = callback {
+            validate_authored(descriptor).map_err(ModuleCallError::new)?;
+            while let Some(node) = prior {
+                // SAFETY: prior nodes are linked and live for the complete
+                // candidate lifetime.
+                let linked = unsafe { node.as_ref() };
+                if let CallbackHandle::Authored(existing) = &linked.callback {
+                    if existing.extension == descriptor.extension {
+                        return Err(ModuleCallError::new(format!(
+                            "authored types {} and {} share the extension {:?}",
+                            existing.type_uuid, descriptor.type_uuid, descriptor.extension
+                        )));
+                    }
+                }
+                prior = linked.next;
+            }
+            return Ok(());
+        }
         if let CallbackHandle::DefaultImport(rule) = callback {
             crate::default_imports::validate_rule(rule).map_err(ModuleCallError::new)?;
             while let Some(node) = prior {
@@ -821,6 +842,18 @@ impl PipelineEpoch {
             .into_iter()
             .filter_map(|(_, callback)| match callback {
                 CallbackHandle::DefaultImport(rule) => Some(rule),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The authored types (§17 "Creating") this epoch registers, in
+    /// registration order.
+    pub fn authored_types(&self) -> Vec<distill_pipeline_api::callbacks::AuthoredDescriptor> {
+        self.callback_rows()
+            .into_iter()
+            .filter_map(|(_, callback)| match callback {
+                CallbackHandle::Authored(descriptor) => Some(descriptor),
                 _ => None,
             })
             .collect()
@@ -1640,6 +1673,30 @@ impl ModuleHost {
     }
 }
 
+/// An authored type's declaration (§17 "Creating"): an extension of
+/// lowercase ASCII letters, digits and `_` other than `bundle` (bundles are
+/// named `<name>.<extension>.bundle`), and an entry local id that is not
+/// empty and not a daemon-owned `$` id.
+fn validate_authored(descriptor: &distill_pipeline_api::callbacks::AuthoredDescriptor) -> Result<(), String> {
+    let extension = descriptor.extension.as_str();
+    if extension.is_empty()
+        || extension == "bundle"
+        || !extension.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(format!(
+            "authored type {}: extension {extension:?} must be lowercase ASCII letters, digits and '_', not \"bundle\"",
+            descriptor.type_uuid
+        ));
+    }
+    if descriptor.local_id.is_empty() || descriptor.local_id.starts_with('$') {
+        return Err(format!(
+            "authored type {}: local id {:?} must be nonempty and not start with '$'",
+            descriptor.type_uuid, descriptor.local_id
+        ));
+    }
+    Ok(())
+}
+
 fn validate_registered_schema_types(
     arena: &CandidateRegistrationArena,
     registry: &BTreeMap<TypeUuid, distill_core::id::LogicalHash>,
@@ -1678,6 +1735,10 @@ fn validate_registered_schema_types(
             CallbackHandle::Defaults { descriptor, .. } => {
                 bound.push(("default materializer".to_owned(), descriptor.type_uuid))
             }
+            CallbackHandle::Authored(descriptor) => bound.push((
+                format!("authored type {:?}", descriptor.extension),
+                descriptor.type_uuid,
+            )),
             CallbackHandle::None
             | CallbackHandle::Codegen { .. }
             | CallbackHandle::Migration { .. }
@@ -2820,6 +2881,48 @@ mod callback_tests {
             .into_result()
             .unwrap_err();
         assert!(error.detail().contains("overlap"));
+        assert!(arena.rejected().is_some());
+        arena.cleanup_reverse().unwrap();
+    }
+
+    /// An authored type's extension must name a bundle (§17 "Creating"),
+    /// once per pipeline; its local id is not daemon-owned.
+    #[test]
+    fn authored_types_need_a_distinct_extension_and_an_authorable_local_id() {
+        let descriptor = |uuid: u8, extension: &str, local_id: &str| crate::callbacks::AuthoredDescriptor {
+            type_uuid: TypeUuid([uuid; 16]),
+            logical_hash: distill_core::id::LogicalHash([0; 32]),
+            extension: extension.into(),
+            local_id: local_id.into(),
+            doc: String::new(),
+            default: Value::U8(0),
+        };
+        for (extension, local_id, refusal) in [
+            ("Cue", "asset", "extension"),
+            ("bundle", "asset", "extension"),
+            ("", "asset", "extension"),
+            ("cue", "$record", "local id"),
+            ("cue", "", "local id"),
+        ] {
+            let mut arena = CandidateRegistrationArena::new(ModuleEpochToken::new(93));
+            let error = arena
+                .registrar()
+                .register_authored(descriptor(1, extension, local_id))
+                .into_result()
+                .unwrap_err();
+            assert!(error.detail().contains(refusal), "{extension:?} {local_id:?}: {error}");
+            arena.cleanup_reverse().unwrap();
+        }
+
+        let mut arena = CandidateRegistrationArena::new(ModuleEpochToken::new(94));
+        arena.registrar().register_authored(descriptor(1, "cue", "asset")).into_result().unwrap();
+        arena.registrar().register_authored(descriptor(2, "mix_2", "asset")).into_result().unwrap();
+        let error = arena
+            .registrar()
+            .register_authored(descriptor(3, "cue", "asset"))
+            .into_result()
+            .unwrap_err();
+        assert!(error.detail().contains("share the extension"), "{error}");
         assert!(arena.rejected().is_some());
         arena.cleanup_reverse().unwrap();
     }

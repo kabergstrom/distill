@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use distill_core::id::TypeUuid;
 use distill_pipeline_api::callbacks::{
+    AuthoredDescriptor,
     ImporterDescriptor, PipelineImporter, PipelineProcessContext, PipelineProcessor,
     ProcessorDescriptor, ProcessorError, ProcessorProduct, ProcessorProducts,
 };
@@ -79,6 +80,21 @@ pub const OPTIONAL_IMPORTER: &str = "optional-importer";
 pub const DEFAULT_RULE: [u8; 16] = [0xd5; 16];
 /// The extension [`DEFAULT_RULE`] matches.
 pub const DEFAULT_EXTENSION: &str = "num";
+
+/// The extension [`PARENT_TYPE`] is authored under (§17 "Creating"); its
+/// default is `value(7)`.
+pub const PARENT_EXTENSION: &str = "parent";
+/// The extension [`VALUE_TYPE`] is authored under, declared with a logical
+/// hash that is not the type's: its default is a schema mismatch.
+pub const STALE_EXTENSION: &str = "stale";
+
+/// The logical schema of [`PARENT_TYPE`] and [`VALUE_TYPE`]: `{ value: u8 }`.
+pub fn value_schema() -> SchemaNode {
+    SchemaNode::Struct {
+        rev: 0,
+        fields: vec![("value".to_owned(), 0, SchemaNode::Primitive(PrimitiveKind::U8))],
+    }
+}
 
 /// A [`VALUE_TYPE`] value (`value` truncated to its `u8`).
 pub fn value(value: u128) -> Value {
@@ -468,6 +484,26 @@ fn register(
             group: DirectoryGrouping::PerFile,
             importer: BYTE_IMPORTER.to_owned(),
             output: "{name}.bundle".to_owned(),
+        })
+        .into_result()?;
+    arena
+        .register_authored(AuthoredDescriptor {
+            type_uuid: PARENT_TYPE,
+            logical_hash: distill_schema::ngp_schema::node_hash(&value_schema()).map_err(|error| ModuleCallError::new(format!("{error:?}")))?,
+            extension: PARENT_EXTENSION.to_owned(),
+            local_id: "asset".to_owned(),
+            doc: "A fixture parent.".to_owned(),
+            default: value(7),
+        })
+        .into_result()?;
+    arena
+        .register_authored(AuthoredDescriptor {
+            type_uuid: VALUE_TYPE,
+            logical_hash: distill_core::id::LogicalHash([0; 32]),
+            extension: STALE_EXTENSION.to_owned(),
+            local_id: "asset".to_owned(),
+            doc: "Declared under another schema.".to_owned(),
+            default: value(1),
         })
         .into_result()?;
     Ok(targets.iter().map(|target| target.name.clone()).collect())

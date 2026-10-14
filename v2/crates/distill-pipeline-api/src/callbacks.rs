@@ -59,6 +59,26 @@ pub struct DefaultsDescriptor {
     pub type_uuid: TypeUuid,
 }
 
+/// A type authors create bundles of (§17 "Creating"): an authoring tool
+/// lists it with its default, names a new bundle `<name>.<extension>.bundle`
+/// and its one entry `local_id`. Data only: the host never calls into it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthoredDescriptor {
+    pub type_uuid: TypeUuid,
+    /// The logical hash the module's `type_uuid` projects to: the default
+    /// conforms to it.
+    pub logical_hash: LogicalHash,
+    /// Bundle file extension before `.bundle` (`cue`); lowercase ASCII
+    /// letters, digits and `_`, unique per pipeline.
+    pub extension: String,
+    /// The entry's local id in a new bundle (`asset`); not `$`-prefixed.
+    pub local_id: String,
+    /// One line on what the type is for.
+    pub doc: String,
+    /// The type's `Default`, the value a new bundle starts from.
+    pub default: Value,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodegenDescriptor {
     pub id: String,
@@ -514,6 +534,7 @@ pub enum CallbackHandle {
     },
     Tool(ToolDescriptor),
     DefaultImport(DefaultImportRule),
+    Authored(AuthoredDescriptor),
 }
 
 impl std::fmt::Debug for CallbackHandle {
@@ -528,6 +549,7 @@ impl std::fmt::Debug for CallbackHandle {
             Self::Defaults { .. } => "CallbackHandle::Defaults",
             Self::Tool(_) => "CallbackHandle::Tool",
             Self::DefaultImport(_) => "CallbackHandle::DefaultImport",
+            Self::Authored(_) => "CallbackHandle::Authored",
         })
     }
 }

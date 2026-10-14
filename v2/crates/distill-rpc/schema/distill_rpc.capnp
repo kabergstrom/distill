@@ -773,6 +773,46 @@ struct DescribableTypesCall {
   }
 }
 
+# §17 "Creating" (protocol 26).
+struct AuthorableType {
+  typeUuid @0 :Data;
+  path @1 :Text;
+  # A new bundle is `<name>.<extension>.bundle`, its one entry `localId`.
+  extension @2 :Text;
+  localId @3 :Text;
+  doc @4 :Text;
+  authoringOnly @5 :Bool;
+  schemaHash @6 :Data;
+  logicalSchema @7 :Data;
+  defaultValue @8 :TypeDefault;
+}
+
+struct AuthorableImporter {
+  id @0 :Text;
+  settingsType @1 :Data;
+  settingsPath @2 :Text;
+  settingsHash @3 :Data;
+  settingsSchema @4 :Data;
+  defaultSettings @5 :AuthoringValue;
+  # Globs of the default import rules naming the importer.
+  defaultGlobs @6 :List(Text);
+}
+
+struct Authorable {
+  types @0 :List(AuthorableType);
+  importers @1 :List(AuthorableImporter);
+}
+
+struct AuthorableCall {
+  union {
+    success @0 :Authorable;
+    reconnectRequired @1 :ReconnectRequired;
+    configurationFailed @2 :ConfigurationError;
+    snapshotExpired @3 :Void;
+    error @4 :RpcError;
+  }
+}
+
 # §17 "Browsing" (protocol 23).
 struct BundleOrigin {
   union {
@@ -1099,6 +1139,9 @@ interface AuthoringSnapshot {
   sourceFiles @8 (root :Text, glob :Text) -> (result :SourceFilesCall);
   # A bundle's path reference edges, both ways. Protocol 23.
   references @9 (bundle :Data) -> (result :ReferencesCall);
+  # The authored types the pipeline declares, with their defaults, and its
+  # importers. Protocol 26.
+  authorable @10 () -> (result :AuthorableCall);
 }
 
 interface ChunkStream {
