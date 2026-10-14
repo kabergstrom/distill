@@ -4486,8 +4486,10 @@ rules. The two matchings differ by what identity is *available*: the
 disk planner diffs two **snapshot ASTs** (the embedded historical
 `SchemaNode` tree against the current type's projection), which carry no
 nominal types by design — so it matches **structurally**: struct fields
-and enum variants by name at each node, containers by position, exactly
-the identity the logical hash defines; the only nominal input is picking
+and enum variants by name at each node, containers by position (a fixed
+array that grew keeps its elements by position and defaults the added
+slots, `GrowArray`; one that shrank is refused, it would drop elements),
+exactly the identity the logical hash defines; the only nominal input is picking
 the root (the entry's `type_uuid` selects which current schema to diff
 against). `TypeDef`-level matching on stable type UUIDs (crate + name
 fallback) is the *engine* planner's business, where live `TypeDef`s
@@ -4517,6 +4519,10 @@ pub enum MigrationOp {                                 // path-addressed, value-
                                                                      // post-migration duplicate
                                                                      // element is an error, exactly
                                                                      // the map-key collision rule
+    GrowArray         { at: FieldPath, element: Vec<MigrationOp> },  // a fixed array grown: old elements
+                                                                     // as MigrateElements, added slots
+                                                                     // the array default's tail —
+                                                                     // automatic segment only (below)
     MigrateMapKeys    { at: FieldPath, key: Vec<MigrationOp> },      // key collision = error
     MigrateInline     { at: FieldPath, ops: Vec<MigrationOp> },
 }
@@ -4528,8 +4534,8 @@ pub enum MigrationOp {                                 // path-addressed, value-
 ```
 
 **Default ops are automatic-segment-only; custom edges carry literals.**
-`WriteFieldDefault`/`WriteParentDefault` consult the live module's
-`DefaultTable<T>`, which exists only for the *current* schema — a
+`WriteFieldDefault`/`WriteParentDefault`/`GrowArray` consult the live
+module's `DefaultTable<T>`, which exists only for the *current* schema — a
 historical edge consulting a later module's table would be unexecutable
 (the field is gone) or silently change meaning (the default moved). So a
 custom `MigrationKind::Ops` edge may not contain them: **edge authoring
@@ -4558,7 +4564,7 @@ schema is written by exactly one op (an unwritten or doubly written
 destination is a plan-validation error naming the path; `DropField`
 documents an intentionally unmatched *input* path and writes nothing).
 Nested op lists (`MapVariant`, `MigrateElements`, `MigrateMapKeys`,
-`MigrateInline`) apply the same model recursively — input element in,
+`GrowArray`, `MigrateInline`) apply the same model recursively — input element in,
 fresh output element out. After every edge, function edges included, the
 output value is **validated against the edge's `to_hash` endpoint
 schema** (embedded in the migration bundle, §6): a `MigrationFn` result

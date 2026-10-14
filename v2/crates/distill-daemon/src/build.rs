@@ -3481,7 +3481,9 @@ impl DefaultProvider for NoMigrationDefaults {
 
 fn migration_ops_use_defaults(ops: &[MigrationOp]) -> bool {
     ops.iter().any(|op| match op {
-        MigrationOp::WriteFieldDefault { .. } | MigrationOp::WriteParentDefault { .. } => true,
+        MigrationOp::WriteFieldDefault { .. }
+        | MigrationOp::WriteParentDefault { .. }
+        | MigrationOp::GrowArray { .. } => true,
         MigrationOp::MapVariant { payload, .. } => migration_ops_use_defaults(payload),
         MigrationOp::MigrateElements { element, .. } => migration_ops_use_defaults(element),
         MigrationOp::MigrateMapKeys { key, .. } => migration_ops_use_defaults(key),

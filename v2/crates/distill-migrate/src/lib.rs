@@ -108,6 +108,15 @@ pub enum MigrationOp {
         at: FieldPath,
         element: Vec<MigrationOp>,
     },
+    /// A fixed array that grew: its old elements migrate by `element` (as
+    /// `MigrateElements`), the slots past them take the tail of the array
+    /// field type's default — automatic segment only, like
+    /// `WriteFieldDefault`. A sparse input's added slots inherit. A
+    /// shrinking array drops elements: the planner refuses it.
+    GrowArray {
+        at: FieldPath,
+        element: Vec<MigrationOp>,
+    },
     /// Key collision = error (§11).
     MigrateMapKeys {
         at: FieldPath,

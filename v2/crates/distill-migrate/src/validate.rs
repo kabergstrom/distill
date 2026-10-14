@@ -39,7 +39,8 @@ pub enum PlanError {
         path: String,
         side: SchemaSide,
     },
-    /// WriteFieldDefault/WriteParentDefault in a custom edge (§11).
+    /// WriteFieldDefault/WriteParentDefault/GrowArray in a custom edge
+    /// (§11).
     DefaultOpInCustomEdge {
         path: String,
         op: &'static str,
@@ -295,6 +296,37 @@ fn validate_frame(
                     group.1.push((fv, tv, payload));
                 } else {
                     mv_groups.push((at.0.clone(), vec![(fv, tv, payload)]));
+                }
+            }
+            MigrationOp::GrowArray { at, element } => {
+                if edge == EdgeKind::Custom {
+                    errors.push(PlanError::DefaultOpInCustomEdge {
+                        path: disp(prefix, at),
+                        op: "GrowArray",
+                    });
+                }
+                let Some((fnode, tnode)) = resolve_at(from, to, at, prefix, errors) else {
+                    continue;
+                };
+                writers.push(at.0.clone());
+                let sub = format!("{}[]", disp(prefix, at));
+                match (fnode, tnode) {
+                    (
+                        SchemaNode::Array { len: l1, elem: a },
+                        SchemaNode::Array { len: l2, elem: b },
+                    ) => {
+                        if l1 >= l2 {
+                            errors.push(PlanError::ContainerMismatch {
+                                path: disp(prefix, at),
+                                detail: format!("GrowArray needs a longer array ({l1} -> {l2})"),
+                            });
+                        }
+                        validate_frame(element, a, b, edge, &sub, errors);
+                    }
+                    _ => errors.push(PlanError::ContainerMismatch {
+                        path: disp(prefix, at),
+                        detail: "GrowArray requires an array on both sides".to_string(),
+                    }),
                 }
             }
             MigrationOp::MigrateElements { at, element } => {

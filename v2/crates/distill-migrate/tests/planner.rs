@@ -187,10 +187,27 @@ fn node_kind_change_refused() {
 }
 
 #[test]
-fn array_len_change_refused() {
+fn grown_array_plans_grow_array() {
     let old = strct(0, &[("a", 0, arr(3, p(PK::U8)))]);
     let new = strct(0, &[("a", 0, arr(4, p(PK::U8)))]);
-    refuses_at(&old, &new, "a", "length");
+    let ops = plan_automatic(&old, &new).unwrap();
+    assert_eq!(
+        ops,
+        vec![MigrationOp::GrowArray {
+            at: path(&["a"]),
+            element: vec![MigrationOp::CopyField {
+                from: root(),
+                to: root()
+            }]
+        }]
+    );
+}
+
+#[test]
+fn shrunk_array_refused() {
+    let old = strct(0, &[("a", 0, arr(4, p(PK::U8)))]);
+    let new = strct(0, &[("a", 0, arr(3, p(PK::U8)))]);
+    refuses_at(&old, &new, "a", "shrank");
 }
 
 #[test]

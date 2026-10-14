@@ -190,11 +190,11 @@ impl DefaultProvider for NoDefaults {
 /// only some of `from`'s struct fields, at any depth (absent = the
 /// consumer's default). Ops reading an absent path are skipped, default
 /// writes (`WriteFieldDefault`, `WriteParentDefault`, `WriteNone`) are not
-/// materialized, and the output holds exactly the fields the remaining
-/// ops wrote, so a renamed field follows its field and a dropped one
-/// disappears. Whole values inside the patch (`Patch::Replace`) migrate
-/// as values, with no default table. The output is not checked for
-/// conformance.
+/// materialized, a grown array's added slots inherit (`GrowArray`), and
+/// the output holds exactly the fields the remaining ops wrote, so a
+/// renamed field follows its field and a dropped one disappears. Whole
+/// values inside the patch (`Patch::Replace`) migrate as values, with no
+/// default table. The output is not checked for conformance.
 pub fn execute_sparse(
     ops: &[MigrationOp],
     input: &Patch,
@@ -474,6 +474,13 @@ fn exec_frame(
                 let out = elements_value(element, v, fnode, tnode, at, defaults, prefix, defaulted)?;
                 insert_write(&mut writes, at, out, prefix)?;
             }
+            MigrationOp::GrowArray { at, element } => {
+                let fnode = resolve_or_shape(from, at, prefix, "from")?;
+                let tnode = resolve_or_shape(to, at, prefix, "to")?;
+                let v = read_input(input, from, at, prefix)?;
+                let out = grow_value(element, v, fnode, tnode, to, at, defaults, prefix, defaulted)?;
+                insert_write(&mut writes, at, out, prefix)?;
+            }
             MigrationOp::MigrateMapKeys { at, key } => {
                 let fnode = resolve_or_shape(from, at, prefix, "from")?;
                 let tnode = resolve_or_shape(to, at, prefix, "to")?;
@@ -657,6 +664,53 @@ fn elements_value(
             detail: "MigrateElements requires matching container kinds on both sides".to_string(),
         }),
     }
+}
+
+/// A grown array (`GrowArray`): the input's elements migrated, then the
+/// slots past them from the array field's default (`frame` is the
+/// to-schema of the frame `at` is in).
+#[allow(clippy::too_many_arguments)]
+fn grow_value(
+    element: &[MigrationOp],
+    v: &Value,
+    fnode: &SchemaNode,
+    tnode: &SchemaNode,
+    frame: &SchemaNode,
+    at: &FieldPath,
+    defaults: &dyn DefaultProvider,
+    prefix: &[String],
+    defaulted: &mut Vec<FieldPath>,
+) -> Result<Value, MigrationError> {
+    let at_disp = dpath(prefix, at);
+    let SchemaNode::Array { len, .. } = tnode else {
+        return Err(MigrationError::PlanShape {
+            path: at_disp,
+            detail: "GrowArray requires an array on both sides".to_string(),
+        });
+    };
+    let Value::Seq(mut items) = elements_value(element, v, fnode, tnode, at, defaults, prefix, defaulted)? else {
+        unreachable!("elements_value of arrays is a sequence");
+    };
+    let default = defaults.field_default(frame, at).ok_or_else(|| MigrationError::MissingDefault {
+        path: at_disp.clone(),
+        op: "GrowArray",
+    })?;
+    let Value::Seq(tail) = default else {
+        return Err(MigrationError::InputShape {
+            path: at_disp,
+            expected: format!("an array default of {len} elements"),
+        });
+    };
+    if tail.len() as u64 != *len || items.len() > tail.len() {
+        return Err(MigrationError::InputShape {
+            path: at_disp,
+            expected: format!("{} input elements and a default of {len}", items.len()),
+        });
+    }
+    let have = items.len();
+    items.extend(tail.into_iter().skip(have));
+    defaulted.push(full_path(prefix, at));
+    Ok(Value::Seq(items))
 }
 
 /// Migrate a map's keys (values pass through) and rebuild it in the
@@ -915,6 +969,15 @@ fn sparse_frame(
                 let out = sparse_elements(element, p, fnode, tnode, at, prefix)?;
                 insert_write(&mut writes, at, out, prefix)?;
             }
+            MigrationOp::GrowArray { at, element } => {
+                let Some(p) = read_sparse(input, from, at, prefix)? else {
+                    continue;
+                };
+                let fnode = resolve_or_shape(from, at, prefix, "from")?;
+                let tnode = resolve_or_shape(to, at, prefix, "to")?;
+                let out = sparse_grow(element, p, fnode, tnode, at, prefix)?;
+                insert_write(&mut writes, at, out, prefix)?;
+            }
             MigrationOp::MigrateMapKeys { at, key } => {
                 let Some(p) = read_sparse(input, from, at, prefix)? else {
                     continue;
@@ -1027,6 +1090,50 @@ fn sparse_elements(
             path: at_disp,
             detail: "MigrateElements requires matching container kinds on both sides".to_string(),
         }),
+    }
+}
+
+/// A grown array in a sparse input: its element patches migrated, then
+/// patches that inherit every added slot. A whole value has no default
+/// table to take the added slots from.
+fn sparse_grow(
+    element: &[MigrationOp],
+    p: &Patch,
+    fnode: &SchemaNode,
+    tnode: &SchemaNode,
+    at: &FieldPath,
+    prefix: &[String],
+) -> Result<Patch, MigrationError> {
+    let at_disp = dpath(prefix, at);
+    let missing = || MigrationError::MissingDefault {
+        path: at_disp.clone(),
+        op: "GrowArray",
+    };
+    let SchemaNode::Array { len, elem } = tnode else {
+        return Err(MigrationError::PlanShape {
+            path: at_disp.clone(),
+            detail: "GrowArray requires an array on both sides".to_string(),
+        });
+    };
+    if matches!(p, Patch::Replace(_)) {
+        return Err(missing());
+    }
+    let Patch::Seq(mut items) = sparse_elements(element, p, fnode, tnode, at, prefix)? else {
+        unreachable!("sparse_elements of a sequence patch is a sequence");
+    };
+    let pad = inherit(elem).ok_or_else(missing)?;
+    items.resize(*len as usize, pad);
+    Ok(Patch::Seq(items))
+}
+
+/// A patch that leaves a value of `node` as it is, where the patch
+/// vocabulary has one: a struct with every field inherited, an array of
+/// those.
+fn inherit(node: &SchemaNode) -> Option<Patch> {
+    match node {
+        SchemaNode::Struct { fields, .. } => Some(Patch::Struct(vec![None; fields.len()].into())),
+        SchemaNode::Array { len, elem } => Some(Patch::Seq(vec![inherit(elem)?; *len as usize])),
+        _ => None,
     }
 }
 

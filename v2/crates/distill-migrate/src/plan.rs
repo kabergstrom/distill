@@ -227,8 +227,10 @@ impl Ctx<'_> {
                 }]
             }
             (SchemaNode::Array { len: l1, elem: a }, SchemaNode::Array { len: l2, elem: b }) => {
-                if l1 != l2 {
-                    self.refuse(disp, format!("array length changed ({l1} -> {l2})"));
+                // A grown array keeps its elements and defaults the added
+                // slots; a shrunk one would drop elements.
+                if l1 > l2 {
+                    self.refuse(disp, format!("array shrank ({l1} -> {l2}); its last elements would be dropped"));
                     return Vec::new();
                 }
                 let elem = self.diff(
@@ -239,10 +241,12 @@ impl Ctx<'_> {
                     old_frames,
                     new_frames,
                 );
-                vec![MigrationOp::MigrateElements {
-                    at: FieldPath(at),
-                    element: elem,
-                }]
+                let at = FieldPath(at);
+                if l1 < l2 {
+                    vec![MigrationOp::GrowArray { at, element: elem }]
+                } else {
+                    vec![MigrationOp::MigrateElements { at, element: elem }]
+                }
             }
             (SchemaNode::Map { key: k1, value: v1 }, SchemaNode::Map { key: k2, value: v2 }) => {
                 let key_same = meaning_identical(k1, k2, old_frames, new_frames);

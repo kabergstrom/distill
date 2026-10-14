@@ -521,3 +521,48 @@ fn unknown_fn_key_is_error() {
         "{err:?}"
     );
 }
+
+#[test]
+fn grow_array_takes_the_added_slots_from_the_field_default() {
+    let from = strct(0, &[("a", 0, arr(2, p(PK::U8)))]);
+    let to = strct(0, &[("a", 0, arr(4, p(PK::U16)))]);
+    let ops = distill_migrate::plan_automatic(&from, &to).unwrap();
+    let mut defaults = TableDefaults::default();
+    defaults.field.insert(path(&["a"]), val(&arr(4, p(PK::U16)), "[7,8,9,10]"));
+    let out = execute_ops(&ops, &val(&from, r#"{"a":[1,2]}"#), &from, &to, &defaults).unwrap();
+    assert_eq!(txt(&to, &out.value), r#"{"a":[1,2,9,10]}"#);
+    assert_eq!(out.defaulted, vec![path(&["a"])]);
+}
+
+#[test]
+fn grow_array_without_a_default_fails_hard() {
+    let from = strct(0, &[("a", 0, arr(2, p(PK::U8)))]);
+    let to = strct(0, &[("a", 0, arr(3, p(PK::U8)))]);
+    let ops = distill_migrate::plan_automatic(&from, &to).unwrap();
+    let err = execute_ops(&ops, &val(&from, r#"{"a":[1,2]}"#), &from, &to, &NoDefaults).unwrap_err();
+    assert!(matches!(&err, MigrationError::MissingDefault { op: "GrowArray", .. }), "{err:?}");
+}
+
+#[test]
+fn grow_array_is_automatic_segment_only() {
+    let from = strct(0, &[("a", 0, arr(2, p(PK::U8)))]);
+    let to = strct(0, &[("a", 0, arr(3, p(PK::U8)))]);
+    let ops = distill_migrate::plan_automatic(&from, &to).unwrap();
+    let errors = distill_migrate::validate_plan(&ops, &from, &to, distill_migrate::EdgeKind::Custom).unwrap_err();
+    assert!(
+        errors.iter().any(|e| matches!(e, distill_migrate::PlanError::DefaultOpInCustomEdge { op: "GrowArray", .. })),
+        "{errors:?}"
+    );
+    distill_migrate::validate_plan(&ops, &from, &to, distill_migrate::EdgeKind::Automatic).unwrap();
+}
+
+#[test]
+fn sparse_grow_array_inherits_the_added_slots() {
+    let elem = strct(0, &[("x", 0, p(PK::U8)), ("y", 0, p(PK::U8))]);
+    let from = strct(0, &[("a", 0, arr(2, elem.clone()))]);
+    let to = strct(0, &[("a", 0, arr(4, elem))]);
+    let ops = distill_migrate::plan_automatic(&from, &to).unwrap();
+    let input = patch(&from, r#"{"a":[{"x":1},{}]}"#);
+    let out = distill_migrate::execute_sparse(&ops, &input, &from, &to).unwrap();
+    assert_eq!(ptxt(&to, &out), r#"{"a":[{"x":1},{},{},{}]}"#);
+}

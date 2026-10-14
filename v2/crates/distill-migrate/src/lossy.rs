@@ -44,7 +44,7 @@ fn walk(
                     walk(ops, node, field, &join(display, at), drops);
                 }
             }
-            MigrationOp::MigrateElements { at, element } => {
+            MigrationOp::MigrateElements { at, element } | MigrationOp::GrowArray { at, element } => {
                 let (Some(node), Some(field)) = (resolve_path(schema, at), lookup(schema, value, at))
                 else {
                     continue;
