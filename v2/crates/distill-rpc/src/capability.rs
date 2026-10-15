@@ -837,7 +837,7 @@ impl TypeFiles<'_> {
                 .uuid
                 .parse()
                 .map_err(|error| invalid_type_file(prefab_types::INDEX, format!("uuid {:?}: {error:?}", row.uuid)))?;
-            types.push(DescribableType { type_uuid, path: row.path });
+            types.push(DescribableType { type_uuid, path: row.path, component: row.component });
         }
         Ok(Some((hash, TypeIndex { root, types })))
     }

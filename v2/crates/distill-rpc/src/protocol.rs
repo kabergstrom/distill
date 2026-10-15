@@ -47,8 +47,9 @@ pub use distill_store::state::{
 /// a reference to the bundle's path without a name resolves to). 25: a
 /// `TypeDescription` names its renamed fields (`renames`). 26: `AuthoringSnapshot`
 /// gains `authorable` (§17 "Creating": the authored types the pipeline
-/// declares, with their defaults, and its importers).
-pub const PROTOCOL_VERSION: u32 = 26;
+/// declares, with their defaults, and its importers). 27: a
+/// `DescribableType` says whether the type derives `Component` (`component`).
+pub const PROTOCOL_VERSION: u32 = 27;
 
 /// A watched import whose latest attempt failed. The bundle keeps serving its
 /// last good contents; the failure clears when a later import succeeds.
@@ -1343,6 +1344,9 @@ pub enum DescribeTypeResult {
 pub struct DescribableType {
     pub type_uuid: TypeUuid,
     pub path: String,
+    /// The type derives `Component` (the index's `component`, protocol 27):
+    /// a prefab node can hold it.
+    pub component: bool,
 }
 
 /// What an authoring tool can create (§17 "Creating"): the authored types

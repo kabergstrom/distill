@@ -7706,7 +7706,8 @@ descriptions, defaults or index, so editing them re-imports nothing.
   hash it names: the module and the schema files come from different walks)
   or `invalid`. `missing`: the index lists no such type, or its schema file
   is a rename redirect.
-- `describableTypes()` answers the index's types (UUID, path), path-sorted,
+- `describableTypes()` answers the index's types (UUID, path, whether the
+  type derives `Component`: protocol 27), path-sorted,
   with the index file's content hash: a changed hash at a later snapshot is
   a changed list.
 - Every file is read at the snapshot: its bytes must hash to the content

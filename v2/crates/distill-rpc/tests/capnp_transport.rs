@@ -2440,6 +2440,7 @@ async fn type_descriptions_round_trip_over_tcp() {
             let mut schema = b.finish();
             schema.source_hashes.insert("game".into(), "0".into());
             schema.types[spinner.0].has_default = true;
+            schema.types[spinner.0].attrs.component = true;
             schema.types[spinner.0].fields[0].attrs.doc = Some("Degrees per second.".into());
             for (path, contents) in prefab_types::files(&schema) {
                 project.write_in("types", &path, contents);
@@ -2467,7 +2468,7 @@ async fn type_descriptions_round_trip_over_tcp() {
                 DescribableTypesResult::Types { stamp: at, index_hash, types } => {
                     assert_eq!(at, stamp);
                     assert!(index_hash.is_some());
-                    assert_eq!(types, [DescribableType { type_uuid, path: "game::Spinner".into() }]);
+                    assert_eq!(types, [DescribableType { type_uuid, path: "game::Spinner".into(), component: true }]);
                 }
                 other => panic!("expected the index, got {other:?}"),
             }

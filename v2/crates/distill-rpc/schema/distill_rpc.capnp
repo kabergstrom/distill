@@ -753,6 +753,8 @@ struct DescribeTypeCall {
 struct DescribableType {
   typeUuid @0 :Data;
   path @1 :Text;
+  # The type derives `Component` (protocol 27).
+  component @2 :Bool;
 }
 
 struct DescribableTypes {

@@ -3318,6 +3318,7 @@ fn write_describable_types_result(
                 let mut wire = list.reborrow().get(index as u32);
                 wire.set_type_uuid(&described.type_uuid.0);
                 wire.set_path(described.path.as_str());
+                wire.set_component(described.component);
             }
         }
         RpcResult::Success(DescribableTypesResult::Drifted { input, current }) => {
@@ -3711,6 +3712,7 @@ pub fn decode_describable_types(
         types.push(DescribableType {
             type_uuid: TypeUuid(decode_uuid(row.get_type_uuid()?, "describableType.typeUuid").map_err(failed)?),
             path: decode_text(row.get_path()?, "describableType.path").map_err(failed)?,
+            component: row.get_component(),
         });
     }
     Ok(DescribableTypesResult::Types { stamp, index_hash, types })
