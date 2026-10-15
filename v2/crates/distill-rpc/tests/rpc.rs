@@ -302,6 +302,24 @@ fn import_failures_are_named_at_the_snapshot_and_read_as_they_stand() {
 }
 
 #[test]
+fn import_failures_name_bundle_files_that_do_not_read() {
+    // A bundle file the namespace refuses is served as nothing: a loader
+    // polling failures learns why, named by the file, with no bundle.
+    let mut project = project();
+    let server = project.server();
+    let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
+    write_entry(&mut project, &entry);
+    project.write("broken.bundle", b"not a bundle");
+    project.publish();
+    let RpcResult::Success(failures) = snapshot(&connect(&server, &[])).import_failures() else {
+        panic!("expected import failures");
+    };
+    let [failure] = failures.as_slice() else { panic!("{failures:?}") };
+    assert_eq!((failure.bundle, &*failure.root, &*failure.path), (None, ROOT, "broken.bundle"));
+    assert!(!failure.message.is_empty());
+}
+
+#[test]
 fn snapshot_clones_share_one_read_transaction() {
     let mut project = project();
     let server = project.server();

@@ -2089,7 +2089,9 @@ impl Snapshot {
     /// failure recorded after it began). A failure whose bundle this
     /// snapshot does not have is left for the snapshot that does.
     /// A directory import that failed before any bundle existed at its
-    /// output is named by that output, with no bundle.
+    /// output is named by that output, with no bundle. So is each of the
+    /// snapshot's namespace errors (a bundle file that does not read, …),
+    /// by the file it names.
     pub fn import_failures(&self) -> RpcResult<Vec<ImportFailure>> {
         let txn = match self.preflight() {
             Ok(txn) => txn,
@@ -2136,6 +2138,19 @@ impl Snapshot {
                 root: failure.destination_root,
                 path: failure.destination_path,
                 message: failure.message,
+            });
+        }
+        // Namespace errors (a bundle file that does not read, duplicate
+        // claims, path collisions): the snapshot serves nothing from the
+        // files they name, so a client polling failures learns why,
+        // instead of finding no asset there.
+        for error in rpc_try!(self.server.inner.handle.namespace_errors(reader)) {
+            let (root, path) = namespace_error_location(&error.detail);
+            failures.push(ImportFailure {
+                bundle: None,
+                root,
+                path,
+                message: error.message,
             });
         }
         failures.sort_by(|a, b| (&a.root, &a.path).cmp(&(&b.root, &b.path)));
@@ -3295,5 +3310,38 @@ mod query_tests {
             scanned_pages >= 100 * indexed_pages,
             "{scanned_pages} pages"
         );
+    }
+}
+
+/// The root and path a namespace error names, for listing it beside import
+/// failures (`Snapshot::import_failures`): its first source's, or `""` for
+/// one that names none (a derived claimant, a whole root).
+fn namespace_error_location(detail: &NamespaceErrorV1) -> (String, String) {
+    let source = |s: &ReadableBundleSource| (s.root_name.clone(), s.normalized_path.clone());
+    let raw = |path: &PlatformPathBytes| match path {
+        PlatformPathBytes::Unix(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        PlatformPathBytes::Windows(units) => String::from_utf16_lossy(units),
+    };
+    match detail {
+        NamespaceErrorV1::DuplicateAssetUuid { claimants, .. } => claimants
+            .iter()
+            .find_map(|claimant| match claimant {
+                AssetClaimant::Authored { source: s, .. } => Some(source(s)),
+                AssetClaimant::Derived { .. } => None,
+            })
+            .unwrap_or_default(),
+        NamespaceErrorV1::DuplicateBundleUuid { sources, .. } => sources.first().map(source).unwrap_or_default(),
+        NamespaceErrorV1::SameRootNormalizedPathCollision { root_name, normalized_path, .. }
+        | NamespaceErrorV1::UnreadableGlobalBundlePath { root_name, normalized_path, .. } => {
+            (root_name.clone(), normalized_path.clone())
+        }
+        NamespaceErrorV1::IncompleteSkeleton { source: s, .. } => source(s),
+        NamespaceErrorV1::InvalidPhysicalPath { root_name, raw_relative_path, .. } => {
+            (root_name.clone(), raw(raw_relative_path))
+        }
+        NamespaceErrorV1::UnreadableScanSubtree { subject, .. } => match subject {
+            ScanSubject::Root { root_name } => (root_name.clone(), String::new()),
+            ScanSubject::Subtree { root_name, raw_relative_path } => (root_name.clone(), raw(raw_relative_path)),
+        },
     }
 }
