@@ -161,7 +161,7 @@ fn primitive_range_and_shape_errors() {
 }
 
 #[test]
-fn f32_canonicality_is_shortest_ties_even_roundtrip() {
+fn f32_reads_any_decimal_and_writes_the_shortest() {
     let sc = schema(st(&[("f", N::Primitive(PK::F32))]));
     let valid = [
         V::Float(0.1),
@@ -179,23 +179,23 @@ fn f32_canonicality_is_shortest_ties_even_roundtrip() {
         assert!(write_bundle(&b).is_ok());
     }
 
+    // Any other decimal reads, rounded once to binary32; the writer then
+    // re-emits the shortest spelling.
     let cases = [
-        (V::Float(0.10000000149011612), "0.1"),
+        (V::Float(0.10000000149011612), 0.1f32, "0.1"),
         // Just above the midpoint between 1.0 and its next binary32
         // neighbour: the text is parsed straight to binary32 (no binary64
         // step), so it rounds up.
-        (V::Float(1.0000000596046448), "1.0000001"),
-        (V::UInt(16_777_217), "16777216"),
+        (V::Float(1.0000000596046448), 1.0000001, "1.0000001"),
+        (V::UInt(16_777_217), 16_777_216.0, "16777216"),
         // Below half the smallest subnormal, so ties-even parsing yields 0.
-        (V::Float(7.0e-46), "0"),
+        (V::Float(7.0e-46), 0.0, "0"),
     ];
-    for (value, expected) in cases {
-        let err = walk_err(&sc, obj(&[("f", value)]));
-        assert!(
-            matches!(&err, E::NonCanonicalF32 { path, canonical, .. }
-                if path == "data.f" && canonical == expected),
-            "got {err:?}"
-        );
+    for (value, expected, text) in cases {
+        let parsed = parse_bundle(&raw_plain(&sc, "a", obj(&[("f", value)]))).unwrap();
+        assert_eq!(parsed, one(&sc, fields(vec![Value::F32(expected)])));
+        let written = String::from_utf8(write_bundle(&parsed).unwrap()).unwrap();
+        assert!(written.contains(&format!("\"f\":{text}}}")), "{written}");
     }
 }
 

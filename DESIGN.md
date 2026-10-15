@@ -1449,9 +1449,9 @@ identity, so no bundle files churn and no migrations are minted.
   (kind, element forms): `vec`, `array(n)`, `option`, `map(key, value)`.
   The `f32`/`f64` distinction also directs canonical JSON emission: an
   `f32` leaf is parsed by IEEE-754 round-to-nearest-ties-even to binary32;
-  canonicality is byte equality with re-emission of the shortest decimal
-  that reparses, under that same rule, to the same binary32 bits (§6).
-  Ordinary values such as `0.1` are therefore canonical.
+  the writer emits the shortest decimal that reparses, under that same
+  rule, to the same binary32 bits (§6); readers accept any decimal that
+  rounds to a finite binary32.
   `AssetRef<T>` hashes as (`assetref`, T's stable type UUID) and
   `WeakAssetRef<T>` as (`weakref`, T's UUID) — the data is a UUID either
   way, but retargeting a reference changes meaning and must be visible to
@@ -1687,9 +1687,9 @@ shortest-round-trip decimal emission (the
 schema, not the in-memory `f64`, decides the width — §5's float leaf
 kinds), so a writer that parsed into a double and one that quantized
 first cannot emit different canonical bytes for one value. Adoption
-and validation enforce canonicality by re-emitting the shortest decimal
-that reparses, under the same ties-even rule, to the same binary32 bits
-and requiring byte equality with the authored token; `0.1` is canonical.
+and validation accept any decimal for an `f32` leaf that rounds, under
+the same ties-even rule, to a finite binary32: the spelling is the
+writer's obligation, not a reason to refuse a value.
 Maps with non-string keys
 encode as an array of `[key, value]` pairs sorted by the key's encoded
 bytes; sets as an array sorted by the element's encoded bytes, duplicate

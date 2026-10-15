@@ -260,15 +260,6 @@ pub enum BundleError {
         local_id: String,
         path: String,
     },
-    /// The authored numeric value rounds to binary32, but its canonical
-    /// JSON text is not the shortest decimal that reparses to those same
-    /// bits under round-to-nearest-ties-even.
-    NonCanonicalF32 {
-        local_id: String,
-        path: String,
-        found: String,
-        canonical: String,
-    },
     /// The schema walk reached a Blob node in a plain-JSON bundle — blobs
     /// require the container encoding (§6).
     BlobInPlainBundle {
@@ -568,15 +559,6 @@ impl fmt::Display for BundleError {
             E::F32OutOfRange { local_id, path } => write!(
                 f,
                 "asset {local_id:?} at {path}: number is outside finite binary32 range"
-            ),
-            E::NonCanonicalF32 {
-                local_id,
-                path,
-                found,
-                canonical,
-            } => write!(
-                f,
-                "asset {local_id:?} at {path}: f32 value {found} must use shortest ties-even roundtrip decimal {canonical}"
             ),
             E::BlobInPlainBundle { local_id, path } => write!(
                 f,

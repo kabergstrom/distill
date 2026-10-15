@@ -214,12 +214,6 @@ pub(crate) fn map_error(local_id: &str, e: TextError, failed: Option<BundleError
         }
         TextErrorKind::NonFiniteFloat => BundleError::NonFiniteFloat { local_id, path },
         TextErrorKind::F32OutOfRange => BundleError::F32OutOfRange { local_id, path },
-        TextErrorKind::NonCanonicalF32 { found, canonical } => BundleError::NonCanonicalF32 {
-            local_id,
-            path,
-            found,
-            canonical,
-        },
         TextErrorKind::BlobInPlain => BundleError::BlobInPlainBundle { local_id, path },
         TextErrorKind::BlobBarred => BundleError::BlobBarred { local_id, path },
         TextErrorKind::Blob(detail) => failed.unwrap_or(BundleError::BadBlobObject {
