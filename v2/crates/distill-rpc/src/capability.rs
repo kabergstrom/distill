@@ -891,6 +891,7 @@ fn describe_type_in(
             None => TypeDefault::Absent,
             Some((_, bytes)) => match prefab_types::read_default(&bytes, &schema.root) {
                 Ok(prefab_types::DefaultFile::OtherSchema(written)) => TypeDefault::SchemaMismatch { written },
+                Ok(prefab_types::DefaultFile::Unavailable(reason)) => TypeDefault::Invalid(reason),
                 Ok(prefab_types::DefaultFile::Value(value)) => {
                     // A default file is read without a type table (`read_default`),
                     // so it holds no dynamic value and carries no types.
