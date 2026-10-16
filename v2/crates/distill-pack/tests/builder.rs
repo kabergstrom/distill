@@ -308,7 +308,7 @@ fn pack_definition_decoder_rejects_noncanonical_or_blob_backed_values() {
     ));
 
     let mut blob_backed = pack_definition_authoring(AssetUuid([42; 16]));
-    blob_backed.blobs.push(Arc::from(&b"unexpected"[..]));
+    blob_backed.blobs.push(distill_rpc::AuthoringBlob::Bytes(Arc::from(&b"unexpected"[..])));
     assert!(matches!(
         decode_pack_definition(&blob_backed),
         Err(PackBuildError::Definition(_))

@@ -242,10 +242,10 @@ impl RemoteHub {
             wire.set_root(request.root.as_str());
             let mut settings = wire.init_settings();
             settings.set_canonical_value(&request.settings.canonical_value);
-            let mut blobs = settings.init_blobs(request.settings.blobs.len() as u32);
-            for (index, blob) in request.settings.blobs.iter().enumerate() {
-                blobs.set(index as u32, blob);
-            }
+            crate::capnp_transport::write_authoring_blobs(
+                settings.init_blobs(request.settings.blobs.len() as u32),
+                &request.settings.blobs,
+            );
         }
         let response = call.send().promise.await?;
         let result = response.get()?.get_result()?;
@@ -551,37 +551,106 @@ impl RemoteAuthoringSnapshot {
         }
     }
 
-    /// The authored entry of `uuid` with its value, authenticated against
-    /// its logical schema, stamped with this snapshot's version.
-    pub async fn inspect(&self, uuid: AssetUuid) -> Result<RemoteCall<AuthoringInspectResult>, capnp::Error> {
+    /// The authored entries of `uuids`, in order, each with its value
+    /// authenticated against its logical schema and stamped with this
+    /// snapshot's version. One call: a bundle holding several of them is
+    /// read once. Values carry blob refs; [`Self::blob`] reads the bytes.
+    pub async fn inspect(
+        &self,
+        uuids: &[AssetUuid],
+    ) -> Result<RemoteCall<Vec<AuthoringInspectResult>>, capnp::Error> {
         let mut request = self.client.inspect_request();
-        request.get().set_uuid(&uuid.0);
+        {
+            let mut wire = request.get().init_uuids(uuids.len() as u32);
+            for (index, uuid) in uuids.iter().enumerate() {
+                wire.set(index as u32, &uuid.0);
+            }
+        }
         let response = request.send().promise.await?;
         let result = response.get()?.get_result()?;
         match result.which()? {
-            schema::authoring_inspect_call::Which::Success(value) => Ok(RemoteCall::Success(
-                AuthoringInspectResult::Inspection(decode_authoring_inspection(value?)?),
-            )),
-            schema::authoring_inspect_call::Which::Missing(()) => {
-                Ok(RemoteCall::Success(AuthoringInspectResult::Missing))
+            schema::authoring_inspect_many_call::Which::Success(answers) => {
+                let answers = answers?;
+                if answers.len() as usize != uuids.len() {
+                    return Err(capnp::Error::failed(format!(
+                        "inspect answered {} entries for {} uuids",
+                        answers.len(),
+                        uuids.len()
+                    )));
+                }
+                let mut out = Vec::with_capacity(uuids.len());
+                for answer in answers.iter() {
+                    out.push(match answer.which()? {
+                        schema::authoring_inspect_answer::Which::Success(value) => {
+                            AuthoringInspectResult::Inspection(decode_authoring_inspection(value?)?)
+                        }
+                        schema::authoring_inspect_answer::Which::Missing(()) => {
+                            AuthoringInspectResult::Missing
+                        }
+                        schema::authoring_inspect_answer::Which::RoleIneligible(value) => {
+                            AuthoringInspectResult::RoleIneligible {
+                                observed: decode_role(value?.get_observed()?),
+                            }
+                        }
+                        schema::authoring_inspect_answer::Which::Drifted(value) => {
+                            let (input, current) = decode_drifted(value?)?;
+                            AuthoringInspectResult::Drifted { input, current }
+                        }
+                    });
+                }
+                Ok(RemoteCall::Success(out))
             }
-            schema::authoring_inspect_call::Which::RoleIneligible(value) => {
-                Ok(RemoteCall::Success(AuthoringInspectResult::RoleIneligible {
-                    observed: decode_role(value?.get_observed()?),
-                }))
-            }
-            schema::authoring_inspect_call::Which::Drifted(value) => {
-                let (input, current) = decode_drifted(value?)?;
-                Ok(RemoteCall::Success(AuthoringInspectResult::Drifted { input, current }))
-            }
-            schema::authoring_inspect_call::Which::ReconnectRequired(value) => Ok(
+            schema::authoring_inspect_many_call::Which::ReconnectRequired(value) => Ok(
                 RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
             ),
-            schema::authoring_inspect_call::Which::ConfigurationFailed(value) => Ok(
+            schema::authoring_inspect_many_call::Which::ConfigurationFailed(value) => Ok(
                 RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
-            schema::authoring_inspect_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
-            schema::authoring_inspect_call::Which::Error(value) => Ok(RemoteCall::Error(decode_rpc_error(value?)?)),
+            schema::authoring_inspect_many_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
+            schema::authoring_inspect_many_call::Which::Error(value) => Ok(RemoteCall::Error(decode_rpc_error(value?)?)),
+        }
+    }
+
+    /// Blob `index` of `uuid`'s value table (the order of an inspection's
+    /// refs) as chunks, read at this snapshot (protocol 28).
+    pub async fn blob(&self, uuid: AssetUuid, index: u32) -> Result<RemoteCall<RemoteAuthoringBlob>, capnp::Error> {
+        let mut request = self.client.blob_request();
+        request.get().set_uuid(&uuid.0);
+        request.get().set_index(index);
+        let response = request.send().promise.await?;
+        let result = response.get()?.get_result()?;
+        match result.which()? {
+            schema::authoring_blob_call::Which::Success(value) => {
+                let value = value?;
+                let stamp = value.get_stamp()?;
+                Ok(RemoteCall::Success(RemoteAuthoringBlob::Blob {
+                    stamp: SnapshotStamp {
+                        instance: StoreInstanceId(fixed::<16>(stamp.get_instance()?, "blob.stamp.instance")?),
+                        version: InputVersion(stamp.get_input_version()),
+                    },
+                    chunks: RemoteChunkStream {
+                        client: value.get_chunks()?,
+                        total_bytes: value.get_total_bytes(),
+                        load_edges: Vec::new(),
+                        pending: std::collections::VecDeque::new(),
+                        received: 0,
+                        done: false,
+                    },
+                }))
+            }
+            schema::authoring_blob_call::Which::Missing(()) => Ok(RemoteCall::Success(RemoteAuthoringBlob::Missing)),
+            schema::authoring_blob_call::Which::Drifted(value) => {
+                let (input, current) = decode_drifted(value?)?;
+                Ok(RemoteCall::Success(RemoteAuthoringBlob::Drifted { input, current }))
+            }
+            schema::authoring_blob_call::Which::ReconnectRequired(value) => Ok(
+                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
+            ),
+            schema::authoring_blob_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
+            ),
+            schema::authoring_blob_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
+            schema::authoring_blob_call::Which::Error(value) => Ok(RemoteCall::Error(decode_rpc_error(value?)?)),
         }
     }
 
@@ -676,10 +745,10 @@ pub fn write_authoring_entry(mut output: schema::authoring_entry_value::Builder<
     }
     let mut value = output.init_value();
     value.set_canonical_value(&entry.value.canonical_value);
-    let mut blobs = value.reborrow().init_blobs(entry.value.blobs.len() as u32);
-    for (index, blob) in entry.value.blobs.iter().enumerate() {
-        blobs.set(index as u32, blob);
-    }
+    crate::capnp_transport::write_authoring_blobs(
+        value.reborrow().init_blobs(entry.value.blobs.len() as u32),
+        &entry.value.blobs,
+    );
     let mut types = value.init_types(entry.value.types.len() as u32);
     for (index, ty) in entry.value.types.iter().enumerate() {
         let mut row = types.reborrow().get(index as u32);
@@ -1543,5 +1612,42 @@ fn decode_bundle_uuid_call(
         ),
         schema::uuid_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
         schema::uuid_call::Which::Error(value) => Ok(RemoteCall::Error(decode_rpc_error(value?)?)),
+    }
+}
+
+/// What [`RemoteAuthoringSnapshot::blob`] answers.
+#[derive(Debug)]
+pub enum RemoteAuthoringBlob {
+    /// The bytes as one structural section, read at `stamp`.
+    Blob { stamp: SnapshotStamp, chunks: RemoteChunkStream },
+    Missing,
+    Drifted { input: DriftedInput, current: SnapshotStamp },
+}
+
+impl RemoteChunkStream {
+    /// The structural section, whole: a stream of one section, read to its
+    /// end, its chunks contiguous and `total_bytes` long.
+    pub async fn read_structural(mut self) -> Result<Vec<u8>, capnp::Error> {
+        let total = usize::try_from(self.total_bytes)
+            .map_err(|_| capnp::Error::failed("stream too large".into()))?;
+        let mut bytes = Vec::with_capacity(total);
+        while let Some(chunk) = self.next_chunk().await? {
+            if chunk.kind != ArtifactChunkKind::Structural || chunk.offset != bytes.len() as u64 {
+                return Err(capnp::Error::failed(format!(
+                    "unexpected chunk {:?} at {} (read {})",
+                    chunk.kind,
+                    chunk.offset,
+                    bytes.len()
+                )));
+            }
+            bytes.extend_from_slice(&chunk.bytes);
+        }
+        if bytes.len() != total {
+            return Err(capnp::Error::failed(format!(
+                "stream ended at {} of {total} bytes",
+                bytes.len()
+            )));
+        }
+        Ok(bytes)
     }
 }

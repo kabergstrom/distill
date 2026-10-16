@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use distill_schema::ngp_schema::Value;
-use distill_rpc::capnp_loader::{RemoteCall, RemoteHub};
+use distill_rpc::capnp_loader::{RemoteAuthoringBlob, RemoteCall, RemoteHub};
 use distill_rpc::capnp_transport::{
     schema, CapnpClient, RemoteConnectOutcome, RemoteMetadataOutcome, StagedListener,
 };
@@ -33,7 +33,7 @@ fn asset_of(entry: &AuthoringEntry) -> Asset {
         &entry.local_id,
         entry.uuid,
         entry.type_uuid,
-        &entry.value.blobs[0],
+        entry.value.blobs[0].bytes().expect("the entry carries its bytes"),
     );
     match entry.role {
         AuthoringEntryRole::Runtime => asset,
@@ -529,24 +529,33 @@ fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
     }
     assert!(!source.contains("Reattest"));
 
-    let inspect = source
-        .split_once("struct AuthoringInspectCall {")
-        .expect("dedicated AuthoringInspectCall")
-        .1
-        .split_once("\n  }\n}")
-        .expect("terminated AuthoringInspectCall")
-        .0;
+    let body = |name: &str| {
+        source
+            .split_once(&format!("struct {name} {{"))
+            .unwrap_or_else(|| panic!("dedicated {name}"))
+            .1
+            .split_once("\n  }\n}")
+            .unwrap_or_else(|| panic!("terminated {name}"))
+            .0
+    };
+    let inspect = body("AuthoringInspectManyCall");
     for arm in [
-        "success @0 :AuthoringInspection",
+        "success @0 :List(AuthoringInspectAnswer)",
         "reconnectRequired @1 :ReconnectRequired",
         "configurationFailed @2 :ConfigurationError",
         "snapshotExpired @3 :Void",
         "error @4 :RpcError",
-        "missing @5 :Void",
-        "roleIneligible @6 :AuthoringRoleFailure",
-        "drifted @7 :DriftedResolve",
     ] {
         assert!(inspect.contains(arm), "missing authoring inspect arm {arm}");
+    }
+    let answer = body("AuthoringInspectAnswer");
+    for arm in [
+        "success @0 :AuthoringInspection",
+        "missing @1 :Void",
+        "roleIneligible @2 :AuthoringRoleFailure",
+        "drifted @3 :DriftedResolve",
+    ] {
+        assert!(answer.contains(arm), "missing authoring inspect answer arm {arm}");
     }
     assert!(source.contains("authoringSnapshot @8 () -> (result :AuthoringSnapshotCall);"));
     assert!(!source.contains("fetch @6 (hash :Data) -> (result :ChunkStreamCall);"));
@@ -554,7 +563,8 @@ fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
     assert!(source.contains("interface AuthoringSnapshot {"));
     assert!(source.contains("version @0 () -> (result :UInt64Call);"));
     assert!(source.contains("query @1 (query :AssetQuery) -> (result :UuidListCall);"));
-    assert!(source.contains("inspect @2 (uuid :Data) -> (result :AuthoringInspectCall);"));
+    assert!(source.contains("inspect @2 (uuids :List(Data)) -> (result :AuthoringInspectManyCall);"));
+    assert!(source.contains("blob @11 (uuid :Data, index :UInt32) -> (result :AuthoringBlobCall);"));
     assert!(source.contains("refresh @3 () -> (result :AuthoringSnapshotCall);"));
     for field in [
         "uuid @0 :OptionalData",
@@ -639,7 +649,7 @@ fn authoring_entry(byte: u8, role: AuthoringEntryRole) -> AuthoringEntry {
         tags: std::collections::BTreeMap::new(),
         value: AuthoringValue {
             canonical_value: Arc::from(&b"{\"len\":1,\"offset\":0}"[..]),
-            blobs: vec![Arc::from([byte.wrapping_add(2)])],
+            blobs: vec![AuthoringBlob::Bytes(Arc::from([byte.wrapping_add(2)]))],
             types: Vec::new(),
         },
     }
@@ -681,7 +691,8 @@ fn write_authoring_entry_value(
     value.set_canonical_value(&entry.value.canonical_value);
     let mut blobs = value.init_blobs(entry.value.blobs.len() as u32);
     for (index, blob) in entry.value.blobs.iter().enumerate() {
-        blobs.set(index as u32, blob);
+        let bytes = blob.bytes().expect("a written entry carries its bytes");
+        blobs.reborrow().get(index as u32).init_bytes(bytes.len() as u32).copy_from_slice(bytes);
     }
 }
 
@@ -793,11 +804,14 @@ async fn authoring_snapshot_round_trips_over_real_tcp_with_exact_stamp_and_role_
             }
 
             let mut inspect = snapshot.inspect_request();
-            inspect.get().set_uuid(&entry.uuid.0);
+            inspect.get().init_uuids(1).set(0, &entry.uuid.0);
             let inspect_response = inspect.send().promise.await.unwrap();
             let inspect_result = inspect_response.get().unwrap().get_result().unwrap();
-            match inspect_result.which().unwrap() {
-                schema::authoring_inspect_call::Which::Success(inspection) => {
+            let schema::authoring_inspect_many_call::Which::Success(answers) = inspect_result.which().unwrap() else {
+                panic!("expected authoring inspection");
+            };
+            match answers.unwrap().get(0).which().unwrap() {
+                schema::authoring_inspect_answer::Which::Success(inspection) => {
                     let inspection = inspection.unwrap();
                     let stamp = inspection.get_stamp().unwrap();
                     assert_eq!(stamp.get_instance().unwrap(), &first_stamp.instance.0);
@@ -824,17 +838,14 @@ async fn authoring_snapshot_round_trips_over_real_tcp_with_exact_stamp_and_role_
             }
 
             let mut wrong_role = snapshot.inspect_request();
-            wrong_role.get().set_uuid(&runtime_uuid.0);
+            wrong_role.get().init_uuids(1).set(0, &runtime_uuid.0);
             let wrong_role_response = wrong_role.send().promise.await.unwrap();
-            match wrong_role_response
-                .get()
-                .unwrap()
-                .get_result()
-                .unwrap()
-                .which()
-                .unwrap()
-            {
-                schema::authoring_inspect_call::Which::RoleIneligible(failure) => {
+            let wrong_role_result = wrong_role_response.get().unwrap().get_result().unwrap();
+            let schema::authoring_inspect_many_call::Which::Success(answers) = wrong_role_result.which().unwrap() else {
+                panic!("expected typed authoring wrong-role result");
+            };
+            match answers.unwrap().get(0).which().unwrap() {
+                schema::authoring_inspect_answer::Which::RoleIneligible(failure) => {
                     assert_eq!(
                         failure.unwrap().get_observed().unwrap(),
                         schema::AuthoringEntryRole::Runtime
@@ -882,7 +893,7 @@ async fn authoring_snapshot_round_trips_over_real_tcp_with_exact_stamp_and_role_
             ));
 
             let mut replacement = entry;
-            replacement.value.blobs = vec![Arc::from([9u8])];
+            replacement.value.blobs = vec![AuthoringBlob::Bytes(Arc::from([9u8]))];
             let second_stamp = publish_entry(&mut project, &replacement);
             assert!(second_stamp.version > first_stamp.version);
             let refresh_response = snapshot.refresh_request().send().promise.await.unwrap();
@@ -1692,7 +1703,7 @@ async fn hub_authoring_operation_and_wire_tree_methods_are_live_and_generation_f
                 request.set_dest("generated/image.bundle");
                 let mut settings = request.reborrow().init_settings();
                 settings.set_canonical_value(b"{}");
-                settings.reborrow().init_blobs(1).set(0, b"settings-blob");
+                settings.reborrow().init_blobs(1).get(0).set_bytes(b"settings-blob");
                 request.set_watch(true);
                 request.set_root("assets");
             }
@@ -1806,7 +1817,7 @@ async fn hub_authoring_operation_and_wire_tree_methods_are_live_and_generation_f
 
             assert_eq!(backend.imports.lock().unwrap().len(), 1);
             assert_eq!(
-                backend.imports.lock().unwrap()[0].settings.blobs[0].as_ref(),
+                backend.imports.lock().unwrap()[0].settings.blobs[0].bytes().unwrap(),
                 b"settings-blob"
             );
             assert_eq!(
@@ -2723,7 +2734,7 @@ async fn browsing_calls_round_trip_over_tcp() {
             let runtime_only = AssetQuery { authoring_only: Some(false), ..all.clone() };
             assert_eq!(snapshot.list(&runtime_only).await.unwrap().success().unwrap(), [row(&runtime)]);
             // An inspection names its bundle's origin and its type's name.
-            match snapshot.inspect(control.uuid).await.unwrap().success().unwrap() {
+            match snapshot.inspect(&[control.uuid]).await.unwrap().success().unwrap().remove(0) {
                 AuthoringInspectResult::Inspection(inspection) => {
                     assert_eq!(inspection.origin, BundleOrigin::Authored);
                     assert_eq!(inspection.type_name, "game::Blob");
@@ -2747,6 +2758,81 @@ async fn browsing_calls_round_trip_over_tcp() {
                 RemoteCall::Error(error) => assert!(error.message.contains("no rule claims"), "{error:?}"),
                 other => panic!("expected a refusal, got {other:?}"),
             }
+            drop(client);
+            server_task.abort();
+        })
+        .await;
+}
+
+/// Inspections carry blob refs, never bytes, so an entry whose blob alone
+/// is past capnp's 64 MiB traversal limit inspects; `blob` streams the
+/// bytes; one `inspect` call reads and parses each bundle once (protocol
+/// 28).
+#[tokio::test(flavor = "current_thread")]
+async fn inspect_batches_by_bundle_and_blobs_travel_by_reference() {
+    LocalSet::new()
+        .run_until(async {
+            let mut project = TestProject::with_roots(vec![target()], &[ROOT]);
+            let big: Vec<u8> = (0..100u32 << 20).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+            let (a, b) = (AssetUuid([21; 16]), AssetUuid([22; 16]));
+            project.write_bundle(
+                "pair.bundle",
+                BundleUuid([23; 16]),
+                Some("a"),
+                &[
+                    Asset::blob("a", a, TypeUuid([1; 16]), &big),
+                    Asset::blob("b", b, TypeUuid([1; 16]), &[1, 2, 3]).authoring_only(),
+                ],
+            );
+            let other = authoring_entry(24, AuthoringEntryRole::Runtime);
+            write_entry(&mut project, &other);
+            project.publish();
+
+            let backend = Arc::new(BrowsingBackend { roots: project.path().to_owned() });
+            let handle = ServerHandle::open(backend, Arc::clone(project.coordinator().server_handle().opener()));
+            let server = Server::open(&handle);
+            let listener = Rc::new(StagedListener::bind(server.root(), "127.0.0.1:0").await.unwrap());
+            let address = listener.local_addr().unwrap();
+            let serving = Rc::clone(&listener);
+            let server_task = tokio::task::spawn_local(async move { serving.serve_one().await });
+            let client = CapnpClient::connect_local(address).await.unwrap();
+            let hub = RemoteHub::connected(client.connect(&request()).await.unwrap()).unwrap();
+            let snapshot = hub.authoring_snapshot().await.unwrap().success().unwrap();
+
+            let parses = handle.authoring_bundle_parses();
+            let answers = snapshot
+                .inspect(&[a, b, other.uuid, AssetUuid([99; 16])])
+                .await
+                .unwrap()
+                .success()
+                .unwrap();
+            assert_eq!(handle.authoring_bundle_parses() - parses, 2, "one parse per bundle");
+            let blobs = |answer: &AuthoringInspectResult| match answer {
+                AuthoringInspectResult::Inspection(inspection) => inspection.value.blobs.clone(),
+                other => panic!("expected an inspection, got {other:?}"),
+            };
+            assert_eq!(blobs(&answers[0]), [AuthoringBlob::Ref(BlobRef::of(&big))]);
+            assert_eq!(blobs(&answers[1]), [AuthoringBlob::Ref(BlobRef::of(&[1, 2, 3]))]);
+            assert_eq!(blobs(&answers[2]), other.value.by_ref().blobs);
+            assert_eq!(answers[3], AuthoringInspectResult::Missing);
+
+            match snapshot.blob(a, 0).await.unwrap().success().unwrap() {
+                RemoteAuthoringBlob::Blob { stamp, chunks } => {
+                    let AuthoringInspectResult::Inspection(inspection) = &answers[0] else { unreachable!() };
+                    assert_eq!(stamp, inspection.stamp);
+                    assert_eq!(chunks.total_bytes(), big.len() as u64);
+                    assert!(chunks.read_structural().await.unwrap() == big);
+                }
+                other => panic!("expected the blob, got {other:?}"),
+            }
+            assert!(matches!(
+                snapshot.blob(a, 1).await.unwrap().success().unwrap(),
+                RemoteAuthoringBlob::Missing
+            ));
+            assert!(matches!(
+                snapshot.blob(AssetUuid([99; 16]), 0).await.unwrap().success().unwrap(),
+                RemoteAuthoringBlob::Missing
+            ));
             drop(client);
             server_task.abort();
         })

@@ -16,7 +16,7 @@ use distill_core::id::{BundleUuid, ContentHash, LogicalHash};
 use distill_migrate::{lossy_drops, plan_automatic_renamed};
 use distill_pipeline_api::callbacks::MigrationKey;
 use distill_rpc::{
-    decode_authoring_payload, AuthoringBackend, AuthoringEntry, AuthoringEntryRole, AuthoringOp,
+    decode_authoring_payload, resolve_blob_refs, value_blobs, AuthoringBackend, AuthoringBlob, AuthoringEntry, AuthoringEntryRole, AuthoringOp,
     Commit, ImportJob, ImportRequest, InputVersion, LongRunningOp, PreparedImportCommit,
     PreparedOperationCommit, RpcFailure, WriteReceipt, WrittenFile,
 };
@@ -396,9 +396,26 @@ impl AuthoringService {
             .map_err(|_| invalid("logical schema is not UTF-8"))?;
         let schema = distill_schema::ngp_schema::verify_snapshot(schema_text, entry.schema_hash)
             .map_err(invalid)?;
-        let (data, types) =
-            decode_authoring_payload(entry.schema_hash, &entry.logical_schema, &entry.value)
+        // A blob named by reference keeps the bytes the bundle holds under it
+        // (§17 "Authoring snapshots"): an edit of a value with a blob
+        // field re-sends no bytes.
+        let resolved;
+        let value = if entry.value.blobs.iter().any(|blob| matches!(blob, AuthoringBlob::Ref(_))) {
+            let types = bundle.type_table().map_err(|error| invalid(error.to_string()))?;
+            let mut held = BTreeMap::new();
+            for existing in bundle.assets.values() {
+                if let Some(schema) = bundle.schemas.get(&existing.schema_hash) {
+                    value_blobs(&schema.root, &existing.data, &types, &mut held).map_err(invalid)?;
+                }
+            }
+            resolved = resolve_blob_refs(&entry.value, &held)
                 .map_err(|error| invalid(format!("invalid authored value: {error:?}")))?;
+            &resolved
+        } else {
+            &entry.value
+        };
+        let (data, types) = decode_authoring_payload(entry.schema_hash, &entry.logical_schema, value)
+            .map_err(|error| invalid(format!("invalid authored value: {error:?}")))?;
         if !force_lossy {
             if let Some(existing) = bundle.assets.get(&entry.local_id) {
                 self.check_lossless(compiled, bundle, existing, &schema, entry.schema_hash)?;

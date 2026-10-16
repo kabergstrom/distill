@@ -7627,7 +7627,7 @@ interface Snapshot {
 interface AuthoringSnapshot {
   version @0 () -> (result :UInt64Call);
   query @1 (query :AssetQuery) -> (result :UuidListCall);
-  inspect @2 (uuid :Data) -> (result :AuthoringInspectCall);
+  inspect @2 (uuids :List(Data)) -> (result :AuthoringInspectManyCall);
   refresh @3 () -> (result :AuthoringSnapshotCall);
   file @4 (root :Text, path :Text) -> (result :DataCall);
   describeType @5 (typeUuid :Data) -> (result :DescribeTypeCall);
@@ -7635,6 +7635,8 @@ interface AuthoringSnapshot {
   list @7 (query :AssetQuery) -> (result :AuthoringListCall);
   sourceFiles @8 (root :Text, glob :Text) -> (result :SourceFilesCall);
   references @9 (bundle :Data) -> (result :ReferencesCall);
+  authorable @10 () -> (result :AuthorableCall);
+  blob @11 (uuid :Data, index :UInt32) -> (result :AuthoringBlobCall);
 }
 ```
 
@@ -7643,8 +7645,18 @@ Values on the wire (`AuthoringValue`):
   entry's logical schema, always beside that schema or its hash
   (`AuthoringInspection.logicalSchema`); both ends parse it against the
   schema at once, never into an untyped tree.
-- Blobs travel in `blobs`; the text names each by a `{"len","offset"}`
-  placement.
+- `blobs` is the blob table the text's `{"len","offset"}` placements
+  index (`offset` is the index). Since protocol 28 each blob is a
+  `BlobRef { len, hash }` (blake3) or its bytes:
+  - an inspection carries refs only, so a value's size is its text's,
+    whatever its blobs weigh; `AuthoringSnapshot.blob(uuid, index)`
+    streams one blob's bytes as a `ChunkStream` of one structural section;
+  - a write (`AuthoringOp::Set`) names a blob by ref or by bytes; a ref
+    resolves against the blobs the target bundle's entries hold now, so an
+    edit of a value with a blob field re-sends no bytes. A ref the bundle
+    does not hold fails the write (`UnknownBlobRef`);
+  - type defaults and importer default settings carry bytes: a client
+    writes them into new entries.
 - `types` (protocol 20) lists each type the value's dynamic values name
   (path, type UUID, schema hash, logical schema; once each, path order);
   a written value's bundle adopts them into its envelope `types` (§6). A
@@ -7821,6 +7833,10 @@ an existing bundle's own (another root is a relocation, refused: use
 rename-with-fixups); a new bundle is created in the root its entries name,
 or, unnamed, in the one configured root (several configured: refused).
 An inspection names the root it read the bundle from (protocol 22).
+`inspect` takes a list of UUIDs (protocol 28; one before) and answers one
+result per UUID, in order, at the snapshot: inspection, missing,
+role-ineligible or drifted. A bundle holding several of them is read,
+verified and parsed once for the call.
 
 Long-running operations expose ordered, cancellable progress. A
 rename-with-fixups (`operation`) is planned when it is asked for and

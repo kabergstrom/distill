@@ -231,10 +231,11 @@ async fn imported(
 
 async fn inspect(snapshot: &RemoteAuthoringSnapshot, uuids: Vec<AssetUuid>) -> Result<AuthoringAnswer, String> {
     let version = remote(snapshot.version().await)?;
+    let answers = remote(snapshot.inspect(&uuids).await)?;
     let mut entries = Vec::with_capacity(uuids.len());
     let mut missing = Vec::new();
-    for uuid in uuids {
-        match remote(snapshot.inspect(uuid).await)? {
+    for (uuid, answer) in uuids.into_iter().zip(answers) {
+        match answer {
             AuthoringInspectResult::Inspection(inspection) => entries.push(inspection),
             AuthoringInspectResult::Missing | AuthoringInspectResult::RoleIneligible { .. } => missing.push(uuid),
             AuthoringInspectResult::Drifted { input, .. } => {

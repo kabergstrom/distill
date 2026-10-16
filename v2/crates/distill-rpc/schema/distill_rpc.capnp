@@ -597,9 +597,25 @@ struct MetadataDiagnostics {
   namespaceErrors @3 :List(NamespaceError);
 }
 
+# A blob a value names (protocol 28): its length and blake3 hash, or, in a
+# write, its bytes. Inspections always carry refs; the bytes come from
+# AuthoringSnapshot.blob. A write naming a ref keeps the bytes the entry
+# already holds under it.
+struct BlobRef {
+  len @0 :UInt64;
+  hash @1 :Data;
+}
+
+struct AuthoringBlob {
+  union {
+    ref @0 :BlobRef;
+    bytes @1 :Data;
+  }
+}
+
 struct AuthoringValue {
   canonicalValue @0 :Data;
-  blobs @1 :List(Data);
+  blobs @1 :List(AuthoringBlob);
   # The types its dynamic values name (newgameplus GAP 23 §3; protocol 20).
   types @2 :List(AuthoringType);
 }
@@ -679,16 +695,42 @@ struct AuthoringRoleFailure {
   observed @0 :AuthoringEntryRole;
 }
 
-struct AuthoringInspectCall {
+# One answer per uuid of AuthoringSnapshot.inspect, in order (protocol 28).
+struct AuthoringInspectAnswer {
   union {
     success @0 :AuthoringInspection;
+    missing @1 :Void;
+    roleIneligible @2 :AuthoringRoleFailure;
+    drifted @3 :DriftedResolve;
+  }
+}
+
+struct AuthoringInspectManyCall {
+  union {
+    success @0 :List(AuthoringInspectAnswer);
+    reconnectRequired @1 :ReconnectRequired;
+    configurationFailed @2 :ConfigurationError;
+    snapshotExpired @3 :Void;
+    error @4 :RpcError;
+  }
+}
+
+# A blob of an authored entry's value as a chunk stream (protocol 28).
+struct AuthoringBlobStream {
+  stamp @0 :SnapshotStampValue;
+  totalBytes @1 :UInt64;
+  chunks @2 :ChunkStream;
+}
+
+struct AuthoringBlobCall {
+  union {
+    success @0 :AuthoringBlobStream;
     reconnectRequired @1 :ReconnectRequired;
     configurationFailed @2 :ConfigurationError;
     snapshotExpired @3 :Void;
     error @4 :RpcError;
     missing @5 :Void;
-    roleIneligible @6 :AuthoringRoleFailure;
-    drifted @7 :DriftedResolve;
+    drifted @6 :DriftedResolve;
   }
 }
 
@@ -1121,7 +1163,10 @@ struct RuntimeTypePolicyCall {
 interface AuthoringSnapshot {
   version @0 () -> (result :UInt64Call);
   query @1 (query :AssetQuery) -> (result :UuidListCall);
-  inspect @2 (uuid :Data) -> (result :AuthoringInspectCall);
+  # Each uuid's inspection, in order; a bundle holding several of them is
+  # read and parsed once. Values carry blob refs. Protocol 28 (one uuid
+  # before).
+  inspect @2 (uuids :List(Data)) -> (result :AuthoringInspectManyCall);
   refresh @3 () -> (result :AuthoringSnapshotCall);
   # The content hash of the file observed at path in root: 32 bytes, or
   # empty for no file there. A WriteReceipt is reflected at the first
@@ -1144,6 +1189,9 @@ interface AuthoringSnapshot {
   # The authored types the pipeline declares, with their defaults, and its
   # importers. Protocol 26.
   authorable @10 () -> (result :AuthorableCall);
+  # Blob `index` of the entry's value table (the order of its refs), as
+  # chunks. Protocol 28.
+  blob @11 (uuid :Data, index :UInt32) -> (result :AuthoringBlobCall);
 }
 
 interface ChunkStream {

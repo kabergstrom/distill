@@ -182,6 +182,8 @@ pub struct ServerHandle {
     /// Admitted hubs and metadata hubs ([`SnapshotPolicy::max_connections`]).
     open_connections: AtomicUsize,
     next_connection_id: AtomicU64,
+    /// Bundle files authoring inspections and blob reads have parsed.
+    pub(crate) authoring_bundle_parses: AtomicU64,
     /// Opens each owner's own reader and writer.
     opener: Arc<StoreOpener>,
     /// The restart-only values the configuration file asks for that this
@@ -249,6 +251,7 @@ impl ServerHandle {
             open_snapshots: AtomicUsize::new(0),
             open_connections: AtomicUsize::new(0),
             next_connection_id: AtomicU64::new(1),
+            authoring_bundle_parses: AtomicU64::new(0),
             opener,
             restart: Mutex::default(),
             rejections: Mutex::default(),
@@ -289,6 +292,12 @@ impl ServerHandle {
         if self.on_publish.set(hook).is_err() {
             panic!("the publication hook is already installed");
         }
+    }
+
+    /// Bundle files authoring inspections and blob reads have read and
+    /// parsed: one per bundle per call (§17 "Authoring snapshots").
+    pub fn authoring_bundle_parses(&self) -> u64 {
+        self.authoring_bundle_parses.load(Ordering::Relaxed)
     }
 
     /// How many publications readers have been told about.
@@ -991,6 +1000,26 @@ pub fn bundle_authoring_entry(
     normalized_path: String,
     terminal_type: TypeUuid,
 ) -> Result<AuthoringEntry, String> {
+    bundle_entry(bundle, local_id, normalized_path, terminal_type, false)
+}
+
+/// [`bundle_authoring_entry`] with its blobs by reference: an inspection.
+pub(crate) fn bundle_authoring_entry_by_ref(
+    bundle: &distill_bundle::Bundle,
+    local_id: &str,
+    normalized_path: String,
+    terminal_type: TypeUuid,
+) -> Result<AuthoringEntry, String> {
+    bundle_entry(bundle, local_id, normalized_path, terminal_type, true)
+}
+
+fn bundle_entry(
+    bundle: &distill_bundle::Bundle,
+    local_id: &str,
+    normalized_path: String,
+    terminal_type: TypeUuid,
+    by_ref: bool,
+) -> Result<AuthoringEntry, String> {
     let entry = bundle
         .assets
         .get(local_id)
@@ -1012,7 +1041,14 @@ pub fn bundle_authoring_entry(
         logical_schema: Arc::from(logical_schema.into_bytes()),
         role: entry_role(entry.authoring_only),
         tags: BTreeMap::new(),
-        value: crate::validate::authoring_value(&schema.root, &entry.data, &bundle.type_table().map_err(|error| error.to_string())?)?,
+        value: {
+            let types = bundle.type_table().map_err(|error| error.to_string())?;
+            if by_ref {
+                crate::validate::authoring_value_by_ref(&schema.root, &entry.data, &types)?
+            } else {
+                crate::validate::authoring_value(&schema.root, &entry.data, &types)?
+            }
+        },
         // The caller knows the root when it needs it (an inspection).
         root: String::new(),
     })

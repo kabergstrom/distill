@@ -49,7 +49,13 @@ pub use distill_store::state::{
 /// gains `authorable` (§17 "Creating": the authored types the pipeline
 /// declares, with their defaults, and its importers). 27: a
 /// `DescribableType` says whether the type derives `Component` (`component`).
-pub const PROTOCOL_VERSION: u32 = 27;
+/// 28 (newgameplus GAP 23 §15.3): an `AuthoringValue`'s blobs are
+/// [`AuthoringBlob`]s, a [`BlobRef`] (length and blake3) or bytes; an
+/// inspection names its blobs by reference only, and a write may name a
+/// blob its bundle holds by reference. `AuthoringSnapshot.inspect` takes a
+/// list of entries (one snapshot, each bundle read once); `blob` streams an
+/// entry's blob bytes.
+pub const PROTOCOL_VERSION: u32 = 28;
 
 /// A watched import whose latest attempt failed. The bundle keeps serving its
 /// last good contents; the failure clears when a later import succeeds.
@@ -467,10 +473,78 @@ pub struct AuthoringValue {
     /// Canonical authored-value bytes. This branded carrier is deliberately
     /// not a `ContentHash` and cannot be fetched as an artifact.
     pub canonical_value: Arc<[u8]>,
-    pub blobs: Vec<Arc<[u8]>>,
+    /// The blob table the text's `{"len","offset"}` placements index.
+    pub blobs: Vec<AuthoringBlob>,
     /// The types its dynamic values name (newgameplus GAP 23 §3), each
     /// once, in path order.
     pub types: Vec<AuthoringType>,
+}
+
+impl AuthoringValue {
+    /// The value with every blob by reference: what an inspection of it
+    /// answers.
+    pub fn by_ref(&self) -> Self {
+        Self {
+            canonical_value: self.canonical_value.clone(),
+            blobs: self.blobs.iter().map(|blob| AuthoringBlob::Ref(blob.blob_ref())).collect(),
+            types: self.types.clone(),
+        }
+    }
+}
+
+/// A blob by length and blake3 of its bytes: what an inspection carries
+/// instead of the bytes (newgameplus GAP 23 §15.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BlobRef {
+    pub len: u64,
+    pub hash: [u8; 32],
+}
+
+impl BlobRef {
+    pub fn of(bytes: &[u8]) -> Self {
+        Self {
+            len: bytes.len() as u64,
+            hash: *blake3::hash(bytes).as_bytes(),
+        }
+    }
+}
+
+/// One blob of an [`AuthoringValue`]: by reference (inspections; a write
+/// naming a blob its bundle already holds) or by its bytes (a write of new
+/// content, import settings).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthoringBlob {
+    Ref(BlobRef),
+    Bytes(Arc<[u8]>),
+}
+
+impl AuthoringBlob {
+    pub fn len(&self) -> u64 {
+        match self {
+            Self::Ref(blob) => blob.len,
+            Self::Bytes(bytes) => bytes.len() as u64,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The reference: a `Ref` as is, bytes hashed.
+    pub fn blob_ref(&self) -> BlobRef {
+        match self {
+            Self::Ref(blob) => *blob,
+            Self::Bytes(bytes) => BlobRef::of(bytes),
+        }
+    }
+
+    /// The bytes of a `Bytes` blob.
+    pub fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Ref(_) => None,
+            Self::Bytes(bytes) => Some(bytes),
+        }
+    }
 }
 
 /// A type a carried value's dynamic values name: the path its text
@@ -1198,6 +1272,18 @@ pub enum AuthoringInspectResult {
     },
 }
 
+/// What [`AuthoringSnapshot::blob`](crate::AuthoringSnapshot::blob)
+/// answers: an entry's blob, by its index in the entry's blob table.
+#[derive(Debug)]
+pub enum AuthoringBlobResult {
+    /// The bytes as one chunk stream section (`Structural`), read at
+    /// `stamp`.
+    Blob { stamp: SnapshotStamp, chunks: ChunkStream },
+    Missing,
+    /// The entry's bundle file no longer holds the published bytes.
+    Drifted { input: DriftedInput, current: SnapshotStamp },
+}
+
 /// Who owns a bundle's entries (§8): a human (authored), an explicit
 /// import, an authored directory rule or the default layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1802,6 +1888,8 @@ pub enum AuthoringValueError {
     BlobIndexOutOfRange { index: u32, blob_count: u32 },
     DuplicateBlobIndex { index: u32 },
     UnusedBlobIndex { index: u32 },
+    /// Blob `index` names by reference a blob its bundle does not hold.
+    UnknownBlobRef { index: u32 },
     /// A carried type is malformed, listed twice, or its schema does not
     /// verify.
     TypeInvalid(String),

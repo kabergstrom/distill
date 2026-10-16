@@ -540,6 +540,106 @@ fn resolve_named_in(
     })
 }
 
+/// A served entry's bundle file, read once, verified against the hash the
+/// snapshot published and parsed.
+struct ReadBundle {
+    parsed: distill_bundle::Bundle,
+    root: String,
+    origin: BundleOrigin,
+}
+
+/// What reading an entry's bundle found: the bundle, or the answer that
+/// stands in for the entry (missing, runtime-only, drifted).
+enum EntryBundle {
+    Read(ServedEntryMeta, Rc<ReadBundle>),
+    Answer(AuthoringInspectResult),
+}
+
+/// The entries' bundles a call has read, by bundle: each is read and
+/// parsed once however many of its entries the call names.
+struct BundleReads<'s> {
+    server: &'s Server,
+    snapshot: &'s StoreReader,
+    read: BTreeMap<BundleUuid, Result<Rc<ReadBundle>, DriftedInput>>,
+}
+
+impl<'s> BundleReads<'s> {
+    fn new(server: &'s Server, snapshot: &'s StoreReader) -> Self {
+        Self { server, snapshot, read: BTreeMap::new() }
+    }
+
+    /// `uuid`'s served metadata and its bundle.
+    fn entry(&mut self, uuid: AssetUuid) -> Result<EntryBundle, RpcFailure> {
+        let Some(meta) = self.snapshot.served_entry_meta(uuid).map_err(store_failure)? else {
+            // A served derived output is a runtime asset with no authored
+            // entry; any other UUID without a served entry is missing here.
+            let answer = if self.snapshot.derived_output(uuid).map_err(store_failure)?.is_some() {
+                AuthoringInspectResult::RoleIneligible { observed: AuthoringEntryRole::Runtime }
+            } else {
+                AuthoringInspectResult::Missing
+            };
+            return Ok(EntryBundle::Answer(answer));
+        };
+        let read = match self.read.get(&meta.bundle) {
+            Some(read) => read.clone(),
+            None => {
+                let read = self.read_bundle(uuid, meta.bundle)?;
+                self.read.insert(meta.bundle, read.clone());
+                read
+            }
+        };
+        Ok(match read {
+            Ok(read) => EntryBundle::Read(meta, read),
+            Err(input) => EntryBundle::Answer(AuthoringInspectResult::Drifted {
+                input,
+                current: self.server.inner.current_stamp().map_err(store_failure)?,
+            }),
+        })
+    }
+
+    fn read_bundle(
+        &self,
+        uuid: AssetUuid,
+        bundle_uuid: BundleUuid,
+    ) -> Result<Result<Rc<ReadBundle>, DriftedInput>, RpcFailure> {
+        let unpublished = || RpcFailure::InvalidQuery {
+            detail: format!("served entry {uuid} has no published bundle"),
+        };
+        let bundle = self
+            .snapshot
+            .bundle(bundle_uuid)
+            .map_err(store_failure)?
+            .ok_or_else(unpublished)?;
+        let root = self
+            .snapshot
+            .root_name(bundle.root)
+            .map_err(store_failure)?
+            .ok_or_else(unpublished)?;
+        let read = self
+            .server
+            .inner
+            .handle
+            .authoring_backend()
+            .read_file(self.snapshot, &root, &bundle.path);
+        let bytes = match read {
+            Ok(bytes) if ContentHash(*blake3::hash(&bytes).as_bytes()) == bundle.content_hash => bytes,
+            _ => return Ok(Err(DriftedInput::File(bundle.path))),
+        };
+        let origin = bundle_origin(self.snapshot, bundle_uuid)
+            .map_err(store_failure)?
+            .ok_or_else(unpublished)?
+            .1;
+        self.server
+            .inner
+            .handle
+            .authoring_bundle_parses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let parsed = distill_bundle::parse_bundle(&bytes)
+            .map_err(|error| RpcFailure::InvalidQuery { detail: error.to_string() })?;
+        Ok(Ok(Rc::new(ReadBundle { parsed, root, origin })))
+    }
+}
+
 /// Inspect `uuid` at `snapshot`: its metadata from the snapshot, its
 /// schema and value from its bundle file, verified against the hash the
 /// snapshot published. A file that no longer holds those bytes is
@@ -550,60 +650,42 @@ fn inspect_authoring(
     stamp: SnapshotStamp,
     uuid: AssetUuid,
 ) -> Result<AuthoringInspectResult, RpcFailure> {
-    let Some(meta) = snapshot.served_entry_meta(uuid).map_err(store_failure)? else {
-        // A served derived output is a runtime asset with no authored
-        // entry; any other UUID without a served entry is missing here.
-        if snapshot
-            .derived_output(uuid)
-            .map_err(store_failure)?
-            .is_some()
-        {
-            return Ok(AuthoringInspectResult::RoleIneligible {
-                observed: AuthoringEntryRole::Runtime,
-            });
-        }
-        return Ok(AuthoringInspectResult::Missing);
+    inspect_entry(&mut BundleReads::new(server, snapshot), stamp, uuid)
+}
+
+/// [`inspect_authoring`] of each of `uuids`, in order, reading each bundle
+/// once.
+fn inspect_authoring_many(
+    server: &Server,
+    snapshot: &StoreReader,
+    stamp: SnapshotStamp,
+    uuids: &[AssetUuid],
+) -> Result<Vec<AuthoringInspectResult>, RpcFailure> {
+    let mut reads = BundleReads::new(server, snapshot);
+    uuids.iter().map(|&uuid| inspect_entry(&mut reads, stamp, uuid)).collect()
+}
+
+fn inspect_entry(
+    reads: &mut BundleReads<'_>,
+    stamp: SnapshotStamp,
+    uuid: AssetUuid,
+) -> Result<AuthoringInspectResult, RpcFailure> {
+    let (meta, read) = match reads.entry(uuid)? {
+        EntryBundle::Read(meta, read) => (meta, read),
+        EntryBundle::Answer(answer) => return Ok(answer),
     };
-    let unpublished = || RpcFailure::InvalidQuery {
-        detail: format!("served entry {uuid} has no published bundle"),
-    };
-    let bundle = snapshot
-        .bundle(meta.bundle)
-        .map_err(store_failure)?
-        .ok_or_else(unpublished)?;
-    let root = snapshot
-        .root_name(bundle.root)
-        .map_err(store_failure)?
-        .ok_or_else(unpublished)?;
-    let read = server
-        .inner
-        .handle
-        .authoring_backend()
-        .read_file(snapshot, &root, &bundle.path);
-    let bytes = match read {
-        Ok(bytes) if ContentHash(*blake3::hash(&bytes).as_bytes()) == bundle.content_hash => bytes,
-        _ => {
-            return Ok(AuthoringInspectResult::Drifted {
-                input: DriftedInput::File(bundle.path),
-                current: server.inner.current_stamp().map_err(store_failure)?,
-            })
-        }
-    };
-    let origin = bundle_origin(snapshot, meta.bundle)
-        .map_err(store_failure)?
-        .ok_or_else(unpublished)?
-        .1;
-    let invalid = |detail: String| RpcFailure::InvalidQuery { detail };
-    let parsed =
-        distill_bundle::parse_bundle(&bytes).map_err(|error| invalid(error.to_string()))?;
-    let entry = crate::server::bundle_authoring_entry(
-        &parsed,
+    let entry = crate::server::bundle_authoring_entry_by_ref(
+        &read.parsed,
         &meta.local_id,
         meta.normalized_path,
         meta.terminal_type,
     )
-    .map_err(invalid)?;
-    let type_name = type_name(&*server.inner.handle.authoring_backend(), snapshot, entry.type_uuid);
+    .map_err(|detail| RpcFailure::InvalidQuery { detail })?;
+    let type_name = type_name(
+        &*reads.server.inner.handle.authoring_backend(),
+        reads.snapshot,
+        entry.type_uuid,
+    );
     Ok(AuthoringInspectResult::Inspection(AuthoringInspection {
         stamp,
         uuid: entry.uuid,
@@ -615,10 +697,47 @@ fn inspect_authoring(
         logical_schema: entry.logical_schema,
         role: entry.role,
         value: entry.value,
-        root,
-        origin,
+        root: read.root.clone(),
+        origin: read.origin,
         type_name,
     }))
+}
+
+/// Blob `index` of `uuid`'s value at `snapshot` as one structural chunk
+/// section; the blob table's order is the order an inspection lists its
+/// refs in.
+fn authoring_blob(
+    server: &Server,
+    snapshot: &StoreReader,
+    stamp: SnapshotStamp,
+    uuid: AssetUuid,
+    index: u32,
+) -> Result<AuthoringBlobResult, RpcFailure> {
+    let (meta, read) = match BundleReads::new(server, snapshot).entry(uuid)? {
+        EntryBundle::Read(meta, read) => (meta, read),
+        EntryBundle::Answer(AuthoringInspectResult::Drifted { input, current }) => {
+            return Ok(AuthoringBlobResult::Drifted { input, current })
+        }
+        EntryBundle::Answer(_) => return Ok(AuthoringBlobResult::Missing),
+    };
+    let invalid = |detail: String| RpcFailure::InvalidQuery { detail };
+    let entry = read
+        .parsed
+        .assets
+        .get(&meta.local_id)
+        .ok_or_else(|| invalid(format!("bundle has no entry {:?}", meta.local_id)))?;
+    let schema = read
+        .parsed
+        .schemas
+        .get(&entry.schema_hash)
+        .ok_or_else(|| invalid(format!("bundle has no schema snapshot for entry {:?}", meta.local_id)))?;
+    let types = read.parsed.type_table().map_err(|error| invalid(error.to_string()))?;
+    let Some(blob) = crate::validate::value_blob(&schema.root, &entry.data, &types, index).map_err(invalid)?
+    else {
+        return Ok(AuthoringBlobResult::Missing);
+    };
+    let payload = ArtifactPayload { structural: blob, blobs: Vec::new(), load_edges: Vec::new() };
+    Ok(AuthoringBlobResult::Blob { stamp, chunks: chunk_payload(&payload, DEFAULT_CHUNK_SIZE) })
 }
 
 // ---------------------------------------------------------------------------
@@ -2571,12 +2690,28 @@ impl AuthoringSnapshot {
         }
     }
 
-    pub fn inspect(&self, uuid: AssetUuid) -> RpcResult<AuthoringInspectResult> {
+    /// Each of `uuids` inspected, in order (§17 "Authoring snapshots"): a
+    /// bundle holding several of them is read and parsed once. Values carry
+    /// blob refs; [`Self::blob`] reads the bytes.
+    pub fn inspect(&self, uuids: &[AssetUuid]) -> RpcResult<Vec<AuthoringInspectResult>> {
         let txn = match self.preflight() {
             Ok(txn) => txn,
             Err(result) => return result,
         };
-        match inspect_authoring(&self.server, txn.snapshot(), self.basis.snapshot, uuid) {
+        match inspect_authoring_many(&self.server, txn.snapshot(), self.basis.snapshot, uuids) {
+            Ok(result) => RpcResult::Success(result),
+            Err(error) => RpcResult::Failure(error),
+        }
+    }
+
+    /// Blob `index` of `uuid`'s value table (the order of an inspection's
+    /// refs), as a chunk stream of one structural section.
+    pub fn blob(&self, uuid: AssetUuid, index: u32) -> RpcResult<AuthoringBlobResult> {
+        let txn = match self.preflight() {
+            Ok(txn) => txn,
+            Err(result) => return result,
+        };
+        match authoring_blob(&self.server, txn.snapshot(), self.basis.snapshot, uuid, index) {
             Ok(result) => RpcResult::Success(result),
             Err(error) => RpcResult::Failure(error),
         }

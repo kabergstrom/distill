@@ -89,7 +89,7 @@ fn asset_of(entry: &AuthoringEntry) -> Asset {
         &entry.local_id,
         entry.uuid,
         entry.type_uuid,
-        &entry.value.blobs[0],
+        entry.value.blobs[0].bytes().expect("the entry carries its bytes"),
     );
     match entry.role {
         AuthoringEntryRole::Runtime => asset,
@@ -722,7 +722,7 @@ fn coordinator_can_project_daemon_controls_but_hub_cannot_write_them_directly() 
     let stamp = publish_entry(&mut project, &control);
     let hub = connect(&server, &[(1, false)]);
     assert!(matches!(
-        authoring_snapshot(&hub).inspect(control.uuid),
+        authoring_snapshot(&hub).inspect_one(control.uuid),
         RpcResult::Success(AuthoringInspectResult::Inspection(_))
     ));
     assert!(matches!(
@@ -878,7 +878,7 @@ fn authoring_entry(byte: u8, role: AuthoringEntryRole) -> AuthoringEntry {
         tags: BTreeMap::new(),
         value: AuthoringValue {
             canonical_value: Arc::from(&b"{\"len\":1,\"offset\":0}"[..]),
-            blobs: vec![Arc::from([byte.wrapping_add(2)])],
+            blobs: vec![AuthoringBlob::Bytes(Arc::from([byte.wrapping_add(2)]))],
             types: Vec::new(),
         },
     }
@@ -888,6 +888,17 @@ fn authoring_snapshot(hub: &Hub) -> AuthoringSnapshot {
     match hub.authoring_snapshot() {
         RpcResult::Success(snapshot) => snapshot,
         other => panic!("expected authoring snapshot, got {other:?}"),
+    }
+}
+
+/// One entry inspected alone.
+trait InspectOne {
+    fn inspect_one(&self, uuid: AssetUuid) -> RpcResult<AuthoringInspectResult>;
+}
+
+impl InspectOne for AuthoringSnapshot {
+    fn inspect_one(&self, uuid: AssetUuid) -> RpcResult<AuthoringInspectResult> {
+        self.inspect(&[uuid]).map_success(|mut answers| answers.pop().expect("one answer"))
     }
 }
 
@@ -934,7 +945,7 @@ fn authoring_payload_decoder_reenters_an_enum_from_its_variant_payload() {
         canonical_value: Arc::from(
             &br#"{"Link":{"blob":{"len":1,"offset":0},"next":{"Link":{"blob":{"len":1,"offset":1},"next":{"End":{}}}}}}"#[..],
         ),
-        blobs: vec![Arc::from([1u8]), Arc::from([2u8])],
+        blobs: vec![AuthoringBlob::Bytes(Arc::from([1u8])), AuthoringBlob::Bytes(Arc::from([2u8]))],
         types: Vec::new(),
     };
     // Variants by name: End = 0, Link = 1; Link fields: blob, next.
@@ -1092,11 +1103,11 @@ fn authoring_commit_authenticates_schema_and_exact_blob_index_coverage() {
     publish_entry(&mut project, &valid);
     // The daemon serves the valid entry as authored.
     assert!(matches!(
-        authoring_snapshot(&connect(&server, &[])).inspect(valid.uuid),
+        authoring_snapshot(&connect(&server, &[])).inspect_one(valid.uuid),
         RpcResult::Success(AuthoringInspectResult::Inspection(inspection))
             if inspection.schema_hash == valid.schema_hash
                 && inspection.logical_schema == valid.logical_schema
-                && inspection.value == valid.value
+                && inspection.value == valid.value.by_ref()
     ));
 
     let mut malformed = valid.clone();
@@ -1502,7 +1513,7 @@ fn authoring_snapshot_pins_role_inclusive_metadata_without_runtime_escape() {
         }),
         RpcResult::Success(vec![asset_id(1)])
     );
-    match pinned.inspect(asset_id(2)) {
+    match pinned.inspect_one(asset_id(2)) {
         RpcResult::Success(AuthoringInspectResult::Inspection(inspection)) => {
             assert_eq!(inspection.stamp, stamp);
             assert_eq!(inspection.uuid, asset_id(2));
@@ -1515,17 +1526,17 @@ fn authoring_snapshot_pins_role_inclusive_metadata_without_runtime_escape() {
         other => panic!("expected pinned inspection, got {other:?}"),
     }
     assert_eq!(
-        pinned.inspect(derived),
+        pinned.inspect_one(derived),
         RpcResult::Success(AuthoringInspectResult::RoleIneligible {
             observed: AuthoringEntryRole::Runtime,
         })
     );
     assert_eq!(
-        pinned.inspect(asset_id(99)),
+        pinned.inspect_one(asset_id(99)),
         RpcResult::Success(AuthoringInspectResult::Missing)
     );
     assert_eq!(
-        pinned.inspect(asset_id(98)),
+        pinned.inspect_one(asset_id(98)),
         RpcResult::Success(AuthoringInspectResult::Missing)
     );
 
@@ -1551,26 +1562,26 @@ fn authoring_snapshot_refreshes_to_a_successor_stamp_without_tearing() {
     let first = authoring_snapshot(&hub);
 
     assert!(
-        matches!(first.inspect(first_entry.uuid).success().unwrap(), AuthoringInspectResult::Inspection(value) if value.stamp == first_stamp && value.value == first_entry.value)
+        matches!(first.inspect_one(first_entry.uuid).success().unwrap(), AuthoringInspectResult::Inspection(value) if value.stamp == first_stamp && value.value == first_entry.value.by_ref())
     );
 
     // The value is the bundle file's, verified against the hash the
     // snapshot published: a file rewritten since is drift, at the current
     // version until the daemon publishes the edit.
     let mut replacement = first_entry.clone();
-    replacement.value.blobs = vec![Arc::from([0xAA])];
+    replacement.value.blobs = vec![AuthoringBlob::Bytes(Arc::from([0xAA]))];
     assert_ne!(replacement.value, first_entry.value);
     write_entry(&mut project, &replacement);
     let drifted = AuthoringInspectResult::Drifted {
         input: DriftedInput::File(first_entry.normalized_path.clone()),
         current: first_stamp,
     };
-    assert_eq!(first.inspect(first_entry.uuid).success().unwrap(), drifted);
+    assert_eq!(first.inspect_one(first_entry.uuid).success().unwrap(), drifted);
     let second_stamp = project.publish();
 
-    let old = first.inspect(first_entry.uuid).success().unwrap();
+    let old = first.inspect_one(first_entry.uuid).success().unwrap();
     let refreshed = first.refresh().success().unwrap();
-    let new = refreshed.inspect(first_entry.uuid).success().unwrap();
+    let new = refreshed.inspect_one(first_entry.uuid).success().unwrap();
     assert_eq!(first.stamp(), first_stamp);
     assert_eq!(refreshed.stamp(), second_stamp);
     assert_eq!(first.basis().snapshot, first_stamp);
@@ -1583,7 +1594,7 @@ fn authoring_snapshot_refreshes_to_a_successor_stamp_without_tearing() {
         }
     );
     assert!(
-        matches!(new, AuthoringInspectResult::Inspection(value) if value.stamp == second_stamp && value.value == replacement.value)
+        matches!(new, AuthoringInspectResult::Inspection(value) if value.stamp == second_stamp && value.value == replacement.value.by_ref())
     );
 }
 
@@ -1604,7 +1615,7 @@ fn every_authoring_snapshot_method_is_expiry_and_generation_fenced() {
         RpcResult::Failure(RpcFailure::SnapshotExpired)
     );
     assert_eq!(
-        expired.inspect(asset_id(1)),
+        expired.inspect_one(asset_id(1)),
         RpcResult::Failure(RpcFailure::SnapshotExpired)
     );
     assert!(matches!(
@@ -1621,7 +1632,7 @@ fn every_authoring_snapshot_method_is_expiry_and_generation_fenced() {
     assert_reconnect(hub.authoring_snapshot(), reason);
     assert_reconnect(stale.version(), reason);
     assert_reconnect(stale.query(AssetQuery::default()), reason);
-    assert_reconnect(stale.inspect(asset_id(1)), reason);
+    assert_reconnect(stale.inspect_one(asset_id(1)), reason);
     assert_reconnect(stale.refresh(), reason);
 }
 
@@ -1681,7 +1692,7 @@ fn authoring_inspection_is_a_pinned_pure_metadata_read_under_configuration_error
         RpcResult::Success(vec![entry.uuid])
     );
     assert!(matches!(
-        pinned.inspect(entry.uuid),
+        pinned.inspect_one(entry.uuid),
         RpcResult::Success(AuthoringInspectResult::Inspection(value))
             if value.stamp == failed_stamp
     ));
@@ -1933,7 +1944,7 @@ fn snapshots_pin_old_metadata_and_refresh_repins_latest() {
     // The bundle moves and its value changes.
     let mut moved = entry.clone();
     moved.normalized_path = "moved/bundle-1.bundle".to_owned();
-    moved.value.blobs = vec![Arc::from([0xAA])];
+    moved.value.blobs = vec![AuthoringBlob::Bytes(Arc::from([0xAA]))];
     project.remove(&entry.normalized_path);
     let second_stamp = publish_entry(&mut project, &moved);
     builds.answer(second_stamp, second);
@@ -2687,7 +2698,7 @@ fn hub_authoring_and_wire_tree_surface_is_versioned_typed_and_generation_first()
         dest: "generated/image.bundle".to_owned(),
         settings: AuthoringValue {
             canonical_value: Arc::from(&b"{}"[..]),
-            blobs: vec![Arc::from(&b"settings-blob"[..])],
+            blobs: vec![AuthoringBlob::Bytes(Arc::from(&b"settings-blob"[..]))],
             types: Vec::new(),
         },
         watch: true,
@@ -3054,7 +3065,7 @@ fn wire_tree_coverage_keeps_pinned_compatible_artifact_references() {
         }
     );
     let mut changed = entry.clone();
-    changed.value.blobs = vec![Arc::from([0xAA])];
+    changed.value.blobs = vec![AuthoringBlob::Bytes(Arc::from([0xAA]))];
     let current_stamp = publish_entry(&mut project, &changed);
     builds.answer(current_stamp, current_hash);
     assert_eq!(

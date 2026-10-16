@@ -131,16 +131,38 @@ pub(crate) fn validate_authoring_entry(entry: &AuthoringEntry) -> Result<(), Aut
 /// the schema (`ngp_schema::parse_value`), blobs as `{"len","offset"}`
 /// placements whose `offset` indexes the carrier's blob table, dynamic
 /// values (GAP 23 §3) through the carrier's types, each named by the value.
-/// Returns the value and those types.
+/// Returns the value and those types. Every blob must carry its bytes: a
+/// writer resolves references first ([`resolve_blob_refs`]); a reference
+/// fails ([`AuthoringValueError::UnknownBlobRef`]).
 pub fn decode_authoring_payload(
     schema_hash: LogicalHash,
     logical_schema: &[u8],
     authored_value: &AuthoringValue,
 ) -> Result<(Value, TypeTable), AuthoringValueError> {
+    decode_payload(schema_hash, logical_schema, authored_value, false)
+}
+
+/// [`decode_authoring_payload`]'s checks on a carrier that may name its
+/// blobs by reference (an inspection): each reference's length against its
+/// placement, the rest as for bytes.
+pub fn check_authoring_payload(
+    schema_hash: LogicalHash,
+    logical_schema: &[u8],
+    authored_value: &AuthoringValue,
+) -> Result<(), AuthoringValueError> {
+    decode_payload(schema_hash, logical_schema, authored_value, true).map(drop)
+}
+
+fn decode_payload(
+    schema_hash: LogicalHash,
+    logical_schema: &[u8],
+    authored_value: &AuthoringValue,
+    refs: bool,
+) -> Result<(Value, TypeTable), AuthoringValueError> {
     let schema = verified_schema(schema_hash, logical_schema)?;
     let types = carried_types(&authored_value.types)?;
     let text = value_text(authored_value)?;
-    let mut table = BlobTable::new(&authored_value.blobs);
+    let mut table = BlobTable::new(&authored_value.blobs, refs);
     let value = parse_value(
         text,
         &schema.root,
@@ -200,7 +222,7 @@ pub fn decode_settings_payload(
 ) -> Result<Value, AuthoringValueError> {
     let schema = verified_schema(schema_hash, logical_schema)?;
     let text = value_text(authored_value)?;
-    let mut table = BlobTable::new(&authored_value.blobs);
+    let mut table = BlobTable::new(&authored_value.blobs, false);
     let patch = parse_patch(text, &schema.root, Options::authored().blobs(&mut table))
         .map_err(|error| table.error(error))?;
     table.all_used()?;
@@ -224,11 +246,97 @@ fn value_text(authored_value: &AuthoringValue) -> Result<&str, AuthoringValueErr
         .map_err(|_| AuthoringValueError::ValueInvalid("value is not UTF-8".to_owned()))
 }
 
+/// `value` with every blob it names by reference replaced by the bytes
+/// `held` has for it (a bundle's blobs by [`BlobRef`]): what a write stores.
+/// A reference `held` lacks fails ([`AuthoringValueError::UnknownBlobRef`]).
+pub fn resolve_blob_refs(
+    value: &AuthoringValue,
+    held: &BTreeMap<BlobRef, Arc<[u8]>>,
+) -> Result<AuthoringValue, AuthoringValueError> {
+    let mut blobs = Vec::with_capacity(value.blobs.len());
+    for (index, blob) in value.blobs.iter().enumerate() {
+        blobs.push(match blob {
+            AuthoringBlob::Bytes(_) => blob.clone(),
+            AuthoringBlob::Ref(blob) => AuthoringBlob::Bytes(held.get(blob).cloned().ok_or(
+                AuthoringValueError::UnknownBlobRef { index: index as u32 },
+            )?),
+        });
+    }
+    Ok(AuthoringValue {
+        canonical_value: value.canonical_value.clone(),
+        blobs,
+        types: value.types.clone(),
+    })
+}
+
+/// Every blob `value` (of `schema`) holds, by reference.
+pub fn value_blobs(
+    schema: &SchemaNode,
+    value: &Value,
+    types: &TypeTable,
+    out: &mut BTreeMap<BlobRef, Arc<[u8]>>,
+) -> Result<(), String> {
+    struct Collect<'o>(&'o mut BTreeMap<BlobRef, Arc<[u8]>>);
+    impl BlobSink for Collect<'_> {
+        fn place(&mut self, _: &[PathComponent], blob: &[u8]) -> Result<(u64, u64), String> {
+            self.0.entry(BlobRef::of(blob)).or_insert_with(|| Arc::from(blob));
+            Ok((blob.len() as u64, 0))
+        }
+    }
+    write_value(
+        schema,
+        value,
+        WriteOptions {
+            blobs: Some(&mut Collect(out)),
+            types: Some(&mut &*types),
+        },
+    )
+    .map(drop)
+    .map_err(|error| error.render("data"))
+}
+
+/// Blob `index` of `value`'s (of `schema`) blob table in placement order,
+/// the order [`authoring_value`] lists its refs in; `None` past the end.
+pub fn value_blob(
+    schema: &SchemaNode,
+    value: &Value,
+    types: &TypeTable,
+    index: u32,
+) -> Result<Option<Arc<[u8]>>, String> {
+    struct Nth {
+        index: u64,
+        placed: u64,
+        found: Option<Arc<[u8]>>,
+    }
+    impl BlobSink for Nth {
+        fn place(&mut self, _: &[PathComponent], blob: &[u8]) -> Result<(u64, u64), String> {
+            if self.placed == self.index {
+                self.found = Some(Arc::from(blob));
+            }
+            self.placed += 1;
+            Ok((blob.len() as u64, self.placed - 1))
+        }
+    }
+    let mut nth = Nth { index: u64::from(index), placed: 0, found: None };
+    write_value(
+        schema,
+        value,
+        WriteOptions {
+            blobs: Some(&mut nth),
+            types: Some(&mut &*types),
+        },
+    )
+    .map_err(|error| error.render("data"))?;
+    Ok(nth.found)
+}
+
 /// The carrier's blob table, read by placement (`offset` = index, `len`
 /// its byte length) and written back the same way. Each blob is placed
 /// exactly once.
 struct BlobTable<'b> {
-    blobs: &'b [Arc<[u8]>],
+    blobs: &'b [AuthoringBlob],
+    /// References read as no bytes (a check); otherwise one fails.
+    refs: bool,
     used: Vec<bool>,
     /// Index of each placed blob by its path, for the canonical rewrite.
     placed: BTreeMap<Vec<PathComponent>, u64>,
@@ -236,9 +344,10 @@ struct BlobTable<'b> {
 }
 
 impl<'b> BlobTable<'b> {
-    fn new(blobs: &'b [Arc<[u8]>]) -> Self {
+    fn new(blobs: &'b [AuthoringBlob], refs: bool) -> Self {
         Self {
             blobs,
+            refs,
             used: vec![false; blobs.len()],
             placed: BTreeMap::new(),
             error: None,
@@ -280,45 +389,81 @@ impl BlobSource for BlobTable<'_> {
             self.error = Some(AuthoringValueError::DuplicateBlobIndex { index });
             return Err("blob index placed twice".to_owned());
         }
-        let bytes = &self.blobs[index as usize];
-        if bytes.len() as u64 != len {
+        let blob = &self.blobs[index as usize];
+        if blob.len() != len {
             return Err(format!(
                 "blob {index} holds {} bytes, the placement says {len}",
-                bytes.len()
+                blob.len()
             ));
         }
         self.placed.insert(path.to_vec(), offset);
-        Ok(bytes.to_vec())
+        match blob {
+            AuthoringBlob::Bytes(bytes) => Ok(bytes.to_vec()),
+            // Checked, not stored: no bytes.
+            AuthoringBlob::Ref(_) if self.refs => Ok(Vec::new()),
+            AuthoringBlob::Ref(_) => {
+                self.error = Some(AuthoringValueError::UnknownBlobRef { index });
+                Err("blob named by reference".to_owned())
+            }
+        }
     }
 }
 
 impl BlobSink for BlobTable<'_> {
-    fn place(&mut self, path: &[PathComponent], blob: &[u8]) -> Result<(u64, u64), String> {
+    fn place(&mut self, path: &[PathComponent], _blob: &[u8]) -> Result<(u64, u64), String> {
         let offset = *self
             .placed
             .get(path)
             .ok_or_else(|| "blob was not read from the table".to_owned())?;
-        Ok((blob.len() as u64, offset))
+        Ok((self.blobs[offset as usize].len(), offset))
     }
 }
 
 /// An RPC authored value carrying `value` (a value of `schema`):
 /// canonical text, each blob a `{"len","offset"}` placement indexing the
-/// blob table in placement order, and the types of `types` its dynamic
-/// values name.
+/// blob table in placement order, each blob's bytes, and the types of
+/// `types` its dynamic values name. A value a client may write into a new
+/// entry (a default, importer settings) carries its bytes.
 pub fn authoring_value(
     schema: &SchemaNode,
     value: &Value,
     types: &TypeTable,
 ) -> Result<AuthoringValue, String> {
-    struct Table(Vec<Arc<[u8]>>);
+    carried_value(schema, value, types, false)
+}
+
+/// [`authoring_value`] with each blob by [`BlobRef`]: what an inspection
+/// carries (§17 "Authoring snapshots"; the bytes through
+/// `AuthoringSnapshot.blob`).
+pub fn authoring_value_by_ref(
+    schema: &SchemaNode,
+    value: &Value,
+    types: &TypeTable,
+) -> Result<AuthoringValue, String> {
+    carried_value(schema, value, types, true)
+}
+
+fn carried_value(
+    schema: &SchemaNode,
+    value: &Value,
+    types: &TypeTable,
+    by_ref: bool,
+) -> Result<AuthoringValue, String> {
+    struct Table {
+        by_ref: bool,
+        blobs: Vec<AuthoringBlob>,
+    }
     impl BlobSink for Table {
         fn place(&mut self, _: &[PathComponent], blob: &[u8]) -> Result<(u64, u64), String> {
-            self.0.push(Arc::from(blob));
-            Ok((blob.len() as u64, self.0.len() as u64 - 1))
+            self.blobs.push(if self.by_ref {
+                AuthoringBlob::Ref(BlobRef::of(blob))
+            } else {
+                AuthoringBlob::Bytes(Arc::from(blob))
+            });
+            Ok((blob.len() as u64, self.blobs.len() as u64 - 1))
         }
     }
-    let mut table = Table(Vec::new());
+    let mut table = Table { by_ref, blobs: Vec::new() };
     let text = write_value(
         schema,
         value,
@@ -344,7 +489,7 @@ pub fn authoring_value(
     }
     Ok(AuthoringValue {
         canonical_value: Arc::from(text.into_bytes()),
-        blobs: table.0,
+        blobs: table.blobs,
         types: carried,
     })
 }
@@ -753,15 +898,47 @@ mod tests {
             ],
         };
         let value = Value::Struct(Box::new([Value::Blob(vec![1, 2]), Value::Blob(vec![3])]));
-        let carried = authoring_value(&schema, &value, &Default::default()).unwrap();
+        let carried = authoring_value_by_ref(&schema, &value, &Default::default()).unwrap();
         assert_eq!(
             &*carried.canonical_value,
             br#"{"a":{"len":2,"offset":0},"b":{"len":1,"offset":1}}"#
         );
-        let mut table = BlobTable::new(&carried.blobs);
+        // By reference only; the bytes come back from what holds them.
+        assert_eq!(
+            carried.blobs,
+            [AuthoringBlob::Ref(BlobRef::of(&[1, 2])), AuthoringBlob::Ref(BlobRef::of(&[3]))]
+        );
+        let mut held = BTreeMap::new();
+        value_blobs(&schema, &value, &Default::default(), &mut held).unwrap();
+        let resolved = resolve_blob_refs(&carried, &held).unwrap();
+        let mut table = BlobTable::new(&resolved.blobs, false);
         let text = std::str::from_utf8(&carried.canonical_value).unwrap();
         let read = parse_value(text, &schema, Options::canonical().blobs(&mut table)).unwrap();
         table.all_used().unwrap();
         assert_eq!(read, value);
+        assert_eq!(
+            resolve_blob_refs(&carried, &BTreeMap::new()),
+            Err(AuthoringValueError::UnknownBlobRef { index: 0 })
+        );
+    }
+
+    /// A value naming its blobs by reference checks against its schema
+    /// without their bytes, placements and canonical form included.
+    #[test]
+    fn a_value_with_blob_refs_checks_without_bytes() {
+        let schema = SchemaNode::Struct { rev: 0, fields: vec![("a".to_owned(), 0, SchemaNode::Blob)] };
+        let value = Value::Struct(Box::new([Value::Blob(vec![7; 40])]));
+        let carried = authoring_value_by_ref(&schema, &value, &Default::default()).unwrap();
+        let schema_text = distill_schema::ngp_schema::snapshot_to_json(&LogicalSchema { root: schema.clone() }).unwrap();
+        let hash = distill_schema::ngp_schema::node_hash(&schema).unwrap();
+        check_authoring_payload(hash, schema_text.as_bytes(), &carried).unwrap();
+        // Decoding stores the value: a reference has no bytes to store.
+        assert_eq!(
+            decode_authoring_payload(hash, schema_text.as_bytes(), &carried).map(drop),
+            Err(AuthoringValueError::UnknownBlobRef { index: 0 })
+        );
+        let mut wrong = carried.clone();
+        wrong.blobs[0] = AuthoringBlob::Ref(BlobRef { len: 39, hash: [0; 32] });
+        assert!(check_authoring_payload(hash, schema_text.as_bytes(), &wrong).is_err());
     }
 }

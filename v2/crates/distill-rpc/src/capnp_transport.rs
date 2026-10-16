@@ -1261,16 +1261,43 @@ impl schema::authoring_snapshot::Server for AuthoringSnapshotService {
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
             generation_gate!(self.snapshot.generation_reconnect(), results);
-            let uuid = match decode_uuid(params.get()?.get_uuid()?, "uuid") {
+            let wire = params.get()?.get_uuids()?;
+            let mut uuids = Vec::with_capacity(wire.len() as usize);
+            for uuid in wire.iter() {
+                match decode_uuid(uuid?, "uuids") {
+                    Ok(uuid) => uuids.push(AssetUuid(uuid)),
+                    Err(error) => {
+                        write_wire_error(results.get().init_result().init_error(), &error);
+                        return Ok(());
+                    }
+                }
+            }
+            write_authoring_inspect_many_result(
+                results.get().init_result(),
+                self.snapshot.inspect(&uuids),
+            );
+            Ok(())
+        }
+    }
+
+    fn blob(
+        self: capnp::capability::Rc<Self>,
+        params: schema::authoring_snapshot::BlobParams,
+        mut results: schema::authoring_snapshot::BlobResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
+        async move {
+            generation_gate!(self.snapshot.generation_reconnect(), results);
+            let params = params.get()?;
+            let uuid = match decode_uuid(params.get_uuid()?, "uuid") {
                 Ok(uuid) => AssetUuid(uuid),
                 Err(error) => {
                     write_wire_error(results.get().init_result().init_error(), &error);
                     return Ok(());
                 }
             };
-            write_authoring_inspect_result(
+            write_authoring_blob_result(
                 results.get().init_result(),
-                self.snapshot.inspect(uuid),
+                self.snapshot.blob(uuid, params.get_index()),
             );
             Ok(())
         }
@@ -1742,17 +1769,52 @@ fn decode_authoring_value(
             .map_err(authoring_decode_error)?
             .to_vec()
             .into(),
-        blobs: value
-            .get_blobs()
-            .map_err(authoring_decode_error)?
-            .iter()
-            .map(|blob| {
-                blob.map(|bytes| bytes.to_vec().into())
-                    .map_err(authoring_decode_error)
-            })
-            .collect::<Result<Vec<_>, _>>()?,
+        blobs: decode_authoring_blobs(value.get_blobs().map_err(authoring_decode_error)?)?,
         types: decode_authoring_types(value.get_types().map_err(authoring_decode_error)?)?,
     })
+}
+
+/// A carrier's blob table: each blob by ref or bytes (protocol 28).
+fn decode_authoring_blobs(
+    blobs: capnp::struct_list::Reader<'_, schema::authoring_blob::Owned>,
+) -> Result<Vec<crate::AuthoringBlob>, String> {
+    blobs
+        .iter()
+        .map(|blob| match blob.which().map_err(authoring_decode_error)? {
+            schema::authoring_blob::Which::Ref(blob_ref) => {
+                let blob_ref = blob_ref.map_err(authoring_decode_error)?;
+                Ok(crate::AuthoringBlob::Ref(crate::BlobRef {
+                    len: blob_ref.get_len(),
+                    hash: decode_hash(
+                        blob_ref.get_hash().map_err(authoring_decode_error)?,
+                        "blobRef.hash",
+                    )
+                    .map_err(|error| error.message)?,
+                }))
+            }
+            schema::authoring_blob::Which::Bytes(bytes) => Ok(crate::AuthoringBlob::Bytes(
+                bytes.map_err(authoring_decode_error)?.to_vec().into(),
+            )),
+        })
+        .collect()
+}
+
+/// Write a carrier's blob table.
+pub(crate) fn write_authoring_blobs(
+    mut output: capnp::struct_list::Builder<'_, schema::authoring_blob::Owned>,
+    blobs: &[crate::AuthoringBlob],
+) {
+    for (index, blob) in blobs.iter().enumerate() {
+        let output = output.reborrow().get(index as u32);
+        match blob {
+            crate::AuthoringBlob::Ref(blob_ref) => {
+                let mut wire = output.init_ref();
+                wire.set_len(blob_ref.len);
+                wire.set_hash(&blob_ref.hash);
+            }
+            crate::AuthoringBlob::Bytes(bytes) => output.init_bytes(bytes.len() as u32).copy_from_slice(bytes),
+        }
+    }
 }
 
 /// A carrier's types (GAP 23 §3); their schemas verify when the value is
@@ -1799,10 +1861,7 @@ pub(crate) fn write_authoring_value(
     value: &crate::AuthoringValue,
 ) {
     output.set_canonical_value(&value.canonical_value);
-    let mut blobs = output.reborrow().init_blobs(value.blobs.len() as u32);
-    for (index, blob) in value.blobs.iter().enumerate() {
-        blobs.set(index as u32, blob);
-    }
+    write_authoring_blobs(output.reborrow().init_blobs(value.blobs.len() as u32), &value.blobs);
     let mut types = output.init_types(value.types.len() as u32);
     for (index, ty) in value.types.iter().enumerate() {
         let mut row = types.reborrow().get(index as u32);
@@ -2486,16 +2545,11 @@ pub fn decode_authoring_inspection(
     let wire_value = value.get_value()?;
     let authored_value = crate::AuthoringValue {
         canonical_value: wire_value.get_canonical_value()?.to_vec().into(),
-        blobs: wire_value
-            .get_blobs()?
-            .iter()
-            .map(|blob| blob.map(|bytes| bytes.to_vec().into()))
-            .collect::<Result<Vec<_>, _>>()?,
+        blobs: decode_authoring_blobs(wire_value.get_blobs()?).map_err(capnp::Error::failed)?,
         types: decode_authoring_types(wire_value.get_types()?).map_err(capnp::Error::failed)?,
     };
     let logical_schema: std::sync::Arc<[u8]> = value.get_logical_schema()?.to_vec().into();
-    crate::validate::decode_authoring_payload(schema_hash, &logical_schema, &authored_value)
-        .map(drop)
+    crate::validate::check_authoring_payload(schema_hash, &logical_schema, &authored_value)
         .map_err(|error| {
             capnp::Error::failed(format!("invalid authoring inspection: {error:?}"))
         })?;
@@ -3172,21 +3226,56 @@ fn write_target_entry_result(
     }
 }
 
-fn write_authoring_inspect_result(
-    mut result: schema::authoring_inspect_call::Builder<'_>,
-    outcome: RpcResult<AuthoringInspectResult>,
+fn write_authoring_inspect_many_result(
+    mut result: schema::authoring_inspect_many_call::Builder<'_>,
+    outcome: RpcResult<Vec<AuthoringInspectResult>>,
 ) {
     match outcome {
-        RpcResult::Success(AuthoringInspectResult::Inspection(inspection)) => {
-            write_authoring_inspection(result.reborrow().init_success(), &inspection);
+        RpcResult::Success(answers) => {
+            let mut wire = result.init_success(answers.len() as u32);
+            for (index, answer) in answers.iter().enumerate() {
+                let mut output = wire.reborrow().get(index as u32);
+                match answer {
+                    AuthoringInspectResult::Inspection(inspection) => {
+                        write_authoring_inspection(output.init_success(), inspection)
+                    }
+                    AuthoringInspectResult::Missing => output.set_missing(()),
+                    AuthoringInspectResult::RoleIneligible { observed } => output
+                        .init_role_ineligible()
+                        .set_observed(wire_authoring_role(*observed)),
+                    AuthoringInspectResult::Drifted { input, current } => {
+                        write_drifted(output.init_drifted(), input, *current)
+                    }
+                }
+            }
         }
-        RpcResult::Success(AuthoringInspectResult::Missing) => result.set_missing(()),
-        RpcResult::Success(AuthoringInspectResult::RoleIneligible { observed }) => {
-            result
-                .init_role_ineligible()
-                .set_observed(wire_authoring_role(observed));
+        RpcResult::ReconnectRequired { reason } => {
+            write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::Success(AuthoringInspectResult::Drifted { input, current }) => {
+        RpcResult::ConfigurationFailed(error) => {
+            write_configuration_error(result.init_configuration_failed(), &error)
+        }
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
+        RpcResult::Failure(error) => write_failure(result.init_error(), &error),
+    }
+}
+
+fn write_authoring_blob_result(
+    mut result: schema::authoring_blob_call::Builder<'_>,
+    outcome: RpcResult<crate::AuthoringBlobResult>,
+) {
+    match outcome {
+        RpcResult::Success(crate::AuthoringBlobResult::Blob { stamp, chunks }) => {
+            let mut output = result.init_success();
+            write_authoring_stamp(output.reborrow().init_stamp(), stamp);
+            output.set_total_bytes(chunks.total_bytes());
+            let client: schema::chunk_stream::Client = capnp_rpc::new_client(ChunkStreamService {
+                stream: RefCell::new(chunks),
+            });
+            output.set_chunks(client);
+        }
+        RpcResult::Success(crate::AuthoringBlobResult::Missing) => result.set_missing(()),
+        RpcResult::Success(crate::AuthoringBlobResult::Drifted { input, current }) => {
             write_drifted(result.init_drifted(), &input, current)
         }
         RpcResult::ReconnectRequired { reason } => {

@@ -7,7 +7,7 @@ use distill_daemon::coordinator::DaemonCoordinator;
 use distill_daemon::scanner::{AssetRoot, ScanDiagnostic};
 use distill_daemon::watcher::WatcherBatch;
 use distill_rpc::{
-    AuthoringBackend, AuthoringEntry, AuthoringEntryRole, AuthoringInspectResult, AuthoringOp,
+    AuthoringBackend, AuthoringBlob, AuthoringEntry, AuthoringEntryRole, AuthoringInspectResult, AuthoringOp,
     AuthoringProgressState, AuthoringValue as RpcAuthoringValue, ConfigurationStatus,
     ConnectOutcome, ConnectRequest, ContentHash, Delta, DoctorRequest, LongRunningOp, MetadataCall,
     MetadataNamespaceCall, RpcFailure, StreamEvent, TargetDefinition, TargetDefinitionHash,
@@ -557,6 +557,84 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
     assert!(store.bundle(bundle_uuid).unwrap().is_none());
     assert!(store.entry(asset_uuid).unwrap().is_none());
 }
+
+/// A write naming a blob by reference keeps the bytes the bundle holds
+/// under it (protocol 28): an edit of a value with a blob field sends no
+/// bytes. A reference the bundle does not hold fails and writes nothing.
+#[test]
+fn a_write_naming_a_held_blob_by_reference_keeps_its_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let coordinator = coordinator(&temp);
+    let mut writer = coordinator.open_writer().unwrap();
+    let schema = LogicalSchema {
+        root: SchemaNode::Struct {
+            rev: 0,
+            fields: vec![
+                ("blob".to_owned(), 0, SchemaNode::Blob),
+                ("n".to_owned(), 0, SchemaNode::Primitive(PrimitiveKind::U8)),
+            ],
+        },
+    };
+    let schema_hash = node_hash(&schema.root).unwrap();
+    let held: Vec<u8> = (0..4096u32).map(|i| (i * 7) as u8).collect();
+    let value = |blob: &[u8], n: u8| Value::Struct(Box::new([Value::Blob(blob.to_vec()), Value::U8(n)]));
+    let (bundle_uuid, asset_uuid, type_uuid) = (BundleUuid([81; 16]), AssetUuid([82; 16]), TypeUuid([83; 16]));
+    let bundle_path = temp.path().join("assets/held.bundle");
+    std::fs::write(
+        &bundle_path,
+        distill_bundle::write_bundle(&Bundle {
+            format_version: 1,
+            uuid: bundle_uuid,
+            primary: Some("entry".into()),
+            schemas: BTreeMap::from([(schema_hash, schema.clone())]),
+            types: Default::default(),
+            assets: BTreeMap::from([(
+                "entry".into(),
+                AssetEntry {
+                    uuid: asset_uuid,
+                    type_uuid,
+                    schema_hash,
+                    authoring_only: false,
+                    data: value(&held, 1),
+                },
+            )]),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+
+    let set = |value: &Value| {
+        let carried = distill_rpc::authoring_value_by_ref(&schema.root, value, &Default::default()).unwrap();
+        assert!(carried.blobs.iter().all(|blob| matches!(blob, AuthoringBlob::Ref(_))));
+        AuthoringOp::Set(AuthoringEntry {
+            root: String::new(),
+            uuid: asset_uuid,
+            bundle: bundle_uuid,
+            local_id: "entry".into(),
+            normalized_path: "held.bundle".into(),
+            type_uuid,
+            terminal_type: type_uuid,
+            schema_hash,
+            logical_schema: Arc::from(snapshot_to_json(&schema).unwrap().into_bytes()),
+            role: AuthoringEntryRole::Runtime,
+            tags: BTreeMap::new(),
+            value: carried,
+        })
+    };
+    let (_, version) =
+        write_and_publish(&coordinator, &mut writer, InputVersion(1), &[set(&value(&held, 2))], false).unwrap();
+    assert_eq!(version, InputVersion(2));
+    let written = std::fs::read(&bundle_path).unwrap();
+    assert_eq!(distill_bundle::parse_bundle(&written).unwrap().assets["entry"].data, value(&held, 2));
+
+    match write_files(&coordinator, &mut writer, InputVersion(2), &[set(&value(&[9; 8], 3))], false) {
+        Err(RpcFailure::InvalidAuthoringRequest { detail }) => assert!(detail.contains("UnknownBlobRef"), "{detail}"),
+        other => panic!("expected an unknown reference, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&bundle_path).unwrap(), written);
+}
+
 
 /// A direct write changes the file and commits nothing: the store keeps
 /// the old version until the watcher publishes the file. A write that fails

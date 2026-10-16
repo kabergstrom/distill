@@ -48,10 +48,15 @@ async fn edit_asset_through_hub_write() {
                 _ => panic!("authoringSnapshot failed"),
             };
             let mut inspect = snapshot.inspect_request();
-            inspect.get().set_uuid(&asset.0);
+            inspect.get().init_uuids(1).set(0, &asset.0);
             let inspected = inspect.send().promise.await.unwrap();
             let inspection = match inspected.get().unwrap().get_result().unwrap().which().unwrap() {
-                schema::authoring_inspect_call::Which::Success(found) => decode_authoring_inspection(found.unwrap()).unwrap(),
+                schema::authoring_inspect_many_call::Which::Success(answers) => match answers.unwrap().get(0).which().unwrap() {
+                    schema::authoring_inspect_answer::Which::Success(found) => {
+                        decode_authoring_inspection(found.unwrap()).unwrap()
+                    }
+                    _ => panic!("inspect {asset}: no authored entry"),
+                },
                 _ => panic!("inspect {asset}: no authored entry"),
             };
 
