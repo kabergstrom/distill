@@ -728,6 +728,20 @@ impl schema::hub::Server for HubService {
         }
     }
 
+    fn subscribe_index(
+        self: capnp::capability::Rc<Self>,
+        params: schema::hub::SubscribeIndexParams,
+        mut results: schema::hub::SubscribeIndexResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
+        async move {
+            generation_gate!(self.hub.generation_reconnect(), results);
+            let since = InputVersion(params.get()?.get_since());
+            let result = self.hub.subscribe_index(since);
+            write_subscribe_result(results.get().init_result(), result);
+            Ok(())
+        }
+    }
+
     fn write(
         self: capnp::capability::Rc<Self>,
         params: schema::hub::WriteParams,
@@ -1361,6 +1375,25 @@ impl schema::authoring_snapshot::Server for AuthoringSnapshotService {
                 }
             };
             write_authoring_list_result(results.get().init_result(), self.snapshot.list(query));
+            Ok(())
+        }
+    }
+
+    fn list_entries(
+        self: capnp::capability::Rc<Self>,
+        params: schema::authoring_snapshot::ListEntriesParams,
+        mut results: schema::authoring_snapshot::ListEntriesResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
+        async move {
+            generation_gate!(self.snapshot.generation_reconnect(), results);
+            let uuids = match decode_uuid_list(params.get()?.get_uuids()?, "uuids") {
+                Ok(uuids) => uuids,
+                Err(error) => {
+                    write_wire_error(results.get().init_result().init_error(), &error);
+                    return Ok(());
+                }
+            };
+            write_authoring_list_result(results.get().init_result(), self.snapshot.list_entries(&uuids));
             Ok(())
         }
     }
@@ -4185,9 +4218,22 @@ fn write_delta(mut output: schema::delta::Builder<'_>, delta: &Delta) {
             });
         }
     }
-    let mut paths = output.init_paths(delta.paths.len() as u32);
-    for (index, path) in delta.paths.iter().enumerate() {
-        paths.set(index as u32, path.as_str());
+    {
+        let mut paths = output.reborrow().init_paths(delta.paths.len() as u32);
+        for (index, path) in delta.paths.iter().enumerate() {
+            paths.set(index as u32, path.as_str());
+        }
+    }
+    output.set_types(delta.types);
+    let mut files = output.init_files(delta.files.len() as u32);
+    for (index, change) in delta.files.iter().enumerate() {
+        let mut file = files.reborrow().get(index as u32);
+        file.set_root(change.root.as_str());
+        file.set_path(change.path.as_str());
+        file.set_state(match change.state {
+            AssetDeltaState::Changed => schema::AssetDeltaState::Changed,
+            AssetDeltaState::Deleted => schema::AssetDeltaState::Deleted,
+        });
     }
 }
 

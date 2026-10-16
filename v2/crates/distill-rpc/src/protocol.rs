@@ -58,7 +58,11 @@ pub use distill_store::state::{
 /// 29 (GAP 23 §15.3): `AuthoringRow` and `AuthoringInspection` carry the
 /// entry's `content` key (blake3 over schema hash, canonical text, blob
 /// refs and carried types; [`crate::content_key`]).
-pub const PROTOCOL_VERSION: u32 = 29;
+/// 30 (GAP 23 §15.4): `Hub.subscribeIndex` delivers every published
+/// version's `Delta`, unfiltered; a `Delta` names source `files` changed
+/// and whether the type files changed (`types`);
+/// `AuthoringSnapshot.listEntries` answers the rows of named entries.
+pub const PROTOCOL_VERSION: u32 = 30;
 
 /// A watched import whose latest attempt failed. The bundle keeps serving its
 /// last good contents; the failure clears when a later import succeeds.
@@ -1702,6 +1706,20 @@ pub struct Delta {
     pub basis: RpcBasis,
     pub assets: Vec<(AssetUuid, AssetDeltaState)>,
     pub paths: Vec<String>,
+    /// Source files the scan found added, changed or removed (bundle
+    /// files excepted): index subscriptions only (protocol 30).
+    pub files: Vec<FileChange>,
+    /// A file of the type-files root changed (`describableTypes` and
+    /// `describeType` may answer otherwise): index subscriptions only.
+    pub types: bool,
+}
+
+/// One source file a version changed (protocol 30).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChange {
+    pub root: String,
+    pub path: String,
+    pub state: AssetDeltaState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

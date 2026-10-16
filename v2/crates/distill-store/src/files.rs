@@ -18,6 +18,7 @@ use rusqlite::OptionalExtension;
 
 use crate::db::{InputTxn, Store, StoreReader};
 use crate::error::StoreError;
+use crate::served::{Change, ServedWrite};
 use crate::state::InputVersion;
 
 /// [`StoreReader::file_content_hash`]'s statement.
@@ -306,6 +307,9 @@ impl InputTxn<'_> {
 
     /// Queue pending work (§13's `file_work`): written when the
     /// outermost transaction commits, unless a pass consumes it first.
+    /// The change is logged for index subscribers (`Change::File`; state 0
+    /// added or changed, 1 removed), except on the first publication, which
+    /// logs nothing (no client holds the version before it).
     pub fn push_dirty(
         &mut self,
         root: RootId,
@@ -321,6 +325,14 @@ impl InputTxn<'_> {
             exists,
             observation,
         });
+        if observation.0 > 1 {
+            let change = Change::File {
+                root: root_name.to_owned(),
+                path: path.to_owned(),
+                state: u8::from(!exists),
+            };
+            self.append_change(observation, &change)?;
+        }
         Ok(())
     }
 

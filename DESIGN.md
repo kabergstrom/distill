@@ -5465,7 +5465,7 @@ that published it, never copied into a table.
 | `watched_import_failures` | bundle uuid → a watched import's last failure: the attempted version, the basis it read and the terminal error. The basis is what decides whether the import is due again |
 | `directory_import_failures` | directory-import origin (rules bundle, rule id, group root and path) → the last failure of an import that has written no bundle yet (§8): the output it would write, the digest of the task it ran, the attempted version, the basis, the terminal error. Cleared when the import succeeds or its origin is no longer produced |
 | `directory_import_failure_keys` | a `directory_import_failures` row → what its basis reads (a path, a listing, an importer capability; `import_keys` kinds 0 to 2), indexed by (kind, key): the failures a changed path or capability may heal. Its rows go with the failure's |
-| `change_log` | publication deltas and fence events in order, read by every RPC front end after its cursor and by a subscriber's history one subject at a time. Only real changes are logged: the first publication on an empty store logs no deltas (no client holds the version before it), and a rescan logs the assets of the bundles that changed and the paths whose candidates changed. Trimmed by version |
+| `change_log` | publication deltas and fence events in order, read by every RPC front end after its cursor and by a subscriber's history one subject at a time. Only real changes are logged: the first publication on an empty store logs no deltas (no client holds the version before it), and a rescan logs the assets of the bundles that changed and the paths whose candidates changed, and (schema 67) the source files the scan queued as dirty, by root and path, for index subscriptions. Trimmed by version |
 | `rpc_targets` | the RPC target set: name → definition hash and reconnect generation |
 | `artifact_load_edges` | an artifact's direct load edges' expected terminal types, the one piece of artifact metadata its bytes do not carry; written with the CAS index and deleted with its extent |
 
@@ -7609,6 +7609,7 @@ interface Hub {
               -> (result :VoidCall);
   authoringSnapshot @8 () -> (result :AuthoringSnapshotCall);
   release @9 (base :UInt64, bundle :Uuid) -> (result :UuidCall);
+  subscribeIndex @10 (since :UInt64) -> (result :SubscribeCall);
 }
 
 interface Snapshot {
@@ -7637,6 +7638,7 @@ interface AuthoringSnapshot {
   references @9 (bundle :Data) -> (result :ReferencesCall);
   authorable @10 () -> (result :AuthorableCall);
   blob @11 (uuid :Data, index :UInt32) -> (result :AuthoringBlobCall);
+  listEntries @12 (uuids :List(Data)) -> (result :AuthoringListCall);
 }
 ```
 
@@ -7811,6 +7813,31 @@ retained history yields `resyncRequired`; a watcher-coverage loss yields
 `restartRequired`; a bound epoch change yields `reconnectRequired`. No
 notification is the authority for a fence—the server checks the fence on every
 call.
+
+`subscribeIndex(since)` (protocol 30) makes the connection's stream an
+index subscription, for an editor that keeps an index of every entry:
+- every published version's `Delta` reaches the stream whole, unfiltered
+  and with no name cap (the 4096-name caps are `subscribe`'s); the
+  connection's asset and path subscriptions keep working, and a client
+  filters its own names out of the same stream;
+- history from `since` is the whole change log after it (one search of
+  `change_log_by_version`), with the same `initialDelta`,
+  `resyncRequired`, `InvalidCursor` and retention
+  (`RETAINED_HISTORY_VERSIONS`) as `subscribe`;
+- a `Delta` then carries `files`: each source file the scan found added,
+  changed (`changed`) or removed (`deleted`) at that version, by root and
+  path, bundle files excepted (their changes are their entries'). The
+  store logs them where the scan queues file work (`push_dirty`; change
+  log kind 4, root in its `root` column), except on the first
+  publication;
+- and `types`: a file under the root holding the type files
+  (`prefab-types.root`, "Type descriptions") changed, so
+  `describableTypes` and `describeType` may answer otherwise.
+- `files` and `types` are empty and false on a connection without it.
+
+`AuthoringSnapshot.listEntries(uuids)` answers the rows of the named
+entries as `list` answers them; one the snapshot does not serve has none.
+An index subscriber reads the entries a delta names with it.
 
 Authoring methods carry an InputVersion base precondition. A stale base returns
 a typed conflict without mutation.

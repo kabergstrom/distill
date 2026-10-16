@@ -2397,6 +2397,21 @@ fn old_history_returns_resync_marker_and_future_cursor_is_typed_failure() {
             current: observed,
         }) if since.0 == current.0 + 1 && observed == current
     ));
+    // An index subscription keeps the same retention (protocol 30).
+    let index_hub = connect(&server, &[(1, false)]);
+    assert!(matches!(
+        index_hub.subscribe_index(InputVersion(current.0 + 1)),
+        RpcResult::Failure(RpcFailure::InvalidCursor { since, current: observed })
+            if since.0 == current.0 + 1 && observed == current
+    ));
+    let index = index_hub.subscribe_index(InputVersion(0)).success().unwrap();
+    assert!(matches!(
+        index.deltas.next(),
+        Some(StreamEvent::ResyncRequired {
+            oldest_available: InputVersion(2),
+            ..
+        })
+    ));
 }
 
 #[test]

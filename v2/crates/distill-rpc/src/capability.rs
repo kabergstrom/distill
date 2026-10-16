@@ -23,8 +23,8 @@ use distill_store::served::{AssetResolution, ServedEntryMeta};
 use distill_store::{Store, StoreError, StoreReader};
 
 use crate::server::{
-    entry_role, history_deltas, pipeline_failure, store_failure, ConnectionState, MetadataBinding,
-    SnapshotHold, SnapshotTxn, DEFAULT_CHUNK_SIZE,
+    entry_role, has_file_changes, history_deltas, pipeline_failure, store_failure, types_root,
+    ConnectionState, HistoryDelta, MetadataBinding, SnapshotHold, SnapshotTxn, DEFAULT_CHUNK_SIZE,
 };
 use crate::validate::{
     path_glob_matches, valid_identifier, valid_logical_path, valid_logical_path_prefix,
@@ -764,14 +764,24 @@ fn list_rows(
         Ok(matched) => matched,
         Err(bundles) => return Ok(Err(RpcFailure::TagIndexPoisoned { bundles })),
     };
+    rows_of(server, snapshot, matched.into_iter().map(|matched| matched.asset)).map(Ok)
+}
+
+/// The rows of `uuids` at `snapshot`, sorted by root, path and local id;
+/// an entry the snapshot does not serve has none.
+fn rows_of(
+    server: &Server,
+    snapshot: &StoreReader,
+    uuids: impl Iterator<Item = AssetUuid>,
+) -> Result<Vec<AuthoringRow>, StoreError> {
     let backend = server.inner.handle.authoring_backend();
     let mut bundles = BTreeMap::<BundleUuid, Option<(String, BundleOrigin)>>::new();
     let mut names = BTreeMap::<TypeUuid, String>::new();
     // The primaries of the bundles at each path (several roots may share one).
     let mut primaries = BTreeMap::<String, std::collections::BTreeSet<AssetUuid>>::new();
-    let mut rows = Vec::with_capacity(matched.len());
-    for matched in matched {
-        let Some(entry) = snapshot.served_entry_meta(matched.asset)? else {
+    let mut rows = Vec::new();
+    for uuid in uuids {
+        let Some(entry) = snapshot.served_entry_meta(uuid)? else {
             continue;
         };
         let bundle = match bundles.entry(entry.bundle) {
@@ -813,7 +823,7 @@ fn list_rows(
     rows.sort_by(|a, b| {
         (&a.root, &a.normalized_path, &a.local_id).cmp(&(&b.root, &b.normalized_path, &b.local_id))
     });
-    Ok(Ok(rows))
+    Ok(rows)
 }
 
 /// `bundle`'s root and origin at `snapshot`; `None` without a published
@@ -1959,6 +1969,64 @@ impl Hub {
         connection.subscribed_assets.extend(requested_assets);
         connection.subscribed_paths.extend(requested_paths);
 
+        let deltas = history_deltas(stamp.instance, &history, None)
+            .iter()
+            .filter_map(|delta| delta.filtered(&new_assets, &new_paths))
+            .collect::<Vec<_>>();
+        self.install_stream(connection, stamp, since, oldest, deltas)
+    }
+
+    /// Index subscription (protocol 30): from now on this connection's
+    /// stream carries every published version's delta whole, with its
+    /// source files and type-file flag, besides the asset and path
+    /// subscriptions it already serves. The history from `since` is the
+    /// whole change log after it; past retention it is `ResyncRequired`.
+    pub fn subscribe_index(&self, since: InputVersion) -> RpcResult<SubscriptionInstall> {
+        if let Some(result) = self.live() {
+            return result;
+        }
+        let inner = &self.server.inner;
+        let (stamp, head, oldest, history, types_root) = rpc_try!(inner.read_consistent(|reader| {
+            let stamp = reader.stamp()?;
+            let oldest = reader.change_log_oldest()?;
+            let history = if oldest <= since && since < stamp.version {
+                reader.change_log_window(since, stamp.version)?
+            } else {
+                Vec::new()
+            };
+            let types_root = if has_file_changes(&history) { types_root(reader)? } else { None };
+            Ok((stamp, reader.change_log_head()?, oldest, history, types_root))
+        }));
+        if since > stamp.version {
+            return RpcResult::Failure(RpcFailure::InvalidCursor {
+                since,
+                current: stamp.version,
+            });
+        }
+        // Deliver everything up to the read version as subscribed before;
+        // the history below covers the index.
+        inner.pump_until(&self.connection, Some(head));
+        let mut connection = self.connection.borrow_mut();
+        connection.index = true;
+        let deltas = history_deltas(stamp.instance, &history, types_root.as_deref())
+            .iter()
+            .filter_map(HistoryDelta::whole)
+            .collect::<Vec<_>>();
+        self.install_stream(connection, stamp, since, oldest, deltas)
+    }
+
+    /// Queue a subscription's history on the connection's stream (or
+    /// `ResyncRequired` when `since` is past retention), installing the
+    /// stream on its first subscription.
+    fn install_stream(
+        &self,
+        mut connection: std::cell::RefMut<'_, ConnectionState>,
+        stamp: SnapshotStamp,
+        since: InputVersion,
+        oldest: InputVersion,
+        deltas: Vec<Delta>,
+    ) -> RpcResult<SubscriptionInstall> {
+        let installed = stamp.version;
         let basis = RpcBasis { snapshot: stamp };
         let first_install = !connection.stream_installed;
         if since < oldest {
@@ -1966,29 +2034,23 @@ impl Hub {
                 basis,
                 oldest_available: oldest,
             });
+        } else if first_install {
+            connection.enqueue(StreamEvent::InitialDelta {
+                basis,
+                since,
+                installed,
+                deltas,
+            });
         } else {
-            let deltas = history_deltas(stamp.instance, &history)
-                .iter()
-                .filter_map(|delta| delta.filtered(&new_assets, &new_paths))
-                .collect::<Vec<_>>();
-            if first_install {
-                connection.enqueue(StreamEvent::InitialDelta {
-                    basis,
-                    since,
-                    installed,
-                    deltas,
-                });
-            } else {
-                for delta in deltas {
-                    connection.enqueue(StreamEvent::Delta(delta));
-                }
+            for delta in deltas {
+                connection.enqueue(StreamEvent::Delta(delta));
             }
         }
         connection.stream_installed = true;
         if first_install {
             // The keys as they are now; a later change reaches the stream
             // through `pump`.
-            let (serial, keys) = inner.handle.restart_required();
+            let (serial, keys) = self.server.inner.handle.restart_required();
             connection.restart_serial = serial;
             if !keys.is_empty() {
                 connection.enqueue(StreamEvent::Asset {
@@ -2759,6 +2821,18 @@ impl AuthoringSnapshot {
             Ok(rows) => RpcResult::Success(rows),
             Err(error) => RpcResult::Failure(error),
         }
+    }
+
+    /// The rows of the named entries (protocol 30), as [`Self::list`]
+    /// answers them; an entry the snapshot does not serve has none. An
+    /// index subscriber reads the entries a delta names with it.
+    pub fn list_entries(&self, uuids: &[AssetUuid]) -> RpcResult<Vec<AuthoringRow>> {
+        let txn = match self.preflight() {
+            Ok(txn) => txn,
+            Err(result) => return result,
+        };
+        let uuids = uuids.iter().copied().collect::<BTreeSet<_>>();
+        RpcResult::Success(rpc_try!(rows_of(&self.server, txn.snapshot(), uuids.into_iter())))
     }
 
     /// The files under `root` that `glob` matches (all without one), bundle

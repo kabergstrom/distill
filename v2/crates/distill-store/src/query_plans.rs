@@ -2626,7 +2626,7 @@ fn cas_and_served_point_statements_search_their_keys() {
             &["SEARCH cas_segments USING COVERING INDEX cas_segments_open (owner=?)"],
         ),
         (
-            "SELECT seq, version, kind, asset_uuid, state, subject FROM change_log WHERE seq > ? ORDER BY seq",
+            "SELECT seq, version, kind, asset_uuid, state, subject, root FROM change_log WHERE seq > ? ORDER BY seq",
             &["SEARCH change_log USING INTEGER PRIMARY KEY (rowid>?)"],
         ),
         (

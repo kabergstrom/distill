@@ -766,3 +766,106 @@ fn poll_while(io: &mut RpcIo, mut condition: impl FnMut(&RpcIo) -> bool) {
         std::thread::sleep(Duration::from_millis(2));
     }
 }
+
+/// The index subscription (protocol 30) shares the connection's stream:
+/// every version reaches `take_index_changes`, with source files, while
+/// the loader's deltas keep to the assets it subscribed.
+#[test]
+fn rpc_io_index_changes_share_the_stream_with_the_loaders_deltas() {
+    let Fixture {
+        mut project,
+        server,
+        request,
+        asset: first,
+        ..
+    } = fixture();
+    let second = AssetUuid([9; 16]);
+    write_asset(&mut project, "assets/b.bundle", second, 0);
+    project.publish();
+
+    let (address_tx, address_rx) = std::sync::mpsc::sync_channel(1);
+    let root = server.root();
+    let server_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&runtime, async move {
+            let listener = StagedListener::bind(root, "127.0.0.1:0").await.unwrap();
+            address_tx.send(listener.local_addr().unwrap()).unwrap();
+            let first = listener.accept_one().await.unwrap();
+            let second = listener.accept_one().await.unwrap();
+            first.await.unwrap().unwrap();
+            second.await.unwrap().unwrap();
+        });
+    });
+    let target = RuntimeTarget {
+        epoch: distill_loader::GameModuleEpoch(1),
+        target_definition_hash: request.target_definition_hash.0,
+    };
+    let mut io = RpcIo::connect(address_rx.recv().unwrap(), request).unwrap();
+    io.bind_target(target);
+    assert!(poll_until(&mut io, 1)
+        .iter()
+        .any(|event| matches!(event, IoEvent::TargetBound { .. })));
+    io.subscribe(first);
+    io.subscribe_index();
+    poll_while(&mut io, |io| io.stats().control_tasks > 2);
+
+    // Wait for the index's next change, collecting the loader's events.
+    let next_change = |io: &mut RpcIo, events: &mut Vec<IoEvent>| {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            events.extend(io.poll());
+            let changes = io.take_index_changes();
+            if !changes.is_empty() {
+                return changes;
+            }
+            assert!(Instant::now() < deadline, "no index change: {events:?}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+
+    // An entry the loader does not hold and a source file.
+    write_asset(&mut project, "assets/b.bundle", second, 1);
+    project.write("assets/notes.txt", "notes");
+    let edit = project.publish();
+    let mut events = Vec::new();
+    let changes = next_change(&mut io, &mut events);
+    assert_eq!(
+        changes,
+        vec![distill_loader::IndexChange {
+            version: edit.version,
+            entries: vec![(second, false)],
+            files: vec![(distill_test_project::ROOT.to_owned(), "assets/notes.txt".to_owned(), false)],
+            types: false,
+            resync: false,
+        }]
+    );
+    poll_for(&mut io, Duration::from_millis(50));
+    assert!(
+        !events.iter().any(|event| matches!(event, IoEvent::Delta { .. })),
+        "the loader holds nothing that changed: {events:?}"
+    );
+
+    // The loader's asset: both are told.
+    write_asset(&mut project, PATH, first, 1);
+    let edit = project.publish();
+    let mut events = Vec::new();
+    let changes = next_change(&mut io, &mut events);
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].version, edit.version);
+    assert_eq!(changes[0].entries, vec![(first, false)]);
+    events.extend(poll_until(&mut io, usize::from(events.is_empty())));
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            IoEvent::Delta { assets, .. }
+                if assets == &vec![(first, distill_loader::AssetDeltaState::Changed)]
+        )),
+        "{events:?}"
+    );
+
+    drop(io);
+    server_thread.join().unwrap();
+}

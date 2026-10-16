@@ -160,7 +160,27 @@ impl RemoteHub {
             }
         }
         let response = request.send().promise.await?;
-        let result = response.get()?.get_result()?;
+        self.subscription(response.get()?.get_result()?, since)
+    }
+
+    /// Install this connection's index subscription (protocol 30): its one
+    /// stream then carries every version's delta whole, with files and
+    /// types.
+    pub async fn subscribe_index(
+        &self,
+        since: InputVersion,
+    ) -> Result<RemoteCall<RemoteSubscription>, capnp::Error> {
+        let mut request = self.client.subscribe_index_request();
+        request.get().set_since(since.0);
+        let response = request.send().promise.await?;
+        self.subscription(response.get()?.get_result()?, since)
+    }
+
+    fn subscription(
+        &self,
+        result: schema::subscribe_call::Reader<'_>,
+        since: InputVersion,
+    ) -> Result<RemoteCall<RemoteSubscription>, capnp::Error> {
         match result.which()? {
             schema::subscribe_call::Which::Success(value) => {
                 let value = value?;
@@ -435,6 +455,31 @@ impl RemoteAuthoringSnapshot {
     pub async fn list(&self, query: &AssetQuery) -> Result<RemoteCall<Vec<AuthoringRow>>, capnp::Error> {
         let mut request = self.client.list_request();
         write_asset_query(request.get().init_query(), query);
+        let response = request.send().promise.await?;
+        let result = response.get()?.get_result()?;
+        match result.which()? {
+            schema::authoring_list_call::Which::Success(rows) => Ok(RemoteCall::Success(decode_authoring_rows(rows?)?)),
+            schema::authoring_list_call::Which::ReconnectRequired(value) => Ok(
+                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
+            ),
+            schema::authoring_list_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
+            ),
+            schema::authoring_list_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
+            schema::authoring_list_call::Which::Error(value) => Ok(RemoteCall::Error(decode_rpc_error(value?)?)),
+        }
+    }
+
+    /// The rows of `uuids` (protocol 30); an entry the snapshot does not
+    /// serve has none.
+    pub async fn list_entries(&self, uuids: &[AssetUuid]) -> Result<RemoteCall<Vec<AuthoringRow>>, capnp::Error> {
+        let mut request = self.client.list_entries_request();
+        {
+            let mut wire = request.get().init_uuids(uuids.len() as u32);
+            for (index, uuid) in uuids.iter().enumerate() {
+                wire.set(index as u32, &uuid.0);
+            }
+        }
         let response = request.send().promise.await?;
         let result = response.get()?.get_result()?;
         match result.which()? {
@@ -1540,10 +1585,23 @@ fn decode_delta(
             "delta assets are not strictly UUID-sorted".into(),
         ));
     }
+    let mut files = Vec::new();
+    for file in value.get_files()?.iter() {
+        files.push(crate::FileChange {
+            root: text(file.get_root()?, "delta.file.root")?,
+            path: text(file.get_path()?, "delta.file.path")?,
+            state: match file.get_state()? {
+                schema::AssetDeltaState::Changed => AssetDeltaState::Changed,
+                schema::AssetDeltaState::Deleted => AssetDeltaState::Deleted,
+            },
+        });
+    }
     Ok(Delta {
         basis,
         assets,
         paths: decode_text_list(value.get_paths()?)?,
+        files,
+        types: value.get_types(),
     })
 }
 

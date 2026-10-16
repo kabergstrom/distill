@@ -21,7 +21,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// and the remedy is [`Store::recreate`], which the daemon's writer runs on
 /// its own ([`Store::open_or_recreate`]); readers still fail. Migrations are
 /// deferred until Distill is declared stable (DESIGN.md §13).
-pub const SCHEMA_VERSION: u32 = 66;
+pub const SCHEMA_VERSION: u32 = 67;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -396,7 +396,9 @@ CREATE TABLE change_log (
     kind       INTEGER NOT NULL,
     asset_uuid BLOB,
     state      INTEGER,
-    subject    TEXT
+    subject    TEXT,
+    -- Schema 67: a source file row's root name (kind 4, `subject` its path).
+    root       TEXT
 );
 CREATE INDEX change_log_by_version ON change_log(version);
 -- Schema 39 (fix-cas): a subscriber's history, one subject at a time.

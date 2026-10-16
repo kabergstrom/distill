@@ -1127,6 +1127,10 @@ interface Hub {
   # again: re-imported under the rule's settings and origin, keeping its
   # bundle and entry UUIDs (§17 "Release"). Protocol 23.
   release @9 (base :UInt64, bundle :Uuid) -> (result :UuidCall);
+  # Every published version's delta, unfiltered, with its files and
+  # types, on the connection's one stream (protocol 30). History and
+  # retention as `subscribe`.
+  subscribeIndex @10 (since :UInt64) -> (result :SubscribeCall);
 }
 
 interface Snapshot {
@@ -1197,6 +1201,9 @@ interface AuthoringSnapshot {
   # Blob `index` of the entry's value table (the order of its refs), as
   # chunks. Protocol 28.
   blob @11 (uuid :Data, index :UInt32) -> (result :AuthoringBlobCall);
+  # The rows of the named entries, as `list` answers them; one the
+  # snapshot does not serve has none (protocol 30).
+  listEntries @12 (uuids :List(Data)) -> (result :AuthoringListCall);
 }
 
 interface ChunkStream {
@@ -1218,6 +1225,18 @@ struct Delta {
   basis @0 :RpcBasisValue;
   assets @1 :List(AssetDelta);
   paths @2 :List(Text);
+  # Protocol 30, index subscriptions only (empty and false otherwise):
+  # source files the scan found added, changed (`changed`) or removed
+  # (`deleted`), bundle files excepted; and whether a file of the
+  # type-files root changed.
+  files @3 :List(FileChange);
+  types @4 :Bool;
+}
+
+struct FileChange {
+  root @0 :Text;
+  path @1 :Text;
+  state @2 :AssetDeltaState;
 }
 
 struct StreamEvent {

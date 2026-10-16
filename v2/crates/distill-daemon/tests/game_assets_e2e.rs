@@ -1081,15 +1081,15 @@ fn rpc_io_authoring_writes_watches_and_renames_through_a_live_daemon() {
     });
     assert!(matches!(authoring_answer(&mut io, ticket), AuthoringAnswer::Stale { current } if current >= written));
 
-    // A watched entry's change is reported to the watcher, not the loader.
-    io.watch_authoring(copy);
+    // An entry's change reaches the index subscription, not the loader.
+    io.subscribe_index();
     // The subscription's initial delta may name it: not this change.
     let settled = Instant::now() + Duration::from_millis(300);
     while Instant::now() < settled {
         io.step();
         std::thread::sleep(Duration::from_millis(5));
     }
-    io.take_authoring_changes();
+    io.take_index_changes();
     let text = std::str::from_utf8(&source.value.canonical_value).unwrap().replacen("#version 450", "#version 460", 1);
     assert_ne!(text.as_bytes(), &*source.value.canonical_value);
     let edited = AuthoringEntry {
@@ -1106,16 +1106,16 @@ fn rpc_io_authoring_writes_watches_and_renames_through_a_live_daemon() {
                 event,
                 distill_loader::IoEvent::Delta { assets, .. } if assets.iter().any(|(asset, _)| *asset == copy)
             )),
-            "an asset watched only for authoring reached the loader"
+            "an entry the loader does not hold reached the loader"
         );
-        if let Some(change) = io.take_authoring_changes().into_iter().find(|change| change.version >= rewritten) {
+        if let Some(change) = io.take_index_changes().into_iter().find(|change| change.version >= rewritten) {
             break change;
         }
-        assert!(Instant::now() < deadline, "the watched entry's change was not reported");
+        assert!(Instant::now() < deadline, "the entry's change was not reported");
         std::thread::sleep(Duration::from_millis(5));
     };
-    assert_eq!(change.uuid, copy);
-    assert!(!change.deleted);
+    assert!(change.entries.contains(&(copy, false)), "{change:?}");
+    assert!(!change.resync);
 
     // Rename the bundle: answered once the move is reflected.
     let ticket = io.authoring(AuthoringRequest::Rename {

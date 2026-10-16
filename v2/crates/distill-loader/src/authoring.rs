@@ -47,6 +47,9 @@ pub enum AuthoringRequest {
     },
     /// The entries `query` selects as rows (`AuthoringSnapshot.list`).
     List(AssetQuery),
+    /// These entries' rows (`AuthoringSnapshot.listEntries`); an entry the
+    /// snapshot does not serve has none.
+    ListEntries(Vec<AssetUuid>),
     /// The files under `root` with the layer claiming each.
     SourceFiles { root: String, glob: Option<String> },
     References(BundleUuid),
@@ -105,12 +108,21 @@ pub enum AuthoringAnswer {
     },
 }
 
-/// A watched entry changed at `version` ([`crate::RpcIo::watch_authoring`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AuthoringChange {
-    pub uuid: AssetUuid,
+/// One published version as the index subscription tells it
+/// ([`crate::RpcIo::subscribe_index`]), or a resync: after a reconnect or
+/// past the daemon's history, what changed is unknown and the subscriber
+/// reads the index again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexChange {
     pub version: InputVersion,
-    pub deleted: bool,
+    /// Entries changed (`false`) or deleted (`true`).
+    pub entries: Vec<(AssetUuid, bool)>,
+    /// Source files added or changed (`false`) or removed (`true`), by
+    /// root and path; bundle files are their entries'.
+    pub files: Vec<(String, String, bool)>,
+    /// A type file changed.
+    pub types: bool,
+    pub resync: bool,
 }
 
 pub(crate) async fn run(hub: &RemoteHub, request: AuthoringRequest) -> Result<AuthoringAnswer, String> {
@@ -155,6 +167,12 @@ pub(crate) async fn run(hub: &RemoteHub, request: AuthoringRequest) -> Result<Au
             let snapshot = remote(hub.authoring_snapshot().await)?;
             let version = remote(snapshot.version().await)?;
             let rows = remote(snapshot.list(&query).await)?;
+            Ok(AuthoringAnswer::Rows { version, rows })
+        }
+        AuthoringRequest::ListEntries(uuids) => {
+            let snapshot = remote(hub.authoring_snapshot().await)?;
+            let version = remote(snapshot.version().await)?;
+            let rows = remote(snapshot.list_entries(&uuids).await)?;
             Ok(AuthoringAnswer::Rows { version, rows })
         }
         AuthoringRequest::SourceFiles { root, glob } => {
@@ -270,5 +288,18 @@ async fn confirm(hub: &RemoteHub, receipt: WriteReceipt) -> Result<AuthoringAnsw
             ));
         }
         tokio::time::sleep(CONFIRM_POLL).await;
+    }
+}
+
+impl IndexChange {
+    /// What changed at `version` is unknown: read the index again.
+    pub fn resync(version: InputVersion) -> Self {
+        Self {
+            version,
+            entries: Vec::new(),
+            files: Vec::new(),
+            types: false,
+            resync: true,
+        }
     }
 }

@@ -18,7 +18,7 @@ pub mod stats;
 pub mod storage;
 
 pub use admission::{Admit, FetchAdmission, Reservation};
-pub use authoring::{AuthoringAnswer, AuthoringChange, AuthoringRequest};
+pub use authoring::{AuthoringAnswer, AuthoringRequest, IndexChange};
 pub use basis::{IoBasis, ManifestHash};
 pub use capnp_io::{RpcIo, RpcIoConfig, RpcIoInitError, RpcIoStats, StepStats, TypeName};
 pub use component::{

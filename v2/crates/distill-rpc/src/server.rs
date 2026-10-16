@@ -1205,6 +1205,9 @@ pub(crate) struct ConnectionState {
     fenced: bool,
     pub(crate) subscribed_assets: BTreeSet<AssetUuid>,
     pub(crate) subscribed_paths: BTreeSet<String>,
+    /// `subscribeIndex` installed: every delta reaches the stream whole,
+    /// with its files and types (protocol 30).
+    pub(crate) index: bool,
     /// Undelivered stream events, at most `MAX_PENDING_STREAM_EVENTS`: past
     /// that the queue collapses into one `ResyncRequired` (a reconnect
     /// prompt survives on its own).
@@ -1248,9 +1251,15 @@ pub(crate) struct HistoryDelta {
     pub(crate) stamp: SnapshotStamp,
     pub(crate) assets: Vec<(AssetUuid, AssetDeltaState)>,
     pub(crate) paths: Vec<String>,
+    /// Source files, bundle files excepted, each once (its last state).
+    pub(crate) files: Vec<FileChange>,
+    /// A file of the type-files root changed.
+    pub(crate) types: bool,
 }
 
 impl HistoryDelta {
+    /// What a subscription to `assets` and `paths` is told of this version;
+    /// files and types reach index subscriptions only.
     pub(crate) fn filtered(
         &self,
         assets: &BTreeSet<AssetUuid>,
@@ -1277,12 +1286,56 @@ impl HistoryDelta {
             },
             assets,
             paths,
+            files: Vec::new(),
+            types: false,
         })
+    }
+
+    /// The whole version, as an index subscription is told it.
+    pub(crate) fn whole(&self) -> Option<Delta> {
+        if self.assets.is_empty() && self.paths.is_empty() && self.files.is_empty() && !self.types {
+            return None;
+        }
+        Some(Delta {
+            basis: RpcBasis {
+                snapshot: self.stamp,
+            },
+            assets: self.assets.clone(),
+            paths: self.paths.clone(),
+            files: self.files.clone(),
+            types: self.types,
+        })
+    }
+
+    /// What `connection`'s subscriptions are told of this version.
+    pub(crate) fn for_connection(&self, connection: &ConnectionState) -> Option<Delta> {
+        if connection.index {
+            self.whole()
+        } else {
+            self.filtered(&connection.subscribed_assets, &connection.subscribed_paths)
+        }
     }
 }
 
-/// Group consecutive asset and path rows into per-version deltas.
-pub(crate) fn history_deltas(instance: StoreInstanceId, rows: &[ChangeEntry]) -> Vec<HistoryDelta> {
+/// The root holding the type files (`prefab_types::MARKER`), if one does.
+pub(crate) fn types_root(reader: &StoreReader) -> Result<Option<String>, StoreError> {
+    let rows = reader.observed_files_at(distill_schema::ngp_schema::prefab_types::MARKER)?;
+    Ok(rows.into_iter().next().map(|row| row.root_name))
+}
+
+/// Whether `rows` hold a source file change (reading the type-files root
+/// is needed only then).
+pub(crate) fn has_file_changes(rows: &[ChangeEntry]) -> bool {
+    rows.iter().any(|row| matches!(row.change, Change::File { .. }))
+}
+
+/// Group consecutive asset, path and file rows into per-version deltas. A
+/// file change under `types_root` marks its version's types changed.
+pub(crate) fn history_deltas(
+    instance: StoreInstanceId,
+    rows: &[ChangeEntry],
+    types_root: Option<&str>,
+) -> Vec<HistoryDelta> {
     let mut deltas: Vec<HistoryDelta> = Vec::new();
     for row in rows {
         let stamp = SnapshotStamp {
@@ -1294,6 +1347,8 @@ pub(crate) fn history_deltas(instance: StoreInstanceId, rows: &[ChangeEntry]) ->
                 stamp,
                 assets: Vec::new(),
                 paths: Vec::new(),
+                files: Vec::new(),
+                types: false,
             });
         }
         let delta = deltas.last_mut().expect("a delta was just pushed");
@@ -1303,7 +1358,29 @@ pub(crate) fn history_deltas(instance: StoreInstanceId, rows: &[ChangeEntry]) ->
                 Err(error) => tracing::error!(%error, "skipping a corrupt change-log row"),
             },
             Change::Path { path } => delta.paths.push(path.clone()),
-            _ => {}
+            Change::File { root, path, state } => {
+                let state = match delta_state(*state) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        tracing::error!(%error, "skipping a corrupt change-log row");
+                        continue;
+                    }
+                };
+                delta.types |= types_root == Some(root.as_str());
+                // A bundle file's change is its entries' (asset deltas).
+                if path.ends_with(".bundle") {
+                    continue;
+                }
+                match delta.files.iter_mut().find(|file| file.root == *root && file.path == *path) {
+                    Some(file) => file.state = state,
+                    None => delta.files.push(FileChange {
+                        root: root.clone(),
+                        path: path.clone(),
+                        state,
+                    }),
+                }
+            }
+            Change::ReconnectAll => {}
         }
     }
     deltas
@@ -1485,6 +1562,7 @@ impl Inner {
             fenced: false,
             subscribed_assets: BTreeSet::new(),
             subscribed_paths: BTreeSet::new(),
+            index: false,
             queue: VecDeque::new(),
             stream_installed: false,
             restart_serial: 0,
@@ -1564,6 +1642,18 @@ impl Inner {
         let Some(last) = rows.last().map(|row| row.seq) else {
             return;
         };
+        // Only an index subscription is told of type files.
+        let types_root = if connection.borrow().index && has_file_changes(&rows) {
+            match types_root(&self.reader) {
+                Ok(root) => root,
+                Err(error) => {
+                    tracing::error!(%error, "cannot read the type-files root");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let mut connection = connection.borrow_mut();
         let connection = &mut *connection;
         connection.seen_seq = last;
@@ -1576,24 +1666,20 @@ impl Inner {
                 version: row.version,
             };
             match &row.change {
-                Change::Asset { .. } | Change::Path { .. } => {
+                Change::Asset { .. } | Change::Path { .. } | Change::File { .. } => {
                     let start = index;
                     while index < rows.len()
                         && rows[index].version == row.version
-                        && matches!(
-                            rows[index].change,
-                            Change::Asset { .. } | Change::Path { .. }
-                        )
+                        && !matches!(rows[index].change, Change::ReconnectAll)
                     {
                         index += 1;
                     }
                     if connection.fenced {
                         continue;
                     }
-                    for delta in history_deltas(instance, &rows[start..index]) {
-                        if let Some(delta) = delta
-                            .filtered(&connection.subscribed_assets, &connection.subscribed_paths)
-                        {
+                    let deltas = history_deltas(instance, &rows[start..index], types_root.as_deref());
+                    for delta in deltas {
+                        if let Some(delta) = delta.for_connection(connection) {
                             connection.enqueue(StreamEvent::Delta(delta));
                         }
                     }

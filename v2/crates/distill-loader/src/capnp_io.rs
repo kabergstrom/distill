@@ -91,7 +91,7 @@ use distill_store::state::{InputVersion, SnapshotStamp};
 use tokio::task::{AbortHandle, LocalSet};
 
 use crate::admission::{FetchAdmission, Reservation};
-use crate::authoring::{AuthoringAnswer, AuthoringChange, AuthoringRequest};
+use crate::authoring::{AuthoringAnswer, AuthoringRequest, IndexChange};
 use crate::io::{
     AssetDeltaState, AssetPath, DriftedInput, IoEvent, LoaderIO, PathResolveResult,
     ReconnectReason, ReqId, ResolveResult, RuntimeTarget,
@@ -352,31 +352,20 @@ impl RpcIo {
         self.shared.authoring_answers.borrow_mut().remove(&ticket)
     }
 
-    /// Report changes of `uuid`'s authored entry ([`Self::take_authoring_changes`]).
-    /// Shares the connection's subscription with the loader: an asset
-    /// watched only here never reaches the loader's deltas.
-    pub fn watch_authoring(&mut self, uuid: AssetUuid) {
-        let mut subscriptions = self.shared.subscriptions.borrow_mut();
-        if subscriptions.authoring.insert(uuid) && !subscriptions.assets.contains(&uuid) {
-            drop(subscriptions);
+    /// Subscribe this connection's index (`Hub.subscribeIndex`, protocol
+    /// 30): every published version reaches [`Self::take_index_changes`]
+    /// whole, and the loader's own deltas are taken from the same stream.
+    /// Kept across reconnects; each new connection reports one resync.
+    pub fn subscribe_index(&mut self) {
+        if !std::mem::replace(&mut self.shared.subscriptions.borrow_mut().index, true) {
             let _local = self.local.enter();
-            self.shared.subscribe(vec![uuid], Vec::new());
+            self.shared.subscribe_index();
         }
     }
 
-    pub fn unwatch_authoring(&mut self, uuid: AssetUuid) {
-        let mut subscriptions = self.shared.subscriptions.borrow_mut();
-        if subscriptions.authoring.remove(&uuid) && !subscriptions.assets.contains(&uuid) {
-            drop(subscriptions);
-            let _local = self.local.enter();
-            self.shared.unsubscribe(vec![uuid], Vec::new());
-        }
-    }
-
-    /// Changes of watched entries since the last call, in stream order. After
-    /// a reconnect every watched entry is reported changed.
-    pub fn take_authoring_changes(&mut self) -> Vec<AuthoringChange> {
-        std::mem::take(&mut *self.shared.authoring_changes.borrow_mut())
+    /// Index changes since the last call, in stream order.
+    pub fn take_index_changes(&mut self) -> Vec<IndexChange> {
+        std::mem::take(&mut *self.shared.index_changes.borrow_mut())
     }
 
     /// What the last [`Self::step`] (or `poll`) did.
@@ -611,7 +600,7 @@ impl LoaderIO for RpcIo {
 
     fn subscribe(&mut self, uuid: AssetUuid) {
         let mut subscriptions = self.shared.subscriptions.borrow_mut();
-        if subscriptions.assets.insert(uuid) && !subscriptions.authoring.contains(&uuid) {
+        if subscriptions.assets.insert(uuid) {
             drop(subscriptions);
             let _local = self.local.enter();
             self.shared.subscribe(vec![uuid], Vec::new());
@@ -620,7 +609,7 @@ impl LoaderIO for RpcIo {
 
     fn unsubscribe(&mut self, uuid: AssetUuid) {
         let mut subscriptions = self.shared.subscriptions.borrow_mut();
-        if subscriptions.assets.remove(&uuid) && !subscriptions.authoring.contains(&uuid) {
+        if subscriptions.assets.remove(&uuid) {
             drop(subscriptions);
             let _local = self.local.enter();
             self.shared.unsubscribe(vec![uuid], Vec::new());
@@ -741,8 +730,8 @@ struct Shared {
     descriptions: RefCell<HashMap<u64, Result<TypeDescription, String>>>,
     /// Answers of `RpcIo::authoring` by ticket, until taken.
     authoring_answers: RefCell<HashMap<u64, Result<AuthoringAnswer, String>>>,
-    /// Changes of watched entries, until taken.
-    authoring_changes: RefCell<Vec<AuthoringChange>>,
+    /// Index changes, until taken.
+    index_changes: RefCell<Vec<IndexChange>>,
     next_description: Cell<u64>,
     /// Signalled whenever a snapshot refresh ends.
     refreshed: tokio::sync::Notify,
@@ -862,17 +851,15 @@ struct Subscriptions {
     /// The loader's.
     assets: BTreeSet<AssetUuid>,
     paths: BTreeSet<String>,
-    /// Watched authored entries (`RpcIo::watch_authoring`).
-    authoring: BTreeSet<AssetUuid>,
+    /// The connection's index is subscribed (`RpcIo::subscribe_index`):
+    /// the stream carries every delta, the loader's filtered from them.
+    index: bool,
 }
 
 impl Subscriptions {
-    /// What the connection subscribes: the loader's and the watched.
+    /// What the connection subscribes: the loader's.
     fn lists(&self) -> (Vec<AssetUuid>, Vec<String>) {
-        (
-            self.assets.union(&self.authoring).copied().collect(),
-            self.paths.iter().cloned().collect(),
-        )
+        (self.assets.iter().copied().collect(), self.paths.iter().cloned().collect())
     }
 }
 
@@ -960,7 +947,7 @@ impl Shared {
             import_failures_changed: Cell::new(false),
             descriptions: RefCell::new(HashMap::new()),
             authoring_answers: RefCell::new(HashMap::new()),
-            authoring_changes: RefCell::new(Vec::new()),
+            index_changes: RefCell::new(Vec::new()),
             next_description: Cell::new(1),
             refreshed: tokio::sync::Notify::new(),
             next_serial: Cell::new(1),
@@ -1081,6 +1068,9 @@ impl Shared {
         if !removed_assets.is_empty() || !removed_paths.is_empty() {
             self.unsubscribe(removed_assets, removed_paths);
         }
+        if self.subscriptions.borrow().index {
+            self.subscribe_index();
+        }
         self.spawn_control(maintain(Rc::clone(self), connection));
         basis
     }
@@ -1143,6 +1133,29 @@ impl Shared {
             match connection.hub.subscribe(since, assets, paths).await {
                 Ok(RemoteCall::Success(subscription)) => {
                     // The connection carries one stream for every subscription.
+                    if !connection.stream_installed.replace(true) {
+                        let stream =
+                            delta_stream(Rc::clone(&shared), Rc::clone(&connection), subscription);
+                        shared.spawn_control(stream);
+                    }
+                }
+                Ok(call) => shared.push_connection(&connection, connection_event(call)),
+                Err(_) => shared.push_connection(&connection, connection_lost()),
+            }
+        });
+    }
+
+    /// Subscribe the current connection's index; with none, the next
+    /// connection does. Must run inside the `LocalSet`.
+    fn subscribe_index(self: &Rc<Self>) {
+        let Some(connection) = self.connection() else {
+            return;
+        };
+        let since = self.snapshots.borrow().subscription_cursor();
+        let shared = Rc::clone(self);
+        self.spawn_control(async move {
+            match connection.hub.subscribe_index(since).await {
+                Ok(RemoteCall::Success(subscription)) => {
                     if !connection.stream_installed.replace(true) {
                         let stream =
                             delta_stream(Rc::clone(&shared), Rc::clone(&connection), subscription);
@@ -1272,7 +1285,7 @@ async fn delta_stream(
         match subscription.next().await {
             Ok(Some(event)) => {
                 let (events, changes) = stream_events(event, &shared.subscriptions.borrow());
-                shared.authoring_changes.borrow_mut().extend(changes);
+                shared.index_changes.borrow_mut().extend(changes);
                 let newest = events
                     .iter()
                     .filter_map(|event| match event {
@@ -1352,12 +1365,9 @@ async fn rebind(shared: Rc<Shared>, target: RuntimeTarget) {
                 let basis = shared.commit(opened);
                 // Changes while disconnected are unknown.
                 let version = basis.rpc_snapshot().map_or(InputVersion(0), |stamp| stamp.version);
-                let watched = shared.subscriptions.borrow().authoring.clone();
-                shared.authoring_changes.borrow_mut().extend(watched.into_iter().map(|uuid| AuthoringChange {
-                    uuid,
-                    version,
-                    deleted: false,
-                }));
+                if shared.subscriptions.borrow().index {
+                    shared.index_changes.borrow_mut().push(IndexChange::resync(version));
+                }
                 shared.push(IoEvent::TargetBound { target, basis });
                 return;
             }
@@ -1750,43 +1760,56 @@ fn connect_request(target: &str, binding: &RuntimeTarget) -> ConnectRequest {
     )
 }
 
-/// The loader's events of one stream event, and the changes of watched
-/// authored entries it names. An asset only watched for authoring is not
-/// the loader's.
-fn stream_events(event: StreamEvent, subscriptions: &Subscriptions) -> (Vec<IoEvent>, Vec<AuthoringChange>) {
+/// The loader's events of one stream event, and the index changes it
+/// tells. With the index subscribed the stream carries every delta: the
+/// loader's are the assets and paths it subscribed.
+fn stream_events(event: StreamEvent, subscriptions: &Subscriptions) -> (Vec<IoEvent>, Vec<IndexChange>) {
     let mut changes = Vec::new();
     let mut delta = |delta: distill_rpc::Delta| {
-        let version = delta.basis.snapshot.version;
-        let mut assets = Vec::with_capacity(delta.assets.len());
-        for (asset, state) in delta.assets {
-            let state = delta_state(state);
-            if subscriptions.authoring.contains(&asset) {
-                changes.push(AuthoringChange {
-                    uuid: asset,
-                    version,
-                    deleted: state == AssetDeltaState::Deleted,
-                });
-                if !subscriptions.assets.contains(&asset) {
-                    continue;
-                }
-            }
-            assets.push((asset, state));
+        if subscriptions.index {
+            changes.push(IndexChange {
+                version: delta.basis.snapshot.version,
+                entries: delta
+                    .assets
+                    .iter()
+                    .map(|(asset, state)| (*asset, *state == distill_rpc::AssetDeltaState::Deleted))
+                    .collect(),
+                files: delta
+                    .files
+                    .iter()
+                    .map(|file| {
+                        let deleted = file.state == distill_rpc::AssetDeltaState::Deleted;
+                        (file.root.clone(), file.path.clone(), deleted)
+                    })
+                    .collect(),
+                types: delta.types,
+                resync: false,
+            });
         }
-        IoEvent::Delta {
+        let assets = delta
+            .assets
+            .into_iter()
+            .filter(|(asset, _)| subscriptions.assets.contains(asset))
+            .map(|(asset, state)| (asset, delta_state(state)))
+            .collect::<Vec<_>>();
+        let paths = delta
+            .paths
+            .into_iter()
+            .filter(|path| subscriptions.paths.contains(path))
+            .collect::<Vec<_>>();
+        (!assets.is_empty() || !paths.is_empty()).then_some(IoEvent::Delta {
             stamp: delta.basis.snapshot,
             assets,
-            paths: delta.paths,
-        }
+            paths,
+        })
     };
     let events = match event {
-        StreamEvent::InitialDelta { deltas, .. } => deltas.into_iter().map(&mut delta).collect(),
-        StreamEvent::Delta(value) => vec![delta(value)],
+        StreamEvent::InitialDelta { deltas, .. } => deltas.into_iter().filter_map(&mut delta).collect(),
+        StreamEvent::Delta(value) => delta(value).into_iter().collect(),
         StreamEvent::ResyncRequired { basis, .. } => {
-            changes.extend(subscriptions.authoring.iter().map(|&uuid| AuthoringChange {
-                uuid,
-                version: basis.snapshot.version,
-                deleted: false,
-            }));
+            if subscriptions.index {
+                changes.push(IndexChange::resync(basis.snapshot.version));
+            }
             vec![IoEvent::Delta {
                 stamp: basis.snapshot,
                 assets: subscriptions

@@ -101,19 +101,23 @@ pub enum Change {
     Path { path: String },
     /// The pipeline changed: every connection must reconnect.
     ReconnectAll,
+    /// A source file under `root` the scan found added or changed
+    /// (`state` 0) or removed (1).
+    File { root: String, path: String, state: u8 },
 }
 
 const CHANGE_ASSET: i64 = 1;
 const CHANGE_PATH: i64 = 2;
 const CHANGE_RECONNECT_ALL: i64 = 3;
+const CHANGE_FILE: i64 = 4;
 
 /// Asset `?1`'s published deltas with `?2 < version <= ?3`, on the asset
 /// deltas' partial index (kind literal: [`CHANGE_ASSET`]).
-pub(crate) const ASSET_HISTORY: &str = "SELECT seq, version, kind, asset_uuid, state, subject
+pub(crate) const ASSET_HISTORY: &str = "SELECT seq, version, kind, asset_uuid, state, subject, root
      FROM change_log WHERE kind = 1 AND asset_uuid = ?1 AND version > ?2 AND version <= ?3";
 /// Path `?1`'s published deltas with `?2 < version <= ?3`, on the path
 /// deltas' partial index (kind literal: [`CHANGE_PATH`]).
-pub(crate) const PATH_HISTORY: &str = "SELECT seq, version, kind, asset_uuid, state, subject
+pub(crate) const PATH_HISTORY: &str = "SELECT seq, version, kind, asset_uuid, state, subject, root
      FROM change_log WHERE kind = 2 AND subject = ?1 AND version > ?2 AND version <= ?3";
 const _: () = assert!(CHANGE_ASSET == 1 && CHANGE_PATH == 2);
 
@@ -457,10 +461,27 @@ impl StoreReader {
     /// Change-log rows after `seq`, oldest first.
     pub fn change_log_after(&self, seq: i64) -> Result<Vec<ChangeEntry>, StoreError> {
         let mut statement = self.conn.prepare_cached(
-            "SELECT seq, version, kind, asset_uuid, state, subject
+            "SELECT seq, version, kind, asset_uuid, state, subject, root
              FROM change_log WHERE seq > ?1 ORDER BY seq",
         )?;
         let rows = statement.query_map([seq], change_entry_row)?;
+        rows.collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+    }
+
+    /// Every change-log row with `since < version <= upto`, oldest first:
+    /// an index subscriber's history, one search of `change_log_by_version`.
+    pub fn change_log_window(
+        &self,
+        since: InputVersion,
+        upto: InputVersion,
+    ) -> Result<Vec<ChangeEntry>, StoreError> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT seq, version, kind, asset_uuid, state, subject, root
+             FROM change_log WHERE version > ?1 AND version <= ?2 ORDER BY seq",
+        )?;
+        let rows = statement.query_map([since.0 as i64, upto.0 as i64], change_entry_row)?;
         rows.collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
@@ -545,6 +566,7 @@ fn change_entry_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ChangeEn
     let asset: Option<Vec<u8>> = row.get(3)?;
     let state: Option<i64> = row.get(4)?;
     let subject: Option<String> = row.get(5)?;
+    let root: Option<String> = row.get(6)?;
     let corrupt = || {
         StoreError::Sqlite(rusqlite::Error::InvalidColumnType(
             2,
@@ -559,6 +581,14 @@ fn change_entry_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ChangeEn
         },
         (CHANGE_PATH, _, _, Some(path)) => Change::Path { path },
         (CHANGE_RECONNECT_ALL, _, _, _) => Change::ReconnectAll,
+        (CHANGE_FILE, _, Some(state), Some(path)) => match root {
+            Some(root) => Change::File {
+                root,
+                path,
+                state: state as u8,
+            },
+            None => return Ok(Err(corrupt())),
+        },
         _ => return Ok(Err(corrupt())),
     };
     Ok(Ok(ChangeEntry {
@@ -606,6 +636,11 @@ pub trait ServedWrite {
             Change::ReconnectAll => conn
                 .prepare_cached(APPEND_RECONNECT_ALL)?
                 .execute(rusqlite::params![version, CHANGE_RECONNECT_ALL])?,
+            Change::File { root, path, state } => conn
+                .prepare_cached(
+                    "INSERT INTO change_log(version, kind, state, subject, root) VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?
+                .execute(rusqlite::params![version, CHANGE_FILE, *state as i64, path, root])?,
         };
         Ok(())
     }

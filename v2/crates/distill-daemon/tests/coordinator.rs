@@ -1688,7 +1688,7 @@ fn restart_required_is_told_as_it_changes_and_clears() {
 
 /// The change log holds only real changes: the first publication on an
 /// empty store logs nothing (no client holds the version before it), and a
-/// full rescan logs only the assets and paths that changed.
+/// full rescan logs only the assets, paths and files that changed.
 #[test]
 fn a_full_rescan_logs_only_what_changed() {
     use distill_store::served::Change;
@@ -1726,12 +1726,21 @@ fn a_full_rescan_logs_only_what_changed() {
         .unwrap()
         .version;
     assert_eq!(edit, InputVersion(2));
+    // The edited file is logged for index subscribers (protocol 30).
+    let file = |path: &str, state| Change::File {
+        root: "main".to_owned(),
+        path: path.to_owned(),
+        state,
+    };
     assert_eq!(
         log(edit),
-        [Change::Asset {
-            asset: edited_asset,
-            state: 0
-        }]
+        [
+            file("edited.bundle", 0),
+            Change::Asset {
+                asset: edited_asset,
+                state: 0
+            }
+        ]
     );
 
     std::fs::remove_file(assets.join("kept.bundle")).unwrap();
@@ -1742,6 +1751,7 @@ fn a_full_rescan_logs_only_what_changed() {
     assert_eq!(
         log(removal),
         [
+            file("kept.bundle", 1),
             Change::Asset {
                 asset: kept_asset,
                 state: 1
@@ -1861,4 +1871,160 @@ fn type_descriptions_read_the_type_files_at_the_snapshot() {
         RpcResult::Success(DescribeTypeResult::Drifted { input: DriftedInput::File(path), .. })
             if path == description_file
     ));
+}
+
+/// GAP 23 §15.4: an index subscription is told every version whole, with
+/// the source files the scan saw change (bundle files are their entries')
+/// and whether a type file changed; history replays from its cursor, a
+/// filtered subscription sees neither files nor types, and `listEntries`
+/// answers the rows a delta names.
+#[test]
+fn an_index_subscription_is_told_every_entry_file_and_type_change() {
+    use distill_rpc::{AssetDeltaState, FileChange};
+    use distill_schema::ngp_schema::prefab_types;
+
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    let types = temp.path().join("types");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::create_dir_all(&types).unwrap();
+    let (first_bytes, _, first_asset) = ordinary_bundle();
+    let (second_bytes, _, second_asset) = ordinary_bundle_with(83, 82, 8);
+    let first_path = assets.join("first.bundle");
+    std::fs::write(&first_path, first_bytes).unwrap();
+    std::fs::write(assets.join("second.bundle"), second_bytes).unwrap();
+    std::fs::write(assets.join("notes.txt"), "one").unwrap();
+    std::fs::write(types.join(prefab_types::MARKER), "").unwrap();
+    std::fs::write(types.join(prefab_types::INDEX), "{}").unwrap();
+    let coordinator = DaemonCoordinator::open(
+        StoreConfig::new(temp.path().join(".distill")),
+        vec![AssetRoot::new("main", &assets), AssetRoot::new("types", &types)],
+        vec![target()],
+        64,
+    )
+    .unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    let startup = coordinator.reconcile_full_scan(&mut writer).unwrap();
+    let connect = || match coordinator
+        .server()
+        .root()
+        .connect(ConnectRequest::new("dev", TargetDefinitionHash([4; 32])))
+    {
+        ConnectOutcome::Connected(connected) => connected.hub,
+        outcome => panic!("target connection failed: {outcome:?}"),
+    };
+    let hub = connect();
+    let index = hub.subscribe_index(startup.version).success().unwrap();
+    assert!(matches!(
+        index.deltas.next(),
+        Some(StreamEvent::InitialDelta { deltas, .. }) if deltas.is_empty()
+    ));
+    let filtered_hub = connect();
+    let filtered = filtered_hub
+        .subscribe(startup.version, vec![first_asset], vec![])
+        .success()
+        .unwrap();
+    assert!(matches!(filtered.deltas.next(), Some(StreamEvent::InitialDelta { .. })));
+
+    // One version: an entry, two source files and a type file.
+    let mut edited = distill_bundle::parse_bundle(&std::fs::read(&first_path).unwrap()).unwrap();
+    edited.assets.get_mut("entry").unwrap().data = Value::U8(9);
+    std::fs::write(&first_path, distill_bundle::write_bundle(&edited).unwrap()).unwrap();
+    std::fs::write(assets.join("notes.txt"), "two").unwrap();
+    std::fs::write(assets.join("new.txt"), "new").unwrap();
+    std::fs::write(types.join(prefab_types::INDEX), "{\"types\": []}").unwrap();
+    let edit = coordinator
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![
+                    first_path.clone(),
+                    assets.join("notes.txt"),
+                    assets.join("new.txt"),
+                    types.join(prefab_types::INDEX),
+                ],
+                renames: Vec::new(),
+            },
+        )
+        .unwrap();
+    let file = |root: &str, path: &str, state| FileChange {
+        root: root.to_owned(),
+        path: path.to_owned(),
+        state,
+    };
+    let Some(StreamEvent::Delta(delta)) = index.deltas.next() else {
+        panic!("the index subscription is told the edit");
+    };
+    assert_eq!(delta.basis.snapshot.version, edit.version);
+    assert_eq!(delta.assets, vec![(first_asset, AssetDeltaState::Changed)]);
+    let mut files = delta.files.clone();
+    files.sort_by(|a, b| (&a.root, &a.path).cmp(&(&b.root, &b.path)));
+    assert_eq!(
+        files,
+        vec![
+            file("main", "new.txt", AssetDeltaState::Changed),
+            file("main", "notes.txt", AssetDeltaState::Changed),
+            file("types", prefab_types::INDEX, AssetDeltaState::Changed),
+        ]
+    );
+    assert!(delta.types);
+    assert!(index.deltas.next().is_none());
+    assert!(matches!(
+        filtered.deltas.next(),
+        Some(StreamEvent::Delta(Delta { assets, files, types: false, .. }))
+            if assets == vec![(first_asset, AssetDeltaState::Changed)] && files.is_empty()
+    ));
+
+    // A removed source file, nothing else.
+    std::fs::remove_file(assets.join("new.txt")).unwrap();
+    let removal = coordinator
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![assets.join("new.txt")],
+                renames: Vec::new(),
+            },
+        )
+        .unwrap();
+    let Some(StreamEvent::Delta(delta)) = index.deltas.next() else {
+        panic!("the index subscription is told the removal");
+    };
+    assert_eq!(delta.basis.snapshot.version, removal.version);
+    assert!(delta.assets.is_empty());
+    assert_eq!(delta.files, vec![file("main", "new.txt", AssetDeltaState::Deleted)]);
+    assert!(!delta.types);
+    assert!(filtered.deltas.next().is_none(), "a filtered subscription is not told files");
+
+    // A late index subscriber replays both versions from its cursor.
+    let late_hub = connect();
+    let late = late_hub.subscribe_index(startup.version).success().unwrap();
+    let Some(StreamEvent::InitialDelta { deltas, .. }) = late.deltas.next() else {
+        panic!("the late subscriber is told its history");
+    };
+    assert_eq!(
+        deltas.iter().map(|delta| delta.basis.snapshot.version).collect::<Vec<_>>(),
+        vec![edit.version, removal.version]
+    );
+    assert!(deltas[0].types && !deltas[1].types);
+
+    // The rows a delta names; an unknown entry has none.
+    let authoring = hub.authoring_snapshot().success().unwrap();
+    let rows = authoring
+        .list_entries(&[second_asset, AssetUuid([0xEE; 16]), first_asset])
+        .success()
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(|row| (row.uuid, row.normalized_path.as_str())).collect::<Vec<_>>(),
+        vec![(first_asset, "first.bundle"), (second_asset, "second.bundle")]
+    );
+    let all = authoring
+        .list(distill_rpc::AssetQuery {
+            path_glob: Some("**".to_owned()),
+            ..Default::default()
+        })
+        .success()
+        .unwrap();
+    for row in &rows {
+        assert!(all.contains(row), "listEntries answers as list does: {row:?}");
+    }
 }

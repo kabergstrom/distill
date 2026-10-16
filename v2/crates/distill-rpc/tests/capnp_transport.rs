@@ -2840,3 +2840,71 @@ async fn inspect_batches_by_bundle_and_blobs_travel_by_reference() {
         })
         .await;
 }
+
+/// Protocol 30 over the wire: `subscribeIndex` installs the connection's
+/// stream, whose deltas carry source files; `listEntries` answers rows.
+#[tokio::test(flavor = "current_thread")]
+async fn capnp_index_subscription_carries_files_and_list_entries_answers_rows() {
+    LocalSet::new()
+        .run_until(async {
+            let mut project = project();
+            let server = project.server();
+            let asset = AssetUuid([46; 16]);
+            let bundle = |value: u8| [Asset::uint("entry", asset, TypeUuid([1; 16]), value)];
+            project.write_bundle("assets/indexed.bundle", BundleUuid([47; 16]), Some("entry"), &bundle(1));
+            let stamp = project.publish();
+            let listener = Rc::new(StagedListener::bind(server.root(), "127.0.0.1:0").await.unwrap());
+            let address = listener.local_addr().unwrap();
+            let server_listener = Rc::clone(&listener);
+            let server_task = tokio::task::spawn_local(async move { server_listener.serve_one().await });
+            let client = CapnpClient::connect_local(address).await.unwrap();
+            let hub = RemoteHub::connected(client.connect(&request()).await.unwrap()).unwrap();
+
+            let mut index = match hub.subscribe_index(stamp.version).await.unwrap() {
+                RemoteCall::Success(subscription) => subscription,
+                other => panic!("index subscription failed: {other:?}"),
+            };
+            assert!(matches!(
+                index.next().await.unwrap(),
+                Some(StreamEvent::InitialDelta { deltas, .. }) if deltas.is_empty()
+            ));
+            project.write_bundle("assets/indexed.bundle", BundleUuid([47; 16]), Some("entry"), &bundle(2));
+            project.write("assets/notes.txt", "notes");
+            let edit = project.publish();
+            let Some(StreamEvent::Delta(delta)) = index.next().await.unwrap() else {
+                panic!("the index subscription is told the edit");
+            };
+            assert_eq!(delta.basis.snapshot, edit);
+            assert_eq!(delta.assets, vec![(asset, AssetDeltaState::Changed)]);
+            assert_eq!(
+                delta.files,
+                vec![FileChange {
+                    root: ROOT.to_owned(),
+                    path: "assets/notes.txt".to_owned(),
+                    state: AssetDeltaState::Changed,
+                }]
+            );
+            assert!(!delta.types);
+
+            let authoring = match hub.authoring_snapshot().await.unwrap() {
+                RemoteCall::Success(authoring) => authoring,
+                other => panic!("authoring snapshot failed: {other:?}"),
+            };
+            let rows = match authoring.list_entries(&[asset, AssetUuid([0xEE; 16])]).await.unwrap() {
+                RemoteCall::Success(rows) => rows,
+                other => panic!("listEntries failed: {other:?}"),
+            };
+            assert_eq!(
+                rows.iter().map(|row| (row.uuid, row.normalized_path.as_str())).collect::<Vec<_>>(),
+                vec![(asset, "assets/indexed.bundle")]
+            );
+
+            drop(client);
+            tokio::time::timeout(std::time::Duration::from_secs(2), server_task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        })
+        .await;
+}
