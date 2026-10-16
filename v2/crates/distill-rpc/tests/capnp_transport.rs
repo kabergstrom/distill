@@ -2729,6 +2729,8 @@ async fn browsing_calls_round_trip_over_tcp() {
                 origin: BundleOrigin::Authored,
                 // A bundle's one runtime entry is its primary.
                 primary: entry.role == AuthoringEntryRole::Runtime,
+                // The key the daemon published is the carried value's.
+                content: content_key_of(entry.schema_hash, &entry.value),
             };
             assert_eq!(rows, [row(&control), row(&runtime)]);
             let runtime_only = AssetQuery { authoring_only: Some(false), ..all.clone() };

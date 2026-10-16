@@ -2577,6 +2577,8 @@ pub fn decode_authoring_inspection(
         origin: decode_bundle_origin(value.get_origin()?, "authoringInspection.origin")?,
         type_name: decode_text(value.get_type_name()?, "authoringInspection.typeName")
             .map_err(|error| capnp::Error::failed(error.message))?,
+        content: decode_hash(value.get_content()?, "authoringInspection.content")
+            .map_err(|error| capnp::Error::failed(error.message))?,
     })
 }
 
@@ -3442,6 +3444,7 @@ fn write_authoring_list_result(
                 wire.set_type_name(row.type_name.as_str());
                 wire.set_role(wire_authoring_role(row.role));
                 wire.set_primary(row.primary);
+                wire.set_content(&row.content);
                 write_bundle_origin(wire.init_origin(), &row.origin);
             }
         }
@@ -3579,6 +3582,7 @@ pub fn decode_authoring_rows(
             },
             origin,
             primary: row.get_primary(),
+            content: decode_hash(row.get_content()?, "authoringRow.content").map_err(failed)?,
         });
     }
     Ok(out)
@@ -3822,6 +3826,7 @@ fn write_authoring_inspection(
     output.set_role(wire_authoring_role(inspection.role));
     output.set_root(inspection.root.as_str());
     output.set_type_name(inspection.type_name.as_str());
+    output.set_content(&inspection.content);
     write_bundle_origin(output.reborrow().init_origin(), &inspection.origin);
     write_authoring_value(output.init_value(), &inspection.value);
 }

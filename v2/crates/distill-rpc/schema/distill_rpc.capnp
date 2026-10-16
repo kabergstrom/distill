@@ -689,6 +689,8 @@ struct AuthoringInspection {
   # The bundle's origin and the type's served schema path (protocol 23).
   origin @11 :BundleOrigin;
   typeName @12 :Text;
+  # The entry's authoring content key (protocol 29).
+  content @13 :Data;
 }
 
 struct AuthoringRoleFailure {
@@ -887,6 +889,9 @@ struct AuthoringRow {
   # The bundle's primary asset: what a reference to the bundle's path
   # without a name resolves to.
   primary @9 :Bool;
+  # The entry's authoring content key: equal keys, equal values (§17
+  # "Content keys"; protocol 29).
+  content @10 :Data;
 }
 
 struct AuthoringListCall {

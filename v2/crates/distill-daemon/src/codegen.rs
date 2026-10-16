@@ -1022,6 +1022,7 @@ mod tests {
                         authoring_only: false,
                         tags: BTreeMap::new(),
                         terminal_type: None,
+                        content: None,
                     })?;
                     Ok(root)
                 })
@@ -1293,6 +1294,7 @@ mod query_tests {
                             authoring_only,
                             tags,
                             terminal_type: None,
+                            content: None,
                         })?;
                     }
                 }

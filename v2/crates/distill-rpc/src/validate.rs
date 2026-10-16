@@ -494,6 +494,72 @@ fn carried_value(
     })
 }
 
+/// The content key of an authored entry (§17 "Content keys"): blake3 over
+/// its schema hash, its canonical value text, its blob refs in table order
+/// and the UUID and schema hash of each type its dynamic values name. Equal
+/// keys mean equal values. [`content_key_of`] keys a carried value the
+/// same way.
+pub fn content_key(
+    schema_hash: LogicalHash,
+    schema: &SchemaNode,
+    value: &Value,
+    types: &TypeTable,
+) -> Result<[u8; 32], String> {
+    struct Refs(Vec<BlobRef>);
+    impl BlobSink for Refs {
+        fn place(&mut self, _: &[PathComponent], blob: &[u8]) -> Result<(u64, u64), String> {
+            self.0.push(BlobRef::of(blob));
+            Ok((blob.len() as u64, self.0.len() as u64 - 1))
+        }
+    }
+    let mut refs = Refs(Vec::new());
+    let text = write_value(
+        schema,
+        value,
+        WriteOptions {
+            blobs: Some(&mut refs),
+            types: Some(&mut &*types),
+        },
+    )
+    .map_err(|error| format!("cannot write authored value: {}", error.render("data")))?;
+    let mut named = BTreeSet::new();
+    distill_schema::ngp_schema::dynamic_type_uuids(value, &mut named);
+    let mut carried = Vec::with_capacity(named.len());
+    for ty in types.subset(&named)?.types() {
+        let hash = distill_schema::ngp_schema::node_hash(&ty.schema.root)
+            .map_err(|error| format!("cannot hash the schema of {}: {error}", ty.path))?;
+        carried.push((ty.uuid, hash));
+    }
+    Ok(key_of(schema_hash, &text, &refs.0, carried))
+}
+
+/// [`content_key`] of a carried value: its text, its blobs' refs and its
+/// carried types as they are.
+pub fn content_key_of(schema_hash: LogicalHash, value: &AuthoringValue) -> [u8; 32] {
+    let refs: Vec<BlobRef> = value.blobs.iter().map(AuthoringBlob::blob_ref).collect();
+    let carried = value.types.iter().map(|ty| (ty.type_uuid, ty.schema_hash)).collect();
+    key_of(schema_hash, &String::from_utf8_lossy(&value.canonical_value), &refs, carried)
+}
+
+fn key_of(schema_hash: LogicalHash, text: &str, refs: &[BlobRef], mut carried: Vec<(TypeUuid, LogicalHash)>) -> [u8; 32] {
+    carried.sort();
+    let mut hasher = blake3::Hasher::new_derive_key("distill authoring content key v1");
+    hasher.update(&schema_hash.0);
+    hasher.update(&(text.len() as u64).to_le_bytes());
+    hasher.update(text.as_bytes());
+    hasher.update(&(refs.len() as u64).to_le_bytes());
+    for blob in refs {
+        hasher.update(&blob.len.to_le_bytes());
+        hasher.update(&blob.hash);
+    }
+    hasher.update(&(carried.len() as u64).to_le_bytes());
+    for (uuid, hash) in carried {
+        hasher.update(&uuid.0);
+        hasher.update(&hash.0);
+    }
+    *hasher.finalize().as_bytes()
+}
+
 /// Complete an importer-settings patch from `defaults`, the importer's
 /// default settings, into a whole value: a field the patch leaves out takes
 /// the default's, a present struct field is completed the same way, and a

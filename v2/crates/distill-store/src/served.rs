@@ -53,6 +53,9 @@ pub struct ServedEntryMeta {
     pub terminal_type: TypeUuid,
     pub logical_hash: LogicalHash,
     pub authoring_only: bool,
+    /// The authoring content key (§17 "Content keys"); zero for a row
+    /// published without one.
+    pub content: [u8; 32],
     pub tags: BTreeMap<String, Option<String>>,
 }
 
@@ -203,7 +206,7 @@ impl Drop for StoreSnapshot {
 }
 
 const SERVED_ENTRY_COLUMNS: &str = "a.asset_uuid, a.bundle_uuid, a.local_id, b.path, a.type_uuid,
-     a.terminal_type, a.logical_hash, a.authoring_only";
+     a.terminal_type, a.logical_hash, a.authoring_only, a.content";
 macro_rules! served_entry_where {
     () => {
         "a.terminal_type IS NOT NULL AND a.logical_hash IS NOT NULL AND b.poison IS NULL"
@@ -232,6 +235,7 @@ fn served_entry_meta_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServedEntr
         terminal_type: TypeUuid(blob16(row.get(5)?)),
         logical_hash: LogicalHash(blob32(row.get(6)?)),
         authoring_only: row.get::<_, i64>(7)? != 0,
+        content: row.get::<_, Option<Vec<u8>>>(8)?.map(blob32).unwrap_or([0; 32]),
         tags: BTreeMap::new(),
     })
 }

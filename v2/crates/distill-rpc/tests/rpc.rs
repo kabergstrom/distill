@@ -3323,3 +3323,43 @@ fn a_commit_logs_the_assets_whose_builds_read_what_changed() {
         [read, reader].map(|asset| Change::Asset { asset, state: 0 })
     );
 }
+
+/// An entry's content key (§17 "Content keys", protocol 29) is the same on
+/// its row and its inspection and the carried value's, stays across
+/// versions that leave the entry alone, and changes with its value.
+#[test]
+fn content_keys_follow_values_not_versions() {
+    let mut project = project();
+    let server = project.server();
+    let a = authoring_entry(1, AuthoringEntryRole::Runtime);
+    let b = authoring_entry(2, AuthoringEntryRole::Runtime);
+    write_entry(&mut project, &a);
+    publish_entry(&mut project, &b);
+    let hub = connect(&server, &[]);
+    let keys = || -> BTreeMap<AssetUuid, [u8; 32]> {
+        let snapshot = authoring_snapshot(&hub);
+        let rows = match snapshot.list(AssetQuery { path_glob: Some("**".into()), ..AssetQuery::default() }) { RpcResult::Success(rows) => rows, other => panic!("list: {other:?}") };
+        for row in &rows {
+            match snapshot.inspect_one(row.uuid).success().unwrap() {
+                AuthoringInspectResult::Inspection(inspection) => assert_eq!(inspection.content, row.content),
+                other => panic!("expected an inspection, got {other:?}"),
+            }
+        }
+        rows.into_iter().map(|row| (row.uuid, row.content)).collect()
+    };
+    let first = keys();
+    assert_eq!(first[&a.uuid], content_key_of(a.schema_hash, &a.value));
+    assert_ne!(first[&a.uuid], first[&b.uuid]);
+
+    publish_unrelated(&mut project);
+    let second = keys();
+    assert_eq!((second[&a.uuid], second[&b.uuid]), (first[&a.uuid], first[&b.uuid]));
+
+    let mut edited = a.clone();
+    edited.value.blobs = vec![AuthoringBlob::Bytes(Arc::from([0xAA]))];
+    publish_entry(&mut project, &edited);
+    let third = keys();
+    assert_eq!(third[&a.uuid], content_key_of(edited.schema_hash, &edited.value));
+    assert_ne!(third[&a.uuid], first[&a.uuid]);
+    assert_eq!(third[&b.uuid], first[&b.uuid]);
+}

@@ -78,6 +78,7 @@ fn asset_record(asset_n: u8, bundle_n: u8, tags: &[&str]) -> AssetRecord {
         authoring_only: false,
         tags: tags.iter().map(|tag| ((*tag).to_owned(), None)).collect(),
         terminal_type: None,
+        content: None,
     }
 }
 

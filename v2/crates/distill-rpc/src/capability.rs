@@ -700,6 +700,7 @@ fn inspect_entry(
         root: read.root.clone(),
         origin: read.origin,
         type_name,
+        content: meta.content,
     }))
 }
 
@@ -806,6 +807,7 @@ fn list_rows(
             role: entry_role(entry.authoring_only),
             origin,
             primary,
+            content: entry.content,
         });
     }
     rows.sort_by(|a, b| {
@@ -2973,6 +2975,7 @@ mod query_tests {
                             authoring_only,
                             tags,
                             terminal_type: Some(if index % 2 == 0 { GPU_MESH } else { TEXTURE }),
+                            content: None,
                         })?;
                     }
                 }

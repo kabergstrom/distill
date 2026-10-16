@@ -55,7 +55,10 @@ pub use distill_store::state::{
 /// blob its bundle holds by reference. `AuthoringSnapshot.inspect` takes a
 /// list of entries (one snapshot, each bundle read once); `blob` streams an
 /// entry's blob bytes.
-pub const PROTOCOL_VERSION: u32 = 28;
+/// 29 (GAP 23 §15.3): `AuthoringRow` and `AuthoringInspection` carry the
+/// entry's `content` key (blake3 over schema hash, canonical text, blob
+/// refs and carried types; [`crate::content_key`]).
+pub const PROTOCOL_VERSION: u32 = 29;
 
 /// A watched import whose latest attempt failed. The bundle keeps serving its
 /// last good contents; the failure clears when a later import succeeds.
@@ -1254,6 +1257,8 @@ pub struct AuthoringInspection {
     pub origin: BundleOrigin,
     /// The type's path in the served schema; empty when unknown.
     pub type_name: String,
+    /// The entry's authoring content key, as its row's (protocol 29).
+    pub content: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1315,6 +1320,9 @@ pub struct AuthoringRow {
     /// The bundle's primary asset: what a reference to the bundle's path
     /// without a name resolves to.
     pub primary: bool,
+    /// The entry's authoring content key (§17 "Content keys"): equal keys
+    /// mean equal values.
+    pub content: [u8; 32],
 }
 
 /// The import layer claiming a source file (§8 "Default imports":

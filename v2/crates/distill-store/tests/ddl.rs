@@ -183,6 +183,7 @@ fn assets_row_shape() {
             "authoring_only",
             "logical_hash",
             "terminal_type",
+            "content",
             "tag_poison",
             "tag_module"
         ]

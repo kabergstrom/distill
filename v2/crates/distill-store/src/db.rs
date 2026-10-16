@@ -21,7 +21,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// and the remedy is [`Store::recreate`], which the daemon's writer runs on
 /// its own ([`Store::open_or_recreate`]); readers still fail. Migrations are
 /// deferred until Distill is declared stable (DESIGN.md §13).
-pub const SCHEMA_VERSION: u32 = 65;
+pub const SCHEMA_VERSION: u32 = 66;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -189,6 +189,10 @@ CREATE TABLE assets (
     -- not serve (skeleton rows, daemon-private rows). The authored value
     -- is read from the bundle file, verified against its published hash.
     terminal_type  BLOB,
+    -- The authoring content key (§17 'Content keys'): blake3 over the
+    -- entry's schema hash, canonical value text, blob refs and carried
+    -- types. NULL where `terminal_type` is.
+    content        BLOB,
     -- The asset's search tags (§10) as `asset_tags` holds them: NULL when
     -- they are its current-schema tags; otherwise why a tag query cannot
     -- answer from them ('tag indexing pending' until a refinement in the

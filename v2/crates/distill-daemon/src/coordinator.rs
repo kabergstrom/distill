@@ -2549,20 +2549,7 @@ fn publish_scan(
                 origin: summary.origin.clone(),
                 import_watched: summary.import_watched,
             };
-            let assets = bundle
-                .assets
-                .iter()
-                .map(|(local_id, entry)| AssetRecord {
-                    asset: entry.uuid,
-                    bundle: bundle.uuid,
-                    local_id: local_id.clone(),
-                    type_uuid: entry.type_uuid,
-                    logical_hash: entry.schema_hash,
-                    authoring_only: entry.authoring_only,
-                    tags: BTreeMap::new(),
-                    terminal_type: Some(projection.interface(entry.type_uuid).terminal),
-                })
-                .collect::<Vec<_>>();
+            let assets = asset_records(bundle, projection)?;
             let primary = bundle
                 .primary
                 .as_ref()
@@ -2924,17 +2911,8 @@ fn publish_claimed(
                 .iter()
                 .map(String::as_str),
         )?;
-        for (local_id, entry) in &bundle.assets {
-            transaction.upsert_pending_asset(&AssetRecord {
-                asset: entry.uuid,
-                bundle: bundle.uuid,
-                local_id: local_id.clone(),
-                type_uuid: entry.type_uuid,
-                logical_hash: entry.schema_hash,
-                authoring_only: entry.authoring_only,
-                tags: BTreeMap::new(),
-                terminal_type: Some(projection.interface(entry.type_uuid).terminal),
-            })?;
+        for asset in &asset_records(bundle, projection)? {
+            transaction.upsert_pending_asset(asset)?;
         }
         if let Some(primary) = &bundle.primary {
             transaction.set_primary_asset(bundle.uuid, bundle.assets[primary].uuid)?;
@@ -3421,6 +3399,35 @@ fn push_entry(
     Ok(())
 }
 
+/// The rows `bundle` publishes, one per entry, each with its authoring
+/// content key (§17 "Content keys").
+fn asset_records(bundle: &Bundle, projection: &PipelineProjection) -> Result<Vec<AssetRecord>, StoreError> {
+    let invalid = |error: String| StoreError::InvalidConfiguration { error };
+    let types = bundle.type_table().map_err(|error| invalid(error.to_string()))?;
+    bundle
+        .assets
+        .iter()
+        .map(|(local_id, entry)| {
+            let schema = bundle.schemas.get(&entry.schema_hash).ok_or_else(|| {
+                invalid(format!("bundle {} has no schema for entry {local_id:?}", bundle.uuid))
+            })?;
+            Ok(AssetRecord {
+                asset: entry.uuid,
+                bundle: bundle.uuid,
+                local_id: local_id.clone(),
+                type_uuid: entry.type_uuid,
+                logical_hash: entry.schema_hash,
+                authoring_only: entry.authoring_only,
+                tags: BTreeMap::new(),
+                terminal_type: Some(projection.interface(entry.type_uuid).terminal),
+                content: Some(
+                    distill_rpc::content_key(entry.schema_hash, &schema.root, &entry.data, &types).map_err(invalid)?,
+                ),
+            })
+        })
+        .collect()
+}
+
 fn rpc_entry(
     normalized_path: String,
     bundle: &Bundle,
@@ -3824,6 +3831,7 @@ mod publish_diff_tests {
                                 authoring_only: false,
                                 tags: BTreeMap::new(),
                                 terminal_type: None,
+                                content: None,
                             })?;
                         }
                         if entries > 0 && random.next(2) == 0 {

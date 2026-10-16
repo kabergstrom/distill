@@ -121,6 +121,7 @@ fn multi_table_input_transactions_are_all_or_nothing() {
                 logical_hash: LogicalHash([4u8; 32]),
                 authoring_only: false,
                 terminal_type: None,
+                content: None,
                 tags: std::collections::BTreeMap::from([("t".into(), None)]),
             })?;
             txn.register_tool(

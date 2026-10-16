@@ -126,6 +126,7 @@ fn populate(store: &mut Store, count: u32) {
                     authoring_only: false,
                     tags,
                     terminal_type: Some(RUNTIME_TYPE),
+                    content: None,
                 })?;
                 if index % 1000 == 3 {
                     txn.upsert_asset(&AssetRecord {
@@ -137,6 +138,7 @@ fn populate(store: &mut Store, count: u32) {
                         authoring_only: true,
                         tags: BTreeMap::new(),
                         terminal_type: None,
+                        content: None,
                     })?;
                 }
                 if index % 100 == 1 {
@@ -2560,7 +2562,7 @@ fn cas_and_served_point_statements_search_their_keys() {
             &["SEARCH a USING INDEX assets_by_local_id (local_id=?)", "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)"],
         ),
         (
-            "SELECT a.asset_uuid, a.bundle_uuid, a.local_id, b.path, a.type_uuid, a.terminal_type, a.logical_hash, a.authoring_only FROM assets a JOIN bundles b ON b.bundle_uuid = a.bundle_uuid WHERE a.terminal_type IS NOT NULL AND a.logical_hash IS NOT NULL AND b.poison IS NULL AND a.asset_uuid = ?",
+            "SELECT a.asset_uuid, a.bundle_uuid, a.local_id, b.path, a.type_uuid, a.terminal_type, a.logical_hash, a.authoring_only, a.content FROM assets a JOIN bundles b ON b.bundle_uuid = a.bundle_uuid WHERE a.terminal_type IS NOT NULL AND a.logical_hash IS NOT NULL AND b.poison IS NULL AND a.asset_uuid = ?",
             &["SEARCH a USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)", "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)"],
         ),
         (

@@ -90,6 +90,9 @@ pub struct AssetRecord {
     /// The terminal type of an entry the RPC namespace serves (see
     /// [`crate::served`]); `None` for a row it does not serve.
     pub terminal_type: Option<TypeUuid>,
+    /// The entry's authoring content key (§17 "Content keys"); `None` where
+    /// `terminal_type` is.
+    pub content: Option<[u8; 32]>,
 }
 
 /// The fully validated, complete namespace skeleton a malformed file's
@@ -162,8 +165,8 @@ pub(crate) const INSERT_BUNDLE: &str = "INSERT INTO bundles(bundle_uuid, root_id
 
 /// A new asset's row (see [`InputTxn::insert_bundle`]).
 pub(crate) const INSERT_ASSET: &str = "INSERT INTO assets(asset_uuid, bundle_uuid, local_id,
-         type_uuid, logical_hash, authoring_only, terminal_type, tag_poison)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
+         type_uuid, logical_hash, authoring_only, terminal_type, tag_poison, content)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
 
 impl InputTxn<'_> {
     /// Publish (or republish) a bundle row. Clears any poison: fixing
@@ -273,6 +276,7 @@ impl InputTxn<'_> {
                     i64::from(rec.authoring_only),
                     rec.terminal_type.map(|terminal| terminal.0.to_vec()),
                     TAG_PENDING,
+                    rec.content.map(|content| content.to_vec()),
                 ])?;
             for (tag, value) in &rec.tags {
                 self.txn
@@ -377,14 +381,15 @@ impl InputTxn<'_> {
             .prepare_cached(
                 "INSERT INTO assets(
                  asset_uuid, bundle_uuid, local_id, type_uuid, logical_hash, authoring_only,
-                 terminal_type, tag_poison
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 terminal_type, tag_poison, content
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(asset_uuid) DO UPDATE SET
                bundle_uuid = excluded.bundle_uuid, local_id = excluded.local_id,
                type_uuid = excluded.type_uuid, logical_hash = excluded.logical_hash,
                authoring_only = excluded.authoring_only,
                terminal_type = excluded.terminal_type,
-               tag_poison = excluded.tag_poison, tag_module = NULL",
+               tag_poison = excluded.tag_poison, tag_module = NULL,
+               content = excluded.content",
             )?
             .execute(rusqlite::params![
                 rec.asset.0.as_slice(),
@@ -395,6 +400,7 @@ impl InputTxn<'_> {
                 i64::from(rec.authoring_only),
                 rec.terminal_type.map(|terminal| terminal.0.to_vec()),
                 tag_poison,
+                rec.content.map(|content| content.to_vec()),
             ])?;
         self.txn
             .prepare_cached("DELETE FROM asset_tags WHERE asset_uuid = ?1")?

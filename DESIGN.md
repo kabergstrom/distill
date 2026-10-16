@@ -5452,7 +5452,7 @@ that published it, never copied into a table.
 | `import_keys` | the import index, one row per (bundle, asset, kind, key) indexed by (kind, key): what each watched import's basis reads (a path, a listing, an importer capability) under its `$record` entry, and each directory-import rules asset by the directory of its listing's literal prefix, so a changed path finds the rules that may list it by its ancestor directories, and (kind 4) each explicit import's sources, keyed `{root len}:{root}{path}`, which no authored or default import rule selects (§8 "Default imports" precedence). A row's source is its bundle's row, and its rows go with that row (a foreign key); the basis itself is read when needed, from the failure memo or the `$record`. Derived from the committed bundles and kept by source: every bundle publication queues its paths in `file_work`, and an import pass reindexes the dirty bundle sources, parsing each once, before it acknowledges that work, so the index is current but for pending work. It is never rebuilt whole; a store starts with no bundles and an empty index |
 | `bundles` | bundle uuid → **(root id, normalized path)**, format version, content hash, primary asset (the runtime entry its path resolves to; a path's candidates are the primaries of its bundles in every root, a search of `bundles_by_path`) — the physical key, matching `files`: UUID-based access must reach the owning file without a logical-index round trip that could turn ambiguous under a same-path file in a second root; path-query ambiguity is derived separately. Directory-import ownership derives at scan from generated bundles' `DirectoryOrigin` records (§8), whose `rule` is the authored stable `ImportRuleId`, never a vector index; deleting that id re-derives the orphan state, never reassigns ownership |
 | `bundle_path_refs` | bundle uuid → each logical path its entries' asset/weak reference fields name, written with the bundle's rows at publication. Rename-with-fixups (§4) reads only the bundles that reference the moving path, plus the poisoned ones, whose references are unknown |
-| `assets` | object | `local_id → asset entry` |
+| `assets` | asset uuid → bundle uuid, local id, type uuid, `authoring_only`, logical hash, terminal type, tag poison and module, and its authoring content key (`content`, §17, protocol 29; written when the bundle publishes) |
 | `asset_tags` | asset uuid → each refined (tag, value), indexed by tag and value for tag queries |
 | `tag_epochs` | authored type → the tag epoch its rows were refined under (a digest of what the schema authority says about the type); a changed epoch marks the type's rows pending in the input that changes it |
 | `results` | static-input-key digest → candidate bucket: (trace digest → trace, deterministic failure or success), revalidated most-recent-first on lookup (§9 — the build-cache lookup; the full input hash is never stored; a re-commit of one key and trace replaces its result, others append) |
@@ -7837,6 +7837,14 @@ An inspection names the root it read the bundle from (protocol 22).
 result per UUID, in order, at the snapshot: inspection, missing,
 role-ineligible or drifted. A bundle holding several of them is read,
 verified and parsed once for the call.
+Each listed row (`AuthoringRow.content`) and inspection
+(`AuthoringInspection.content`) carries the entry's content key
+(protocol 29): a blake3 key over the value's schema hash, its canonical
+text, its blob refs and the schema hash of each carried type
+(`content_key`, `content_key_of`), stored in `assets.content` when the
+coordinator publishes the bundle. A version that leaves an entry's value
+as it was leaves its key as it was: a client compares keys instead of
+fetching values to find what changed.
 
 Long-running operations expose ordered, cancellable progress. A
 rename-with-fixups (`operation`) is planned when it is asked for and
