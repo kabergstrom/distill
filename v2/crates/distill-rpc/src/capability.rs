@@ -1040,10 +1040,7 @@ fn describe_type_in(
                 path,
                 doc: member.doc,
                 type_doc: member.type_doc,
-                range: member.editor.range,
-                color: member.editor.color,
-                slider: member.editor.slider,
-                hidden: member.editor.hidden,
+                editor: member.editor.to_json(),
             })
             .collect();
         Ok(Some(TypeDescription {

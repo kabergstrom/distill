@@ -2456,6 +2456,13 @@ async fn type_descriptions_round_trip_over_tcp() {
             for (path, contents) in prefab_types::files(&schema) {
                 project.write_in("types", &path, contents);
             }
+            // The daemon carries hints as written, keys it never interprets
+            // (`position`) included.
+            project.write_in(
+                "types",
+                &prefab_types::description_file("game::Spinner"),
+                r#"{"members":{"$.rate":{"doc":"Degrees per second.","editor":{"unit":"deg/s","position":true}}}}"#,
+            );
             let type_uuid = schema.types[spinner.0].stable_type_uuid();
             let projected = distill_schema::ngp_schema::project_values(&schema, spinner).unwrap().0;
             let schema_hash = node_hash(&projected.root).unwrap();
@@ -2499,7 +2506,7 @@ async fn type_descriptions_round_trip_over_tcp() {
             assert_eq!(description.members.len(), 1);
             assert_eq!(description.members[0].path, "$.rate");
             assert_eq!(description.members[0].doc.as_deref(), Some("Degrees per second."));
-            assert_eq!(description.members[0].range, None);
+            assert_eq!(description.members[0].editor, r#"{"unit":"deg/s","position":true}"#, "the hints cross as their text");
             assert_eq!(description.renames, [("$.rate".to_owned(), "speed".to_owned())].into());
 
             // Another walk's default names its own schema hash.

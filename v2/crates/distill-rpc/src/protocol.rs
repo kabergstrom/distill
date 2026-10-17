@@ -62,7 +62,10 @@ pub use distill_store::state::{
 /// version's `Delta`, unfiltered; a `Delta` names source `files` changed
 /// and whether the type files changed (`types`);
 /// `AuthoringSnapshot.listEntries` answers the rows of named entries.
-pub const PROTOCOL_VERSION: u32 = 30;
+/// 31 (GAP 23 §16.2): `TypeMember` carries the editor hints as one
+/// canonical JSON text (`editor`) instead of `hasRange`/`rangeMin`/
+/// `rangeMax`/`color`/`slider`/`hidden`.
+pub const PROTOCOL_VERSION: u32 = 31;
 
 /// A watched import whose latest attempt failed. The bundle keeps serving its
 /// last good contents; the failure clears when a later import succeeds.
@@ -1416,11 +1419,10 @@ pub struct TypeMember {
     pub doc: Option<String>,
     /// The doc comment of the struct or enum at the path.
     pub type_doc: Option<String>,
-    /// `#[ngp(editor(range = (min, max)))]`.
-    pub range: Option<[f64; 2]>,
-    pub color: bool,
-    pub slider: bool,
-    pub hidden: bool,
+    /// `#[ngp(editor(...))]` hints as canonical JSON
+    /// (`ngp_schema::describe::EditorHints::to_json`); empty: none. Distill
+    /// carries them opaque: a new key needs no protocol change.
+    pub editor: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]

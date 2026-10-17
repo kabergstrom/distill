@@ -7710,7 +7710,10 @@ descriptions, defaults or index, so editing them re-imports nothing.
   the canonical logical schema of its value projection with its hash, its
   default, its members: per planner path (`$`, `$.rate`,
   `$.shape{Ring}`), the doc comment, the doc of the type there, and the
-  editor hints (`range`, `color`, `slider`, `hidden`); and (protocol 25)
+  editor hints (`editor`: since protocol 31 the hints as one canonical JSON
+  text, `ngp_schema::describe::EditorHints`, which Distill carries without
+  interpreting, so a new hint key needs no protocol change; before, the flattened
+  `range`, `color`, `slider`, `hidden`); and (protocol 25)
   its renamed fields (`renames`: planner path → the name it was renamed
   from, the schema file's `renames`), so an editor migrating a value
   written under an older schema follows renames as the automatic planner

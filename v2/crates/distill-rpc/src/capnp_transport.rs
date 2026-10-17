@@ -3363,14 +3363,7 @@ fn write_type_description(
         wire.set_path(member.path.as_str());
         wire.set_doc(member.doc.as_deref().unwrap_or(""));
         wire.set_type_doc(member.type_doc.as_deref().unwrap_or(""));
-        if let Some([min, max]) = member.range {
-            wire.set_has_range(true);
-            wire.set_range_min(min);
-            wire.set_range_max(max);
-        }
-        wire.set_color(member.color);
-        wire.set_slider(member.slider);
-        wire.set_hidden(member.hidden);
+        wire.set_editor(member.editor.as_str());
     }
     let mut renames = output.init_renames(description.renames.len() as u32);
     for (index, (at, from)) in description.renames.iter().enumerate() {
@@ -3710,10 +3703,7 @@ pub fn decode_type_description(
             path: decode_text(member.get_path()?, "typeMember.path").map_err(failed)?,
             doc: optional(decode_text(member.get_doc()?, "typeMember.doc").map_err(failed)?),
             type_doc: optional(decode_text(member.get_type_doc()?, "typeMember.typeDoc").map_err(failed)?),
-            range: member.get_has_range().then(|| [member.get_range_min(), member.get_range_max()]),
-            color: member.get_color(),
-            slider: member.get_slider(),
-            hidden: member.get_hidden(),
+            editor: decode_text(member.get_editor()?, "typeMember.editor").map_err(failed)?,
         });
     }
     let mut renames = BTreeMap::new();

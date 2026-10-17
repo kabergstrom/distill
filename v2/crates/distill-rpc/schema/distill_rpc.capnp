@@ -743,12 +743,9 @@ struct TypeMember {
   # Empty: none.
   doc @1 :Text;
   typeDoc @2 :Text;
-  hasRange @3 :Bool;
-  rangeMin @4 :Float64;
-  rangeMax @5 :Float64;
-  color @6 :Bool;
-  slider @7 :Bool;
-  hidden @8 :Bool;
+  # The editor hints (GAP 23 §16.2) as canonical JSON
+  # (`ngp_schema::describe::EditorHints::to_json`); empty: none (protocol 31).
+  editor @3 :Text;
 }
 
 struct TypeRename {

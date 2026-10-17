@@ -1852,13 +1852,13 @@ fn type_descriptions_read_the_type_files_at_the_snapshot() {
     let members: Vec<_> = description
         .members
         .iter()
-        .map(|m| (m.path.as_str(), m.doc.as_deref(), m.type_doc.as_deref(), m.range))
+        .map(|m| (m.path.as_str(), m.doc.as_deref(), m.type_doc.as_deref(), m.editor.as_str()))
         .collect();
     assert_eq!(
         members,
         [
-            ("$", None, Some("Turns."), None),
-            ("$.rate", Some("Degrees per second."), None, Some([-720.0, 720.0])),
+            ("$", None, Some("Turns."), ""),
+            ("$.rate", Some("Degrees per second."), None, r#"{"range":[-720.0,720.0]}"#),
         ]
     );
     assert_eq!(snapshot.describe_type(TypeUuid([9; 16])), RpcResult::Success(DescribeTypeResult::Missing));
