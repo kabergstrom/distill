@@ -597,7 +597,7 @@ struct MetadataDiagnostics {
   namespaceErrors @3 :List(NamespaceError);
 }
 
-# A blob a value names (protocol 28): its length and blake3 hash, or, in a
+# A blob a value names (protocol 28): its length and XXH3-128 hash, or, in a
 # write, its bytes. Inspections always carry refs; the bytes come from
 # AuthoringSnapshot.blob. A write naming a ref keeps the bytes the entry
 # already holds under it.
@@ -1174,7 +1174,7 @@ interface AuthoringSnapshot {
   # before).
   inspect @2 (uuids :List(Data)) -> (result :AuthoringInspectManyCall);
   refresh @3 () -> (result :AuthoringSnapshotCall);
-  # The content hash of the file observed at path in root: 32 bytes, or
+  # The content hash of the file observed at path in root: 16 bytes (XXH3-128), or
   # empty for no file there. A WriteReceipt is reflected at the first
   # version whose answers match it. Protocol 13.
   file @4 (root :Text, path :Text) -> (result :DataCall);
