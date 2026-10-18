@@ -134,20 +134,6 @@ fn authoring_only_is_mandatory_typed_and_reserved_entries_require_it() {
 // ---- entry roles ----
 
 #[test]
-fn legacy_lineage_key_is_ignored_and_dropped_on_write() {
-    let (plain, bundle) = valid_plain();
-    let bytes = mutate_envelope(&plain, |env| {
-        env_entry(env, "a").insert(
-            "lineage".into(),
-            obj(&[("bootstrap", obj(&[("bundle_format_version", u(1))]))]),
-        );
-    });
-    let parsed = parse_bundle(&bytes).unwrap();
-    assert_eq!(parsed, bundle);
-    assert_eq!(write_bundle(&parsed).unwrap(), plain);
-}
-
-#[test]
 fn bootstrap_type_requires_the_embedded_schema() {
     let (plain, _) = valid_plain();
     let bytes = mutate_envelope(&plain, |env| {

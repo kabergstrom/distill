@@ -5,8 +5,8 @@
 //! Two physical encodings, one parser dispatching on the first byte:
 //!
 //! - **Plain JSON** — whenever the bundle has no blobs; diffable text.
-//! - **Container** — whenever blobs are present: a fixed 36-byte header
-//!   (magic, version, lengths, CRC-32C checksums), the envelope JSON with
+//! - **Container** — whenever blobs are present: a fixed 28-byte header
+//!   (the NGPF file header, envelope and blob lengths), the envelope JSON with
 //!   every blob leaf rewritten as `{"len": n, "offset": m}`, zero padding
 //!   to 16-byte alignment, then the blob chunk.
 //!

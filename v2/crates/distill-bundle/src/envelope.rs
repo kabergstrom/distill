@@ -276,7 +276,7 @@ pub(crate) fn parse(
             for key in entry.keys() {
                 if !matches!(
                     key.as_str(),
-                    "authoring_only" | "data" | "lineage" | "schema_hash" | "type_uuid" | "uuid"
+                    "authoring_only" | "data" | "schema_hash" | "type_uuid" | "uuid"
                 ) && strictness == Strictness::Full
                 {
                     return Err(BundleError::UnknownEntryKey {
@@ -288,9 +288,6 @@ pub(crate) fn parse(
             let uuid: AssetUuid = take_id(text, &mut entry, &local_id, "uuid")?;
             let type_uuid: TypeUuid = take_id(text, &mut entry, &local_id, "type_uuid")?;
             let schema_hash: LogicalHash = take_id(text, &mut entry, &local_id, "schema_hash")?;
-            // Bundles written before lineage was retired carry a `lineage`
-            // key; it is accepted and ignored.
-            entry.remove("lineage");
             let authoring_only = {
                 let span = entry
                     .remove("authoring_only")
