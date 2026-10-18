@@ -273,11 +273,9 @@ fn pack_definition_authoring(root: AssetUuid) -> AuthoringValue {
         ),
         uuid
     );
-    AuthoringValue {
-        canonical_value: Arc::from(text.into_bytes()),
-        blobs: Vec::new(),
-        types: Vec::new(),
-    }
+    let schema = distill_pack_build::builder::pack_definition_schema().unwrap();
+    let value = ngp_schema::parse_value(&text, &schema.root, ngp_schema::Options::canonical()).unwrap();
+    AuthoringValue { value: Arc::new(value), types: Vec::new() }
 }
 
 #[test]
@@ -298,22 +296,9 @@ fn decodes_the_sealed_pack_definition_authored_shape() {
 }
 
 #[test]
-fn pack_definition_decoder_rejects_noncanonical_or_blob_backed_values() {
-    let mut noncanonical = pack_definition_authoring(AssetUuid([42; 16]));
-    let mut bytes = noncanonical.canonical_value.to_vec();
-    bytes.push(b' ');
-    noncanonical.canonical_value = Arc::from(bytes);
-    assert!(matches!(
-        decode_pack_definition(&noncanonical),
-        Err(PackBuildError::Definition(_))
-    ));
-
-    let mut blob_backed = pack_definition_authoring(AssetUuid([42; 16]));
-    blob_backed.blobs.push(distill_rpc::AuthoringBlob::Bytes(Arc::from(&b"unexpected"[..])));
-    assert!(matches!(
-        decode_pack_definition(&blob_backed),
-        Err(PackBuildError::Definition(_))
-    ));
+fn pack_definition_decoder_rejects_a_value_of_another_shape() {
+    let other = AuthoringValue { value: Arc::new(ngp_schema::Value::U8(0)), types: Vec::new() };
+    assert!(matches!(decode_pack_definition(&other), Err(PackBuildError::Definition(_))));
 }
 
 #[test]

@@ -19,7 +19,7 @@ use distill_loader::{
 };
 use distill_pack::{PackfileIO, RuntimeTarget as PackRuntimeTarget};
 use distill_rpc::{
-    AuthoringEntry, AuthoringEntryRole, AuthoringOp, AuthoringValue, RenameWithFixupsRequest, ConnectOutcome, ConnectRequest, ImportRequest, ResolveResult,
+    AuthoringEntry, AuthoringEntryRole, AuthoringOp, AuthoringValue, RenameWithFixupsRequest, ConnectOutcome, ConnectRequest, ResolveResult,
     TargetDefinitionHash,
 };
 use distill_schema::ngp_schema::{
@@ -555,7 +555,7 @@ fn import_assets(process: &DaemonProcess, config: &DaemonConfig, assets: &Path) 
         config,
         process.rpc_address(),
         None,
-        &ImportRequest {
+        &distill_daemon::bootstrap::ImportArgs {
             importer: "fixture-game-assets".into(),
             sources: vec![
                 "pixel.ppm".into(),
@@ -563,11 +563,7 @@ fn import_assets(process: &DaemonProcess, config: &DaemonConfig, assets: &Path) 
                 "shaders/basic.comp".into(),
             ],
             dest: "game-assets.bundle".into(),
-            settings: AuthoringValue {
-                canonical_value: Arc::from(&b"{\"value\":0}"[..]),
-                blobs: Vec::new(),
-                types: Vec::new(),
-            },
+            settings: "{\"value\":0}".into(),
             watch: true,
             root: "main".into(),
             if_changed: false,
@@ -1103,7 +1099,7 @@ fn rpc_io_authoring_writes_watches_and_renames_through_a_live_daemon() {
         type_uuid: source.type_uuid,
         terminal_type: source.type_uuid,
         schema_hash: source.schema_hash,
-        logical_schema: source.logical_schema.clone(),
+        schema: source.schema.clone(),
         role: AuthoringEntryRole::Runtime,
         tags: Default::default(),
         value: source.value.clone(),
@@ -1134,11 +1130,11 @@ fn rpc_io_authoring_writes_watches_and_renames_through_a_live_daemon() {
         std::thread::sleep(Duration::from_millis(5));
     }
     io.take_index_changes();
-    let text = std::str::from_utf8(&source.value.canonical_value).unwrap().replacen("#version 450", "#version 460", 1);
-    assert_ne!(text.as_bytes(), &*source.value.canonical_value);
+    let text = replace_in_strings(&source.value.value, "#version 450", "#version 460");
+    assert_ne!(text, *source.value.value);
     let edited = AuthoringEntry {
         root: String::new(),
-        value: AuthoringValue { canonical_value: Arc::from(text.as_bytes()), ..source.value.clone() },
+        value: AuthoringValue { value: Arc::new(text), ..source.value.clone() },
         ..entry
     };
     let (_, rewritten) = write_confirmed(&mut io, at, vec![AuthoringOp::Set(edited)]);
@@ -1183,4 +1179,16 @@ fn rpc_io_authoring_writes_watches_and_renames_through_a_live_daemon() {
     assert!(at >= renamed);
     assert_eq!(moved.normalized_path, "moved/copy.bundle");
     assert!(!assets.join("copy.bundle").exists());
+}
+
+/// `value` with the first `from` in each string replaced by `to`.
+fn replace_in_strings(value: &distill_schema::ngp_schema::Value, from: &str, to: &str) -> distill_schema::ngp_schema::Value {
+    use distill_schema::ngp_schema::Value;
+    match value {
+        Value::String(text) => Value::String(text.replacen(from, to, 1)),
+        Value::Struct(fields) => Value::Struct(fields.iter().map(|field| replace_in_strings(field, from, to)).collect()),
+        Value::Seq(items) => Value::Seq(items.iter().map(|item| replace_in_strings(item, from, to)).collect()),
+        Value::Option(Some(inner)) => Value::Option(Some(Box::new(replace_in_strings(inner, from, to)))),
+        other => other.clone(),
+    }
 }

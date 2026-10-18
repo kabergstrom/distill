@@ -448,9 +448,9 @@ pub struct ModuleAbiIdentity {
     pub interface_fingerprint: [u8; 16],  // shared host-interface build
                                           // fingerprint, computed identically
                                           // by both workspace builds:
-                                          // digest(Domain::ModuleAbi, 1, …)
+                                          // digest(Domain::ModuleInterface, 1, …)
     pub measured_interface: [u8; 16],     // measured layout digest (§5),
-                                          // digest(Domain::ModuleAbi, 2, …), over
+                                          // digest(Domain::ModuleLayout, 1, …), over
                                           // the boundary types themselves —
                                           // Registry, Outputs, Value, Patch,
                                           // error types — the backstop no
@@ -462,15 +462,16 @@ pub struct ModuleAbiIdentity {
                                           // #[global_allocator] fails the check
 }
 
-/// The bundle decoder's sealed logical bootstrap. It has exactly five rows:
-/// SchemaLineageManifest, Migration, ImportRecord, DirectoryImportRules, and
-/// PackDefinition. Each row is `(symbol, TypeUuid, canonical logical-schema
-/// bytes, logical hash)` and rows are strictly TypeUuid-sorted. The checked-in byte
-/// resource (`distill-core/src/bootstrap.rs`, spec version 2: `u32` symbols and
-/// schema encodings with `u32` node kinds) is parsed and rehashed by every
-/// bundle consumer; it contains no
-/// native layout, build-policy projection, or consumer-specific brand.
-pub struct BootstrapControlSpecV1(pub [BootstrapControlSpecRowV1; 5]);
+/// The bundle decoder's sealed logical bootstrap. It has exactly three rows:
+/// ImportRecord, DirectoryImportRules, and PackDefinition. Each row is
+/// `(symbol, TypeUuid, schema encoding, logical hash)` and rows are strictly
+/// TypeUuid-sorted. The checked-in byte resource
+/// (`distill-core/src/bootstrap_spec_v1.rs`: the shared file header,
+/// `Domain::BootstrapSpec` version 2, then a `u32` count and the rows with
+/// `u32` symbols and schema encodings with `u32` node kinds) is parsed and
+/// rehashed by every bundle consumer; it contains no native layout,
+/// build-policy projection, or consumer-specific brand.
+pub struct BootstrapControlSpecV1(pub [BootstrapControlSpecRowV1; 3]);
 
 pub enum HostCallbackError {
     Panic(CallbackPanic),
@@ -955,6 +956,25 @@ are named refusals (`DecodeErrorKind`). Two builds of any component can
 never disagree on a record's bytes, and no `‖` formula in this document can
 repartition variable-length fields.
 
+A record's version is never a field of its body: it is its digest's
+version, its file's header version (below), or, for a record only the
+store holds (the tool record, §9), the store's schema version.
+
+**Values** (`ngp_value::encoding`; the per-node table is newgameplus GAP 23
+§17.3) use the one encoding walked by their logical schema, with no names
+or kinds in the body: struct fields in schema order, an enum as its `u32`
+variant index and payload, sequences, sets and maps as a `u32` count and
+items (set elements and map keys sorted by their encoding, strictly
+increasing), a blob as `u32` 0 and its bytes or 1 and a `BlobRef { len,
+hash }`, a dynamic value as its carried type's UUID and the payload under
+that type's schema. A patch is a `u32` `Patch` tag per node, struct and
+enum patches as `(u32 field index, patch)` pairs. Decoding is strict
+(counts bounded by the schema's minimum element size, depth 256, one byte
+string per value, trailing bytes refused). A value's digest is
+`digest(Domain::Value, 1, schema hash ‖ carried types (UUID, schema hash)
+sorted by UUID ‖ body with blobs as refs)`: the authoring content key
+(§17) and the first build stage's input hash (§9).
+
 **Hashes** (`distill_core::hash`; GAP 23 §17.4): every content hash, digest
 and identity is XXH3-128 (`xxhash-rust`, named by distill-core only),
 16 little-endian bytes, printed as 32 lowercase hex characters. Content
@@ -970,7 +990,7 @@ is a spec defect, since that is how two meanings come to share bytes:
 |---|---|
 | `Schema` (1) | logical hash — the schema encoding of a root node (§5) |
 | `Layout` (2) | layout hash — the layout encoding of a wire tree (§12) |
-| `ModuleAbi` (3) | `ModuleAbiIdentity` — the host-interface identity (§3): `interface_fingerprint` at version 1, `measured_interface` at version 2 (`distill-pipeline-api/src/module.rs`) |
+| `ModuleInterface` (3) | `ModuleAbiIdentity.interface_fingerprint` — the host-interface sources and build configuration (§3, `distill-pipeline-api/src/module.rs`) |
 | `TargetDefinition` (4) | target-definition hash (§18) |
 | `ProcessorInputs` (5) | static-input key (§9) |
 | `Trace` (6) | dependency-trace digest (§9) |
@@ -990,9 +1010,11 @@ is a spec defect, since that is how two meanings come to share bytes:
 | `PackEntry` (21) | pack encoding key (§16) |
 | `PackManifest` (22) | pack manifest hash and file format (§16) |
 | `AssetQuery` / `FileQuery` (23, 24) | asset-namespace / raw-file query result hashes (§10, §8) |
-| `ContentKey` (25) | authoring entry content key (§17) |
+| `ContentKey` (25) | retired: the authoring content key is the entry's value digest (`Value`, §17) |
 | `Value` (26) | a value's identity under its schema (GAP 23 §17.3) |
 | `ArtifactImage`, `PackArchive`, `Bundle`, `SchemaFile` (27–30) | file formats only (shared header below) |
+| `ModuleLayout` (31) | `ModuleAbiIdentity.measured_interface` — the measured layouts of the boundary types (§3) |
+| `BootstrapSpec` (32) | file format only: the bootstrap control spec (§3) |
 
 A schema-lineage chain digest (§6, §11, §13) is not built; it takes a new
 `Domain` when it is.
@@ -1001,7 +1023,8 @@ A schema-lineage chain digest (§6, §11, §13) is not built; it takes a new
 bytes `NGPF`, the `u32` `Domain` naming its format and the `u32` version of
 that format (`distill_core::header`; one reader refuses a wrong magic,
 domain or version by name): the artifact image (§12), pack archive and
-manifest (§16), bundle container (§6) and the newgameplus schema file.
+manifest (§16), bundle container (§6), the bootstrap control spec (§3) and
+the newgameplus schema file.
 There are no checksums: files are named or observed by their hash.
 
 The local deterministic-failure and configuration-poison records are
@@ -1757,6 +1780,14 @@ container from an artifact image (`Domain::ArtifactImage`, §12). Committed
 bundles from before container version 2 were rewritten once; no reader of
 the old container remains.
 
+Canonical text is the bundle's storage form only (newgameplus GAP 23
+§17.9): the daemon parses it when it reads a bundle and writes it when it
+writes one. The authoring RPC carries values in the value encoding (§5
+"Values", §17), and content keys and memo inputs are value digests, not
+hashes of text. In text, sets and maps with non-string keys are written
+in their elements' and keys' encoded order (§5), the order of the value
+encoding; string-keyed maps are JSON objects in raw key order.
+
 ### Envelope
 
 | Field | Type | Description |
@@ -1821,8 +1852,8 @@ pub enum EntryLineageV1 {
 }
 
 `EntryLineageV1::Bootstrap` is legal and mandatory iff `type_uuid` is one of
-the five closed `BootstrapControlSpecV1` TypeUuids: `SchemaLineageManifest`,
-`Migration`, `ImportRecord`, `DirectoryImportRules`, or `PackDefinition`.
+the three closed `BootstrapControlSpecV1` TypeUuids: `ImportRecord`,
+`DirectoryImportRules`, or `PackDefinition`.
 It requires both the enclosing bundle and arm to say the type's format
 version (1; 2 for `DirectoryImportRules`, whose sealed row's
 `ImportRule.settings` is `Dynamic { sparse: true }`, the one row format 2
@@ -1914,7 +1945,7 @@ exact retained `StagedPipelineEpoch` to `Ready` as one coordinator operation;
 an identity mismatch, a stale base/cursor, or a different staged candidate
 leaves the manifest untouched. Thus two acceptors cannot lose an epoch or
 cursor move, and an acceptor cannot select a schema different from the code it
-validated. Bootstrap is non-circular: the closed five-row
+validated. Bootstrap is non-circular: the closed three-row
 `BootstrapControlSpecV1` (§3) is authority of bundle `format_version` and is
 validated independently before the manifest is decoded. The manifest's
 `types` map MUST NOT contain any bootstrap-control TypeUuid and is never
@@ -3614,8 +3645,9 @@ present literally. `ReadOnlyPackageRoot` and `ReadOnlyPackageSubdir` are valid
 only for package tools; ambient tools use `EmptyScratch`.
 
 The tool-execution identity hash is `digest(Domain::ToolCapsule,
-RECORD_VERSION = 3, ToolExecutionIdentityV2)` (`distill-core/src/tool.rs`)
-in the one encoding (§5), tags as `u32` discriminants with the fixed values
+DIGEST_VERSION = 3, ToolExecutionIdentityV2)` (`distill-core/src/tool.rs`)
+in the one encoding (§5); the stored record (`tools`, §13) is the same
+fields with no version of its own, tags as `u32` discriminants with the fixed values
 above. A package identity commits every package file row plus
 launch/environment/cwd metadata. An ambient identity commits the exact
 launcher path, toolchain ID, optional trusted fingerprint, environment, and cwd
@@ -3800,7 +3832,10 @@ changing cache authority.
 pub struct StaticInputs {
     pub asset: AssetUuid,
     pub stage: u16,                        // index in the type's chain (pipeline map)
-    pub input_hash: ContentHash,       // the input artifact's content hash
+    pub input_hash: ContentHash,       // stage 0: the imported value's digest
+                                       // (§5 "Values") under the project
+                                       // schema; later stages: the previous
+                                       // artifact's content hash
     pub target_def_hash: [u8; 16],         // canonical Target ‖ bound identity (§18)
     pub processor: (&'static str, u32),    // Processor::ID, Processor::VERSION
     pub dylib_hash: [u8; 16],
@@ -7799,23 +7834,27 @@ interface AuthoringSnapshot {
   sourceFiles @8 (root :Text, glob :Text) -> (result :SourceFilesCall);
   references @9 (bundle :Data) -> (result :ReferencesCall);
   authorable @10 () -> (result :AuthorableCall);
-  blob @11 (uuid :Data, index :UInt32) -> (result :AuthoringBlobCall);
+  blob @11 (uuid :Data, blob :BlobRef) -> (result :AuthoringBlobCall);
   listEntries @12 (uuids :List(Data)) -> (result :AuthoringListCall);
 }
 ```
 
-Values on the wire (`AuthoringValue`):
-- `canonicalValue` is canonical text (`ngp_schema::text`, §6) of the
-  entry's logical schema, always beside that schema or its hash
-  (`AuthoringInspection.logicalSchema`); both ends parse it against the
-  schema at once, never into an untyped tree.
-- `blobs` is the blob table the text's `{"len","offset"}` placements
-  index (`offset` is the index). Since protocol 28 each blob is a
-  `BlobRef { len, hash }` (the blob's plain XXH3-128, 16 bytes since
-  protocol 32) or its bytes:
-  - an inspection carries refs only, so a value's size is its text's,
-    whatever its blobs weigh; `AuthoringSnapshot.blob(uuid, index)`
-    streams one blob's bytes as a `ChunkStream` of one structural section;
+Values on the wire (protocol 33; newgameplus GAP 23 §17.6). No text
+travels on the authoring path:
+- A schema travels as its schema encoding (§5) beside its hash
+  (`AuthoringType.schema`, `AuthoringInspection.logicalSchema`,
+  `TypeDescription.schema`). The reader rehashes it and refuses a
+  mismatch (`distill-protocol/src/codec.rs` `read_schema`).
+- `AuthoringValue { value, types }`: `value` is the value encoding
+  (`ngp_value::encoding`) under the entry's logical schema and `types`;
+  decoding is strict and checks the value against both. `AuthoringPatch
+  { patch, types }` carries a patch the same way (import settings).
+- Blobs live inside the value (`BlobData`: bytes, or a `BlobRef { len,
+  hash }`, the blob's plain XXH3-128):
+  - an inspection carries refs only, so a value's size does not grow with
+    its blobs; `AuthoringSnapshot.blob(uuid, blob)` streams the bytes of
+    the entry's blob `blob` names as a `ChunkStream` of one structural
+    section;
   - a write (`AuthoringOp::Set`) names a blob by ref or by bytes; a ref
     resolves against the blobs the target bundle's entries hold now, so an
     edit of a value with a blob field re-sends no bytes. A ref the bundle
@@ -7823,11 +7862,15 @@ Values on the wire (`AuthoringValue`):
   - type defaults and importer default settings carry bytes: a client
     writes them into new entries.
 - `types` (protocol 20) lists each type the value's dynamic values name
-  (path, type UUID, schema hash, logical schema; once each, path order);
+  (path, type UUID, schema hash, schema encoding; once each, path order);
   a written value's bundle adopts them into its envelope `types` (§6). A
   malformed or unused type fails the value (`TypeInvalid`, `UnusedType`).
-- `ImportRequest.settings` is authored-mode, partial text, completed
-  against the importer's default settings before the import runs.
+- `ImportRequest` carries the importer's Settings schema and hash
+  (`settingsSchema`, `settingsHash`) and `settings`, a sparse
+  `AuthoringPatch` of it. The daemon refuses another hash, then completes
+  the patch against the importer's default settings before the import
+  runs. The daemon CLI's `--settings` is the one text intake: authored
+  text parsed against the importer's schema (`distilld import`).
 
 A Snapshot pins one `SnapshotStamp { StoreInstanceId, InputVersion }` and an
 ordinary bounded lease. Every terminal resolve, fetch, path, and delta outcome
@@ -7873,15 +7916,17 @@ descriptions, defaults or index, so editing them re-imports nothing.
   the canonical logical schema of its value projection with its hash, its
   default, its members: per planner path (`$`, `$.rate`,
   `$.shape{Ring}`), the doc comment, the doc of the type there, and the
-  editor hints (`editor`: since protocol 31 the hints as one canonical JSON
-  text, `ngp_schema::describe::EditorHints`, which Distill carries without
-  interpreting, so a new hint key needs no protocol change; before, the flattened
-  `range`, `color`, `slider`, `hidden`); and (protocol 25)
+  editor hints (`editor`: since protocol 33 an `EditorHints` struct with
+  one field per key, `ngp_value::EditorHints`; an empty text field is an
+  unset key, `hasX` flags mark set numbers and `hasNode` the node hint, so
+  a new key is a schema addition, not a protocol bump; protocol 31 sent
+  one JSON text, earlier ones the flattened `range`, `color`, `slider`,
+  `hidden`); and (protocol 25)
   its renamed fields (`renames`: planner path → the name it was renamed
   from, the schema file's `renames`), so an editor migrating a value
   written under an older schema follows renames as the automatic planner
-  does (`plan_automatic_renamed`). The default is a
-  canonical `AuthoringValue` under that schema, `absent` (no default file),
+  does (`plan_automatic_renamed`). The default is an
+  `AuthoringValue` under that schema (with the types it names), `absent` (no default file),
   `schemaMismatch` (the file was written under another projection, whose
   hash it names: the module and the schema files come from different walks)
   or `invalid`. `missing`: the index lists no such type, or its schema file
@@ -8032,9 +8077,10 @@ role-ineligible or drifted. A bundle holding several of them is read,
 verified and parsed once for the call.
 Each listed row (`AuthoringRow.content`) and inspection
 (`AuthoringInspection.content`) carries the entry's content key
-(protocol 29): `digest(Domain::ContentKey, 1, schema hash ‖ canonical text ‖
-blob refs (len, hash) ‖ (type UUID, schema hash) of each carried type, sorted)`
-(`distill-rpc/src/validate.rs` `content_key`, `content_key_of`), stored in `assets.content` when the
+(protocol 29; since protocol 33 the value digest, newgameplus GAP 23
+§17.3: `ngp_value::digest`, `Domain::Value` over the schema hash, the
+carried types sorted by UUID and the value encoding with blobs as refs;
+`distill-rpc/src/validate.rs` `content_key`, `content_key_of`), stored in `assets.content` when the
 coordinator publishes the bundle. A version that leaves an entry's value
 as it was leaves its key as it was: a client compares keys instead of
 fetching values to find what changed.
@@ -10241,7 +10287,7 @@ put production image codecs, mesh optimization, or shader compilers in core.
   can authorize an automatic migration. (Refined in R25: equality is against
   Active rows; Retired rows preserve history but are excluded, and explicit
   stale-base candidate-checked retire/reactivate transitions are the only way
-  authority state changes.) (Refined in R27: the closed five-row bootstrap
+  authority state changes.) (Refined in R27: the closed three-row bootstrap
   control source and DSCI-keyed measured output remain in DSCA but validate
   against bundle-format authority under a separate gate and are the only
   exclusion from Active-manifest equality.)
@@ -10528,12 +10574,12 @@ put production image codecs, mesh optimization, or shader compilers in core.
   target that reappears is journaled and conflict-preserved alongside the temp
   and verified aside before stop/retry, and no overwrite primitive conforms.
 - **Bootstrap controls have one closed authority exception** (§§2–3, 5–6,
-  13): the fixed five-row semantic source and DSCI-keyed, DSNL-measured output
+  13): the fixed three-row semantic source and DSCI-keyed, DSNL-measured output
   remain in every compiled table and DSCA, validate byte-for-byte under a
   separate bootstrap gate, and are exactly the set excluded from Active-
   manifest equality. All other compiled rows equal Active authority; the set
   cannot be configured or extended. (Refined in R28: every pack/RPC boundary
-  projection is its requested runtime set union these five rows, with DSCA and
+  projection is its requested runtime set union these three rows, with DSCA and
   DSLP recomputed over that union and each local consumer independently
   matching its embedded authority; the rows never enter runtime closure.)
 - **Duplicate target names have a canonical DSCP arm** (§5, §13, §18):

@@ -12,7 +12,7 @@ use distill_build::trace::PackDefinitionControlValue;
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, TypeUuid};
 use distill_core::bootstrap::{BootstrapControlSpecV1, PACK_DEFINITION_TYPE_UUID};
 use distill_schema::ngp_schema::{
-    node_from_bytes, parse_value, write_value, LogicalSchema, Options, SchemaNode, Value, WriteOptions,
+    node_from_bytes, LogicalSchema, SchemaNode, Value,
 };
 use distill_rpc::capnp_loader::{
     RemoteCall, RemoteChunkStream, RemoteError, RemoteHub, RemoteSnapshot,
@@ -142,35 +142,18 @@ impl From<PointerError> for PackBuildError {
 }
 
 /// Decode the sealed PackDefinition authored value carried by the metadata
-/// RPC. The daemon has already authenticated its bootstrap type/schema; this
-/// function still parses the canonical text against the bootstrap
-/// PackDefinition schema and requires it to be canonical.
+/// RPC. The caller checked the inspection's schema hash against the
+/// bootstrap PackDefinition schema, and the transport decoded the value
+/// under that schema.
 pub fn decode_pack_definition(
     authored: &AuthoringValue,
 ) -> Result<PackDefinitionControlValue, PackBuildError> {
-    if !authored.blobs.is_empty() {
-        return Err(definition_error("PackDefinition cannot contain blobs"));
-    }
     let schema = pack_definition_schema()?;
-    let text = std::str::from_utf8(&authored.canonical_value)
-        .map_err(|error| definition_error(format!("PackDefinition is not UTF-8: {error}")))?;
-    let value = parse_value(text, &schema.root, Options::canonical()).map_err(|error| {
-        definition_error(format!(
-            "PackDefinition is invalid: {}",
-            error.render("PackDefinition")
-        ))
-    })?;
-    if write_value(&schema.root, &value, WriteOptions::default())
-        .map_err(|error| definition_error(format!("PackDefinition is not writable: {error}")))?
-        != text
-    {
-        return Err(definition_error("PackDefinition JSON is not canonical"));
-    }
-    decode_pack_definition_value(&schema.root, &value)
+    decode_pack_definition_value(&schema.root, &authored.value)
 }
 
 /// The bootstrap PackDefinition logical schema.
-fn pack_definition_schema() -> Result<LogicalSchema, PackBuildError> {
+pub fn pack_definition_schema() -> Result<LogicalSchema, PackBuildError> {
     let spec = BootstrapControlSpecV1::embedded()
         .map_err(|error| definition_error(format!("bootstrap spec: {error}")))?;
     let row = spec

@@ -1,7 +1,7 @@
 //! A manual authoring edit through a running daemon's `Hub.write`
 //! (`#[ignore]`d; for end-to-end checks of hot reload from authoring
 //! writes, newgameplus GAP 23 §4): inspect one asset, replace text in its
-//! canonical value, write the entry back at the inspected version.
+//! value's canonical text, write the entry back at the inspected version.
 //!
 //! Environment (the first three as `distilld engine-args` prints them):
 //! `DISTILL_EDIT_ADDRESS`, `DISTILL_EDIT_TARGET`, `DISTILL_EDIT_TARGET_HASH`
@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use distill_rpc::capnp_transport::{decode_authoring_inspection, schema, CapnpClient, RemoteConnectOutcome};
 use distill_rpc::*;
+use distill_schema::ngp_schema::{parse_value, write_value, Options, WriteOptions};
 use tokio::task::LocalSet;
 
 fn var(name: &str) -> String {
@@ -60,9 +61,19 @@ async fn edit_asset_through_hub_write() {
                 _ => panic!("inspect {asset}: no authored entry"),
             };
 
-            let text = std::str::from_utf8(&inspection.value.canonical_value).expect("canonical text");
+            // The value as canonical text: this harness edits text; the
+            // authoring path carries values.
+            let mut types = inspection.value.type_table().expect("carried types");
+            let text = write_value(
+                &inspection.schema.root,
+                &inspection.value.value,
+                WriteOptions { types: Some(&mut types), ..Default::default() },
+            )
+            .expect("canonical text");
             assert_eq!(text.matches(from.as_str()).count(), 1, "DISTILL_EDIT_FROM must occur once in {text}");
             let edited = text.replacen(from.as_str(), &to, 1);
+            let value = parse_value(&edited, &inspection.schema.root, Options::canonical().types(&mut types))
+                .unwrap_or_else(|error| panic!("edited text: {}", error.render("value")));
             let entry = AuthoringEntry {
                 root: String::new(),
                 uuid: inspection.uuid,
@@ -72,17 +83,18 @@ async fn edit_asset_through_hub_write() {
                 type_uuid: inspection.type_uuid,
                 terminal_type: inspection.type_uuid,
                 schema_hash: inspection.schema_hash,
-                logical_schema: inspection.logical_schema,
+                schema: inspection.schema,
                 role: inspection.role,
                 tags: Default::default(),
-                value: AuthoringValue { canonical_value: Arc::from(edited.as_bytes()), ..inspection.value },
+                value: AuthoringValue { value: Arc::new(value), types: inspection.value.types },
             };
 
             let mut write = hub.write_request();
             {
                 let mut params = write.get();
                 params.set_base(inspection.stamp.version.0);
-                distill_rpc::capnp_loader::write_authoring_entry(params.reborrow().init_ops(1).get(0).init_set(), &entry);
+                distill_rpc::capnp_loader::write_authoring_entry(params.reborrow().init_ops(1).get(0).init_set(), &entry)
+                    .expect("the edited value encodes");
             }
             let written = write.send().promise.await.unwrap();
             match written.get().unwrap().get_result().unwrap().which().unwrap() {

@@ -1,4 +1,5 @@
-//! The sealed logical bootstrap of the bundle formats (spec encoding v1).
+//! The sealed logical bootstrap of the bundle formats: a file under the
+//! shared header ([`Domain::BootstrapSpec`], version [`VERSION`]).
 //! `ImportRecord` and `PackDefinition` are as format 1 sealed them;
 //! `DirectoryImportRules` is format 2's, its rule settings a sparse dynamic
 //! value (`Dynamic { sparse: true }`) where format 1 spelled a JSON tree
@@ -12,6 +13,7 @@ use std::fmt;
 
 use crate::encoding::{Decoder, Encoder};
 use crate::hash::{digest_bytes, Domain, SCHEMA_DIGEST_VERSION};
+use crate::header::{read_header, write_header, HeaderError};
 use crate::id::{LogicalHash, TypeUuid};
 
 mod checked_in {
@@ -20,9 +22,9 @@ mod checked_in {
 
 pub use checked_in::BOOTSTRAP_CONTROL_SPEC_V1_BYTES;
 
-/// The spec encoding's version: `u32` symbols and schema encodings with
-/// `u32` node kinds (§5).
-const VERSION: u32 = 2;
+/// The spec file's version (its header's): `u32` symbols and schema
+/// encodings with `u32` node kinds (§5).
+pub const VERSION: u32 = 2;
 pub const BOOTSTRAP_CONTROL_COUNT: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -84,7 +86,7 @@ pub struct BootstrapControlSpecV1(pub [BootstrapControlSpecRowV1; BOOTSTRAP_CONT
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootstrapSpecError {
-    UnsupportedVersion(u32),
+    Header(HeaderError),
     WrongCount(u32),
     UnknownSymbol(u32),
     DuplicateSymbol(BootstrapControlSymbol),
@@ -110,11 +112,8 @@ impl std::error::Error for BootstrapSpecError {}
 
 impl BootstrapControlSpecV1 {
     pub fn parse(bytes: &[u8]) -> Result<Self, BootstrapSpecError> {
-        let mut reader = Decoder::new(bytes);
-        let version = reader.u32().map_err(BootstrapSpecError::Decode)?;
-        if version != VERSION {
-            return Err(BootstrapSpecError::UnsupportedVersion(version));
-        }
+        let body = read_header(bytes, Domain::BootstrapSpec, VERSION).map_err(BootstrapSpecError::Header)?;
+        let mut reader = Decoder::new(body);
         let count = reader.u32().map_err(BootstrapSpecError::Decode)?;
         if count != BOOTSTRAP_CONTROL_COUNT as u32 {
             return Err(BootstrapSpecError::WrongCount(count));
@@ -174,7 +173,6 @@ impl BootstrapControlSpecV1 {
 
     pub fn encode(&self) -> Result<Vec<u8>, BootstrapSpecError> {
         let mut encoder = Encoder::new();
-        encoder.u32(VERSION);
         encoder.u32(BOOTSTRAP_CONTROL_COUNT as u32);
         for row in &self.0 {
             encoder.enum_variant(row.symbol as u32);
@@ -184,7 +182,9 @@ impl BootstrapControlSpecV1 {
             }
             encoder.bytes(&row.logical_schema);
         }
-        let bytes = encoder.into_bytes();
+        let mut bytes = Vec::new();
+        write_header(&mut bytes, Domain::BootstrapSpec, VERSION);
+        bytes.extend_from_slice(encoder.as_bytes());
         // Encoding is used only by diagnostics/tests; the parser remains the
         // single structural authority.
         Self::parse(&bytes)?;

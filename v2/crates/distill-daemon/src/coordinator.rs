@@ -3421,7 +3421,7 @@ fn asset_records(bundle: &Bundle, projection: &PipelineProjection) -> Result<Vec
                 tags: BTreeMap::new(),
                 terminal_type: Some(projection.interface(entry.type_uuid).terminal),
                 content: Some(
-                    distill_rpc::content_key(entry.schema_hash, &schema.root, &entry.data, &types).map_err(invalid)?,
+                    distill_rpc::content_key(schema, &entry.data, &types).map_err(invalid)?,
                 ),
             })
         })

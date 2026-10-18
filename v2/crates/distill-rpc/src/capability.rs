@@ -694,7 +694,7 @@ fn inspect_entry(
         normalized_path: entry.normalized_path,
         type_uuid: entry.type_uuid,
         schema_hash: entry.schema_hash,
-        logical_schema: entry.logical_schema,
+        schema: entry.schema,
         role: entry.role,
         value: entry.value,
         root: read.root.clone(),
@@ -704,15 +704,14 @@ fn inspect_entry(
     }))
 }
 
-/// Blob `index` of `uuid`'s value at `snapshot` as one structural chunk
-/// section; the blob table's order is the order an inspection lists its
-/// refs in.
+/// The bytes `uuid`'s value at `snapshot` holds as `blob`, as one
+/// structural chunk section.
 fn authoring_blob(
     server: &Server,
     snapshot: &StoreReader,
     stamp: SnapshotStamp,
     uuid: AssetUuid,
-    index: u32,
+    blob: BlobRef,
 ) -> Result<AuthoringBlobResult, RpcFailure> {
     let (meta, read) = match BundleReads::new(server, snapshot).entry(uuid)? {
         EntryBundle::Read(meta, read) => (meta, read),
@@ -727,14 +726,7 @@ fn authoring_blob(
         .assets
         .get(&meta.local_id)
         .ok_or_else(|| invalid(format!("bundle has no entry {:?}", meta.local_id)))?;
-    let schema = read
-        .parsed
-        .schemas
-        .get(&entry.schema_hash)
-        .ok_or_else(|| invalid(format!("bundle has no schema snapshot for entry {:?}", meta.local_id)))?;
-    let types = read.parsed.type_table().map_err(|error| invalid(error.to_string()))?;
-    let Some(blob) = crate::validate::value_blob(&schema.root, &entry.data, &types, index).map_err(invalid)?
-    else {
+    let Some(blob) = crate::validate::value_blob(&entry.data, blob) else {
         return Ok(AuthoringBlobResult::Missing);
     };
     let payload = ArtifactPayload { structural: blob, blobs: Vec::new(), load_edges: Vec::new() };
@@ -1016,8 +1008,6 @@ fn describe_type_in(
         };
         let schema_hash = distill_schema::ngp_schema::node_hash(&schema.root)
             .map_err(|error| invalid_type_file(&schema_path, format!("{error:?}")))?;
-        let logical_schema = distill_schema::ngp_schema::snapshot_to_json(&schema)
-            .map_err(|error| invalid_type_file(&schema_path, error))?;
         let default = match files.read(&index.root, &prefab_types::default_file(&entry.path))? {
             None => TypeDefault::Absent,
             Some((_, bytes)) => match prefab_types::read_default(&bytes, &schema.root) {
@@ -1026,7 +1016,7 @@ fn describe_type_in(
                 Ok(prefab_types::DefaultFile::Value(value)) => {
                     // A default file is read without a type table (`read_default`),
                     // so it holds no dynamic value and carries no types.
-                    match crate::validate::authoring_value(&schema.root, &value, &Default::default()) {
+                    match crate::validate::authoring_value(&value, &Default::default()) {
                         Ok(value) => TypeDefault::Value(value),
                         Err(error) => TypeDefault::Invalid(error),
                     }
@@ -1040,7 +1030,7 @@ fn describe_type_in(
                 path,
                 doc: member.doc,
                 type_doc: member.type_doc,
-                editor: distill_schema::ngp_schema::describe::hints_to_json(&member.editor),
+                editor: member.editor,
             })
             .collect();
         Ok(Some(TypeDescription {
@@ -1048,7 +1038,7 @@ fn describe_type_in(
             type_uuid,
             path: entry.path,
             schema_hash,
-            logical_schema: Arc::from(logical_schema.into_bytes()),
+            schema: Arc::new(schema),
             default,
             members,
             renames,
@@ -2752,14 +2742,14 @@ impl AuthoringSnapshot {
         }
     }
 
-    /// Blob `index` of `uuid`'s value table (the order of an inspection's
-    /// refs), as a chunk stream of one structural section.
-    pub fn blob(&self, uuid: AssetUuid, index: u32) -> RpcResult<AuthoringBlobResult> {
+    /// The bytes of the blob `uuid`'s value names as `blob` (an
+    /// inspection's reference), as a chunk stream of one structural section.
+    pub fn blob(&self, uuid: AssetUuid, blob: BlobRef) -> RpcResult<AuthoringBlobResult> {
         let txn = match self.preflight() {
             Ok(txn) => txn,
             Err(result) => return result,
         };
-        match authoring_blob(&self.server, txn.snapshot(), self.basis.snapshot, uuid, index) {
+        match authoring_blob(&self.server, txn.snapshot(), self.basis.snapshot, uuid, blob) {
             Ok(result) => RpcResult::Success(result),
             Err(error) => RpcResult::Failure(error),
         }

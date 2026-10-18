@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use distill_rpc::*;
 use distill_schema::ngp_schema::{
-    node_hash, parse_value, snapshot_to_json, AssetRefValue, LogicalSchema, Options, PrimitiveKind,
+    node_hash, parse_value, AssetRefValue, LogicalSchema, Options, PrimitiveKind,
     SchemaNode, Value,
 };
 use distill_store::config::RestartOnlyChange;
@@ -83,13 +83,21 @@ fn project() -> TestProject {
     TestProject::new(vec![target_with(7, &[])])
 }
 
+/// The bytes of `entry`'s blob value (see [`authoring_entry`]).
+fn entry_blob(entry: &AuthoringEntry) -> Arc<[u8]> {
+    match &*entry.value.value {
+        Value::Blob(blob) => Arc::from(blob.bytes().expect("the entry carries its bytes")),
+        other => panic!("not a blob entry: {other:?}"),
+    }
+}
+
 /// `entry` (see [`authoring_entry`]) as an authored asset.
 fn asset_of(entry: &AuthoringEntry) -> Asset {
     let asset = Asset::blob(
         &entry.local_id,
         entry.uuid,
         entry.type_uuid,
-        entry.value.blobs[0].bytes().expect("the entry carries its bytes"),
+        &entry_blob(entry),
     );
     match entry.role {
         AuthoringEntryRole::Runtime => asset,
@@ -856,14 +864,10 @@ fn authoring_entry(byte: u8, role: AuthoringEntryRole) -> AuthoringEntry {
         type_uuid: type_id(byte),
         terminal_type: type_id(byte),
         schema_hash,
-        logical_schema: Arc::from(&b"\"blob\""[..]),
+        schema: Arc::new(LogicalSchema { root: SchemaNode::Blob }),
         role,
         tags: BTreeMap::new(),
-        value: AuthoringValue {
-            canonical_value: Arc::from(&b"{\"len\":1,\"offset\":0}"[..]),
-            blobs: vec![AuthoringBlob::Bytes(Arc::from([byte.wrapping_add(2)]))],
-            types: Vec::new(),
-        },
+        value: plain(Value::Blob(vec![byte.wrapping_add(2)].into())),
     }
 }
 
@@ -886,30 +890,20 @@ impl InspectOne for AuthoringSnapshot {
 }
 
 #[test]
-fn authoring_payload_decoder_materializes_authenticated_blob_bytes() {
+fn a_stored_value_holds_the_blob_bytes_its_entry_carries() {
     let entry = authoring_entry(9, AuthoringEntryRole::AuthoringOnly);
-    assert_eq!(
-        decode_authoring_payload(entry.schema_hash, &entry.logical_schema, &entry.value).unwrap().0,
-        Value::Blob(vec![11].into())
-    );
+    assert_eq!(stored_value(&entry.schema, &entry.value).unwrap().0, Value::Blob(vec![11].into()));
 }
 
 #[test]
-fn authoring_payload_decoder_reenters_an_enum_from_its_variant_payload() {
+fn a_stored_value_reenters_an_enum_from_its_variant_payload() {
     // { End: {}, Link: { blob: Blob, next: BackRef(0) } }: a variant
     // payload opens no frame of its own (§5), so `next` is the enum again.
     let schema = LogicalSchema {
         root: SchemaNode::Enum {
             rev: 0,
             variants: vec![
-                (
-                    "End".to_owned(),
-                    0,
-                    SchemaNode::Struct {
-                        rev: 0,
-                        fields: Vec::new(),
-                    },
-                ),
+                ("End".to_owned(), 0, SchemaNode::Struct { rev: 0, fields: Vec::new() }),
                 (
                     "Link".to_owned(),
                     0,
@@ -924,32 +918,14 @@ fn authoring_payload_decoder_reenters_an_enum_from_its_variant_payload() {
             ],
         },
     };
-    let value = AuthoringValue {
-        canonical_value: Arc::from(
-            &br#"{"Link":{"blob":{"len":1,"offset":0},"next":{"Link":{"blob":{"len":1,"offset":1},"next":{"End":{}}}}}}"#[..],
-        ),
-        blobs: vec![AuthoringBlob::Bytes(Arc::from([1u8])), AuthoringBlob::Bytes(Arc::from([2u8]))],
-        types: Vec::new(),
-    };
     // Variants by name: End = 0, Link = 1; Link fields: blob, next.
     let link = |byte: u8, next: Value| Value::Enum {
         variant: 1,
         payload: Box::new([Value::Blob(vec![byte].into()), next]),
     };
-    let end = Value::Enum {
-        variant: 0,
-        payload: Box::new([]),
-    };
-    assert_eq!(
-        decode_authoring_payload(
-            node_hash(&schema.root).unwrap(),
-            snapshot_to_json(&schema).unwrap().as_bytes(),
-            &value,
-        )
-        .unwrap()
-        .0,
-        link(1, link(2, end))
-    );
+    let end = Value::Enum { variant: 0, payload: Box::new([]) };
+    let value = link(1, link(2, end));
+    assert_eq!(stored_value(&schema, &plain(value.clone())).unwrap().0, value);
 }
 
 fn option_of(inner: SchemaNode) -> SchemaNode {
@@ -966,26 +942,38 @@ fn record(fields: Vec<(&str, SchemaNode)>) -> SchemaNode {
     }
 }
 
-/// What a write of `entry` meets at intake: its value decoded against its
-/// schema (`decode_authoring_payload`).
-fn decode_entry(entry: &AuthoringEntry) -> Result<(), AuthoringValueError> {
-    decode_authoring_payload(entry.schema_hash, &entry.logical_schema, &entry.value).map(drop)
+/// Import settings of an empty struct.
+fn empty_settings() -> (LogicalHash, Arc<LogicalSchema>, AuthoringPatch) {
+    let schema = LogicalSchema { root: record(Vec::new()) };
+    let patch = Patch::Struct(Box::new([]));
+    (node_hash(&schema.root).unwrap(), Arc::new(schema), AuthoringPatch { patch: Arc::new(patch), types: Vec::new() })
 }
 
+/// Import settings of a struct with one blob field, set.
+fn blob_settings() -> (LogicalHash, Arc<LogicalSchema>, AuthoringPatch) {
+    let schema = LogicalSchema { root: record(vec![("data", SchemaNode::Blob)]) };
+    let patch = Patch::Struct(Box::new([Some(Patch::Replace(Value::Blob(b"settings-blob".to_vec().into())))]));
+    (node_hash(&schema.root).unwrap(), Arc::new(schema), AuthoringPatch { patch: Arc::new(patch), types: Vec::new() })
+}
+
+/// A value carrying no types.
+fn plain(value: Value) -> AuthoringValue {
+    AuthoringValue { value: Arc::new(value), types: Vec::new() }
+}
+
+/// What a write of `entry` meets at intake: its value checked against its
+/// schema (`stored_value`).
+fn decode_entry(entry: &AuthoringEntry) -> Result<(), AuthoringValueError> {
+    stored_value(&entry.schema, &entry.value).map(drop)
+}
+
+/// `canonical` read as a value of `root`, then checked as a write is.
 fn decode_plain(root: SchemaNode, canonical: &str) -> Result<Value, AuthoringValueError> {
     let schema = LogicalSchema { root };
-    decode_authoring_payload(
-        node_hash(&schema.root).unwrap(),
-        snapshot_to_json(&schema).unwrap().as_bytes(),
-        &AuthoringValue {
-            canonical_value: Arc::from(canonical.as_bytes()),
-            blobs: Vec::new(),
-            types: Vec::new(),
-        },
-    )
-    .map(|(value, _)| value)
+    let value = parse_value(canonical, &schema.root, Options::canonical())
+        .map_err(|error| AuthoringValueError::ValueInvalid(error.render("value")))?;
+    stored_value(&schema, &plain(value)).map(|(value, _)| value)
 }
-
 #[test]
 fn authoring_payload_decoder_reenters_a_backref_under_its_own_ancestors() {
     // A { b: Option<B> }, B { a: Option<A>, b: Option<B> }. B.b re-enters
@@ -1085,45 +1073,33 @@ fn tag_queries_fail_when_other_selectors_could_include_a_poisoned_entry() {
 }
 
 #[test]
-fn authoring_commit_authenticates_schema_and_exact_blob_index_coverage() {
+fn authoring_commit_authenticates_schema_and_blob_references() {
     let mut project = project();
     let server = project.server();
     let valid = authoring_entry(1, AuthoringEntryRole::AuthoringOnly);
     publish_entry(&mut project, &valid);
-    // The daemon serves the valid entry as authored.
+    // The daemon serves the valid entry as authored, its blob by reference.
     assert!(matches!(
         authoring_snapshot(&connect(&server, &[])).inspect_one(valid.uuid),
         RpcResult::Success(AuthoringInspectResult::Inspection(inspection))
             if inspection.schema_hash == valid.schema_hash
-                && inspection.logical_schema == valid.logical_schema
+                && inspection.schema == valid.schema
                 && inspection.value == valid.value.by_ref()
     ));
 
     let mut malformed = valid.clone();
-    malformed.value.canonical_value = Arc::from(&b"0"[..]);
-    assert!(matches!(
-        decode_entry(&malformed),
-        Err(AuthoringValueError::SchemaValueShape { .. })
-    ));
+    malformed.value = plain(Value::U8(0));
+    assert!(matches!(decode_entry(&malformed), Err(AuthoringValueError::SchemaValueShape { .. })));
 
-    let mut duplicate = valid.clone();
-    duplicate.logical_schema = Arc::from(&b"{\"array\":{\"elem\":\"blob\",\"len\":2}}"[..]);
-    duplicate.schema_hash = node_hash(&SchemaNode::Array {
-        len: 2,
-        elem: Box::new(SchemaNode::Blob),
-    })
-    .unwrap();
-    duplicate.value.canonical_value =
-        Arc::from(&b"[{\"len\":1,\"offset\":0},{\"len\":1,\"offset\":0}]"[..]);
-    assert!(matches!(
-        decode_entry(&duplicate),
-        Err(AuthoringValueError::DuplicateBlobIndex { index: 0 })
-    ));
+    // A blob named by reference has no bytes until the bundle's blobs
+    // resolve it (`resolve_blob_refs`).
+    let mut by_ref = valid.clone();
+    by_ref.value = valid.value.by_ref();
+    assert!(matches!(decode_entry(&by_ref), Err(AuthoringValueError::UnknownBlobRef { .. })));
 
-    let mut tampered_schema = valid;
-    tampered_schema.schema_hash = LogicalHash([0; 16]);
+    // A schema is read only against the hash it is named by.
     assert!(matches!(
-        decode_entry(&tampered_schema),
+        codec::read_schema(LogicalHash([0; 16]), &codec::schema_bytes(&valid.schema)),
         Err(AuthoringValueError::LogicalSchemaInvalid(_))
     ));
 }
@@ -1133,30 +1109,14 @@ fn authoring_schema_walk_type_checks_primitive_and_reference_leaves() {
     let mut entry = authoring_entry(1, AuthoringEntryRole::Runtime);
     let primitive = SchemaNode::Primitive(PrimitiveKind::U8);
     entry.schema_hash = node_hash(&primitive).unwrap();
-    entry.logical_schema = Arc::from(
-        snapshot_to_json(&LogicalSchema { root: primitive })
-            .unwrap()
-            .into_bytes(),
-    );
-    entry.value.canonical_value = Arc::from(&b"{\"len\":1,\"offset\":0}"[..]);
-    entry.value.blobs.clear();
-    assert!(matches!(
-        decode_entry(&entry.clone()),
-        Err(AuthoringValueError::SchemaValueShape { .. })
-    ));
+    entry.schema = Arc::new(LogicalSchema { root: primitive });
+    entry.value = plain(Value::Blob(vec![1].into()));
+    assert!(matches!(decode_entry(&entry.clone()), Err(AuthoringValueError::SchemaValueShape { .. })));
 
     let reference = SchemaNode::AssetRef(type_id(1));
     entry.schema_hash = node_hash(&reference).unwrap();
-    entry.logical_schema = Arc::from(
-        snapshot_to_json(&LogicalSchema { root: reference })
-            .unwrap()
-            .into_bytes(),
-    );
-    entry.value.canonical_value = Arc::from(&b"{\"len\":1,\"offset\":0}"[..]);
-    assert!(matches!(
-        decode_entry(&entry),
-        Err(AuthoringValueError::SchemaValueShape { .. })
-    ));
+    entry.schema = Arc::new(LogicalSchema { root: reference });
+    assert!(matches!(decode_entry(&entry), Err(AuthoringValueError::SchemaValueShape { .. })));
 }
 
 #[test]
@@ -1460,10 +1420,7 @@ fn authoring_snapshot_pins_role_inclusive_metadata_without_runtime_escape() {
             assert_eq!(inspection.stamp, stamp);
             assert_eq!(inspection.uuid, asset_id(2));
             assert_eq!(inspection.role, AuthoringEntryRole::AuthoringOnly);
-            assert_eq!(
-                &*inspection.value.canonical_value,
-                br#"{"group":"group-2"}"#
-            );
+            assert_eq!(*inspection.value.value, Value::Struct(Box::new([Value::String("group-2".to_owned())])));
         }
         other => panic!("expected pinned inspection, got {other:?}"),
     }
@@ -1511,7 +1468,7 @@ fn authoring_snapshot_refreshes_to_a_successor_stamp_without_tearing() {
     // snapshot published: a file rewritten since is drift, at the current
     // version until the daemon publishes the edit.
     let mut replacement = first_entry.clone();
-    replacement.value.blobs = vec![AuthoringBlob::Bytes(Arc::from([0xAA]))];
+    replacement.value = plain(Value::Blob(vec![0xAA].into()));
     assert_ne!(replacement.value, first_entry.value);
     write_entry(&mut project, &replacement);
     let drifted = AuthoringInspectResult::Drifted {
@@ -1886,7 +1843,7 @@ fn snapshots_pin_old_metadata_and_refresh_repins_latest() {
     // The bundle moves and its value changes.
     let mut moved = entry.clone();
     moved.normalized_path = "moved/bundle-1.bundle".to_owned();
-    moved.value.blobs = vec![AuthoringBlob::Bytes(Arc::from([0xAA]))];
+    moved.value = plain(Value::Blob(vec![0xAA].into()));
     project.remove(&entry.normalized_path);
     let second_stamp = publish_entry(&mut project, &moved);
     builds.answer(second_stamp, second);
@@ -2653,11 +2610,9 @@ fn hub_authoring_and_wire_tree_surface_is_versioned_typed_and_generation_first()
         importer: "image-importer".to_owned(),
         sources: vec!["source/image.png".to_owned()],
         dest: "generated/image.bundle".to_owned(),
-        settings: AuthoringValue {
-            canonical_value: Arc::from(&b"{}"[..]),
-            blobs: vec![AuthoringBlob::Bytes(Arc::from(&b"settings-blob"[..]))],
-            types: Vec::new(),
-        },
+        settings_hash: blob_settings().0,
+        settings_schema: blob_settings().1,
+        settings: blob_settings().2,
         watch: true,
         root: "assets".to_owned(),
         if_changed: true,
@@ -2794,11 +2749,9 @@ fn an_unregistered_importer_is_typed_and_never_advances_the_input_version() {
         importer: "image-importer".to_owned(),
         sources: vec!["source/image.png".to_owned()],
         dest: "generated/image.bundle".to_owned(),
-        settings: AuthoringValue {
-            canonical_value: Arc::from(&b"{}"[..]),
-            blobs: vec![],
-            types: Vec::new(),
-        },
+        settings_hash: empty_settings().0,
+        settings_schema: empty_settings().1,
+        settings: empty_settings().2,
         watch: false,
         root: String::new(),
         if_changed: false,
@@ -2917,7 +2870,7 @@ fn wire_tree_coverage_keeps_pinned_compatible_artifact_references() {
         }
     );
     let mut changed = entry.clone();
-    changed.value.blobs = vec![AuthoringBlob::Bytes(Arc::from([0xAA]))];
+    changed.value = plain(Value::Blob(vec![0xAA].into()));
     let current_stamp = publish_entry(&mut project, &changed);
     builds.answer(current_stamp, current_hash);
     assert_eq!(
@@ -3200,7 +3153,7 @@ fn content_keys_follow_values_not_versions() {
         rows.into_iter().map(|row| (row.uuid, row.content)).collect()
     };
     let first = keys();
-    assert_eq!(first[&a.uuid], content_key_of(a.schema_hash, &a.value));
+    assert_eq!(first[&a.uuid], content_key_of(&a.schema, &a.value).unwrap());
     assert_ne!(first[&a.uuid], first[&b.uuid]);
 
     publish_unrelated(&mut project);
@@ -3208,10 +3161,10 @@ fn content_keys_follow_values_not_versions() {
     assert_eq!((second[&a.uuid], second[&b.uuid]), (first[&a.uuid], first[&b.uuid]));
 
     let mut edited = a.clone();
-    edited.value.blobs = vec![AuthoringBlob::Bytes(Arc::from([0xAA]))];
+    edited.value = plain(Value::Blob(vec![0xAA].into()));
     publish_entry(&mut project, &edited);
     let third = keys();
-    assert_eq!(third[&a.uuid], content_key_of(edited.schema_hash, &edited.value));
+    assert_eq!(third[&a.uuid], content_key_of(&edited.schema, &edited.value).unwrap());
     assert_ne!(third[&a.uuid], first[&a.uuid]);
     assert_eq!(third[&b.uuid], first[&b.uuid]);
 }

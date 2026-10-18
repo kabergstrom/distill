@@ -2435,9 +2435,9 @@ fn process_chain(
     node_trace: &mut Vec<TraceOp>,
     cacheable: &mut bool,
 ) -> Result<Vec<EncodedNodeOutput>, BuildError> {
+    let (input_hash, current_value) = imported_value_digest(context, loaded, project, current_value)?;
     if !context.verify_fresh {
-        if let Some((outputs, traces)) = hydrate_complete_chain(context, loaded, chain, &imported)?
-        {
+        if let Some((outputs, traces)) = hydrate_complete_chain(context, loaded, chain, input_hash)? {
             node_trace.extend(traces);
             return Ok(outputs);
         }
@@ -2451,7 +2451,8 @@ fn process_chain(
             load_current_value(context, loaded, project, current_load, &mut trace)?
         }
     };
-    let mut current_hash = ContentHash(distill_core::hash::hash(&imported.bytes));
+    let mut current_hash = input_hash;
+    drop(imported);
     let mut extras = BTreeMap::<String, EncodedNodeOutput>::new();
     let mut final_primary = None;
     for stage in &chain.stages {
@@ -2600,13 +2601,38 @@ fn run_processor_stage(
     Ok((next, encoded, trace, cacheable))
 }
 
+/// The first stage's memo input: the value digest (§17.3) of the imported
+/// value under the authored type's project schema. The stored value is that
+/// value unless its schema differs; then the migrated value is loaded (and
+/// handed back for the chain to run on).
+fn imported_value_digest(
+    context: &BuildContext,
+    loaded: &LoadedAsset,
+    project: &ProjectTypeAuthority,
+    current_value: Option<Value>,
+) -> Result<(ContentHash, Option<Value>), BuildError> {
+    let digest = |value: &Value| {
+        distill_rpc::content_key(&project.logical_schema, value, &loaded.types)
+            .map(ContentHash)
+            .map_err(BuildError::Failed)
+    };
+    match current_value {
+        Some(value) => Ok((digest(&value)?, Some(value))),
+        None if loaded.entry.schema_hash == project.logical_hash => Ok((digest(&loaded.entry.data)?, None)),
+        None => {
+            let mut trace = Vec::new();
+            let value = load_current_value(context, loaded, project, &context.env.current_load, &mut trace)?;
+            Ok((digest(&value)?, Some(value)))
+        }
+    }
+}
+
 fn hydrate_complete_chain(
     context: &mut BuildContext,
     loaded: &LoadedAsset,
     chain: &PipelineChain,
-    imported: &EncodedNodeOutput,
+    mut input_hash: ContentHash,
 ) -> Result<Option<(Vec<EncodedNodeOutput>, Vec<TraceOp>)>, BuildError> {
-    let mut input_hash = ContentHash(distill_core::hash::hash(&imported.bytes));
     let mut extras = BTreeMap::<String, EncodedNodeOutput>::new();
     let mut final_primary = None;
     let mut traces = Vec::new();

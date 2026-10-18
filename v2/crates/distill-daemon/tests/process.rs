@@ -1433,15 +1433,11 @@ fn start_gate_daemon(temp: &tempfile::TempDir, variant: &GateVariant) -> DaemonP
         &config,
         process.rpc_address(),
         None,
-        &distill_rpc::ImportRequest {
+        &distill_daemon::bootstrap::ImportArgs {
             importer: "gate-fixture".into(),
             sources: vec!["note.txt".into()],
             dest: "note.bundle".into(),
-            settings: distill_rpc::AuthoringValue {
-                canonical_value: std::sync::Arc::from(&b"{\"value\":0}"[..]),
-                blobs: Vec::new(),
-                types: Vec::new(),
-            },
+            settings: "{\"value\":0}".into(),
             watch: true,
             root: "main".into(),
             if_changed: false,

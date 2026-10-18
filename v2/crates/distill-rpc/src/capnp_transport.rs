@@ -1147,9 +1147,17 @@ impl schema::authoring_snapshot::Server for AuthoringSnapshotService {
                     return Ok(());
                 }
             };
+            let wire = params.get_blob()?;
+            let blob = match decode_hash(wire.get_hash()?, "blob.hash") {
+                Ok(hash) => crate::BlobRef { len: wire.get_len(), hash },
+                Err(error) => {
+                    write_wire_error(results.get().init_result().init_error(), &error);
+                    return Ok(());
+                }
+            };
             write_authoring_blob_result(
                 results.get().init_result(),
-                self.snapshot.blob(uuid, params.get_index()),
+                self.snapshot.blob(uuid, blob),
             );
             Ok(())
         }
@@ -1594,26 +1602,24 @@ fn decode_connect_request(
     })
 }
 
-/// Write a carrier: canonical text, blobs, types.
-pub(crate) fn write_authoring_value(
-    mut output: schema::authoring_value::Builder<'_>,
+/// Write a served value: the store checked it against `schema` when it
+/// read it, so it encodes.
+pub(crate) fn write_served_value(
+    output: schema::authoring_value::Builder<'_>,
+    logical: &crate::LogicalSchema,
     value: &crate::AuthoringValue,
 ) {
-    output.set_canonical_value(&value.canonical_value);
-    write_authoring_blobs(output.reborrow().init_blobs(value.blobs.len() as u32), &value.blobs);
-    let mut types = output.init_types(value.types.len() as u32);
-    for (index, ty) in value.types.iter().enumerate() {
-        let mut row = types.reborrow().get(index as u32);
-        row.set_path(ty.path.as_str());
-        row.reborrow().init_type_uuid().set_bytes(&ty.type_uuid.0);
-        row.set_schema_hash(&ty.schema_hash.0);
-        row.set_logical_schema(&ty.logical_schema);
-    }
+    write_authoring_value(output, logical, value).expect("a served value encodes under the schema it was checked by");
 }
 
 fn decode_authoring_entry(
     value: schema::authoring_entry_value::Reader<'_>,
 ) -> Result<crate::AuthoringEntry, String> {
+    let (schema_hash, logical) = decode_schema(
+        value.get_schema_hash().map_err(authoring_decode_error)?,
+        value.get_schema().map_err(authoring_decode_error)?,
+        "authoringOp.schemaHash",
+    )?;
     let mut tags = std::collections::BTreeMap::new();
     let mut previous: Option<String> = None;
     for row in value.get_tags().map_err(authoring_decode_error)?.iter() {
@@ -1698,24 +1704,14 @@ fn decode_authoring_entry(
             )
             .map_err(|error| error.message)?,
         ),
-        schema_hash: crate::LogicalHash(
-            decode_hash(
-                value.get_schema_hash().map_err(authoring_decode_error)?,
-                "authoringOp.schemaHash",
-            )
-            .map_err(|error| error.message)?,
-        ),
-        logical_schema: value
-            .get_logical_schema()
-            .map_err(authoring_decode_error)?
-            .to_vec()
-            .into(),
+        schema_hash,
+        value: decode_authoring_value(&logical, value.get_value().map_err(authoring_decode_error)?)?,
+        schema: logical,
         role: match value.get_role().map_err(authoring_decode_error)? {
             schema::AuthoringEntryRole::Runtime => AuthoringEntryRole::Runtime,
             schema::AuthoringEntryRole::AuthoringOnly => AuthoringEntryRole::AuthoringOnly,
         },
         tags,
-        value: decode_authoring_value(value.get_value().map_err(authoring_decode_error)?)?,
         root: decode_text(value.get_root().map_err(authoring_decode_error)?, "authoringOp.root")
             .map_err(|error| error.message)?,
     })
@@ -1757,6 +1753,11 @@ fn decode_import_request(
                 .map_err(|error| error.message)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let (settings_hash, settings_schema) = decode_schema(
+        request.get_settings_hash().map_err(authoring_decode_error)?,
+        request.get_settings_schema().map_err(authoring_decode_error)?,
+        "import.settingsHash",
+    )?;
     Ok(crate::ImportRequest {
         importer: decode_text(
             request.get_importer().map_err(authoring_decode_error)?,
@@ -1769,7 +1770,9 @@ fn decode_import_request(
             "import.dest",
         )
         .map_err(|error| error.message)?,
-        settings: decode_authoring_value(request.get_settings().map_err(authoring_decode_error)?)?,
+        settings: decode_authoring_patch(&settings_schema, request.get_settings().map_err(authoring_decode_error)?)?,
+        settings_hash,
+        settings_schema,
         watch: request.get_watch(),
         if_changed: request.get_if_changed(),
         root: decode_text(
@@ -2367,15 +2370,15 @@ fn write_type_description(
     output.set_type_uuid(&description.type_uuid.0);
     output.set_path(description.path.as_str());
     output.set_schema_hash(&description.schema_hash.0);
-    output.set_logical_schema(&description.logical_schema);
-    write_type_default(output.reborrow().init_default_value(), &description.default);
+    output.set_schema(&crate::codec::schema_bytes(&description.schema));
+    write_type_default(output.reborrow().init_default_value(), &description.schema, &description.default);
     let mut members = output.reborrow().init_members(description.members.len() as u32);
     for (index, member) in description.members.iter().enumerate() {
         let mut wire = members.reborrow().get(index as u32);
         wire.set_path(member.path.as_str());
         wire.set_doc(member.doc.as_deref().unwrap_or(""));
         wire.set_type_doc(member.type_doc.as_deref().unwrap_or(""));
-        wire.set_editor(member.editor.as_str());
+        write_editor_hints(wire.reborrow().init_editor(), &member.editor);
     }
     let mut renames = output.init_renames(description.renames.len() as u32);
     for (index, (at, from)) in description.renames.iter().enumerate() {
@@ -2385,9 +2388,9 @@ fn write_type_description(
     }
 }
 
-fn write_type_default(mut output: schema::type_default::Builder<'_>, default: &TypeDefault) {
+fn write_type_default(mut output: schema::type_default::Builder<'_>, logical: &crate::LogicalSchema, default: &TypeDefault) {
     match default {
-        TypeDefault::Value(value) => write_authoring_value(output.init_value(), value),
+        TypeDefault::Value(value) => write_served_value(output.init_value(), logical, value),
         TypeDefault::Absent => output.set_absent(()),
         TypeDefault::SchemaMismatch { written } => output.set_schema_mismatch(&written.0),
         TypeDefault::Invalid(detail) => output.set_invalid(detail.as_str()),
@@ -2408,8 +2411,8 @@ fn write_authorable_result(mut result: schema::authorable_call::Builder<'_>, out
                 wire.set_doc(ty.doc.as_str());
                 wire.set_authoring_only(ty.authoring_only);
                 wire.set_schema_hash(&ty.schema_hash.0);
-                wire.set_logical_schema(&ty.logical_schema);
-                write_type_default(wire.init_default_value(), &ty.default);
+                wire.set_schema(&crate::codec::schema_bytes(&ty.schema));
+                write_type_default(wire.init_default_value(), &ty.schema, &ty.default);
             }
             let mut importers = output.init_importers(authorable.importers.len() as u32);
             for (index, importer) in authorable.importers.iter().enumerate() {
@@ -2418,8 +2421,8 @@ fn write_authorable_result(mut result: schema::authorable_call::Builder<'_>, out
                 wire.set_settings_type(&importer.settings_type.0);
                 wire.set_settings_path(importer.settings_path.as_str());
                 wire.set_settings_hash(&importer.settings_hash.0);
-                wire.set_settings_schema(&importer.settings_schema);
-                write_authoring_value(wire.reborrow().init_default_settings(), &importer.default_settings);
+                wire.set_settings_schema(&crate::codec::schema_bytes(&importer.settings_schema));
+                write_served_value(wire.reborrow().init_default_settings(), &importer.settings_schema, &importer.default_settings);
                 let mut globs = wire.init_default_globs(importer.default_globs.len() as u32);
                 for (at, glob) in importer.default_globs.iter().enumerate() {
                     globs.set(at as u32, glob.as_str());
@@ -2588,13 +2591,13 @@ fn write_authoring_inspection(
     output.set_normalized_path(inspection.normalized_path.as_str());
     output.set_type_uuid(&inspection.type_uuid.0);
     output.set_schema_hash(&inspection.schema_hash.0);
-    output.set_logical_schema(&inspection.logical_schema);
+    output.set_schema(&crate::codec::schema_bytes(&inspection.schema));
     output.set_role(wire_authoring_role(inspection.role));
     output.set_root(inspection.root.as_str());
     output.set_type_name(inspection.type_name.as_str());
     output.set_content(&inspection.content);
     write_bundle_origin(output.reborrow().init_origin(), &inspection.origin);
-    write_authoring_value(output.init_value(), &inspection.value);
+    write_served_value(output.init_value(), &inspection.schema, &inspection.value);
 }
 
 fn wire_authoring_role(role: AuthoringEntryRole) -> schema::AuthoringEntryRole {

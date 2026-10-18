@@ -16,7 +16,7 @@ use distill_pipeline_fixture::{
     SETTINGS_TYPE,
 };
 use distill_rpc::{
-    AuthoringValue, ImportRequest, InputVersion, TargetDefinition, TargetDefinitionHash,
+    ImportRequest, InputVersion, TargetDefinition, TargetDefinitionHash,
 };
 use distill_schema::ngp_schema::{
     parse_patch, write_value, DynamicPayload, DynamicValue, LogicalSchema, Options, SchemaNode,
@@ -101,6 +101,28 @@ fn import(
     import_with(coordinator, importer, sources, dest, &text(&default_settings()))
 }
 
+/// `settings`, authored text, as a patch of `importer`'s settings schema
+/// (the hub's `authorable` answer names it).
+fn settings_patch(
+    coordinator: &DaemonCoordinator,
+    importer: &str,
+    settings: &str,
+) -> (distill_core::id::LogicalHash, Arc<LogicalSchema>, distill_rpc::AuthoringPatch) {
+    let distill_rpc::RpcResult::Success(snapshot) = connect(coordinator).authoring_snapshot() else {
+        panic!("an authoring snapshot")
+    };
+    let distill_rpc::RpcResult::Success(authorable) = snapshot.authorable() else {
+        panic!("the authorable answer")
+    };
+    let importer = authorable.importers.into_iter().find(|row| row.id == importer).expect("the importer");
+    let patch = parse_patch(settings, &importer.settings_schema.root, Options::authored()).unwrap();
+    (
+        importer.settings_hash,
+        importer.settings_schema,
+        distill_rpc::AuthoringPatch { patch: Arc::new(patch), types: Vec::new() },
+    )
+}
+
 /// [`import`] with the importer settings `settings`.
 fn import_with(
     coordinator: &DaemonCoordinator,
@@ -110,15 +132,14 @@ fn import_with(
     settings: &str,
 ) -> BundleUuid {
     let base = coordinator.server().current_stamp().unwrap().version;
+    let (settings_hash, settings_schema, settings) = settings_patch(coordinator, importer, settings);
     let request = ImportRequest {
         importer: importer.into(),
         sources: sources.iter().map(|source| (*source).to_owned()).collect(),
         dest: dest.into(),
-        settings: AuthoringValue {
-            canonical_value: Arc::from(settings.as_bytes()),
-            blobs: Vec::new(),
-            types: Vec::new(),
-        },
+        settings_hash,
+        settings_schema,
+        settings,
         watch: true,
         root: "main".into(),
         if_changed: false,
@@ -1929,15 +1950,14 @@ fn import_if_changed(
     settings: &str,
 ) -> BundleUuid {
     let base = coordinator.server().current_stamp().unwrap().version;
+    let (settings_hash, settings_schema, settings) = settings_patch(coordinator, BYTE_IMPORTER, settings);
     let request = ImportRequest {
         importer: BYTE_IMPORTER.into(),
         sources: sources.iter().map(|source| (*source).to_owned()).collect(),
         dest: dest.into(),
-        settings: AuthoringValue {
-            canonical_value: Arc::from(settings.as_bytes()),
-            blobs: Vec::new(),
-            types: Vec::new(),
-        },
+        settings_hash,
+        settings_schema,
+        settings,
         watch: true,
         root: "main".into(),
         if_changed: true,
@@ -3524,7 +3544,7 @@ fn authorable_lists_the_authored_types_and_importers() {
     let TypeDefault::Value(default) = &parent.default else {
         panic!("the parent's default, got {:?}", parent.default)
     };
-    assert_eq!(&*default.canonical_value, br#"{"value":7}"#);
+    assert_eq!(*default.value, byte(7));
 
     let rules = &authorable.types[1];
     assert_eq!(rules.type_uuid, DIRECTORY_IMPORT_RULES_TYPE_UUID);
@@ -3544,7 +3564,7 @@ fn authorable_lists_the_authored_types_and_importers() {
     assert_eq!(byte.settings_type, SETTINGS_TYPE);
     assert!(!byte.settings_path.is_empty());
     assert_eq!(byte.default_globs, ["**/*.num"]);
-    assert_eq!(&*byte.default_settings.canonical_value, text(&default_settings()).as_bytes());
+    assert_eq!(*byte.default_settings.value, default_settings());
     let chain = authorable.importers.iter().find(|importer| importer.id == CHAIN_IMPORTER).unwrap();
     assert!(chain.default_globs.is_empty());
 
@@ -3557,7 +3577,7 @@ fn authorable_lists_the_authored_types_and_importers() {
         type_uuid: parent.type_uuid,
         terminal_type: parent.type_uuid,
         schema_hash: parent.schema_hash,
-        logical_schema: parent.logical_schema.clone(),
+        schema: parent.schema.clone(),
         role: AuthoringEntryRole::Runtime,
         tags: BTreeMap::new(),
         value: default.clone(),

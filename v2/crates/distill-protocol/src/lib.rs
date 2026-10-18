@@ -3,6 +3,7 @@
 //! (`state`) and target definitions. Pure data: no store, transport or runtime,
 //! so a runtime client links it without the daemon's crates.
 
+pub mod codec;
 mod rpc;
 pub mod state;
 mod target;

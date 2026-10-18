@@ -5,7 +5,7 @@ use crate::*;
 /// Pure preparation result returned by an injected authoring backend. The RPC
 /// server validates and commits this change set atomically against the caller's
 /// input-version precondition.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PreparedImportCommit {
     pub bundle: BundleUuid,
     pub commit: Commit,
@@ -22,7 +22,7 @@ pub trait DeferredOperation: Send + Sync {
     ) -> Result<DeferredOperationResult, String>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DeferredOperationResult {
     /// What the operation publishes in its own input; `None` for one whose
     /// effect is files the watcher publishes (a rename).

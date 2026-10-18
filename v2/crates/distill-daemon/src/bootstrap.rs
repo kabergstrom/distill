@@ -11,7 +11,8 @@ use distill_build::keys::target_definition_hash;
 use distill_core::id::BundleUuid;
 use distill_rpc::capnp_loader::{RemoteCall, RemoteHub};
 use distill_rpc::capnp_transport::{CapnpClient, RemoteConnectOutcome};
-use distill_rpc::{ConnectRequest, ImportRequest, RpcFailure, TargetDefinitionHash};
+use distill_rpc::{Authorable, AuthoringPatch, ConnectRequest, ImportRequest, RpcFailure, TargetDefinitionHash};
+use distill_schema::ngp_schema::{parse_patch, Options};
 use distill_schema::ProjectSchemaAuthority;
 use distill_store::state::InputVersion;
 
@@ -106,11 +107,25 @@ pub fn engine_args(
 /// Import through the daemon serving `config` at `address`, connected as
 /// `target`. Retries, for up to `wait`, while the daemon is not listening
 /// yet, its pipeline is not ready, or another publication moved the base.
+/// An import as the command line spells it: settings as authored text
+/// (fields left out take the defaults), parsed against the settings schema
+/// the hub serves for the importer.
+#[derive(Debug, Clone)]
+pub struct ImportArgs {
+    pub importer: String,
+    pub sources: Vec<String>,
+    pub dest: String,
+    pub settings: String,
+    pub watch: bool,
+    pub root: String,
+    pub if_changed: bool,
+}
+
 pub fn import(
     config: &DaemonConfig,
     address: std::net::SocketAddr,
     target: Option<&str>,
-    request: &ImportRequest,
+    request: &ImportArgs,
     wait: Duration,
 ) -> Result<BundleUuid, BootstrapError> {
     let authority = load_authority(config)?;
@@ -150,7 +165,7 @@ struct ImportAttemptError {
 async fn import_once(
     address: std::net::SocketAddr,
     connect: &ConnectRequest,
-    request: &ImportRequest,
+    args: &ImportArgs,
 ) -> Result<BundleUuid, ImportAttemptError> {
     let fail = |retry: bool| move |message: String| ImportAttemptError { message, retry };
     let client = CapnpClient::connect_local(address)
@@ -172,7 +187,40 @@ async fn import_once(
         Ok(other) => return Err(fail(true)(format!("snapshot: {other:?}"))),
         Err(error) => return Err(fail(true)(error.to_string())),
     };
-    import_at(&hub, base, request).await
+    let authorable = match hub.authoring_snapshot().await {
+        Ok(RemoteCall::Success(snapshot)) => match snapshot.authorable().await {
+            Ok(RemoteCall::Success(authorable)) => authorable,
+            Ok(other) => return Err(fail(true)(format!("authorable: {other:?}"))),
+            Err(error) => return Err(fail(true)(error.to_string())),
+        },
+        Ok(other) => return Err(fail(true)(format!("authoring snapshot: {other:?}"))),
+        Err(error) => return Err(fail(true)(error.to_string())),
+    };
+    let request = import_request(args, &authorable).map_err(fail(false))?;
+    import_at(&hub, base, &request).await
+}
+
+/// `args` as the hub takes it: the settings text read as a patch of the
+/// importer's settings schema.
+fn import_request(args: &ImportArgs, authorable: &Authorable) -> Result<ImportRequest, String> {
+    let importer = authorable
+        .importers
+        .iter()
+        .find(|importer| importer.id == args.importer)
+        .ok_or_else(|| format!("the pipeline has no importer {:?}", args.importer))?;
+    let patch = parse_patch(&args.settings, &importer.settings_schema.root, Options::authored())
+        .map_err(|error| error.render("settings"))?;
+    Ok(ImportRequest {
+        importer: args.importer.clone(),
+        sources: args.sources.clone(),
+        dest: args.dest.clone(),
+        settings_hash: importer.settings_hash,
+        settings_schema: importer.settings_schema.clone(),
+        settings: AuthoringPatch { patch: std::sync::Arc::new(patch), types: Vec::new() },
+        watch: args.watch,
+        root: args.root.clone(),
+        if_changed: args.if_changed,
+    })
 }
 
 async fn import_at(

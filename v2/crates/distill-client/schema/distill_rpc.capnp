@@ -597,34 +597,34 @@ struct MetadataDiagnostics {
   namespaceErrors @3 :List(NamespaceError);
 }
 
-# A blob a value names (protocol 28): its length and XXH3-128 hash, or, in a
-# write, its bytes. Inspections always carry refs; the bytes come from
-# AuthoringSnapshot.blob. A write naming a ref keeps the bytes the entry
-# already holds under it.
+# A blob by its length and XXH3-128 hash (protocol 28): what
+# AuthoringSnapshot.blob streams.
 struct BlobRef {
   len @0 :UInt64;
   hash @1 :Data;
 }
 
-struct AuthoringBlob {
-  union {
-    ref @0 :BlobRef;
-    bytes @1 :Data;
-  }
+# A value beside the schema that types it (newgameplus GAP 23 §17.6;
+# protocol 33): its value encoding, blobs inside it as bytes or by
+# reference (inspections carry references; a write naming one keeps the
+# bytes the entry holds under it), and the types its dynamic values name.
+struct AuthoringValue {
+  value @0 :Data;
+  types @1 :List(AuthoringType);
 }
 
-struct AuthoringValue {
-  canonicalValue @0 :Data;
-  blobs @1 :List(AuthoringBlob);
-  # The types its dynamic values name (newgameplus GAP 23 §3; protocol 20).
-  types @2 :List(AuthoringType);
+# A patch (import settings), carried like an AuthoringValue.
+struct AuthoringPatch {
+  patch @0 :Data;
+  types @1 :List(AuthoringType);
 }
 
 struct AuthoringType {
   path @0 :Text;
   typeUuid @1 :Uuid;
   schemaHash @2 :Data;
-  logicalSchema @3 :Data;
+  # The schema encoding; the reader checks it against schemaHash.
+  schema @3 :Data;
 }
 
 struct AuthoringEntryValue {
@@ -635,7 +635,7 @@ struct AuthoringEntryValue {
   typeUuid @4 :Uuid;
   terminalType @5 :Uuid;
   schemaHash @6 :Data;
-  logicalSchema @7 :Data;
+  schema @7 :Data;
   role @8 :AuthoringEntryRole;
   tags @9 :List(EntryTag);
   value @10 :AuthoringValue;
@@ -655,10 +655,13 @@ struct ImportRequest {
   importer @0 :Text;
   sources @1 :List(Text);
   dest @2 :Text;
-  settings @3 :AuthoringValue;
+  # Sparse, under the settings schema below (protocol 33).
+  settings @3 :AuthoringPatch;
   watch @4 :Bool;
   root @5 :Text;
   ifChanged @6 :Bool;
+  settingsHash @7 :Data;
+  settingsSchema @8 :Data;
 }
 
 struct LongRunningOp {
@@ -683,13 +686,13 @@ struct AuthoringInspection {
   schemaHash @6 :Data;
   role @7 :AuthoringEntryRole;
   value @8 :AuthoringValue;
-  logicalSchema @9 :Data;
+  schema @9 :Data;
   # The root holding the entry's bundle (protocol 22).
   root @10 :Text;
   # The bundle's origin and the type's served schema path (protocol 23).
   origin @11 :BundleOrigin;
   typeName @12 :Text;
-  # The entry's authoring content key (protocol 29).
+  # The entry's content key, its value digest (protocol 29, 33).
   content @13 :Data;
 }
 
@@ -743,9 +746,63 @@ struct TypeMember {
   # Empty: none.
   doc @1 :Text;
   typeDoc @2 :Text;
-  # The editor hints (GAP 23 §16.2) as canonical JSON
-  # (`ngp_schema::describe::EditorHints::to_json`); empty: none (protocol 31).
-  editor @3 :Text;
+  # The editor hints (GAP 23 §16.3; protocol 33).
+  editor @3 :EditorHints;
+}
+
+# `#[ngp(editor(...))]` (GAP 23 §16.3), one field per key: a new key is a
+# schema addition. Text: empty is unset; a number counts only with its
+# `has` flag.
+struct EditorHints {
+  label @0 :Text;
+  group @1 :Text;
+  collapsed @2 :Bool;
+  readOnly @3 :Bool;
+  hidden @4 :Bool;
+  hasRange @5 :Bool;
+  rangeMin @6 :Float64;
+  rangeMax @7 :Float64;
+  hasMin @8 :Bool;
+  min @9 :Float64;
+  hasMax @10 :Bool;
+  max @11 :Float64;
+  hasStep @12 :Bool;
+  step @13 :Float64;
+  unit @14 :Text;
+  degrees @15 :Bool;
+  percent @16 :Bool;
+  hasPrecision @17 :Bool;
+  precision @18 :UInt32;
+  slider @19 :Bool;
+  multiline @20 :Bool;
+  hasMaxLen @21 :Bool;
+  maxLen @22 :UInt32;
+  flags @23 :Bool;
+  color @24 :ColorHint;
+  hdr @25 :Bool;
+  alpha @26 :AlphaHint;
+  filter @27 :Text;
+  # `node(component = …)`, with `hasNode`.
+  nodeComponent @28 :Text;
+  normalized @29 :Bool;
+  uniform @30 :Bool;
+  position @31 :Bool;
+  rotation @32 :Bool;
+  # `nodeComponent` holds a component.
+  hasNode @33 :Bool;
+}
+
+enum ColorHint {
+  none @0;
+  srgb @1;
+  linear @2;
+}
+
+# `alpha = false` / `alpha = true`.
+enum AlphaHint {
+  unset @0;
+  off @1;
+  on @2;
 }
 
 struct TypeRename {
@@ -771,11 +828,11 @@ struct TypeDescription {
   typeUuid @1 :Data;
   path @2 :Text;
   schemaHash @3 :Data;
-  logicalSchema @4 :Data;
+  schema @4 :Data;
   defaultValue @5 :TypeDefault;
   members @6 :List(TypeMember);
   # Renamed fields (`#[asset(renamed_from)]`) by planner path, path-sorted
-  # (protocol 25): what an automatic migration to `logicalSchema` needs.
+  # (protocol 25): what an automatic migration to `schema` needs.
   renames @7 :List(TypeRename);
 }
 
@@ -826,7 +883,7 @@ struct AuthorableType {
   doc @4 :Text;
   authoringOnly @5 :Bool;
   schemaHash @6 :Data;
-  logicalSchema @7 :Data;
+  schema @7 :Data;
   defaultValue @8 :TypeDefault;
 }
 
@@ -1195,9 +1252,9 @@ interface AuthoringSnapshot {
   # The authored types the pipeline declares, with their defaults, and its
   # importers. Protocol 26.
   authorable @10 () -> (result :AuthorableCall);
-  # Blob `index` of the entry's value table (the order of its refs), as
-  # chunks. Protocol 28.
-  blob @11 (uuid :Data, index :UInt32) -> (result :AuthoringBlobCall);
+  # The bytes of a blob the entry's value names by reference, as chunks.
+  # Protocol 28; by reference since 33.
+  blob @11 (uuid :Data, blob :BlobRef) -> (result :AuthoringBlobCall);
   # The rows of the named entries, as `list` answers them; one the
   # snapshot does not serve has none (protocol 30).
   listEntries @12 (uuids :List(Data)) -> (result :AuthoringListCall);

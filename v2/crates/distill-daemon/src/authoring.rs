@@ -16,7 +16,7 @@ use distill_core::id::{BundleUuid, ContentHash, LogicalHash};
 use distill_migrate::{lossy_drops, plan_automatic_renamed};
 use distill_pipeline_api::callbacks::MigrationKey;
 use distill_rpc::{
-    decode_authoring_payload, resolve_blob_refs, value_blobs, AuthoringBackend, AuthoringBlob, AuthoringEntry, AuthoringEntryRole, AuthoringOp,
+    names_blob_ref, resolve_blob_refs, stored_value, value_blobs, AuthoringBackend, AuthoringEntry, AuthoringEntryRole, AuthoringOp,
     Commit, ImportJob, ImportRequest, InputVersion, LongRunningOp, PreparedImportCommit,
     PreparedOperationCommit, RpcFailure, WriteReceipt, WrittenFile,
 };
@@ -392,21 +392,20 @@ impl AuthoringService {
             )));
         }
 
-        let schema_text = std::str::from_utf8(&entry.logical_schema)
-            .map_err(|_| invalid("logical schema is not UTF-8"))?;
-        let schema = distill_schema::ngp_schema::verify_snapshot(schema_text, entry.schema_hash)
-            .map_err(invalid)?;
+        // The capnp transport verified the schema against its hash; an
+        // in-process caller hands it over as built.
+        if distill_schema::ngp_schema::node_hash(&entry.schema.root).map_err(invalid)? != entry.schema_hash {
+            return Err(invalid("the entry's schema does not hash to its schema hash"));
+        }
+        let schema = &*entry.schema;
         // A blob named by reference keeps the bytes the bundle holds under it
         // (§17 "Authoring snapshots"): an edit of a value with a blob
         // field re-sends no bytes.
         let resolved;
-        let value = if entry.value.blobs.iter().any(|blob| matches!(blob, AuthoringBlob::Ref(_))) {
-            let types = bundle.type_table().map_err(|error| invalid(error.to_string()))?;
+        let value = if names_blob_ref(&entry.value.value) {
             let mut held = BTreeMap::new();
             for existing in bundle.assets.values() {
-                if let Some(schema) = bundle.schemas.get(&existing.schema_hash) {
-                    value_blobs(&schema.root, &existing.data, &types, &mut held).map_err(invalid)?;
-                }
+                value_blobs(&existing.data, &mut held);
             }
             resolved = resolve_blob_refs(&entry.value, &held)
                 .map_err(|error| invalid(format!("invalid authored value: {error:?}")))?;
@@ -414,14 +413,14 @@ impl AuthoringService {
         } else {
             &entry.value
         };
-        let (data, types) = decode_authoring_payload(entry.schema_hash, &entry.logical_schema, value)
+        let (data, types) = stored_value(schema, value)
             .map_err(|error| invalid(format!("invalid authored value: {error:?}")))?;
         if !force_lossy {
             if let Some(existing) = bundle.assets.get(&entry.local_id) {
-                self.check_lossless(compiled, bundle, existing, &schema, entry.schema_hash)?;
+                self.check_lossless(compiled, bundle, existing, schema, entry.schema_hash)?;
             }
         }
-        bundle.schemas.insert(entry.schema_hash, schema);
+        bundle.schemas.insert(entry.schema_hash, schema.clone());
         // The written types replace the bundle's by path and UUID; an entry
         // this write leaves naming one must still conform (the bundle write
         // checks it).
@@ -674,7 +673,7 @@ impl AuthoringBackend for AuthoringService {
 /// the registered importers.
 fn authorable(compiled: &Compiled) -> Result<distill_rpc::Authorable, RpcFailure> {
     use distill_rpc::{AuthorableImporter, AuthorableType, TypeDefault};
-    use distill_schema::ngp_schema::{node_from_bytes, node_hash, snapshot_to_json, TypeTable};
+    use distill_schema::ngp_schema::{node_from_bytes, node_hash, TypeTable};
 
     let epoch = compiled.pipeline_epoch().map_err(|failure| {
         RpcFailure::PipelineUnavailable(Box::new(distill_rpc::PipelineUnavailableDiagnostic::PipelineFailure(
@@ -687,7 +686,6 @@ fn authorable(compiled: &Compiled) -> Result<distill_rpc::Authorable, RpcFailure
         let project = authority.project_type(type_uuid)?;
         Some(authority.schema().types.get(project.schema_type.0)?.path.display_path())
     };
-    let schema_json = |schema| snapshot_to_json(schema).map(|text| Arc::<[u8]>::from(text.into_bytes())).map_err(invalid);
     let no_types = TypeTable::default();
 
     let mut types = Vec::new();
@@ -700,7 +698,10 @@ fn authorable(compiled: &Compiled) -> Result<distill_rpc::Authorable, RpcFailure
         let default = if descriptor.logical_hash != project.logical_hash {
             TypeDefault::SchemaMismatch { written: descriptor.logical_hash }
         } else {
-            match distill_rpc::authoring_value(&project.logical_schema.root, &descriptor.default, &no_types) {
+            match distill_rpc::authoring_value(&descriptor.default, &no_types).and_then(|value| {
+                distill_rpc::check_authoring_value(&project.logical_schema, &value).map_err(|error| error.to_string())?;
+                Ok(value)
+            }) {
                 Ok(value) => TypeDefault::Value(value),
                 Err(error) => TypeDefault::Invalid(error),
             }
@@ -713,7 +714,7 @@ fn authorable(compiled: &Compiled) -> Result<distill_rpc::Authorable, RpcFailure
             doc: descriptor.doc,
             authoring_only: false,
             schema_hash: project.logical_hash,
-            logical_schema: schema_json(&project.logical_schema)?,
+            schema: Arc::new(project.logical_schema.clone()),
             default,
         });
     }
@@ -733,7 +734,7 @@ fn authorable(compiled: &Compiled) -> Result<distill_rpc::Authorable, RpcFailure
             .to_owned(),
         authoring_only: true,
         schema_hash: node_hash(&rules_schema.root).map_err(|error| invalid(format!("{error:?}")))?,
-        logical_schema: schema_json(&rules_schema)?,
+        schema: Arc::new(rules_schema),
         default: TypeDefault::Absent,
     });
     types.sort_by(|a, b| a.extension.cmp(&b.extension));
@@ -746,12 +747,15 @@ fn authorable(compiled: &Compiled) -> Result<distill_rpc::Authorable, RpcFailure
             settings_type: importer.settings_type_uuid,
             settings_path: path_of(importer.settings_type_uuid).unwrap_or_default(),
             settings_hash: importer.settings_hash,
-            settings_schema: schema_json(&importer.settings_schema)?,
+            settings_schema: Arc::new(importer.settings_schema.clone()),
             default_settings: distill_rpc::authoring_value(
-                &importer.settings_schema.root,
                 &importer.default_settings,
                 &no_types,
             )
+            .and_then(|value| {
+                distill_rpc::check_authoring_value(&importer.settings_schema, &value).map_err(|error| error.to_string())?;
+                Ok(value)
+            })
             .map_err(|error| invalid(format!("importer {id:?} default settings: {error}")))?,
             default_globs: default_rules
                 .iter()

@@ -19,6 +19,9 @@ pub struct OutputHash {
 pub struct StaticInputs {
     pub asset: AssetUuid,
     pub stage: u16,
+    /// Stage 0: the value digest of the imported value (§17.3, under the
+    /// authored type's project schema); later stages: the hash of the
+    /// previous stage's primary artifact bytes.
     pub input_hash: ContentHash,
     pub target_def_hash: [u8; 16],
     pub processor_id: String,

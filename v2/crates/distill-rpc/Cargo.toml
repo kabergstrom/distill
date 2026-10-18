@@ -13,6 +13,7 @@ distill-protocol = { path = "../distill-protocol" }
 distill-core = { path = "../distill-core" }
 distill-bundle = { path = "../distill-bundle" }
 distill-schema = { path = "../distill-schema" }
+ngp-value = { path = "../../../../newgameplus/ngp-value" }
 distill-store = { path = "../distill-store" }
 distill-wire = { path = "../distill-wire" }
 futures = "0.3"

@@ -260,12 +260,10 @@ impl RemoteHub {
             wire.set_watch(request.watch);
             wire.set_if_changed(request.if_changed);
             wire.set_root(request.root.as_str());
-            let mut settings = wire.init_settings();
-            settings.set_canonical_value(&request.settings.canonical_value);
-            crate::capnp_transport::write_authoring_blobs(
-                settings.init_blobs(request.settings.blobs.len() as u32),
-                &request.settings.blobs,
-            );
+            wire.set_settings_hash(&request.settings_hash.0);
+            wire.set_settings_schema(&crate::codec::schema_bytes(&request.settings_schema));
+            crate::capnp_transport::write_authoring_patch(wire.init_settings(), &request.settings_schema, &request.settings)
+                .map_err(|error| capnp::Error::failed(format!("import settings: {error}")))?;
         }
         let response = call.send().promise.await?;
         let result = response.get()?.get_result()?;
@@ -324,7 +322,8 @@ impl RemoteHub {
             for (index, op) in ops.iter().enumerate() {
                 let output = wire.reborrow().get(index as u32);
                 match op {
-                    AuthoringOp::Set(entry) => write_authoring_entry(output.init_set(), entry),
+                    AuthoringOp::Set(entry) => write_authoring_entry(output.init_set(), entry)
+                        .map_err(|error| capnp::Error::failed(format!("write {}: {error}", entry.uuid)))?,
                     AuthoringOp::Remove { uuid } => output.init_remove().set_bytes(&uuid.0),
                 }
             }
@@ -656,12 +655,16 @@ impl RemoteAuthoringSnapshot {
         }
     }
 
-    /// Blob `index` of `uuid`'s value table (the order of an inspection's
-    /// refs) as chunks, read at this snapshot (protocol 28).
-    pub async fn blob(&self, uuid: AssetUuid, index: u32) -> Result<RemoteCall<RemoteAuthoringBlob>, capnp::Error> {
+    /// The blob `blob` names in `uuid`'s value (a reference an inspection
+    /// carries) as chunks, read at this snapshot (protocol 33).
+    pub async fn blob(&self, uuid: AssetUuid, blob: crate::BlobRef) -> Result<RemoteCall<RemoteAuthoringBlob>, capnp::Error> {
         let mut request = self.client.blob_request();
         request.get().set_uuid(&uuid.0);
-        request.get().set_index(index);
+        {
+            let mut wire = request.get().init_blob();
+            wire.set_len(blob.len);
+            wire.set_hash(&blob.hash);
+        }
         let response = request.send().promise.await?;
         let result = response.get()?.get_result()?;
         match result.which()? {
@@ -765,7 +768,10 @@ impl RemoteProgress {
 }
 
 /// Encode `entry` as `Hub.write`'s `AuthoringEntryValue`.
-pub fn write_authoring_entry(mut output: schema::authoring_entry_value::Builder<'_>, entry: &AuthoringEntry) {
+pub fn write_authoring_entry(
+    mut output: schema::authoring_entry_value::Builder<'_>,
+    entry: &AuthoringEntry,
+) -> Result<(), crate::AuthoringValueError> {
     output.reborrow().init_uuid().set_bytes(&entry.uuid.0);
     output.reborrow().init_bundle().set_bytes(&entry.bundle.0);
     output.set_local_id(entry.local_id.as_str());
@@ -774,7 +780,7 @@ pub fn write_authoring_entry(mut output: schema::authoring_entry_value::Builder<
     output.reborrow().init_type_uuid().set_bytes(&entry.type_uuid.0);
     output.reborrow().init_terminal_type().set_bytes(&entry.terminal_type.0);
     output.set_schema_hash(&entry.schema_hash.0);
-    output.set_logical_schema(&entry.logical_schema);
+    output.set_schema(&crate::codec::schema_bytes(&entry.schema));
     output.set_role(match entry.role {
         AuthoringEntryRole::Runtime => schema::AuthoringEntryRole::Runtime,
         AuthoringEntryRole::AuthoringOnly => schema::AuthoringEntryRole::AuthoringOnly,
@@ -788,20 +794,7 @@ pub fn write_authoring_entry(mut output: schema::authoring_entry_value::Builder<
             row.set_value(value.as_str());
         }
     }
-    let mut value = output.init_value();
-    value.set_canonical_value(&entry.value.canonical_value);
-    crate::capnp_transport::write_authoring_blobs(
-        value.reborrow().init_blobs(entry.value.blobs.len() as u32),
-        &entry.value.blobs,
-    );
-    let mut types = value.init_types(entry.value.types.len() as u32);
-    for (index, ty) in entry.value.types.iter().enumerate() {
-        let mut row = types.reborrow().get(index as u32);
-        row.set_path(ty.path.as_str());
-        row.reborrow().init_type_uuid().set_bytes(&ty.type_uuid.0);
-        row.set_schema_hash(&ty.schema_hash.0);
-        row.set_logical_schema(&ty.logical_schema);
-    }
+    crate::capnp_transport::write_authoring_value(output.init_value(), &entry.schema, &entry.value)
 }
 
 #[derive(Clone)]

@@ -249,68 +249,78 @@ pub fn authoring_decode_error(error: impl fmt::Display) -> String {
     error.to_string()
 }
 
+/// A schema named by `hash`, read from its schema encoding and refused
+/// unless it hashes to `hash` (protocol 33).
+#[doc(hidden)]
+pub fn decode_schema(hash: &[u8], bytes: &[u8], field: &str) -> Result<(crate::LogicalHash, Arc<crate::LogicalSchema>), String> {
+    let hash = crate::LogicalHash(decode_hash(hash, field).map_err(|error| error.message)?);
+    let schema = crate::codec::read_schema(hash, bytes).map_err(|error| format!("{field}: {error}"))?;
+    Ok((hash, schema))
+}
+
+/// A carrier's value under `schema`, decoded with the types it carries
+/// (protocol 33: the value encoding, blobs inside by bytes or reference).
 #[doc(hidden)]
 pub fn decode_authoring_value(
+    schema: &crate::LogicalSchema,
     value: schema::authoring_value::Reader<'_>,
 ) -> Result<crate::AuthoringValue, String> {
-    Ok(crate::AuthoringValue {
-        canonical_value: value
-            .get_canonical_value()
-            .map_err(authoring_decode_error)?
-            .to_vec()
-            .into(),
-        blobs: decode_authoring_blobs(value.get_blobs().map_err(authoring_decode_error)?)?,
-        types: decode_authoring_types(value.get_types().map_err(authoring_decode_error)?)?,
-    })
+    let types = decode_authoring_types(value.get_types().map_err(authoring_decode_error)?)?;
+    crate::codec::read_value(schema, types, value.get_value().map_err(authoring_decode_error)?)
+        .map_err(|error| error.to_string())
 }
 
-/// A carrier's blob table: each blob by ref or bytes (protocol 28).
+/// A carrier's patch of `schema`, decoded with the types it carries.
 #[doc(hidden)]
-pub fn decode_authoring_blobs(
-    blobs: capnp::struct_list::Reader<'_, schema::authoring_blob::Owned>,
-) -> Result<Vec<crate::AuthoringBlob>, String> {
-    blobs
-        .iter()
-        .map(|blob| match blob.which().map_err(authoring_decode_error)? {
-            schema::authoring_blob::Which::Ref(blob_ref) => {
-                let blob_ref = blob_ref.map_err(authoring_decode_error)?;
-                Ok(crate::AuthoringBlob::Ref(crate::BlobRef {
-                    len: blob_ref.get_len(),
-                    hash: decode_hash(
-                        blob_ref.get_hash().map_err(authoring_decode_error)?,
-                        "blobRef.hash",
-                    )
-                    .map_err(|error| error.message)?,
-                }))
-            }
-            schema::authoring_blob::Which::Bytes(bytes) => Ok(crate::AuthoringBlob::Bytes(
-                bytes.map_err(authoring_decode_error)?.to_vec().into(),
-            )),
-        })
-        .collect()
+pub fn decode_authoring_patch(
+    schema: &crate::LogicalSchema,
+    patch: schema::authoring_patch::Reader<'_>,
+) -> Result<crate::AuthoringPatch, String> {
+    let types = decode_authoring_types(patch.get_types().map_err(authoring_decode_error)?)?;
+    crate::codec::read_patch(schema, types, patch.get_patch().map_err(authoring_decode_error)?)
+        .map_err(|error| error.to_string())
 }
 
-/// Write a carrier's blob table.
+/// Write `value`, a value of `schema`, and the types it carries.
 #[doc(hidden)]
-pub fn write_authoring_blobs(
-    mut output: capnp::struct_list::Builder<'_, schema::authoring_blob::Owned>,
-    blobs: &[crate::AuthoringBlob],
+pub fn write_authoring_value(
+    mut output: schema::authoring_value::Builder<'_>,
+    schema: &crate::LogicalSchema,
+    value: &crate::AuthoringValue,
+) -> Result<(), crate::AuthoringValueError> {
+    output.set_value(&crate::codec::value_bytes(schema, value)?);
+    write_authoring_types(output.init_types(value.types.len() as u32), &value.types);
+    Ok(())
+}
+
+/// Write `patch`, a patch of `schema`, and the types it carries.
+#[doc(hidden)]
+pub fn write_authoring_patch(
+    mut output: schema::authoring_patch::Builder<'_>,
+    schema: &crate::LogicalSchema,
+    patch: &crate::AuthoringPatch,
+) -> Result<(), crate::AuthoringValueError> {
+    output.set_patch(&crate::codec::patch_bytes(schema, patch)?);
+    write_authoring_types(output.init_types(patch.types.len() as u32), &patch.types);
+    Ok(())
+}
+
+/// Write a carrier's types, each with its schema.
+#[doc(hidden)]
+pub fn write_authoring_types(
+    mut output: capnp::struct_list::Builder<'_, schema::authoring_type::Owned>,
+    types: &[crate::AuthoringType],
 ) {
-    for (index, blob) in blobs.iter().enumerate() {
-        let output = output.reborrow().get(index as u32);
-        match blob {
-            crate::AuthoringBlob::Ref(blob_ref) => {
-                let mut wire = output.init_ref();
-                wire.set_len(blob_ref.len);
-                wire.set_hash(&blob_ref.hash);
-            }
-            crate::AuthoringBlob::Bytes(bytes) => output.init_bytes(bytes.len() as u32).copy_from_slice(bytes),
-        }
+    for (index, ty) in types.iter().enumerate() {
+        let mut row = output.reborrow().get(index as u32);
+        row.set_path(ty.path.as_str());
+        row.reborrow().init_type_uuid().set_bytes(&ty.type_uuid.0);
+        row.set_schema_hash(&ty.schema_hash.0);
+        row.set_schema(&crate::codec::schema_bytes(&ty.schema));
     }
 }
 
-/// A carrier's types (GAP 23 §3); their schemas verify when the value is
-/// decoded.
+/// A carrier's types (GAP 23 §3), each schema verified against its hash.
 #[doc(hidden)]
 pub fn decode_authoring_types(
     types: capnp::struct_list::Reader<'_, schema::authoring_type::Owned>,
@@ -318,6 +328,11 @@ pub fn decode_authoring_types(
     types
         .iter()
         .map(|ty| {
+            let (schema_hash, schema) = decode_schema(
+                ty.get_schema_hash().map_err(authoring_decode_error)?,
+                ty.get_schema().map_err(authoring_decode_error)?,
+                "authoringType.schemaHash",
+            )?;
             Ok(crate::AuthoringType {
                 path: decode_text(ty.get_path().map_err(authoring_decode_error)?, "authoringType.path")
                     .map_err(|error| error.message)?,
@@ -331,21 +346,135 @@ pub fn decode_authoring_types(
                     )
                     .map_err(|error| error.message)?,
                 ),
-                schema_hash: crate::LogicalHash(
-                    decode_hash(
-                        ty.get_schema_hash().map_err(authoring_decode_error)?,
-                        "authoringType.schemaHash",
-                    )
-                    .map_err(|error| error.message)?,
-                ),
-                logical_schema: ty
-                    .get_logical_schema()
-                    .map_err(authoring_decode_error)?
-                    .to_vec()
-                    .into(),
+                schema_hash,
+                schema,
             })
         })
         .collect()
+}
+
+/// A blob reference: its length and content hash.
+#[doc(hidden)]
+pub fn decode_blob_ref(value: schema::blob_ref::Reader<'_>, field: &str) -> Result<crate::BlobRef, String> {
+    Ok(crate::BlobRef {
+        len: value.get_len(),
+        hash: decode_hash(value.get_hash().map_err(authoring_decode_error)?, field).map_err(|error| error.message)?,
+    })
+}
+
+/// Write the editor hints of a type member.
+#[doc(hidden)]
+pub fn write_editor_hints(mut output: schema::editor_hints::Builder<'_>, hints: &crate::EditorHints) {
+    let text = |value: &Option<String>| value.as_deref().unwrap_or("").to_string();
+    output.set_label(text(&hints.label).as_str());
+    output.set_group(text(&hints.group).as_str());
+    output.set_collapsed(hints.collapsed);
+    output.set_read_only(hints.read_only);
+    output.set_hidden(hints.hidden);
+    if let Some([min, max]) = hints.range {
+        output.set_has_range(true);
+        output.set_range_min(min);
+        output.set_range_max(max);
+    }
+    if let Some(min) = hints.min {
+        output.set_has_min(true);
+        output.set_min(min);
+    }
+    if let Some(max) = hints.max {
+        output.set_has_max(true);
+        output.set_max(max);
+    }
+    if let Some(step) = hints.step {
+        output.set_has_step(true);
+        output.set_step(step);
+    }
+    output.set_unit(text(&hints.unit).as_str());
+    output.set_degrees(hints.degrees);
+    output.set_percent(hints.percent);
+    if let Some(precision) = hints.precision {
+        output.set_has_precision(true);
+        output.set_precision(precision);
+    }
+    output.set_slider(hints.slider);
+    output.set_multiline(hints.multiline);
+    if let Some(max_len) = hints.max_len {
+        output.set_has_max_len(true);
+        output.set_max_len(max_len);
+    }
+    output.set_flags(hints.flags);
+    output.set_color(match hints.color {
+        None => schema::ColorHint::None,
+        Some(crate::ColorSpace::Srgb) => schema::ColorHint::Srgb,
+        Some(crate::ColorSpace::Linear) => schema::ColorHint::Linear,
+    });
+    output.set_hdr(hints.hdr);
+    output.set_alpha(match hints.alpha {
+        None => schema::AlphaHint::Unset,
+        Some(false) => schema::AlphaHint::Off,
+        Some(true) => schema::AlphaHint::On,
+    });
+    output.set_filter(text(&hints.filter).as_str());
+    if let Some(node) = &hints.node {
+        output.set_has_node(true);
+        output.set_node_component(node.component.as_str());
+    }
+    output.set_normalized(hints.normalized);
+    output.set_uniform(hints.uniform);
+    output.set_position(hints.position);
+    output.set_rotation(hints.rotation);
+}
+
+/// A type member's editor hints.
+#[doc(hidden)]
+pub fn decode_editor_hints(value: schema::editor_hints::Reader<'_>) -> Result<crate::EditorHints, capnp::Error> {
+    let text = |value: capnp::text::Reader<'_>, field: &str| -> Result<Option<String>, capnp::Error> {
+        let value = decode_text(value, field).map_err(|error| capnp::Error::failed(error.message))?;
+        Ok((!value.is_empty()).then_some(value))
+    };
+    let flag = |has: bool, value| has.then_some(value);
+    Ok(crate::EditorHints {
+        label: text(value.get_label()?, "editorHints.label")?,
+        group: text(value.get_group()?, "editorHints.group")?,
+        collapsed: value.get_collapsed(),
+        read_only: value.get_read_only(),
+        hidden: value.get_hidden(),
+        range: value.get_has_range().then(|| [value.get_range_min(), value.get_range_max()]),
+        min: flag(value.get_has_min(), value.get_min()),
+        max: flag(value.get_has_max(), value.get_max()),
+        step: flag(value.get_has_step(), value.get_step()),
+        unit: text(value.get_unit()?, "editorHints.unit")?,
+        degrees: value.get_degrees(),
+        percent: value.get_percent(),
+        precision: value.get_has_precision().then(|| value.get_precision()),
+        slider: value.get_slider(),
+        multiline: value.get_multiline(),
+        max_len: value.get_has_max_len().then(|| value.get_max_len()),
+        flags: value.get_flags(),
+        color: match value.get_color()? {
+            schema::ColorHint::None => None,
+            schema::ColorHint::Srgb => Some(crate::ColorSpace::Srgb),
+            schema::ColorHint::Linear => Some(crate::ColorSpace::Linear),
+        },
+        hdr: value.get_hdr(),
+        alpha: match value.get_alpha()? {
+            schema::AlphaHint::Unset => None,
+            schema::AlphaHint::Off => Some(false),
+            schema::AlphaHint::On => Some(true),
+        },
+        filter: text(value.get_filter()?, "editorHints.filter")?,
+        node: if value.get_has_node() {
+            Some(crate::NodeHint {
+                component: decode_text(value.get_node_component()?, "editorHints.nodeComponent")
+                    .map_err(|error| capnp::Error::failed(error.message))?,
+            })
+        } else {
+            None
+        },
+        normalized: value.get_normalized(),
+        uniform: value.get_uniform(),
+        position: value.get_position(),
+        rotation: value.get_rotation(),
+    })
 }
 
 #[doc(hidden)]
@@ -652,17 +781,10 @@ pub fn decode_authoring_inspection(
         decode_uuid(value.get_type_uuid()?, "authoringInspection.typeUuid")
             .map_err(|error| capnp::Error::failed(error.message))?,
     );
-    let schema_hash = crate::LogicalHash(
-        decode_hash(value.get_schema_hash()?, "authoringInspection.schemaHash")
-            .map_err(|error| capnp::Error::failed(error.message))?,
-    );
-    let wire_value = value.get_value()?;
-    let authored_value = crate::AuthoringValue {
-        canonical_value: wire_value.get_canonical_value()?.to_vec().into(),
-        blobs: decode_authoring_blobs(wire_value.get_blobs()?).map_err(capnp::Error::failed)?,
-        types: decode_authoring_types(wire_value.get_types()?).map_err(capnp::Error::failed)?,
-    };
-    let logical_schema: std::sync::Arc<[u8]> = value.get_logical_schema()?.to_vec().into();
+    let (schema_hash, logical) =
+        decode_schema(value.get_schema_hash()?, value.get_schema()?, "authoringInspection.schemaHash")
+            .map_err(capnp::Error::failed)?;
+    let authored_value = decode_authoring_value(&logical, value.get_value()?).map_err(capnp::Error::failed)?;
     Ok(AuthoringInspection {
         stamp,
         uuid,
@@ -676,7 +798,7 @@ pub fn decode_authoring_inspection(
         .map_err(|error| capnp::Error::failed(error.message))?,
         type_uuid,
         schema_hash,
-        logical_schema,
+        schema: logical,
         role: match value.get_role()? {
             schema::AuthoringEntryRole::Runtime => AuthoringEntryRole::Runtime,
             schema::AuthoringEntryRole::AuthoringOnly => AuthoringEntryRole::AuthoringOnly,
@@ -1173,10 +1295,10 @@ pub fn decode_type_description(
     let failed = |error: WireFailure| capnp::Error::failed(error.message);
     let stamp = decode_stamp_value(value.get_stamp()?, "typeDescription.stamp.instance")?;
     let type_uuid = TypeUuid(decode_uuid(value.get_type_uuid()?, "typeDescription.typeUuid").map_err(failed)?);
-    let schema_hash =
-        crate::LogicalHash(decode_hash(value.get_schema_hash()?, "typeDescription.schemaHash").map_err(failed)?);
-    let logical_schema: Arc<[u8]> = value.get_logical_schema()?.to_vec().into();
-    let default = decode_type_default(value.get_default_value()?, "typeDescription.defaultValue")?;
+    let (schema_hash, logical) =
+        decode_schema(value.get_schema_hash()?, value.get_schema()?, "typeDescription.schemaHash")
+            .map_err(capnp::Error::failed)?;
+    let default = decode_type_default(&logical, value.get_default_value()?, "typeDescription.defaultValue")?;
     let optional = |text: String| (!text.is_empty()).then_some(text);
     let mut members = Vec::new();
     for member in value.get_members()? {
@@ -1184,7 +1306,7 @@ pub fn decode_type_description(
             path: decode_text(member.get_path()?, "typeMember.path").map_err(failed)?,
             doc: optional(decode_text(member.get_doc()?, "typeMember.doc").map_err(failed)?),
             type_doc: optional(decode_text(member.get_type_doc()?, "typeMember.typeDoc").map_err(failed)?),
-            editor: decode_text(member.get_editor()?, "typeMember.editor").map_err(failed)?,
+            editor: decode_editor_hints(member.get_editor()?)?,
         });
     }
     let mut renames = BTreeMap::new();
@@ -1199,7 +1321,7 @@ pub fn decode_type_description(
         type_uuid,
         path: decode_text(value.get_path()?, "typeDescription.path").map_err(failed)?,
         schema_hash,
-        logical_schema,
+        schema: logical,
         default,
         members,
         renames,
@@ -1208,11 +1330,13 @@ pub fn decode_type_description(
 
 /// Decode a type default under its (verified) schema.
 #[doc(hidden)]
-pub fn decode_type_default(value: schema::type_default::Reader<'_>, field: &str) -> Result<TypeDefault, capnp::Error> {
+pub fn decode_type_default(
+    logical: &crate::LogicalSchema,
+    value: schema::type_default::Reader<'_>, field: &str) -> Result<TypeDefault, capnp::Error> {
     let failed = |error: WireFailure| capnp::Error::failed(error.message);
     Ok(match value.which()? {
         schema::type_default::Which::Value(wire) => {
-            TypeDefault::Value(decode_authoring_value(wire?).map_err(capnp::Error::failed)?)
+            TypeDefault::Value(decode_authoring_value(logical, wire?).map_err(capnp::Error::failed)?)
         }
         schema::type_default::Which::Absent(()) => TypeDefault::Absent,
         schema::type_default::Which::SchemaMismatch(hash) => TypeDefault::SchemaMismatch {
@@ -1228,15 +1352,10 @@ pub fn decode_type_default(value: schema::type_default::Reader<'_>, field: &str)
 /// each schema against its hash and each default against its schema.
 pub fn decode_authorable(value: schema::authorable::Reader<'_>) -> Result<Authorable, capnp::Error> {
     let failed = |error: WireFailure| capnp::Error::failed(error.message);
-    let hashed = |hash: &[u8], schema: &[u8], field: &str| -> Result<(crate::LogicalHash, Arc<[u8]>), capnp::Error> {
-        let hash = crate::LogicalHash(decode_hash(hash, field).map_err(failed)?);
-        let schema: Arc<[u8]> = schema.to_vec().into();
-        Ok((hash, schema))
-    };
+    let hashed = |hash: &[u8], bytes: &[u8], field: &str| decode_schema(hash, bytes, field).map_err(capnp::Error::failed);
     let mut types = Vec::new();
     for ty in value.get_types()? {
-        let (schema_hash, logical_schema) =
-            hashed(ty.get_schema_hash()?, ty.get_logical_schema()?, "authorableType.schemaHash")?;
+        let (schema_hash, logical) = hashed(ty.get_schema_hash()?, ty.get_schema()?, "authorableType.schemaHash")?;
         types.push(AuthorableType {
             type_uuid: TypeUuid(decode_uuid(ty.get_type_uuid()?, "authorableType.typeUuid").map_err(failed)?),
             path: decode_text(ty.get_path()?, "authorableType.path").map_err(failed)?,
@@ -1244,9 +1363,9 @@ pub fn decode_authorable(value: schema::authorable::Reader<'_>) -> Result<Author
             local_id: decode_text(ty.get_local_id()?, "authorableType.localId").map_err(failed)?,
             doc: decode_text(ty.get_doc()?, "authorableType.doc").map_err(failed)?,
             authoring_only: ty.get_authoring_only(),
-            default: decode_type_default(ty.get_default_value()?, "authorableType.defaultValue")?,
+            default: decode_type_default(&logical, ty.get_default_value()?, "authorableType.defaultValue")?,
             schema_hash,
-            logical_schema,
+            schema: logical,
         });
     }
     let mut importers = Vec::new();
@@ -1257,7 +1376,7 @@ pub fn decode_authorable(value: schema::authorable::Reader<'_>) -> Result<Author
             "authorableImporter.settingsHash",
         )?;
         let default_settings =
-            decode_authoring_value(importer.get_default_settings()?).map_err(capnp::Error::failed)?;
+            decode_authoring_value(&settings_schema, importer.get_default_settings()?).map_err(capnp::Error::failed)?;
         let mut default_globs = Vec::new();
         for glob in importer.get_default_globs()? {
             default_globs.push(decode_text(glob?, "authorableImporter.defaultGlobs").map_err(failed)?);

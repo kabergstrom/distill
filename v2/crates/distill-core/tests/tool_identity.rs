@@ -41,11 +41,10 @@ fn ambient(fingerprint: Option<[u8; 16]>) -> ToolExecutionIdentityV2 {
 }
 
 #[test]
-fn package_identity_roundtrips_at_its_record_version() {
+fn package_identity_roundtrips_through_its_record() {
     let identity = package();
     let record = identity.encode_record().unwrap();
 
-    assert_eq!(record[0], ToolExecutionIdentityV2::RECORD_VERSION);
     assert_eq!(
         ToolExecutionIdentityV2::decode_record(&record).unwrap(),
         identity

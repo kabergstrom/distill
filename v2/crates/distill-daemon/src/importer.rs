@@ -26,10 +26,10 @@ use distill_core::bootstrap::{
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_schema::ngp_schema::{parse_patch, write_value, Options, Value, WriteOptions};
 use distill_rpc::{
-    complete_settings, decode_settings_payload, ImportRequest, InputVersion, PreparedImportCommit,
+    complete_settings, settings_value, ImportRequest, InputVersion, PreparedImportCommit,
     RpcFailure,
 };
-use distill_schema::ngp_schema::{node_hash, snapshot_to_json, LogicalSchema};
+use distill_schema::ngp_schema::{node_hash, LogicalSchema};
 use distill_store::bundles::{BundleMeta, DirectoryOrigin as StoredDirectoryOrigin};
 use distill_store::imports::{
     DirectoryImportFailure, DirectoryRuleSource, ExplicitImport, ImportIndexSource, ImportReadKey,
@@ -1797,13 +1797,13 @@ impl AuthoringService {
     ) -> Result<(RegisteredImporter, ImportInvocation), RpcFailure> {
         let compiled = self.compiled(store)?;
         let importer = self.registered_importer(&compiled, &request.importer)?;
-        let settings_snapshot = snapshot_to_json(&importer.settings_schema).map_err(invalid)?;
-        let settings = decode_settings_payload(
-            importer.settings_hash,
-            settings_snapshot.as_bytes(),
-            &request.settings,
-            &importer.default_settings,
-        )
+        if request.settings_hash != importer.settings_hash {
+            return Err(invalid(format!(
+                "importer settings are under schema {}, the importer's is {}",
+                request.settings_hash, importer.settings_hash
+            )));
+        }
+        let settings = settings_value(&importer.settings_schema, &request.settings, &importer.default_settings)
         .map_err(|error| invalid(format!("invalid importer settings: {error:?}")))?;
 
         let dest = normalize_path(&request.dest).map_err(invalid)?;

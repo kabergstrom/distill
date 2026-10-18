@@ -45,7 +45,6 @@ pub struct ToolExecutionIdentityV2 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolIdentityError {
-    UnsupportedVersion(u8),
     UnknownSource(u32),
     UnknownCwdPolicy(u32),
     InvalidBool(u8),
@@ -73,7 +72,10 @@ impl fmt::Display for ToolIdentityError {
 impl std::error::Error for ToolIdentityError {}
 
 impl ToolExecutionIdentityV2 {
-    pub const RECORD_VERSION: u8 = 3;
+    /// The digest version of the fields ([`Self::digest`]). The record
+    /// ([`Self::encode_record`]) is the same fields with no version of its
+    /// own: the store holding it is versioned (`distill_store::SCHEMA_VERSION`).
+    pub const DIGEST_VERSION: u32 = 3;
 
     pub fn validate(&self) -> Result<(), ToolIdentityError> {
         if u32::try_from(self.environment.len()).is_err()
@@ -185,26 +187,20 @@ impl ToolExecutionIdentityV2 {
 
     pub fn digest(&self) -> Result<Hash128, ToolIdentityError> {
         self.validate()?;
-        Ok(digest(Domain::ToolCapsule, u32::from(Self::RECORD_VERSION), |encoder| {
+        Ok(digest(Domain::ToolCapsule, Self::DIGEST_VERSION, |encoder| {
             self.encode_fields(encoder)
         }))
     }
 
     pub fn encode_record(&self) -> Result<Vec<u8>, ToolIdentityError> {
         self.validate()?;
-        let mut bytes = vec![Self::RECORD_VERSION];
         let mut encoder = Encoder::new();
         self.encode_fields(&mut encoder);
-        bytes.extend_from_slice(&encoder.into_bytes());
-        Ok(bytes)
+        Ok(encoder.into_bytes())
     }
 
     pub fn decode_record(bytes: &[u8]) -> Result<Self, ToolIdentityError> {
         let mut reader = RecordReader::new(bytes);
-        let version = reader.u8()?;
-        if version != Self::RECORD_VERSION {
-            return Err(ToolIdentityError::UnsupportedVersion(version));
-        }
         let source = match reader.u32()? {
             1 => ToolSourceIdentityV2::Package {
                 launcher: reader.string()?,

@@ -56,8 +56,7 @@ pub use crate::state::{
 /// list of entries (one snapshot, each bundle read once); `blob` streams an
 /// entry's blob bytes.
 /// 29 (GAP 23 §15.3): `AuthoringRow` and `AuthoringInspection` carry the
-/// entry's `content` key (a digest over schema hash, canonical text, blob
-/// refs and carried types; [`crate::content_key`]).
+/// entry's `content` key.
 /// 30 (GAP 23 §15.4): `Hub.subscribeIndex` delivers every published
 /// version's `Delta`, unfiltered; a `Delta` names source `files` changed
 /// and whether the type files changed (`types`);
@@ -68,7 +67,15 @@ pub use crate::state::{
 /// 32 (GAP 23 §17.2): every hash, digest and identity on the wire is
 /// XXH3-128 (16 bytes; 32 hex chars), values and schemas in the §5
 /// encoding.
-pub const PROTOCOL_VERSION: u32 = 32;
+/// 33 (GAP 23 §17.6): authoring values, patches and schemas cross as
+/// bytes of the value and schema encodings ([`crate::codec`]), decoded by
+/// the transport: an [`AuthoringValue`] is a `Value` with its carried
+/// types (blobs inside it, as bytes or by reference), no text or blob
+/// table; a schema is checked against its hash where it is read. Import
+/// settings are a `Patch` under the settings schema the request names;
+/// `TypeMember.editor` is a struct; the `content` key is the entry's value
+/// digest; `AuthoringSnapshot.blob` names a blob by reference.
+pub const PROTOCOL_VERSION: u32 = 33;
 
 /// A watched import whose latest attempt failed. The bundle keeps serving its
 /// last good contents; the failure clears when a later import succeeds.
@@ -430,15 +437,14 @@ pub enum AuthoringEntryRole {
     AuthoringOnly,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A value as the authoring calls carry it (newgameplus GAP 23 §17.6),
+/// beside the schema that types it: the value, its blobs inside it (bytes,
+/// or by [`BlobRef`]), and the types its dynamic values name. On the wire:
+/// the value encoding and each type's schema encoding ([`crate::codec`]).
+#[derive(Debug, Clone, PartialEq)]
 pub struct AuthoringValue {
-    /// Canonical authored-value bytes. This branded carrier is deliberately
-    /// not a `ContentHash` and cannot be fetched as an artifact.
-    pub canonical_value: Arc<[u8]>,
-    /// The blob table the text's `{"len","offset"}` placements index.
-    pub blobs: Vec<AuthoringBlob>,
-    /// The types its dynamic values name (newgameplus GAP 23 §3), each
-    /// once, in path order.
+    pub value: Arc<Value>,
+    /// The types its dynamic values name, each once, in path order.
     pub types: Vec<AuthoringType>,
 }
 
@@ -446,45 +452,62 @@ impl AuthoringValue {
     /// The value with every blob by reference: what an inspection of it
     /// answers.
     pub fn by_ref(&self) -> Self {
-        Self {
-            canonical_value: self.canonical_value.clone(),
-            blobs: self.blobs.iter().map(|blob| AuthoringBlob::Ref(blob.blob_ref())).collect(),
-            types: self.types.clone(),
-        }
+        let mut value = (*self.value).clone();
+        ngp_value::value_blobs_mut(&mut value, &mut |blob| *blob = AuthoringBlob::Ref(blob.blob_ref()));
+        Self { value: Arc::new(value), types: self.types.clone() }
     }
+
+    /// The carried types as the value encoding resolves them.
+    pub fn type_table(&self) -> Result<TypeTable, AuthoringValueError> {
+        crate::codec::type_table(&self.types)
+    }
+}
+
+/// A sparse value (import settings), carried like an [`AuthoringValue`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthoringPatch {
+    pub patch: Arc<Patch>,
+    /// The types its dynamic values name, each once, in path order.
+    pub types: Vec<AuthoringType>,
 }
 
 /// A blob by length and XXH3-128 of its bytes (what an inspection carries
 /// instead of the bytes), and one blob of an [`AuthoringValue`]: by
 /// reference or by its bytes (newgameplus GAP 23 §15.3; `ngp_value::blob`).
 pub use ngp_schema::{BlobData as AuthoringBlob, BlobRef};
+pub use ngp_schema::{LogicalSchema, Patch, TypeTable, Value};
+pub use ngp_value::{ColorSpace, EditorHints, NodeHint};
 
 /// A type a carried value's dynamic values name: the path its text
-/// spells and its verified schema snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// spells and its schema, checked against `schema_hash` where it is read.
+#[derive(Debug, Clone, PartialEq)]
 pub struct AuthoringType {
     pub path: String,
     pub type_uuid: TypeUuid,
     pub schema_hash: LogicalHash,
-    pub logical_schema: Arc<[u8]>,
+    pub schema: Arc<LogicalSchema>,
 }
 
 /// Closed authoring mutation grammar accepted by `Hub.write`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum AuthoringOp {
     Set(AuthoringEntry),
     Remove { uuid: AssetUuid },
 }
 
-/// Explicit importer request. Settings retain their canonical authored-value
-/// bytes; the RPC layer never sniffs sources or reinterprets this payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Explicit importer request. The RPC layer never sniffs sources.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ImportRequest {
     pub importer: String,
     pub sources: Vec<String>,
     pub dest: String,
-    pub settings: AuthoringValue,
+    /// The importer's settings schema the patch was made under; the daemon
+    /// refuses one that is not the importer's current settings schema.
+    pub settings_hash: LogicalHash,
+    pub settings_schema: Arc<LogicalSchema>,
+    /// Sparse: fields left out take the importer's defaults.
+    pub settings: AuthoringPatch,
     pub watch: bool,
     pub root: String,
     /// Skip the import when the destination already holds an import by
@@ -790,7 +813,7 @@ pub enum AssetReferenceQuery {
     SameBundleLocalId(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AuthoringEntry {
     pub uuid: AssetUuid,
     pub bundle: BundleUuid,
@@ -799,9 +822,9 @@ pub struct AuthoringEntry {
     pub type_uuid: TypeUuid,
     pub terminal_type: TypeUuid,
     pub schema_hash: LogicalHash,
-    /// Canonical §5 logical-schema snapshot bytes authenticated by
-    /// `schema_hash` before authored-value decoding.
-    pub logical_schema: Arc<[u8]>,
+    /// The logical schema of `type_uuid` the value is typed by; `schema_hash`
+    /// is its hash.
+    pub schema: Arc<LogicalSchema>,
     pub role: AuthoringEntryRole,
     pub tags: BTreeMap<String, Option<String>>,
     pub value: AuthoringValue,
@@ -810,7 +833,7 @@ pub struct AuthoringEntry {
     pub root: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AuthoringInspection {
     pub stamp: SnapshotStamp,
     pub uuid: AssetUuid,
@@ -819,7 +842,7 @@ pub struct AuthoringInspection {
     pub normalized_path: String,
     pub type_uuid: TypeUuid,
     pub schema_hash: LogicalHash,
-    pub logical_schema: Arc<[u8]>,
+    pub schema: Arc<LogicalSchema>,
     pub role: AuthoringEntryRole,
     pub value: AuthoringValue,
     /// The asset root holding the bundle, by name.
@@ -828,11 +851,12 @@ pub struct AuthoringInspection {
     pub origin: BundleOrigin,
     /// The type's path in the served schema; empty when unknown.
     pub type_name: String,
-    /// The entry's authoring content key, as its row's (protocol 29).
+    /// The entry's content key, as its row's: its value digest
+    /// (newgameplus GAP 23 §17.3).
     pub content: [u8; 16],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)] // Public wire-domain shape mirrors the typed result union.
 pub enum AuthoringInspectResult {
     Inspection(AuthoringInspection),
@@ -880,8 +904,8 @@ pub struct AuthoringRow {
     /// The bundle's primary asset: what a reference to the bundle's path
     /// without a name resolves to.
     pub primary: bool,
-    /// The entry's authoring content key (§17 "Content keys"): equal keys
-    /// mean equal values.
+    /// The entry's content key, its value digest (§17 "Content keys"):
+    /// equal keys mean equal values.
     pub content: [u8; 16],
 }
 
@@ -932,26 +956,25 @@ pub struct TypeDescription {
     pub type_uuid: TypeUuid,
     /// The type's path (`game::Spinner`), as prefabs name it.
     pub path: String,
-    /// The hash of `logical_schema`.
+    /// The hash of `schema`.
     pub schema_hash: LogicalHash,
-    /// Canonical §5 logical-schema snapshot bytes of the type's value
-    /// projection, as [`AuthoringInspection::logical_schema`].
-    pub logical_schema: Arc<[u8]>,
+    /// The logical schema of the type's value projection.
+    pub schema: Arc<LogicalSchema>,
     pub default: TypeDefault,
     /// Docs and editor hints by planner path (`$`, `$.rate`,
     /// `$.shape{Ring}`), path-sorted; paths with neither are absent.
     pub members: Vec<TypeMember>,
     /// The renamed fields of the projection (`#[asset(renamed_from)]`):
     /// planner path → the name it was renamed from (protocol 25). An
-    /// automatic migration of a value to `logical_schema` follows them
+    /// automatic migration of a value to `schema` follows them
     /// (`distill_migrate::plan_automatic_renamed`).
     pub renames: BTreeMap<String, String>,
 }
 
 /// A described type's default value.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TypeDefault {
-    /// The value, canonical, conforming to the description's schema.
+    /// The value, under the description's schema.
     Value(AuthoringValue),
     /// No default file: the type has no `Default` thunk in the game
     /// module, or its defaults were not written yet.
@@ -972,10 +995,8 @@ pub struct TypeMember {
     pub doc: Option<String>,
     /// The doc comment of the struct or enum at the path.
     pub type_doc: Option<String>,
-    /// `#[ngp(editor(...))]` hints as canonical JSON
-    /// (`ngp_schema::describe::EditorHints::to_json`); empty: none. Distill
-    /// carries them opaque: a new key needs no protocol change.
-    pub editor: String,
+    /// `#[ngp(editor(...))]` hints (GAP 23 §16.3); default: none.
+    pub editor: EditorHints,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1005,7 +1026,7 @@ pub struct DescribableType {
 /// What an authoring tool can create (§17 "Creating"): the authored types
 /// the serving pipeline declares and the control type
 /// `distill::DirectoryImportRules`, and the pipeline's importers.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Authorable {
     /// Extension-sorted.
     pub types: Vec<AuthorableType>,
@@ -1015,7 +1036,7 @@ pub struct Authorable {
 
 /// A type a new bundle can hold: `<name>.<extension>.bundle` with one entry
 /// `local_id` of it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AuthorableType {
     pub type_uuid: TypeUuid,
     /// The type's path in the served schema.
@@ -1026,8 +1047,8 @@ pub struct AuthorableType {
     pub doc: String,
     pub authoring_only: bool,
     pub schema_hash: LogicalHash,
-    pub logical_schema: Arc<[u8]>,
-    /// The pipeline's `Default` of the type, under `logical_schema`.
+    pub schema: Arc<LogicalSchema>,
+    /// The pipeline's `Default` of the type, under `schema`.
     /// `Absent` for `DirectoryImportRules` (a rules bundle needs a rule);
     /// `SchemaMismatch` while the pipeline module and the served schema
     /// disagree on the type (one is being rebuilt).
@@ -1035,7 +1056,7 @@ pub struct AuthorableType {
 }
 
 /// A registered importer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AuthorableImporter {
     pub id: String,
     pub settings_type: TypeUuid,
@@ -1043,7 +1064,7 @@ pub struct AuthorableImporter {
     /// settings name (`{"type": <path>, "value": …}`).
     pub settings_path: String,
     pub settings_hash: LogicalHash,
-    pub settings_schema: Arc<[u8]>,
+    pub settings_schema: Arc<LogicalSchema>,
     /// Complete default settings, under `settings_schema`.
     pub default_settings: AuthoringValue,
     /// The path globs of the default import rules naming this importer
@@ -1208,7 +1229,7 @@ pub struct AssetMutation {
     pub delta: AssetDeltaState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)] // Commit grammar keeps Set strongly typed and allocation policy explicit.
 pub enum AuthoringMutation {
     Set(AuthoringEntry),
@@ -1248,7 +1269,7 @@ pub enum TagPoisonMutation {
     },
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Commit {
     pub assets: Vec<AssetMutation>,
     pub authoring: Vec<AuthoringMutation>,
@@ -1272,19 +1293,37 @@ pub struct Commit {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthoringValueError {
-    LogicalSchemaUtf8,
+    /// A schema does not decode, or does not hash to the hash it is
+    /// named by.
     LogicalSchemaInvalid(String),
+    /// The bytes do not decode under the schema and carried types
+    /// (`ngp_value::DecodeError`, with its offset and value path).
     ValueInvalid(String),
-    ValueNotCanonical,
+    /// The value does not fit its schema, or breaks a rule beyond it (an
+    /// asset reference query, settings completion).
     SchemaValueShape { detail: String },
-    BlobIndexOutOfRange { index: u32, blob_count: u32 },
-    DuplicateBlobIndex { index: u32 },
-    UnusedBlobIndex { index: u32 },
-    /// Blob `index` names by reference a blob its bundle does not hold.
-    UnknownBlobRef { index: u32 },
+    /// A blob named by reference its bundle does not hold.
+    UnknownBlobRef { blob: BlobRef },
     /// A carried type is malformed, listed twice, or its schema does not
     /// verify.
     TypeInvalid(String),
     /// A carried type no dynamic value names.
     UnusedType { path: String },
 }
+
+impl std::fmt::Display for AuthoringValueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LogicalSchemaInvalid(detail) => write!(f, "logical schema invalid: {detail}"),
+            Self::ValueInvalid(detail) => write!(f, "value invalid: {detail}"),
+            Self::SchemaValueShape { detail } => write!(f, "value does not fit its schema: {detail}"),
+            Self::UnknownBlobRef { blob } => {
+                write!(f, "unknown blob reference ({} bytes, {:02x?})", blob.len, blob.hash)
+            }
+            Self::TypeInvalid(detail) => write!(f, "carried type invalid: {detail}"),
+            Self::UnusedType { path } => write!(f, "carried type {path} is not named by the value"),
+        }
+    }
+}
+
+impl std::error::Error for AuthoringValueError {}

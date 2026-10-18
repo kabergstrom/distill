@@ -187,7 +187,7 @@ pub struct ServerHandle {
     /// process does not use ([`Self::set_restart_required`]).
     restart: Mutex<RestartRequired>,
     /// What the daemon cannot accept now, which no snapshot carries
-    /// ([`Self::set_scan_rejection`], [`Self::set_configuration_source_error`]).
+    /// ([`Self::set_scan_rejection`], [`Self::set_configuration_source_`]).
     rejections: Mutex<Rejections>,
 }
 
@@ -201,7 +201,7 @@ struct RestartRequired {
     values: Vec<(&'static str, String)>,
 }
 
-/// Process state, in no store row: the configuration source's error and
+/// Process state, in no store row: the configuration source's     Ok(AuthoringEntry { and
 /// the pending scan rejection. Neither changes a published row, so every
 /// snapshot reads them as they are now; a restart finds them again (its
 /// configuration parse and first scan run anyway).
@@ -1015,8 +1015,6 @@ fn bundle_entry(
         .schemas
         .get(&entry.schema_hash)
         .ok_or_else(|| format!("bundle has no schema snapshot for entry {local_id:?}"))?;
-    let logical_schema = distill_schema::ngp_schema::snapshot_to_json(schema)
-        .map_err(|error| format!("cannot serialize verified schema: {error}"))?;
     Ok(AuthoringEntry {
         uuid: entry.uuid,
         bundle: bundle.uuid,
@@ -1025,15 +1023,15 @@ fn bundle_entry(
         type_uuid: entry.type_uuid,
         terminal_type,
         schema_hash: entry.schema_hash,
-        logical_schema: Arc::from(logical_schema.into_bytes()),
+        schema: Arc::new(schema.clone()),
         role: entry_role(entry.authoring_only),
         tags: BTreeMap::new(),
         value: {
             let types = bundle.type_table().map_err(|error| error.to_string())?;
             if by_ref {
-                crate::validate::authoring_value_by_ref(&schema.root, &entry.data, &types)?
+                crate::validate::authoring_value_by_ref(&entry.data, &types)?
             } else {
-                crate::validate::authoring_value(&schema.root, &entry.data, &types)?
+                crate::validate::authoring_value(&entry.data, &types)?
             }
         },
         // The caller knows the root when it needs it (an inspection).

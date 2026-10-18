@@ -31,7 +31,6 @@ pub use server::{
     MAX_SUBSCRIBED_ASSETS, MAX_SUBSCRIBED_PATHS,
 };
 pub use validate::{
-    authoring_value, authoring_value_by_ref, check_authoring_payload, content_key, content_key_of,
-    complete_settings, decode_asset_reference_query, decode_authoring_payload,
-    decode_settings_payload, resolve_blob_refs, value_blob, value_blobs,
+    authoring_value, authoring_value_by_ref, check_authoring_value, complete_settings, content_key, content_key_of,
+    decode_asset_reference_query, names_blob_ref, resolve_blob_refs, settings_value, stored_value, value_blob, value_blobs,
 };

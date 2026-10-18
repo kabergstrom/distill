@@ -64,8 +64,9 @@ pub enum Domain {
     Schema = 1,
     /// A wire layout's hash: the layout encoding of its tree (§12).
     Layout = 2,
-    /// A pipeline module's host-interface ABI identity (§3).
-    ModuleAbi = 3,
+    /// A pipeline module's host-interface fingerprint: the interface
+    /// sources and build configuration both sides compiled (§3).
+    ModuleInterface = 3,
     /// A target definition (§18).
     TargetDefinition = 4,
     /// A processor stage's static inputs: the build-cache lookup key (§9).
@@ -108,7 +109,8 @@ pub enum Domain {
     AssetQuery = 23,
     /// A query result over files (§10).
     FileQuery = 24,
-    /// An authoring entry's content key (§17).
+    /// Retired: an authoring entry's content key is its value digest
+    /// ([`Domain::Value`], §17).
     ContentKey = 25,
     /// A value's identity under its schema (newgameplus GAP 23 §17.3).
     Value = 26,
@@ -120,14 +122,19 @@ pub enum Domain {
     Bundle = 29,
     /// The physical schema file format (newgameplus GAP 23 §17.7).
     SchemaFile = 30,
+    /// A pipeline module's measured host interface: the layouts of the
+    /// boundary types as compiled (§3).
+    ModuleLayout = 31,
+    /// The bootstrap control spec file format (§3).
+    BootstrapSpec = 32,
 }
 
 impl Domain {
     /// Every domain, in discriminant order.
-    pub const ALL: [Domain; 30] = [
+    pub const ALL: [Domain; 32] = [
         Domain::Schema,
         Domain::Layout,
-        Domain::ModuleAbi,
+        Domain::ModuleInterface,
         Domain::TargetDefinition,
         Domain::ProcessorInputs,
         Domain::Trace,
@@ -155,6 +162,8 @@ impl Domain {
         Domain::PackArchive,
         Domain::Bundle,
         Domain::SchemaFile,
+        Domain::ModuleLayout,
+        Domain::BootstrapSpec,
     ];
 
     pub fn from_u32(value: u32) -> Option<Domain> {

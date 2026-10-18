@@ -8,7 +8,7 @@ use distill_rpc::capnp_transport::{
     schema, CapnpClient, RemoteConnectOutcome, RemoteMetadataOutcome, StagedListener,
 };
 use distill_rpc::*;
-use distill_schema::ngp_schema::{node_hash, SchemaNode};
+use distill_schema::ngp_schema::{node_hash, LogicalSchema, SchemaNode};
 use distill_test_project::{
     Asset, TestBuilds, TestProject, PARENT_TYPE, REFLECTION, ROOT, TAGGED_TYPE,
 };
@@ -33,7 +33,10 @@ fn asset_of(entry: &AuthoringEntry) -> Asset {
         &entry.local_id,
         entry.uuid,
         entry.type_uuid,
-        entry.value.blobs[0].bytes().expect("the entry carries its bytes"),
+        match &*entry.value.value {
+            Value::Blob(blob) => blob.bytes().expect("the entry carries its bytes"),
+            other => panic!("not a blob entry: {other:?}"),
+        },
     );
     match entry.role {
         AuthoringEntryRole::Runtime => asset,
@@ -564,7 +567,7 @@ fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
     assert!(source.contains("version @0 () -> (result :UInt64Call);"));
     assert!(source.contains("query @1 (query :AssetQuery) -> (result :UuidListCall);"));
     assert!(source.contains("inspect @2 (uuids :List(Data)) -> (result :AuthoringInspectManyCall);"));
-    assert!(source.contains("blob @11 (uuid :Data, index :UInt32) -> (result :AuthoringBlobCall);"));
+    assert!(source.contains("blob @11 (uuid :Data, blob :BlobRef) -> (result :AuthoringBlobCall);"));
     assert!(source.contains("refresh @3 () -> (result :AuthoringSnapshotCall);"));
     for field in [
         "uuid @0 :OptionalData",
@@ -644,56 +647,15 @@ fn authoring_entry(byte: u8, role: AuthoringEntryRole) -> AuthoringEntry {
         type_uuid: TypeUuid([1; 16]),
         terminal_type: TypeUuid([1; 16]),
         schema_hash,
-        logical_schema: Arc::from(&b"\"blob\""[..]),
+        schema: Arc::new(LogicalSchema { root: SchemaNode::Blob }),
         role,
         tags: std::collections::BTreeMap::new(),
-        value: AuthoringValue {
-            canonical_value: Arc::from(&b"{\"len\":1,\"offset\":0}"[..]),
-            blobs: vec![AuthoringBlob::Bytes(Arc::from([byte.wrapping_add(2)]))],
-            types: Vec::new(),
-        },
+        value: AuthoringValue { value: Arc::new(Value::Blob(vec![byte.wrapping_add(2)].into())), types: Vec::new() },
     }
 }
 
-fn write_authoring_entry_value(
-    mut output: schema::authoring_entry_value::Builder<'_>,
-    entry: &AuthoringEntry,
-) {
-    output.reborrow().init_uuid().set_bytes(&entry.uuid.0);
-    output.reborrow().init_bundle().set_bytes(&entry.bundle.0);
-    output.set_local_id(entry.local_id.as_str());
-    output.set_normalized_path(entry.normalized_path.as_str());
-    output.set_root(entry.root.as_str());
-    output
-        .reborrow()
-        .init_type_uuid()
-        .set_bytes(&entry.type_uuid.0);
-    output
-        .reborrow()
-        .init_terminal_type()
-        .set_bytes(&entry.terminal_type.0);
-    output.set_schema_hash(&entry.schema_hash.0);
-    output.set_logical_schema(&entry.logical_schema);
-    output.set_role(match entry.role {
-        AuthoringEntryRole::Runtime => schema::AuthoringEntryRole::Runtime,
-        AuthoringEntryRole::AuthoringOnly => schema::AuthoringEntryRole::AuthoringOnly,
-    });
-    let mut tags = output.reborrow().init_tags(entry.tags.len() as u32);
-    for (index, (tag, value)) in entry.tags.iter().enumerate() {
-        let mut row = tags.reborrow().get(index as u32);
-        row.set_tag(tag.as_str());
-        if let Some(value) = value {
-            row.set_has_value(true);
-            row.set_value(value.as_str());
-        }
-    }
-    let mut value = output.init_value();
-    value.set_canonical_value(&entry.value.canonical_value);
-    let mut blobs = value.init_blobs(entry.value.blobs.len() as u32);
-    for (index, blob) in entry.value.blobs.iter().enumerate() {
-        let bytes = blob.bytes().expect("a written entry carries its bytes");
-        blobs.reborrow().get(index as u32).init_bytes(bytes.len() as u32).copy_from_slice(bytes);
-    }
+fn write_authoring_entry_value(output: schema::authoring_entry_value::Builder<'_>, entry: &AuthoringEntry) {
+    distill_rpc::capnp_loader::write_authoring_entry(output, entry).expect("the entry encodes");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -813,25 +775,16 @@ async fn authoring_snapshot_round_trips_over_real_tcp_with_exact_stamp_and_role_
             match answers.unwrap().get(0).which().unwrap() {
                 schema::authoring_inspect_answer::Which::Success(inspection) => {
                     let inspection = inspection.unwrap();
+                    let decoded = distill_rpc::capnp_transport::decode_authoring_inspection(inspection).unwrap();
+                    assert_eq!(decoded.schema, entry.schema);
+                    assert_eq!(decoded.value, entry.value.by_ref());
                     let stamp = inspection.get_stamp().unwrap();
                     assert_eq!(stamp.get_instance().unwrap(), &first_stamp.instance.0);
                     assert_eq!(stamp.get_input_version(), first_stamp.version.0);
                     assert_eq!(inspection.get_uuid().unwrap(), &entry.uuid.0);
                     assert_eq!(
-                        inspection.get_logical_schema().unwrap(),
-                        &*entry.logical_schema
-                    );
-                    assert_eq!(
                         inspection.get_role().unwrap(),
                         schema::AuthoringEntryRole::AuthoringOnly
-                    );
-                    assert_eq!(
-                        inspection
-                            .get_value()
-                            .unwrap()
-                            .get_canonical_value()
-                            .unwrap(),
-                        &*entry.value.canonical_value
                     );
                 }
                 _ => panic!("expected authoring inspection"),
@@ -893,7 +846,7 @@ async fn authoring_snapshot_round_trips_over_real_tcp_with_exact_stamp_and_role_
             ));
 
             let mut replacement = entry;
-            replacement.value.blobs = vec![AuthoringBlob::Bytes(Arc::from([9u8]))];
+            replacement.value.value = Arc::new(Value::Blob(vec![9u8].into()));
             let second_stamp = publish_entry(&mut project, &replacement);
             assert!(second_stamp.version > first_stamp.version);
             let refresh_response = snapshot.refresh_request().send().promise.await.unwrap();
@@ -1701,9 +1654,15 @@ async fn hub_authoring_operation_and_wire_tree_methods_are_live_and_generation_f
                 let mut sources = request.reborrow().init_sources(1);
                 sources.set(0, "source/image.png");
                 request.set_dest("generated/image.bundle");
-                let mut settings = request.reborrow().init_settings();
-                settings.set_canonical_value(b"{}");
-                settings.reborrow().init_blobs(1).get(0).set_bytes(b"settings-blob");
+                let (hash, settings_schema, settings) = blob_settings();
+                request.set_settings_hash(&hash.0);
+                request.set_settings_schema(&codec::schema_bytes(&settings_schema));
+                distill_rpc::capnp_transport::write_authoring_patch(
+                    request.reborrow().init_settings(),
+                    &settings_schema,
+                    &settings,
+                )
+                .unwrap();
                 request.set_watch(true);
                 request.set_root("assets");
             }
@@ -1817,8 +1776,8 @@ async fn hub_authoring_operation_and_wire_tree_methods_are_live_and_generation_f
 
             assert_eq!(backend.imports.lock().unwrap().len(), 1);
             assert_eq!(
-                backend.imports.lock().unwrap()[0].settings.blobs[0].bytes().unwrap(),
-                b"settings-blob"
+                backend.imports.lock().unwrap()[0].settings,
+                blob_settings().2
             );
             assert_eq!(
                 *backend.reimports.lock().unwrap(),
@@ -2268,10 +2227,7 @@ async fn remote_snapshot_serves_the_pack_surface() {
                 AuthoringInspectResult::Inspection(inspection) => {
                     assert_eq!(inspection.role, AuthoringEntryRole::AuthoringOnly);
                     assert_eq!(inspection.stamp, snapshot.basis().snapshot);
-                    assert_eq!(
-                        &*inspection.value.canonical_value,
-                        br#"{"group":"group-6"}"#
-                    );
+                    assert_eq!(*inspection.value.value, Value::Struct(Box::new([Value::String("group-6".to_owned())])));
                 }
                 other => panic!("expected an inspection, got {other:?}"),
             }
@@ -2500,13 +2456,17 @@ async fn type_descriptions_round_trip_over_tcp() {
             assert_eq!(description.stamp, stamp);
             assert_eq!(description.schema_hash, schema_hash);
             match &description.default {
-                TypeDefault::Value(value) => assert_eq!(&*value.canonical_value, br#"{"rate":90}"#),
+                TypeDefault::Value(value) => assert_eq!(*value.value, rate(90)),
                 other => panic!("expected the default, got {other:?}"),
             }
             assert_eq!(description.members.len(), 1);
             assert_eq!(description.members[0].path, "$.rate");
             assert_eq!(description.members[0].doc.as_deref(), Some("Degrees per second."));
-            assert_eq!(description.members[0].editor, r#"{"unit":"deg/s","position":true}"#, "the hints cross as their text");
+            assert_eq!(
+                description.members[0].editor,
+                EditorHints { unit: Some("deg/s".into()), position: true, ..EditorHints::default() },
+                "the hints cross field by field"
+            );
             assert_eq!(description.renames, [("$.rate".to_owned(), "speed".to_owned())].into());
 
             // Another walk's default names its own schema hash.
@@ -2612,7 +2572,7 @@ impl AuthoringBackend for BrowsingBackend {
 /// A fixed `authorable` listing: one type with its default, one with a
 /// schema mismatch, the rules type without one, one importer.
 fn browsing_authorable() -> Authorable {
-    use distill_schema::ngp_schema::{snapshot_to_json, LogicalSchema, PrimitiveKind};
+    use distill_schema::ngp_schema::PrimitiveKind;
     let schema = LogicalSchema {
         root: SchemaNode::Struct {
             rev: 0,
@@ -2620,12 +2580,8 @@ fn browsing_authorable() -> Authorable {
         },
     };
     let schema_hash = node_hash(&schema.root).unwrap();
-    let logical_schema: Arc<[u8]> = snapshot_to_json(&schema).unwrap().into_bytes().into();
-    let value = |text: &str| AuthoringValue {
-        canonical_value: Arc::from(text.as_bytes()),
-        blobs: Vec::new(),
-        types: Vec::new(),
-    };
+    let schema = Arc::new(schema);
+    let value = |value: u8| AuthoringValue { value: Arc::new(Value::Struct(Box::new([Value::U8(value)]))), types: Vec::new() };
     let ty = |extension: &str, default: TypeDefault| AuthorableType {
         type_uuid: TypeUuid([extension.len() as u8; 16]),
         path: format!("game::{extension}"),
@@ -2634,12 +2590,12 @@ fn browsing_authorable() -> Authorable {
         doc: format!("A {extension}."),
         authoring_only: extension == "rules",
         schema_hash,
-        logical_schema: logical_schema.clone(),
+        schema: schema.clone(),
         default,
     };
     Authorable {
         types: vec![
-            ty("cue", TypeDefault::Value(value(r#"{"value":3}"#))),
+            ty("cue", TypeDefault::Value(value(3))),
             ty("rules", TypeDefault::Absent),
             ty("stale", TypeDefault::SchemaMismatch { written: LogicalHash([2; 16]) }),
         ],
@@ -2648,8 +2604,8 @@ fn browsing_authorable() -> Authorable {
             settings_type: TypeUuid([4; 16]),
             settings_path: "game::ImageSettings".into(),
             settings_hash: schema_hash,
-            settings_schema: logical_schema.clone(),
-            default_settings: value(r#"{"value":0}"#),
+            settings_schema: schema.clone(),
+            default_settings: value(0),
             default_globs: vec!["**/*.png".into(), "**/*.jpg".into()],
         }],
     }
@@ -2737,7 +2693,7 @@ async fn browsing_calls_round_trip_over_tcp() {
                 // A bundle's one runtime entry is its primary.
                 primary: entry.role == AuthoringEntryRole::Runtime,
                 // The key the daemon published is the carried value's.
-                content: content_key_of(entry.schema_hash, &entry.value),
+                content: content_key_of(&entry.schema, &entry.value).unwrap(),
             };
             assert_eq!(rows, [row(&control), row(&runtime)]);
             let runtime_only = AssetQuery { authoring_only: Some(false), ..all.clone() };
@@ -2817,15 +2773,15 @@ async fn inspect_batches_by_bundle_and_blobs_travel_by_reference() {
                 .unwrap();
             assert_eq!(handle.authoring_bundle_parses() - parses, 2, "one parse per bundle");
             let blobs = |answer: &AuthoringInspectResult| match answer {
-                AuthoringInspectResult::Inspection(inspection) => inspection.value.blobs.clone(),
+                AuthoringInspectResult::Inspection(inspection) => blobs_of(&inspection.value.value),
                 other => panic!("expected an inspection, got {other:?}"),
             };
             assert_eq!(blobs(&answers[0]), [AuthoringBlob::Ref(BlobRef::of(&big))]);
             assert_eq!(blobs(&answers[1]), [AuthoringBlob::Ref(BlobRef::of(&[1, 2, 3]))]);
-            assert_eq!(blobs(&answers[2]), other.value.by_ref().blobs);
+            assert_eq!(blobs(&answers[2]), blobs_of(&other.value.by_ref().value));
             assert_eq!(answers[3], AuthoringInspectResult::Missing);
 
-            match snapshot.blob(a, 0).await.unwrap().success().unwrap() {
+            match snapshot.blob(a, BlobRef::of(&big)).await.unwrap().success().unwrap() {
                 RemoteAuthoringBlob::Blob { stamp, chunks } => {
                     let AuthoringInspectResult::Inspection(inspection) = &answers[0] else { unreachable!() };
                     assert_eq!(stamp, inspection.stamp);
@@ -2835,11 +2791,11 @@ async fn inspect_batches_by_bundle_and_blobs_travel_by_reference() {
                 other => panic!("expected the blob, got {other:?}"),
             }
             assert!(matches!(
-                snapshot.blob(a, 1).await.unwrap().success().unwrap(),
+                snapshot.blob(a, BlobRef::of(b"held by no entry")).await.unwrap().success().unwrap(),
                 RemoteAuthoringBlob::Missing
             ));
             assert!(matches!(
-                snapshot.blob(AssetUuid([99; 16]), 0).await.unwrap().success().unwrap(),
+                snapshot.blob(AssetUuid([99; 16]), BlobRef::of(&big)).await.unwrap().success().unwrap(),
                 RemoteAuthoringBlob::Missing
             ));
             drop(client);
@@ -2914,4 +2870,20 @@ async fn capnp_index_subscription_carries_files_and_list_entries_answers_rows() 
                 .unwrap();
         })
         .await;
+}
+
+/// Import settings of a struct with one blob field, set.
+fn blob_settings() -> (LogicalHash, Arc<LogicalSchema>, AuthoringPatch) {
+    let schema = LogicalSchema {
+        root: SchemaNode::Struct { rev: 0, fields: vec![("data".to_owned(), 0, SchemaNode::Blob)] },
+    };
+    let patch = Patch::Struct(Box::new([Some(Patch::Replace(Value::Blob(b"settings-blob".to_vec().into())))]));
+    (node_hash(&schema.root).unwrap(), Arc::new(schema), AuthoringPatch { patch: Arc::new(patch), types: Vec::new() })
+}
+
+/// The blobs `value` holds, in walk order.
+fn blobs_of(value: &Value) -> Vec<AuthoringBlob> {
+    let mut blobs = Vec::new();
+    ngp_value::value_blobs(value, &mut |blob| blobs.push(blob.clone()));
+    blobs
 }

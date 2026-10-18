@@ -1,6 +1,5 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use distill_core::id::AssetUuid;
@@ -8,7 +7,6 @@ use distill_daemon::bootstrap;
 use distill_daemon::config::DaemonConfig;
 use distill_daemon::pack_command::build_configured_pack;
 use distill_daemon::process::{codegen_once, DaemonProcess};
-use distill_rpc::{AuthoringValue, ImportRequest};
 
 // Pipeline modules allocate with System and hand those allocations to the
 // daemon (see distill-pipeline-api).
@@ -117,17 +115,13 @@ fn import(args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
     }
-    // The hub parses the settings against the importer's settings schema
+    // Parsed against the importer's settings schema the hub serves
     // (authored spelling, fields left out take the defaults).
-    let request = ImportRequest {
+    let request = bootstrap::ImportArgs {
         importer,
         sources: vec![source.to_owned()],
         dest: dest.to_owned(),
-        settings: AuthoringValue {
-            canonical_value: Arc::from(settings.as_bytes()),
-            blobs: Vec::new(),
-            types: Vec::new(),
-        },
+        settings,
         watch,
         root,
         if_changed,

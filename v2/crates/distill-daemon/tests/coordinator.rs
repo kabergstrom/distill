@@ -7,15 +7,14 @@ use distill_daemon::coordinator::DaemonCoordinator;
 use distill_daemon::scanner::{AssetRoot, ScanDiagnostic};
 use distill_daemon::watcher::WatcherBatch;
 use distill_rpc::{
-    AuthoringBackend, AuthoringBlob, AuthoringEntry, AuthoringEntryRole, AuthoringInspectResult, AuthoringOp,
-    AuthoringProgressState, AuthoringValue as RpcAuthoringValue, ConfigurationStatus,
+    AuthoringBackend, AuthoringEntry, AuthoringEntryRole, AuthoringInspectResult, AuthoringOp,
+    AuthoringProgressState, EditorHints, AuthoringValue as RpcAuthoringValue, ConfigurationStatus,
     ConnectOutcome, ConnectRequest, ContentHash, Delta, DoctorRequest, LongRunningOp, MetadataCall,
     MetadataNamespaceCall, RpcFailure, StreamEvent, TargetDefinition, TargetDefinitionHash,
     WriteReceipt, WrittenFile,
 };
 use distill_schema::ngp_schema::{
-    node_hash, snapshot_to_json, write_value, LogicalSchema, PrimitiveKind, SchemaNode, Value,
-    WriteOptions,
+    node_hash, LogicalSchema, PrimitiveKind, SchemaNode, Value,
 };
 use distill_store::config::RestartOnlyChange;
 use distill_store::served::AssetResolution;
@@ -501,7 +500,7 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
 
     let parsed = distill_bundle::parse_bundle(&std::fs::read(&bundle_path).unwrap()).unwrap();
     let original = &parsed.assets["entry"];
-    let logical_schema = snapshot_to_json(&parsed.schemas[&original.schema_hash]).unwrap();
+    let logical_schema = Arc::new(parsed.schemas[&original.schema_hash].clone());
     let operation = AuthoringOp::Set(AuthoringEntry {
         root: String::new(),
         uuid: asset_uuid,
@@ -511,14 +510,10 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
         type_uuid: original.type_uuid,
         terminal_type: original.type_uuid,
         schema_hash: original.schema_hash,
-        logical_schema: Arc::from(logical_schema.into_bytes()),
+        schema: logical_schema.clone(),
         role: AuthoringEntryRole::Runtime,
         tags: BTreeMap::new(),
-        value: RpcAuthoringValue {
-            canonical_value: Arc::from(&b"9"[..]),
-            blobs: Vec::new(),
-            types: Vec::new(),
-        },
+        value: RpcAuthoringValue { value: Arc::new(Value::U8(9)), types: Vec::new() },
     });
     let (receipt, version) = write_and_publish(
         &coordinator,
@@ -605,8 +600,10 @@ fn a_write_naming_a_held_blob_by_reference_keeps_its_bytes() {
     coordinator.reconcile_full_scan(&mut writer).unwrap();
 
     let set = |value: &Value| {
-        let carried = distill_rpc::authoring_value_by_ref(&schema.root, value, &Default::default()).unwrap();
-        assert!(carried.blobs.iter().all(|blob| matches!(blob, AuthoringBlob::Ref(_))));
+        let carried = distill_rpc::authoring_value_by_ref(value, &Default::default()).unwrap();
+        let mut held = BTreeMap::new();
+        distill_rpc::value_blobs(&carried.value, &mut held);
+        assert!(held.is_empty(), "every blob by reference");
         AuthoringOp::Set(AuthoringEntry {
             root: String::new(),
             uuid: asset_uuid,
@@ -616,7 +613,7 @@ fn a_write_naming_a_held_blob_by_reference_keeps_its_bytes() {
             type_uuid,
             terminal_type: type_uuid,
             schema_hash,
-            logical_schema: Arc::from(snapshot_to_json(&schema).unwrap().into_bytes()),
+            schema: Arc::new(schema.clone()),
             role: AuthoringEntryRole::Runtime,
             tags: BTreeMap::new(),
             value: carried,
@@ -672,16 +669,10 @@ fn a_new_bundle_is_created_in_the_root_it_names() {
             type_uuid: original.type_uuid,
             terminal_type: original.type_uuid,
             schema_hash: original.schema_hash,
-            logical_schema: Arc::from(
-                snapshot_to_json(&parsed.schemas[&original.schema_hash]).unwrap().into_bytes(),
-            ),
+            schema: Arc::new(parsed.schemas[&original.schema_hash].clone()),
             role: AuthoringEntryRole::Runtime,
             tags: BTreeMap::new(),
-            value: RpcAuthoringValue {
-                canonical_value: Arc::from(&b"5"[..]),
-                blobs: Vec::new(),
-                types: Vec::new(),
-            },
+            value: RpcAuthoringValue { value: Arc::new(Value::U8(5)), types: Vec::new() },
         })
     };
     let fresh = |root: &str| entry(AssetUuid([90; 16]), BundleUuid([91; 16]), "fresh.bundle", root);
@@ -1189,18 +1180,10 @@ fn rewrite_under_a_new_schema(
         type_uuid,
         terminal_type: type_uuid,
         schema_hash: node_hash(&schema.root).unwrap(),
-        logical_schema: Arc::from(snapshot_to_json(&schema).unwrap().into_bytes()),
+        schema: Arc::new(schema.clone()),
         role: AuthoringEntryRole::Runtime,
         tags: BTreeMap::new(),
-        value: RpcAuthoringValue {
-            canonical_value: Arc::from(
-                write_value(&schema.root, &value, WriteOptions::default())
-                    .unwrap()
-                    .into_bytes(),
-            ),
-            blobs: Vec::new(),
-            types: Vec::new(),
-        },
+        value: RpcAuthoringValue { value: Arc::new(value), types: Vec::new() },
     });
     let (_, version) = write_and_publish(
         &coordinator,
@@ -1356,7 +1339,7 @@ fn a_pending_scan_rejection_survives_an_authoring_write_and_a_rescan() {
         // An RPC authoring write, published by the watcher, keeps it.
         let parsed = distill_bundle::parse_bundle(&std::fs::read(&bundle_path).unwrap()).unwrap();
         let original = &parsed.assets["entry"];
-        let logical_schema = snapshot_to_json(&parsed.schemas[&original.schema_hash]).unwrap();
+        let logical_schema = Arc::new(parsed.schemas[&original.schema_hash].clone());
         let operation = AuthoringOp::Set(AuthoringEntry {
             root: String::new(),
             uuid: asset_uuid,
@@ -1366,14 +1349,10 @@ fn a_pending_scan_rejection_survives_an_authoring_write_and_a_rescan() {
             type_uuid: original.type_uuid,
             terminal_type: original.type_uuid,
             schema_hash: original.schema_hash,
-            logical_schema: Arc::from(logical_schema.into_bytes()),
+            schema: logical_schema.clone(),
             role: AuthoringEntryRole::Runtime,
             tags: BTreeMap::new(),
-            value: RpcAuthoringValue {
-                canonical_value: Arc::from(&b"9"[..]),
-                blobs: Vec::new(),
-                types: Vec::new(),
-            },
+            value: RpcAuthoringValue { value: Arc::new(Value::U8(9)), types: Vec::new() },
         });
         let base = coordinator.server().current_stamp().unwrap().version;
         let (_, version) =
@@ -1844,21 +1823,26 @@ fn type_descriptions_read_the_type_files_at_the_snapshot() {
     };
     assert_eq!(description.path, "game::Spinner");
     assert_eq!(description.schema_hash, node_hash(&projected.root).unwrap());
-    assert_eq!(&*description.logical_schema, snapshot_to_json(&projected).unwrap().as_bytes());
+    assert_eq!(*description.schema, projected);
     match &description.default {
-        TypeDefault::Value(value) => assert_eq!(&*value.canonical_value, br#"{"rate":1.5}"#),
+        TypeDefault::Value(value) => assert_eq!(*value.value, default),
         other => panic!("expected the default file's value, got {other:?}"),
     }
     let members: Vec<_> = description
         .members
         .iter()
-        .map(|m| (m.path.as_str(), m.doc.as_deref(), m.type_doc.as_deref(), m.editor.as_str()))
+        .map(|m| (m.path.as_str(), m.doc.as_deref(), m.type_doc.as_deref(), m.editor.clone()))
         .collect();
     assert_eq!(
         members,
         [
-            ("$", None, Some("Turns."), ""),
-            ("$.rate", Some("Degrees per second."), None, r#"{"range":[-720.0,720.0]}"#),
+            ("$", None, Some("Turns."), EditorHints::default()),
+            (
+                "$.rate",
+                Some("Degrees per second."),
+                None,
+                EditorHints { range: Some([-720.0, 720.0]), ..EditorHints::default() },
+            ),
         ]
     );
     assert_eq!(snapshot.describe_type(TypeUuid([9; 16])), RpcResult::Success(DescribeTypeResult::Missing));

@@ -93,7 +93,7 @@ pub fn host_rustc_identity() -> &'static str {
 /// host puts it in the expected candidate; a module returns its own from the
 /// C-prefix probe, and the two must be equal.
 pub fn host_module_abi_identity() -> ModuleAbiIdentity {
-    let interface_fingerprint = digest(Domain::ModuleAbi, 1, |encoder| {
+    let interface_fingerprint = digest(Domain::ModuleInterface, 1, |encoder| {
         encoder.seq(
             host_interface_closure::HOST_INTERFACE_CLOSURE,
             |encoder, row| {
@@ -110,7 +110,7 @@ pub fn host_module_abi_identity() -> ModuleAbiIdentity {
             },
         );
     });
-    let measured_interface = digest(Domain::ModuleAbi, 2, |encoder| {
+    let measured_interface = digest(Domain::ModuleLayout, 1, |encoder| {
         encode_measurement::<PipelineModuleTableV2>(encoder);
         encode_measurement::<PipelineProbeFnV2>(encoder);
         encode_measurement::<PipelineRegisterFnV2>(encoder);
