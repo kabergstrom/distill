@@ -260,7 +260,7 @@ unsafe impl AssetReflect for Blob {
         sink.blob(self.as_bytes())
     }
     fn to_value(&self) -> Value {
-        Value::Blob(self.as_bytes().to_vec())
+        Value::Blob(self.as_bytes().to_vec().into())
     }
 }
 

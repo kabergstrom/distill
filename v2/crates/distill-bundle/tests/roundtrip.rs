@@ -426,13 +426,13 @@ fn nonstring_map_and_set_roundtrip() {
         ),
     ]));
     let data = obj(&[
-        // Non-string-key map: [k, v] pairs sorted by encoded key bytes
-        // ("-1" < "2" byte-wise).
+        // Non-string-key map: [k, v] pairs sorted by the key's encoding
+        // (little-endian i64: 2 = 02 00 … before -1 = ff ff …).
         (
             "m",
             arr(vec![
-                arr(vec![V::Int(-1), s("neg")]),
                 arr(vec![u(2), s("pos")]),
+                arr(vec![V::Int(-1), s("neg")]),
             ]),
         ),
         ("s", arr(vec![s("a"), s("b")])),
@@ -509,30 +509,15 @@ fn container_with_zero_blobs_parses_but_writer_picks_plain() {
 
 #[test]
 fn path_component_encoding_is_pinned() {
-    // tag byte + u64 BIG-endian length + payload; Index payload is an
-    // 8-byte big-endian u64.
-    assert_eq!(
-        encode_path(&[P::Field("ab".into())]),
-        vec![0x01, 0, 0, 0, 0, 0, 0, 0, 2, b'a', b'b']
-    );
-    assert_eq!(
-        encode_path(&[P::Variant("V".into())]),
-        vec![0x02, 0, 0, 0, 0, 0, 0, 0, 1, b'V']
-    );
-    assert_eq!(
-        encode_path(&[P::Index(3)]),
-        vec![0x03, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 3]
-    );
-    assert_eq!(
-        encode_path(&[P::MapKey(b"5".to_vec())]),
-        vec![0x04, 0, 0, 0, 0, 0, 0, 0, 1, b'5']
-    );
-    // Components concatenate in order.
+    // Per component, in the one encoding: a u32 discriminant (Field 0,
+    // Variant 1, Index 2, MapKey 3) and its payload (u32-length bytes; an
+    // index as a u64), little-endian; components concatenate, no count.
+    assert_eq!(encode_path(&[P::Field("ab".into())]), vec![0, 0, 0, 0, 2, 0, 0, 0, b'a', b'b']);
+    assert_eq!(encode_path(&[P::Variant("V".into())]), vec![1, 0, 0, 0, 1, 0, 0, 0, b'V']);
+    assert_eq!(encode_path(&[P::Index(3)]), vec![2, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(encode_path(&[P::MapKey(b"5".to_vec())]), vec![3, 0, 0, 0, 1, 0, 0, 0, b'5']);
     assert_eq!(
         encode_path(&[P::Field("a".into()), P::Index(0)]),
-        vec![
-            0x01, 0, 0, 0, 0, 0, 0, 0, 1, b'a', 0x03, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0,
-            0
-        ]
+        vec![0, 0, 0, 0, 1, 0, 0, 0, b'a', 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     );
 }

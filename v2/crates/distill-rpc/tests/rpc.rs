@@ -890,7 +890,7 @@ fn authoring_payload_decoder_materializes_authenticated_blob_bytes() {
     let entry = authoring_entry(9, AuthoringEntryRole::AuthoringOnly);
     assert_eq!(
         decode_authoring_payload(entry.schema_hash, &entry.logical_schema, &entry.value).unwrap().0,
-        Value::Blob(vec![11])
+        Value::Blob(vec![11].into())
     );
 }
 
@@ -934,7 +934,7 @@ fn authoring_payload_decoder_reenters_an_enum_from_its_variant_payload() {
     // Variants by name: End = 0, Link = 1; Link fields: blob, next.
     let link = |byte: u8, next: Value| Value::Enum {
         variant: 1,
-        payload: Box::new([Value::Blob(vec![byte]), next]),
+        payload: Box::new([Value::Blob(vec![byte].into()), next]),
     };
     let end = Value::Enum {
         variant: 0,

@@ -1040,7 +1040,7 @@ fn describe_type_in(
                 path,
                 doc: member.doc,
                 type_doc: member.type_doc,
-                editor: member.editor.to_json(),
+                editor: distill_schema::ngp_schema::describe::hints_to_json(&member.editor),
             })
             .collect();
         Ok(Some(TypeDescription {

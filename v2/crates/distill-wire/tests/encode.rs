@@ -505,7 +505,7 @@ fn blobs_sort_by_structural_path_and_patch_slots_after_sorting() {
     let encoded = encode_value(
         &schema,
         &wire,
-        &Value::Struct(Box::new([Value::Blob(vec![1]), Value::Blob(vec![2])])),
+        &Value::Struct(Box::new([Value::Blob(vec![1].into()), Value::Blob(vec![2].into())])),
         &mut no_references,
     )
     .unwrap();

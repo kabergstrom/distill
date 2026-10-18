@@ -260,8 +260,8 @@ fn canonical_blob_order_matches_writer_assignment() {
         vec![PathComponent::Index(10)],
     ];
     // Encoded-bytes order: field("a")... < field("b") < index(2) < index(10)
-    // (index payloads are big-endian, so byte order == numeric order; the
-    // field tag 0x01 sorts before the index tag 0x03).
+    // (equal-length names compare by bytes; the field discriminant 0 sorts
+    // before the index discriminant 2; indices compare little-endian).
     let order = canonical_blob_order(&paths).expect("order");
     assert_eq!(order, vec![1, 0, 2, 3]);
 }

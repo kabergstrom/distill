@@ -282,12 +282,13 @@ fn map_keys_must_be_strictly_ascending_by_encoded_bytes() {
             value: Box::new(N::String),
         },
     )]));
-    // "-1" < "2" byte-wise, so [[2,..],[-1,..]] is unsorted.
+    // Little-endian i64: 2 (02 00 …) sorts before -1 (ff ff …), so
+    // [[-1,..],[2,..]] is unsorted.
     let err = walk_err(
         &sc,
         obj(&[(
             "m",
-            arr(vec![arr(vec![u(2), s("x")]), arr(vec![V::Int(-1), s("y")])]),
+            arr(vec![arr(vec![V::Int(-1), s("y")]), arr(vec![u(2), s("x")])]),
         )]),
     );
     assert!(
@@ -365,7 +366,7 @@ fn write_rejects_blob_value_at_non_blob_position() {
     let sc = simple_schema();
     let b = one(
         &sc,
-        fields(vec![Value::Blob(b"zz".to_vec()), Value::String("n".into())]),
+        fields(vec![Value::Blob(b"zz".to_vec().into()), Value::String("n".into())]),
     );
     let err = write_bundle(&b).unwrap_err();
     assert!(
@@ -415,9 +416,9 @@ fn walk_depth_is_capped_never_a_stack_overflow() {
     // reports a definite error instead of overflowing the stack or writing
     // text the parser's depth cap would refuse.
     let sc = tree_schema();
-    let mut node = fields(vec![Value::Seq(vec![]), Value::Blob(b"x".to_vec())]);
+    let mut node = fields(vec![Value::Seq(vec![]), Value::Blob(b"x".to_vec().into())]);
     for _ in 0..600 {
-        node = fields(vec![Value::Seq(vec![node]), Value::Blob(b"x".to_vec())]);
+        node = fields(vec![Value::Seq(vec![node]), Value::Blob(b"x".to_vec().into())]);
     }
     let b = one(&sc, node);
     let err = write_bundle(&b).unwrap_err();

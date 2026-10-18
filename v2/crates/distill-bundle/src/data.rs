@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use distill_json::Lexer;
 use ngp_schema::{
-    display_path, encode_path, read_value, BlobSink, BlobSource, Options, PathComponent,
+    display_path, encode_path, read_value, BlobData, BlobSink, BlobSource, Options, PathComponent,
     SchemaNode, TextError, TextErrorKind, TypeTable, Value,
 };
 
@@ -58,7 +58,7 @@ struct ChunkSource<'c, 'l> {
 }
 
 impl BlobSource for ChunkSource<'_, '_> {
-    fn blob(&mut self, path: &[PathComponent], len: u64, offset: u64) -> Result<Vec<u8>, String> {
+    fn blob(&mut self, path: &[PathComponent], len: u64, offset: u64) -> Result<BlobData, String> {
         let blob_len = self.chunk.len() as u64;
         let bytes = offset
             .checked_add(len)
@@ -83,7 +83,7 @@ impl BlobSource for ChunkSource<'_, '_> {
             offset,
             len,
         });
-        Ok(bytes.to_vec())
+        Ok(bytes.into())
     }
 }
 
@@ -124,7 +124,10 @@ pub(crate) struct LayoutSink<'a> {
 }
 
 impl BlobSink for LayoutSink<'_> {
-    fn place(&mut self, path: &[PathComponent], blob: &[u8]) -> Result<(u64, u64), String> {
+    fn place(&mut self, path: &[PathComponent], blob: &BlobData) -> Result<(u64, u64), String> {
+        let blob = blob
+            .bytes()
+            .ok_or_else(|| format!("a blob reference at {} has no bytes to place", display(path)))?;
         let offset = *self
             .layout
             .get(&encode_path(path))

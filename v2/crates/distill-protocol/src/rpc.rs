@@ -454,60 +454,10 @@ impl AuthoringValue {
     }
 }
 
-/// A blob by length and XXH3-128 of its bytes: what an inspection carries
-/// instead of the bytes (newgameplus GAP 23 §15.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct BlobRef {
-    pub len: u64,
-    pub hash: [u8; 16],
-}
-
-impl BlobRef {
-    pub fn of(bytes: &[u8]) -> Self {
-        Self {
-            len: bytes.len() as u64,
-            hash: distill_core::hash::hash(bytes),
-        }
-    }
-}
-
-/// One blob of an [`AuthoringValue`]: by reference (inspections; a write
-/// naming a blob its bundle already holds) or by its bytes (a write of new
-/// content, import settings).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AuthoringBlob {
-    Ref(BlobRef),
-    Bytes(Arc<[u8]>),
-}
-
-impl AuthoringBlob {
-    pub fn len(&self) -> u64 {
-        match self {
-            Self::Ref(blob) => blob.len,
-            Self::Bytes(bytes) => bytes.len() as u64,
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// The reference: a `Ref` as is, bytes hashed.
-    pub fn blob_ref(&self) -> BlobRef {
-        match self {
-            Self::Ref(blob) => *blob,
-            Self::Bytes(bytes) => BlobRef::of(bytes),
-        }
-    }
-
-    /// The bytes of a `Bytes` blob.
-    pub fn bytes(&self) -> Option<&[u8]> {
-        match self {
-            Self::Ref(_) => None,
-            Self::Bytes(bytes) => Some(bytes),
-        }
-    }
-}
+/// A blob by length and XXH3-128 of its bytes (what an inspection carries
+/// instead of the bytes), and one blob of an [`AuthoringValue`]: by
+/// reference or by its bytes (newgameplus GAP 23 §15.3; `ngp_value::blob`).
+pub use ngp_schema::{BlobData as AuthoringBlob, BlobRef};
 
 /// A type a carried value's dynamic values name: the path its text
 /// spells and its verified schema snapshot.

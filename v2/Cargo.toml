@@ -58,3 +58,9 @@ debug-assertions = true
 # that cc built optimized in every profile.
 [profile.dev.package.xxhash-rust]
 opt-level = 3
+
+# The value encoding (GAP 23 §17.3): its recursive walks decode up to 256
+# nested frames; unoptimized frames (~6 KiB a level) would not fit a 2 MiB
+# thread stack at the cap.
+[profile.dev.package.ngp-value]
+opt-level = 2

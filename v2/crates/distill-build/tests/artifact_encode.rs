@@ -65,7 +65,7 @@ fn composite_encoder_binds_refs_blobs_headers_and_split_transport() {
         ],
     };
     let value = Value::Struct(Box::new([
-        Value::Blob(vec![1, 2, 3]),
+        Value::Blob(vec![1, 2, 3].into()),
         Value::AssetRef(AssetRefValue::Path("query".into())),
         Value::U32(44),
     ]));

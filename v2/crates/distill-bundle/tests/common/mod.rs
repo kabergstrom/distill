@@ -133,8 +133,8 @@ pub fn parse_json(text: &str) -> V {
 pub fn try_value(schema: &LogicalSchema, data: &V) -> Result<Value, TextError> {
     struct Chunk(Vec<u8>);
     impl BlobSource for Chunk {
-        fn blob(&mut self, _: &[PathComponent], len: u64, offset: u64) -> Result<Vec<u8>, String> {
-            Ok(self.0[offset as usize..(offset + len) as usize].to_vec())
+        fn blob(&mut self, _: &[PathComponent], len: u64, offset: u64) -> Result<ngp_schema::BlobData, String> {
+            Ok(self.0[offset as usize..(offset + len) as usize].to_vec().into())
         }
     }
     let mut chunk = Vec::new();

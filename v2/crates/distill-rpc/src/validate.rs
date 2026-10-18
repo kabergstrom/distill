@@ -8,7 +8,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use distill_schema::ngp_schema::{
     display_path, parse_patch, parse_value, verify_snapshot, write_value, AssetRefValue,
-    Blob, BlobSink, BlobSource, Frames, LogicalSchema, Options, Patch, PathComponent, SchemaNode,
+    BlobData, BlobSink, BlobSource, Frames, LogicalSchema, Options, Patch, PathComponent, SchemaNode,
     TextError, TypeTable, Value, WriteOptions,
 };
 
@@ -166,9 +166,12 @@ pub fn value_blobs(
 ) -> Result<(), String> {
     struct Collect<'o>(&'o mut BTreeMap<BlobRef, Arc<[u8]>>);
     impl BlobSink for Collect<'_> {
-        fn place(&mut self, _: &[PathComponent], blob: &[u8]) -> Result<(u64, u64), String> {
-            self.0.entry(BlobRef::of(blob)).or_insert_with(|| Arc::from(blob));
-            Ok((blob.len() as u64, 0))
+        fn place(&mut self, _: &[PathComponent], blob: &BlobData) -> Result<(u64, u64), String> {
+            let BlobData::Bytes(bytes) = blob else {
+                return Err("a blob reference has no bytes".to_owned());
+            };
+            self.0.entry(BlobRef::of(bytes)).or_insert_with(|| bytes.clone());
+            Ok((blob.len(), 0))
         }
     }
     write_value(
@@ -197,12 +200,12 @@ pub fn value_blob(
         found: Option<Arc<[u8]>>,
     }
     impl BlobSink for Nth {
-        fn place(&mut self, _: &[PathComponent], blob: &[u8]) -> Result<(u64, u64), String> {
+        fn place(&mut self, _: &[PathComponent], blob: &BlobData) -> Result<(u64, u64), String> {
             if self.placed == self.index {
-                self.found = Some(Arc::from(blob));
+                self.found = blob.bytes().map(Arc::from);
             }
             self.placed += 1;
-            Ok((blob.len() as u64, self.placed - 1))
+            Ok((blob.len(), self.placed - 1))
         }
     }
     let mut nth = Nth { index: u64::from(index), placed: 0, found: None };
@@ -266,7 +269,7 @@ impl<'b> BlobTable<'b> {
 }
 
 impl BlobSource for BlobTable<'_> {
-    fn blob(&mut self, path: &[PathComponent], len: u64, offset: u64) -> Result<Blob, String> {
+    fn blob(&mut self, path: &[PathComponent], len: u64, offset: u64) -> Result<BlobData, String> {
         let blob_count = self.blob_count();
         let Some(index) = u32::try_from(offset).ok().filter(|index| *index < blob_count) else {
             let index = u32::try_from(offset).unwrap_or(u32::MAX);
@@ -286,9 +289,9 @@ impl BlobSource for BlobTable<'_> {
         }
         self.placed.insert(path.to_vec(), offset);
         match blob {
-            AuthoringBlob::Bytes(bytes) => Ok(bytes.to_vec()),
-            // Checked, not stored: no bytes.
-            AuthoringBlob::Ref(_) if self.refs => Ok(Vec::new()),
+            AuthoringBlob::Bytes(bytes) => Ok(BlobData::Bytes(bytes.clone())),
+            // Checked, not stored.
+            AuthoringBlob::Ref(blob) if self.refs => Ok(BlobData::Ref(*blob)),
             AuthoringBlob::Ref(_) => {
                 self.error = Some(AuthoringValueError::UnknownBlobRef { index });
                 Err("blob named by reference".to_owned())
@@ -298,7 +301,7 @@ impl BlobSource for BlobTable<'_> {
 }
 
 impl BlobSink for BlobTable<'_> {
-    fn place(&mut self, path: &[PathComponent], _blob: &[u8]) -> Result<(u64, u64), String> {
+    fn place(&mut self, path: &[PathComponent], _blob: &BlobData) -> Result<(u64, u64), String> {
         let offset = *self
             .placed
             .get(path)
@@ -342,13 +345,13 @@ fn carried_value(
         blobs: Vec<AuthoringBlob>,
     }
     impl BlobSink for Table {
-        fn place(&mut self, _: &[PathComponent], blob: &[u8]) -> Result<(u64, u64), String> {
-            self.blobs.push(if self.by_ref {
-                AuthoringBlob::Ref(BlobRef::of(blob))
-            } else {
-                AuthoringBlob::Bytes(Arc::from(blob))
+        fn place(&mut self, _: &[PathComponent], blob: &BlobData) -> Result<(u64, u64), String> {
+            self.blobs.push(match (self.by_ref, blob) {
+                (true, blob) => AuthoringBlob::Ref(blob.blob_ref()),
+                (false, AuthoringBlob::Bytes(bytes)) => AuthoringBlob::Bytes(bytes.clone()),
+                (false, AuthoringBlob::Ref(_)) => return Err("a blob reference has no bytes".to_owned()),
             });
-            Ok((blob.len() as u64, self.blobs.len() as u64 - 1))
+            Ok((blob.len(), self.blobs.len() as u64 - 1))
         }
     }
     let mut table = Table { by_ref, blobs: Vec::new() };
@@ -395,9 +398,9 @@ pub fn content_key(
 ) -> Result<[u8; 16], String> {
     struct Refs(Vec<BlobRef>);
     impl BlobSink for Refs {
-        fn place(&mut self, _: &[PathComponent], blob: &[u8]) -> Result<(u64, u64), String> {
-            self.0.push(BlobRef::of(blob));
-            Ok((blob.len() as u64, self.0.len() as u64 - 1))
+        fn place(&mut self, _: &[PathComponent], blob: &BlobData) -> Result<(u64, u64), String> {
+            self.0.push(blob.blob_ref());
+            Ok((blob.len(), self.0.len() as u64 - 1))
         }
     }
     let mut refs = Refs(Vec::new());
@@ -844,7 +847,7 @@ mod tests {
                 ("b".to_owned(), 0, SchemaNode::Blob),
             ],
         };
-        let value = Value::Struct(Box::new([Value::Blob(vec![1, 2]), Value::Blob(vec![3])]));
+        let value = Value::Struct(Box::new([Value::Blob(vec![1, 2].into()), Value::Blob(vec![3].into())]));
         let carried = authoring_value_by_ref(&schema, &value, &Default::default()).unwrap();
         assert_eq!(
             &*carried.canonical_value,
@@ -874,7 +877,7 @@ mod tests {
     #[test]
     fn a_value_with_blob_refs_checks_without_bytes() {
         let schema = SchemaNode::Struct { rev: 0, fields: vec![("a".to_owned(), 0, SchemaNode::Blob)] };
-        let value = Value::Struct(Box::new([Value::Blob(vec![7; 40])]));
+        let value = Value::Struct(Box::new([Value::Blob(vec![7; 40].into())]));
         let carried = authoring_value_by_ref(&schema, &value, &Default::default()).unwrap();
         let schema_text = distill_schema::ngp_schema::snapshot_to_json(&LogicalSchema { root: schema.clone() }).unwrap();
         let hash = distill_schema::ngp_schema::node_hash(&schema).unwrap();

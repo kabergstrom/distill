@@ -54,7 +54,7 @@ impl Asset {
             uuid,
             type_uuid,
             schema: SchemaNode::Blob,
-            value: Value::Blob(bytes.to_vec()),
+            value: Value::Blob(bytes.to_vec().into()),
             authoring_only: false,
         }
     }

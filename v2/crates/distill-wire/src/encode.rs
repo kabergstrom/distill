@@ -542,7 +542,10 @@ impl<'a, R: ReferenceResolver + ?Sized> Encoder<'a, R> {
         location: Location,
         offset: u32,
     ) -> Result<(), EncodeError> {
-        let Value::Blob(bytes) = value else {
+        let Some(bytes) = (match value {
+            Value::Blob(blob) => blob.bytes(),
+            _ => None,
+        }) else {
             return self.shape("blob bytes");
         };
         let (size, _, kind, pointee) =
@@ -557,7 +560,7 @@ impl<'a, R: ReferenceResolver + ?Sized> Encoder<'a, R> {
         self.write(slot, &[0; 8])?;
         self.blobs.push(PendingBlob {
             path: self.path.clone(),
-            bytes: bytes.clone(),
+            bytes: bytes.to_vec(),
             slot,
         });
         Ok(())

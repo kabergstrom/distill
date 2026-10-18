@@ -91,7 +91,7 @@ fn option_is_none_or_inner() {
 
 #[test]
 fn blob_leaf() {
-    conforms(&Value::Blob(vec![1, 2]), &SchemaNode::Blob).unwrap();
+    conforms(&Value::Blob(vec![1, 2].into()), &SchemaNode::Blob).unwrap();
     conforms(&s("AAEC"), &SchemaNode::Blob).unwrap_err();
 }
 

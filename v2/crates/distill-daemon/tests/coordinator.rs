@@ -577,7 +577,7 @@ fn a_write_naming_a_held_blob_by_reference_keeps_its_bytes() {
     };
     let schema_hash = node_hash(&schema.root).unwrap();
     let held: Vec<u8> = (0..4096u32).map(|i| (i * 7) as u8).collect();
-    let value = |blob: &[u8], n: u8| Value::Struct(Box::new([Value::Blob(blob.to_vec()), Value::U8(n)]));
+    let value = |blob: &[u8], n: u8| Value::Struct(Box::new([Value::Blob(blob.to_vec().into()), Value::U8(n)]));
     let (bundle_uuid, asset_uuid, type_uuid) = (BundleUuid([81; 16]), AssetUuid([82; 16]), TypeUuid([83; 16]));
     let bundle_path = temp.path().join("assets/held.bundle");
     std::fs::write(
