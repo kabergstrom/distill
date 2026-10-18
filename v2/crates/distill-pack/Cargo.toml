@@ -19,6 +19,7 @@ distill-store = { path = "../distill-store" }
 distill-wire = { path = "../distill-wire" }
 
 [dev-dependencies]
+distill-asset = { path = "../distill-asset" }
 distill-test-project = { path = "../distill-daemon/tests/fixtures/test-project" }
 distill-rpc = { path = "../distill-rpc", features = ["test-hooks"] }
 tempfile = "3"

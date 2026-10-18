@@ -11,6 +11,7 @@ pub mod basis;
 pub mod capnp_io;
 pub mod component;
 pub mod io;
+pub mod layered;
 pub mod orchestrator;
 mod rpc_decode;
 pub mod runtime;
@@ -20,7 +21,9 @@ pub mod storage;
 pub use admission::{Admit, FetchAdmission, Reservation};
 pub use authoring::{AuthoringAnswer, AuthoringRequest, IndexChange};
 pub use basis::{IoBasis, ManifestHash};
-pub use capnp_io::{RpcIo, RpcIoConfig, RpcIoInitError, RpcIoStats, StepStats, TypeName};
+pub use capnp_io::{
+    RpcIo, RpcIoConfig, RpcIoInitError, RpcIoStats, RpcIoStatus, StepStats, TypeName,
+};
 pub use component::{
     load_cycles, AdoptionDecision, CandidateAsset, CandidateOutcome, ComponentPlanner,
     MemberFailure,
@@ -29,6 +32,7 @@ pub use io::{
     AssetDeltaState, AssetPath, DriftedInput, FetchedArtifact, IoEvent, LoaderIO,
     PathResolveResult, ReconnectReason, ReqId, ResolveResult, RuntimeTarget,
 };
+pub use layered::{Layer, LayeredIO};
 pub use orchestrator::{
     Handle, LoadStatus, Loader, LoaderDiagnostic, LoaderError, RegistrationError,
     TargetBindingState,

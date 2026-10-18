@@ -6602,6 +6602,10 @@ pub enum ManifestState {
 pub enum IoBasis {
     Rpc { snapshot: SnapshotStamp },
     Pack { manifest: ManifestHash },
+    /// RpcIO before its first connection (RpcIO without a daemon, below).
+    Disconnected,
+    /// LayeredIO: one basis per layer, bottom to top (§16, "Layer stack").
+    Layers(Arc<[IoBasis]>),
 }
 /// A pack manifest's "DSPM" hash (§16): the mounted pack's identity.
 pub struct ManifestHash(pub [u8; 32]);
@@ -6954,7 +6958,8 @@ waits for admission, so a waiting fetch cannot stall a frame.
 /// connection epoch, and stale completions are discarded explicitly.
 pub struct ReqId(pub u64);
 
-pub trait LoaderIO {                     // RpcIO (dev) | PackfileIO (ship), no third path
+pub trait LoaderIO {                     // RpcIO (dev) | PackfileIO (ship), no third path;
+                                         // LayeredIO stacks them (§16)
     /// The basis every call of the coming sweep is issued under: RpcIO
     /// returns the stamp of the newest snapshot it holds (never waiting:
     /// an event that starts a new round is published only once such a
@@ -7051,6 +7056,28 @@ TypeUuid and DSLH to match the current local descriptor, rejects a local
 native layout. Plans are owned by the resident game-module epoch and are
 dropped during its drain. There is no global registry comparison, accepted
 set, expansion protocol, or mutable compatibility handshake.
+
+### RpcIO without a daemon
+
+- `RpcIo::connect` waits for the daemon (`connect_timeout`) and fails the
+  caller without one. `RpcIo::connect_in_background` never waits: it
+  starts unconnected (basis `IoBasis::Disconnected`), and the first
+  `bind_target` starts connecting.
+- A failed attempt retries with backoff, 25 ms doubling to 1 s, as every
+  rebind does; `TargetRejected` once per rebind after
+  `target_rejection_after` failures, retries continuing.
+- While no connection serves (none yet, or one that reported
+  `ReconnectRequired`, until the rebind binds), requests are answered at
+  once:
+  - a resolve or path this IO never named: `Missing`, so the layers under
+    it answer (§16, "Layer stack");
+  - one whose last answer named it: `RequestError`, so its component
+    freezes with what is resident instead of turning `Dead`;
+  - a fetch: `RequestError`.
+- Losing a connection publishes no delta: nothing resident is deleted.
+- `RpcIo::status()` → `RpcIoStatus { address, connected, last_error }`;
+  `last_error` is the last failed attempt or the lost connection, `None`
+  once a connection binds. The engine shows "Distill unreachable" from it.
 
 ### Carried over from v1
 
@@ -7522,6 +7549,56 @@ pub struct PackDefinition {
                                       // Unsupported at request time (§15)
 }
 ```
+
+### Layer stack
+
+- `LayeredIO` (`distill-loader/src/layered.rs`): one `LoaderIO` over
+  ordered `Layer`s, bottom to top, each a `PackfileIO` (on disk or
+  `mount_static`) or an `RpcIo`. It composes the two IO paths; it is not a
+  third. Stacks: dev `[engine pack, daemon]`; ship `[engine pack, game
+  pack]`, DLC/mod packs above.
+- **Lookup is first hit from the top**: layers add or replace, never
+  delete.
+- **Resolve and resolve_path** go to every layer, each under its own
+  basis. The answer is the topmost layer naming it, taken once every
+  higher layer answered "not named" (`Missing`, `Deleted`, a path's
+  `Unsupported`). Every other answer names it (`Built`, `Failed`,
+  `Drifted`, `RoleIneligible`, `RequestError`, `SnapshotExpired`). Named
+  by none: the topmost `Deleted`, else `Missing`; a path `Missing` when
+  any layer has a path table, else `Unsupported`.
+- **Fetch** goes to the layer whose resolve answered that `ContentHash`
+  under the request's basis (else under any live basis: a payload carried
+  across a rebase).
+- **Closure edges resolve through the stack**: a daemon asset may
+  load-reference an engine pack asset. A pack's mount still requires its
+  own closure inside it (`verify_expected_terminals`).
+- **Basis** `IoBasis::Layers`: one basis per layer; a delta in any layer
+  is a new loader round. `end_sweep` ends a layer basis at its layer only
+  once no live stack basis shares it (a pack's unchanged basis outlives a
+  daemon delta).
+- **Events**: one terminal event per request, carrying the stack basis it
+  was issued under; `end_sweep` and `bind_target` cancel without one. A
+  delta from any layer but the bottom publishes `Deleted` as `Changed`:
+  the asset re-resolves and the stack answers whether it is gone.
+- **Subscriptions** go to every layer (no-ops on packs).
+- **Targets**: each layer binds its own (`Layer::with_target`: the engine
+  pack's target under the game's loader). The stack's `TargetBound` waits
+  for every layer not marked `Layer::optional`; a required layer's
+  `TargetRejected` is the stack's.
+- **An optional layer** (the daemon):
+  - never delays or fails the binding; its rejections are
+    `ConnectionError` diagnostics;
+  - its `ReconnectRequired` stays inside the stack: it alone rebinds,
+    requests it still owed fail (`RequestError`), nothing re-resolves or
+    is deleted (§15, "RpcIO without a daemon");
+  - binding after the stack did (the daemon connects or reconnects) is a
+    change: every subscribed asset and path is published `Changed`, so
+    what it now names (an engine shader edited under a daemon mounting
+    its sources) becomes a new revision.
+- **Engine access**: `LayeredIO::layer::<T>()` / `layer_mut::<T>()` return
+  the topmost layer of a type (`RpcIo::status`, authoring calls);
+  `layer_bound(index)`.
+- Patches stay within a layer: a new manifest plus missing blobs (above).
 
 ## 17. RPC Interface
 

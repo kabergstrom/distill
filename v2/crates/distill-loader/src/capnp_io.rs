@@ -67,6 +67,19 @@
 //! same for everything of the old connection, which fences the old
 //! connection: no event from it can follow a rebind. Dropping `RpcIo` drops
 //! every task without running it.
+//!
+//! # Without a connection
+//!
+//! [`RpcIo::connect_in_background`] starts with no connection; the first
+//! `bind_target` starts connecting, and a failed attempt retries with
+//! backoff (25 ms doubling to 1 s), as every rebind does. While no
+//! connection is bound, requests are answered at once as by a daemon that
+//! names nothing, so the layers under it in a `LayeredIO` answer instead:
+//! a resolve or path this IO never named is `Missing`; one it named fails
+//! (`RequestError`), so what is resident keeps its value instead of
+//! turning `Dead`; a fetch fails. Losing a connection publishes no delta.
+//! [`RpcIo::status`] tells whether a connection is bound and the last
+//! connection error.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -203,6 +216,18 @@ pub struct RpcIoStats {
     pub received_chunks: u64,
 }
 
+/// Whether an [`RpcIo`] has a connection; the engine shows "Distill
+/// unreachable" from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcIoStatus {
+    pub address: SocketAddr,
+    /// A connection is bound to the loader's target.
+    pub connected: bool,
+    /// Why the last connection attempt failed or the last connection
+    /// ended; `None` once a connection binds.
+    pub last_error: Option<String>,
+}
+
 /// What one [`RpcIo::step`] did: the work a frame's `poll` may do, which
 /// the module docs bound ("Stepping") by the step budget plus one turn.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -226,7 +251,7 @@ pub struct RpcIo {
     last_step: StepStats,
     queued_fetches: VecDeque<Queued>,
     /// The last basis `begin_sweep` returned, for a sweep begun while no
-    /// connection is bound: requests under it fail as stale.
+    /// connection is bound (`IoBasis::Disconnected` before the first).
     last_basis: IoBasis,
     // Dropped after everything above, the tasks before the runtime.
     local: LocalSet,
@@ -285,6 +310,49 @@ impl RpcIo {
             local,
             runtime,
         })
+    }
+
+    /// Start without a connection: the first [`LoaderIO::bind_target`]
+    /// starts connecting in the background and retries until a connection
+    /// binds (module docs, "Without a connection"). Never waits on the
+    /// daemon; fails only when the IO's runtime cannot be built.
+    pub fn connect_in_background(
+        address: SocketAddr,
+        request: ConnectRequest,
+    ) -> Result<Self, RpcIoInitError> {
+        Self::connect_in_background_with_config(address, request, RpcIoConfig::default())
+    }
+
+    pub fn connect_in_background_with_config(
+        address: SocketAddr,
+        request: ConnectRequest,
+        config: RpcIoConfig,
+    ) -> Result<Self, RpcIoInitError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| RpcIoInitError::Unavailable(error.to_string()))?;
+        Ok(Self {
+            shared: Rc::new(Shared::new(address, request.target, &config)),
+            max_in_flight_requests: config.max_in_flight_requests.max(1),
+            max_in_flight_fetches: config.max_in_flight_fetches.max(1),
+            step_budget: config.step_budget,
+            queued: VecDeque::new(),
+            last_step: StepStats::default(),
+            queued_fetches: VecDeque::new(),
+            last_basis: IoBasis::Disconnected,
+            local: LocalSet::new(),
+            runtime,
+        })
+    }
+
+    /// Whether a connection is bound, and the last connection error.
+    pub fn status(&self) -> RpcIoStatus {
+        RpcIoStatus {
+            address: self.shared.address,
+            connected: self.shared.connection().is_some(),
+            last_error: self.shared.last_error.borrow().clone(),
+        }
     }
 
     /// The daemon's current watched-import failures when they changed since
@@ -464,6 +532,11 @@ impl RpcIo {
     }
 
     fn enqueue(&mut self, req: ReqId, basis: &IoBasis, kind: RequestKind) {
+        if self.shared.connection().is_none() {
+            let event = self.shared.unreachable_answer(req, basis.clone(), kind);
+            self.shared.push_request(basis.rpc_snapshot(), event, None);
+            return;
+        }
         let held = match basis {
             IoBasis::Rpc { snapshot } => self
                 .shared
@@ -472,7 +545,7 @@ impl RpcIo {
                 .held
                 .contains_key(snapshot)
                 .then_some(*snapshot),
-            IoBasis::Pack { .. } => None,
+            _ => None,
         };
         let Some(stamp) = held else {
             self.shared.push_request(
@@ -741,6 +814,12 @@ struct Shared {
     /// Artifact payload bytes and chunks received, ever.
     received_bytes: Cell<u64>,
     received_chunks: Cell<u64>,
+    /// Assets and paths whose last answer named them (anything but
+    /// `Missing`/`Deleted`); without a connection they fail instead of
+    /// answering `Missing` (module docs, "Without a connection").
+    named_assets: RefCell<HashSet<AssetUuid>>,
+    named_paths: RefCell<HashSet<AssetPath>>,
+    last_error: RefCell<Option<String>>,
 }
 
 enum Link {
@@ -954,6 +1033,59 @@ impl Shared {
             task_polls: Rc::new(Cell::new(0)),
             received_bytes: Cell::new(0),
             received_chunks: Cell::new(0),
+            named_assets: RefCell::new(HashSet::new()),
+            named_paths: RefCell::new(HashSet::new()),
+            last_error: RefCell::new(None),
+        }
+    }
+
+    /// The answer to a request made while no connection is bound.
+    fn unreachable_answer(&self, req: ReqId, basis: IoBasis, kind: RequestKind) -> IoEvent {
+        match kind {
+            RequestKind::Resolve(uuid) if !self.named_assets.borrow().contains(&uuid) => {
+                IoEvent::Resolved {
+                    req,
+                    uuid,
+                    result: ResolveResult::Missing,
+                    basis,
+                }
+            }
+            RequestKind::Path(path) if !self.named_paths.borrow().contains(&path) => {
+                IoEvent::PathResolved {
+                    req,
+                    path,
+                    result: PathResolveResult::Missing,
+                    basis,
+                }
+            }
+            _ => request_error(
+                req,
+                basis,
+                format!("the daemon at {} is unreachable", self.address),
+            ),
+        }
+    }
+
+    /// Remember whether an answer named its asset or path.
+    fn note_named(&self, event: &IoEvent) {
+        match event {
+            IoEvent::Resolved { uuid, result, .. } => {
+                let mut named = self.named_assets.borrow_mut();
+                if matches!(result, ResolveResult::Missing | ResolveResult::Deleted { .. }) {
+                    named.remove(uuid);
+                } else {
+                    named.insert(*uuid);
+                }
+            }
+            IoEvent::PathResolved { path, result, .. } => {
+                let mut named = self.named_paths.borrow_mut();
+                if matches!(result, PathResolveResult::Missing) {
+                    named.remove(path);
+                } else {
+                    named.insert(path.clone());
+                }
+            }
+            _ => {}
         }
     }
 
@@ -968,9 +1100,13 @@ impl Shared {
         })
     }
 
+    /// The bound connection, unless it reported `ReconnectRequired`: a lost
+    /// or fenced connection serves nothing until the rebind.
     fn connection(&self) -> Option<Rc<Connection>> {
         match &*self.link.borrow() {
-            Link::Connected(connection) => Some(Rc::clone(connection)),
+            Link::Connected(connection) if !connection.reconnect_reported.get() => {
+                Some(Rc::clone(connection))
+            }
             _ => None,
         }
     }
@@ -998,10 +1134,14 @@ impl Shared {
 
     /// Connection-level events: `ReconnectRequired` once per connection.
     fn push_connection(&self, connection: &Connection, event: IoEvent) {
-        if matches!(event, IoEvent::ReconnectRequired { .. })
-            && connection.reconnect_reported.replace(true)
-        {
-            return;
+        if let IoEvent::ReconnectRequired { reason } = &event {
+            if connection.reconnect_reported.replace(true) {
+                return;
+            }
+            if *reason == ReconnectReason::ConnectionLost {
+                *self.last_error.borrow_mut() =
+                    Some(format!("lost the connection to the daemon at {}", self.address));
+            }
         }
         self.push(event);
     }
@@ -1033,6 +1173,7 @@ impl Shared {
             stream_installed: Cell::new(false),
         });
         *self.link.borrow_mut() = Link::Connected(Rc::clone(&connection));
+        *self.last_error.borrow_mut() = None;
         self.install(opened.snapshot);
         if let Some(subscription) = opened.subscription {
             connection.stream_installed.set(true);
@@ -1270,7 +1411,10 @@ async fn run_request(
         IoEvent::ReconnectRequired { .. }
         | IoEvent::ConnectionError { .. }
         | IoEvent::RestartRequired { .. } => shared.push_connection(&connection, event),
-        event => shared.push_request(Some(stamp), event, reservation),
+        event => {
+            shared.note_named(&event);
+            shared.push_request(Some(stamp), event, reservation)
+        }
     }
 }
 
@@ -1377,6 +1521,7 @@ async fn rebind(shared: Rc<Shared>, target: RuntimeTarget) {
                 RECONNECT_ATTEMPT_TIMEOUT.as_millis()
             ),
         };
+        *shared.last_error.borrow_mut() = Some(message.clone());
         failures = failures.saturating_add(1);
         if !reported && failures >= shared.target_rejection_after {
             reported = true;
