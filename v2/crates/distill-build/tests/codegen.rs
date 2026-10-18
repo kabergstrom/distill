@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use distill_build::codegen::{
     generated_module_name, CodegenAttempt, CodegenCoordinator, CodegenFailure, CodegenPublication,
-    CodegenPublisher, CodegenSnapshot, GeneratedFile, PublicationError,
+    CodegenOutput, CodegenPublisher, CodegenSnapshot, GeneratedFile, PublicationError,
 };
 use distill_build::query::AssetQuery;
 use distill_build::trace::{Observed, TraceOp};
@@ -12,7 +12,7 @@ use distill_core::id::{AssetUuid, ContentHash};
 struct World {
     basis: u64,
     query: [u8; 32],
-    published: Vec<(u64, Vec<GeneratedFile>)>,
+    published: Vec<(u64, CodegenOutput)>,
 }
 
 impl CodegenSnapshot<u64> for World {
@@ -26,8 +26,8 @@ impl CodegenSnapshot<u64> for World {
 }
 
 impl CodegenPublisher<u64> for World {
-    fn publish(&mut self, basis: &u64, files: &[GeneratedFile]) -> Result<(), PublicationError> {
-        self.published.push((*basis, files.to_vec()));
+    fn publish(&mut self, basis: &u64, output: &CodegenOutput) -> Result<(), PublicationError> {
+        self.published.push((*basis, output.clone()));
         Ok(())
     }
 }
@@ -66,7 +66,7 @@ fn stale_basis_or_newly_discovered_dependency_discards_and_requeues() {
     let attempt = CodegenAttempt::success(
         6,
         query_trace([1; 32]),
-        vec![file(AssetUuid([1; 16]), b"a")],
+        CodegenOutput::new(vec![file(AssetUuid([1; 16]), b"a")]),
     );
     let mut coordinator = CodegenCoordinator::default();
     assert_eq!(
@@ -78,7 +78,7 @@ fn stale_basis_or_newly_discovered_dependency_discards_and_requeues() {
     let attempt = CodegenAttempt::success(
         7,
         query_trace([2; 32]),
-        vec![file(AssetUuid([1; 16]), b"a")],
+        CodegenOutput::new(vec![file(AssetUuid([1; 16]), b"a")]),
     );
     assert_eq!(
         coordinator.finish(attempt, &mut world),
@@ -102,13 +102,13 @@ fn complete_batch_and_trace_publish_together_after_immediate_revalidation() {
         file(AssetUuid([2; 16]), b"b"),
         file(AssetUuid([1; 16]), b"a"),
     ];
-    let attempt = CodegenAttempt::success(9, query_trace([3; 32]), files);
+    let attempt = CodegenAttempt::success(9, query_trace([3; 32]), CodegenOutput::new(files));
     let mut coordinator = CodegenCoordinator::default();
 
     let published = coordinator.finish(attempt, &mut world);
     assert!(matches!(published, CodegenPublication::Published { .. }));
     assert_eq!(world.published.len(), 1);
-    assert!(world.published[0].1[0].relative_path() < world.published[0].1[1].relative_path());
+    assert!(world.published[0].1.files[0].relative_path() < world.published[0].1.files[1].relative_path());
     assert!(coordinator.holds(&world));
     world.query = [4; 32];
     assert!(!coordinator.holds(&world));
@@ -125,7 +125,7 @@ fn duplicate_namespace_claims_fail_before_any_write() {
     let attempt = CodegenAttempt::success(
         1,
         query_trace([4; 32]),
-        vec![file(id, b"first"), file(id, b"second")],
+        CodegenOutput::new(vec![file(id, b"first"), file(id, b"second")]),
     );
     let mut coordinator = CodegenCoordinator::default();
 
@@ -167,7 +167,7 @@ fn publication_error_does_not_install_trace_or_partial_state() {
         }
     }
     impl CodegenPublisher<u64> for Failing {
-        fn publish(&mut self, _: &u64, _: &[GeneratedFile]) -> Result<(), PublicationError> {
+        fn publish(&mut self, _: &u64, _: &CodegenOutput) -> Result<(), PublicationError> {
             Err(PublicationError::new("publication conflict"))
         }
     }
@@ -181,7 +181,7 @@ fn publication_error_does_not_install_trace_or_partial_state() {
     let attempt = CodegenAttempt::success(
         3,
         query_trace([8; 32]),
-        vec![file(AssetUuid([8; 16]), b"x")],
+        CodegenOutput::new(vec![file(AssetUuid([8; 16]), b"x")]),
     );
     assert!(matches!(
         coordinator.finish(attempt, &mut world),
@@ -201,4 +201,89 @@ fn file_content_identity_is_exposed_for_diff_and_journal_preimages() {
         BTreeMap::from([(f.relative_path().to_owned(), f.content_hash())]).len(),
         1
     );
+}
+
+#[test]
+fn alias_collisions_name_every_claimant_and_publish_nothing() {
+    let mut world = World {
+        basis: 1,
+        query: [5; 32],
+        ..World::default()
+    };
+    let (first, second, third) = (AssetUuid([3; 16]), AssetUuid([1; 16]), AssetUuid([2; 16]));
+    let mut coordinator = CodegenCoordinator::default();
+    // Two files under one alias.
+    let attempt = CodegenAttempt::success(
+        1,
+        query_trace([5; 32]),
+        CodegenOutput::new(vec![
+            file(first, b"a").with_alias("gtao"),
+            file(second, b"b").with_alias("gtao"),
+            file(third, b"c").with_alias("scene"),
+        ]),
+    );
+    assert_eq!(
+        coordinator.finish(attempt, &mut world),
+        CodegenPublication::Failed(CodegenFailure::NamespaceCollision {
+            name: "gtao".into(),
+            claimants: vec![second, first],
+        })
+    );
+    // An alias spelling another file's physical module name.
+    let attempt = CodegenAttempt::success(
+        1,
+        query_trace([5; 32]),
+        CodegenOutput::new(vec![
+            file(first, b"a"),
+            file(second, b"b").with_alias(generated_module_name(first)),
+        ]),
+    );
+    assert_eq!(
+        coordinator.finish(attempt, &mut world),
+        CodegenPublication::Failed(CodegenFailure::NamespaceCollision {
+            name: generated_module_name(first),
+            claimants: vec![second, first],
+        })
+    );
+    assert!(world.published.is_empty());
+    assert!(!coordinator.holds(&world));
+}
+
+#[test]
+fn aliases_must_be_lowercase_identifiers_and_not_keywords() {
+    for (alias, valid) in [
+        ("gtao", true),
+        ("_private", true),
+        ("scene_frag2", true),
+        (&"a".repeat(64)[..], true),
+        (&"a".repeat(65)[..], false),
+        ("", false),
+        ("_", false),
+        ("Gtao", false),
+        ("2d", false),
+        ("a-b", false),
+        ("mod", false),
+        ("self", false),
+        ("gen", false),
+    ] {
+        let mut world = World {
+            basis: 1,
+            query: [6; 32],
+            ..World::default()
+        };
+        let attempt = CodegenAttempt::success(
+            1,
+            query_trace([6; 32]),
+            CodegenOutput::new(vec![file(AssetUuid([4; 16]), b"x").with_alias(alias)]),
+        );
+        let published = CodegenCoordinator::default().finish(attempt, &mut world);
+        if valid {
+            assert!(matches!(published, CodegenPublication::Published { files: 1 }), "{alias:?}");
+        } else {
+            assert!(
+                matches!(published, CodegenPublication::Failed(CodegenFailure::InvalidAlias { .. })),
+                "{alias:?}: {published:?}"
+            );
+        }
+    }
 }

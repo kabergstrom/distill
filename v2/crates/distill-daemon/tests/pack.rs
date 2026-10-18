@@ -53,9 +53,6 @@ os = "macos"
 arch = "aarch64"
 apis = ["vulkan"]
 optimize = false
-[codegen]
-rs_mod_path = '{}'
-auto_codegen = false
 [pipeline]
 parallelism = 2
 max_dependency_depth = 64
@@ -68,7 +65,6 @@ cache_limit = "8MiB"
             assets.display(),
             temp.path().join("schema.json").display(),
             temp.path().join("pipeline.so").display(),
-            temp.path().join("generated").display(),
         ),
     )
     .unwrap();

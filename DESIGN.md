@@ -8013,9 +8013,13 @@ macos-dev = { os = "macos", arch = "aarch64", apis = ["metal"] }
 # item); a non-host target like this is illustrative until that lands.
 win-ship  = { os = "windows", arch = "x86_64", apis = ["vulkan", "dx12"] }
 
-[codegen]
+# One generated Rust namespace per entry (§20): the registered codegen
+# `codegen` generates `rs_mod_path` from the assets under the root `root`.
+# No entry, no codegen.
+[[codegen.output]]
+root = "engine"
 rs_mod_path = "../newgameplus-api/src/shaders/"
-auto_codegen = true
+codegen = "ngp.glsl-rust"
 
 [pipeline]
 parallelism = 8
@@ -8072,8 +8076,8 @@ root, `daemon.address` **loopback**
 (a non-loopback bind is a typed error at staging: the RPC surface is
 unauthenticated by design, §17, and remote access is a named open item,
 §22), `state_path`, module artifact paths, and every daemon-owned
-output directory (`rs_mod_path` included) **disjoint from — never
-nested inside — every asset root** (a violation is a staging-time
+output directory (each `[[codegen.output]]` `rs_mod_path` included) **disjoint from — never
+nested inside — every asset root**, the codegen namespaces disjoint from each other too (a violation is a staging-time
 error naming both paths: a daemon writing inside a watched root would
 advance input versions with its own outputs, an unbounded feedback
 loop; §14's scanner excludes daemon-owned directories by identity as
@@ -8167,7 +8171,7 @@ ships; an unclassified key is a spec defect:
 | `daemon.displaced_retention_days` | operational-live | applies at the next retention sweep (§14) |
 | `daemon.state_path` | restart-only | daemon state is disposable (§2): relocation is stop, move-or-rebuild, start |
 | `daemon.address` | restart-only | rebinding requires a restart; loopback is validated at staging either way (above) |
-| `[codegen]` (`rs_mod_path`, `auto_codegen`) | restart-only | the codegen service reconfigures at startup — retargeting `rs_mod_path` mid-flight would orphan generated files and their journal pre-images (§20) |
+| `[[codegen.output]]` (`root`, `rs_mod_path`, `codegen`) | restart-only | the codegen service reconfigures at startup — retargeting an `rs_mod_path` mid-flight would orphan generated files and their journal pre-images (§20); staging requires each `root` to name a configured root and each `rs_mod_path` to be disjoint from every root and every other output; the restart key is `codegen.output` |
 
 **Restart-only keys still stage and validate.** An edit to a
 restart-only key follows the same staged-candidate validation as every
@@ -8296,7 +8300,7 @@ input hash.
 An authoring-side service, like auto-migration — not a build-graph node. It
 runs the `RUST_CODEGEN` reflection pass against source bundles under its own
 recorded dep trace, generates `<pipeline>.rs`, diffs against the tree, and
-writes only on change (gated by `auto_codegen`); the `mod.rs` chain is
+writes only on change; the `mod.rs` chain is
 maintained under a recorded query over all `ShaderPipeline` assets. A
 body-only edit diffs to a no-op — no `.rs` mtime bump, no cargo rebuild
 cascade. A new pipeline gets its `.rs` as soon as its import lands, with no
@@ -8306,6 +8310,26 @@ Every source-entry hit or miss is recorded as DSTR v1
 identity; query membership remains an ordinary `TraceOp::Query`. This keeps
 codegen on the shared outcome-bearing trace/revalidation path without treating
 authored bundle bytes as artifact ContentHashes.
+
+**Outputs, one namespace each.** The configuration declares the generated
+namespaces as `[[codegen.output]] { root, rs_mod_path, codegen }` (§18):
+the codegen the pipeline module registered as `codegen`
+(`register_codegen`, `CodegenDescriptor::id`) generates the directory
+`rs_mod_path` from the assets under the asset root `root`. No entry, no
+codegen. Each output is its own namespace — its own `mod.rs`, collision
+check, mark checks, stale-file deletion, installed trace and attempted
+basis — and one output's failure fails only that output. Two outputs may
+name one root (two codegens over it) or one codegen (one generator, two
+crates). An output whose codegen the module does not register fails at
+each basis as a codegen failure (the background error), naming the id;
+the module can be fixed and reloaded without a restart.
+
+**Root-restricted reads.** A run's `PipelineCodegenContext` serves one
+output: `root()` names its root, `query` answers only assets whose bundle
+lies under it (a poisoned bundle under another root never fails it), and
+`read` of an asset under another root answers `None`. Trace observations
+revalidate under the same restriction, so an edit under another root never
+reruns the output.
 
 Each codegen attempt returns a single `CodegenAttempt { basis, trace,
 outcome }`: the pinned input/configuration basis, the complete outcome-bearing
@@ -8350,19 +8374,54 @@ Generated physical names have exactly one grammar and one authority:
 `sp_<32hex>.rs`; neither contains `local_id`, title, path, or an escaped
 human spelling. An optional display slug may be emitted in a comment or
 side-table only if it is at most 32 ASCII bytes and matches
-`[a-z0-9_]+`; it is non-authoritative, never a filename/module/key, and may
-change without identity or path churn. Authored strings embedded in generated
+`[a-z0-9_]+`; it is non-authoritative, never a filename or key, and may
+change without identity or path churn. A generated file may also carry an
+**alias** (`GeneratedFile::with_alias`): `[a-z_][a-z0-9_]*`, at most 64
+bytes, not `_` and not a Rust keyword (`alias_defect`; a bad one fails
+the batch as `CodegenFailure::InvalidAlias`). The physical name stays the
+identity — file, module, mark — and the alias is a re-export: `mod.rs`
+holds `mod sp_<32hex>;` and `pub use self::sp_<32hex> as <alias>;` for an
+aliased file, `pub mod sp_<32hex>;` otherwise. Renaming the source a
+codegen derives the alias from changes the re-export only, so call sites
+naming the old alias break at compile time, never silently.
+Authored strings embedded in generated
 content use ordinary Rust string escaping and never influence token or path
 boundaries. Before writing anything, the generator materializes and
 validates the **entire generated namespace** — filenames, module names,
-and `mod.rs` entries — for collisions. Any collision is a build/codegen
-failure naming every claimant, and the batch writes nothing; replacement
+aliases and `mod.rs` entries — for collisions (an alias against every
+other alias and every physical module name). Any collision is a
+build/codegen failure (`CodegenFailure::NamespaceCollision`) naming every
+claimant, and the batch writes nothing; replacement
 is never a collision policy. Before each batch the codegen service canonicalizes
 and revalidates `rs_mod_path`, and it rejects symlinked destination entries;
 filesystem drift fails or retries the batch without publishing state (§14).
 Generated content is escaped as data: every
 string literal is emitted through Rust string escaping — authored
 text can never terminate a literal or smuggle tokens into generated source.
+
+**`mod.rs`.** `PipelineCodegen::generate` returns a `CodegenOutput { files,
+mod_preamble, mod_items }`. The namespace's `mod.rs`, under its generated
+mark like every unit, holds three sections, each ending in a newline, a
+blank line between them, an empty one left out:
+
+- `mod_preamble` (e.g. `#![allow(dead_code)]`);
+- the module lines, by physical name;
+- `mod_items` (e.g. `pub const ALL: &[ShaderAsset] = &[…];` listing every
+  unit).
+
+The bytes depend on the output alone, so a run that generates what stands
+rewrites nothing.
+
+**One-shot codegen.** `distilld codegen <config> [--check]` runs without a
+daemon: it opens the configuration's state, reconciles the roots as a
+starting daemon does (imports included; import failures are logged and the
+bundles read as they are), runs every output once and publishes. It prints
+one line per generated file it created, updated or deleted. With `--check`
+it writes no generated file: it prints each file that would change and
+exits 1 if any would, 0 if every output is current. Any failure (a
+codegen failure, a collision, an unregistered codegen, a running daemon)
+exits 2. A daemon serving the configuration holds its state lock, and the
+command refuses to run beside it: that daemon generates the outputs itself.
 
 ### Invalidation walk-through
 

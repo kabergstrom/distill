@@ -263,6 +263,10 @@ impl<'a> ContainedCodegenContext<'a> {
 }
 
 impl PipelineCodegenContext for ContainedCodegenContext<'_> {
+    fn root(&self) -> &str {
+        self.inner.root()
+    }
+
     fn query(&mut self, query: &AssetQuery) -> Result<Vec<AssetUuid>, CodegenContextError> {
         if self.panicked.get() {
             return self.failed();

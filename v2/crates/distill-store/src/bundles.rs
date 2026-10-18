@@ -1171,6 +1171,8 @@ pub struct AssetFilter {
     /// Only authoring-only rows (`Some(true)`) or only runtime rows. Alone,
     /// `Some(false)` selects every runtime row: it narrows nothing.
     pub authoring_only: Option<bool>,
+    /// Only rows whose owning bundle lies under this asset root.
+    pub root: Option<crate::files::RootId>,
 }
 
 /// What an asset query answers: the rows it selects, by asset UUID, or the
@@ -1362,6 +1364,10 @@ impl AssetFilter {
         if let Some(local_id) = &self.local_id {
             let n = bind(params, Value::Text(local_id.clone()));
             conditions.push(format!("a.local_id = ?{n}"));
+        }
+        if let Some(root) = self.root {
+            let n = bind(params, Value::Integer(root.0));
+            conditions.push(format!("b.root_id = ?{n}"));
         }
         // The authored types the rows must have, as a condition on a
         // `type_uuid` column.

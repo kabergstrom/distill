@@ -26,7 +26,7 @@ use distill_store::state::{
     PipelineFailureOrigin,
 };
 
-use crate::codegen::CodegenService;
+use crate::codegen::{CodegenChange, CodegenService};
 use crate::config::{candidate_error_reason, config_error_reason, DaemonConfig, DaemonConfigError};
 use crate::coordinator::{CoordinatorError, CoordinatorInitError, DaemonCoordinator, PassOutcome};
 use crate::settle::{HeldOpen, QuietWindow};
@@ -227,12 +227,8 @@ impl DaemonProcess {
         let watcher =
             WatcherThread::start(coordinator.scanner(), config_watch.control_paths(), sink)?;
         let watcher_control = watcher.control();
-        let codegen = CodegenService::new(
-            &coordinator,
-            &config.codegen.rs_mod_path,
-            config.codegen.auto_codegen,
-        )
-        .map_err(DaemonProcessError::Codegen)?;
+        let codegen = CodegenService::new(&coordinator, &config.codegen)
+            .map_err(DaemonProcessError::Codegen)?;
 
         let stop = Arc::new(watch::Sender::new(false));
         let (errors, last_background_error) = watch::channel(None);
@@ -347,6 +343,98 @@ impl Drop for DaemonProcess {
             let _ = thread.join();
         }
     }
+}
+
+/// How many reconciliation passes, and how many codegen runs whose attempt
+/// went stale, `codegen_once` makes before it gives up.
+const CODEGEN_ONCE_ATTEMPTS: usize = 16;
+
+/// `distilld codegen`: reconcile `config`'s project as a starting daemon
+/// does (its imports included), then run every `[[codegen.output]]` once
+/// and publish what it generates. With `check`, write nothing. Answers what
+/// changed (with `check`, what would change). Refused while a daemon serves
+/// the configuration (its state directory is locked). Import failures are
+/// logged; generation reads the bundles as they are.
+pub fn codegen_once(
+    config: DaemonConfig,
+    check: bool,
+) -> Result<Vec<CodegenChange>, DaemonProcessError> {
+    let schema_bytes = std::fs::read(&config.assets.schema_path).map_err(|source| {
+        DaemonProcessError::SchemaRead {
+            path: config.assets.schema_path.clone(),
+            source,
+        }
+    })?;
+    let authority = ProjectSchemaAuthority::from_json(&schema_bytes)?;
+    let targets = config.target_definitions(authority.identity())?;
+    let coordinator = match DaemonCoordinator::open(
+        config.store_config(),
+        config.asset_roots(),
+        targets,
+        config.pipeline.max_dependency_depth,
+    ) {
+        Ok(coordinator) => Arc::new(coordinator),
+        Err(CoordinatorInitError::Store(distill_store::StoreError::StateLocked { path })) => {
+            return Err(DaemonProcessError::Codegen(format!(
+                "a daemon is running on this configuration (state directory {} is locked); \
+                 it generates the outputs itself",
+                path.display()
+            )))
+        }
+        Err(error) => return Err(error.into()),
+    };
+    for root in config.asset_roots() {
+        distill_store::atomic_file::open_staging(&root.path).map_err(|source| {
+            DaemonProcessError::Staging {
+                path: root.path.clone(),
+                source,
+            }
+        })?;
+    }
+    coordinator.attach_build_backend();
+    let mut config_watch = ConfigWatch::new(config.clone());
+    let watcher = WatcherThread::start(
+        coordinator.scanner(),
+        config_watch.control_paths(),
+        Arc::new(|_| {}),
+    )?;
+    let watcher_control = watcher.control();
+    let mut codegen = CodegenService::new(&coordinator, &config.codegen)
+        .map_err(DaemonProcessError::Codegen)?;
+    if check {
+        codegen.check_only();
+    }
+    let mut writer = coordinator
+        .open_writer()
+        .map_err(CoordinatorInitError::Store)?;
+    let store = &mut *writer;
+    config_watch.reconcile(
+        &coordinator,
+        store,
+        &watcher_control,
+        ControlInvalidation::all(),
+    )?;
+    let mut queue = WatcherQueue::new();
+    for _ in 0..CODEGEN_ONCE_ATTEMPTS {
+        let outcome = coordinator.reconcile_rescan(store, &mut queue)?;
+        if let Some(failures) = pass_failures(&outcome) {
+            tracing::warn!(%failures, "reconciliation failed for some sources");
+        }
+        if !outcome.more_work {
+            break;
+        }
+    }
+    for _ in 0..CODEGEN_ONCE_ATTEMPTS {
+        if !codegen
+            .run_outputs(&coordinator, store)
+            .map_err(DaemonProcessError::Codegen)?
+        {
+            return Ok(codegen.take_changes());
+        }
+    }
+    Err(DaemonProcessError::Codegen(
+        "codegen inputs kept changing while it ran".to_owned(),
+    ))
 }
 
 #[derive(Debug)]
@@ -1232,14 +1320,9 @@ fn restart_changes(current: &DaemonConfig, candidate: &DaemonConfig) -> Vec<Rest
     if current.daemon.address != candidate.daemon.address {
         changes.push(RestartOnlyChange::Address(candidate.daemon.address));
     }
-    if current.codegen.rs_mod_path != candidate.codegen.rs_mod_path {
-        changes.push(RestartOnlyChange::RsModPath(
-            candidate.codegen.rs_mod_path.clone(),
-        ));
-    }
-    if current.codegen.auto_codegen != candidate.codegen.auto_codegen {
-        changes.push(RestartOnlyChange::AutoCodegen(
-            candidate.codegen.auto_codegen,
+    if current.codegen != candidate.codegen {
+        changes.push(RestartOnlyChange::CodegenOutputs(
+            candidate.codegen.canonical_text(),
         ));
     }
     changes

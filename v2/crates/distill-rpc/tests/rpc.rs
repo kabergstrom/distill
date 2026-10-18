@@ -2526,7 +2526,7 @@ fn restart_required_replaces_the_prior_key_set() {
         &project,
         &[RestartOnlyChange::Address(([127, 0, 0, 1], 9000).into())],
     );
-    announce_restart(&project, &[RestartOnlyChange::AutoCodegen(true)]);
+    announce_restart(&project, &[RestartOnlyChange::CodegenOutputs("main generated bindings\n".into())]);
     let install = hub
         .subscribe(InputVersion(0), vec![], vec![])
         .success()
@@ -2537,7 +2537,7 @@ fn restart_required_replaces_the_prior_key_set() {
         Some(StreamEvent::Asset {
             event: AssetEvent::RestartRequired { keys },
             ..
-        }) if keys == vec!["codegen.auto_codegen"]
+        }) if keys == vec!["codegen.output"]
     ));
 }
 

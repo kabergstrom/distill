@@ -946,9 +946,6 @@ os = "{}"
 arch = "{}"
 apis = ["vulkan"]
 optimize = false
-[codegen]
-rs_mod_path = '{}'
-auto_codegen = false
 [pipeline]
 parallelism = 2
 max_dependency_depth = 64
@@ -963,7 +960,6 @@ cache_limit = "16MiB"
         module.display(),
         os,
         std::env::consts::ARCH,
-        temp.path().join("generated").display(),
     );
     assert_eq!(&host_layout_identity(), identity);
     let path = temp.path().join("distill.toml");

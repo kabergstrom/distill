@@ -87,8 +87,9 @@ fn validate_scheduler(parallelism: usize, reserved: usize) -> Result<(), ConfigV
 pub enum RestartOnlyChange {
     StatePath(PathBuf),
     Address(SocketAddr),
-    RsModPath(PathBuf),
-    AutoCodegen(bool),
+    /// The `[[codegen.output]]` entries, as one canonical text (one
+    /// `root rs_mod_path codegen` line per entry, in order).
+    CodegenOutputs(String),
 }
 
 impl RestartOnlyChange {
@@ -115,8 +116,7 @@ impl RestartOnlyChange {
                 }
                 ("daemon.address", address.to_string())
             }
-            Self::RsModPath(path) => ("codegen.rs_mod_path", path.to_string_lossy().into_owned()),
-            Self::AutoCodegen(value) => ("codegen.auto_codegen", value.to_string()),
+            Self::CodegenOutputs(outputs) => ("codegen.output", outputs.clone()),
         })
     }
 }

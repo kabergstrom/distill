@@ -1003,41 +1003,38 @@ impl PipelineEpoch {
         }
     }
 
-    pub fn invoke_codegens(
+    /// Run the codegen registered as `id` for the output `context` serves.
+    pub fn invoke_codegen(
         &self,
+        id: &str,
         context: &mut dyn PipelineCodegenContext,
     ) -> Result<
-        Vec<distill_build::codegen::GeneratedFile>,
+        distill_build::codegen::CodegenOutput,
         CallbackInvokeError<distill_build::codegen::CodegenFailure>,
     > {
         self.ensure_healthy()?;
-        let callbacks = self
-            .callback_rows()
-            .into_iter()
-            .filter(|(_, callback)| matches!(callback, CallbackHandle::Codegen { .. }))
-            .collect::<Vec<_>>();
-        let mut files = Vec::new();
-        for (pointer, callback) in callbacks {
-            let CallbackHandle::Codegen { call, .. } = callback else {
-                unreachable!("codegen predicate returned another kind")
-            };
-            let mut contained = ContainedCodegenContext::new(context);
-            let result = unsafe { call(pointer, &mut contained) };
-            if contained.panicked() {
-                return Err(CallbackInvokeError::HostRejected(
-                    "daemon codegen-context callback panicked".to_owned(),
-                ));
-            }
-            match result {
-                Ok(Ok(mut generated)) => files.append(&mut generated),
-                Ok(Err(error)) => return Err(CallbackInvokeError::Rejected(error)),
-                Err(_) => {
-                    self.callback_panicked("codegen");
-                    return Err(CallbackInvokeError::Panicked);
-                }
+        let Some((pointer, CallbackHandle::Codegen { call, .. })) =
+            self.callback_rows().into_iter().find(|(_, callback)| {
+                matches!(callback, CallbackHandle::Codegen { descriptor, .. } if descriptor.id == id)
+            })
+        else {
+            return Err(CallbackInvokeError::Missing);
+        };
+        let mut contained = ContainedCodegenContext::new(context);
+        let result = unsafe { call(pointer, &mut contained) };
+        if contained.panicked() {
+            return Err(CallbackInvokeError::HostRejected(
+                "daemon codegen-context callback panicked".to_owned(),
+            ));
+        }
+        match result {
+            Ok(Ok(output)) => Ok(output),
+            Ok(Err(error)) => Err(CallbackInvokeError::Rejected(error)),
+            Err(_) => {
+                self.callback_panicked("codegen");
+                Err(CallbackInvokeError::Panicked)
             }
         }
-        Ok(files)
     }
 
     pub fn invoke_validators(
@@ -2307,7 +2304,7 @@ mod callback_tests {
         PipelineValidator, ProcessorProduct, ProcessorProducts, ToolRegistration, ToolSource,
     };
     use crate::importer::{AuthoringImportContext, AuthoringImporterError};
-    use distill_build::codegen::{CodegenFailure, GeneratedFile};
+    use distill_build::codegen::{CodegenFailure, CodegenOutput, GeneratedFile};
     use distill_build::import::{ImportError, ImportOutput};
     use distill_build::outputs::OutputDecls;
     use distill_build::pipeline::TargetSelector;
@@ -2574,21 +2571,27 @@ mod callback_tests {
         fn generate(
             &self,
             context: &mut dyn PipelineCodegenContext,
-        ) -> Result<Vec<GeneratedFile>, CodegenFailure> {
+        ) -> Result<CodegenOutput, CodegenFailure> {
             let asset = context
                 .read(AssetUuid([7; 16]))
                 .map_err(|error| CodegenFailure::Generation(error.to_string()))?
                 .ok_or_else(|| CodegenFailure::Generation("source disappeared".into()))?;
-            Ok(vec![GeneratedFile::new(
+            Ok(CodegenOutput::new(vec![GeneratedFile::new(
                 asset.asset,
                 format!("pub const VALUE: u64 = {:?};\n", asset.value).into_bytes(),
-            )])
+            )
+            .with_alias(context.root())])
+            .with_mod_items("pub const COUNT: usize = 1;\n"))
         }
     }
 
     struct CodegenContext;
 
     impl PipelineCodegenContext for CodegenContext {
+        fn root(&self) -> &str {
+            "shaders"
+        }
+
         fn query(&mut self, _query: &AssetQuery) -> Result<Vec<AssetUuid>, CodegenContextError> {
             Ok(vec![AssetUuid([7; 16])])
         }
@@ -2608,15 +2611,19 @@ mod callback_tests {
         fn generate(
             &self,
             context: &mut dyn PipelineCodegenContext,
-        ) -> Result<Vec<GeneratedFile>, CodegenFailure> {
+        ) -> Result<CodegenOutput, CodegenFailure> {
             let _ = context.read(AssetUuid([7; 16]));
-            Ok(Vec::new())
+            Ok(CodegenOutput::default())
         }
     }
 
     struct PanickingCodegenContext;
 
     impl PipelineCodegenContext for PanickingCodegenContext {
+        fn root(&self) -> &str {
+            "main"
+        }
+
         fn read(&mut self, _asset: AssetUuid) -> Result<Option<CodegenAsset>, CodegenContextError> {
             panic!("daemon codegen read panicked")
         }
@@ -2639,7 +2646,7 @@ mod callback_tests {
         });
 
         assert!(matches!(
-            epoch.invoke_codegens(&mut PanickingCodegenContext),
+            epoch.invoke_codegen("reads", &mut PanickingCodegenContext),
             Err(CallbackInvokeError::HostRejected(detail))
                 if detail.contains("codegen-context")
         ));
@@ -2852,9 +2859,15 @@ mod callback_tests {
             Some(Value::U32(7))
         );
         assert_eq!(epoch.tool_descriptors()[0].id, "compiler");
-        let generated = epoch.invoke_codegens(&mut CodegenContext).unwrap();
-        assert_eq!(generated.len(), 1);
-        assert_eq!(generated[0].asset(), AssetUuid([7; 16]));
+        assert!(matches!(
+            epoch.invoke_codegen("unregistered", &mut CodegenContext),
+            Err(CallbackInvokeError::Missing)
+        ));
+        let generated = epoch.invoke_codegen("rust_bindings", &mut CodegenContext).unwrap();
+        assert_eq!(generated.files.len(), 1);
+        assert_eq!(generated.files[0].asset(), AssetUuid([7; 16]));
+        assert_eq!(generated.files[0].alias(), Some("shaders"));
+        assert_eq!(generated.mod_items, "pub const COUNT: usize = 1;\n");
 
         assert!(unload_epoch(&mut epoch).is_ok());
     }

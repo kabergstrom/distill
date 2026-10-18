@@ -10,13 +10,15 @@ use std::collections::BTreeMap;
 
 use distill_core::id::AssetUuid;
 
-pub use distill_pipeline_api::codegen::{generated_module_name, CodegenFailure, GeneratedFile};
+pub use distill_pipeline_api::codegen::{
+    alias_defect, generated_module_name, CodegenFailure, CodegenOutput, GeneratedFile,
+};
 
 use crate::trace::TraceOp;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AttemptOutcome {
-    Files(Vec<GeneratedFile>),
+    Output(CodegenOutput),
     Failure(CodegenFailure),
 }
 
@@ -29,11 +31,11 @@ pub struct CodegenAttempt<B> {
 }
 
 impl<B> CodegenAttempt<B> {
-    pub fn success(basis: B, trace: Vec<TraceOp>, files: Vec<GeneratedFile>) -> Self {
+    pub fn success(basis: B, trace: Vec<TraceOp>, output: CodegenOutput) -> Self {
         Self {
             basis,
             trace,
-            outcome: AttemptOutcome::Files(files),
+            outcome: AttemptOutcome::Output(output),
         }
     }
 
@@ -78,14 +80,15 @@ impl std::fmt::Display for PublicationError {
 
 impl std::error::Error for PublicationError {}
 
-/// The implementation must publish the complete slice. It is passed the
+/// The implementation must publish the complete namespace: every file, and
+/// the `mod.rs` of their modules, aliases, preamble and items. It is passed the
 /// attempted basis so the daemon can repeat the basis fence while it holds
 /// the store and writes the files.
 pub trait CodegenPublisher<B> {
     fn publish(
         &mut self,
         attempted_basis: &B,
-        files: &[GeneratedFile],
+        output: &CodegenOutput,
     ) -> Result<(), PublicationError>;
 }
 
@@ -124,15 +127,15 @@ impl CodegenCoordinator {
                 self.installed = Some(attempt.trace);
                 CodegenPublication::Failed(failure)
             }
-            AttemptOutcome::Files(mut files) => {
-                if let Err(collision) = validate_namespace(&files) {
+            AttemptOutcome::Output(mut output) => {
+                if let Err(collision) = validate_namespace(&output.files) {
                     return CodegenPublication::Failed(collision);
                 }
-                files.sort_unstable_by(|left, right| {
-                    left.relative_path().cmp(right.relative_path())
-                });
-                let count = files.len();
-                if let Err(error) = world.publish(&attempt.basis, &files) {
+                output
+                    .files
+                    .sort_unstable_by(|left, right| left.relative_path().cmp(right.relative_path()));
+                let count = output.files.len();
+                if let Err(error) = world.publish(&attempt.basis, &output) {
                     return CodegenPublication::PublicationFailed(error);
                 }
                 self.installed = Some(attempt.trace);
@@ -151,18 +154,29 @@ impl CodegenCoordinator {
     }
 }
 
+/// Every alias names a valid re-export, and every name of the namespace,
+/// physical module name or alias, has one claimant. A collision names its
+/// every claimant; the first colliding name (by name) fails the batch.
 fn validate_namespace(files: &[GeneratedFile]) -> Result<(), CodegenFailure> {
     let mut claims = BTreeMap::<&str, Vec<AssetUuid>>::new();
     for file in files {
-        claims
-            .entry(file.relative_path())
-            .or_default()
-            .push(file.asset());
+        claims.entry(file.module_name()).or_default().push(file.asset());
+        if let Some(alias) = file.alias() {
+            if let Some(reason) = alias_defect(alias) {
+                return Err(CodegenFailure::InvalidAlias {
+                    asset: file.asset(),
+                    alias: alias.to_owned(),
+                    reason: reason.to_owned(),
+                });
+            }
+            claims.entry(alias).or_default().push(file.asset());
+        }
     }
-    if let Some((name, claimants)) = claims
+    if let Some((name, mut claimants)) = claims
         .into_iter()
         .find(|(_, claimants)| claimants.len() > 1)
     {
+        claimants.sort_unstable();
         return Err(CodegenFailure::NamespaceCollision {
             name: name.to_owned(),
             claimants,

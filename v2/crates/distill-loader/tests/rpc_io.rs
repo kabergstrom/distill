@@ -712,11 +712,11 @@ fn rpc_io_reports_a_restart_requirement_and_its_clearing() {
 
     project
         .coordinator()
-        .set_restart_required(&[RestartOnlyChange::AutoCodegen(true)])
+        .set_restart_required(&[RestartOnlyChange::CodegenOutputs("main generated bindings\n".into())])
         .unwrap();
     assert!(matches!(
         poll_until(&mut io, 1).as_slice(),
-        [IoEvent::RestartRequired { keys }] if keys == &["codegen.auto_codegen"]
+        [IoEvent::RestartRequired { keys }] if keys == &["codegen.output"]
     ));
     // The file again matches what the daemon runs with: the requirement
     // clears with an empty key set.

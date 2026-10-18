@@ -64,14 +64,14 @@ fn operational_store_values_apply_without_copying_restart_state() {
 fn restart_only_changes_name_their_keys_once_in_key_order() {
     let rows = RestartOnlyChange::key_values(&[
         RestartOnlyChange::Address(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999)),
-        RestartOnlyChange::AutoCodegen(false),
-        RestartOnlyChange::AutoCodegen(false),
+        RestartOnlyChange::CodegenOutputs("glsl generated ngp.glsl-rust\n".into()),
+        RestartOnlyChange::CodegenOutputs("glsl generated ngp.glsl-rust\n".into()),
     ])
     .unwrap();
     assert_eq!(
         rows,
         [
-            ("codegen.auto_codegen", "false".to_owned()),
+            ("codegen.output", "glsl generated ngp.glsl-rust\n".to_owned()),
             ("daemon.address", "127.0.0.1:9999".to_owned()),
         ]
     );
