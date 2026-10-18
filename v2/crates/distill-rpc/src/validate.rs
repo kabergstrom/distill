@@ -79,8 +79,18 @@ pub fn resolve_blob_refs(
     held: &BTreeMap<BlobRef, Arc<[u8]>>,
 ) -> Result<AuthoringValue, AuthoringValueError> {
     let mut resolved = (*value.value).clone();
+    resolve_value_blob_refs(&mut resolved, held)?;
+    Ok(AuthoringValue { value: Arc::new(resolved), types: value.types.clone() })
+}
+
+/// [`resolve_blob_refs`] in place on a plain value (an import request's
+/// completed settings, against the destination bundle's blobs).
+pub fn resolve_value_blob_refs(
+    value: &mut Value,
+    held: &BTreeMap<BlobRef, Arc<[u8]>>,
+) -> Result<(), AuthoringValueError> {
     let mut missing = None;
-    ngp_value::value_blobs_mut(&mut resolved, &mut |blob| {
+    ngp_value::value_blobs_mut(value, &mut |blob| {
         if let BlobData::Ref(r) = blob {
             match held.get(r) {
                 Some(bytes) => *blob = BlobData::Bytes(bytes.clone()),
@@ -90,10 +100,10 @@ pub fn resolve_blob_refs(
             }
         }
     });
-    if let Some(blob) = missing {
-        return Err(AuthoringValueError::UnknownBlobRef { blob });
+    match missing {
+        Some(blob) => Err(AuthoringValueError::UnknownBlobRef { blob }),
+        None => Ok(()),
     }
-    Ok(AuthoringValue { value: Arc::new(resolved), types: value.types.clone() })
 }
 
 /// Every blob `value` holds with its bytes, by reference.

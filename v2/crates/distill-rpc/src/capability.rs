@@ -543,7 +543,7 @@ fn resolve_named_in(
 /// A served entry's bundle file, read once, verified against the hash the
 /// snapshot published and parsed.
 struct ReadBundle {
-    parsed: distill_bundle::Bundle,
+    parsed: Arc<distill_bundle::Bundle>,
     root: String,
     origin: BundleOrigin,
 }
@@ -629,13 +629,24 @@ impl<'s> BundleReads<'s> {
             .map_err(store_failure)?
             .ok_or_else(unpublished)?
             .1;
-        self.server
-            .inner
-            .handle
-            .authoring_bundle_parses
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let parsed = distill_bundle::parse_bundle(&bytes)
-            .map_err(|error| RpcFailure::InvalidQuery { detail: error.to_string() })?;
+        let handle = &self.server.inner.handle;
+        let cached = handle.authoring_bundles.lock().unwrap_or_else(|e| e.into_inner()).get(bundle.content_hash);
+        let parsed = match cached {
+            Some(parsed) => parsed,
+            None => {
+                handle.authoring_bundle_parses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let parsed = Arc::new(
+                    distill_bundle::parse_bundle(&bytes)
+                        .map_err(|error| RpcFailure::InvalidQuery { detail: error.to_string() })?,
+                );
+                handle
+                    .authoring_bundles
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(bundle.content_hash, parsed.clone());
+                parsed
+            }
+        };
         Ok(Ok(Rc::new(ReadBundle { parsed, root, origin })))
     }
 }
