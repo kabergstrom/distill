@@ -48,3 +48,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [profile.daemon]
 inherits = "release"
 debug-assertions = true
+
+# XXH3 (distill_core::hash) runs on every scan, import, artifact check and
+# fetched payload. It is pure Rust, slow unoptimized (rpc_io_backpressure's
+# 4 MiB fetch went past its frame budget); blake3's SIMD was C/assembly
+# that cc built optimized in every profile.
+[profile.dev.package.xxhash-rust]
+opt-level = 3
