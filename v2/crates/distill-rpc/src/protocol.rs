@@ -50,7 +50,7 @@ pub use distill_store::state::{
 /// declares, with their defaults, and its importers). 27: a
 /// `DescribableType` says whether the type derives `Component` (`component`).
 /// 28 (newgameplus GAP 23 §15.3): an `AuthoringValue`'s blobs are
-/// [`AuthoringBlob`]s, a [`BlobRef`] (length and blake3) or bytes; an
+/// [`AuthoringBlob`]s, a [`BlobRef`] (length and XXH3-128) or bytes; an
 /// inspection names its blobs by reference only, and a write may name a
 /// blob its bundle holds by reference. `AuthoringSnapshot.inspect` takes a
 /// list of entries (one snapshot, each bundle read once); `blob` streams an
@@ -505,7 +505,7 @@ impl AuthoringValue {
     }
 }
 
-/// A blob by length and blake3 of its bytes: what an inspection carries
+/// A blob by length and XXH3-128 of its bytes: what an inspection carries
 /// instead of the bytes (newgameplus GAP 23 §15.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BlobRef {
@@ -1103,7 +1103,7 @@ pub struct BuildEntry {
 }
 
 /// Snapshot- and target-bound schema policy lookup used by offline pack
-/// construction. `build_only` is intentionally not part of DSLH, so the
+/// construction. `build_only` is intentionally not part of the schema hash, so the
 /// published project schema authority is the sole source of this fact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeTypePolicyRequest {

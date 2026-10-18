@@ -1,8 +1,8 @@
 //! Validated daemon authority derived from one watched shared-schema artifact.
 //!
 //! The schema model and classifier remain in `ngp-schema`. This layer performs
-//! Distill's logical projection and authenticated DSWL trees. Native layout
-//! compatibility is checked locally when the loader compiles a DSWL plan.
+//! Distill's logical projection and authenticated wire trees. Native layout
+//! compatibility is checked locally when the loader compiles a wire plan.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -28,7 +28,7 @@ pub struct ProjectSchemaAuthority {
 }
 
 /// All schema and target-layout material needed to encode one project asset
-/// type and publish its authenticated DSWL tree.
+/// type and publish its authenticated wire tree.
 #[derive(Debug, Clone)]
 pub struct ProjectTypeAuthority {
     pub schema_type: SchemaTypeId,

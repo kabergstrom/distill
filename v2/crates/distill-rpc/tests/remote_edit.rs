@@ -19,7 +19,7 @@ fn var(name: &str) -> String {
 }
 
 fn target_hash(hex: &str) -> TargetDefinitionHash {
-    assert_eq!(hex.len(), 64, "DISTILL_EDIT_TARGET_HASH: 32 bytes of hex");
+    assert_eq!(hex.len(), 32, "DISTILL_EDIT_TARGET_HASH: 16 bytes of hex");
     let mut out = [0u8; 16];
     for (i, byte) in out.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).expect("hex");

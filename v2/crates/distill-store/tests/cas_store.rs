@@ -104,7 +104,7 @@ fn declare_child(store: &mut Store, parent: AssetUuid, key: &str) -> AssetUuid {
 
 #[test]
 fn wire_trees_are_first_class_cas_records() {
-    // §13: LayoutHash is the domain-separated digest of the canonical DSWL
+    // §13: LayoutHash is the domain-separated digest of the canonical layout encoding
     // body, while typed reads return that body without the CAS preimage.
     let (_d, mut store) = store();
     let root = WireNode::Unit { offset: 0 };
@@ -128,7 +128,7 @@ fn wire_tree_writes_are_idempotent() {
 fn malformed_wire_tree_bodies_are_rejected_before_append() {
     let (_d, mut store) = store();
     assert!(matches!(
-        store.put_wire_tree(b"not DSWL"),
+        store.put_wire_tree(b"not a wire tree"),
         Err(StoreError::InvalidWireTree { .. })
     ));
 }
@@ -330,7 +330,7 @@ fn build_import_results_carry_exactly_one_output_row() {
         other => panic!("expected BuildImportOutputArity, got {other:?}"),
     }
 
-    // Exactly one output row commits and is bucket-indexed by DSBI digest.
+    // Exactly one output row commits and is bucket-indexed by its build-import pre-key digest.
     let commit = BuildCommit {
         reads: Vec::new(),
         wire_trees: Vec::new(),

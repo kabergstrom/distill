@@ -449,7 +449,7 @@ pub(crate) fn validate_entry_role(
         detail: "bootstrap logical schema is not canonical",
     })?;
     if entry.schema_hash != expected.logical_hash || actual_schema != expected.logical_schema {
-        return role_error(local_id, "bootstrap schema hash does not match DSB");
+        return role_error(local_id, "bootstrap schema hash does not match the bootstrap spec");
     }
     Ok(())
 }

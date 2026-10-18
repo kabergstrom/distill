@@ -1,4 +1,4 @@
-//! The DSTL artifact container (§12).
+//! The artifact image (§12).
 //!
 //! Layout, pinned (all integers LE):
 //!
@@ -339,7 +339,7 @@ impl<'a> ArtifactView<'a> {
 
 /// The structural prefix of a fetched artifact, with blob extents validated
 /// separately in canonical table order. Packs and RPC transport blobs out of
-/// line, but their identity and metadata are still those of the complete DSTL
+/// line, but their identity and metadata are still those of the complete artifact image
 /// file; this view is the bridge back to the fixup executor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactPartsView<'a> {
@@ -358,7 +358,7 @@ pub struct ArtifactPartsView<'a> {
 }
 
 /// The layout hash an artifact's header declares, read without hashing or
-/// validating the rest of the file. A transport uses it to fetch the DSWL
+/// validating the rest of the file. A transport uses it to fetch the wire
 /// tree it then authenticates against this hash; the artifact's own identity
 /// is checked later by [`parse_artifact_parts`].
 pub fn artifact_header_layout_hash(structural: &[u8]) -> Result<LayoutHash, ArtifactError> {

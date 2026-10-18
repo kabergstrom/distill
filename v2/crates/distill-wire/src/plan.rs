@@ -218,7 +218,7 @@ pub struct CompiledPlans {
 }
 
 /// Plan-compilation failures. The trees authenticate separately (logical
-/// hash, DSWL recomputation); a mismatch here means corrupted inputs or a
+/// hash, layout hash recomputation); a mismatch here means corrupted inputs or a
 /// registry disagreement — named, never guessed around.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanError {

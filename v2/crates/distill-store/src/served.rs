@@ -735,7 +735,7 @@ pub trait ServedWrite {
     }
 
     /// Record an artifact's typed direct load edges, replacing any an
-    /// earlier install recorded. The DSTL bytes carry the edges' assets but
+    /// earlier install recorded. The artifact image carries the edges' assets but
     /// not their expected terminals, so the same bytes rebuilt after a
     /// dependency's terminal type changed carry other edges: the latest
     /// install's are the artifact's. The rows go with the artifact's

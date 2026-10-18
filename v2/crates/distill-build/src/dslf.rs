@@ -1,4 +1,4 @@
-//! Closed DSLF v1 deterministic local-failure grammar (§5/§9).
+//! The closed deterministic local-failure record (`Domain::LocalFailure` v1) (§5/§9).
 //!
 //! Presentation text is deliberately absent.  Every memoizable producer has
 //! one typed arm whose required fields are encoded in a pinned order.

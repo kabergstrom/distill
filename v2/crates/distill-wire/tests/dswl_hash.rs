@@ -1,4 +1,4 @@
-//! DSWL — the wire-layout hash (§12): grammar bytes pinned, physical
+//! The layout hash (§12): grammar bytes pinned, physical
 //! order with declaration-index tie-break, semantic identity in payloads,
 //! all three enum forms, pointee inclusion, backrefs.
 

@@ -333,6 +333,6 @@ fn typed_configuration_error_carries_its_reason_and_message_is_not_hashed() {
             address: "10.0.0.5:9999".to_owned(),
         }
         .reason_hash(),
-        "presentation prose never enters DSCP"
+        "presentation prose never enters the configuration-poison record"
     );
 }

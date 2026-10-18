@@ -116,7 +116,7 @@ pub enum ControlFailureSubject {
 }
 
 /// Stable coordinator-control failure codes. Zero is permanently reserved;
-/// these numeric values are part of the DSTR v1 grammar.
+/// these numeric values are part of the trace v1 grammar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum ControlFailureCode {
@@ -140,7 +140,7 @@ pub enum ControlFailureError {
 
 /// Canonical conflicting/duplicate entry identities carried by a control
 /// failure. Construction sorts and deduplicates the entries so equality and
-/// revalidation have the same semantics as their DSTR encoding.
+/// revalidation have the same semantics as their trace encoding.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct ControlFailureEntries(Vec<AssetUuid>);
 
@@ -167,7 +167,7 @@ impl From<Vec<AssetUuid>> for ControlFailureEntries {
 }
 
 /// Canonical, cardinality-checked control failure payload. Its fields are
-/// private so a DSTR fingerprint cannot represent a forbidden code/entry
+/// private so a trace fingerprint cannot represent a forbidden code/entry
 /// combination.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ControlFailureFingerprint {

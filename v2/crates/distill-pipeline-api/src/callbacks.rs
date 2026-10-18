@@ -131,7 +131,7 @@ impl From<ProcessContextError> for ProcessorError {
     fn from(error: ProcessContextError) -> Self {
         Self {
             // Zero is reserved by the host boundary for infrastructure/context
-            // rejection and is never committed as a deterministic DSLF row.
+            // rejection and is never committed as a deterministic local-failure row.
             code: 0,
             message: error.to_string(),
         }

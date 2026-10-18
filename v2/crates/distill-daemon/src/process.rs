@@ -1197,7 +1197,7 @@ fn observe_configuration(path: &Path) -> ConfigObservation {
                     error.to_string(),
                 )
             }))
-            .expect("configuration staging defects produce valid DSCP rows")
+            .expect("configuration staging defects produce valid configuration-poison rows")
             .expect("parse_staged returns at least one defect");
             (*selected.detail, selected.message)
         }),

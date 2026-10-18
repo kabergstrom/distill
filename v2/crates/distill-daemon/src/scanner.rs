@@ -814,7 +814,7 @@ fn scanned_file_row(row: ObservedFile) -> (ScannedFile, Option<PathBuf>) {
     (file, alias)
 }
 
-/// A scanned bundle file: `bytes` parsed, with `file_hash`, their blake3
+/// A scanned bundle file: `bytes` parsed, with `file_hash`, their XXH3-128
 /// hash (`BundleFileHash::of_observed_bytes`), which the caller computed.
 pub(crate) fn scanned_bundle(
     root_name: &str,
@@ -1019,7 +1019,7 @@ impl RootedScanner {
     }
 
     /// Locate an observed physical error beneath its configured root and
-    /// preserve the platform's exact relative path units for DSVP.
+    /// preserve the platform's exact relative path units for the namespace-error record.
     pub fn scan_subject(&self, path: &Path) -> Option<distill_store::state::ScanSubject> {
         self.root_snapshot()
             .values()

@@ -25,7 +25,7 @@ fn content_hash(byte: u8) -> ContentHash {
     ContentHash([byte; 16])
 }
 
-#[allow(clippy::too_many_arguments)] // Test fixture mirrors the authenticated DSTL header/parts tuple.
+#[allow(clippy::too_many_arguments)] // Test fixture mirrors the authenticated artifact image header/parts tuple.
 fn canonical_artifact(
     asset: AssetUuid,
     authored_type: TypeUuid,

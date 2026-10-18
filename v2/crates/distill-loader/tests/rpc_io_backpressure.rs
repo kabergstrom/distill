@@ -728,7 +728,7 @@ fn assert_blobs(events: &[IoEvent], len: usize) {
     }
 }
 
-/// Slack over the budget for the DSWL trees of admitted payloads, which
+/// Slack over the budget for the wire trees of admitted payloads, which
 /// grow a reservation without waiting.
 const DSWL_SLACK: usize = 4 * 1024;
 

@@ -1504,9 +1504,9 @@ async fn path_event(
     }
 }
 
-/// Fetch one artifact and its DSWL tree. The payload's size is reserved
+/// Fetch one artifact and its wire tree. The payload's size is reserved
 /// before its stream is read, waiting unread while it does not fit; the
-/// reservation grows by the DSWL tree once that arrives and travels with
+/// reservation grows by the wire tree once that arrives and travels with
 /// the event until the loader takes it.
 async fn fetch_event(
     shared: &Shared,

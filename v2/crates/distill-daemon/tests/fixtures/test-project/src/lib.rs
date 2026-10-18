@@ -900,7 +900,7 @@ pub fn put_artifact(server: &ServerHandle, payload: &ArtifactPayload) -> Content
         .unwrap()
 }
 
-/// Put the wire tree `bytes` (canonical DSWL) into `server`'s store, as the
+/// Put the wire tree `bytes` (canonical layout encoding) into `server`'s store, as the
 /// daemon's build workers put theirs; returns its layout hash.
 pub fn put_wire_tree(server: &ServerHandle, bytes: &[u8]) -> LayoutHash {
     server

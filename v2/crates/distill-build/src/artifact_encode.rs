@@ -30,7 +30,7 @@ pub struct ArtifactValueSpec<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedArtifact {
-    /// Complete canonical DSTL bytes, suitable for the durable build CAS.
+    /// Complete canonical artifact image bytes, suitable for the durable build CAS.
     pub bytes: Vec<u8>,
     /// Header/tables/fixed/variable prefix, suitable for RPC or pack split
     /// transport. Blob extents are carried separately below.

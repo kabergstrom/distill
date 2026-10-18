@@ -1,4 +1,4 @@
-//! The wire-layout grammar DSWL (§12): the layout hash is
+//! The layout encoding (§12): the layout hash is
 //! `digest(Domain::Layout, DSWL_VERSION, root)` (§5) over the wire tree,
 //! nodes depth-first in physical field order — (wire offset ascending, then
 //! the field's `declaration_index`) — integers LE, `str` raw as in §5 (u32
@@ -31,7 +31,7 @@ use distill_core::hash::{digest_bytes, Domain};
 use distill_core::id::LayoutHash;
 use std::collections::BTreeSet;
 
-/// DSWL grammar version: the [`Domain::Layout`] digest version.
+/// Layout encoding version: the [`Domain::Layout`] digest version.
 pub const DSWL_VERSION: u32 = 2;
 
 fn put_str(out: &mut Vec<u8>, value: &str) -> Result<(), LayoutHashError> {
@@ -41,7 +41,7 @@ fn put_str(out: &mut Vec<u8>, value: &str) -> Result<(), LayoutHashError> {
     Ok(())
 }
 
-/// Serialize a wire tree to its pinned DSWL byte form.
+/// Serialize a wire tree to its pinned layout encoding.
 pub fn dswl_bytes(root: &WireNode) -> Result<Vec<u8>, LayoutHashError> {
     let mut out = Vec::new();
     let mut frames = Vec::new();
@@ -75,7 +75,7 @@ pub enum DswlDecodeError {
     NodeLimitExceeded,
 }
 
-/// Decode the authenticated DSWL body carried by the daemon or pack. The
+/// Decode the authenticated layout encoding carried by the daemon or pack. The
 /// decoder is deliberately strict: it accepts only the one form emitted by
 /// [`dswl_bytes`], so a layout hash can never name two in-memory trees.
 pub fn decode_dswl(bytes: &[u8]) -> Result<WireNode, DswlDecodeError> {

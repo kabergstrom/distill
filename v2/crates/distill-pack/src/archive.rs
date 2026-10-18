@@ -11,7 +11,7 @@ use distill_core::id::ContentHash;
 
 /// 3: path-table rows carry the asset name (a local id; empty for the
 /// primary). 4: the shared file header, XXH3-128 keys and trailers, `u32`
-/// object kinds, no per-object CRC.
+/// object kinds, no per-object checksum.
 pub const PACK_VERSION: u32 = 4;
 
 /// Trailer length: the file's XXH3-128.

@@ -113,7 +113,7 @@ pub struct FetchedArtifact {
     pub structural: Arc<[u8]>,
     pub blobs: Vec<Blob>,
     pub load_edges: Vec<distill_rpc::ServedLoadEdge>,
-    /// Canonical DSWL body authenticated by the artifact header's
+    /// Canonical layout encoding authenticated by the artifact header's
     /// `layout_hash`; LoaderIO resolves this before completing the fetch.
     pub wire_layout: Blob,
     /// What the IO measured while fetching it (doc 22 phase 0).

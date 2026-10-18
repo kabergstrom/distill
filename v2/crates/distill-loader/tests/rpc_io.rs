@@ -174,7 +174,7 @@ fn rpc_io_drives_the_same_loader_boundary_on_the_callers_thread() {
 
     io.fetch(ReqId(10), hash, &basis);
     io.fetch(ReqId(11), hash, &basis);
-    // The DSWL trees overflow the budget: growing an admitted payload never
+    // The wire trees overflow the budget: growing an admitted payload never
     // waits, and both payloads stay in memory until `poll` hands them over.
     let both = poll_until(&mut io, 2);
     assert_eq!(

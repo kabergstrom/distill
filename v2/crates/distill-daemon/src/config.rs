@@ -750,8 +750,8 @@ fn target_matches_layout_identity(target: &TargetSection, identity: &LayoutIdent
     arch_matches && os_matches
 }
 
-/// Convert a rejected source candidate into the stable DSCP fact carried by
-/// the failed version. Errors whose grammar has no more specific DSCP row
+/// Convert a rejected source candidate into the stable configuration-poison fact carried by
+/// the failed version. Errors whose grammar has no more specific configuration-poison row
 /// bind to the exact source bytes through `MalformedConfiguration`.
 pub(crate) fn config_error_reason(error: &DaemonConfigError, source: &[u8]) -> DscpV1 {
     let malformed = || DscpV1::MalformedConfiguration {

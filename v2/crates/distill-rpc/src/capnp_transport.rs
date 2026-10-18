@@ -2546,7 +2546,7 @@ fn decode_metadata_response(
 
 /// Decode and authenticate a wire authoring inspection before handing it to
 /// tooling. This is the sole high-level boundary for the branded raw fields:
-/// logical-schema DSLH and the complete schema/value/blob walk are verified
+/// logical schema hash and the complete schema/value/blob walk are verified
 /// before success is returned.
 pub fn decode_authoring_inspection(
     value: schema::authoring_inspection::Reader<'_>,
@@ -2627,7 +2627,7 @@ pub fn decode_configuration_error(
     let code = crate::ConfigurationErrorCode::try_from(reader.get_code())
         .map_err(|error| capnp::Error::failed(error.to_string()))?;
     let detail = crate::DscpV1::from_canonical_detail_bytes(code, reader.get_detail_bytes()?)
-        .map_err(|error| capnp::Error::failed(format!("invalid DSCP v1 detail: {error}")))?;
+        .map_err(|error| capnp::Error::failed(format!("invalid configuration-poison detail: {error}")))?;
     let value = ConfigurationError {
         code,
         reason_hash: decode_hash(reader.get_reason_hash()?, "reasonHash")
@@ -4312,7 +4312,7 @@ fn write_pipeline_failure(
 ) -> Result<(), capnp::Error> {
     failure
         .validate()
-        .map_err(|error| capnp::Error::failed(format!("invalid DSPP diagnostic: {error}")))?;
+        .map_err(|error| capnp::Error::failed(format!("invalid pipeline-failure diagnostic: {error}")))?;
     output.set_code(match failure.code {
         crate::PipelineFailureCode::CandidateOpen => schema::PipelineFailureCode::CandidateOpen,
         crate::PipelineFailureCode::CandidateAttestation => {

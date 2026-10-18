@@ -673,7 +673,7 @@ impl StoreReader {
             .optional()?)
     }
 
-    /// The (path, blake3 hash) of each observed `.bundle` file at or below
+    /// The (path, XXH3-128 hash) of each observed `.bundle` file at or below
     /// `prefix` in `root_name`, in path order: its `files` content hash.
     pub fn bundle_file_hashes_under(
         &self,
@@ -896,7 +896,7 @@ impl StoreReader {
         Ok(())
     }
 
-    /// Visit every observed `.bundle` file's (root name, path, blake3 hash)
+    /// Visit every observed `.bundle` file's (root name, path, XXH3-128 hash)
     /// in (root name, path) order: its `files` content hash.
     pub fn for_each_bundle_file_hash(
         &self,

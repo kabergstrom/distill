@@ -1,4 +1,4 @@
-//! Binary artifact format (§12): the DSTL container, wire-layout derivation
+//! Binary artifact format (§12): the artifact image, wire-layout derivation
 //! and hashing, the live native-layout tree, fixup-plan compilation, and the
 //! transactional fixup executor.
 

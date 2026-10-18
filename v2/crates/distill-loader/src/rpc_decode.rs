@@ -43,9 +43,9 @@ pub(crate) fn fetched_artifact(
 
 fn verify_wire_layout(layout_hash: LayoutHash, wire_layout: &[u8]) -> Result<(), String> {
     let wire = distill_wire::dswl::decode_dswl(wire_layout)
-        .map_err(|error| format!("invalid DSWL wire tree: {error:?}"))?;
+        .map_err(|error| format!("invalid wire tree: {error:?}"))?;
     if distill_wire::dswl::dswl_hash(&wire).ok() != Some(layout_hash) {
-        return Err("DSWL wire-tree hash mismatch".into());
+        return Err("wire-tree hash mismatch".into());
     }
     Ok(())
 }

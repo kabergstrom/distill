@@ -1,7 +1,7 @@
 //! Authoring-side Rust binding generation (§20).
 //!
 //! Pipeline code owns reflection and emitted unit bytes. The daemon owns the
-//! pinned authored reads, DSTR observations, complete generated namespace,
+//! pinned authored reads, trace observations, complete generated namespace,
 //! and its atomic publication.
 
 use std::collections::{BTreeMap, BTreeSet};

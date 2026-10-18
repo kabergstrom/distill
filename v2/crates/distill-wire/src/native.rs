@@ -813,7 +813,7 @@ pub enum NativeTagEncoding {
     Single,
 }
 
-/// Failures serializing a wire layout under the DSWL grammar.
+/// Failures serializing a wire layout under the layout encoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LayoutHashError {
     /// A back-reference names a frame that is not on the expansion path.

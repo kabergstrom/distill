@@ -26,11 +26,11 @@ pub enum StoreError {
     /// The store holds no copy of file content; the watcher reports the
     /// change, and the read is retried once the change is published.
     Drifted { root: String, path: String },
-    /// Persisted DSVP bytes were malformed or non-canonical.
+    /// Persisted namespace-error bytes were malformed or non-canonical.
     InvalidNamespaceError(crate::state::NamespaceErrorDecodeError),
-    /// Persisted DSPP fields were unknown, noncanonical, or inconsistent.
+    /// Persisted pipeline-failure fields were unknown, noncanonical, or inconsistent.
     InvalidPipelineFailure(crate::state::PipelineFailureDecodeError),
-    /// The checked-in DSB format authority could not be parsed. A binary
+    /// The checked-in bootstrap spec could not be parsed. A binary
     /// built in this state cannot advertise bundle format v1 or reach Ready.
     InvalidBootstrapSpec(distill_core::bootstrap::BootstrapSpecError),
     /// A store-side epoch has invalid identity or registration metadata.
@@ -87,7 +87,7 @@ pub enum StoreError {
     /// Another process holds the state directory.
     StateLocked { path: PathBuf },
     /// A CAS frame failed validation at the stated segment offset:
-    /// framing, CRC, or blake3 (§13's recovery verification).
+    /// framing or hash (§13's recovery verification).
     BadRecord {
         segment: u64,
         offset: u64,
@@ -95,7 +95,7 @@ pub enum StoreError {
     },
     /// A read named a hash the extent index does not hold.
     NotFound { hash: [u8; 16] },
-    /// A wire-tree body or stored DSWL preimage was malformed, noncanonical,
+    /// A wire-tree body or stored layout preimage was malformed, noncanonical,
     /// or did not authenticate to the requested LayoutHash.
     InvalidWireTree { detail: String },
     /// A disposable exact-hash schema cache row is malformed. Rebuilding the
@@ -206,7 +206,7 @@ impl fmt::Display for StoreError {
                 write!(f, "no CAS extent for hash {}", hex(hash))
             }
             StoreError::InvalidWireTree { detail } => {
-                write!(f, "invalid DSWL wire tree: {detail}")
+                write!(f, "invalid wire tree: {detail}")
             }
             StoreError::InvalidSchemaCache { detail } => {
                 write!(f, "invalid cached schema snapshot: {detail}")

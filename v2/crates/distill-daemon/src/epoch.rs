@@ -1981,7 +1981,7 @@ fn pipeline_failure(
     message: impl Into<String>,
 ) -> PipelineFailure {
     PipelineFailure::new(code, origin, cleanup, message)
-        .expect("daemon emits only the closed DSPP code/origin/cleanup matrix")
+        .expect("daemon emits only the closed pipeline-failure code/origin/cleanup matrix")
 }
 
 const fn cleanup_disposition_name(disposition: CandidateCleanupDisposition) -> &'static str {

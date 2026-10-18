@@ -1,6 +1,6 @@
 //! The wire layout tree (§12): derived deterministically from the native
 //! layout by the layout schema — identical except where indirection or
-//! niche encoding forces divergence. This is the tree the DSWL hash
+//! niche encoding forces divergence. This is the tree the layout hash
 //! covers, the tree the daemon persists under its hash, and the wire-side
 //! input to fixup-plan compilation.
 
@@ -21,7 +21,7 @@ pub enum SlotKind {
 }
 
 impl SlotKind {
-    /// The DSWL grammar id, pinned.
+    /// The layout encoding version, pinned.
     pub fn grammar_id(self) -> u32 {
         match self {
             SlotKind::Vec => 0x00,
@@ -49,7 +49,7 @@ pub enum WireEnumForm {
     Canonical,
 }
 
-/// One field of a wire struct. `declaration_index` is the DSWL physical
+/// One field of a wire struct. `declaration_index` is the layout encoding's physical
 /// order tie-break for equal wire offsets (§12); it is never hashed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WireField {

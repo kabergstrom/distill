@@ -85,7 +85,7 @@ fn noncanonical_target_rows_are_rejected() {
 
 #[test]
 fn registering_a_package_tool_is_content_addressed_and_input_versioned() {
-    // §13: tool key → (complete staged package, DSCT) at an input version.
+    // §13: tool key → (complete staged package, tool-capsule) at an input version.
     let (_d, mut store) = store();
     let binary = b"#!/bin/sh\necho v1\n";
 

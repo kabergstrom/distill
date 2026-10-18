@@ -115,7 +115,7 @@ pub enum Stage {
     Accept,
     /// Accept part: header parse and content hash.
     AcceptParse,
-    /// Accept part: DSWL decode and hash.
+    /// Accept part: layout decode and hash.
     AcceptDswl,
     /// Accept part: fixup plan compile.
     AcceptPlan,

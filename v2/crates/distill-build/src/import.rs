@@ -56,7 +56,7 @@ pub enum FileDep {
 
 pub trait ImportBackend {
     fn read(&mut self, path: &str) -> Result<(RootedPath, Vec<u8>), RawFileFailureClass>;
-    /// `read` with the blake3 hash of the bytes, which a read set records.
+    /// `read` with the XXH3-128 hash of the bytes, which a read set records.
     /// A backend that hashes what it reads anyway answers that hash rather
     /// than hashing twice.
     fn read_hashed(

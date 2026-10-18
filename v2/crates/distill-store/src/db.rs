@@ -189,7 +189,7 @@ CREATE TABLE assets (
     -- not serve (skeleton rows, daemon-private rows). The authored value
     -- is read from the bundle file, verified against its published hash.
     terminal_type  BLOB,
-    -- The authoring content key (§17 'Content keys'): blake3 over the
+    -- The authoring content key (§17 'Content keys'): XXH3-128 over the
     -- entry's schema hash, canonical value text, blob refs and carried
     -- types. NULL where `terminal_type` is.
     content        BLOB,
@@ -409,7 +409,7 @@ CREATE TABLE rpc_targets (
     name            TEXT NOT NULL PRIMARY KEY,
     definition_hash BLOB NOT NULL
 );
--- The one piece of artifact metadata the DSTL bytes do not carry: each
+-- The one piece of artifact metadata the artifact image does not carry: each
 -- direct load edge's expected terminal type. Written with the CAS index,
 -- by the artifact's latest install; deleted with its extent.
 CREATE TABLE artifact_load_edges (

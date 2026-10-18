@@ -2,8 +2,8 @@
 //! share.
 //!
 //! A build is a pure function of its inputs. Its static inputs are digested
-//! into its key (DSNK for an asset node, DSSI per processor stage, DSBI per
-//! import) and never name an input version; what it observes of the
+//! into its key (the node key for an asset node, the StaticInputs digest per processor stage,
+//! the pre-key per import) and never name an input version; what it observes of the
 //! project (queries, reads, resolves, tools, capabilities) is its trace. A
 //! cached result serves a snapshot exactly when its trace holds there, so
 //! one result serves every snapshot whose answers agree.
@@ -89,7 +89,7 @@ use trace_source::{BuiltNodes, StoreTraceSource, TraceBasis, TraceQueries};
 const MIGRATION_PLANNER_VERSION: u32 = 1;
 
 /// The production lazy-build authority. A request resolves at the
-/// requester's snapshot: its DSNK node key is a digest of the node's static
+/// requester's snapshot: its node key is a digest of the node's static
 /// inputs only, the node cache answers when a cached result's trace holds
 /// at that snapshot, and a miss submits the key's build cell, which every
 /// requester of the key shares (`crate::scheduler`).
@@ -522,7 +522,7 @@ fn pipeline_registry(epoch: &PipelineEpoch) -> Result<PipelineRegistry, String> 
     .map_err(|error| format!("{error:?}"))
 }
 
-/// A node's DSNK key.
+/// A node's node key (`Domain::NodeKey`).
 struct NodeKey {
     digest: [u8; 16],
 }
@@ -3614,7 +3614,7 @@ fn artifact_encoding_failure(error: &ArtifactEncodeError) -> Option<ArtifactEnco
                 path: field_path_from_display(path),
             })
         }
-        // The v1 DSLF grammar has no exact fact payload for these failures.
+        // The v1 local-failure record has no exact fact payload for these failures.
         // Keep them deterministic but non-memoized rather than inventing an
         // observation or collapsing distinct failures into a false fact.
         ArtifactEncodeError::Value(
@@ -4680,7 +4680,7 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct BuildWireTree {
         layout_hash: LayoutHash,
-        /// Canonical DSWL body bytes (without the CAS domain/version prefix).
+        /// Canonical layout encoding bytes (without the CAS domain/version prefix).
         bytes: Arc<[u8]>,
     }
 

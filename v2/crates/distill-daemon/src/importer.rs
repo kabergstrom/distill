@@ -3717,7 +3717,7 @@ impl<'a> RootedImportBackend<'a> {
 }
 
 impl RootedImportBackend<'_> {
-    /// The bytes at `path` as the pass observes them, with their blake3
+    /// The bytes at `path` as the pass observes them, with their XXH3-128
     /// hash: one file, read through the scan's identity checks, whose hash
     /// is its row's content hash.
     fn read_checked(
@@ -4192,7 +4192,7 @@ pub(crate) struct ImportControls {
     settings: Value,
 }
 
-/// Decoded `ImportControls` by the blake3 hash of their bundle file's bytes
+/// Decoded `ImportControls` by the XXH3-128 hash of their bundle file's bytes
 /// (`BundleFileHash`, the file's content hash). Decoding is a function of
 /// the bytes, so an entry never goes stale; a pass revalidating thousands
 /// of bundles reads none whose bytes it decoded before, where it would

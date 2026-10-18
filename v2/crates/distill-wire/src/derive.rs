@@ -129,7 +129,7 @@ struct Ctx<'a> {
     view: LayoutView<'a>,
     /// Struct/enum frames on the expansion path (§5's backref rule):
     /// records, enums, and variant payload frames — exactly the nodes the
-    /// DSWL hasher counts.
+    /// layout hasher counts.
     path: Vec<SchemaTypeId>,
     depth: u32,
     /// Deriving a frame's geometry only ([`shape`]): slot pointees are
@@ -411,7 +411,7 @@ fn reentry(ctx: &Ctx<'_>, id: SchemaTypeId) -> Option<u32> {
 }
 
 /// A frame re-entered inline: a back-reference occupying the frame's
-/// geometry (DSWL infers it from the referenced frame), so the enclosing
+/// geometry (the layout encoding infers it from the referenced frame), so the enclosing
 /// record lays it out like the expanded frame.
 fn inline_backref(
     ctx: &mut Ctx<'_>,

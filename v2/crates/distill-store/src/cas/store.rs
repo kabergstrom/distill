@@ -86,8 +86,8 @@ pub enum CommitOutcome {
 #[derive(Debug, Clone)]
 pub struct BuildCommit {
     pub key_kind: KeyKind,
-    /// The `"DSSI"` StaticInputs digest, the `"DSBI"` pre-key digest or the
-    /// `"DSNK"` node key.
+    /// The processor StaticInputs digest, the build-import pre-key digest or
+    /// the node key.
     pub static_input_key: [u8; 16],
     /// The parent asset (processor results) or entry (build imports).
     pub asset_uuid: AssetUuid,
@@ -99,7 +99,7 @@ pub struct BuildCommit {
     /// each once), indexed so a publication changing one finds the
     /// result's assets (§15, [`crate::served::ServedWrite::build_dependents`]).
     pub reads: Vec<BuildRead>,
-    /// Canonical DSWL bodies of the wire trees the outputs name, committed
+    /// Canonical layout encodings of the wire trees the outputs name, committed
     /// with the result. A tree already in the CAS may be left out.
     pub wire_trees: Vec<Vec<u8>>,
 }
@@ -319,7 +319,7 @@ pub(crate) fn artifact_layout(bytes: &[u8]) -> Option<[u8; 16]> {
     parse_artifact(bytes).ok().map(|view| view.layout_hash.0)
 }
 
-/// Validate a canonical DSWL body and return its LayoutHash and the
+/// Validate a canonical layout encoding and return its LayoutHash and the
 /// digest preimage the CAS stores.
 fn wire_tree_preimage(tree_bytes: &[u8]) -> Result<(LayoutHash, Vec<u8>), StoreError> {
     let root = decode_dswl(tree_bytes).map_err(|error| StoreError::InvalidWireTree {
@@ -337,8 +337,8 @@ fn wire_tree_preimage(tree_bytes: &[u8]) -> Result<(LayoutHash, Vec<u8>), StoreE
         detail: format!("cannot authenticate body: {error}"),
     })?;
     // The generic CAS authenticates raw payload bytes. Persist the exact
-    // DSWL digest preimage so its raw hash is the semantic LayoutHash;
-    // typed reads strip the domain/version prefix before serving DSWL.
+    // layout digest preimage so its raw hash is the semantic LayoutHash;
+    // typed reads strip the domain/version prefix before serving the encoding.
     let mut preimage = Vec::with_capacity(8 + tree_bytes.len());
     preimage.extend_from_slice(&distill_core::hash::digest_prefix(
         distill_core::hash::Domain::Layout,
@@ -527,7 +527,7 @@ impl Store {
         Ok(layout_hash)
     }
 
-    /// Store raw artifact bytes outside a build (explicit installs), indexed by their blake3 content hash, together
+    /// Store raw artifact bytes outside a build (explicit installs), indexed by their XXH3-128 content hash, together
     /// with the artifact's typed direct load edges. Idempotent. The install
     /// also holds the artifact's wire tree when the CAS has it.
     pub fn put_artifact(
@@ -960,14 +960,14 @@ impl StoreReader {
     }
 
     /// Read a first-class wire tree by its semantic LayoutHash, returning
-    /// the canonical DSWL body (without the stored digest preimage prefix).
+    /// the canonical layout encoding (without the stored digest preimage prefix).
     pub fn wire_tree_read(&self, hash: LayoutHash) -> Result<Vec<u8>, StoreError> {
         let preimage = self.cas_read(&hash.0)?;
         let prefix =
             distill_core::hash::digest_prefix(distill_core::hash::Domain::Layout, DSWL_VERSION);
         let Some(body) = preimage.strip_prefix(&prefix) else {
             return Err(StoreError::InvalidWireTree {
-                detail: "stored extent lacks the layout digest prefix at the supported DSWL version"
+                detail: "stored extent lacks the layout digest prefix at the supported layout encoding version"
                     .to_owned(),
             });
         };

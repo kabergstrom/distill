@@ -117,7 +117,7 @@ impl std::fmt::Display for EncodeError {
 
 impl std::error::Error for EncodeError {}
 
-/// Encode one schema-conforming value. The caller supplies the exact DSWL
+/// Encode one schema-conforming value. The caller supplies the exact wire
 /// tree selected for the target and a snapshot-bound reference resolver.
 pub fn encode_value(
     schema: &SchemaNode,
@@ -186,7 +186,7 @@ enum FrameMode {
     /// An ordinary logical record/enum and its matching wire frame.
     Both,
     /// A physical variant-payload record. Logical projection folds this
-    /// record into its enum frame, while DSWL counts the record separately.
+    /// record into its enum frame, while the layout encoding counts the record separately.
     WireOnly,
 }
 
@@ -305,7 +305,7 @@ impl<'a, R: ReferenceResolver + ?Sized> Encoder<'a, R> {
         frame_mode: FrameMode,
     ) -> Result<(), EncodeError> {
         // Box and Arc are transparent in the logical schema, but remain
-        // explicit indirection slots in DSWL. Peel exactly one physical
+        // explicit indirection slots in the layout encoding. Peel exactly one physical
         // wrapper while preserving the logical node and expansion frames.
         if let WireNode::Slot {
             size,
@@ -922,7 +922,7 @@ impl<'a, R: ReferenceResolver + ?Sized> Encoder<'a, R> {
         self.wire_frames.push(wire);
         self.path.push(PathComponent::Variant(name.clone()));
         // The payload is a struct node folded into the enum frame
-        // logically, but its own record in DSWL.
+        // logically, but its own record in the layout encoding.
         let result = match payload_schema {
             SchemaNode::Struct { fields, .. } => {
                 if self.depth >= MAX_ENCODE_DEPTH {

@@ -1848,7 +1848,7 @@ impl<I: LoaderIO> Loader<I> {
                 self.reject_fetched(
                     uuid,
                     &basis,
-                    format!("invalid DSWL for {type_uuid}: {error:?}"),
+                    format!("invalid wire tree for {type_uuid}: {error:?}"),
                 );
                 return;
             }
@@ -1859,7 +1859,7 @@ impl<I: LoaderIO> Loader<I> {
                 self.reject_fetched(
                     uuid,
                     &basis,
-                    format!("DSWL hash disagrees with artifact header for {type_uuid}"),
+                    format!("layout hash disagrees with artifact header for {type_uuid}"),
                 );
                 return;
             }
@@ -1867,7 +1867,7 @@ impl<I: LoaderIO> Loader<I> {
                 self.reject_fetched(
                     uuid,
                     &basis,
-                    format!("cannot hash DSWL for {type_uuid}: {error:?}"),
+                    format!("cannot hash wire tree for {type_uuid}: {error:?}"),
                 );
                 return;
             }
@@ -1921,7 +1921,7 @@ impl<I: LoaderIO> Loader<I> {
             plans,
         };
         let t_constructed = self.stats.now();
-        // Header checks between parse and DSWL count as parse.
+        // Header checks between parse and the layout count as parse.
         let parts = AcceptParts {
             parse_ns: t_checked - t_begin,
             dswl_ns: t_dswl - t_checked,

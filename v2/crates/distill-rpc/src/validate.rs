@@ -494,7 +494,7 @@ fn carried_value(
     })
 }
 
-/// The content key of an authored entry (§17 "Content keys"): blake3 over
+/// The content key of an authored entry (§17 "Content keys"): XXH3-128 over
 /// its schema hash, its canonical value text, its blob refs in table order
 /// and the UUID and schema hash of each type its dynamic values name. Equal
 /// keys mean equal values. [`content_key_of`] keys a carried value the

@@ -118,7 +118,7 @@ pub struct DecodedControlValue {
     pub value: ControlValue,
 }
 
-/// Construct a local stable fingerprint from the closed DSLF v1 grammar.
+/// Construct a local stable fingerprint from the closed local-failure record (`Domain::LocalFailure` v1).
 /// Human presentation text and optional catch-all fact bags are impossible.
 pub fn local_failure_fingerprint(facts: &DslfV1) -> Result<StableFailureFingerprint, DslfError> {
     Ok(StableFailureFingerprint::Local {

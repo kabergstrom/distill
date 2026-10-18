@@ -912,7 +912,7 @@ fn reentry_inline_through_another_record_emits_backref() {
             ]
         )
     );
-    // DSWL takes the inline backref's geometry from the frame it names.
+    // The layout encoding takes the inline backref's geometry from the frame it names.
     dswl_hash(&wire).unwrap();
 }
 

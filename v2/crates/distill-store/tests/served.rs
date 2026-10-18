@@ -114,7 +114,7 @@ fn a_target_is_installed_replaced_and_removed_without_a_fence() {
 
 #[test]
 fn an_artifacts_load_edges_are_its_latest_installs_and_go_with_it() {
-    // The DSTL bytes do not carry the edges' expected terminals, so a
+    // The artifact image does not carry the edges' expected terminals, so a
     // dependency whose terminal type changed rebuilds the same bytes with
     // other edges. That publication succeeds and its edges are served; the
     // edges live exactly as long as the artifact's extent.
