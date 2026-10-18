@@ -14,6 +14,7 @@ pub mod coordinator;
 mod default_imports;
 pub mod epoch;
 pub mod importer;
+pub mod migrate_bundles;
 pub mod module_loader;
 mod operations;
 pub mod pack_command;
