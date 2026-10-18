@@ -1,21 +1,25 @@
 //! The wire-layout grammar DSWL (§12): the layout hash is
-//! `blake3("DSWL" ‖ version:u8 ‖ root)` over the wire tree, nodes
-//! depth-first in physical field order — (wire offset ascending, then the
-//! field's `declaration_index`) — integers LE, `str` as in §5. Node
-//! payloads carry semantic identity, not just geometry.
+//! `digest(Domain::Layout, DSWL_VERSION, root)` (§5) over the wire tree,
+//! nodes depth-first in physical field order — (wire offset ascending, then
+//! the field's `declaration_index`) — integers LE, `str` raw as in §5 (u32
+//! length, UTF-8 bytes; names are NFC from intake, never normalized here).
+//! Node payloads carry semantic identity, not just geometry. Every kind,
+//! scalar id, slot kind and enum form is a `u32` (§5's enum discriminants),
+//! as in the schema encoding.
 //!
-//! Node kind bytes, pinned:
+//! Node kinds, pinned:
 //!
-//! | kind | byte | payload |
-//! |------|------|---------|
-//! | primitive | 0x01 | `ScalarKind` id u8 |
-//! | struct    | 0x02 | field count u32 + per-field (name:str, node) in physical order |
-//! | enum      | 0x03 | tag-form u8 (single 0x00 / fully-flat 0x01 / canonical 0x02); fully-flat adds native tag offset u32 + tag size u8; then variant count u32 + per-variant (name:str, [fully-flat: discriminant u128 LE,] node) in name-sorted order |
-//! | array     | 0x04 | len u32, stride u32, element node |
-//! | slot      | 0x05 | slot kind u8 + pointee node(s): vec/set/box/arc one element node, map key then value, string/blob none; pointee offsets frame-relative to the element |
-//! | unit      | 0x06 | — (header size 0, align 1 by rule) |
-//! | backref   | 0x07 | distance u32 (header offset = the slot's own origin; size and align = the referenced frame's, by rule) |
+//! | kind | id | payload |
+//! |------|----|---------|
+//! | primitive | 1 | `ScalarKind` id u32 |
+//! | struct    | 2 | field count u32 + per-field (name:str, node) in physical order |
+//! | enum      | 3 | tag form u32 (single 0 / fully-flat 1 / canonical 2); fully-flat adds native tag offset u32 + tag size u8; then variant count u32 + per-variant (name:str, [fully-flat: discriminant u128 LE,] node) in name-sorted (bytewise) order |
+//! | array     | 4 | len u32, stride u32, element node |
+//! | slot      | 5 | slot kind u32 + pointee node(s): vec/set/box/arc one element node, map key then value, string/blob none; pointee offsets frame-relative to the element |
+//! | unit      | 6 | — (header size 0, align 1 by rule) |
+//! | backref   | 7 | distance u32 (header offset = the slot's own origin; size and align = the referenced frame's, by rule) |
 //!
+//! Each node starts with its kind u32, then offset, size and align u32.
 //! The grammar text (§12) pins struct's field count but leaves the enum
 //! variant count implicit; without a count the encoding would not be
 //! injective (a variant list could alias a following sibling), so the
@@ -23,27 +27,17 @@
 
 use crate::native::{LayoutHashError, ScalarKind};
 use crate::wire::{SlotKind, WireEnumForm, WireField, WireNode, WireVariant};
+use distill_core::hash::{digest_bytes, Domain};
 use distill_core::id::LayoutHash;
-use std::borrow::Cow;
 use std::collections::BTreeSet;
-use unicode_normalization::{is_nfc, UnicodeNormalization};
 
-/// DSWL grammar version.
-pub const DSWL_VERSION: u8 = 1;
-
-pub(crate) fn nfc_of(value: &str) -> Cow<'_, str> {
-    if is_nfc(value) {
-        Cow::Borrowed(value)
-    } else {
-        Cow::Owned(value.nfc().collect())
-    }
-}
+/// DSWL grammar version: the [`Domain::Layout`] digest version.
+pub const DSWL_VERSION: u32 = 2;
 
 fn put_str(out: &mut Vec<u8>, value: &str) -> Result<(), LayoutHashError> {
-    let nfc = nfc_of(value);
-    let length = u32::try_from(nfc.len()).map_err(|_| LayoutHashError::NameTooLong)?;
+    let length = u32::try_from(value.len()).map_err(|_| LayoutHashError::NameTooLong)?;
     out.extend_from_slice(&length.to_le_bytes());
-    out.extend_from_slice(nfc.as_bytes());
+    out.extend_from_slice(value.as_bytes());
     Ok(())
 }
 
@@ -55,14 +49,10 @@ pub fn dswl_bytes(root: &WireNode) -> Result<Vec<u8>, LayoutHashError> {
     Ok(out)
 }
 
-/// `blake3("DSWL" ‖ version:u8 ‖ root)` — the layout hash (§12).
+/// `digest(Domain::Layout, DSWL_VERSION, root)` — the layout hash (§12).
 pub fn dswl_hash(root: &WireNode) -> Result<LayoutHash, LayoutHashError> {
     let body = dswl_bytes(root)?;
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"DSWL");
-    hasher.update(&[DSWL_VERSION]);
-    hasher.update(&body);
-    Ok(LayoutHash(*hasher.finalize().as_bytes()))
+    Ok(LayoutHash(digest_bytes(Domain::Layout, DSWL_VERSION, &body)))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,13 +60,12 @@ pub enum DswlDecodeError {
     Truncated,
     TrailingBytes,
     Utf8,
-    NonNfc,
     DuplicateName,
     NamesNotSorted,
-    UnknownNode(u8),
-    UnknownScalar(u8),
-    UnknownSlot(u8),
-    UnknownEnumForm(u8),
+    UnknownNode(u32),
+    UnknownScalar(u32),
+    UnknownSlot(u32),
+    UnknownEnumForm(u32),
     InvalidGeometry,
     InvalidEnum,
     DuplicateDiscriminant,
@@ -140,9 +129,6 @@ impl Decoder<'_> {
     fn string(&mut self) -> Result<String, DswlDecodeError> {
         let len = usize::try_from(self.u32()?).map_err(|_| DswlDecodeError::Truncated)?;
         let value = std::str::from_utf8(self.take(len)?).map_err(|_| DswlDecodeError::Utf8)?;
-        if !is_nfc(value) {
-            return Err(DswlDecodeError::NonNfc);
-        }
         Ok(value.to_owned())
     }
 
@@ -154,7 +140,7 @@ impl Decoder<'_> {
         if self.nodes > 1_000_000 {
             return Err(DswlDecodeError::NodeLimitExceeded);
         }
-        let kind = self.u8()?;
+        let kind = self.u32()?;
         let offset = self.u32()?;
         let size = self.u32()?;
         let align = self.u32()?;
@@ -166,7 +152,7 @@ impl Decoder<'_> {
                 offset,
                 size,
                 align,
-                kind: scalar(self.u8()?)?,
+                kind: scalar(self.u32()?)?,
             }),
             0x02 => {
                 let count = self.u32()?;
@@ -199,7 +185,7 @@ impl Decoder<'_> {
                 })
             }
             0x03 => {
-                let form = match self.u8()? {
+                let form = match self.u32()? {
                     0x00 => WireEnumForm::Single,
                     0x01 => WireEnumForm::FullyFlat {
                         tag_offset: self.u32()?,
@@ -261,7 +247,7 @@ impl Decoder<'_> {
                 })
             }
             0x05 => {
-                let slot = slot(self.u8()?)?;
+                let slot = slot(self.u32()?)?;
                 let pointee_count = match slot {
                     SlotKind::String | SlotKind::Blob => 0,
                     SlotKind::Map => 2,
@@ -344,7 +330,7 @@ fn validate_enum(
     }
 }
 
-fn scalar(id: u8) -> Result<ScalarKind, DswlDecodeError> {
+fn scalar(id: u32) -> Result<ScalarKind, DswlDecodeError> {
     Ok(match id {
         0x00 => ScalarKind::Bool,
         0x01 => ScalarKind::Char,
@@ -364,7 +350,7 @@ fn scalar(id: u8) -> Result<ScalarKind, DswlDecodeError> {
     })
 }
 
-fn slot(id: u8) -> Result<SlotKind, DswlDecodeError> {
+fn slot(id: u32) -> Result<SlotKind, DswlDecodeError> {
     Ok(match id {
         0x00 => SlotKind::Vec,
         0x01 => SlotKind::String,
@@ -377,8 +363,8 @@ fn slot(id: u8) -> Result<SlotKind, DswlDecodeError> {
     })
 }
 
-fn header(out: &mut Vec<u8>, kind: u8, offset: u32, size: u32, align: u32) {
-    out.push(kind);
+fn header(out: &mut Vec<u8>, kind: u32, offset: u32, size: u32, align: u32) {
+    out.extend_from_slice(&kind.to_le_bytes());
     out.extend_from_slice(&offset.to_le_bytes());
     out.extend_from_slice(&size.to_le_bytes());
     out.extend_from_slice(&align.to_le_bytes());
@@ -397,7 +383,7 @@ fn encode(
             kind,
         } => {
             header(out, 0x01, *offset, *size, *align);
-            out.push(kind.grammar_id());
+            out.extend_from_slice(&kind.grammar_id().to_le_bytes());
         }
         WireNode::Struct {
             offset,
@@ -425,24 +411,24 @@ fn encode(
         } => {
             header(out, 0x03, *offset, *size, *align);
             match form {
-                WireEnumForm::Single => out.push(0x00),
+                WireEnumForm::Single => out.extend_from_slice(&0u32.to_le_bytes()),
                 WireEnumForm::FullyFlat {
                     tag_offset,
                     tag_size,
                 } => {
-                    out.push(0x01);
+                    out.extend_from_slice(&1u32.to_le_bytes());
                     out.extend_from_slice(&tag_offset.to_le_bytes());
                     out.push(*tag_size);
                 }
-                WireEnumForm::Canonical => out.push(0x02),
+                WireEnumForm::Canonical => out.extend_from_slice(&2u32.to_le_bytes()),
             }
-            // Name-sorted by NFC bytes (§5's order); a duplicate name has
+            // Name-sorted bytewise (§5's order); a duplicate name has
             // no canonical order and is an error.
-            let mut sorted: Vec<_> = variants.iter().map(|v| (nfc_of(&v.name), v)).collect();
+            let mut sorted: Vec<_> = variants.iter().map(|v| (v.name.as_str(), v)).collect();
             sorted.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
             for w in sorted.windows(2) {
                 if w[0].0 == w[1].0 {
-                    return Err(LayoutHashError::DuplicateName(w[0].0.clone().into_owned()));
+                    return Err(LayoutHashError::DuplicateName(w[0].0.to_owned()));
                 }
             }
             out.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
@@ -479,7 +465,7 @@ fn encode(
             pointee,
         } => {
             header(out, 0x05, *offset, *size, *align);
-            out.push(kind.grammar_id());
+            out.extend_from_slice(&kind.grammar_id().to_le_bytes());
             for p in pointee {
                 encode(p, out, frames)?;
             }

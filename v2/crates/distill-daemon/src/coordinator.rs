@@ -357,7 +357,7 @@ impl DaemonCoordinator {
     /// Test hook: the content hash of the module the Ready pipeline epoch
     /// loaded, if one is Ready.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn ready_dylib_hash(&self) -> Option<[u8; 32]> {
+    pub fn ready_dylib_hash(&self) -> Option<[u8; 16]> {
         lock_pipeline(&self.pipeline)
             .host
             .published_ready_epoch()
@@ -379,7 +379,7 @@ impl DaemonCoordinator {
     pub(crate) fn ready_pipeline_serves(
         &self,
         candidate: &ProjectSchemaAuthority,
-        dylib_hash: [u8; 32],
+        dylib_hash: [u8; 16],
     ) -> bool {
         let Some(installed) = self
             .compiled
@@ -1169,7 +1169,7 @@ mod cas_pass_tests {
                 reads: Vec::new(),
                 wire_trees: Vec::new(),
                 key_kind: KeyKind::Processor,
-                static_input_key: [key; 32],
+                static_input_key: [key; 16],
                 asset_uuid: AssetUuid([7; 16]),
                 trace: vec![key],
                 outcome: CommitOutcome::Success {
@@ -3816,7 +3816,7 @@ mod publish_diff_tests {
                             root: roots[random.next(2) as usize],
                             path: path(index),
                             format_version: 1,
-                            content_hash: ContentHash([0; 32]),
+                            content_hash: ContentHash([0; 16]),
                             origin: None,
                             import_watched: false,
                         })?;
@@ -3827,7 +3827,7 @@ mod publish_diff_tests {
                                 bundle: bundle(index),
                                 local_id: format!("e{entry}"),
                                 type_uuid: TypeUuid([1; 16]),
-                                logical_hash: LogicalHash([1; 32]),
+                                logical_hash: LogicalHash([1; 16]),
                                 authoring_only: false,
                                 tags: BTreeMap::new(),
                                 terminal_type: None,
@@ -3953,7 +3953,7 @@ mod projection_tests {
             .collect();
         PipelineProjection::build(
             descriptors,
-            [9; 32],
+            [9; 16],
             &BTreeMap::from([("dev".to_owned(), target)]),
             [SOURCE],
         )

@@ -1,4 +1,5 @@
-use distill_core::canonical::{CanonicalEncoder, DSVP};
+use distill_core::encoding::Encoder;
+use distill_core::hash::{digest_prefix, Domain};
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid};
 use distill_store::state::{
     AssetClaimant, NamespaceError, NamespaceErrorCode, NamespaceErrorDecodeError, NamespaceErrorV1,
@@ -10,7 +11,7 @@ fn source(root: &str, path: &str, byte: u8) -> ReadableBundleSource {
     ReadableBundleSource {
         root_name: root.into(),
         normalized_path: path.into(),
-        file_hash: BundleFileHash([byte; 32]),
+        file_hash: BundleFileHash([byte; 16]),
     }
 }
 
@@ -36,24 +37,23 @@ fn namespace_error_identity_pins_dsvp_v1_and_excludes_message() {
     assert_eq!(first.code, NamespaceErrorCode::DuplicateAssetUuid);
     assert_eq!(first.identity, second.identity);
 
-    let mut expected = CanonicalEncoder::new();
-    expected.raw(&DSVP);
-    expected.u8(1);
-    expected.u16(NamespaceErrorCode::DuplicateAssetUuid as u16);
+    let mut expected = Encoder::new();
+    expected.raw(&digest_prefix(Domain::NamespaceError, 1));
+    expected.enum_variant(NamespaceErrorCode::DuplicateAssetUuid as u32);
     expected.raw(&[3; 16]);
     expected.u32(2);
-    expected.u8(1); // AssetClaimant::Authored
+    expected.enum_variant(1); // AssetClaimant::Authored
     expected.str("main");
     expected.str("a.bundle");
-    expected.raw(&[1; 32]);
+    expected.raw(&[1; 16]);
     expected.raw(&[4; 16]);
     expected.str("entry");
-    expected.u8(2); // AssetClaimant::Derived
+    expected.enum_variant(2); // AssetClaimant::Derived
     expected.raw(&[5; 16]);
     expected.str("extra");
     assert_eq!(
         first.identity,
-        *blake3::hash(&expected.into_bytes()).as_bytes()
+        distill_core::hash::hash(&expected.into_bytes())
     );
     let encoded = first.persisted_bytes().unwrap();
     assert_eq!(
@@ -95,11 +95,11 @@ fn same_root_path_collision_retains_lossless_distinct_physical_names() {
             claims: vec![
                 PhysicalPathClaim {
                     raw_relative_path: PlatformPathBytes::Unix(b"cafe\xcc\x81.bundle".to_vec()),
-                    file_hash: BundleFileHash([1; 32]),
+                    file_hash: BundleFileHash([1; 16]),
                 },
                 PhysicalPathClaim {
                     raw_relative_path: PlatformPathBytes::Unix(b"caf\xc3\xa9.bundle".to_vec()),
-                    file_hash: BundleFileHash([2; 32]),
+                    file_hash: BundleFileHash([2; 16]),
                 },
             ],
         },
@@ -144,18 +144,17 @@ fn invalid_physical_path_retains_raw_bytes_and_fixed_failure_code() {
         error
     );
 
-    let mut expected_identity = CanonicalEncoder::new();
-    expected_identity.raw(&DSVP);
-    expected_identity.u8(1);
-    expected_identity.u16(6);
+    let mut expected_identity = Encoder::new();
+    expected_identity.raw(&digest_prefix(Domain::NamespaceError, 1));
+    expected_identity.enum_variant(6);
     expected_identity.str("main");
-    expected_identity.u8(1); // Unix
+    expected_identity.enum_variant(1); // Unix
     expected_identity.u32(2);
     expected_identity.raw(&[b'b', 0xff]);
-    expected_identity.u16(1); // InvalidUnixUtf8
+    expected_identity.enum_variant(1); // InvalidUnixUtf8
     assert_eq!(
         error.identity,
-        *blake3::hash(&expected_identity.into_bytes()).as_bytes()
+        distill_core::hash::hash(&expected_identity.into_bytes())
     );
 }
 
@@ -229,15 +228,14 @@ fn canonical_winner_is_independent_of_discovery_order() {
 
 #[test]
 fn invalid_physical_path_rejects_unknown_failure_code() {
-    let mut encoded = CanonicalEncoder::new();
-    encoded.raw(&DSVP);
-    encoded.u8(1);
-    encoded.u16(NamespaceErrorCode::InvalidPhysicalPath as u16);
+    let mut encoded = Encoder::new();
+    encoded.raw(&digest_prefix(Domain::NamespaceError, 1));
+    encoded.enum_variant(NamespaceErrorCode::InvalidPhysicalPath as u32);
     encoded.str("main");
-    encoded.u8(1); // Unix
+    encoded.enum_variant(1); // Unix
     encoded.u32(1);
     encoded.raw(b"x");
-    encoded.u16(8); // not a PhysicalPathFailureCode
+    encoded.enum_variant(8); // not a PhysicalPathFailureCode
     encoded.str("diagnostic");
     assert_eq!(
         NamespaceError::from_persisted_bytes(&encoded.into_bytes()).unwrap_err(),
@@ -361,16 +359,15 @@ fn unreadable_scan_subtree_pins_closed_subject_and_failure_encodings() {
         "cannot enumerate root",
     )
     .unwrap();
-    let mut expected = CanonicalEncoder::new();
-    expected.raw(&DSVP);
-    expected.u8(1);
-    expected.u16(7);
-    expected.u8(1); // ScanSubject::Root
+    let mut expected = Encoder::new();
+    expected.raw(&digest_prefix(Domain::NamespaceError, 1));
+    expected.enum_variant(7);
+    expected.enum_variant(1); // ScanSubject::Root
     expected.str("main");
-    expected.u16(1); // PermissionDenied
+    expected.enum_variant(1); // PermissionDenied
     assert_eq!(
         root.identity,
-        *blake3::hash(&expected.into_bytes()).as_bytes()
+        distill_core::hash::hash(&expected.into_bytes())
     );
 
     let failures = [
@@ -416,23 +413,21 @@ fn unreadable_scan_subtree_pins_closed_subject_and_failure_encodings() {
 
 #[test]
 fn unreadable_scan_subtree_rejects_open_tags_and_failure_codes() {
-    let mut unknown_subject = CanonicalEncoder::new();
-    unknown_subject.raw(&DSVP);
-    unknown_subject.u8(1);
-    unknown_subject.u16(NamespaceErrorCode::UnreadableScanSubtree as u16);
-    unknown_subject.u8(3);
+    let mut unknown_subject = Encoder::new();
+    unknown_subject.raw(&digest_prefix(Domain::NamespaceError, 1));
+    unknown_subject.enum_variant(NamespaceErrorCode::UnreadableScanSubtree as u32);
+    unknown_subject.enum_variant(3);
     assert_eq!(
         NamespaceError::from_persisted_bytes(&unknown_subject.into_bytes()).unwrap_err(),
         NamespaceErrorDecodeError::UnknownScanSubjectTag(3)
     );
 
-    let mut unknown_failure = CanonicalEncoder::new();
-    unknown_failure.raw(&DSVP);
-    unknown_failure.u8(1);
-    unknown_failure.u16(NamespaceErrorCode::UnreadableScanSubtree as u16);
-    unknown_failure.u8(1);
+    let mut unknown_failure = Encoder::new();
+    unknown_failure.raw(&digest_prefix(Domain::NamespaceError, 1));
+    unknown_failure.enum_variant(NamespaceErrorCode::UnreadableScanSubtree as u32);
+    unknown_failure.enum_variant(1);
     unknown_failure.str("main");
-    unknown_failure.u16(6);
+    unknown_failure.enum_variant(6);
     unknown_failure.str("diagnostic");
     assert_eq!(
         NamespaceError::from_persisted_bytes(&unknown_failure.into_bytes()).unwrap_err(),

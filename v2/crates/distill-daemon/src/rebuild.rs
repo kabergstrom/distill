@@ -133,7 +133,7 @@ struct JobState {
     /// Where cargo writes; nothing under it is an input.
     target_dir: Option<PathBuf>,
     /// Each input's content as of the job's last start (`None`: missing).
-    inputs: BTreeMap<PathBuf, Option<blake3::Hash>>,
+    inputs: BTreeMap<PathBuf, Option<distill_core::hash::Hash128>>,
 }
 
 impl JobState {
@@ -750,8 +750,8 @@ fn simplified(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-fn content_hash(path: &Path) -> Option<blake3::Hash> {
-    std::fs::read(path).ok().map(|bytes| blake3::hash(&bytes))
+fn content_hash(path: &Path) -> Option<distill_core::hash::Hash128> {
+    std::fs::read(path).ok().map(|bytes| distill_core::hash::hash(&bytes))
 }
 
 /// The prerequisites of every rule in a make-style dep-info file. Cargo

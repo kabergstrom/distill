@@ -29,7 +29,7 @@ fn namespace_error(message: &str) -> NamespaceError {
             source: ReadableBundleSource {
                 root_name: "main".into(),
                 normalized_path: "broken.bundle".into(),
-                file_hash: BundleFileHash([9; 32]),
+                file_hash: BundleFileHash([9; 16]),
             },
             failure: SkeletonFailureCode::IncompleteAssetIdentity,
         },
@@ -38,7 +38,7 @@ fn namespace_error(message: &str) -> NamespaceError {
     .unwrap()
 }
 
-fn success_commit(static_key: [u8; 32], trace: &[u8]) -> BuildCommit {
+fn success_commit(static_key: [u8; 16], trace: &[u8]) -> BuildCommit {
     BuildCommit {
         reads: Vec::new(),
         wire_trees: Vec::new(),
@@ -142,7 +142,7 @@ fn a_successful_commit_publishes_outputs_and_advances_only_the_memo_seq() {
     let input_version_before = store.input_version().unwrap();
 
     let receipt = store
-        .commit_build(success_commit([1u8; 32], b"trace"))
+        .commit_build(success_commit([1u8; 16], b"trace"))
         .unwrap();
     assert_eq!(receipt.memo_seq.0, 1);
     assert_eq!(store.memo_seq().unwrap().0, 1);
@@ -157,7 +157,7 @@ fn a_successful_commit_publishes_outputs_and_advances_only_the_memo_seq() {
     let primary = receipt.outputs.iter().find(|(k, _)| k.is_empty()).unwrap();
     assert_eq!(
         primary.1,
-        ContentHash(*blake3::hash(b"primary artifact bytes").as_bytes())
+        ContentHash(distill_core::hash::hash(b"primary artifact bytes"))
     );
 
     // Every output and aux payload reads back by content hash.
@@ -176,11 +176,11 @@ fn lookup_finds_the_committed_candidate() {
     let (_d, mut store) = store();
     declare_child(&mut store, PARENT, "normals");
     store
-        .commit_build(success_commit([1u8; 32], b"trace"))
+        .commit_build(success_commit([1u8; 16], b"trace"))
         .unwrap();
 
     let candidates = store
-        .lookup_candidates(KeyKind::Processor, &[1u8; 32])
+        .lookup_candidates(KeyKind::Processor, &[1u8; 16])
         .unwrap();
     assert_eq!(candidates.len(), 1);
     let c = &candidates[0];
@@ -197,11 +197,11 @@ fn lookup_finds_the_committed_candidate() {
 
     // A different key kind or key misses — the two key grammars never mix.
     assert!(store
-        .lookup_candidates(KeyKind::BuildImport, &[1u8; 32])
+        .lookup_candidates(KeyKind::BuildImport, &[1u8; 16])
         .unwrap()
         .is_empty());
     assert!(store
-        .lookup_candidates(KeyKind::Processor, &[2u8; 32])
+        .lookup_candidates(KeyKind::Processor, &[2u8; 16])
         .unwrap()
         .is_empty());
 }
@@ -214,14 +214,14 @@ fn commits_append_to_the_bucket_never_overwrite() {
     let (_d, mut store) = store();
     declare_child(&mut store, PARENT, "normals");
     store
-        .commit_build(success_commit([1u8; 32], b"trace-A"))
+        .commit_build(success_commit([1u8; 16], b"trace-A"))
         .unwrap();
     store
-        .commit_build(success_commit([1u8; 32], b"trace-B"))
+        .commit_build(success_commit([1u8; 16], b"trace-B"))
         .unwrap();
 
     let candidates = store
-        .lookup_candidates(KeyKind::Processor, &[1u8; 32])
+        .lookup_candidates(KeyKind::Processor, &[1u8; 16])
         .unwrap();
     assert_eq!(candidates.len(), 2, "the bucket holds both");
     assert_eq!(candidates[0].payload.trace, b"trace-B", "most recent first");
@@ -230,10 +230,10 @@ fn commits_append_to_the_bucket_never_overwrite() {
     // Recommitting an existing (key, trace) refreshes recency, never
     // duplicates.
     store
-        .commit_build(success_commit([1u8; 32], b"trace-A"))
+        .commit_build(success_commit([1u8; 16], b"trace-A"))
         .unwrap();
     let candidates = store
-        .lookup_candidates(KeyKind::Processor, &[1u8; 32])
+        .lookup_candidates(KeyKind::Processor, &[1u8; 16])
         .unwrap();
     assert_eq!(candidates.len(), 2);
     assert_eq!(
@@ -257,17 +257,17 @@ fn a_commit_naming_payloads_already_in_the_cas_appends_nothing() {
     };
     let before = segment_bytes();
     store
-        .commit_build(success_commit([1u8; 32], b"trace"))
+        .commit_build(success_commit([1u8; 16], b"trace"))
         .unwrap();
     let first = segment_bytes() - before;
     let before = segment_bytes();
-    let mut node = success_commit([2u8; 32], b"trace");
+    let mut node = success_commit([2u8; 16], b"trace");
     node.key_kind = KeyKind::Node;
     store.commit_build(node).unwrap();
     let appended = segment_bytes() - before;
     assert!(first > 0);
     assert_eq!(appended, 0, "a segment holds only the bytes");
-    let candidates = store.lookup_candidates(KeyKind::Node, &[2u8; 32]).unwrap();
+    let candidates = store.lookup_candidates(KeyKind::Node, &[2u8; 16]).unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].payload.key_kind, KeyKind::Node);
     let ResultOutcome::Success { outputs, .. } = &candidates[0].payload.outcome else {
@@ -281,8 +281,8 @@ fn a_commit_naming_payloads_already_in_the_cas_appends_nothing() {
 #[test]
 fn cas_read_of_an_unknown_hash_is_not_found() {
     let (_d, store) = store();
-    match store.cas_read(&[9u8; 32]) {
-        Err(StoreError::NotFound { hash }) => assert_eq!(hash, [9u8; 32]),
+    match store.cas_read(&[9u8; 16]) {
+        Err(StoreError::NotFound { hash }) => assert_eq!(hash, [9u8; 16]),
         other => panic!("expected NotFound, got {other:?}"),
     }
 }
@@ -294,7 +294,7 @@ fn corrupted_segment_bytes_fail_the_read() {
     let (dir, mut store) = store();
     declare_child(&mut store, PARENT, "normals");
     let receipt = store
-        .commit_build(success_commit([1u8; 32], b"trace"))
+        .commit_build(success_commit([1u8; 16], b"trace"))
         .unwrap();
     let hash = receipt.outputs[0].1;
 
@@ -321,7 +321,7 @@ fn corrupted_segment_bytes_fail_the_read() {
 #[test]
 fn build_import_results_carry_exactly_one_output_row() {
     let (_d, mut store) = store();
-    let mut commit = success_commit([2u8; 32], b"bi-trace");
+    let mut commit = success_commit([2u8; 16], b"bi-trace");
     commit.key_kind = KeyKind::BuildImport;
     // Two outputs: arity error.
     let err = store.commit_build(commit).unwrap_err();
@@ -335,7 +335,7 @@ fn build_import_results_carry_exactly_one_output_row() {
         reads: Vec::new(),
         wire_trees: Vec::new(),
         key_kind: KeyKind::BuildImport,
-        static_input_key: [2u8; 32],
+        static_input_key: [2u8; 16],
         asset_uuid: PARENT,
         trace: b"bi-trace".to_vec(),
         outcome: CommitOutcome::Success {
@@ -349,7 +349,7 @@ fn build_import_results_carry_exactly_one_output_row() {
     };
     store.commit_build(commit).unwrap();
     let candidates = store
-        .lookup_candidates(KeyKind::BuildImport, &[2u8; 32])
+        .lookup_candidates(KeyKind::BuildImport, &[2u8; 16])
         .unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].payload.trace, b"bi-trace");
@@ -367,7 +367,7 @@ fn failure_records_commit_index_and_carry_no_outputs() {
         reads: Vec::new(),
         wire_trees: Vec::new(),
         key_kind: KeyKind::Processor,
-        static_input_key: [3u8; 32],
+        static_input_key: [3u8; 16],
         asset_uuid: PARENT,
         trace: b"trace incl failing op".to_vec(),
         outcome: CommitOutcome::Failure {
@@ -379,7 +379,7 @@ fn failure_records_commit_index_and_carry_no_outputs() {
     assert!(receipt.aux.is_empty());
 
     let candidates = store
-        .lookup_candidates(KeyKind::Processor, &[3u8; 32])
+        .lookup_candidates(KeyKind::Processor, &[3u8; 16])
         .unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].payload.trace, b"trace incl failing op");
@@ -404,7 +404,7 @@ fn a_capability_miss_memoizes_with_its_requested_key() {
         reads: Vec::new(),
         wire_trees: Vec::new(),
         key_kind: KeyKind::Processor,
-        static_input_key: [4u8; 32],
+        static_input_key: [4u8; 16],
         asset_uuid: PARENT,
         // The trace ends in the TraceOp::Capability miss (§9); its bytes
         // are opaque to the store.
@@ -415,7 +415,7 @@ fn a_capability_miss_memoizes_with_its_requested_key() {
     };
     store.commit_build(commit).unwrap();
     let candidates = store
-        .lookup_candidates(KeyKind::Processor, &[4u8; 32])
+        .lookup_candidates(KeyKind::Processor, &[4u8; 16])
         .unwrap();
     assert_eq!(candidates.len(), 1);
     match &candidates[0].payload.outcome {
@@ -435,19 +435,19 @@ fn a_deterministic_local_failure_memoizes_with_an_empty_trace() {
         reads: Vec::new(),
         wire_trees: Vec::new(),
         key_kind: KeyKind::Processor,
-        static_input_key: [5u8; 32],
+        static_input_key: [5u8; 16],
         asset_uuid: PARENT,
         trace: Vec::new(),
         outcome: CommitOutcome::Failure {
             cause: FailureCause::Local(FailureFingerprint::Local {
                 class: LocalFailureClass::Validator,
-                detail: *blake3::hash(b"normal map length != 1").as_bytes(),
+                detail: distill_core::hash::hash(b"normal map length != 1"),
             }),
         },
     };
     store.commit_build(commit).unwrap();
     let candidates = store
-        .lookup_candidates(KeyKind::Processor, &[5u8; 32])
+        .lookup_candidates(KeyKind::Processor, &[5u8; 16])
         .unwrap();
     assert_eq!(candidates.len(), 1);
     assert!(candidates[0].payload.trace.is_empty());
@@ -492,7 +492,7 @@ fn the_namespace_is_the_only_authority_for_child_resolution() {
     let (_d, mut store) = store();
     let child = declare_child(&mut store, PARENT, "normals");
     store
-        .commit_build(success_commit([1u8; 32], b"trace"))
+        .commit_build(success_commit([1u8; 16], b"trace"))
         .unwrap();
     assert!(store.resolve_child(child).unwrap().is_some());
 
@@ -540,7 +540,7 @@ fn segments_roll_at_the_size_cap() {
             reads: Vec::new(),
             wire_trees: Vec::new(),
             key_kind: KeyKind::Processor,
-            static_input_key: [i; 32],
+            static_input_key: [i; 16],
             asset_uuid: PARENT,
             trace: vec![i],
             outcome: CommitOutcome::Success {
@@ -569,7 +569,7 @@ fn segments_roll_at_the_size_cap() {
 
     // Everything still reads.
     for i in 0..4u8 {
-        let hash = *blake3::hash(&vec![i; 400]).as_bytes();
+        let hash = distill_core::hash::hash(&vec![i; 400]);
         assert_eq!(store.cas_read(&hash).unwrap(), vec![i; 400]);
     }
 }
@@ -597,7 +597,7 @@ fn a_record_larger_than_the_cap_gets_one_typed_dedicated_oversize_segment() {
             reads: Vec::new(),
             wire_trees: Vec::new(),
             key_kind: KeyKind::Processor,
-            static_input_key: [0x33; 32],
+            static_input_key: [0x33; 16],
             asset_uuid: PARENT,
             trace: b"oversize".to_vec(),
             outcome: CommitOutcome::Success {
@@ -631,7 +631,7 @@ fn a_record_larger_than_the_cap_gets_one_typed_dedicated_oversize_segment() {
     assert_eq!(recovery, distill_store::cas::RecoveryReport::default());
     assert_eq!(
         reopened
-            .lookup_candidates(KeyKind::Processor, &[0x33; 32])
+            .lookup_candidates(KeyKind::Processor, &[0x33; 16])
             .unwrap()
             .len(),
         1
@@ -648,7 +648,7 @@ fn commits_survive_reopen() {
     let config = StoreConfig::new(dir.path().join(".distill"));
     let mut store = Store::open(config.clone()).unwrap();
     let receipt = store
-        .commit_build(success_commit([1u8; 32], b"trace"))
+        .commit_build(success_commit([1u8; 16], b"trace"))
         .unwrap();
     let hash = receipt.outputs[0].1;
     drop(store);
@@ -656,7 +656,7 @@ fn commits_survive_reopen() {
     let store = Store::open(config).unwrap();
     assert_eq!(store.cas_read(&hash.0).unwrap(), b"primary artifact bytes");
     let candidates = store
-        .lookup_candidates(KeyKind::Processor, &[1u8; 32])
+        .lookup_candidates(KeyKind::Processor, &[1u8; 16])
         .unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(store.memo_seq().unwrap().0, 1, "memo counter persisted");

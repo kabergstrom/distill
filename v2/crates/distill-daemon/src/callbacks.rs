@@ -98,7 +98,7 @@ impl AuthoringImportContext for ContainedImportContext<'_> {
     fn importer_capability(
         &mut self,
         id: &str,
-    ) -> Result<[u8; 32], distill_build::import::ImportError> {
+    ) -> Result<[u8; 16], distill_build::import::ImportError> {
         if self.panicked.get() {
             return Err(self.failure());
         }

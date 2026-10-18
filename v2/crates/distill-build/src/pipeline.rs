@@ -17,7 +17,7 @@ pub struct ProcessorRegistration {
     pub input: TypeUuid,
     pub selector: TargetSelector,
     pub outputs: OutputDecls,
-    pub dylib_hash: [u8; 32],
+    pub dylib_hash: [u8; 16],
 }
 
 impl ProcessorRegistration {
@@ -27,7 +27,7 @@ impl ProcessorRegistration {
         input: TypeUuid,
         selector: TargetSelector,
         outputs: OutputDecls,
-        dylib_hash: [u8; 32],
+        dylib_hash: [u8; 16],
     ) -> Result<Self, PipelineError> {
         Ok(Self {
             id: normalize_identifier(id).map_err(PipelineError::InvalidId)?,

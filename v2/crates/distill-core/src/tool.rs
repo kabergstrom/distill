@@ -5,14 +5,15 @@ use std::path::Path;
 
 use unicode_normalization::is_nfc;
 
-use crate::canonical::{domain_digest, CanonicalEncoder, DSCT};
+use crate::encoding::Encoder;
+use crate::hash::{digest, Domain, Hash128};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolPackageFile {
     pub path: String,
     pub executable: bool,
     pub len: u64,
-    pub bytes_hash: [u8; 32],
+    pub bytes_hash: Hash128,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,7 +25,7 @@ pub enum ToolSourceIdentityV2 {
     Ambient {
         launcher: String,
         toolchain_id: String,
-        trusted_fingerprint: Option<[u8; 32]>,
+        trusted_fingerprint: Option<Hash128>,
     },
 }
 
@@ -45,8 +46,8 @@ pub struct ToolExecutionIdentityV2 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolIdentityError {
     UnsupportedVersion(u8),
-    UnknownSource(u8),
-    UnknownCwdPolicy(u8),
+    UnknownSource(u32),
+    UnknownCwdPolicy(u32),
     InvalidBool(u8),
     InvalidUtf8,
     NonCanonicalText,
@@ -72,7 +73,7 @@ impl fmt::Display for ToolIdentityError {
 impl std::error::Error for ToolIdentityError {}
 
 impl ToolExecutionIdentityV2 {
-    pub const RECORD_VERSION: u8 = 2;
+    pub const RECORD_VERSION: u8 = 3;
 
     pub fn validate(&self) -> Result<(), ToolIdentityError> {
         if u32::try_from(self.environment.len()).is_err()
@@ -182,9 +183,9 @@ impl ToolExecutionIdentityV2 {
         }
     }
 
-    pub fn digest(&self) -> Result<[u8; 32], ToolIdentityError> {
+    pub fn digest(&self) -> Result<Hash128, ToolIdentityError> {
         self.validate()?;
-        Ok(domain_digest(DSCT, Self::RECORD_VERSION, |encoder| {
+        Ok(digest(Domain::ToolCapsule, u32::from(Self::RECORD_VERSION), |encoder| {
             self.encode_fields(encoder)
         }))
     }
@@ -192,7 +193,7 @@ impl ToolExecutionIdentityV2 {
     pub fn encode_record(&self) -> Result<Vec<u8>, ToolIdentityError> {
         self.validate()?;
         let mut bytes = vec![Self::RECORD_VERSION];
-        let mut encoder = CanonicalEncoder::new();
+        let mut encoder = Encoder::new();
         self.encode_fields(&mut encoder);
         bytes.extend_from_slice(&encoder.into_bytes());
         Ok(bytes)
@@ -204,7 +205,7 @@ impl ToolExecutionIdentityV2 {
         if version != Self::RECORD_VERSION {
             return Err(ToolIdentityError::UnsupportedVersion(version));
         }
-        let source = match reader.u8()? {
+        let source = match reader.u32()? {
             1 => ToolSourceIdentityV2::Package {
                 launcher: reader.string()?,
                 files: reader.seq(|reader| {
@@ -224,7 +225,7 @@ impl ToolExecutionIdentityV2 {
             value => return Err(ToolIdentityError::UnknownSource(value)),
         };
         let environment = reader.seq(|reader| Ok((reader.string()?, reader.string()?)))?;
-        let cwd_policy = match reader.u8()? {
+        let cwd_policy = match reader.u32()? {
             1 => ToolCwdPolicy::EmptyScratch,
             2 => ToolCwdPolicy::ReadOnlyPackageRoot,
             3 => ToolCwdPolicy::ReadOnlyPackageSubdir(reader.string()?),
@@ -242,7 +243,7 @@ impl ToolExecutionIdentityV2 {
         Ok(identity)
     }
 
-    fn encode_fields(&self, encoder: &mut CanonicalEncoder) {
+    fn encode_fields(&self, encoder: &mut Encoder) {
         match &self.source {
             ToolSourceIdentityV2::Package { launcher, files } => {
                 encoder.enum_variant(1);

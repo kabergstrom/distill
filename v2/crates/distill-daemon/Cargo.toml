@@ -14,7 +14,6 @@ path = "src/bin/distill-daemon.rs"
 serde_json = "1"
 tracing.workspace = true
 tracing-subscriber.workspace = true
-blake3 = { workspace = true }
 distill-asset = { path = "../distill-asset" }
 distill-bundle = { path = "../distill-bundle" }
 distill-build = { path = "../distill-build" }

@@ -24,7 +24,7 @@ pub struct GeneratedFile {
 impl GeneratedFile {
     pub fn new(asset: AssetUuid, bytes: Vec<u8>) -> Self {
         let relative_path = format!("{}.rs", generated_module_name(asset));
-        let content_hash = ContentHash(*blake3::hash(&bytes).as_bytes());
+        let content_hash = ContentHash(distill_core::hash::hash(&bytes));
         Self {
             asset,
             relative_path,

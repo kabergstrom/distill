@@ -173,7 +173,7 @@ pub struct DirectoryImportFailure {
     pub destination_path: String,
     /// Digest of what the attempt ran (importer, sources, settings,
     /// output): a task that digests otherwise runs again.
-    pub task: [u8; 32],
+    pub task: [u8; 16],
     pub attempted_input_version: InputVersion,
     pub basis: Vec<u8>,
     /// What `basis` reads, for finding the failures a change may heal.

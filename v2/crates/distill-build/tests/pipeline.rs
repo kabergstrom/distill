@@ -27,7 +27,7 @@ fn reg(id: &str, input: u8, output: u8, selector: TargetSelector) -> ProcessorRe
         ty(input),
         selector,
         OutputDecls::new(ty(output), vec![]).unwrap(),
-        [id.as_bytes()[0]; 32],
+        [id.as_bytes()[0]; 16],
     )
     .unwrap()
 }

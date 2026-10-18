@@ -18,7 +18,6 @@
 //! - Variant payload nodes' own `whole_drop` annotations are ignored: a
 //!   variant payload is not a standalone value; the enum's glue covers it.
 
-use crate::dswl::nfc_of;
 use crate::native::{
     CtorId, DropId, NativeLayoutNode, NativeTagEncoding, NativeVariantTag, ScalarKind,
     SkipDefaultId,
@@ -734,7 +733,7 @@ impl<'w, 'n> Compiler<'w, 'n> {
         let mut by_name: HashMap<String, &'w crate::wire::WireField> = HashMap::new();
         for field in wf.iter() {
             if by_name
-                .insert(nfc_of(&field.name).into_owned(), field)
+                .insert(field.name.clone(), field)
                 .is_some()
             {
                 return Err(mismatch(format!("duplicate wire field {:?}", field.name)));
@@ -754,7 +753,7 @@ impl<'w, 'n> Compiler<'w, 'n> {
                 });
                 continue;
             }
-            let key = nfc_of(field.name).into_owned();
+            let key = field.name.to_owned();
             let wire_field = by_name.get(key.as_str()).ok_or_else(|| {
                 mismatch(format!("native field {:?} missing on the wire", field.name))
             })?;
@@ -784,8 +783,8 @@ impl<'w, 'n> Compiler<'w, 'n> {
         if matched != wf.len() {
             let native_names: Vec<&str> = nf.iter().map(|f| f.name).collect();
             for field in wf.iter() {
-                let key = nfc_of(&field.name);
-                if !nf.iter().any(|f| nfc_of(f.name) == key) {
+                let key = field.name.as_str();
+                if !nf.iter().any(|f| f.name == key) {
                     return Err(mismatch(format!(
                         "wire field {:?} missing natively (native fields: {native_names:?})",
                         field.name
@@ -829,7 +828,7 @@ impl<'w, 'n> Compiler<'w, 'n> {
                     nv.len()
                 )));
             }
-            if nfc_of(&wv[0].name) != nfc_of(nv[0].name) {
+            if wv[0].name != nv[0].name {
                 return Err(mismatch(format!(
                     "variant name {:?} vs {:?}",
                     wv[0].name, nv[0].name
@@ -858,12 +857,12 @@ impl<'w, 'n> Compiler<'w, 'n> {
         // Name-sorted pairing (§5's order).
         let mut ws: Vec<_> = wv
             .iter()
-            .map(|v| (nfc_of(&v.name).into_owned(), v))
+            .map(|v| (v.name.clone(), v))
             .collect();
         ws.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
         let mut ns: Vec<_> = nv
             .iter()
-            .map(|v| (nfc_of(v.name).into_owned(), v))
+            .map(|v| (v.name.to_owned(), v))
             .collect();
         ns.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
         if ws.len() != ns.len() {
@@ -974,7 +973,7 @@ impl<'w, 'n> Compiler<'w, 'n> {
 
         let mut variants = wire_variants
             .iter()
-            .map(|variant| (nfc_of(&variant.name).into_owned(), variant))
+            .map(|variant| (variant.name.clone(), variant))
             .collect::<Vec<_>>();
         variants.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
         if variants.len() != 2 || variants[0].0 != "None" || variants[1].0 != "Some" {
@@ -1020,7 +1019,7 @@ fn option_some_payload(node: &WireNode) -> Result<(&WireNode, u32), PlanError> {
     match node {
         WireNode::Struct { offset, fields, .. } if fields.len() == 1 => {
             let field = &fields[0];
-            if nfc_of(&field.name) != "0" {
+            if field.name != "0" {
                 return Err(mismatch("Option::Some payload field is not tuple field 0"));
             }
             Ok((

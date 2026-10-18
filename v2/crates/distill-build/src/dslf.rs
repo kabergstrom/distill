@@ -3,7 +3,9 @@
 //! Presentation text is deliberately absent.  Every memoizable producer has
 //! one typed arm whose required fields are encoded in a pinned order.
 
-use distill_core::canonical::{domain_digest, CanonicalEncoder, DSLF};
+use distill_core::hash::digest;
+use distill_core::encoding::Encoder;
+use distill_core::hash::Domain;
 use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
 use distill_migrate::FieldPath;
 
@@ -236,10 +238,10 @@ impl DslfV1 {
         }
     }
 
-    pub fn digest(&self) -> Result<[u8; 32], DslfError> {
+    pub fn digest(&self) -> Result<[u8; 16], DslfError> {
         self.validate()?;
-        Ok(domain_digest(DSLF, 1, |encoder| {
-            encoder.u16(self.class() as u16);
+        Ok(digest(Domain::LocalFailure, 1, |encoder| {
+            encoder.enum_variant(self.class() as u32);
             self.encode_fields(encoder);
         }))
     }
@@ -257,7 +259,7 @@ impl DslfV1 {
         Ok(())
     }
 
-    fn encode_fields(&self, e: &mut CanonicalEncoder) {
+    fn encode_fields(&self, e: &mut Encoder) {
         match self {
             Self::Validator {
                 asset,
@@ -357,12 +359,12 @@ impl DslfV1 {
 }
 
 fn canonical_path_bytes(path: &FieldPath) -> Vec<u8> {
-    let mut e = CanonicalEncoder::new();
+    let mut e = Encoder::new();
     encode_path(&mut e, path);
     e.into_bytes()
 }
 
-fn encode_path(e: &mut CanonicalEncoder, path: &FieldPath) {
+fn encode_path(e: &mut Encoder, path: &FieldPath) {
     e.seq(&path.0, |e, segment| e.str(segment));
 }
 
@@ -373,7 +375,7 @@ fn sorted_unique_assets(entries: &[AssetUuid]) -> Vec<AssetUuid> {
     entries
 }
 
-fn encode_migration_plan_failure(e: &mut CanonicalEncoder, failure: &MigrationPlanFailureV1) {
+fn encode_migration_plan_failure(e: &mut Encoder, failure: &MigrationPlanFailureV1) {
     match failure {
         MigrationPlanFailureV1::MissingPath { path } => tagged_path(e, 1, path),
         MigrationPlanFailureV1::UnwrittenDestination { path } => tagged_path(e, 2, path),
@@ -383,31 +385,31 @@ fn encode_migration_plan_failure(e: &mut CanonicalEncoder, failure: &MigrationPl
             expected_revision,
             observed_revision,
         } => {
-            e.u16(4);
+            e.enum_variant(4);
             encode_path(e, path);
             e.u32(*expected_revision);
             e.u32(*observed_revision);
         }
         MigrationPlanFailureV1::AmbiguousEdge { conflicting_edges } => {
-            e.u16(5);
+            e.enum_variant(5);
             e.seq(&sorted_unique_assets(conflicting_edges), |e, id| {
                 e.raw(&id.0)
             });
         }
         MigrationPlanFailureV1::Cycle { cycle_edges } => {
-            e.u16(6);
+            e.enum_variant(6);
             e.seq(&sorted_unique_assets(cycle_edges), |e, id| e.raw(&id.0));
         }
         MigrationPlanFailureV1::MissingReverseEdge {
             missing_from,
             missing_to,
         } => {
-            e.u16(7);
+            e.enum_variant(7);
             e.raw(&missing_from.0);
             e.raw(&missing_to.0);
         }
         MigrationPlanFailureV1::NonConformingOutput { edge, path } => {
-            e.u16(8);
+            e.enum_variant(8);
             e.raw(&edge.0);
             encode_path(e, path);
         }
@@ -417,33 +419,33 @@ fn encode_migration_plan_failure(e: &mut CanonicalEncoder, failure: &MigrationPl
     }
 }
 
-fn tagged_path(e: &mut CanonicalEncoder, tag: u16, path: &FieldPath) {
-    e.u16(tag);
+fn tagged_path(e: &mut Encoder, tag: u32, path: &FieldPath) {
+    e.enum_variant(tag);
     encode_path(e, path);
 }
 
-fn encode_output_binding_slot(e: &mut CanonicalEncoder, slot: &OutputBindingSlotV1) {
+fn encode_output_binding_slot(e: &mut Encoder, slot: &OutputBindingSlotV1) {
     match slot {
-        OutputBindingSlotV1::Primary => e.u16(1),
+        OutputBindingSlotV1::Primary => e.enum_variant(1),
         OutputBindingSlotV1::Extra { output_key } => {
-            e.u16(2);
+            e.enum_variant(2);
             e.str(output_key);
         }
     }
 }
 
-fn encode_output_binding_failure(e: &mut CanonicalEncoder, failure: &OutputBindingFailureV1) {
+fn encode_output_binding_failure(e: &mut Encoder, failure: &OutputBindingFailureV1) {
     match failure {
-        OutputBindingFailureV1::MissingPrimary => e.u16(1),
+        OutputBindingFailureV1::MissingPrimary => e.enum_variant(1),
         OutputBindingFailureV1::DuplicatePrimary { observed_count } => {
-            e.u16(2);
+            e.enum_variant(2);
             e.u32(*observed_count);
         }
         OutputBindingFailureV1::MissingExtra {
             output_key,
             expected_type,
         } => {
-            e.u16(3);
+            e.enum_variant(3);
             e.str(output_key);
             e.raw(&expected_type.0);
         }
@@ -452,7 +454,7 @@ fn encode_output_binding_failure(e: &mut CanonicalEncoder, failure: &OutputBindi
             expected_type,
             observed_count,
         } => {
-            e.u16(4);
+            e.enum_variant(4);
             e.str(output_key);
             e.raw(&expected_type.0);
             e.u32(*observed_count);
@@ -461,7 +463,7 @@ fn encode_output_binding_failure(e: &mut CanonicalEncoder, failure: &OutputBindi
             output_key,
             observed_type,
         } => {
-            e.u16(5);
+            e.enum_variant(5);
             e.str(output_key);
             e.raw(&observed_type.0);
         }
@@ -470,17 +472,17 @@ fn encode_output_binding_failure(e: &mut CanonicalEncoder, failure: &OutputBindi
             expected_type,
             observed_type,
         } => {
-            e.u16(6);
+            e.enum_variant(6);
             encode_output_binding_slot(e, slot);
             e.raw(&expected_type.0);
             e.raw(&observed_type.0);
         }
         OutputBindingFailureV1::InvalidOutputKey { output_key } => {
-            e.u16(7);
+            e.enum_variant(7);
             e.str(output_key);
         }
         OutputBindingFailureV1::DuplicateDebugKey { debug_key } => {
-            e.u16(8);
+            e.enum_variant(8);
             e.str(debug_key);
         }
         OutputBindingFailureV1::EncodeRejected {
@@ -488,7 +490,7 @@ fn encode_output_binding_failure(e: &mut CanonicalEncoder, failure: &OutputBindi
             encoded_type,
             failure,
         } => {
-            e.u16(9);
+            e.enum_variant(9);
             encode_output_binding_slot(e, slot);
             e.raw(&encoded_type.0);
             encode_artifact_encoding_failure(e, failure);
@@ -496,7 +498,7 @@ fn encode_output_binding_failure(e: &mut CanonicalEncoder, failure: &OutputBindi
     }
 }
 
-fn encode_import_intake_failure(e: &mut CanonicalEncoder, failure: &ImportIntakeFailureV1) {
+fn encode_import_intake_failure(e: &mut Encoder, failure: &ImportIntakeFailureV1) {
     match failure {
         ImportIntakeFailureV1::DuplicateLocalId { local_id } => tagged_string(e, 1, local_id),
         ImportIntakeFailureV1::ReservedLocalId { local_id } => tagged_string(e, 2, local_id),
@@ -504,13 +506,13 @@ fn encode_import_intake_failure(e: &mut CanonicalEncoder, failure: &ImportIntake
             first_local_id,
             attempted_local_id,
         } => {
-            e.u16(3);
+            e.enum_variant(3);
             e.str(first_local_id);
             e.str(attempted_local_id);
         }
         ImportIntakeFailureV1::PrimaryMissing { local_id } => tagged_string(e, 4, local_id),
         ImportIntakeFailureV1::VanishedPriorPrimary { bundle, local_id } => {
-            e.u16(5);
+            e.enum_variant(5);
             e.raw(&bundle.0);
             e.str(local_id);
         }
@@ -519,17 +521,17 @@ fn encode_import_intake_failure(e: &mut CanonicalEncoder, failure: &ImportIntake
             expected_role,
             observed_role,
         } => {
-            e.u16(6);
+            e.enum_variant(6);
             e.str(local_id);
-            e.u8(*expected_role as u8);
-            e.u8(*observed_role as u8);
+            e.enum_variant(*expected_role as u32);
+            e.enum_variant(*observed_role as u32);
         }
         ImportIntakeFailureV1::TypeMismatch {
             local_id,
             expected_type,
             observed_type,
         } => {
-            e.u16(7);
+            e.enum_variant(7);
             e.str(local_id);
             e.raw(&expected_type.0);
             e.raw(&observed_type.0);
@@ -539,7 +541,7 @@ fn encode_import_intake_failure(e: &mut CanonicalEncoder, failure: &ImportIntake
             type_uuid,
             path,
         } => {
-            e.u16(8);
+            e.enum_variant(8);
             e.str(local_id);
             e.raw(&type_uuid.0);
             encode_path(e, path);
@@ -548,32 +550,32 @@ fn encode_import_intake_failure(e: &mut CanonicalEncoder, failure: &ImportIntake
             settings_type,
             path,
         } => {
-            e.u16(9);
+            e.enum_variant(9);
             e.raw(&settings_type.0);
             encode_path(e, path);
         }
     }
 }
 
-fn tagged_string(e: &mut CanonicalEncoder, tag: u16, value: &str) {
-    e.u16(tag);
+fn tagged_string(e: &mut Encoder, tag: u32, value: &str) {
+    e.enum_variant(tag);
     e.str(value);
 }
 
-fn encode_reference_observation(e: &mut CanonicalEncoder, observed: &ReferenceObservationV1) {
+fn encode_reference_observation(e: &mut Encoder, observed: &ReferenceObservationV1) {
     match observed {
-        ReferenceObservationV1::Missing => e.u16(1),
+        ReferenceObservationV1::Missing => e.enum_variant(1),
         ReferenceObservationV1::Found { observed_terminal } => {
-            e.u16(2);
+            e.enum_variant(2);
             e.raw(&observed_terminal.0);
         }
     }
 }
 
-fn encode_artifact_encoding_failure(e: &mut CanonicalEncoder, failure: &ArtifactEncodingFailureV1) {
+fn encode_artifact_encoding_failure(e: &mut Encoder, failure: &ArtifactEncodingFailureV1) {
     match failure {
         ArtifactEncodingFailureV1::SizeLimit { limit, observed } => {
-            e.u16(1);
+            e.enum_variant(1);
             e.u64(*limit);
             e.u64(*observed);
         }
@@ -583,19 +585,19 @@ fn encode_artifact_encoding_failure(e: &mut CanonicalEncoder, failure: &Artifact
             expected_type,
             observed_type,
         } => {
-            e.u16(3);
+            e.enum_variant(3);
             encode_path(e, path);
             e.raw(&expected_type.0);
             e.raw(&observed_type.0);
         }
-        ArtifactEncodingFailureV1::LayoutUnavailable => e.u16(4),
+        ArtifactEncodingFailureV1::LayoutUnavailable => e.enum_variant(4),
         ArtifactEncodingFailureV1::InvalidScalar { path } => tagged_path(e, 5, path),
         ArtifactEncodingFailureV1::InvalidReference {
             path,
             expected_terminal,
             observed,
         } => {
-            e.u16(6);
+            e.enum_variant(6);
             encode_path(e, path);
             e.raw(&expected_terminal.0);
             encode_reference_observation(e, observed);

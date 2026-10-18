@@ -10,7 +10,6 @@ use distill_wire::native::{
     validate_native_descriptor, CallbackPanic, CtorEntry, CtorId, CtorTable, DropId, DropTable,
     NativeField, NativeLayoutNode, NativeVariant, SkipDefaultId, SkipEntry, SkipWriterTable,
 };
-use unicode_normalization::UnicodeNormalization;
 
 use crate::{AssetReflect, AssetRuntimeDescriptor, AssetType, EncodeSink, EpochToken, ErasedValue};
 
@@ -154,8 +153,12 @@ impl LogicalBuilder {
     pub fn u64(&mut self, value: u64) {
         self.bytes.extend_from_slice(&value.to_le_bytes())
     }
+    /// A node kind: the schema encoding's `u32` discriminant (§5).
+    pub fn kind(&mut self, kind: u32) {
+        self.u32(kind)
+    }
+    /// A name, raw (§5): Rust names reach the macro NFC-normalized by rustc.
     pub fn string(&mut self, value: &str) {
-        let value = value.nfc().collect::<String>();
         self.u32(checked_len(value.len()));
         self.bytes(value.as_bytes());
     }
@@ -173,7 +176,7 @@ impl LogicalBuilder {
         debug_assert_eq!(popped, Some(TypeId::of::<T>()));
     }
     pub fn backref(&mut self, distance: u32) {
-        self.byte(0x0C);
+        self.kind(0x0C);
         self.u32(distance);
     }
 }
@@ -186,11 +189,11 @@ pub fn logical_bytes<T: AssetReflect>() -> Vec<u8> {
 }
 
 pub fn logical_hash<T: AssetReflect>() -> LogicalHash {
-    let mut hash = blake3::Hasher::new();
-    hash.update(b"DSLH");
-    hash.update(&[1]);
-    hash.update(&logical_bytes::<T>());
-    LogicalHash(*hash.finalize().as_bytes())
+    LogicalHash(distill_core::hash::digest_bytes(
+        distill_core::hash::Domain::Schema,
+        distill_core::hash::SCHEMA_DIGEST_VERSION,
+        &logical_bytes::<T>(),
+    ))
 }
 
 pub fn build_descriptor<T>(metadata: AssetMetadata) -> AssetRuntimeDescriptor

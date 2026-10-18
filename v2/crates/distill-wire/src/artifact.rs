@@ -3,14 +3,13 @@
 //! Layout, pinned (all integers LE):
 //!
 //! ```text
-//! magic         [u8; 8]     89 44 53 54 4C 0D 1A 0A  ("\x89DSTL\r\x1a\n")
-//! version       u32
+//! header        [u8; 12]    shared file header (§5): "NGPF", u32 Domain::ArtifactImage, u32 version
 //! asset_uuid    [u8; 16]
 //! authored_type [u8; 16]
 //! terminal_type [u8; 16]
 //! encoded_type  [u8; 16]
-//! logical_hash  [u8; 32]
-//! layout_hash   [u8; 32]
+//! logical_hash  [u8; 16]
+//! layout_hash   [u8; 16]
 //! dep_count     u32
 //! blob_count    u32
 //! fixed_len     u32
@@ -31,16 +30,16 @@
 //! path key (§6): entries sorted by `distill_bundle::encode_path` bytes.
 
 use distill_bundle::{encode_path, PathComponent};
+use distill_core::hash::Domain;
+use distill_core::header::{read_header, write_header, HeaderError, HEADER_LEN};
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
 
-/// `"\x89DSTL\r\x1a\n"` (§12).
-pub const ARTIFACT_MAGIC: [u8; 8] = [0x89, 0x44, 0x53, 0x54, 0x4C, 0x0D, 0x1A, 0x0A];
-
-/// Artifact format version — an input-hash input (§12).
+/// Artifact format version (the shared header's version, §5) — an
+/// input-hash input (§12).
 pub const ARTIFACT_FORMAT_VERSION: u32 = 1;
 
-/// Fixed header size in bytes (magic through `var_len`), pinned.
-pub const ARTIFACT_HEADER_LEN: usize = 160;
+/// Fixed header size in bytes (file header through `var_len`), pinned.
+pub const ARTIFACT_HEADER_LEN: usize = 128;
 
 /// Identity fields of the header (§12).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,10 +56,9 @@ pub struct ArtifactHeader {
 /// is strict: any deviation from the canonical form is an error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArtifactError {
-    BadMagic,
-    UnsupportedVersion {
-        got: u32,
-    },
+    /// The shared file header (§5) is not an artifact image's at
+    /// [`ARTIFACT_FORMAT_VERSION`].
+    Header(HeaderError),
     /// Fewer bytes than the header/tables/sections claim.
     Truncated {
         needed: u64,
@@ -115,10 +113,7 @@ pub enum ArtifactError {
 impl std::fmt::Display for ArtifactError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ArtifactError::BadMagic => write!(f, "bad artifact magic"),
-            ArtifactError::UnsupportedVersion { got } => {
-                write!(f, "unsupported artifact format version {got}")
-            }
+            ArtifactError::Header(error) => write!(f, "artifact: {error}"),
             ArtifactError::Truncated { needed, have } => {
                 write!(f, "artifact truncated: need {needed} bytes, have {have}")
             }
@@ -177,9 +172,9 @@ impl std::fmt::Display for ArtifactError {
 
 impl std::error::Error for ArtifactError {}
 
-/// blake3 over the whole raw file — the artifact's identity (§12).
+/// XXH3-128 over the whole raw file — the artifact's identity (§12).
 pub fn content_hash(bytes: &[u8]) -> ContentHash {
-    ContentHash(*blake3::hash(bytes).as_bytes())
+    ContentHash(distill_core::hash::hash(bytes))
 }
 
 fn align_up_u64(n: u64, align: u64) -> Option<u64> {
@@ -278,8 +273,7 @@ pub fn write_artifact(
     }
 
     let mut out = Vec::new();
-    out.extend_from_slice(&ARTIFACT_MAGIC);
-    out.extend_from_slice(&ARTIFACT_FORMAT_VERSION.to_le_bytes());
+    write_header(&mut out, Domain::ArtifactImage, ARTIFACT_FORMAT_VERSION);
     out.extend_from_slice(&header.asset_uuid.0);
     out.extend_from_slice(&header.authored_type.0);
     out.extend_from_slice(&header.terminal_type.0);
@@ -372,15 +366,9 @@ pub fn artifact_header_layout_hash(structural: &[u8]) -> Result<LayoutHash, Arti
         bytes: structural,
         pos: 0,
     };
-    if r.take(8)? != ARTIFACT_MAGIC {
-        return Err(ArtifactError::BadMagic);
-    }
-    let version = r.u32()?;
-    if version != ARTIFACT_FORMAT_VERSION {
-        return Err(ArtifactError::UnsupportedVersion { got: version });
-    }
-    r.take(4 * 16 + 32)?;
-    Ok(LayoutHash(r.bytes32()?))
+    r.file_header()?;
+    r.take(4 * 16 + 16)?;
+    Ok(LayoutHash(r.bytes16()?))
 }
 
 /// Parse a fetched artifact whose canonical structural prefix and blob
@@ -393,19 +381,13 @@ pub fn parse_artifact_parts<'a>(
         bytes: structural,
         pos: 0,
     };
-    if r.take(8)? != ARTIFACT_MAGIC {
-        return Err(ArtifactError::BadMagic);
-    }
-    let version = r.u32()?;
-    if version != ARTIFACT_FORMAT_VERSION {
-        return Err(ArtifactError::UnsupportedVersion { got: version });
-    }
+    let version = r.file_header()?;
     let asset_uuid = AssetUuid(r.bytes16()?);
     let authored_type = TypeUuid(r.bytes16()?);
     let terminal_type = TypeUuid(r.bytes16()?);
     let encoded_type = TypeUuid(r.bytes16()?);
-    let logical_hash = LogicalHash(r.bytes32()?);
-    let layout_hash = LayoutHash(r.bytes32()?);
+    let logical_hash = LogicalHash(r.bytes16()?);
+    let layout_hash = LayoutHash(r.bytes16()?);
     let dep_count = r.u32()?;
     let blob_count = r.u32()?;
     let fixed_len = r.u32()?;
@@ -460,7 +442,7 @@ pub fn parse_artifact_parts<'a>(
         });
     }
 
-    let mut hasher = blake3::Hasher::new();
+    let mut hasher = distill_core::hash::Hasher::new();
     hasher.update(structural);
     let mut cursor = 0u64;
     const ZERO_PAD: [u8; 16] = [0; 16];
@@ -490,7 +472,7 @@ pub fn parse_artifact_parts<'a>(
         blob_table,
         fixed,
         variable,
-        content_hash: ContentHash(*hasher.finalize().as_bytes()),
+        content_hash: ContentHash(hasher.finish()),
     })
 }
 
@@ -527,8 +509,16 @@ impl<'a> Reader<'a> {
         Ok(self.take(16)?.try_into().unwrap())
     }
 
-    fn bytes32(&mut self) -> Result<[u8; 32], ArtifactError> {
-        Ok(self.take(32)?.try_into().unwrap())
+    /// The shared file header (§5); returns the version it names.
+    fn file_header(&mut self) -> Result<u32, ArtifactError> {
+        let header = self.take(HEADER_LEN as u64).map_err(|_| {
+            ArtifactError::Header(HeaderError::TooShort {
+                len: self.bytes.len(),
+            })
+        })?;
+        read_header(header, Domain::ArtifactImage, ARTIFACT_FORMAT_VERSION)
+            .map_err(ArtifactError::Header)?;
+        Ok(ARTIFACT_FORMAT_VERSION)
     }
 
     fn pad_to_16(&mut self) -> Result<(), ArtifactError> {
@@ -578,19 +568,13 @@ pub fn split_artifact(bytes: &[u8]) -> Result<(&[u8], Vec<&[u8]>), ArtifactError
 pub fn parse_artifact(bytes: &[u8]) -> Result<ArtifactView<'_>, ArtifactError> {
     let mut r = Reader { bytes, pos: 0 };
 
-    if r.take(8)? != ARTIFACT_MAGIC {
-        return Err(ArtifactError::BadMagic);
-    }
-    let version = r.u32()?;
-    if version != ARTIFACT_FORMAT_VERSION {
-        return Err(ArtifactError::UnsupportedVersion { got: version });
-    }
+    let version = r.file_header()?;
     let asset_uuid = AssetUuid(r.bytes16()?);
     let authored_type = TypeUuid(r.bytes16()?);
     let terminal_type = TypeUuid(r.bytes16()?);
     let encoded_type = TypeUuid(r.bytes16()?);
-    let logical_hash = LogicalHash(r.bytes32()?);
-    let layout_hash = LayoutHash(r.bytes32()?);
+    let logical_hash = LogicalHash(r.bytes16()?);
+    let layout_hash = LayoutHash(r.bytes16()?);
     let dep_count = r.u32()?;
     let blob_count = r.u32()?;
     let fixed_len = r.u32()?;

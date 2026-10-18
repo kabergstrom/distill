@@ -24,13 +24,13 @@ fn commit_with_aux(
     key: u8,
     bytes: &[u8],
     aux: &[u8],
-) -> ([u8; 32], [u8; 32], [u8; 32]) {
+) -> ([u8; 16], [u8; 16], [u8; 16]) {
     let receipt = store
         .commit_build(BuildCommit {
             reads: Vec::new(),
             wire_trees: Vec::new(),
             key_kind: KeyKind::Processor,
-            static_input_key: [key; 32],
+            static_input_key: [key; 16],
             asset_uuid: PARENT,
             trace: vec![key],
             outcome: CommitOutcome::Success {
@@ -58,13 +58,13 @@ fn commit_artifact(
     key: u8,
     artifact: &[u8],
     wire_trees: Vec<Vec<u8>>,
-) -> ([u8; 32], [u8; 32]) {
+) -> ([u8; 16], [u8; 16]) {
     let receipt = store
         .commit_build(BuildCommit {
             reads: Vec::new(),
             wire_trees,
             key_kind: KeyKind::Processor,
-            static_input_key: [key; 32],
+            static_input_key: [key; 16],
             asset_uuid: PARENT,
             trace: vec![key],
             outcome: CommitOutcome::Success {
@@ -93,10 +93,10 @@ fn evicting_an_unpinned_result_removes_the_whole_unit() {
     let (out, aux, trace_digest) = commit_with_aux(&mut store, 1, b"artifact", b"debug");
 
     assert!(store
-        .evict_result(KeyKind::Processor, &[1u8; 32], &trace_digest)
+        .evict_result(KeyKind::Processor, &[1u8; 16], &trace_digest)
         .unwrap());
     assert!(store
-        .lookup_candidates(KeyKind::Processor, &[1u8; 32])
+        .lookup_candidates(KeyKind::Processor, &[1u8; 16])
         .unwrap()
         .is_empty());
     assert!(matches!(
@@ -110,7 +110,7 @@ fn evicting_an_unpinned_result_removes_the_whole_unit() {
 
     // Evicting an absent candidate is Ok(false), not an error.
     assert!(!store
-        .evict_result(KeyKind::Processor, &[1u8; 32], &trace_digest)
+        .evict_result(KeyKind::Processor, &[1u8; 16], &trace_digest)
         .unwrap());
 }
 
@@ -125,7 +125,7 @@ fn a_shared_extent_survives_until_its_last_referencing_result_is_evicted() {
     assert_eq!(out1, out2, "content-addressed collapse");
 
     assert!(store
-        .evict_result(KeyKind::Processor, &[1u8; 32], &digest1)
+        .evict_result(KeyKind::Processor, &[1u8; 16], &digest1)
         .unwrap());
     assert_eq!(
         store.cas_read(&out1).unwrap(),
@@ -133,7 +133,7 @@ fn a_shared_extent_survives_until_its_last_referencing_result_is_evicted() {
         "still referenced by the second result"
     );
     assert!(store
-        .evict_result(KeyKind::Processor, &[2u8; 32], &digest2)
+        .evict_result(KeyKind::Processor, &[2u8; 16], &digest2)
         .unwrap());
     assert!(matches!(
         store.cas_read(&out1),
@@ -148,7 +148,7 @@ fn unit_artifact(layout: distill_core::id::LayoutHash) -> Vec<u8> {
             authored_type: TypeUuid([1; 16]),
             terminal_type: TypeUuid([2; 16]),
             encoded_type: TypeUuid([3; 16]),
-            logical_hash: LogicalHash([4; 32]),
+            logical_hash: LogicalHash([4; 16]),
             layout_hash: layout,
         },
         &[],
@@ -176,7 +176,7 @@ fn a_wire_tree_is_part_of_every_result_that_names_it() {
     let (_, digest2) = commit_artifact(&mut store, 2, &artifact, Vec::new());
 
     assert!(store
-        .evict_result(KeyKind::Processor, &[1; 32], &digest1)
+        .evict_result(KeyKind::Processor, &[1; 16], &digest1)
         .unwrap());
     assert_eq!(
         store.wire_tree_read(layout).unwrap(),
@@ -184,7 +184,7 @@ fn a_wire_tree_is_part_of_every_result_that_names_it() {
         "the second result still references the shared layout"
     );
     assert!(store
-        .evict_result(KeyKind::Processor, &[2; 32], &digest2)
+        .evict_result(KeyKind::Processor, &[2; 16], &digest2)
         .unwrap());
     assert!(matches!(
         store.wire_tree_read(layout),
@@ -201,7 +201,7 @@ fn a_commit_naming_an_absent_wire_tree_is_refused() {
         reads: Vec::new(),
         wire_trees: Vec::new(),
         key_kind: KeyKind::Processor,
-        static_input_key: [1; 32],
+        static_input_key: [1; 16],
         asset_uuid: PARENT,
         trace: vec![1],
         outcome: CommitOutcome::Success {
@@ -215,7 +215,7 @@ fn a_commit_naming_an_absent_wire_tree_is_refused() {
     });
     assert!(matches!(result, Err(StoreError::MissingWireTree { hash }) if hash == layout.0));
     assert!(store
-        .lookup_candidates(KeyKind::Processor, &[1; 32])
+        .lookup_candidates(KeyKind::Processor, &[1; 16])
         .unwrap()
         .is_empty());
 }
@@ -268,7 +268,7 @@ fn compaction_repoints_live_records_and_the_sweeper_deletes_the_dead_segment() {
     let (survivor, _, _) = commit_with_aux(&mut store, 1, b"surviving artifact", b"dbg-s");
     let (_, _, dead_digest) = commit_with_aux(&mut store, 2, &[9u8; 4096], b"dbg-d");
     assert!(store
-        .evict_result(KeyKind::Processor, &[2u8; 32], &dead_digest)
+        .evict_result(KeyKind::Processor, &[2u8; 16], &dead_digest)
         .unwrap());
 
     let size_before: u64 = segment_bytes(&dir);
@@ -298,11 +298,11 @@ fn compaction_repoints_live_records_and_the_sweeper_deletes_the_dead_segment() {
     // Everything live still reads; the bucket still resolves.
     assert_eq!(store.cas_read(&survivor).unwrap(), b"surviving artifact");
     let candidates = store
-        .lookup_candidates(KeyKind::Processor, &[1u8; 32])
+        .lookup_candidates(KeyKind::Processor, &[1u8; 16])
         .unwrap();
     assert_eq!(candidates.len(), 1);
     assert!(store
-        .lookup_candidates(KeyKind::Processor, &[2u8; 32])
+        .lookup_candidates(KeyKind::Processor, &[2u8; 16])
         .unwrap()
         .is_empty());
 
@@ -324,7 +324,7 @@ fn a_snapshot_reads_its_blobs_until_the_dead_segment_is_swept() {
 
     let view = store.reader().unwrap().begin_snapshot().unwrap();
     assert!(store
-        .evict_result(KeyKind::Processor, &[2u8; 32], &digest)
+        .evict_result(KeyKind::Processor, &[2u8; 16], &digest)
         .unwrap());
     assert!(!store.compact().unwrap().dead_segments.is_empty());
     let mut sweeper = SegmentSweeper::new(Duration::from_millis(200));
@@ -358,7 +358,7 @@ fn compaction_keeps_a_shared_payload_for_its_surviving_result() {
         commit_with_aux(&mut store, 2, b"shared artifact", &[3u8; 4096]);
     assert_eq!(hash, duplicate);
     assert!(store
-        .evict_result(KeyKind::Processor, &[2; 32], &second_digest)
+        .evict_result(KeyKind::Processor, &[2; 16], &second_digest)
         .unwrap());
 
     assert!(!store.compact().unwrap().dead_segments.is_empty());
@@ -371,7 +371,7 @@ fn compaction_keeps_a_shared_payload_for_its_surviving_result() {
     assert_eq!(recovery, distill_store::cas::RecoveryReport::default());
     assert_eq!(store.cas_read(&hash).unwrap(), b"shared artifact");
     let candidates = store
-        .lookup_candidates(KeyKind::Processor, &[1; 32])
+        .lookup_candidates(KeyKind::Processor, &[1; 16])
         .unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].trace_digest, first_digest);
@@ -390,7 +390,7 @@ fn compaction_leaves_failure_results() {
             reads: Vec::new(),
             wire_trees: Vec::new(),
             key_kind: KeyKind::Processor,
-            static_input_key: [5u8; 32],
+            static_input_key: [5u8; 16],
             asset_uuid: PARENT,
             trace: b"failing trace".to_vec(),
             outcome: CommitOutcome::Failure {
@@ -404,11 +404,11 @@ fn compaction_leaves_failure_results() {
         .unwrap();
     let (_, _, digest) = commit_with_aux(&mut store, 6, &[6u8; 4096], b"dbg");
     assert!(store
-        .evict_result(KeyKind::Processor, &[6u8; 32], &digest)
+        .evict_result(KeyKind::Processor, &[6u8; 16], &digest)
         .unwrap());
     store.compact().unwrap();
     let candidates = store
-        .lookup_candidates(KeyKind::Processor, &[5u8; 32])
+        .lookup_candidates(KeyKind::Processor, &[5u8; 16])
         .unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].payload.trace, b"failing trace");
@@ -456,7 +456,7 @@ fn a_segment_a_rolled_back_input_left_behind_is_reclaimed() {
 
     let (kept, _, _) = commit_with_aux(&mut store, 3, b"kept artifact", b"dbg-3");
     assert!(store
-        .evict_result(KeyKind::Processor, &[1u8; 32], &first)
+        .evict_result(KeyKind::Processor, &[1u8; 16], &first)
         .unwrap());
     let report = store.compact().unwrap();
     SegmentSweeper::new(Duration::ZERO)

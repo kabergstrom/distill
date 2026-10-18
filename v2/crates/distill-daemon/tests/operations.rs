@@ -46,7 +46,7 @@ fn bundle(
 }
 
 fn target() -> TargetDefinition {
-    TargetDefinition::new("dev", TargetDefinitionHash([8; 32]))
+    TargetDefinition::new("dev", TargetDefinitionHash([8; 16]))
 }
 
 /// Complete a deferred operation as the server does, inside an input at

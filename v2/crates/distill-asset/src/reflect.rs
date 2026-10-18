@@ -85,7 +85,7 @@ fn scalar<T>(offset: u32, kind: ScalarKind) -> NativeLayoutNode {
 }
 
 fn logical_primitive(builder: &mut LogicalBuilder, name: &str) {
-    builder.byte(0x01);
+    builder.kind(0x01);
     builder.string(name);
 }
 
@@ -209,7 +209,7 @@ unsafe impl AssetReflect for () {
         NativeLayoutNode::Unit { offset }
     }
     fn logical(builder: &mut LogicalBuilder) {
-        builder.byte(0x0D)
+        builder.kind(0x0D)
     }
     fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
         sink.flat(&[])
@@ -231,7 +231,7 @@ unsafe impl AssetReflect for String {
         }
     }
     fn logical(builder: &mut LogicalBuilder) {
-        builder.byte(0x08)
+        builder.kind(0x08)
     }
     fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
         sink.begin(EncodeContainer::Str, checked_len(self.len()))?;
@@ -254,7 +254,7 @@ unsafe impl AssetReflect for Blob {
         }
     }
     fn logical(builder: &mut LogicalBuilder) {
-        builder.byte(0x0B)
+        builder.kind(0x0B)
     }
     fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
         sink.blob(self.as_bytes())
@@ -278,7 +278,7 @@ unsafe impl<T: AssetReflect> AssetReflect for Vec<T> {
         }
     }
     fn logical(builder: &mut LogicalBuilder) {
-        builder.byte(0x04);
+        builder.kind(0x04);
         T::logical(builder);
     }
     fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
@@ -314,7 +314,7 @@ unsafe impl<T: AssetReflect, const N: usize> AssetReflect for [T; N] {
         }
     }
     fn logical(builder: &mut LogicalBuilder) {
-        builder.byte(0x05);
+        builder.kind(0x05);
         builder.u64(N as u64);
         T::logical(builder);
     }
@@ -353,7 +353,7 @@ unsafe impl<T: AssetReflect> AssetReflect for Option<T> {
         }
     }
     fn logical(builder: &mut LogicalBuilder) {
-        builder.byte(0x06);
+        builder.kind(0x06);
         T::logical(builder);
     }
     fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
@@ -453,7 +453,7 @@ where
         }
     }
     fn logical(builder: &mut LogicalBuilder) {
-        builder.byte(0x0E);
+        builder.kind(0x0E);
         T::logical(builder);
     }
     fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
@@ -487,7 +487,7 @@ where
         }
     }
     fn logical(builder: &mut LogicalBuilder) {
-        builder.byte(0x0E);
+        builder.kind(0x0E);
         T::logical(builder);
     }
     fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
@@ -527,7 +527,7 @@ where
         }
     }
     fn logical(builder: &mut LogicalBuilder) {
-        builder.byte(0x07);
+        builder.kind(0x07);
         K::logical(builder);
         V::logical(builder);
     }
@@ -566,7 +566,7 @@ where
         }
     }
     fn logical(builder: &mut LogicalBuilder) {
-        builder.byte(0x07);
+        builder.kind(0x07);
         K::logical(builder);
         V::logical(builder);
     }
@@ -604,7 +604,7 @@ unsafe impl<T: AssetType> AssetReflect for AssetRef<T> {
         }
     }
     fn logical(builder: &mut LogicalBuilder) {
-        builder.byte(0x09);
+        builder.kind(0x09);
         builder.bytes(&T::TYPE_UUID.0);
     }
     fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
@@ -620,7 +620,7 @@ unsafe impl<T: AssetType> AssetReflect for WeakAssetRef<T> {
         <AssetRef<T> as AssetReflect>::layout(builder, offset)
     }
     fn logical(builder: &mut LogicalBuilder) {
-        builder.byte(0x0A);
+        builder.kind(0x0A);
         builder.bytes(&T::TYPE_UUID.0);
     }
     fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
@@ -742,7 +742,7 @@ unsafe impl AssetReflect for crate::types::DynamicPatch {
         <String as AssetReflect>::layout(builder, offset)
     }
     fn logical(builder: &mut LogicalBuilder) {
-        builder.byte(0x0F);
+        builder.kind(0x0F);
         builder.byte(1);
     }
     fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {

@@ -34,7 +34,7 @@ use distill_wire::wire::WireNode;
 #[distill_asset::asset(uuid = "51112233-4455-6677-8899-aabbccddeeff")]
 struct A;
 
-const TARGET_HASH: [u8; 32] = [7; 32];
+const TARGET_HASH: [u8; 16] = [7; 16];
 
 fn target() -> RuntimeTarget {
     RuntimeTarget::new(GameModuleEpoch(1), TARGET_HASH)
@@ -353,7 +353,7 @@ fn is_request_error(event: &IoEvent) -> bool {
 
 fn stale() -> IoBasis {
     IoBasis::Pack {
-        manifest: ManifestHash([0; 32]),
+        manifest: ManifestHash([0; 16]),
     }
 }
 

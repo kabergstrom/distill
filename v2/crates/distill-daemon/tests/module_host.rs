@@ -195,8 +195,8 @@ impl PipelineModuleLoader for FakeLoader {
 fn module_abi(tag: u8) -> ModuleAbiIdentity {
     ModuleAbiIdentity {
         rustc: format!("rustc-{tag}"),
-        interface_fingerprint: [tag; 32],
-        measured_interface: [tag; 32],
+        interface_fingerprint: [tag; 16],
+        measured_interface: [tag; 16],
         panic_strategy: "unwind".into(),
         allocator: "system".into(),
     }
@@ -215,7 +215,7 @@ fn module_host(state_dir: impl AsRef<Path>) -> std::io::Result<ModuleHost> {
 
 fn requirements(tag: u8) -> CandidateRequirements {
     let mut schema_registry = bootstrap_control_logical_registry_v1().unwrap();
-    schema_registry.insert(TypeUuid([tag; 16]), LogicalHash([tag.wrapping_add(1); 32]));
+    schema_registry.insert(TypeUuid([tag; 16]), LogicalHash([tag.wrapping_add(1); 16]));
     CandidateRequirements {
         module_abi: module_abi(tag),
         source_hashes: [("pipeline".to_owned(), format!("{tag:016x}"))]
@@ -224,7 +224,7 @@ fn requirements(tag: u8) -> CandidateRequirements {
         schema_registry,
         targets: vec![TargetDefinition {
             name: "desktop".into(),
-            fingerprint: [tag; 32],
+            fingerprint: [tag; 16],
         }],
     }
 }
@@ -254,7 +254,7 @@ fn fake_module(tag: u8, calls: Arc<Mutex<Calls>>) -> FakeModule {
 }
 
 fn write_module(path: &Path, byte: u8) {
-    std::fs::write(path, [byte; 32]).unwrap();
+    std::fs::write(path, [byte; 16]).unwrap();
 }
 
 fn assert_failure_fields(
@@ -267,7 +267,7 @@ fn assert_failure_fields(
     assert_eq!(failure.origin, origin);
     assert_eq!(failure.cleanup, cleanup);
     failure.validate().unwrap();
-    assert_ne!(failure.identity, [0; 32]);
+    assert_ne!(failure.identity, [0; 16]);
 }
 
 #[test]
@@ -319,29 +319,29 @@ fn candidate_target_set_is_normalized_sorted_and_retained() {
     candidate.targets = vec![
         TargetDefinition {
             name: "z".to_owned(),
-            fingerprint: [9; 32],
+            fingerprint: [9; 16],
         },
         TargetDefinition {
             name: "e\u{301}".to_owned(),
-            fingerprint: [8; 32],
+            fingerprint: [8; 16],
         },
         TargetDefinition {
             name: "aa".to_owned(),
-            fingerprint: [7; 32],
+            fingerprint: [7; 16],
         },
     ];
     let expected = CanonicalTargetSet::canonical(vec![
         TargetSetRow {
             name: "z".to_owned(),
-            target_definition_hash: [9; 32],
+            target_definition_hash: [9; 16],
         },
         TargetSetRow {
             name: "e\u{301}".to_owned(),
-            target_definition_hash: [8; 32],
+            target_definition_hash: [8; 16],
         },
         TargetSetRow {
             name: "aa".to_owned(),
-            target_definition_hash: [7; 32],
+            target_definition_hash: [7; 16],
         },
     ])
     .unwrap();
@@ -388,11 +388,11 @@ fn nfc_equivalent_target_names_are_rejected_before_open_or_register() {
     candidate.targets = vec![
         TargetDefinition {
             name: "é".to_owned(),
-            fingerprint: [1; 32],
+            fingerprint: [1; 16],
         },
         TargetDefinition {
             name: "e\u{301}".to_owned(),
-            fingerprint: [2; 32],
+            fingerprint: [2; 16],
         },
     ];
     let mut host = module_host(temp.path().join("state")).unwrap();

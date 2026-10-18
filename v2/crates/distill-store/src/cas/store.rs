@@ -88,7 +88,7 @@ pub struct BuildCommit {
     pub key_kind: KeyKind,
     /// The `"DSSI"` StaticInputs digest, the `"DSBI"` pre-key digest or the
     /// `"DSNK"` node key.
-    pub static_input_key: [u8; 32],
+    pub static_input_key: [u8; 16],
     /// The parent asset (processor results) or entry (build imports).
     pub asset_uuid: AssetUuid,
     /// Canonical trace-op bytes, §9's encoding (up to and including the
@@ -116,7 +116,7 @@ pub enum BuildRead {
 #[derive(Debug, Clone)]
 pub struct CommitReceipt {
     pub memo_seq: MemoSeq,
-    pub trace_digest: [u8; 32],
+    pub trace_digest: [u8; 16],
     /// `output_key → ContentHash` for every committed output.
     pub outputs: Vec<(String, ContentHash)>,
     /// `debug_key → ContentHash` for every committed aux payload.
@@ -127,10 +127,10 @@ pub struct CommitReceipt {
 /// from it yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CandidateRow {
-    pub trace_digest: [u8; 32],
+    pub trace_digest: [u8; 16],
     pub memo_seq: MemoSeq,
     key_kind: KeyKind,
-    static_key: [u8; 32],
+    static_key: [u8; 16],
 }
 
 /// A candidate bucket's rows, newest first.
@@ -158,7 +158,7 @@ pub(crate) const READ_PATH: i64 = 1;
 /// One bucket candidate, most-recently-committed-first (§13).
 #[derive(Debug, Clone)]
 pub struct Candidate {
-    pub trace_digest: [u8; 32],
+    pub trace_digest: [u8; 16],
     pub memo_seq: MemoSeq,
     pub asset_uuid: AssetUuid,
     pub payload: ResultPayload,
@@ -288,8 +288,8 @@ fn io_err(path: &std::path::Path) -> impl Fn(std::io::Error) -> StoreError + '_ 
 /// Install `holder` as a holder of the extent `hash`.
 pub(crate) fn insert_ref(
     txn: &rusqlite::Connection,
-    holder: &[u8; 32],
-    hash: &[u8; 32],
+    holder: &[u8; 16],
+    hash: &[u8; 16],
 ) -> Result<(), StoreError> {
     txn.prepare_cached("INSERT OR IGNORE INTO cas_refs(holder, content_hash) VALUES (?1, ?2)")?
         .execute(rusqlite::params![holder.as_slice(), hash.as_slice()])?;
@@ -298,7 +298,7 @@ pub(crate) fn insert_ref(
 
 pub(crate) fn extent_exists(
     txn: &rusqlite::Connection,
-    hash: &[u8; 32],
+    hash: &[u8; 16],
 ) -> Result<bool, StoreError> {
     use rusqlite::OptionalExtension;
     Ok(txn
@@ -309,9 +309,11 @@ pub(crate) fn extent_exists(
 }
 
 /// The wire tree an artifact's bytes name, if they are an artifact.
-pub(crate) fn artifact_layout(bytes: &[u8]) -> Option<[u8; 32]> {
-    use distill_wire::artifact::{parse_artifact, ARTIFACT_MAGIC};
-    if !bytes.starts_with(&ARTIFACT_MAGIC) {
+pub(crate) fn artifact_layout(bytes: &[u8]) -> Option<[u8; 16]> {
+    use distill_core::header::{header, HEADER_LEN};
+    use distill_wire::artifact::{parse_artifact, ARTIFACT_FORMAT_VERSION};
+    let magic: [u8; HEADER_LEN] = header(distill_core::hash::Domain::ArtifactImage, ARTIFACT_FORMAT_VERSION);
+    if !bytes.starts_with(&magic) {
         return None;
     }
     parse_artifact(bytes).ok().map(|view| view.layout_hash.0)
@@ -335,13 +337,15 @@ fn wire_tree_preimage(tree_bytes: &[u8]) -> Result<(LayoutHash, Vec<u8>), StoreE
         detail: format!("cannot authenticate body: {error}"),
     })?;
     // The generic CAS authenticates raw payload bytes. Persist the exact
-    // DSWL digest preimage so its raw blake3 is the semantic LayoutHash;
+    // DSWL digest preimage so its raw hash is the semantic LayoutHash;
     // typed reads strip the domain/version prefix before serving DSWL.
-    let mut preimage = Vec::with_capacity(5 + tree_bytes.len());
-    preimage.extend_from_slice(b"DSWL");
-    preimage.push(DSWL_VERSION);
+    let mut preimage = Vec::with_capacity(8 + tree_bytes.len());
+    preimage.extend_from_slice(&distill_core::hash::digest_prefix(
+        distill_core::hash::Domain::Layout,
+        DSWL_VERSION,
+    ));
     preimage.extend_from_slice(tree_bytes);
-    debug_assert_eq!(*blake3::hash(&preimage).as_bytes(), layout_hash.0);
+    debug_assert_eq!(distill_core::hash::hash(&preimage), layout_hash.0);
     Ok((layout_hash, preimage))
 }
 
@@ -498,7 +502,7 @@ impl Store {
     /// appended only when the index does not hold it.
     fn put_installed(
         &mut self,
-        hash: [u8; 32],
+        hash: [u8; 16],
         bytes: &[u8],
         also: impl FnOnce(&mut Store) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
@@ -532,7 +536,7 @@ impl Store {
         load_edges: &[(AssetUuid, distill_core::id::TypeUuid)],
     ) -> Result<ContentHash, StoreError> {
         use crate::served::ServedWrite;
-        let hash = ContentHash(*blake3::hash(bytes).as_bytes());
+        let hash = ContentHash(distill_core::hash::hash(bytes));
         let layout = artifact_layout(bytes);
         self.put_installed(hash.0, bytes, |store| {
             if let Some(layout) = layout {
@@ -581,15 +585,15 @@ impl Store {
         }
 
         // The result's rows, and the bytes they name.
-        let mut extents: Vec<([u8; 32], &[u8])> = Vec::new();
+        let mut extents: Vec<([u8; 16], &[u8])> = Vec::new();
         let mut output_rows: Vec<OutputRow> = Vec::new();
         let mut aux_rows: Vec<AuxRow> = Vec::new();
         // (output key, wire tree) for each output that names one.
-        let mut layouts: Vec<(String, [u8; 32])> = Vec::new();
+        let mut layouts: Vec<(String, [u8; 16])> = Vec::new();
         let failure = match &commit.outcome {
             CommitOutcome::Success { outputs, aux } => {
                 for out in outputs {
-                    let hash = *blake3::hash(&out.bytes).as_bytes();
+                    let hash = distill_core::hash::hash(&out.bytes);
                     output_rows.push(OutputRow {
                         output_key: out.output_key.clone(),
                         type_uuids: out.type_uuids.clone(),
@@ -601,7 +605,7 @@ impl Store {
                     extents.push((hash, &out.bytes));
                 }
                 for a in aux {
-                    let hash = *blake3::hash(&a.bytes).as_bytes();
+                    let hash = distill_core::hash::hash(&a.bytes);
                     aux_rows.push(AuxRow {
                         debug_key: a.debug_key.clone(),
                         content_hash: ContentHash(hash),
@@ -625,7 +629,7 @@ impl Store {
             crate::cas::gc::evict_result_rows(&store.conn, key_kind, &static_key, &trace_digest)?;
             // Bytes the index holds are not appended again: a node result
             // names the bytes its last stage committed.
-            let mut group: Vec<([u8; 32], &[u8])> = Vec::new();
+            let mut group: Vec<([u8; 16], &[u8])> = Vec::new();
             for (hash, preimage) in &trees {
                 if !extent_exists(&store.conn, &hash.0)?
                     && !group.iter().any(|(held, _)| *held == hash.0)
@@ -676,7 +680,7 @@ impl Store {
                                                 types, content_hash)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 )?;
-                let mut name = |role: i64, name: &str, types: Option<Vec<u8>>, hash: &[u8; 32]| {
+                let mut name = |role: i64, name: &str, types: Option<Vec<u8>>, hash: &[u8; 16]| {
                     named.execute(rusqlite::params![
                         key_kind as i64,
                         static_key.as_slice(),
@@ -785,7 +789,7 @@ impl StoreReader {
     pub fn lookup_candidates(
         &self,
         key_kind: KeyKind,
-        static_key: &[u8; 32],
+        static_key: &[u8; 16],
     ) -> Result<Vec<Candidate>, StoreError> {
         let mut out = Vec::new();
         for row in self.candidate_rows(key_kind, static_key)? {
@@ -800,14 +804,14 @@ impl StoreReader {
     pub fn candidate_rows(
         &self,
         key_kind: KeyKind,
-        static_key: &[u8; 32],
+        static_key: &[u8; 16],
     ) -> Result<Vec<CandidateRow>, StoreError> {
         let mut stmt = self.conn.prepare_cached(CANDIDATE_ROWS)?;
         let rows = stmt.query_map(
             rusqlite::params![key_kind as i64, static_key.as_slice()],
             |r| {
                 Ok(CandidateRow {
-                    trace_digest: crate::bundles::blob32(r.get(0)?),
+                    trace_digest: crate::bundles::blob16(r.get(0)?),
                     memo_seq: MemoSeq(r.get::<_, i64>(1)? as u64),
                     key_kind,
                     static_key: *static_key,
@@ -850,7 +854,7 @@ impl StoreReader {
                 continue;
             };
             let name: String = r.get(4)?;
-            let hash = ContentHash(crate::bundles::blob32(r.get(6)?));
+            let hash = ContentHash(crate::bundles::blob16(r.get(6)?));
             match role {
                 ROLE_OUTPUT => {
                     let types: Vec<u8> = r.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default();
@@ -916,7 +920,7 @@ impl StoreReader {
         ))
     }
 
-    pub(crate) fn extent_of(&self, hash: &[u8; 32]) -> Result<Option<(u64, u64, u64)>, StoreError> {
+    pub(crate) fn extent_of(&self, hash: &[u8; 16]) -> Result<Option<(u64, u64, u64)>, StoreError> {
         use rusqlite::OptionalExtension;
         Ok(self
             .conn
@@ -938,7 +942,7 @@ impl StoreReader {
     /// verify against the requested hash — corruption is caught, never
     /// returned. Valid under namespace errors and pipeline failures (§13's
     /// pure-metadata classification).
-    pub fn cas_read(&self, hash: &[u8; 32]) -> Result<Vec<u8>, StoreError> {
+    pub fn cas_read(&self, hash: &[u8; 16]) -> Result<Vec<u8>, StoreError> {
         let (segment, offset, len) = self
             .extent_of(hash)?
             .ok_or(StoreError::NotFound { hash: *hash })?;
@@ -949,7 +953,7 @@ impl StoreReader {
             }
             bytes => bytes?,
         };
-        if *blake3::hash(&bytes).as_bytes() != *hash {
+        if distill_core::hash::hash(&bytes) != *hash {
             return Err(StoreError::CorruptExtent { segment, offset });
         }
         Ok(bytes)
@@ -959,21 +963,14 @@ impl StoreReader {
     /// the canonical DSWL body (without the stored digest preimage prefix).
     pub fn wire_tree_read(&self, hash: LayoutHash) -> Result<Vec<u8>, StoreError> {
         let preimage = self.cas_read(&hash.0)?;
-        let Some(body) = preimage.strip_prefix(b"DSWL") else {
+        let prefix =
+            distill_core::hash::digest_prefix(distill_core::hash::Domain::Layout, DSWL_VERSION);
+        let Some(body) = preimage.strip_prefix(&prefix) else {
             return Err(StoreError::InvalidWireTree {
-                detail: "stored extent lacks the DSWL domain prefix".to_owned(),
+                detail: "stored extent lacks the layout digest prefix at the supported DSWL version"
+                    .to_owned(),
             });
         };
-        let Some((&version, body)) = body.split_first() else {
-            return Err(StoreError::InvalidWireTree {
-                detail: "stored extent lacks the DSWL version".to_owned(),
-            });
-        };
-        if version != DSWL_VERSION {
-            return Err(StoreError::InvalidWireTree {
-                detail: format!("stored DSWL version {version} is unsupported"),
-            });
-        }
         let root = decode_dswl(body).map_err(|error| StoreError::InvalidWireTree {
             detail: format!("stored body is invalid: {error:?}"),
         })?;
@@ -1024,7 +1021,7 @@ impl StoreReader {
                 bytes.resize(len, 0);
                 file.seek(SeekFrom::Start(offset)).map_err(io_err(&path))?;
                 file.read_exact(&mut bytes).map_err(io_err(&path))?;
-                if blake3::hash(&bytes).as_bytes().as_slice() != hash.as_slice() {
+                if distill_core::hash::hash(&bytes).as_slice() != hash.as_slice() {
                     return Err(StoreError::CorruptExtent {
                         segment: segment as u64,
                         offset,
@@ -1061,7 +1058,7 @@ impl StoreReader {
 
 pub(crate) fn upsert_extent(
     txn: &rusqlite::Connection,
-    hash: &[u8; 32],
+    hash: &[u8; 16],
     segment: u64,
     offset: u64,
     len: u64,

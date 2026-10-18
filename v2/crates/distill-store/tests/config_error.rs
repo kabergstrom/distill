@@ -1,4 +1,4 @@
-//! DSCP v1 configuration-error grammar pinning.
+//! Configuration-error reason digest (`Domain::ConfigError` v1) pinning.
 
 use distill_store::state::{
     ConfigurationError, ConfigurationErrorCode, ConfigurationPathKey,
@@ -16,7 +16,7 @@ fn identity(target: &str, marker: u8) -> LayoutIdentity {
 }
 
 #[test]
-fn dscp_v1_discriminants_and_one_complete_preimage_are_byte_pinned() {
+fn config_error_discriminants_and_one_complete_preimage_are_byte_pinned() {
     assert_eq!(ConfigurationErrorCode::MalformedConfiguration as u16, 1);
     assert_eq!(ConfigurationErrorCode::NonLoopbackAddress as u16, 2);
     assert_eq!(ConfigurationErrorCode::DuplicateRootName as u16, 3);
@@ -52,17 +52,19 @@ fn dscp_v1_discriminants_and_one_complete_preimage_are_byte_pinned() {
         normalized_or_raw_path: "out/shaders".to_owned(),
     };
     let mut preimage = Vec::new();
-    preimage.extend_from_slice(b"DSCP");
-    preimage.push(1);
-    preimage.extend_from_slice(&4u16.to_le_bytes());
-    preimage.push(5);
+    preimage.extend_from_slice(&distill_core::hash::digest_prefix(
+        distill_core::hash::Domain::ConfigError,
+        1,
+    ));
+    preimage.extend_from_slice(&4u32.to_le_bytes());
+    preimage.extend_from_slice(&5u32.to_le_bytes());
     preimage.extend_from_slice(&11u32.to_le_bytes());
     preimage.extend_from_slice(b"out/shaders");
-    assert_eq!(reason.reason_hash(), *blake3::hash(&preimage).as_bytes());
+    assert_eq!(reason.reason_hash(), distill_core::hash::hash(&preimage));
 }
 
 #[test]
-fn every_dscp_v1_arm_maps_to_its_fixed_code() {
+fn every_config_error_arm_maps_to_its_fixed_code() {
     let owned = OwnedPathSide {
         kind: OwnedPathKind::AssetRoot,
         path: "assets".to_owned(),
@@ -73,7 +75,7 @@ fn every_dscp_v1_arm_maps_to_its_fixed_code() {
     let compilation = identity("aarch64-apple-darwin", 1);
     let cases = [
         (
-            DscpV1::MalformedConfiguration { file_hash: [0; 32] },
+            DscpV1::MalformedConfiguration { file_hash: [0; 16] },
             ConfigurationErrorCode::MalformedConfiguration,
         ),
         (

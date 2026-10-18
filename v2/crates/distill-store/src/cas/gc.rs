@@ -96,8 +96,8 @@ pub(crate) const EVICT_RESULT_ROW: &str = "DELETE FROM results
 pub(crate) fn evict_result_rows(
     txn: &rusqlite::Connection,
     key_kind: KeyKind,
-    static_key: &[u8; 32],
-    trace_digest: &[u8; 32],
+    static_key: &[u8; 16],
+    trace_digest: &[u8; 16],
 ) -> Result<Option<u64>, StoreError> {
     use rusqlite::OptionalExtension;
     let key = rusqlite::params![
@@ -171,8 +171,8 @@ impl Store {
     pub fn evict_result(
         &mut self,
         key_kind: KeyKind,
-        static_key: &[u8; 32],
-        trace_digest: &[u8; 32],
+        static_key: &[u8; 16],
+        trace_digest: &[u8; 16],
     ) -> Result<bool, StoreError> {
         self.write_txn(|store| {
             count_cas_write(&store.conn)?;
@@ -182,7 +182,7 @@ impl Store {
 
     /// Evict one installed artifact or wire tree, and what only it held.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn evict_installed(&mut self, hash: &[u8; 32]) -> Result<(), StoreError> {
+    pub fn evict_installed(&mut self, hash: &[u8; 16]) -> Result<(), StoreError> {
         self.write_txn(|store| {
             count_cas_write(&store.conn)?;
             release_install(&store.conn, hash).map(drop)
@@ -215,7 +215,7 @@ impl Store {
                         .query_row([from], |r| Ok((r.get(1)?, r.get(2)?, r.get(3)?)))
                         .optional()?)
                 };
-                let mut from = [0u8; 32];
+                let mut from = [0u8; 16];
                 getrandom::getrandom(&mut from).expect("OS randomness unavailable");
                 let victim = match sample(&from)? {
                     Some(victim) => Some(victim),
@@ -233,8 +233,8 @@ impl Store {
                         evict_result_rows(
                             txn,
                             key_kind,
-                            &crate::bundles::blob32(static_key),
-                            &crate::bundles::blob32(trace_digest),
+                            &crate::bundles::blob16(static_key),
+                            &crate::bundles::blob16(trace_digest),
                         )?
                         .unwrap_or(0)
                     }
@@ -539,7 +539,7 @@ mod tests {
     }
 
     fn commit_result(store: &mut Store, index: u32) {
-        let mut key = [0u8; 32];
+        let mut key = [0u8; 16];
         key[..4].copy_from_slice(&index.to_le_bytes());
         store
             .commit_build(BuildCommit {
@@ -679,7 +679,7 @@ mod tests {
         let mut store = Store::open(config).unwrap();
         let mut digests = Vec::new();
         for index in 0..200u32 {
-            let mut key = [0u8; 32];
+            let mut key = [0u8; 16];
             key[..4].copy_from_slice(&index.to_le_bytes());
             digests.push(key);
             commit_result(&mut store, index);
@@ -783,7 +783,7 @@ mod tests {
         store.enforce_cache_limit().unwrap();
         store.compact().unwrap();
         store
-            .lookup_candidates(KeyKind::Processor, &[0; 32])
+            .lookup_candidates(KeyKind::Processor, &[0; 16])
             .unwrap();
         assert_eq!(store.cas_writes().unwrap(), committed);
     }
@@ -806,7 +806,7 @@ mod tests {
                 authored_type: TypeUuid([1; 16]),
                 terminal_type: TypeUuid([2; 16]),
                 encoded_type: TypeUuid([3; 16]),
-                logical_hash: LogicalHash([4; 32]),
+                logical_hash: LogicalHash([4; 16]),
                 layout_hash: layout,
             },
             &[],
@@ -826,7 +826,7 @@ mod tests {
                 reads: Vec::new(),
                 wire_trees: vec![wire_bytes.clone()],
                 key_kind: KeyKind::Processor,
-                static_input_key: [1; 32],
+                static_input_key: [1; 16],
                 asset_uuid: AssetUuid([7; 16]),
                 trace: vec![1],
                 outcome: CommitOutcome::Success {
@@ -860,7 +860,7 @@ mod tests {
             )
             .is_err());
         assert!(a
-            .evict_result(KeyKind::Processor, &[1; 32], &receipt.trace_digest)
+            .evict_result(KeyKind::Processor, &[1; 16], &receipt.trace_digest)
             .unwrap());
         assert!(matches!(
             a.wire_tree_read(layout),
@@ -902,14 +902,14 @@ mod tests {
             }
         }));
         let output = vec![9u8; 300];
-        let hash = *blake3::hash(&output).as_bytes();
+        let hash = distill_core::hash::hash(&output);
         let second = vec![8u8; 300];
-        let second_hash = *blake3::hash(&second).as_bytes();
+        let second_hash = distill_core::hash::hash(&second);
         b.commit_build(BuildCommit {
             reads: Vec::new(),
             wire_trees: Vec::new(),
             key_kind: KeyKind::Processor,
-            static_input_key: [1; 32],
+            static_input_key: [1; 16],
             asset_uuid: AssetUuid([7; 16]),
             trace: vec![1],
             outcome: CommitOutcome::Success {
@@ -960,7 +960,7 @@ mod tests {
         store.put_artifact(b"kept", &[]).unwrap();
         let mut other = store.open_writer().unwrap();
         other.put_artifact(b"another writer's", &[]).unwrap();
-        let kept = *blake3::hash(b"kept").as_bytes();
+        let kept = distill_core::hash::hash(b"kept");
         let read = store.cas_read(&kept);
         assert!(
             read.as_deref().ok() == Some(b"kept".as_slice()),
@@ -969,7 +969,7 @@ mod tests {
         );
         assert_eq!(
             other
-                .cas_read(blake3::hash(b"another writer's").as_bytes())
+                .cas_read(&distill_core::hash::hash(b"another writer's"))
                 .unwrap(),
             b"another writer's"
         );
@@ -1025,7 +1025,7 @@ mod tests {
 
     fn not_found(store: &Store, bytes: &[u8]) -> bool {
         matches!(
-            store.cas_read(blake3::hash(bytes).as_bytes()),
+            store.cas_read(&distill_core::hash::hash(bytes)),
             Err(StoreError::NotFound { .. })
         )
     }
@@ -1066,11 +1066,11 @@ mod tests {
             "the index covers the dead bytes and the record after them"
         );
         assert_eq!(
-            store.cas_read(blake3::hash(b"before").as_bytes()).unwrap(),
+            store.cas_read(&distill_core::hash::hash(b"before")).unwrap(),
             b"before"
         );
         assert_eq!(
-            store.cas_read(blake3::hash(b"after").as_bytes()).unwrap(),
+            store.cas_read(&distill_core::hash::hash(b"after")).unwrap(),
             b"after"
         );
         assert!(not_found(&store, b"rolled back"));
@@ -1080,11 +1080,11 @@ mod tests {
         assert_eq!(recovery.truncated_tails, []);
         assert_eq!(recovery.lost_tails, []);
         assert_eq!(
-            store.cas_read(blake3::hash(b"before").as_bytes()).unwrap(),
+            store.cas_read(&distill_core::hash::hash(b"before")).unwrap(),
             b"before"
         );
         assert_eq!(
-            store.cas_read(blake3::hash(b"after").as_bytes()).unwrap(),
+            store.cas_read(&distill_core::hash::hash(b"after")).unwrap(),
             b"after"
         );
     }
@@ -1148,13 +1148,13 @@ mod tests {
         );
         assert_eq!(
             store
-                .cas_read(blake3::hash(&payload(1)).as_bytes())
+                .cas_read(&distill_core::hash::hash(&payload(1)))
                 .unwrap(),
             payload(1)
         );
         assert_eq!(
             store
-                .cas_read(blake3::hash(&payload(3)).as_bytes())
+                .cas_read(&distill_core::hash::hash(&payload(3)))
                 .unwrap(),
             payload(3)
         );
@@ -1182,13 +1182,13 @@ mod tests {
         assert_eq!(recovery.lost_tails, []);
         assert_eq!(
             store
-                .cas_read(blake3::hash(&payload(1)).as_bytes())
+                .cas_read(&distill_core::hash::hash(&payload(1)))
                 .unwrap(),
             payload(1)
         );
         assert_eq!(
             store
-                .cas_read(blake3::hash(&payload(3)).as_bytes())
+                .cas_read(&distill_core::hash::hash(&payload(3)))
                 .unwrap(),
             payload(3)
         );
@@ -1196,7 +1196,7 @@ mod tests {
         store.put_artifact(&payload(5), &[]).unwrap();
         assert_eq!(
             store
-                .cas_read(blake3::hash(&payload(5)).as_bytes())
+                .cas_read(&distill_core::hash::hash(&payload(5)))
                 .unwrap(),
             payload(5)
         );

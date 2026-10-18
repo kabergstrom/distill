@@ -10,7 +10,7 @@ use ngp_schema::Value;
 struct Fs {
     reads: VecDeque<Result<(RootedPath, Vec<u8>), RawFileFailureClass>>,
     listings: VecDeque<Result<Vec<RootedPath>, RawFileFailureClass>>,
-    importer: Option<[u8; 32]>,
+    importer: Option<[u8; 16]>,
 }
 
 impl ImportBackend for Fs {
@@ -23,7 +23,7 @@ impl ImportBackend for Fs {
     fn enumerate(&mut self, _: &FileQuery) -> Result<Vec<RootedPath>, RawFileFailureClass> {
         self.listings.pop_front().unwrap()
     }
-    fn capability(&mut self, _: &CapabilityKey) -> Option<[u8; 32]> {
+    fn capability(&mut self, _: &CapabilityKey) -> Option<[u8; 16]> {
         self.importer
     }
 }
@@ -78,7 +78,7 @@ fn successful_read_records_root_and_raw_byte_hash() {
             ..
         } => {
             assert_eq!(o.path, RootedPath::new("assets", "a.bin").unwrap());
-            assert_eq!(o.hash, *blake3::hash(b"abc").as_bytes());
+            assert_eq!(o.hash, distill_core::hash::hash(b"abc"));
         }
         other => panic!("unexpected {other:?}"),
     }

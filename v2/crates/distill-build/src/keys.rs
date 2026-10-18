@@ -1,13 +1,12 @@
-//! DSBI/DSSI/DSIH/DSNK key construction (§§8–9).
+//! Build keys (§§8–9): the import key, the processor static-inputs and
+//! input-hash digests, the target definition and the node key.
 
-use distill_core::canonical::{domain_digest, CanonicalEncoder, DSSI, DSTG};
+use distill_core::encoding::Encoder;
+use distill_core::hash::{digest, Domain};
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
 
 use crate::pipeline::{Target, TargetArch, TargetOs};
 use crate::trace::{trace_digest, TraceOp};
-
-const DSBI: [u8; 4] = *b"DSBI";
-const DSIH: [u8; 4] = *b"DSIH";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputHash {
@@ -21,19 +20,19 @@ pub struct StaticInputs {
     pub asset: AssetUuid,
     pub stage: u16,
     pub input_hash: ContentHash,
-    pub target_def_hash: [u8; 32],
+    pub target_def_hash: [u8; 16],
     pub processor_id: String,
     pub processor_version: u32,
-    pub dylib_hash: [u8; 32],
+    pub dylib_hash: [u8; 16],
     pub output_hashes: Vec<OutputHash>,
     pub artifact_format_version: u32,
 }
 
-pub fn static_inputs_digest(inputs: &StaticInputs) -> [u8; 32] {
-    domain_digest(DSSI, 1, |e| encode_static(e, inputs))
+pub fn static_inputs_digest(inputs: &StaticInputs) -> [u8; 16] {
+    digest(Domain::ProcessorInputs, 1, |e| encode_static(e, inputs))
 }
 
-fn encode_static(e: &mut CanonicalEncoder, inputs: &StaticInputs) {
+fn encode_static(e: &mut Encoder, inputs: &StaticInputs) {
     e.raw(&inputs.asset.0);
     e.u16(inputs.stage);
     e.raw(&inputs.input_hash.0);
@@ -53,9 +52,9 @@ fn encode_static(e: &mut CanonicalEncoder, inputs: &StaticInputs) {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppliedMigration {
-    pub bundle_hash: [u8; 32],
+    pub bundle_hash: [u8; 16],
     pub planner_version: u32,
-    pub dylib_hash: Option<[u8; 32]>,
+    pub dylib_hash: Option<[u8; 16]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,7 +64,7 @@ pub struct AutomaticMigration {
     pub planner_version: u32,
     /// Present only when the selected automatic plan executes a registered
     /// default materializer from the pinned pipeline epoch.
-    pub dylib_hash: Option<[u8; 32]>,
+    pub dylib_hash: Option<[u8; 16]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,19 +81,18 @@ pub struct BuildImportInputs {
     pub automatic_migration: Option<AutomaticMigration>,
     /// Validator code participates only when this authored type has at least
     /// one registered validator in the pinned epoch.
-    pub validator_dylib_hash: Option<[u8; 32]>,
+    pub validator_dylib_hash: Option<[u8; 16]>,
     pub artifact_format_version: u32,
 }
 
-pub fn build_import_digest(inputs: &BuildImportInputs) -> [u8; 32] {
-    domain_digest(DSBI, 1, |e| {
+pub fn build_import_digest(inputs: &BuildImportInputs) -> [u8; 16] {
+    digest(Domain::ImportKey, 1, |e| {
         e.raw(&inputs.asset.0);
         e.raw(&inputs.bundle.0);
         e.str(&inputs.local_id);
         e.raw(&inputs.authored_type.0);
         e.raw(&inputs.terminal_type.0);
-        e.u64(inputs.canonical_bundle_bytes.len() as u64);
-        e.raw(&inputs.canonical_bundle_bytes);
+        e.bytes(&inputs.canonical_bundle_bytes);
         e.raw(&inputs.logical.0);
         e.raw(&inputs.layout.0);
         e.seq(&inputs.migrations, |e, migration| {
@@ -113,22 +111,22 @@ pub fn build_import_digest(inputs: &BuildImportInputs) -> [u8; 32] {
     })
 }
 
-pub fn full_input_hash(inputs: &StaticInputs, trace: &[TraceOp]) -> [u8; 32] {
-    domain_digest(DSIH, 1, |e| {
+pub fn full_input_hash(inputs: &StaticInputs, trace: &[TraceOp]) -> [u8; 16] {
+    digest(Domain::InputHash, 1, |e| {
         encode_static(e, inputs);
         e.raw(&trace_digest(trace));
     })
 }
 
 /// Canonical target identity. Names are data, never config ordinals.
-pub fn target_definition_hash(target: &Target) -> [u8; 32] {
-    domain_digest(DSTG, 1, |e| {
-        e.u8(match target.os {
+pub fn target_definition_hash(target: &Target) -> [u8; 16] {
+    digest(Domain::TargetDefinition, 1, |e| {
+        e.enum_variant(match target.os {
             TargetOs::Linux => 0,
             TargetOs::MacOs => 1,
             TargetOs::Windows => 2,
         });
-        e.u8(match target.arch {
+        e.enum_variant(match target.arch {
             TargetArch::Aarch64 => 0,
             TargetArch::X86_64 => 1,
         });
@@ -142,7 +140,6 @@ pub fn target_definition_hash(target: &Target) -> [u8; 32] {
     })
 }
 
-const DSNK: [u8; 4] = *b"DSNK";
 
 /// One processor stage of a node's chain: its identity and the closed
 /// output table it declares.
@@ -182,8 +179,8 @@ pub struct NodeInputs {
     pub bundle_hash: ContentHash,
     pub authored_type: TypeUuid,
     pub authored_logical: LogicalHash,
-    pub target_def_hash: [u8; 32],
-    pub dylib_hash: [u8; 32],
+    pub target_def_hash: [u8; 16],
+    pub dylib_hash: [u8; 16],
     /// Whether the pinned epoch registers a validator for the authored type.
     pub validated: bool,
     pub terminal_type: TypeUuid,
@@ -194,12 +191,12 @@ pub struct NodeInputs {
     pub artifact_format_version: u32,
 }
 
-/// The `"DSNK"` node key.
-pub fn node_digest(inputs: &NodeInputs) -> [u8; 32] {
-    domain_digest(DSNK, 2, |e| encode_node(e, inputs))
+/// The node key.
+pub fn node_digest(inputs: &NodeInputs) -> [u8; 16] {
+    digest(Domain::NodeKey, 2, |e| encode_node(e, inputs))
 }
 
-fn encode_node(e: &mut CanonicalEncoder, inputs: &NodeInputs) {
+fn encode_node(e: &mut Encoder, inputs: &NodeInputs) {
     e.raw(&inputs.asset.0);
     e.raw(&inputs.bundle.0);
     e.str(&inputs.local_id);

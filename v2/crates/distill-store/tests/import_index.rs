@@ -22,7 +22,7 @@ fn publish(store: &mut Store, path: &str, bundle: u8) {
                 root,
                 path: path.to_owned(),
                 format_version: 1,
-                content_hash: ContentHash([bundle; 32]),
+                content_hash: ContentHash([bundle; 16]),
                 origin: None,
                 import_watched: true,
             })

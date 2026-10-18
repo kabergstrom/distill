@@ -152,7 +152,7 @@ pub struct TagSelector {
 /// use distill_core::id::{LogicalHash, TypeUuid};
 ///
 /// let _ = AssetQuery {
-///     migration_edge: Some((TypeUuid([1; 16]), LogicalHash([2; 32]))),
+///     migration_edge: Some((TypeUuid([1; 16]), LogicalHash([2; 16]))),
 ///     ..AssetQuery::default()
 /// };
 /// ```
@@ -218,33 +218,25 @@ impl AssetQuery {
     }
 }
 
-pub fn asset_query_result_hash(results: &[AssetUuid]) -> [u8; 32] {
+pub fn asset_query_result_hash(results: &[AssetUuid]) -> [u8; 16] {
     let mut results = results.to_vec();
     results.sort_unstable();
     results.dedup();
-    let mut h = blake3::Hasher::new();
-    h.update(b"ASTQ");
-    h.update(&[1]);
-    h.update(&(results.len() as u32).to_le_bytes());
-    for id in results {
-        h.update(&id.0);
-    }
-    *h.finalize().as_bytes()
+    distill_core::hash::digest(distill_core::hash::Domain::AssetQuery, 1, |e| {
+        e.seq(&results, |e, id| {
+            e.raw(&id.0);
+        });
+    })
 }
 
-pub fn file_query_result_hash(results: &[RootedPath]) -> [u8; 32] {
+pub fn file_query_result_hash(results: &[RootedPath]) -> [u8; 16] {
     let mut results = results.to_vec();
     results.sort_unstable();
     results.dedup();
-    let mut h = blake3::Hasher::new();
-    h.update(b"FILQ");
-    h.update(&[1]);
-    h.update(&(results.len() as u32).to_le_bytes());
-    for item in results {
-        for text in [&item.root.0, &item.path] {
-            h.update(&(text.len() as u32).to_le_bytes());
-            h.update(text.as_bytes());
-        }
-    }
-    *h.finalize().as_bytes()
+    distill_core::hash::digest(distill_core::hash::Domain::FileQuery, 1, |e| {
+        e.seq(&results, |e, item| {
+            e.str(&item.root.0);
+            e.str(&item.path);
+        });
+    })
 }

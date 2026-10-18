@@ -1,5 +1,5 @@
 //! Identity newtypes (§7). UUIDs display and parse in RFC 4122 hyphenated
-//! form; hashes as 64 lowercase hex chars. Parsing rejects any other shape —
+//! form; hashes (XXH3-128, 16 bytes) as 32 lowercase hex chars. Parsing rejects any other shape —
 //! never truncates, never guesses.
 
 use std::fmt;
@@ -11,7 +11,7 @@ pub struct IdParseError;
 
 impl fmt::Display for IdParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("malformed id: expected RFC 4122 hyphenated uuid or 64-char hex hash")
+        f.write_str("malformed id: expected RFC 4122 hyphenated uuid or 32-char hex hash")
     }
 }
 
@@ -90,7 +90,7 @@ macro_rules! uuid_newtype {
     };
 }
 
-/// Serde as the canonical text form (hyphenated uuid / 64-hex) — schema
+/// Serde as the canonical text form (hyphenated uuid / 32-hex) — schema
 /// JSON interchange wants readable ids, and the strict FromStr does the
 /// validation.
 #[cfg(feature = "serde")]
@@ -147,7 +147,7 @@ macro_rules! hash_newtype {
     ($(#[$doc:meta])* $name:ident) => {
         $(#[$doc])*
         #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-        pub struct $name(pub [u8; 32]);
+        pub struct $name(pub crate::hash::Hash128);
 
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -168,10 +168,10 @@ macro_rules! hash_newtype {
             type Err = IdParseError;
             fn from_str(s: &str) -> Result<Self, IdParseError> {
                 let b = s.as_bytes();
-                if b.len() != 64 {
+                if b.len() != 32 {
                     return Err(IdParseError);
                 }
-                let mut out = [0u8; 32];
+                let mut out = [0u8; 16];
                 for (i, chunk) in b.chunks_exact(2).enumerate() {
                     out[i] = (hex_val(chunk[0])? << 4) | hex_val(chunk[1])?;
                 }
@@ -184,27 +184,27 @@ macro_rules! hash_newtype {
 }
 
 hash_newtype! {
-    /// blake3 of an artifact's bytes — content identity: what traces
+    /// XXH3-128 of an artifact's bytes — content identity: what traces
     /// record, clients fetch, and packs ship (§9, §12).
     ContentHash
 }
 hash_newtype! {
-    /// Raw blake3 identity of the exact observed bundle-file bytes, whether
+    /// Raw XXH3-128 identity of the exact observed bundle-file bytes, whether
     /// valid or malformed. Parsing/canonicality is an independent gate (§6).
     BundleFileHash
 }
 
 impl BundleFileHash {
     pub fn of_observed_bytes(bytes: &[u8]) -> Self {
-        Self(*blake3::hash(bytes).as_bytes())
+        Self(crate::hash::hash(bytes))
     }
 }
 hash_newtype! {
-    /// blake3 of the DSLH encoding of a type's logical schema (§5).
+    /// The schema digest of a type's logical schema: the schema encoding of its root (§5).
     LogicalHash
 }
 hash_newtype! {
-    /// blake3 of the DSWL encoding of a type's wire layout tree (§12).
+    /// The layout digest of a type's wire layout tree: its layout encoding (§12).
     LayoutHash
 }
 
@@ -213,8 +213,9 @@ hash_newtype! {
 /// names as its rules bundle. Derived from the root's name, never stored; no
 /// bundle file may claim it.
 pub fn default_rules_bundle(root: &str) -> BundleUuid {
-    let digest = crate::canonical::domain_digest(*b"DSDR", 1, |encoder| encoder.str(root));
-    let mut uuid = [0; 16];
-    uuid.copy_from_slice(&digest[..16]);
-    BundleUuid(uuid)
+    BundleUuid(crate::hash::digest(
+        crate::hash::Domain::DefaultRulesBundle,
+        1,
+        |encoder| encoder.str(root),
+    ))
 }

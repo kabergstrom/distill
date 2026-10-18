@@ -18,7 +18,7 @@ use distill_rpc::capnp_transport::{
 use distill_rpc::*;
 use distill_test_project::{Asset, TestProject};
 
-const TARGET_HASH: TargetDefinitionHash = TargetDefinitionHash([7; 32]);
+const TARGET_HASH: TargetDefinitionHash = TargetDefinitionHash([7; 16]);
 /// `runtime_type_policy` of this type blocks until the test releases it.
 const STALL: TypeUuid = TypeUuid([0xee; 16]);
 /// `runtime_type_policy` of this type panics.
@@ -184,7 +184,7 @@ fn artifact(asset: AssetUuid, fixed: &[u8]) -> (ContentHash, ArtifactPayload) {
             authored_type: TypeUuid([1; 16]),
             terminal_type: TypeUuid([1; 16]),
             encoded_type: TypeUuid([1; 16]),
-            logical_hash: LogicalHash([77; 32]),
+            logical_hash: LogicalHash([77; 16]),
             layout_hash,
         },
         &[],

@@ -220,7 +220,7 @@ mod tests {
             }),
             identity: ngp_module_host::ModuleSourceIdentity {
                 crate_name: "pipeline".to_owned(),
-                source_hash: "0123456789abcdef".to_owned(),
+                source_hash: "0123456789abcdef0123456789abcdef".to_owned(),
             },
         };
 

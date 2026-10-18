@@ -26,7 +26,7 @@ pub enum ScalarKind {
 
 impl ScalarKind {
     /// The native/wire grammar id — declaration order, pinned.
-    pub fn grammar_id(self) -> u8 {
+    pub fn grammar_id(self) -> u32 {
         match self {
             ScalarKind::Bool => 0x00,
             ScalarKind::Char => 0x01,
@@ -515,9 +515,7 @@ impl ValidationContext {
                 let mut occupied = Vec::new();
                 self.frames.push((size, align));
                 for field in fields.iter() {
-                    let normalized = unicode_normalization::UnicodeNormalization::nfc(field.name)
-                        .collect::<String>();
-                    if !names.insert(normalized) || !declarations.insert(field.declaration_index) {
+                    if !names.insert(field.name) || !declarations.insert(field.declaration_index) {
                         self.frames.pop();
                         return Err(invalid(format!("{path} has duplicate field identity")));
                     }
@@ -662,9 +660,7 @@ fn validate_native_enum(
     let mut names = std::collections::BTreeSet::new();
     let mut declarations = std::collections::BTreeSet::new();
     for variant in variants {
-        let normalized =
-            unicode_normalization::UnicodeNormalization::nfc(variant.name).collect::<String>();
-        if !names.insert(normalized) || !declarations.insert(variant.declaration_index) {
+        if !names.insert(variant.name) || !declarations.insert(variant.declaration_index) {
             return Err(invalid(format!(
                 "{path} enum has duplicate variant identity"
             )));
@@ -822,7 +818,7 @@ pub enum NativeTagEncoding {
 pub enum LayoutHashError {
     /// A back-reference names a frame that is not on the expansion path.
     BackRefOutOfRange { distance: u32, frames: u32 },
-    /// Two fields or variants share one (NFC-normalized) name — no
+    /// Two fields or variants share one name — no
     /// canonical order exists, so no canonical bytes exist.
     DuplicateName(String),
     /// A field or variant name exceeds the grammar's u32 length bound.

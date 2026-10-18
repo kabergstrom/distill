@@ -56,7 +56,7 @@ pub use distill_store::state::{
 /// list of entries (one snapshot, each bundle read once); `blob` streams an
 /// entry's blob bytes.
 /// 29 (GAP 23 §15.3): `AuthoringRow` and `AuthoringInspection` carry the
-/// entry's `content` key (blake3 over schema hash, canonical text, blob
+/// entry's `content` key (a digest over schema hash, canonical text, blob
 /// refs and carried types; [`crate::content_key`]).
 /// 30 (GAP 23 §15.4): `Hub.subscribeIndex` delivers every published
 /// version's `Delta`, unfiltered; a `Delta` names source `files` changed
@@ -65,7 +65,10 @@ pub use distill_store::state::{
 /// 31 (GAP 23 §16.2): `TypeMember` carries the editor hints as one
 /// canonical JSON text (`editor`) instead of `hasRange`/`rangeMin`/
 /// `rangeMax`/`color`/`slider`/`hidden`.
-pub const PROTOCOL_VERSION: u32 = 31;
+/// 32 (GAP 23 §17.2): every hash, digest and identity on the wire is
+/// XXH3-128 (16 bytes; 32 hex chars), values and schemas in the §5
+/// encoding.
+pub const PROTOCOL_VERSION: u32 = 32;
 
 /// A watched import whose latest attempt failed. The bundle keeps serving its
 /// last good contents; the failure clears when a later import succeeds.
@@ -83,7 +86,7 @@ pub struct ImportFailure {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TargetDefinitionHash(pub [u8; 32]);
+pub struct TargetDefinitionHash(pub [u8; 16]);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectRequest {
@@ -507,14 +510,14 @@ impl AuthoringValue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BlobRef {
     pub len: u64,
-    pub hash: [u8; 32],
+    pub hash: [u8; 16],
 }
 
 impl BlobRef {
     pub fn of(bytes: &[u8]) -> Self {
         Self {
             len: bytes.len() as u64,
-            hash: *blake3::hash(bytes).as_bytes(),
+            hash: distill_core::hash::hash(bytes),
         }
     }
 }
@@ -1265,7 +1268,7 @@ pub struct AuthoringInspection {
     /// The type's path in the served schema; empty when unknown.
     pub type_name: String,
     /// The entry's authoring content key, as its row's (protocol 29).
-    pub content: [u8; 32],
+    pub content: [u8; 16],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1329,7 +1332,7 @@ pub struct AuthoringRow {
     pub primary: bool,
     /// The entry's authoring content key (§17 "Content keys"): equal keys
     /// mean equal values.
-    pub content: [u8; 32],
+    pub content: [u8; 16],
 }
 
 /// The import layer claiming a source file (§8 "Default imports":

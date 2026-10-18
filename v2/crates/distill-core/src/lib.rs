@@ -1,10 +1,12 @@
-//! distill-core: identity newtypes (§7) and the canonical record encoding
-//! (§5) every hashed composite in DESIGN.md uses.
+//! distill-core: identity newtypes (§7), the one encoding (§5), the hash
+//! and its digest domains (§5), and the shared file header.
 
 pub mod bootstrap;
 pub mod callback;
-pub mod canonical;
+pub mod encoding;
 pub mod frames;
+pub mod hash;
+pub mod header;
 pub mod id;
 pub mod target_set;
 pub mod tool;

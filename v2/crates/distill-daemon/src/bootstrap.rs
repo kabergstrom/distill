@@ -69,7 +69,7 @@ pub(crate) fn target_hash(
     config: &DaemonConfig,
     authority: &ProjectSchemaAuthority,
     target: &str,
-) -> Result<[u8; 32], BootstrapError> {
+) -> Result<[u8; 16], BootstrapError> {
     let targets = config
         .build_targets(authority.identity())
         .map_err(|error| BootstrapError::Config(error.to_string()))?;

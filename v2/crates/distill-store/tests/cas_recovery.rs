@@ -17,13 +17,13 @@ fn cfg(dir: &tempfile::TempDir) -> StoreConfig {
     StoreConfig::new(dir.path().join(".distill"))
 }
 
-fn commit(store: &mut Store, key: u8, bytes: &[u8]) -> [u8; 32] {
+fn commit(store: &mut Store, key: u8, bytes: &[u8]) -> [u8; 16] {
     store
         .commit_build(BuildCommit {
             reads: Vec::new(),
             wire_trees: Vec::new(),
             key_kind: KeyKind::Processor,
-            static_input_key: [key; 32],
+            static_input_key: [key; 16],
             asset_uuid: PARENT,
             trace: vec![key],
             outcome: CommitOutcome::Success {
@@ -36,7 +36,7 @@ fn commit(store: &mut Store, key: u8, bytes: &[u8]) -> [u8; 32] {
             },
         })
         .unwrap();
-    *blake3::hash(bytes).as_bytes()
+    distill_core::hash::hash(bytes)
 }
 
 fn segment_files(dir: &tempfile::TempDir) -> Vec<std::path::PathBuf> {
@@ -87,11 +87,11 @@ fn bytes_past_the_index_are_cut_off_and_publish_nothing() {
     assert_eq!(recovery.truncated_tails, [(0, indexed)], "{recovery:?}");
     assert_eq!(std::fs::metadata(&seg).unwrap().len(), indexed);
     assert!(matches!(
-        store.cas_read(blake3::hash(&payload).as_bytes()),
+        store.cas_read(&distill_core::hash::hash(&payload)),
         Err(StoreError::NotFound { .. })
     ));
     assert!(store
-        .lookup_candidates(KeyKind::Processor, &[9u8; 32])
+        .lookup_candidates(KeyKind::Processor, &[9u8; 16])
         .unwrap()
         .is_empty());
     assert_eq!(store.cas_read(&committed).unwrap(), b"committed artifact");
@@ -146,7 +146,7 @@ fn a_lost_tail_is_reported_and_changes_nothing() {
         );
         assert_eq!(
             store
-                .lookup_candidates(KeyKind::Processor, &[2u8; 32])
+                .lookup_candidates(KeyKind::Processor, &[2u8; 16])
                 .unwrap()
                 .len(),
             1
@@ -158,7 +158,7 @@ fn a_lost_tail_is_reported_and_changes_nothing() {
         assert_eq!(store.cas_read(&first).unwrap(), b"first artifact");
         assert_eq!(
             store
-                .lookup_candidates(KeyKind::Processor, &[1u8; 32])
+                .lookup_candidates(KeyKind::Processor, &[1u8; 16])
                 .unwrap()
                 .len(),
             1
@@ -193,12 +193,12 @@ fn a_segment_file_no_row_names_is_left_for_the_allocation_of_its_id() {
     // the next id.
     commit(&mut store, 2, b"after");
     assert_eq!(
-        store.cas_read(blake3::hash(b"after").as_bytes()).unwrap(),
+        store.cas_read(&distill_core::hash::hash(b"after")).unwrap(),
         b"after"
     );
     assert_eq!(
         store
-            .cas_read(blake3::hash(b"artifact").as_bytes())
+            .cas_read(&distill_core::hash::hash(b"artifact"))
             .unwrap(),
         b"artifact"
     );
@@ -218,12 +218,12 @@ fn dead_segments_are_deleted_at_startup() {
     let (_, digest) = {
         let hash = commit(&mut store, 1, &[1u8; 4096]);
         let candidates = store
-            .lookup_candidates(KeyKind::Processor, &[1; 32])
+            .lookup_candidates(KeyKind::Processor, &[1; 16])
             .unwrap();
         (hash, candidates[0].trace_digest)
     };
     assert!(store
-        .evict_result(KeyKind::Processor, &[1; 32], &digest)
+        .evict_result(KeyKind::Processor, &[1; 16], &digest)
         .unwrap());
     let dead = store.compact().unwrap().dead_segments;
     assert_eq!(dead.len(), 1);
@@ -249,7 +249,7 @@ fn node_publication(key: u8) -> (BuildCommit, Vec<u8>) {
             authored_type: TypeUuid([1; 16]),
             terminal_type: TypeUuid([2; 16]),
             encoded_type: TypeUuid([3; 16]),
-            logical_hash: LogicalHash([4; 32]),
+            logical_hash: LogicalHash([4; 16]),
             layout_hash: dswl_hash(&node).unwrap(),
         },
         &[AssetUuid([9; 16])],
@@ -262,7 +262,7 @@ fn node_publication(key: u8) -> (BuildCommit, Vec<u8>) {
         reads: Vec::new(),
         wire_trees: vec![dswl_bytes(&node).unwrap()],
         key_kind: KeyKind::Node,
-        static_input_key: [key; 32],
+        static_input_key: [key; 16],
         asset_uuid: AssetUuid([key; 16]),
         trace: vec![key],
         outcome: CommitOutcome::Success {
@@ -305,16 +305,16 @@ fn a_rolled_back_publication_stays_rolled_back_across_a_restart() {
     });
     assert!(rolled_back.is_err());
     assert!(store
-        .candidate_rows(KeyKind::Node, &[2; 32])
+        .candidate_rows(KeyKind::Node, &[2; 16])
         .unwrap()
         .is_empty());
     drop(store);
 
     let (store, _) = Store::open_with_recovery(cfg(&dir)).unwrap();
-    let hash = ContentHash(*blake3::hash(&second_bytes).as_bytes());
+    let hash = ContentHash(distill_core::hash::hash(&second_bytes));
     assert!(
         store
-            .candidate_rows(KeyKind::Node, &[2; 32])
+            .candidate_rows(KeyKind::Node, &[2; 16])
             .unwrap()
             .is_empty(),
         "recovery adopted a rolled-back node result; its load edges: {:?}",
@@ -326,9 +326,9 @@ fn a_rolled_back_publication_stays_rolled_back_across_a_restart() {
     ));
     // The committed publication is intact.
     assert_eq!(
-        store.candidate_rows(KeyKind::Node, &[1; 32]).unwrap().len(),
+        store.candidate_rows(KeyKind::Node, &[1; 16]).unwrap().len(),
         1
     );
-    let first_hash = ContentHash(*blake3::hash(&first_bytes).as_bytes());
+    let first_hash = ContentHash(distill_core::hash::hash(&first_bytes));
     assert_eq!(store.artifact_load_edges(first_hash).unwrap(), edges);
 }

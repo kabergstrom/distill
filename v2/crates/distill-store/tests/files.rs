@@ -17,7 +17,7 @@ fn file_state(mtime: i64) -> FileState {
         mtime,
         size: 42,
         kind: FileKind::File,
-        content_hash: Some(ContentHash([3u8; 32])),
+        content_hash: Some(ContentHash([3u8; 16])),
     }
 }
 
@@ -78,7 +78,7 @@ fn file_rows_roundtrip_and_are_keyed_per_root() {
     assert_eq!(a.mtime, 100);
     assert_eq!(b.mtime, 200);
     assert_eq!(a.kind, FileKind::File);
-    assert_eq!(a.content_hash, Some(ContentHash([3u8; 32])));
+    assert_eq!(a.content_hash, Some(ContentHash([3u8; 16])));
     assert!(store.file(main, "absent").unwrap().is_none());
     let _ = (main, engine);
     assert_eq!(

@@ -406,7 +406,7 @@ impl TestBuilds {
                 authored_type,
                 terminal_type: request.requested_terminal_type,
                 encoded_type: request.requested_terminal_type,
-                logical_hash: LogicalHash([77; 32]),
+                logical_hash: LogicalHash([77; 16]),
                 layout_hash,
             },
             &[],
@@ -913,5 +913,5 @@ pub fn put_wire_tree(server: &ServerHandle, bytes: &[u8]) -> LayoutHash {
 
 /// The schema authority of [`project_schema`].
 pub fn project_authority() -> Arc<ProjectSchemaAuthority> {
-    Arc::new(ProjectSchemaAuthority::from_schema(project_schema(), [0; 32]).unwrap())
+    Arc::new(ProjectSchemaAuthority::from_schema(project_schema(), [0; 16]).unwrap())
 }

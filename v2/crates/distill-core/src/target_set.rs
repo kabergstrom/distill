@@ -8,7 +8,7 @@ use unicode_normalization::UnicodeNormalization;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetSetRow {
     pub name: String,
-    pub target_definition_hash: [u8; 32],
+    pub target_definition_hash: crate::hash::Hash128,
 }
 
 /// A canonical, NFC-normalized, name-sorted target set.

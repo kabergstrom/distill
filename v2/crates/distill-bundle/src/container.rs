@@ -1,22 +1,20 @@
 //! The container encoding (§6) and the writer for both encodings.
 //!
 //! ```text
-//! magic     [u8;8] = 89 44 53 42 0D 0A 1A 0A
-//! version   u32 LE   (pinned = 1)
+//! header    [u8;12]  shared file header (§5): "NGPF", u32 Domain::Bundle, u32 version (2)
 //! json_len  u64 LE
 //! blob_len  u64 LE
-//! json_crc  u32 LE   CRC-32C of the json bytes
-//! blob_crc  u32 LE   CRC-32C of the blob chunk bytes
 //! json      [json_len]   envelope JSON; blob leaves are {"len","offset"}
-//! pad       zeros to 16-byte alignment of (36 + json_len)
+//! pad       zeros to 16-byte alignment of (28 + json_len)
 //! blob      [blob_len]
 //! ```
 //!
 //! Parse-side validation runs before any large allocation: header length,
-//! magic (with loud line-ending-mangling detection), version, lengths
+//! the shared header (magic, domain, version, refused by name), lengths
 //! checked against the actual file size with overflow-checked arithmetic
-//! (the file must be exactly `36 + json_len + pad + blob_len`), CRCs, pad
-//! bytes. Blob placement is then validated globally: offsets 16-aligned,
+//! (the file must be exactly `28 + json_len + pad + blob_len`), pad bytes.
+//! There is no checksum (§5): a bundle file is hashed whole on every
+//! observation, and a truncated one fails these length checks. Blob placement is then validated globally: offsets 16-aligned,
 //! non-overlapping, at exactly the canonical position (the next 16-aligned
 //! offset in `(local_id, encoded path)` order — zero-length blobs take the
 //! current position and may share the next blob's offset), inter-blob gap
@@ -30,37 +28,24 @@ use std::collections::BTreeMap;
 
 use ngp_schema::{blob_sites, encode_path, node_hash, write_value, SnapshotError, WriteOptions};
 
-use crate::crc32c::crc32c;
 use crate::envelope;
 use crate::error::BundleError;
 use crate::data::{display, map_error, text_depth, BlobSite, Blobs, LayoutSink, MAX_DATA_DEPTH};
 use crate::envelope::Strictness;
-use crate::{Bundle, BundleError as E, CONTAINER_MAGIC, CONTAINER_VERSION};
+use crate::{Bundle, BundleError as E, CONTAINER_VERSION};
+use distill_core::hash::Domain;
+use distill_core::header::{read_header, write_header};
 
-const HEADER_LEN: u64 = 36;
+const HEADER_LEN: u64 = distill_core::header::HEADER_LEN as u64 + 16;
 
 fn align16(n: u64) -> Option<u64> {
     n.checked_add(15).map(|x| x & !15)
-}
-
-fn le_u32(bytes: &[u8], at: usize) -> u32 {
-    let mut buf = [0u8; 4];
-    buf.copy_from_slice(&bytes[at..at + 4]);
-    u32::from_le_bytes(buf)
 }
 
 fn le_u64(bytes: &[u8], at: usize) -> u64 {
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&bytes[at..at + 8]);
     u64::from_le_bytes(buf)
-}
-
-/// Does a non-matching magic look like the real magic after line-ending
-/// translation? LF→CRLF doubles the `\n` bytes; CRLF→LF collapses the
-/// `\r\n`. The PNG-style magic exists to catch exactly this, loudly.
-fn looks_line_ending_mangled(found: &[u8; 8]) -> bool {
-    found[..4] == CONTAINER_MAGIC[..4]
-        && (found[4..8] == [0x0D, 0x0D, 0x0A, 0x1A] || found[4..7] == [0x0A, 0x1A, 0x0A])
 }
 
 pub(crate) fn parse(bytes: &[u8]) -> Result<Bundle, BundleError> {
@@ -79,22 +64,9 @@ fn parse_with(
     if bytes.len() < HEADER_LEN as usize {
         return Err(E::TooShortForHeader { len: bytes.len() });
     }
-    let mut magic = [0u8; 8];
-    magic.copy_from_slice(&bytes[0..8]);
-    if magic != CONTAINER_MAGIC {
-        return Err(E::BadMagic {
-            found: magic,
-            line_ending_mangled: looks_line_ending_mangled(&magic),
-        });
-    }
-    let version = le_u32(bytes, 8);
-    if version != CONTAINER_VERSION {
-        return Err(E::UnsupportedContainerVersion { found: version });
-    }
+    read_header(bytes, Domain::Bundle, CONTAINER_VERSION).map_err(E::Header)?;
     let json_len = le_u64(bytes, 12);
     let blob_len = le_u64(bytes, 20);
-    let json_crc = le_u32(bytes, 28);
-    let blob_crc = le_u32(bytes, 32);
 
     let overflow = E::HeaderOverflow { json_len, blob_len };
     let json_end = HEADER_LEN.checked_add(json_len).ok_or(overflow.clone())?;
@@ -119,20 +91,6 @@ fn parse_with(
     let pad = &bytes[json_end as usize..chunk_start as usize];
     let chunk = &bytes[chunk_start as usize..];
 
-    let actual_json_crc = crc32c(json);
-    if actual_json_crc != json_crc {
-        return Err(E::JsonCrcMismatch {
-            expected: json_crc,
-            actual: actual_json_crc,
-        });
-    }
-    let actual_blob_crc = crc32c(chunk);
-    if actual_blob_crc != blob_crc {
-        return Err(E::BlobCrcMismatch {
-            expected: blob_crc,
-            actual: actual_blob_crc,
-        });
-    }
     if let Some(i) = pad.iter().position(|&b| b != 0) {
         return Err(E::NonzeroPadByte {
             file_offset: json_end + i as u64,
@@ -331,12 +289,9 @@ pub(crate) fn write(bundle: &Bundle) -> Result<Vec<u8>, BundleError> {
 
     // ---- header + pad + chunk ----
     let mut out = Vec::with_capacity(HEADER_LEN as usize + json.len() + 15 + chunk.len());
-    out.extend_from_slice(&CONTAINER_MAGIC);
-    out.extend_from_slice(&CONTAINER_VERSION.to_le_bytes());
+    write_header(&mut out, Domain::Bundle, CONTAINER_VERSION);
     out.extend_from_slice(&(json.len() as u64).to_le_bytes());
     out.extend_from_slice(&(chunk.len() as u64).to_le_bytes());
-    out.extend_from_slice(&crc32c(&json).to_le_bytes());
-    out.extend_from_slice(&crc32c(&chunk).to_le_bytes());
     out.extend_from_slice(&json);
     let padded = align16(out.len() as u64).ok_or_else(overflow)?;
     out.resize(padded as usize, 0);

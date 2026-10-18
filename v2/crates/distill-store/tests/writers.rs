@@ -233,7 +233,7 @@ fn a_failed_inline_build_flush_commits_no_partial_node() {
                 authored_type: TypeUuid([1; 16]),
                 terminal_type: TypeUuid([2; 16]),
                 encoded_type: TypeUuid([3; 16]),
-                logical_hash: LogicalHash([4; 32]),
+                logical_hash: LogicalHash([4; 16]),
                 layout_hash: dswl_hash(&node).unwrap(),
             },
             &[AssetUuid([9; 16])],
@@ -246,7 +246,7 @@ fn a_failed_inline_build_flush_commits_no_partial_node() {
             reads: Vec::new(),
             wire_trees: vec![dswl_bytes(&node).unwrap()],
             key_kind: KeyKind::Node,
-            static_input_key: [key; 32],
+            static_input_key: [key; 16],
             asset_uuid: AssetUuid([key; 16]),
             trace: vec![key],
             outcome: CommitOutcome::Success {
@@ -271,7 +271,7 @@ fn a_failed_inline_build_flush_commits_no_partial_node() {
     assert!(flush.is_err());
     store.finish_input(true).unwrap();
     assert!(store
-        .candidate_rows(KeyKind::Node, &[3; 32])
+        .candidate_rows(KeyKind::Node, &[3; 16])
         .unwrap()
         .is_empty());
 

@@ -691,7 +691,7 @@ impl ProcessLoop {
 enum ArtifactSourceState {
     Missing,
     Unreadable(std::io::ErrorKind),
-    Bytes([u8; 32]),
+    Bytes([u8; 16]),
 }
 
 #[derive(Clone)]
@@ -702,7 +702,7 @@ struct SchemaObservation {
 
 fn observe_artifact_source(path: &Path) -> ArtifactSourceState {
     match std::fs::read(path) {
-        Ok(bytes) => ArtifactSourceState::Bytes(*blake3::hash(&bytes).as_bytes()),
+        Ok(bytes) => ArtifactSourceState::Bytes(distill_core::hash::hash(&bytes)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => ArtifactSourceState::Missing,
         Err(error) => ArtifactSourceState::Unreadable(error.kind()),
     }
@@ -711,7 +711,7 @@ fn observe_artifact_source(path: &Path) -> ArtifactSourceState {
 fn observe_schema_source(path: &Path) -> SchemaObservation {
     match std::fs::read(path) {
         Ok(bytes) => SchemaObservation {
-            state: ArtifactSourceState::Bytes(*blake3::hash(&bytes).as_bytes()),
+            state: ArtifactSourceState::Bytes(distill_core::hash::hash(&bytes)),
             outcome: ProjectSchemaAuthority::from_json(&bytes)
                 .map(Arc::new)
                 .map_err(|error| error.to_string()),
@@ -733,7 +733,7 @@ fn observe_schema_source(path: &Path) -> SchemaObservation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ConfigSourceState {
     Failure(Box<DscpV1>),
-    Bytes([u8; 32]),
+    Bytes([u8; 16]),
 }
 
 struct ConfigObservation {
@@ -1188,7 +1188,7 @@ fn observe_configuration(path: &Path) -> ConfigObservation {
             format!("cannot read {}: {error}", path.display()),
         );
     }
-    let hash = *blake3::hash(&bytes).as_bytes();
+    let hash = distill_core::hash::hash(&bytes);
     let outcome = match std::str::from_utf8(&bytes) {
         Ok(source) => DaemonConfig::parse_staged(path, source).map_err(|errors| {
             let selected = ConfigurationError::select_canonical(errors.iter().map(|error| {

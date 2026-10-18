@@ -10,6 +10,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use crate::encoding::{Decoder, Encoder};
+use crate::hash::{digest_bytes, Domain, SCHEMA_DIGEST_VERSION};
 use crate::id::{LogicalHash, TypeUuid};
 
 mod checked_in {
@@ -18,11 +20,13 @@ mod checked_in {
 
 pub use checked_in::BOOTSTRAP_CONTROL_SPEC_V1_BYTES;
 
-const VERSION: u8 = 1;
+/// The spec encoding's version: `u32` symbols and schema encodings with
+/// `u32` node kinds (§5).
+const VERSION: u32 = 2;
 pub const BOOTSTRAP_CONTROL_COUNT: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u8)]
+#[repr(u32)]
 pub enum BootstrapControlSymbol {
     ImportRecord = 3,
     DirectoryImportRules = 4,
@@ -30,7 +34,7 @@ pub enum BootstrapControlSymbol {
 }
 
 impl BootstrapControlSymbol {
-    fn decode(value: u8) -> Result<Self, BootstrapSpecError> {
+    fn decode(value: u32) -> Result<Self, BootstrapSpecError> {
         match value {
             3 => Ok(Self::ImportRecord),
             4 => Ok(Self::DirectoryImportRules),
@@ -80,9 +84,9 @@ pub struct BootstrapControlSpecV1(pub [BootstrapControlSpecRowV1; BOOTSTRAP_CONT
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootstrapSpecError {
-    UnsupportedVersion(u8),
+    UnsupportedVersion(u32),
     WrongCount(u32),
-    UnknownSymbol(u8),
+    UnknownSymbol(u32),
     DuplicateSymbol(BootstrapControlSymbol),
     DuplicateType(TypeUuid),
     SymbolUuidMismatch {
@@ -93,8 +97,7 @@ pub enum BootstrapSpecError {
     EmptyLogicalSchema(BootstrapControlSymbol),
     RowsNotStrictlySorted,
     LengthOverflow,
-    Truncated,
-    TrailingBytes,
+    Decode(crate::encoding::DecodeError),
 }
 
 impl fmt::Display for BootstrapSpecError {
@@ -107,12 +110,12 @@ impl std::error::Error for BootstrapSpecError {}
 
 impl BootstrapControlSpecV1 {
     pub fn parse(bytes: &[u8]) -> Result<Self, BootstrapSpecError> {
-        let mut reader = Reader { bytes, position: 0 };
-        let version = reader.u8()?;
+        let mut reader = Decoder::new(bytes);
+        let version = reader.u32().map_err(BootstrapSpecError::Decode)?;
         if version != VERSION {
             return Err(BootstrapSpecError::UnsupportedVersion(version));
         }
-        let count = reader.u32()?;
+        let count = reader.u32().map_err(BootstrapSpecError::Decode)?;
         if count != BOOTSTRAP_CONTROL_COUNT as u32 {
             return Err(BootstrapSpecError::WrongCount(count));
         }
@@ -120,11 +123,12 @@ impl BootstrapControlSpecV1 {
         let mut rows = Vec::with_capacity(BOOTSTRAP_CONTROL_COUNT);
         let mut symbols = BTreeSet::new();
         for _ in 0..BOOTSTRAP_CONTROL_COUNT {
-            let symbol = BootstrapControlSymbol::decode(reader.u8()?)?;
+            let symbol =
+                BootstrapControlSymbol::decode(reader.u32().map_err(BootstrapSpecError::Decode)?)?;
             if !symbols.insert(symbol) {
                 return Err(BootstrapSpecError::DuplicateSymbol(symbol));
             }
-            let type_uuid = TypeUuid(reader.array()?);
+            let type_uuid = TypeUuid(reader.array().map_err(BootstrapSpecError::Decode)?);
             let expected = symbol_uuid(symbol);
             if type_uuid != expected {
                 return Err(BootstrapSpecError::SymbolUuidMismatch {
@@ -133,24 +137,26 @@ impl BootstrapControlSpecV1 {
                     observed: type_uuid,
                 });
             }
-            let length =
-                usize::try_from(reader.u32()?).map_err(|_| BootstrapSpecError::LengthOverflow)?;
-            let logical_schema = reader.take(length)?.to_vec();
+            let logical_schema = reader
+                .bytes()
+                .map_err(BootstrapSpecError::Decode)?
+                .to_vec();
             if logical_schema.is_empty() {
                 return Err(BootstrapSpecError::EmptyLogicalSchema(symbol));
             }
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(b"DSLH");
-            hasher.update(&[VERSION]);
-            hasher.update(&logical_schema);
+            let logical_hash = LogicalHash(digest_bytes(
+                Domain::Schema,
+                SCHEMA_DIGEST_VERSION,
+                &logical_schema,
+            ));
             rows.push(BootstrapControlSpecRowV1 {
                 symbol,
                 type_uuid,
                 logical_schema,
-                logical_hash: LogicalHash(*hasher.finalize().as_bytes()),
+                logical_hash,
             });
         }
-        reader.finish()?;
+        reader.finish().map_err(BootstrapSpecError::Decode)?;
         for pair in rows.windows(2) {
             if pair[0].type_uuid == pair[1].type_uuid {
                 return Err(BootstrapSpecError::DuplicateType(pair[0].type_uuid));
@@ -167,16 +173,18 @@ impl BootstrapControlSpecV1 {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, BootstrapSpecError> {
-        let mut bytes = vec![VERSION];
-        bytes.extend_from_slice(&(BOOTSTRAP_CONTROL_COUNT as u32).to_le_bytes());
+        let mut encoder = Encoder::new();
+        encoder.u32(VERSION);
+        encoder.u32(BOOTSTRAP_CONTROL_COUNT as u32);
         for row in &self.0 {
-            bytes.push(row.symbol as u8);
-            bytes.extend_from_slice(&row.type_uuid.0);
-            let length = u32::try_from(row.logical_schema.len())
-                .map_err(|_| BootstrapSpecError::LengthOverflow)?;
-            bytes.extend_from_slice(&length.to_le_bytes());
-            bytes.extend_from_slice(&row.logical_schema);
+            encoder.enum_variant(row.symbol as u32);
+            encoder.raw(&row.type_uuid.0);
+            if u32::try_from(row.logical_schema.len()).is_err() {
+                return Err(BootstrapSpecError::LengthOverflow);
+            }
+            encoder.bytes(&row.logical_schema);
         }
+        let bytes = encoder.into_bytes();
         // Encoding is used only by diagnostics/tests; the parser remains the
         // single structural authority.
         Self::parse(&bytes)?;
@@ -203,44 +211,3 @@ pub fn bootstrap_control_logical_registry_v1(
         .collect())
 }
 
-struct Reader<'a> {
-    bytes: &'a [u8],
-    position: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn take(&mut self, length: usize) -> Result<&'a [u8], BootstrapSpecError> {
-        let end = self
-            .position
-            .checked_add(length)
-            .ok_or(BootstrapSpecError::Truncated)?;
-        let value = self
-            .bytes
-            .get(self.position..end)
-            .ok_or(BootstrapSpecError::Truncated)?;
-        self.position = end;
-        Ok(value)
-    }
-
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], BootstrapSpecError> {
-        self.take(N)?
-            .try_into()
-            .map_err(|_| BootstrapSpecError::Truncated)
-    }
-
-    fn u8(&mut self) -> Result<u8, BootstrapSpecError> {
-        Ok(self.array::<1>()?[0])
-    }
-
-    fn u32(&mut self) -> Result<u32, BootstrapSpecError> {
-        Ok(u32::from_le_bytes(self.array()?))
-    }
-
-    fn finish(self) -> Result<(), BootstrapSpecError> {
-        if self.position == self.bytes.len() {
-            Ok(())
-        } else {
-            Err(BootstrapSpecError::TrailingBytes)
-        }
-    }
-}

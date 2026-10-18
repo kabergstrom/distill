@@ -128,7 +128,7 @@ impl AuthoringService {
                 .ok_or_else(|| invalid("bundle root identity is missing"))?;
             let path = scanner.physical_path(&root, &meta.path).map_err(invalid)?;
             let bytes = scanner.read_identity_checked(&path).map_err(invalid)?;
-            let observed = ContentHash(*blake3::hash(&bytes).as_bytes());
+            let observed = ContentHash(distill_core::hash::hash(&bytes));
             if observed != meta.content_hash {
                 return Err(invalid(format!(
                     "bundle {} changed since durable version {}",
@@ -679,7 +679,7 @@ mod reference_tests {
             ),
             &root,
         );
-        one_entry(LogicalSchema { root }, LogicalHash([1; 32]), data)
+        one_entry(LogicalSchema { root }, LogicalHash([1; 16]), data)
     }
 
     #[test]
@@ -730,7 +730,7 @@ mod reference_tests {
             ),
             &root,
         );
-        let bundle = one_entry(LogicalSchema { root }, LogicalHash([1; 32]), data);
+        let bundle = one_entry(LogicalSchema { root }, LogicalHash([1; 16]), data);
         let references = bundle_path_references(&bundle);
         assert_eq!(
             references,

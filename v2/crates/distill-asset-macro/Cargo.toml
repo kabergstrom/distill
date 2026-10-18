@@ -15,7 +15,6 @@ unicode-normalization = "0.1"
 
 [dev-dependencies]
 trybuild = { workspace = true }
-blake3 = { workspace = true }
 distill-asset = { path = "../distill-asset" }
 distill-core = { path = "../distill-core" }
 distill-bundle = { path = "../distill-bundle" }

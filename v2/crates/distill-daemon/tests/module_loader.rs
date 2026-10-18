@@ -13,8 +13,8 @@ use distill_daemon::module_loader::{
 fn identity() -> ModuleAbiIdentity {
     ModuleAbiIdentity {
         rustc: "rustc 1.92.0".to_owned(),
-        interface_fingerprint: [1; 32],
-        measured_interface: [2; 32],
+        interface_fingerprint: [1; 16],
+        measured_interface: [2; 16],
         panic_strategy: "unwind".to_owned(),
         allocator: "system".to_owned(),
     }
@@ -44,8 +44,8 @@ fn module_abi_identity_covers_the_resolved_interface_closure() {
     }
 
     let host = host_module_abi_identity();
-    assert_ne!(host.interface_fingerprint, [0; 32]);
-    assert_ne!(host.measured_interface, [0; 32]);
+    assert_ne!(host.interface_fingerprint, [0; 16]);
+    assert_ne!(host.measured_interface, [0; 16]);
     assert_eq!(host.rustc, host_rustc_identity());
     assert!(!host_rustc_identity().is_empty());
 }
@@ -121,11 +121,11 @@ fn compiled_pipeline_cdylib_opens_registers_unloads_and_closes() {
             distill_pipeline_fixture::VALUE_TYPE,
         ]
         .into_iter()
-        .map(|type_uuid| (type_uuid, distill_core::id::LogicalHash([1; 32])))
+        .map(|type_uuid| (type_uuid, distill_core::id::LogicalHash([1; 16])))
         .collect(),
         targets: vec![TargetDefinition {
             name: "desktop".to_owned(),
-            fingerprint: [0x42; 32],
+            fingerprint: [0x42; 16],
         }],
     };
     let mut host = ModuleHost::new(temp.path().join("module-host")).unwrap();

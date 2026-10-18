@@ -5,8 +5,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-blake3 = { workspace = true }
-unicode-normalization = { workspace = true }
 distill-core = { path = "../distill-core" }
 # The canonical structural blob path encoding is pinned in distill-bundle
 # (§6) and REUSED here: the §12 artifact blob table sorts by the same

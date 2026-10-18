@@ -5,6 +5,8 @@ mod common;
 
 use common::*;
 use distill_bundle::{parse_bundle, write_bundle, BundleError as E};
+use distill_core::hash::Domain;
+use distill_core::header::HeaderError;
 use ngp_schema::SchemaNode as N;
 
 /// A canonical container with multiple blobs and inter-blob gaps.
@@ -29,70 +31,25 @@ fn too_short_for_header() {
 }
 
 #[test]
-fn bad_magic_byte() {
+fn without_the_magic_bytes_are_not_a_container() {
+    // The magic dispatches a container; without it the bytes are read as
+    // the plain encoding's text and refused there, never as a container.
     let mut bytes = base_container();
-    bytes[5] = 0x00; // clobber the \n inside the magic
+    bytes[1] = b'X';
+    let err = parse_bundle(&bytes).unwrap_err();
+    assert!(!matches!(err, E::Header(_)), "got {err:?}");
+}
+
+#[test]
+fn another_formats_header_is_refused_by_name() {
+    let mut bytes = base_container();
+    bytes[4..8].copy_from_slice(&(Domain::PackArchive as u32).to_le_bytes());
     let err = parse_bundle(&bytes).unwrap_err();
     assert!(
         matches!(
             err,
-            E::BadMagic {
-                line_ending_mangled: false,
-                ..
-            }
-        ),
-        "got {err:?}"
-    );
-}
-
-#[test]
-fn magic_mangled_by_lf_to_crlf_translation() {
-    // Simulate a checkout/transfer that rewrote LF as CRLF over the whole
-    // file: the magic's \n bytes double into \r\n.
-    let base = base_container();
-    let mut mangled = Vec::new();
-    for &b in &base {
-        if b == 0x0A {
-            mangled.push(0x0D);
-        }
-        mangled.push(b);
-    }
-    let err = parse_bundle(&mangled).unwrap_err();
-    assert!(
-        matches!(
-            err,
-            E::BadMagic {
-                line_ending_mangled: true,
-                ..
-            }
-        ),
-        "got {err:?}"
-    );
-}
-
-#[test]
-fn magic_mangled_by_crlf_to_lf_translation() {
-    // The reverse translation: \r\n collapses to \n.
-    let base = base_container();
-    let mut mangled = Vec::new();
-    let mut i = 0;
-    while i < base.len() {
-        if base[i] == 0x0D && base.get(i + 1) == Some(&0x0A) {
-            mangled.push(0x0A);
-            i += 2;
-        } else {
-            mangled.push(base[i]);
-            i += 1;
-        }
-    }
-    let err = parse_bundle(&mangled).unwrap_err();
-    assert!(
-        matches!(
-            err,
-            E::BadMagic {
-                line_ending_mangled: true,
-                ..
-            }
+            E::Header(HeaderError::WrongDomain { expected: Domain::Bundle, found })
+                if found == Domain::PackArchive as u32
         ),
         "got {err:?}"
     );
@@ -101,10 +58,13 @@ fn magic_mangled_by_crlf_to_lf_translation() {
 #[test]
 fn unsupported_container_version() {
     let mut bytes = base_container();
-    bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+    bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
     let err = parse_bundle(&bytes).unwrap_err();
     assert!(
-        matches!(err, E::UnsupportedContainerVersion { found: 2 }),
+        matches!(
+            err,
+            E::Header(HeaderError::UnsupportedVersion { domain: Domain::Bundle, expected: 2, found: 1 })
+        ),
         "got {err:?}"
     );
 }
@@ -150,38 +110,16 @@ fn header_length_overflow_is_checked() {
 }
 
 #[test]
-fn json_crc_mismatch() {
-    let mut bytes = base_container();
-    bytes[28] ^= 0xFF; // corrupt the stored json_crc, json bytes intact
-    let err = parse_bundle(&bytes).unwrap_err();
-    assert!(
-        matches!(err, E::JsonCrcMismatch { expected, actual } if expected != actual),
-        "got {err:?}"
-    );
-}
-
-#[test]
-fn blob_crc_mismatch() {
-    let mut bytes = base_container();
-    bytes[32] ^= 0xFF;
-    let err = parse_bundle(&bytes).unwrap_err();
-    assert!(
-        matches!(err, E::BlobCrcMismatch { expected, actual } if expected != actual),
-        "got {err:?}"
-    );
-}
-
-#[test]
 fn nonzero_pad_byte() {
     let mut bytes = base_container();
     let json_len = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
-    let json_end = 36 + json_len;
+    let json_end = CONTAINER_HEADER_LEN as u64 + json_len;
     let pad = align16(json_end) - json_end;
     assert!(
         pad > 0,
         "fixture must have pad bytes (json_len = {json_len})"
     );
-    bytes[json_end as usize] = 1; // pad is covered by neither CRC
+    bytes[json_end as usize] = 1;
     let err = parse_bundle(&bytes).unwrap_err();
     assert!(
         matches!(err, E::NonzeroPadByte { file_offset } if file_offset == json_end),
@@ -193,10 +131,9 @@ fn nonzero_pad_byte() {
 fn nonzero_inter_blob_gap_byte() {
     let mut bytes = base_container();
     let json_len = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
-    let chunk_start = align16(36 + json_len) as usize;
+    let chunk_start = align16(CONTAINER_HEADER_LEN as u64 + json_len) as usize;
     // First blob is 8 bytes; 8..16 is the alignment gap before the second.
     bytes[chunk_start + 10] = 7;
-    fix_blob_crc(&mut bytes);
     let err = parse_bundle(&bytes).unwrap_err();
     assert!(
         matches!(err, E::NonzeroGapByte { chunk_offset: 10 }),

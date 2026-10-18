@@ -7,15 +7,15 @@ use distill_pack::manifest::*;
 fn sample() -> PackManifest {
     PackManifest {
         target: PackTarget { name: "dev".into() },
-        target_def_hash: [5; 32],
+        target_def_hash: [5; 16],
         archives: vec![ArchiveRef {
             generation: 7,
-            file_hash: [8; 32],
+            file_hash: [8; 16],
         }],
         assets: vec![
             ManifestAssetRow {
                 asset_uuid: AssetUuid([1; 16]),
-                content_hash: ContentHash([11; 32]),
+                content_hash: ContentHash([11; 16]),
                 load_deps: vec![ManifestLoadEdge {
                     asset_uuid: AssetUuid([2; 16]),
                     expected_terminal: TypeUuid([22; 16]),
@@ -23,17 +23,17 @@ fn sample() -> PackManifest {
             },
             ManifestAssetRow {
                 asset_uuid: AssetUuid([2; 16]),
-                content_hash: ContentHash([12; 32]),
+                content_hash: ContentHash([12; 16]),
                 load_deps: Vec::new(),
             },
         ],
         encodings: vec![EncodingRow {
-            content_hash: ContentHash([11; 32]),
-            blocks: vec![EKey([31; 32])],
-            blobs: vec![EKey([32; 32])],
+            content_hash: ContentHash([11; 16]),
+            blocks: vec![EKey([31; 16])],
+            blobs: vec![EKey([32; 16])],
         }],
         index: vec![IndexRow {
-            ekey: EKey([31; 32]),
+            ekey: EKey([31; 16]),
             location: ObjectLocation {
                 generation: 7,
                 offset: 64,
@@ -41,7 +41,7 @@ fn sample() -> PackManifest {
             },
         }],
         wire_trees: vec![WireTreeRow {
-            layout_hash: LayoutHash([41; 32]),
+            layout_hash: LayoutHash([41; 16]),
             bytes: vec![1, 2, 3],
         }],
         paths: Some(vec![
@@ -121,11 +121,11 @@ fn manifest_rejects_corruption_and_truncation() {
 #[test]
 fn manifest_bounds_authenticated_counts_before_allocating() {
     let mut bytes = encode_manifest(&sample()).unwrap();
-    let target_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-    let archive_count = 12 + target_len + 32;
+    let target_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let archive_count = 16 + target_len + 16;
     bytes[archive_count..archive_count + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-    let trailer = bytes.len() - 32;
-    let digest = *blake3::hash(&bytes[..trailer]).as_bytes();
+    let trailer = bytes.len() - 16;
+    let digest = distill_core::hash::hash(&bytes[..trailer]);
     bytes[trailer..].copy_from_slice(&digest);
 
     assert_eq!(decode_manifest(&bytes), Err(ManifestError::Truncated));

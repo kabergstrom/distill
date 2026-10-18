@@ -14,8 +14,8 @@ fn put_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
 }
 
-fn header(out: &mut Vec<u8>, kind: u8, offset: u32, size: u32, align: u32) {
-    out.push(kind);
+fn header(out: &mut Vec<u8>, kind: u32, offset: u32, size: u32, align: u32) {
+    out.extend_from_slice(&kind.to_le_bytes());
     out.extend_from_slice(&offset.to_le_bytes());
     out.extend_from_slice(&size.to_le_bytes());
     out.extend_from_slice(&align.to_le_bytes());
@@ -28,14 +28,14 @@ fn primitive_bytes_pinned_and_hash_domain_prefixed() {
     let node = wprim(4, ScalarKind::U32);
     let mut expected = Vec::new();
     header(&mut expected, 0x01, 4, 4, 4);
-    expected.push(0x04); // ScalarKind::U32
+    expected.extend_from_slice(&0x04u32.to_le_bytes()); // ScalarKind::U32
     assert_eq!(dswl_bytes(&node).unwrap(), expected);
 
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"DSWL");
-    hasher.update(&[DSWL_VERSION]);
-    hasher.update(&expected);
-    assert_eq!(dswl_hash(&node).unwrap().0, *hasher.finalize().as_bytes());
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(&(distill_core::hash::Domain::Layout as u32).to_le_bytes());
+    preimage.extend_from_slice(&DSWL_VERSION.to_le_bytes());
+    preimage.extend_from_slice(&expected);
+    assert_eq!(dswl_hash(&node).unwrap().0, distill_core::hash::hash(&preimage));
 }
 
 #[test]
@@ -43,9 +43,9 @@ fn vec_slot_bytes_carry_slot_kind_and_pointee_node() {
     let node = wvec_slot(8, wprim(0, ScalarKind::U16));
     let mut expected = Vec::new();
     header(&mut expected, 0x05, 8, 24, 8);
-    expected.push(0x00); // SlotKind::Vec
+    expected.extend_from_slice(&0x00u32.to_le_bytes()); // SlotKind::Vec
     header(&mut expected, 0x01, 0, 2, 2); // pointee, frame-relative to the element
-    expected.push(0x03); // U16
+    expected.extend_from_slice(&0x03u32.to_le_bytes()); // U16
     assert_eq!(dswl_bytes(&node).unwrap(), expected);
 }
 
@@ -60,11 +60,11 @@ fn map_slot_bytes_carry_key_then_value() {
     );
     let mut expected = Vec::new();
     header(&mut expected, 0x05, 0, 48, 8);
-    expected.push(0x02); // SlotKind::Map
+    expected.extend_from_slice(&0x02u32.to_le_bytes()); // SlotKind::Map
     header(&mut expected, 0x01, 0, 4, 4);
-    expected.push(0x04); // key u32
+    expected.extend_from_slice(&0x04u32.to_le_bytes()); // key u32
     header(&mut expected, 0x05, 0, 24, 8);
-    expected.push(0x01); // value: SlotKind::String, no pointee
+    expected.extend_from_slice(&0x01u32.to_le_bytes()); // value: SlotKind::String, no pointee
     assert_eq!(dswl_bytes(&node).unwrap(), expected);
 }
 
@@ -73,13 +73,13 @@ fn string_and_blob_slots_have_no_pointee() {
     let s = wstring_slot(0);
     let mut expected = Vec::new();
     header(&mut expected, 0x05, 0, 24, 8);
-    expected.push(0x01);
+    expected.extend_from_slice(&0x01u32.to_le_bytes());
     assert_eq!(dswl_bytes(&s).unwrap(), expected);
 
     let b = wslot(16, 32, 8, SlotKind::Blob, vec![]);
     let mut expected = Vec::new();
     header(&mut expected, 0x05, 16, 32, 8);
-    expected.push(0x06);
+    expected.extend_from_slice(&0x06u32.to_le_bytes());
     assert_eq!(dswl_bytes(&b).unwrap(), expected);
 }
 
@@ -98,7 +98,7 @@ fn array_bytes_pinned() {
     expected.extend_from_slice(&4u32.to_le_bytes());
     expected.extend_from_slice(&2u32.to_le_bytes());
     header(&mut expected, 0x01, 0, 2, 2);
-    expected.push(0x08); // I16
+    expected.extend_from_slice(&0x08u32.to_le_bytes()); // I16
     assert_eq!(dswl_bytes(&node).unwrap(), expected);
 }
 
@@ -128,10 +128,10 @@ fn struct_fields_serialize_in_wire_offset_order_without_declaration_index() {
     expected.extend_from_slice(&2u32.to_le_bytes());
     put_str(&mut expected, "a"); // offset 0 first; per-field payload is (name, node)
     header(&mut expected, 0x01, 0, 4, 4);
-    expected.push(0x04);
+    expected.extend_from_slice(&0x04u32.to_le_bytes());
     put_str(&mut expected, "b");
     header(&mut expected, 0x01, 4, 2, 2);
-    expected.push(0x03);
+    expected.extend_from_slice(&0x03u32.to_le_bytes());
     assert_eq!(dswl_bytes(&node).unwrap(), expected);
 }
 
@@ -227,14 +227,14 @@ fn single_variant_enum_bytes_pinned() {
     );
     let mut expected = Vec::new();
     header(&mut expected, 0x03, 0, 4, 4);
-    expected.push(0x00); // form Single
+    expected.extend_from_slice(&0x00u32.to_le_bytes()); // form Single
     expected.extend_from_slice(&1u32.to_le_bytes()); // variant count
     put_str(&mut expected, "Only");
     header(&mut expected, 0x02, 0, 4, 4);
     expected.extend_from_slice(&1u32.to_le_bytes());
     put_str(&mut expected, "0");
     header(&mut expected, 0x01, 0, 4, 4);
-    expected.push(0x0C);
+    expected.extend_from_slice(&0x0Cu32.to_le_bytes());
     assert_eq!(dswl_bytes(&node).unwrap(), expected);
 }
 
@@ -260,7 +260,7 @@ fn fully_flat_enum_bytes_carry_tag_geometry_and_discriminants_name_sorted() {
     );
     let mut expected = Vec::new();
     header(&mut expected, 0x03, 0, 8, 4);
-    expected.push(0x01); // form FullyFlat
+    expected.extend_from_slice(&0x01u32.to_le_bytes()); // form FullyFlat
     expected.extend_from_slice(&0u32.to_le_bytes()); // native tag offset
     expected.push(4); // tag size
     expected.extend_from_slice(&2u32.to_le_bytes());
@@ -270,7 +270,7 @@ fn fully_flat_enum_bytes_carry_tag_geometry_and_discriminants_name_sorted() {
     expected.extend_from_slice(&1u32.to_le_bytes());
     put_str(&mut expected, "0");
     header(&mut expected, 0x01, 4, 4, 4);
-    expected.push(0x04);
+    expected.extend_from_slice(&0x04u32.to_le_bytes());
     put_str(&mut expected, "B");
     expected.extend_from_slice(&7u128.to_le_bytes());
     header(&mut expected, 0x02, 0, 4, 4);
@@ -292,7 +292,7 @@ fn canonical_enum_bytes_omit_discriminants() {
     );
     let mut expected = Vec::new();
     header(&mut expected, 0x03, 0, 12, 4);
-    expected.push(0x02); // form Canonical
+    expected.extend_from_slice(&0x02u32.to_le_bytes()); // form Canonical
     expected.extend_from_slice(&2u32.to_le_bytes());
     put_str(&mut expected, "One"); // name-sorted
     header(&mut expected, 0x02, 4, 4, 4);
@@ -342,7 +342,7 @@ fn duplicate_variant_names_are_an_error() {
 }
 
 #[test]
-fn variant_names_sort_by_nfc_bytes() {
+fn variant_names_are_raw_bytes_never_normalized() {
     let composed = wenum(
         0,
         4,
@@ -357,10 +357,12 @@ fn variant_names_sort_by_nfc_bytes() {
         WireEnumForm::Canonical,
         vec![wvariant("e\u{301}", 0, wstruct(4, 0, 1, vec![]))],
     );
-    assert_eq!(
+    // Intake normalizes names (§10); the layout encoding takes them as given.
+    assert_ne!(
         dswl_hash(&composed).unwrap(),
         dswl_hash(&decomposed).unwrap()
     );
+    assert_eq!(decode_dswl(&dswl_bytes(&decomposed).unwrap()).unwrap(), decomposed);
 }
 
 // --- backrefs -------------------------------------------------------------------
@@ -393,7 +395,7 @@ fn backref_header_carries_referenced_wire_frame_geometry() {
     expected.extend_from_slice(&1u32.to_le_bytes());
     put_str(&mut expected, "next");
     header(&mut expected, 0x05, 0, 8, 8);
-    expected.push(0x04); // SlotKind::Box
+    expected.extend_from_slice(&0x04u32.to_le_bytes()); // SlotKind::Box
     header(&mut expected, 0x07, 0, 8, 8); // backref: referenced frame's size/align
     expected.extend_from_slice(&0u32.to_le_bytes());
     assert_eq!(dswl_bytes(&node).unwrap(), expected);
@@ -469,7 +471,7 @@ fn decoder_rejects_unknown_kinds_and_false_backref_geometry() {
     );
     let mut bytes = dswl_bytes(&node).unwrap();
     let backref = bytes.iter().rposition(|byte| *byte == 0x07).unwrap();
-    bytes[backref + 5] ^= 1;
+    bytes[backref + 8] ^= 1; // the offset after u32 kind and u32 distance
     assert_eq!(decode_dswl(&bytes), Err(DswlDecodeError::BackRefGeometry));
 }
 

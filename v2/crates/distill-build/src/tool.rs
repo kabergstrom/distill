@@ -187,7 +187,7 @@ impl<'a, S: ToolEpochSnapshot + ?Sized> ProcessContext<'a, S> {
     fn transient(
         &mut self,
         id: String,
-        tool_hash: [u8; 32],
+        tool_hash: [u8; 16],
         class: ToolLaunchFailureClass,
     ) -> ToolRunError {
         self.discard();
@@ -249,7 +249,7 @@ impl ExecutionTree {
                 let bytes = std::fs::read(&source)
                     .map_err(|_| ToolLaunchFailureClass::PackageUnavailable)?;
                 if bytes.len() as u64 != file.len
-                    || blake3::hash(&bytes).as_bytes() != &file.bytes_hash
+                    || distill_core::hash::hash(&bytes) != file.bytes_hash
                 {
                     return Err(ToolLaunchFailureClass::PackageUnavailable);
                 }
@@ -406,7 +406,7 @@ fn verify_execution_root(root: &Path, expected: &[ToolPackageFile]) -> Result<()
             return Err(());
         }
         let bytes = std::fs::read(&path).map_err(|_| ())?;
-        if blake3::hash(&bytes).as_bytes() != &file.bytes_hash
+        if distill_core::hash::hash(&bytes) != file.bytes_hash
             || !file_permissions_match(&metadata, file.executable)
         {
             return Err(());

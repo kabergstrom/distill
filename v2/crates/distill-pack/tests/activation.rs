@@ -7,13 +7,13 @@ use distill_pack::archive::{encode_archive, ArtifactPayload};
 
 #[test]
 fn pointer_grammar_is_exactly_lowercase_hex_plus_newline() {
-    let hash = [0xAB; 32];
+    let hash = [0xAB; 16];
     let bytes = pointer_bytes(hash);
-    assert_eq!(bytes.len(), 65);
+    assert_eq!(bytes.len(), 33);
     assert_eq!(&bytes[..4], b"abab");
-    assert_eq!(bytes[64], b'\n');
+    assert_eq!(bytes[32], b'\n');
     assert_eq!(parse_pointer(&bytes).unwrap(), hash);
-    assert!(parse_pointer(&bytes[..64]).is_err());
+    assert!(parse_pointer(&bytes[..32]).is_err());
     let mut upper = bytes;
     upper[0] = b'A';
     assert!(parse_pointer(&upper).is_err());
@@ -30,10 +30,10 @@ fn activation_atomically_replaces_pointer_and_leaves_no_temp() {
             .as_nanos()
     ));
     fs::create_dir(&dir).unwrap();
-    activate(&dir, [1; 32]).unwrap();
-    assert_eq!(read_current(&dir).unwrap(), [1; 32]);
-    activate(&dir, [2; 32]).unwrap();
-    assert_eq!(read_current(&dir).unwrap(), [2; 32]);
+    activate(&dir, [1; 16]).unwrap();
+    assert_eq!(read_current(&dir).unwrap(), [1; 16]);
+    activate(&dir, [2; 16]).unwrap();
+    assert_eq!(read_current(&dir).unwrap(), [2; 16]);
     assert_eq!(published_names(&dir), ["pack.current"]);
     fs::remove_dir_all(dir).unwrap();
 }
@@ -54,18 +54,18 @@ fn archive_names_are_hash_addressed_and_publication_is_no_replace() {
         "test",
         1,
         &[ArtifactPayload {
-            content_hash: ContentHash([1; 32]),
+            content_hash: ContentHash([1; 16]),
             structural: vec![1, 2, 3],
             blobs: vec![],
         }],
     )
     .unwrap();
     let hash = publish_archive(&dir, &archive.bytes).unwrap();
-    assert_eq!(hash, *blake3::hash(&archive.bytes).as_bytes());
-    assert_ne!(hash.as_slice(), &archive.bytes[archive.bytes.len() - 32..]);
+    assert_eq!(hash, distill_core::hash::hash(&archive.bytes));
+    assert_ne!(hash.as_slice(), &archive.bytes[archive.bytes.len() - 16..]);
     let expected = archive_filename(hash);
     assert!(expected.starts_with("archive-"));
-    assert_eq!(expected.len(), "archive-".len() + 64 + ".dpk".len());
+    assert_eq!(expected.len(), "archive-".len() + 32 + ".dpk".len());
     assert_eq!(fs::read(dir.join(&expected)).unwrap(), archive.bytes);
     publish_archive(&dir, &archive.bytes).unwrap();
     assert_eq!(published_names(&dir), [expected.clone()]);

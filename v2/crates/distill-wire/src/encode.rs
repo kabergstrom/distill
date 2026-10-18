@@ -6,7 +6,6 @@ use distill_core::frames::{reenter, resolve_backref};
 use distill_core::id::{AssetUuid, TypeUuid};
 use ngp_schema::node::{PrimitiveKind, SchemaNode};
 use ngp_schema::{write_value, AssetRefValue, TypeTable, Value, WriteOptions};
-use unicode_normalization::{is_nfc, UnicodeNormalization};
 
 use crate::wire::{SlotKind, WireEnumForm, WireNode, WireVariant};
 
@@ -1048,19 +1047,18 @@ impl<'a, R: ReferenceResolver + ?Sized> Encoder<'a, R> {
     ) -> Result<usize, EncodeError> {
         let mut names = variants
             .iter()
-            .map(|variant| nfc(&variant.name))
+            .map(|variant| variant.name.as_str())
             .collect::<Vec<_>>();
         names.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
         if names.windows(2).any(|pair| pair[0] == pair[1]) {
-            return self.invalid_wire("wire enum has duplicate NFC variant names");
+            return self.invalid_wire("wire enum has duplicate variant names");
         }
-        let selected = nfc(selected);
         names
             .iter()
             .position(|name| *name == selected)
             .ok_or_else(|| EncodeError::MissingWireVariant {
                 path: self.path_string(),
-                variant: selected,
+                variant: selected.to_owned(),
             })
     }
 
@@ -1210,14 +1208,6 @@ fn align_up_usize(value: usize, align: usize) -> Option<usize> {
     }
 }
 
-fn nfc(value: &str) -> String {
-    if is_nfc(value) {
-        value.to_owned()
-    } else {
-        value.nfc().collect()
-    }
-}
-
 /// The canonical JSON text of a map key or set element (§6): what both
 /// sorts by and the `MapKey` path payload. Key and element nodes are
 /// blob-free (§5) and walked with no frames open.
@@ -1257,7 +1247,7 @@ fn display_path(path: &[PathComponent]) -> String {
     result
 }
 
-fn primitive_grammar_id(kind: PrimitiveKind) -> u8 {
+fn primitive_grammar_id(kind: PrimitiveKind) -> u32 {
     use crate::native::ScalarKind;
     match kind {
         PrimitiveKind::Bool => ScalarKind::Bool,

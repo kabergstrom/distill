@@ -12,7 +12,7 @@
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, TypeUuid};
 use rusqlite::OptionalExtension;
 
-use crate::bundles::{blob16, blob32};
+use crate::bundles::blob16;
 use crate::db::StoreReader;
 use crate::error::StoreError;
 use crate::state::InputVersion;
@@ -65,7 +65,7 @@ impl StoreReader {
             });
         }
         Ok(Some(TraceEntry {
-            bundle_hash: ContentHash(blob32(bundle_hash)),
+            bundle_hash: ContentHash(blob16(bundle_hash)),
             type_uuid: TypeUuid(blob16(type_uuid)),
             authoring_only,
         }))
@@ -78,7 +78,7 @@ impl StoreReader {
         &self,
         key: &str,
         basis: InputVersion,
-    ) -> Result<Option<[u8; 32]>, StoreError> {
+    ) -> Result<Option<[u8; 16]>, StoreError> {
         let row = self
             .conn
             .prepare_cached(TOOL_HASH_AT)?

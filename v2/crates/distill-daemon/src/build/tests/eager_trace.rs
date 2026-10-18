@@ -35,7 +35,7 @@ pub(super) struct EagerTraceSource {
     pub(super) terminal_types: BTreeMap<AssetUuid, TypeUuid>,
     pub(super) roles: BTreeMap<AssetUuid, EntryRole>,
     pub(super) paths: BTreeMap<String, Vec<AssetUuid>>,
-    pub(super) tools: BTreeMap<String, [u8; 32]>,
+    pub(super) tools: BTreeMap<String, [u8; 16]>,
     pub(super) current_load: CurrentLoadSource,
     pub(super) content_hashes: BTreeMap<AssetUuid, ContentHash>,
     pub(super) tag_poisons: BTreeMap<AssetUuid, BundleUuid>,
@@ -252,7 +252,7 @@ impl TraceSource for EagerTraceSource {
         }
     }
 
-    fn query(&self, query: &AssetQuery) -> Observed<[u8; 32]> {
+    fn query(&self, query: &AssetQuery) -> Observed<[u8; 16]> {
         if query.tag.is_some() {
             let mut without_tag = query.clone();
             without_tag.tag = None;
@@ -268,7 +268,7 @@ impl TraceSource for EagerTraceSource {
         Observed::Ok(asset_query_result_hash(&self.query_results(query)))
     }
 
-    fn tool(&self, id: &str) -> Observed<[u8; 32]> {
+    fn tool(&self, id: &str) -> Observed<[u8; 16]> {
         self.tools.get(id).copied().map_or_else(
             || {
                 Observed::Err(StableFailureFingerprint::MissingCapability {
@@ -279,7 +279,7 @@ impl TraceSource for EagerTraceSource {
         )
     }
 
-    fn capability(&self, key: &CapabilityKey) -> Observed<[u8; 32]> {
+    fn capability(&self, key: &CapabilityKey) -> Observed<[u8; 16]> {
         self.current_load.capability(key)
     }
 
@@ -291,7 +291,7 @@ impl TraceSource for EagerTraceSource {
         Observed::Ok(self.roles.get(&asset).copied())
     }
 
-    fn control(&self, _query: &ControlQuery) -> Observed<[u8; 32]> {
+    fn control(&self, _query: &ControlQuery) -> Observed<[u8; 16]> {
         no_trace()
     }
 

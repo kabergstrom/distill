@@ -17,7 +17,7 @@ fn source(path: &str, bundle: u8, asset: u8) -> SourceClaims {
     let readable = ReadableBundleSource {
         root_name: "main".to_owned(),
         normalized_path: path.to_owned(),
-        file_hash: BundleFileHash([asset; 32]),
+        file_hash: BundleFileHash([asset; 16]),
     };
     SourceClaims {
         root_name: "main".to_owned(),
@@ -192,7 +192,7 @@ fn namespace_errors_and_withholding_are_read_from_the_claims() {
             source: ReadableBundleSource {
                 root_name: "main".to_owned(),
                 normalized_path: "broken.bundle".to_owned(),
-                file_hash: BundleFileHash([9; 32]),
+                file_hash: BundleFileHash([9; 16]),
             },
             failure: SkeletonFailureCode::IncompleteAssetIdentity,
         },

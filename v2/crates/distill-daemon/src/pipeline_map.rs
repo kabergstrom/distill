@@ -33,7 +33,7 @@ pub(crate) struct PipelineProjection {
 impl PipelineProjection {
     pub(crate) fn build(
         descriptors: Vec<ProcessorDescriptor>,
-        dylib_hash: [u8; 32],
+        dylib_hash: [u8; 16],
         targets: &BTreeMap<String, Target>,
         authored_types: impl IntoIterator<Item = TypeUuid>,
     ) -> Result<Self, PipelineError> {
@@ -176,7 +176,7 @@ mod tests {
                 TargetSelector::new(None, None).unwrap(),
                 TERMINAL,
             )],
-            [9; 32],
+            [9; 16],
             &targets,
             [SOURCE],
         )
@@ -216,7 +216,7 @@ mod tests {
                 descriptor(linux, TERMINAL),
                 descriptor(windows, TypeUuid([4; 16])),
             ],
-            [9; 32],
+            [9; 16],
             &targets,
             [SOURCE],
         )

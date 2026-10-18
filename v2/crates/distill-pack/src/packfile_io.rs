@@ -26,7 +26,7 @@ use crate::manifest::{
 #[derive(Debug, Clone)]
 pub struct RuntimeTarget {
     pub target: String,
-    pub target_def_hash: [u8; 32],
+    pub target_def_hash: [u8; 16],
 }
 
 #[derive(Debug)]
@@ -164,7 +164,7 @@ impl PackfileIO {
 
     fn mount_backings(
         manifest: PackManifest,
-        manifest_hash: [u8; 32],
+        manifest_hash: [u8; 16],
         archive_files: Vec<ArchiveBacking>,
         runtime: &RuntimeTarget,
     ) -> Result<Self, MountError> {
@@ -176,7 +176,7 @@ impl PackfileIO {
             let bytes = backing.as_ref().as_ref();
             let scanned = scan_archive(bytes)?;
             let generation = scanned.generation;
-            let file_hash = *blake3::hash(bytes).as_bytes();
+            let file_hash = distill_core::hash::hash(bytes);
             if archives
                 .insert(generation, MountedArchive { scanned, backing })
                 .is_some()

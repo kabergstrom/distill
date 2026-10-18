@@ -39,7 +39,7 @@ pub enum PersistedOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedHit {
     pub memo_seq: MemoSeq,
-    pub trace_digest: [u8; 32],
+    pub trace_digest: [u8; 16],
     pub asset_uuid: AssetUuid,
     pub trace: Vec<TraceOp>,
     pub outcome: PersistedOutcome,
@@ -58,8 +58,8 @@ pub enum PersistedCacheError {
         observed: AssetUuid,
     },
     TraceDigestMismatch {
-        indexed: [u8; 32],
-        observed: [u8; 32],
+        indexed: [u8; 16],
+        observed: [u8; 16],
     },
     InvalidFailureCause,
 }
@@ -100,7 +100,7 @@ impl From<TraceDecodeError> for PersistedCacheError {
 pub fn lookup_persisted_candidate(
     store: &StoreReader,
     key_kind: KeyKind,
-    static_key: &[u8; 32],
+    static_key: &[u8; 16],
     expected_asset: AssetUuid,
     source: &impl TraceSource,
 ) -> Result<Option<PersistedHit>, PersistedCacheError> {

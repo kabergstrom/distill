@@ -17,7 +17,7 @@ use crate::db::{ReaderConn, StoreReader};
 use crate::files::{path_name, FileKind, FileObservation, FileState, PathSelection};
 use crate::{Store, StoreConfig};
 
-const SCHEMA: LogicalHash = LogicalHash([0x5c; 32]);
+const SCHEMA: LogicalHash = LogicalHash([0x5c; 16]);
 const RUNTIME_TYPE: TypeUuid = TypeUuid([0x71; 16]);
 const RECORD_TYPE: TypeUuid = TypeUuid([0x72; 16]);
 /// The bundle every hundredth bundle references.
@@ -62,7 +62,7 @@ fn populate(store: &mut Store, count: u32) {
                         mtime: i64::from(index),
                         size: bytes.len() as u64,
                         kind: FileKind::File,
-                        content_hash: Some(ContentHash(*blake3::hash(&bytes).as_bytes())),
+                        content_hash: Some(ContentHash(distill_core::hash::hash(&bytes))),
                     }),
                     version,
                 )?;
@@ -75,7 +75,7 @@ fn populate(store: &mut Store, count: u32) {
                             mtime: 0,
                             size: 0,
                             kind: FileKind::File,
-                            content_hash: Some(ContentHash([0; 32])),
+                            content_hash: Some(ContentHash([0; 16])),
                         }),
                         version,
                     )?;
@@ -88,7 +88,7 @@ fn populate(store: &mut Store, count: u32) {
                             root,
                             path,
                             format_version: 1,
-                            content_hash: ContentHash(*blake3::hash(&bytes).as_bytes()),
+                            content_hash: ContentHash(distill_core::hash::hash(&bytes)),
                             entries: vec![SkeletonEntry {
                                 asset: runtime,
                                 local_id: "main".into(),
@@ -106,7 +106,7 @@ fn populate(store: &mut Store, count: u32) {
                     root,
                     path: path.clone(),
                     format_version: 1,
-                    content_hash: ContentHash(*blake3::hash(&bytes).as_bytes()),
+                    content_hash: ContentHash(distill_core::hash::hash(&bytes)),
                     origin: None,
                     import_watched: index % 1000 == 7,
                 })?;
@@ -656,7 +656,7 @@ fn generating_rules_pages(generated: u32) -> u64 {
                     root,
                     path: format!("gen/{index}.bundle"),
                     format_version: 1,
-                    content_hash: ContentHash([0; 32]),
+                    content_hash: ContentHash([0; 16]),
                     origin: Some(DirectoryOrigin {
                         rules_bundle: bundle_uuid(if index % 2 == 0 { 2 } else { 99_999 }),
                         rule: DirectoryRuleId([1; 16]),
@@ -692,7 +692,7 @@ fn derived_resolution_pages(count: u32) -> u64 {
             let readable = ReadableBundleSource {
                 root_name: "main".to_owned(),
                 normalized_path: path.clone(),
-                file_hash: BundleFileHash([0; 32]),
+                file_hash: BundleFileHash([0; 16]),
             };
             let parent = asset_uuid(index, 1);
             SourceClaims {
@@ -1323,7 +1323,7 @@ fn stale_tag_rows_are_index_searches() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, mut store) = store_with(200);
-    let (module, old_module) = ([9; 32], [8; 32]);
+    let (module, old_module) = ([9; 16], [8; 16]);
     let updates = (0..200)
         .map(|index| {
             let (dylib_hash, poison) = match index % 50 {
@@ -1433,7 +1433,7 @@ fn import_index_statements_search_their_keys() {
                     root,
                     path: format!("gen/{index}.bundle"),
                     format_version: 1,
-                    content_hash: ContentHash([0; 32]),
+                    content_hash: ContentHash([0; 16]),
                     origin: Some(DirectoryOrigin {
                         rules_bundle: rules,
                         rule: DirectoryRuleId([1; 16]),
@@ -1573,7 +1573,7 @@ fn tag_state_statements_search_the_asset_key() {
             .refine_unpublished_tag_index(&[TagIndexUpdate {
                 asset,
                 tags: BTreeMap::new(),
-                dylib_hash: Some([9; 32]),
+                dylib_hash: Some([9; 16]),
                 poison: None,
             }])
             .unwrap();
@@ -1702,7 +1702,7 @@ fn a_changed_tag_epoch_marks_only_its_types_rows() {
         store.refine_unpublished_tag_index(&updates).unwrap();
     };
     let epochs =
-        |record: u8| BTreeMap::from([(RUNTIME_TYPE, [1; 32]), (RECORD_TYPE, [record; 32])]);
+        |record: u8| BTreeMap::from([(RUNTIME_TYPE, [1; 16]), (RECORD_TYPE, [record; 16])]);
     let pending = |store: &Store| {
         [asset_uuid(3, 1), asset_uuid(3, 2), asset_uuid(4, 1)]
             .into_iter()
@@ -1714,7 +1714,7 @@ fn a_changed_tag_epoch_marks_only_its_types_rows() {
             })
             .collect::<Vec<_>>()
     };
-    let mark = |store: &mut Store, epochs: &BTreeMap<TypeUuid, [u8; 32]>| {
+    let mark = |store: &mut Store, epochs: &BTreeMap<TypeUuid, [u8; 16]>| {
         store.replace_tag_epochs(epochs).unwrap()
     };
     refined(&mut store);
@@ -1949,7 +1949,7 @@ fn pass_bookkeeping_statements_search_their_indexes() {
                 source: ReadableBundleSource {
                     root_name: "main".to_owned(),
                     normalized_path: path.to_owned(),
-                    file_hash: BundleFileHash([1; 32]),
+                    file_hash: BundleFileHash([1; 16]),
                 },
             },
             crate::claims::SourceClaim::Authored {
@@ -1958,7 +1958,7 @@ fn pass_bookkeeping_statements_search_their_indexes() {
                     source: ReadableBundleSource {
                         root_name: "main".to_owned(),
                         normalized_path: path.to_owned(),
-                        file_hash: BundleFileHash([1; 32]),
+                        file_hash: BundleFileHash([1; 16]),
                     },
                     bundle: bundle_uuid(42),
                     local_id: "main".to_owned(),
@@ -2224,7 +2224,7 @@ fn cas_verification_reads_per_segment() {
     config.segment_size = 512;
     let mut store = Store::open(config).unwrap();
     for index in 0..300u32 {
-        let mut key = [0u8; 32];
+        let mut key = [0u8; 16];
         key[..4].copy_from_slice(&index.to_le_bytes());
         store
             .commit_build(BuildCommit {
@@ -2466,7 +2466,7 @@ fn cas_and_served_point_statements_search_their_keys() {
         .map(|index| store.put_artifact(&[index; 1000], &edges).unwrap())
         .collect::<Vec<_>>();
     store.put_artifact(&[0; 1000], &edges).unwrap();
-    let key = [3; 32];
+    let key = [3; 16];
     store
         .commit_build(BuildCommit {
             reads: Vec::new(),
@@ -2753,7 +2753,7 @@ fn a_file_content_hash_searches_two_keys() {
     let path = bundle_path(0);
     assert_eq!(
         reader.file_content_hash("main", &path).unwrap(),
-        Some(ContentHash(*blake3::hash(b"bundle 0").as_bytes()))
+        Some(ContentHash(distill_core::hash::hash(b"bundle 0")))
     );
     assert_eq!(reader.file_content_hash("alt", &path).unwrap(), None);
     assert_eq!(reader.file_content_hash("main", "missing").unwrap(), None);

@@ -499,7 +499,7 @@ fn register(
     arena
         .register_authored(AuthoredDescriptor {
             type_uuid: VALUE_TYPE,
-            logical_hash: distill_core::id::LogicalHash([0; 32]),
+            logical_hash: distill_core::id::LogicalHash([0; 16]),
             extension: STALE_EXTENSION.to_owned(),
             local_id: "asset".to_owned(),
             doc: "Declared under another schema.".to_owned(),

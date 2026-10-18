@@ -19,7 +19,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use distill_core::canonical::{domain_digest, CanonicalEncoder, DSCP, DSPP, DSVP};
+use distill_core::hash::digest;
+use distill_core::encoding::Encoder;
+use distill_core::hash::Domain;
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, LogicalHash, TypeUuid};
 use distill_core::target_set::CanonicalTargetSet;
 use ngp_schema::identity::LayoutIdentity;
@@ -125,7 +127,7 @@ pub struct PipelineFailure {
     pub code: PipelineFailureCode,
     pub origin: PipelineFailureOrigin,
     pub cleanup: CleanupDisposition,
-    pub identity: [u8; 32],
+    pub identity: [u8; 16],
     pub message: String,
 }
 
@@ -159,7 +161,7 @@ impl PipelineFailure {
         code: u16,
         origin: u16,
         cleanup: u16,
-        identity: [u8; 32],
+        identity: [u8; 16],
         message: impl Into<String>,
     ) -> Result<Self, PipelineFailureDecodeError> {
         let value = Self::new(
@@ -187,14 +189,12 @@ fn pipeline_failure_identity(
     code: PipelineFailureCode,
     origin: PipelineFailureOrigin,
     cleanup: CleanupDisposition,
-) -> [u8; 32] {
-    let mut encoder = CanonicalEncoder::new();
-    encoder.raw(&DSPP);
-    encoder.u8(1);
-    encoder.u16(code as u16);
-    encoder.u16(origin as u16);
-    encoder.u16(cleanup as u16);
-    *blake3::hash(&encoder.into_bytes()).as_bytes()
+) -> [u8; 16] {
+    distill_core::hash::digest(Domain::PipelineFailure, 1, |encoder| {
+        encoder.enum_variant(code as u32);
+        encoder.enum_variant(origin as u32);
+        encoder.enum_variant(cleanup as u32);
+    })
 }
 
 fn validate_pipeline_failure_matrix(
@@ -265,7 +265,7 @@ pipeline_failure_try_from!(CleanupDisposition, UnknownCleanup, {
     6 => DlcloseFailed, 7 => PublishedEpochLeaked,
 });
 
-/// Closed DSCP v1 discriminants. Persisted/wire values outside this set
+/// Closed configuration-error discriminants. Persisted/wire values outside this set
 /// reject; there is deliberately no extensible `Other` arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -321,10 +321,10 @@ impl std::error::Error for UnknownConfigurationErrorCode {}
 pub enum DscpError {
     UnsupportedVersion(u8),
     CodeDetailMismatch,
-    UnknownPathKey(u8),
-    UnknownOwnedPathKind(u8),
-    UnknownConfigurationSourcePath(u8),
-    UnknownConfigurationSourceFailure(u16),
+    UnknownPathKey(u32),
+    UnknownOwnedPathKind(u32),
+    UnknownConfigurationSourcePath(u32),
+    UnknownConfigurationSourceFailure(u32),
     Truncated,
     TrailingBytes,
     InvalidUtf8,
@@ -334,7 +334,7 @@ pub enum DscpError {
 
 impl fmt::Display for DscpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid DSCP detail: {self:?}")
+        write!(f, "invalid configuration-error detail: {self:?}")
     }
 }
 
@@ -390,13 +390,13 @@ pub struct DirectoryAliasSide {
     pub normalized_path: String,
 }
 
-/// Exact, closed typed facts hashed by DSCP v1. Presentation prose never
+/// Exact, closed typed facts hashed by the configuration-error digest. Presentation prose never
 /// enters this value; callers supply it separately when publishing an error.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(clippy::large_enum_variant)] // DSCP's public variant field types are protocol grammar.
+#[allow(clippy::large_enum_variant)] // The public variant field types are protocol grammar.
 pub enum DscpV1 {
     MalformedConfiguration {
-        file_hash: [u8; 32],
+        file_hash: [u8; 16],
     },
     NonLoopbackAddress {
         address: String,
@@ -462,19 +462,20 @@ impl DscpV1 {
         }
     }
 
-    /// `blake3("DSCP" || 0x01 || code:u16 || exact variant fields)`.
+    /// The configuration-error digest: the code as a `u32` discriminant, then
+    /// the exact variant fields.
     /// Symmetric records are canonicalized here,
     /// so callers cannot publish an order-dependent state.
-    pub fn reason_hash(&self) -> [u8; 32] {
-        domain_digest(DSCP, 1, |encoder| {
-            encoder.u16(self.code() as u16);
+    pub fn reason_hash(&self) -> [u8; 16] {
+        digest(Domain::ConfigError, 1, |encoder| {
+            encoder.enum_variant(self.code() as u32);
             encoder.raw(&self.canonical_detail_bytes());
         })
     }
 
-    /// Exact bytes stored beside the explicit DSCP version and code.
+    /// Exact bytes stored beside the code.
     pub fn canonical_detail_bytes(&self) -> Vec<u8> {
-        let mut encoder = CanonicalEncoder::new();
+        let mut encoder = Encoder::new();
         encode_dscp_detail(&mut encoder, self);
         encoder.into_bytes()
     }
@@ -499,7 +500,7 @@ impl DscpV1 {
     }
 }
 
-fn encode_dscp_detail(encoder: &mut CanonicalEncoder, detail: &DscpV1) {
+fn encode_dscp_detail(encoder: &mut Encoder, detail: &DscpV1) {
     match detail {
         DscpV1::MalformedConfiguration { file_hash } => encoder.raw(file_hash),
         DscpV1::NonLoopbackAddress { address } => encoder.str(address),
@@ -508,7 +509,7 @@ fn encode_dscp_detail(encoder: &mut CanonicalEncoder, detail: &DscpV1) {
             key,
             normalized_or_raw_path,
         } => {
-            encoder.u8(*key as u8);
+            encoder.enum_variant(*key as u32);
             encoder.str(normalized_or_raw_path);
         }
         DscpV1::OwnedPathOverlap { first, second } => {
@@ -538,23 +539,23 @@ fn encode_dscp_detail(encoder: &mut CanonicalEncoder, detail: &DscpV1) {
         DscpV1::DuplicateTargetName { normalized_name } => encoder.str(normalized_name),
         DscpV1::ConfigurationSourceUnavailable { path, failure } => {
             encode_configuration_source_path(encoder, path);
-            encoder.u16(*failure as u16);
+            encoder.enum_variant(*failure as u32);
         }
     }
 }
 
 fn encode_configuration_source_path(
-    encoder: &mut CanonicalEncoder,
+    encoder: &mut Encoder,
     path: &ConfigurationSourcePath,
 ) {
     match path {
         ConfigurationSourcePath::Unix(bytes) => {
-            encoder.u8(1);
+            encoder.enum_variant(1);
             encoder.u32(u32::try_from(bytes.len()).expect("configuration path exceeds u32"));
             encoder.raw(bytes);
         }
         ConfigurationSourcePath::Windows(units) => {
-            encoder.u8(2);
+            encoder.enum_variant(2);
             encoder.u32(u32::try_from(units.len()).expect("configuration path exceeds u32"));
             for unit in units {
                 encoder.u16(*unit);
@@ -564,13 +565,13 @@ fn encode_configuration_source_path(
 }
 
 fn encode_symmetric_pair<T>(
-    encoder: &mut CanonicalEncoder,
+    encoder: &mut Encoder,
     first: &T,
     second: &T,
-    encode: fn(&mut CanonicalEncoder, &T),
+    encode: fn(&mut Encoder, &T),
 ) {
     let encode_one = |side: &T| {
-        let mut encoded = CanonicalEncoder::new();
+        let mut encoded = Encoder::new();
         encode(&mut encoded, side);
         encoded.into_bytes()
     };
@@ -580,16 +581,16 @@ fn encode_symmetric_pair<T>(
     encoder.raw(&sides[1]);
 }
 
-fn encode_owned_path_side(encoder: &mut CanonicalEncoder, side: &OwnedPathSide) {
-    encoder.u8(side.kind as u8);
+fn encode_owned_path_side(encoder: &mut Encoder, side: &OwnedPathSide) {
+    encoder.enum_variant(side.kind as u32);
     encoder.str(&side.path);
 }
 
-fn encode_directory_alias_side(encoder: &mut CanonicalEncoder, side: &DirectoryAliasSide) {
+fn encode_directory_alias_side(encoder: &mut Encoder, side: &DirectoryAliasSide) {
     encoder.str(&side.normalized_path);
 }
 
-fn encode_layout_identity(encoder: &mut CanonicalEncoder, identity: &LayoutIdentity) {
+fn encode_layout_identity(encoder: &mut Encoder, identity: &LayoutIdentity) {
     encoder.str(&identity.target_triple);
     encoder.str(&identity.rustc);
     encoder.u32(identity.algorithm_version);
@@ -609,10 +610,6 @@ impl<'a> DscpDecoder<'a> {
             .ok_or(DscpError::Truncated)?;
         self.cursor = end;
         Ok(value)
-    }
-
-    fn u8(&mut self) -> Result<u8, DscpError> {
-        Ok(self.take(1)?[0])
     }
 
     fn u32(&mut self) -> Result<u32, DscpError> {
@@ -643,7 +640,7 @@ impl<'a> DscpDecoder<'a> {
     }
 
     fn owned_path_side(&mut self) -> Result<OwnedPathSide, DscpError> {
-        let kind = match self.u8()? {
+        let kind = match self.u32()? {
             1 => OwnedPathKind::AssetRoot,
             2 => OwnedPathKind::DaemonState,
             3 => OwnedPathKind::SchemaArtifact,
@@ -666,7 +663,7 @@ impl<'a> DscpDecoder<'a> {
     }
 
     fn configuration_source_path(&mut self) -> Result<ConfigurationSourcePath, DscpError> {
-        match self.u8()? {
+        match self.u32()? {
             1 => {
                 let len = self.count(1)?;
                 Ok(ConfigurationSourcePath::Unix(self.take(len)?.to_vec()))
@@ -703,7 +700,7 @@ impl<'a> DscpDecoder<'a> {
                 normalized_name: self.string()?,
             },
             ConfigurationErrorCode::InvalidPath => DscpV1::InvalidPath {
-                key: match self.u8()? {
+                key: match self.u32()? {
                     1 => ConfigurationPathKey::AssetRoot,
                     2 => ConfigurationPathKey::StatePath,
                     3 => ConfigurationPathKey::SchemaArtifact,
@@ -746,7 +743,7 @@ impl<'a> DscpDecoder<'a> {
             ConfigurationErrorCode::ConfigurationSourceUnavailable => {
                 DscpV1::ConfigurationSourceUnavailable {
                     path: self.configuration_source_path()?,
-                    failure: match self.u16()? {
+                    failure: match self.u32()? {
                         1 => ConfigurationSourceFailureCode::Missing,
                         2 => ConfigurationSourceFailureCode::PermissionDenied,
                         3 => ConfigurationSourceFailureCode::InvalidFileType,
@@ -807,11 +804,11 @@ fn validate_dscp_text(detail: &DscpV1) -> Result<(), DscpError> {
 }
 
 /// Stable typed failure carried by a configuration-failed input version.
-/// `message` is presentation-only; `reason_hash` is exclusively DSCP v1.
+/// `message` is presentation-only; `reason_hash` is exclusively the configuration-error digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigurationError {
     pub code: ConfigurationErrorCode,
-    pub reason_hash: [u8; 32],
+    pub reason_hash: [u8; 16],
     pub detail: Box<DscpV1>,
     pub message: String,
 }
@@ -1028,19 +1025,20 @@ pub enum NamespaceErrorV1 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamespaceError {
     pub code: NamespaceErrorCode,
-    pub identity: [u8; 32],
+    pub identity: [u8; 16],
     pub detail: NamespaceErrorV1,
     pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NamespaceErrorDecodeError {
-    UnsupportedVersion(u8),
-    UnknownCode(u16),
-    UnknownFailureCode(u16),
-    UnknownClaimantTag(u8),
-    UnknownPlatformPathTag(u8),
-    UnknownScanSubjectTag(u8),
+    WrongDomain,
+    UnsupportedVersion(u32),
+    UnknownCode(u32),
+    UnknownFailureCode(u32),
+    UnknownClaimantTag(u32),
+    UnknownPlatformPathTag(u32),
+    UnknownScanSubjectTag(u32),
     Truncated,
     TrailingBytes,
     InvalidUtf8,
@@ -1108,10 +1106,9 @@ impl NamespaceError {
 
     pub fn persisted_bytes(&self) -> Result<Vec<u8>, NamespaceErrorDecodeError> {
         self.validate()?;
-        let mut encoder = CanonicalEncoder::new();
-        encoder.raw(&DSVP);
-        encoder.u8(1);
-        encoder.u16(self.code as u16);
+        let mut encoder = Encoder::new();
+        encoder.raw(&distill_core::hash::digest_prefix(Domain::NamespaceError, 1));
+        encoder.enum_variant(self.code as u32);
         encode_namespace_error_detail(&mut encoder, &self.detail);
         encoder.str(&self.message);
         Ok(encoder.into_bytes())
@@ -1119,14 +1116,14 @@ impl NamespaceError {
 
     pub fn from_persisted_bytes(bytes: &[u8]) -> Result<Self, NamespaceErrorDecodeError> {
         let mut decoder = NamespaceErrorDecoder { bytes, cursor: 0 };
-        if decoder.take(4)? != DSVP {
-            return Err(NamespaceErrorDecodeError::UnknownCode(0));
+        if decoder.u32()? != Domain::NamespaceError as u32 {
+            return Err(NamespaceErrorDecodeError::WrongDomain);
         }
-        let version = decoder.u8()?;
+        let version = decoder.u32()?;
         if version != 1 {
             return Err(NamespaceErrorDecodeError::UnsupportedVersion(version));
         }
-        let code_raw = decoder.u16()?;
+        let code_raw = decoder.u32()?;
         let code = NamespaceErrorCode::try_from(code_raw)?;
         let detail = decoder.detail(code)?;
         let message = decoder.string()?;
@@ -1156,7 +1153,7 @@ impl NamespaceError {
             .into_iter()
             .map(|error| {
                 error.validate()?;
-                let mut detail = CanonicalEncoder::new();
+                let mut detail = Encoder::new();
                 encode_namespace_error_detail(&mut detail, &error.detail);
                 Ok(((error.code as u16, detail.into_bytes()), error))
             })
@@ -1171,9 +1168,9 @@ impl NamespaceError {
     }
 }
 
-impl TryFrom<u16> for NamespaceErrorCode {
+impl TryFrom<u32> for NamespaceErrorCode {
     type Error = NamespaceErrorDecodeError;
-    fn try_from(value: u16) -> Result<Self, Self::Error> {
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {
             1 => Ok(Self::DuplicateAssetUuid),
             2 => Ok(Self::DuplicateBundleUuid),
@@ -1217,10 +1214,6 @@ impl<'a> NamespaceErrorDecoder<'a> {
             .ok_or(NamespaceErrorDecodeError::Truncated)?;
         self.cursor = end;
         Ok(value)
-    }
-
-    pub(crate) fn u8(&mut self) -> Result<u8, NamespaceErrorDecodeError> {
-        Ok(self.take(1)?[0])
     }
 
     fn u16(&mut self) -> Result<u16, NamespaceErrorDecodeError> {
@@ -1269,7 +1262,7 @@ impl<'a> NamespaceErrorDecoder<'a> {
     }
 
     pub(crate) fn claimant(&mut self) -> Result<AssetClaimant, NamespaceErrorDecodeError> {
-        match self.u8()? {
+        match self.u32()? {
             1 => Ok(AssetClaimant::Authored {
                 source: self.source()?,
                 bundle: BundleUuid(self.array()?),
@@ -1300,7 +1293,7 @@ impl<'a> NamespaceErrorDecoder<'a> {
     }
 
     fn platform_path(&mut self) -> Result<PlatformPathBytes, NamespaceErrorDecodeError> {
-        match self.u8()? {
+        match self.u32()? {
             1 => {
                 let len = usize::try_from(self.u32()?)
                     .map_err(|_| NamespaceErrorDecodeError::Truncated)?;
@@ -1343,7 +1336,7 @@ impl<'a> NamespaceErrorDecoder<'a> {
             }
             NamespaceErrorCode::IncompleteSkeleton => NamespaceErrorV1::IncompleteSkeleton {
                 source: self.source()?,
-                failure: match self.u16()? {
+                failure: match self.u32()? {
                     1 => SkeletonFailureCode::EnvelopeMalformed,
                     2 => SkeletonFailureCode::MissingFormatVersion,
                     3 => SkeletonFailureCode::InvalidBundleUuid,
@@ -1357,7 +1350,7 @@ impl<'a> NamespaceErrorDecoder<'a> {
                 NamespaceErrorV1::UnreadableGlobalBundlePath {
                     root_name: self.string()?,
                     normalized_path: self.string()?,
-                    failure: match self.u16()? {
+                    failure: match self.u32()? {
                         1 => GlobalBundleReadFailureCode::PermissionDenied,
                         2 => GlobalBundleReadFailureCode::InvalidFileType,
                         3 => GlobalBundleReadFailureCode::SymlinkIdentityChanged,
@@ -1369,7 +1362,7 @@ impl<'a> NamespaceErrorDecoder<'a> {
             NamespaceErrorCode::InvalidPhysicalPath => NamespaceErrorV1::InvalidPhysicalPath {
                 root_name: self.string()?,
                 raw_relative_path: self.platform_path()?,
-                failure: match self.u16()? {
+                failure: match self.u32()? {
                     1 => PhysicalPathFailureCode::InvalidUnixUtf8,
                     2 => PhysicalPathFailureCode::UnpairedWindowsUtf16,
                     3 => PhysicalPathFailureCode::Absolute,
@@ -1381,7 +1374,7 @@ impl<'a> NamespaceErrorDecoder<'a> {
                 },
             },
             NamespaceErrorCode::UnreadableScanSubtree => NamespaceErrorV1::UnreadableScanSubtree {
-                subject: match self.u8()? {
+                subject: match self.u32()? {
                     1 => ScanSubject::Root {
                         root_name: self.string()?,
                     },
@@ -1391,7 +1384,7 @@ impl<'a> NamespaceErrorDecoder<'a> {
                     },
                     other => return Err(NamespaceErrorDecodeError::UnknownScanSubjectTag(other)),
                 },
-                failure: match self.u16()? {
+                failure: match self.u32()? {
                     1 => ScanFailureCode::PermissionDenied,
                     2 => ScanFailureCode::NotFound,
                     3 => ScanFailureCode::InvalidFileType,
@@ -1404,16 +1397,14 @@ impl<'a> NamespaceErrorDecoder<'a> {
     }
 }
 
-fn namespace_error_identity(code: NamespaceErrorCode, detail: &NamespaceErrorV1) -> [u8; 32] {
-    let mut encoder = CanonicalEncoder::new();
-    encoder.raw(&DSVP);
-    encoder.u8(1);
-    encoder.u16(code as u16);
-    encode_namespace_error_detail(&mut encoder, detail);
-    *blake3::hash(&encoder.into_bytes()).as_bytes()
+fn namespace_error_identity(code: NamespaceErrorCode, detail: &NamespaceErrorV1) -> [u8; 16] {
+    distill_core::hash::digest(Domain::NamespaceError, 1, |encoder| {
+        encoder.enum_variant(code as u32);
+        encode_namespace_error_detail(encoder, detail);
+    })
 }
 
-fn encode_namespace_error_detail(encoder: &mut CanonicalEncoder, detail: &NamespaceErrorV1) {
+fn encode_namespace_error_detail(encoder: &mut Encoder, detail: &NamespaceErrorV1) {
     match detail {
         NamespaceErrorV1::DuplicateAssetUuid { asset, claimants } => {
             encoder.raw(&asset.0);
@@ -1434,7 +1425,7 @@ fn encode_namespace_error_detail(encoder: &mut CanonicalEncoder, detail: &Namesp
         }
         NamespaceErrorV1::IncompleteSkeleton { source, failure } => {
             encode_bundle_source(encoder, source);
-            encoder.u16(*failure as u16);
+            encoder.enum_variant(*failure as u32);
         }
         NamespaceErrorV1::UnreadableGlobalBundlePath {
             root_name,
@@ -1443,7 +1434,7 @@ fn encode_namespace_error_detail(encoder: &mut CanonicalEncoder, detail: &Namesp
         } => {
             encoder.str(root_name);
             encoder.str(normalized_path);
-            encoder.u16(*failure as u16);
+            encoder.enum_variant(*failure as u32);
         }
         NamespaceErrorV1::InvalidPhysicalPath {
             root_name,
@@ -1452,62 +1443,62 @@ fn encode_namespace_error_detail(encoder: &mut CanonicalEncoder, detail: &Namesp
         } => {
             encoder.str(root_name);
             encode_platform_path(encoder, raw_relative_path);
-            encoder.u16(*failure as u16);
+            encoder.enum_variant(*failure as u32);
         }
         NamespaceErrorV1::UnreadableScanSubtree { subject, failure } => {
             match subject {
                 ScanSubject::Root { root_name } => {
-                    encoder.u8(1);
+                    encoder.enum_variant(1);
                     encoder.str(root_name);
                 }
                 ScanSubject::Subtree {
                     root_name,
                     raw_relative_path,
                 } => {
-                    encoder.u8(2);
+                    encoder.enum_variant(2);
                     encoder.str(root_name);
                     encode_platform_path(encoder, raw_relative_path);
                 }
             }
-            encoder.u16(*failure as u16);
+            encoder.enum_variant(*failure as u32);
         }
     }
 }
 
-pub(crate) fn encode_asset_claimant(encoder: &mut CanonicalEncoder, claimant: &AssetClaimant) {
+pub(crate) fn encode_asset_claimant(encoder: &mut Encoder, claimant: &AssetClaimant) {
     match claimant {
         AssetClaimant::Authored {
             source,
             bundle,
             local_id,
         } => {
-            encoder.u8(1);
+            encoder.enum_variant(1);
             encode_bundle_source(encoder, source);
             encoder.raw(&bundle.0);
             encoder.str(local_id);
         }
         AssetClaimant::Derived { parent, output_key } => {
-            encoder.u8(2);
+            encoder.enum_variant(2);
             encoder.raw(&parent.0);
             encoder.str(output_key);
         }
     }
 }
 
-fn encode_physical_path_claim(encoder: &mut CanonicalEncoder, claim: &PhysicalPathClaim) {
+fn encode_physical_path_claim(encoder: &mut Encoder, claim: &PhysicalPathClaim) {
     encode_platform_path(encoder, &claim.raw_relative_path);
     encoder.raw(&claim.file_hash.0);
 }
 
-fn encode_platform_path(encoder: &mut CanonicalEncoder, path: &PlatformPathBytes) {
+fn encode_platform_path(encoder: &mut Encoder, path: &PlatformPathBytes) {
     match path {
         PlatformPathBytes::Unix(bytes) => {
-            encoder.u8(1);
+            encoder.enum_variant(1);
             encoder.u32(u32::try_from(bytes.len()).expect("raw Unix path exceeds u32 length"));
             encoder.raw(bytes);
         }
         PlatformPathBytes::Windows(units) => {
-            encoder.u8(2);
+            encoder.enum_variant(2);
             encoder.u32(u32::try_from(units.len()).expect("raw Windows path exceeds u32 length"));
             for unit in units {
                 encoder.u16(*unit);
@@ -1516,11 +1507,11 @@ fn encode_platform_path(encoder: &mut CanonicalEncoder, path: &PlatformPathBytes
     }
 }
 
-fn encode_bundle_sources(encoder: &mut CanonicalEncoder, sources: &[ReadableBundleSource]) {
+fn encode_bundle_sources(encoder: &mut Encoder, sources: &[ReadableBundleSource]) {
     encoder.seq(sources, encode_bundle_source);
 }
 
-pub(crate) fn encode_bundle_source(encoder: &mut CanonicalEncoder, source: &ReadableBundleSource) {
+pub(crate) fn encode_bundle_source(encoder: &mut Encoder, source: &ReadableBundleSource) {
     encoder.str(&source.root_name);
     encoder.str(&source.normalized_path);
     encoder.raw(&source.file_hash.0);

@@ -23,12 +23,10 @@ use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
 use ngp_schema::{DynamicType, LogicalSchema, TypeTable, Value};
 
 mod container;
-mod crc32c;
 mod data;
 mod envelope;
 mod error;
 
-pub use crc32c::crc32c;
 pub use error::BundleError;
 pub use ngp_schema::{encode_path, PathComponent};
 
@@ -59,13 +57,9 @@ pub fn format_version_for(assets: &BTreeMap<String, AssetEntry>) -> u32 {
 }
 
 /// The container encoding version this crate reads and writes (§6): the
-/// header `version` field. Pinned to exactly 1.
-pub const CONTAINER_VERSION: u32 = 1;
-
-/// PNG-style container magic: `\x89DSB\r\n\x1a\n`. The high-bit first byte
-/// is invalid as UTF-8/JSON at byte zero, and the embedded `\r\n` / `\n`
-/// detect line-ending mangling loudly at open time (§6).
-pub const CONTAINER_MAGIC: [u8; 8] = [0x89, 0x44, 0x53, 0x42, 0x0D, 0x0A, 0x1A, 0x0A];
+/// shared file header's version under `Domain::Bundle`. 2: the shared
+/// header, no CRCs.
+pub const CONTAINER_VERSION: u32 = 2;
 
 /// Walk nesting cap for the schema-directed walk — a definite error, never
 /// a stack overflow (§12's cap discipline applied to the walk). JSON text
@@ -224,14 +218,14 @@ where
     })
 }
 
-/// Parse a bundle from file bytes, dispatching on the first byte: 0x89 →
-/// container, anything else → plain-JSON envelope (§6). All validation
-/// (framing, CRCs, envelope shape, schema closure, the schema-directed
+/// Parse a bundle from file bytes, dispatching on the shared file header's
+/// magic (`NGPF`) → container, anything else → plain-JSON envelope (§6).
+/// All validation (framing, envelope shape, schema closure, the schema-directed
 /// walk, blob placement) happens here; malformed input is a definite
 /// [`BundleError`], never a panic.
 pub fn parse_bundle(bytes: &[u8]) -> Result<Bundle, BundleError> {
     on_reserved_stack(|| {
-        if bytes.first() == Some(&0x89) {
+        if distill_core::header::has_magic(bytes) {
             container::parse(bytes)
         } else {
             envelope::parse(envelope::utf8(bytes)?, envelope::Strictness::Full, data::Blobs::Plain)
@@ -246,7 +240,7 @@ pub fn parse_bundle(bytes: &[u8]) -> Result<Bundle, BundleError> {
 /// must publish a namespace error.
 pub fn extract_namespace_skeleton(bytes: &[u8]) -> Result<BundleNamespaceSkeleton, BundleError> {
     on_reserved_stack(|| {
-        let bundle = if bytes.first() == Some(&0x89) {
+        let bundle = if distill_core::header::has_magic(bytes) {
             container::parse_namespace(bytes)?
         } else {
             envelope::parse(

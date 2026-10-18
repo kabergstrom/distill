@@ -45,7 +45,7 @@ fn schema_closure_missing_hash() {
 fn schemas_key_must_equal_snapshot_hash() {
     let (plain, b) = valid_plain();
     let real = b.assets["a"].schema_hash;
-    let fake = "00000000000000000000000000000000000000000000000000000000000000aa";
+    let fake = "000000000000000000000000000000aa";
     let bytes = mutate_envelope(&plain, |env| {
         let schemas = as_obj(as_obj(env).get_mut("schemas").unwrap());
         let snapshot = schemas.remove(&real.to_string()).unwrap();

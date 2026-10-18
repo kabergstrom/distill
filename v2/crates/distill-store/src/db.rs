@@ -21,7 +21,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// and the remedy is [`Store::recreate`], which the daemon's writer runs on
 /// its own ([`Store::open_or_recreate`]); readers still fail. Migrations are
 /// deferred until Distill is declared stable (DESIGN.md §13).
-pub const SCHEMA_VERSION: u32 = 67;
+pub const SCHEMA_VERSION: u32 = 68;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -329,7 +329,7 @@ CREATE TABLE tools (
     tool_key       TEXT NOT NULL,
     present        INTEGER NOT NULL CHECK (present IN (0, 1)),
     identity_object BLOB NOT NULL,
-    tool_hash      BLOB NOT NULL CHECK (length(tool_hash) = 32),
+    tool_hash      BLOB NOT NULL CHECK (length(tool_hash) = 16),
     input_version  INTEGER NOT NULL,
     PRIMARY KEY (tool_key, input_version)
 );
@@ -360,7 +360,7 @@ CREATE TABLE directory_import_failures (
     group_path              TEXT NOT NULL,
     destination_root        TEXT NOT NULL,
     destination_path        TEXT NOT NULL,
-    task                    BLOB NOT NULL CHECK (length(task) = 32),
+    task                    BLOB NOT NULL CHECK (length(task) = 16),
     attempted_input_version INTEGER NOT NULL,
     basis                   BLOB NOT NULL,
     terminal_kind           INTEGER NOT NULL CHECK (terminal_kind IN (1, 2)),

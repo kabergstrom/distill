@@ -24,7 +24,7 @@ pub struct ProjectSchemaAuthority {
     registry: SchemaRegistry,
     identity: LayoutIdentity,
     project_types: BTreeMap<TypeUuid, ProjectTypeAuthority>,
-    source_hash: [u8; 32],
+    source_hash: [u8; 16],
 }
 
 /// All schema and target-layout material needed to encode one project asset
@@ -48,12 +48,12 @@ impl ProjectSchemaAuthority {
     pub fn from_json(bytes: &[u8]) -> Result<Self, SchemaAuthorityError> {
         let schema = Schema::from_json(bytes)
             .map_err(|error| SchemaAuthorityError::Json(error.to_string()))?;
-        Self::from_schema(schema, *blake3::hash(bytes).as_bytes())
+        Self::from_schema(schema, distill_core::hash::hash(bytes))
     }
 
     pub fn from_schema(
         schema: Schema,
-        source_hash: [u8; 32],
+        source_hash: [u8; 16],
     ) -> Result<Self, SchemaAuthorityError> {
         validate_model(&schema)?;
         let view = schema
@@ -156,7 +156,7 @@ impl ProjectSchemaAuthority {
         Ok(registry)
     }
 
-    pub fn source_hash(&self) -> [u8; 32] {
+    pub fn source_hash(&self) -> [u8; 16] {
         self.source_hash
     }
 }
@@ -242,7 +242,7 @@ fn validate_model(schema: &Schema) -> Result<(), SchemaAuthorityError> {
     }
     let mut identities = BTreeSet::new();
     for table in &schema.layouts {
-        if !identities.insert(ngp_schema::identity_digest(&table.identity)) {
+        if !identities.insert(&table.identity) {
             return Err(SchemaAuthorityError::DuplicateLayoutIdentity);
         }
         if table.layouts.len() != schema.types.len() {

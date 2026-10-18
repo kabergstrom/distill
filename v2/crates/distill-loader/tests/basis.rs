@@ -15,7 +15,7 @@ fn rpc_basis_is_exactly_the_snapshot_stamp() {
 
 #[test]
 fn pack_basis_is_exactly_the_manifest_hash() {
-    let hash = ManifestHash([3; 32]);
+    let hash = ManifestHash([3; 16]);
     assert_eq!(
         IoBasis::Pack { manifest: hash },
         IoBasis::Pack { manifest: hash }

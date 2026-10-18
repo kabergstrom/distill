@@ -680,7 +680,7 @@ impl DaemonCoordinator {
                         continue;
                     };
                     let key = (output.root.clone(), output.path.clone());
-                    let hash = ContentHash(*blake3::hash(&output.bytes).as_bytes());
+                    let hash = ContentHash(distill_core::hash::hash(&output.bytes));
                     let held = store
                         .observed_files_at(&output.path)?
                         .into_iter()

@@ -17,7 +17,7 @@ use distill_wire::artifact::{content_hash, parse_artifact, write_artifact, Artif
 use distill_wire::dswl::{dswl_bytes, dswl_hash};
 use distill_wire::wire::{WireField, WireNode};
 
-const TARGET_HASH: [u8; 32] = [7; 32];
+const TARGET_HASH: [u8; 16] = [7; 16];
 const TYPE: TypeUuid = TypeUuid([2; 16]);
 /// The bundle file holding the fixture's asset.
 const PATH: &str = "assets/a.bundle";
@@ -48,7 +48,7 @@ fn write_asset(project: &mut TestProject, path: &str, asset: AssetUuid, value: u
 fn fixture() -> Fixture {
     let asset = AssetUuid([1; 16]);
     let type_uuid = TYPE;
-    let logical_hash = LogicalHash([3; 32]);
+    let logical_hash = LogicalHash([3; 16]);
     let target = TargetDefinition::new("dev", TargetDefinitionHash(TARGET_HASH));
     let mut project = TestProject::new(vec![target]);
     let server = project.server();
@@ -610,7 +610,7 @@ fn rpc_io_rebind_fences_everything_of_the_old_connection() {
         io.resolve(ReqId(request_id), asset, &basis);
     }
     let stale_basis = IoBasis::Pack {
-        manifest: ManifestHash([0; 32]),
+        manifest: ManifestHash([0; 16]),
     };
     io.resolve(ReqId(1_000), asset, &stale_basis);
     io.step();

@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::bundles::{blob16, blob32};
+use crate::bundles::blob16;
 use crate::db::{meta_get_u64, meta_set_u64, InputTxn, StoreReader};
 use crate::error::StoreError;
 use crate::state::{InputVersion, SnapshotStamp};
@@ -55,7 +55,7 @@ pub struct ServedEntryMeta {
     pub authoring_only: bool,
     /// The authoring content key (§17 "Content keys"); zero for a row
     /// published without one.
-    pub content: [u8; 32],
+    pub content: [u8; 16],
     pub tags: BTreeMap<String, Option<String>>,
 }
 
@@ -133,7 +133,7 @@ pub struct ChangeEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcTargetRow {
     pub name: String,
-    pub definition_hash: [u8; 32],
+    pub definition_hash: [u8; 16],
 }
 
 /// A read transaction held open on its own connection: every read sees the
@@ -237,9 +237,9 @@ fn served_entry_meta_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServedEntr
         normalized_path: row.get(3)?,
         type_uuid: TypeUuid(blob16(row.get(4)?)),
         terminal_type: TypeUuid(blob16(row.get(5)?)),
-        logical_hash: LogicalHash(blob32(row.get(6)?)),
+        logical_hash: LogicalHash(blob16(row.get(6)?)),
         authoring_only: row.get::<_, i64>(7)? != 0,
-        content: row.get::<_, Option<Vec<u8>>>(8)?.map(blob32).unwrap_or([0; 32]),
+        content: row.get::<_, Option<Vec<u8>>>(8)?.map(blob16).unwrap_or([0; 16]),
         tags: BTreeMap::new(),
     })
 }
@@ -555,7 +555,7 @@ impl StoreReader {
 fn rpc_target_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RpcTargetRow> {
     Ok(RpcTargetRow {
         name: row.get(0)?,
-        definition_hash: blob32(row.get(1)?),
+        definition_hash: blob16(row.get(1)?),
     })
 }
 
@@ -720,7 +720,7 @@ pub trait ServedWrite {
     }
 
     /// Install one RPC target, or replace its definition.
-    fn set_rpc_target(&mut self, name: &str, definition_hash: [u8; 32]) -> Result<(), StoreError> {
+    fn set_rpc_target(&mut self, name: &str, definition_hash: [u8; 16]) -> Result<(), StoreError> {
         self.served_conn()
             .prepare_cached(SET_RPC_TARGET)?
             .execute(rusqlite::params![name, definition_hash.as_slice()])?;

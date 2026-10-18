@@ -334,14 +334,14 @@ impl TraceSource for StoreTraceSource<'_> {
         }))
     }
 
-    fn query(&self, query: &AssetQuery) -> Observed<[u8; 32]> {
+    fn query(&self, query: &AssetQuery) -> Observed<[u8; 16]> {
         self.answer(self.try_query_results(query).map(|answer| match answer {
             Ok(results) => Observed::Ok(asset_query_result_hash(&results)),
             Err(bundle) => Observed::Err(StableFailureFingerprint::Poisoned { bundle }),
         }))
     }
 
-    fn tool(&self, id: &str) -> Observed<[u8; 32]> {
+    fn tool(&self, id: &str) -> Observed<[u8; 16]> {
         self.answer(
             self.store
                 .tool_hash_at(id, self.basis.tool_version)
@@ -359,7 +359,7 @@ impl TraceSource for StoreTraceSource<'_> {
         )
     }
 
-    fn capability(&self, key: &CapabilityKey) -> Observed<[u8; 32]> {
+    fn capability(&self, key: &CapabilityKey) -> Observed<[u8; 16]> {
         self.current_load.capability(key)
     }
 
@@ -371,7 +371,7 @@ impl TraceSource for StoreTraceSource<'_> {
         self.answer(self.role(asset).map(Observed::Ok))
     }
 
-    fn control(&self, _query: &ControlQuery) -> Observed<[u8; 32]> {
+    fn control(&self, _query: &ControlQuery) -> Observed<[u8; 16]> {
         no_trace()
     }
 

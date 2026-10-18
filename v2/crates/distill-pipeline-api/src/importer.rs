@@ -63,7 +63,7 @@ pub trait AuthoringImportContext {
     fn read(&mut self, path: &str) -> Result<Vec<u8>, ImportError>;
     fn probe(&mut self, path: &str) -> Result<bool, ImportError>;
     fn enumerate(&mut self, query: &FileQuery) -> Result<Vec<RootedPath>, ImportError>;
-    fn importer_capability(&mut self, id: &str) -> Result<[u8; 32], ImportError>;
+    fn importer_capability(&mut self, id: &str) -> Result<[u8; 16], ImportError>;
 
     /// The `$settings` of the import of `path`: the bundle at
     /// `{path}.bundle` whose `$record` names `path` among its sources.

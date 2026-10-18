@@ -2296,7 +2296,7 @@ fn decode_uuid(bytes: &[u8], field: &str) -> Result<[u8; 16], WireFailure> {
     fixed(bytes, field, InvalidRequest::Uuid)
 }
 
-fn decode_hash(bytes: &[u8], field: &str) -> Result<[u8; 32], WireFailure> {
+fn decode_hash(bytes: &[u8], field: &str) -> Result<[u8; 16], WireFailure> {
     fixed(bytes, field, InvalidRequest::Hash)
 }
 
@@ -4711,7 +4711,7 @@ mod tests {
                 limit: 64,
             },
             RpcFailure::ArtifactNotFound {
-                hash: ContentHash([3; 32]),
+                hash: ContentHash([3; 16]),
             },
             RpcFailure::AssetNotFound {
                 uuid: AssetUuid([4; 16]),
@@ -4743,7 +4743,7 @@ mod tests {
                 operation: "write".to_owned(),
             },
             RpcFailure::WireTreeNotFound {
-                hash: LayoutHash([8; 32]),
+                hash: LayoutHash([8; 16]),
             },
         ];
         for failure in failures {

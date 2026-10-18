@@ -21,23 +21,23 @@ impl TraceSource for Snapshot {
         Observed::Ok(None)
     }
     fn read(&self, _: AssetUuid) -> Observed<ContentHash> {
-        Observed::Ok(ContentHash([0; 32]))
+        Observed::Ok(ContentHash([0; 16]))
     }
 
     fn resolve(&self, path: &str) -> Observed<Option<AssetUuid>> {
         self.paths.get(path).cloned().unwrap_or(Observed::Ok(None))
     }
 
-    fn query(&self, _: &AssetQuery) -> Observed<[u8; 32]> {
-        Observed::Ok([0; 32])
+    fn query(&self, _: &AssetQuery) -> Observed<[u8; 16]> {
+        Observed::Ok([0; 16])
     }
 
-    fn tool(&self, _: &str) -> Observed<[u8; 32]> {
-        Observed::Ok([0; 32])
+    fn tool(&self, _: &str) -> Observed<[u8; 16]> {
+        Observed::Ok([0; 16])
     }
 
-    fn capability(&self, _: &CapabilityKey) -> Observed<[u8; 32]> {
-        Observed::Ok([0; 32])
+    fn capability(&self, _: &CapabilityKey) -> Observed<[u8; 16]> {
+        Observed::Ok([0; 16])
     }
 
     fn ref_check(&self, _: AssetUuid, _: TypeUuid) -> Observed<Option<TypeUuid>> {
@@ -48,16 +48,16 @@ impl TraceSource for Snapshot {
         Observed::Ok(None)
     }
 
-    fn control(&self, _: &ControlQuery) -> Observed<[u8; 32]> {
-        Observed::Ok([0; 32])
+    fn control(&self, _: &ControlQuery) -> Observed<[u8; 16]> {
+        Observed::Ok([0; 16])
     }
 
     fn control_read(&self, _: &ControlSubject) -> Observed<ControlValueHash> {
-        Observed::Ok(ControlValueHash([0; 32]))
+        Observed::Ok(ControlValueHash([0; 16]))
     }
 }
 
-fn commit(store: &mut Store, key: [u8; 32], asset: AssetUuid, trace: Vec<TraceOp>, bytes: &[u8]) {
+fn commit(store: &mut Store, key: [u8; 16], asset: AssetUuid, trace: Vec<TraceOp>, bytes: &[u8]) {
     store
         .commit_build(BuildCommit {
             reads: Vec::new(),
@@ -82,7 +82,7 @@ fn commit(store: &mut Store, key: [u8; 32], asset: AssetUuid, trace: Vec<TraceOp
 fn durable_bucket_revalidates_newest_first_and_hydrates_the_selected_extent() {
     let directory = tempfile::tempdir().unwrap();
     let mut store = Store::open(StoreConfig::new(directory.path())).unwrap();
-    let key = [7; 32];
+    let key = [7; 16];
     let asset = AssetUuid([1; 16]);
     let resolved = AssetUuid([2; 16]);
     commit(
@@ -141,7 +141,7 @@ fn a_lookup_reads_only_the_candidates_it_reaches() {
     for size in [2, 40] {
         let directory = tempfile::tempdir().unwrap();
         let mut store = Store::open(StoreConfig::new(directory.path())).unwrap();
-        let key = [7; 32];
+        let key = [7; 16];
         let asset = AssetUuid([1; 16]);
         for index in 0..size {
             commit(

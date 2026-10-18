@@ -1888,7 +1888,7 @@ mod bound_tests {
         let mut store = Store::open(StoreConfig::new(dir.join(".distill"))).unwrap();
         let targets = target_map(vec![TargetDefinition::new(
             "dev",
-            TargetDefinitionHash([7; 32]),
+            TargetDefinitionHash([7; 16]),
         )])
         .unwrap();
         store
@@ -1902,7 +1902,7 @@ mod bound_tests {
     }
 
     fn connect(server: &Server) -> ConnectOutcome {
-        let request = ConnectRequest::new("dev", TargetDefinitionHash([7; 32]));
+        let request = ConnectRequest::new("dev", TargetDefinitionHash([7; 16]));
         server.root().connect(request)
     }
 

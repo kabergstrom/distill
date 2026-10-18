@@ -504,7 +504,7 @@ pub fn content_key(
     schema: &SchemaNode,
     value: &Value,
     types: &TypeTable,
-) -> Result<[u8; 32], String> {
+) -> Result<[u8; 16], String> {
     struct Refs(Vec<BlobRef>);
     impl BlobSink for Refs {
         fn place(&mut self, _: &[PathComponent], blob: &[u8]) -> Result<(u64, u64), String> {
@@ -535,29 +535,26 @@ pub fn content_key(
 
 /// [`content_key`] of a carried value: its text, its blobs' refs and its
 /// carried types as they are.
-pub fn content_key_of(schema_hash: LogicalHash, value: &AuthoringValue) -> [u8; 32] {
+pub fn content_key_of(schema_hash: LogicalHash, value: &AuthoringValue) -> [u8; 16] {
     let refs: Vec<BlobRef> = value.blobs.iter().map(AuthoringBlob::blob_ref).collect();
     let carried = value.types.iter().map(|ty| (ty.type_uuid, ty.schema_hash)).collect();
     key_of(schema_hash, &String::from_utf8_lossy(&value.canonical_value), &refs, carried)
 }
 
-fn key_of(schema_hash: LogicalHash, text: &str, refs: &[BlobRef], mut carried: Vec<(TypeUuid, LogicalHash)>) -> [u8; 32] {
+fn key_of(schema_hash: LogicalHash, text: &str, refs: &[BlobRef], mut carried: Vec<(TypeUuid, LogicalHash)>) -> [u8; 16] {
     carried.sort();
-    let mut hasher = blake3::Hasher::new_derive_key("distill authoring content key v1");
-    hasher.update(&schema_hash.0);
-    hasher.update(&(text.len() as u64).to_le_bytes());
-    hasher.update(text.as_bytes());
-    hasher.update(&(refs.len() as u64).to_le_bytes());
-    for blob in refs {
-        hasher.update(&blob.len.to_le_bytes());
-        hasher.update(&blob.hash);
-    }
-    hasher.update(&(carried.len() as u64).to_le_bytes());
-    for (uuid, hash) in carried {
-        hasher.update(&uuid.0);
-        hasher.update(&hash.0);
-    }
-    *hasher.finalize().as_bytes()
+    distill_core::hash::digest(distill_core::hash::Domain::ContentKey, 1, |e| {
+        e.raw(&schema_hash.0);
+        e.str(text);
+        e.seq(refs, |e, blob| {
+            e.u64(blob.len);
+            e.raw(&blob.hash);
+        });
+        e.seq(&carried, |e, (uuid, hash)| {
+            e.raw(&uuid.0);
+            e.raw(&hash.0);
+        });
+    })
 }
 
 /// Complete an importer-settings patch from `defaults`, the importer's
@@ -1004,7 +1001,7 @@ mod tests {
             Err(AuthoringValueError::UnknownBlobRef { index: 0 })
         );
         let mut wrong = carried.clone();
-        wrong.blobs[0] = AuthoringBlob::Ref(BlobRef { len: 39, hash: [0; 32] });
+        wrong.blobs[0] = AuthoringBlob::Ref(BlobRef { len: 39, hash: [0; 16] });
         assert!(check_authoring_payload(hash, schema_text.as_bytes(), &wrong).is_err());
     }
 }

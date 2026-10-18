@@ -6,7 +6,11 @@
 
 use std::collections::BTreeMap;
 
-use distill_bundle::{crc32c, AssetEntry, Bundle, CONTAINER_MAGIC, CONTAINER_VERSION};
+use distill_bundle::{AssetEntry, Bundle, CONTAINER_VERSION};
+use distill_core::hash::Domain;
+
+/// The container header: shared file header (12 bytes), json_len, blob_len.
+pub const CONTAINER_HEADER_LEN: usize = 28;
 use distill_core::id::{LogicalHash, TypeUuid};
 use distill_json::{Kind, Lexer};
 use ngp_schema::{
@@ -289,18 +293,14 @@ pub fn align16(n: u64) -> u64 {
 }
 
 /// Build container bytes from a JSON chunk and a blob chunk, with a correct
-/// header. Corruption tests mutate the result (recomputing CRCs when the
-/// corruption is meant to hit a later check).
+/// header. Corruption tests mutate the result.
 pub fn build_container(json: &[u8], chunk: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(&CONTAINER_MAGIC);
-    out.extend_from_slice(&CONTAINER_VERSION.to_le_bytes());
+    distill_core::header::write_header(&mut out, Domain::Bundle, CONTAINER_VERSION);
     out.extend_from_slice(&(json.len() as u64).to_le_bytes());
     out.extend_from_slice(&(chunk.len() as u64).to_le_bytes());
-    out.extend_from_slice(&crc32c(json).to_le_bytes());
-    out.extend_from_slice(&crc32c(chunk).to_le_bytes());
     out.extend_from_slice(json);
-    let json_end = 36 + json.len() as u64;
+    let json_end = (CONTAINER_HEADER_LEN + json.len()) as u64;
     out.resize(align16(json_end) as usize, 0);
     out.extend_from_slice(chunk);
     out
@@ -310,25 +310,13 @@ pub fn build_container(json: &[u8], chunk: &[u8]) -> Vec<u8> {
 pub fn container_parts(bytes: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let json_len = u64::from_le_bytes(bytes[12..20].try_into().unwrap()) as usize;
     let blob_len = u64::from_le_bytes(bytes[20..28].try_into().unwrap()) as usize;
-    let json_end = 36 + json_len;
+    let json_end = CONTAINER_HEADER_LEN + json_len;
     let pad_end = align16(json_end as u64) as usize;
     (
-        bytes[36..json_end].to_vec(),
+        bytes[CONTAINER_HEADER_LEN..json_end].to_vec(),
         bytes[json_end..pad_end].to_vec(),
         bytes[pad_end..pad_end + blob_len].to_vec(),
     )
-}
-
-/// Patch the stored json_crc to match the (possibly mutated) json chunk.
-pub fn fix_json_crc(bytes: &mut [u8]) {
-    let (json, _, _) = container_parts(bytes);
-    bytes[28..32].copy_from_slice(&crc32c(&json).to_le_bytes());
-}
-
-/// Patch the stored blob_crc to match the (possibly mutated) blob chunk.
-pub fn fix_blob_crc(bytes: &mut [u8]) {
-    let (_, _, chunk) = container_parts(bytes);
-    bytes[32..36].copy_from_slice(&crc32c(&chunk).to_le_bytes());
 }
 
 // ---- reference envelope builder (bypasses write_bundle validation) ----

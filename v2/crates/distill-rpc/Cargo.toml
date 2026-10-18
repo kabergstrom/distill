@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 tracing.workspace = true
-blake3.workspace = true
 capnp = "0.26.2"
 capnp-rpc = "0.26.1"
 distill-core = { path = "../distill-core" }

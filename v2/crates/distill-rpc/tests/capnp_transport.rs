@@ -15,11 +15,11 @@ use distill_test_project::{
 use tokio::task::LocalSet;
 
 fn target() -> TargetDefinition {
-    TargetDefinition::new("dev", TargetDefinitionHash([7; 32]))
+    TargetDefinition::new("dev", TargetDefinitionHash([7; 16]))
 }
 
 fn request() -> ConnectRequest {
-    ConnectRequest::new("dev", TargetDefinitionHash([7; 32]))
+    ConnectRequest::new("dev", TargetDefinitionHash([7; 16]))
 }
 
 /// An empty project whose daemon serves the target "dev" (definition 7).
@@ -71,7 +71,7 @@ fn publish_unrelated(project: &mut TestProject) -> SnapshotStamp {
 }
 
 /// The configuration error [`reject_configuration`] publishes.
-fn configuration_error(file_hash: [u8; 32]) -> ConfigurationError {
+fn configuration_error(file_hash: [u8; 16]) -> ConfigurationError {
     ConfigurationError::from_reason(
         &DscpV1::MalformedConfiguration { file_hash },
         "invalid staged configuration",
@@ -81,7 +81,7 @@ fn configuration_error(file_hash: [u8; 32]) -> ConfigurationError {
 /// The daemon rejects its configuration source (a malformed configuration
 /// file hashing to `file_hash`): no version is published, the current one
 /// is served under the failure (its stamp is returned).
-fn reject_configuration(project: &TestProject, file_hash: [u8; 32]) -> SnapshotStamp {
+fn reject_configuration(project: &TestProject, file_hash: [u8; 16]) -> SnapshotStamp {
     project
         .coordinator()
         .reject_configuration(
@@ -104,7 +104,7 @@ fn canonical_artifact(
             authored_type: type_uuid,
             terminal_type: type_uuid,
             encoded_type: type_uuid,
-            logical_hash: LogicalHash([77; 32]),
+            logical_hash: LogicalHash([77; 16]),
             layout_hash,
         },
         &[],
@@ -923,7 +923,7 @@ async fn authoring_snapshot_round_trips_over_real_tcp_with_exact_stamp_and_role_
                 _ => panic!("expected refreshed version"),
             }
 
-            let failed_stamp = reject_configuration(&project, [7; 32]);
+            let failed_stamp = reject_configuration(&project, [7; 16]);
             let failed_refresh = refreshed.refresh_request().send().promise.await.unwrap();
             let failed = match failed_refresh
                 .get()
@@ -1005,8 +1005,8 @@ async fn unbound_metadata_bootstrap_round_trips_over_tcp_while_failed() {
             // A malformed bundle file: a namespace error naming it.
             project.write("broken.bundle", b"not a bundle");
             project.publish();
-            let error = configuration_error([6; 32]);
-            let stamp = reject_configuration(&project, [6; 32]);
+            let error = configuration_error([6; 16]);
+            let stamp = reject_configuration(&project, [6; 16]);
             let namespace_errors = match server.root().metadata(PROTOCOL_VERSION) {
                 MetadataConnectOutcome::Connected(connected) => {
                     let diagnostics = connected.hub.diagnostics().success().unwrap();
@@ -1141,7 +1141,7 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
             let builds = TestBuilds::install(&server);
             let uuid = AssetUuid([3; 16]);
             let (hash, payload) =
-                canonical_artifact(uuid, TypeUuid([1; 16]), LayoutHash([4; 32]), &[10, 11, 12]);
+                canonical_artifact(uuid, TypeUuid([1; 16]), LayoutHash([4; 16]), &[10, 11, 12]);
             let expected_structural = payload.structural.clone();
             assert_eq!(
                 distill_test_project::put_artifact(&server.handle(), &payload),
@@ -1298,8 +1298,8 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
 
             // A configuration error remains a typed result union over the
             // generated transport; refresh itself remains safe.
-            let error = configuration_error([8; 32]);
-            reject_configuration(&project, [8; 32]);
+            let error = configuration_error([8; 16]);
+            reject_configuration(&project, [8; 16]);
             let refresh_response = snapshot.refresh_request().send().promise.await.unwrap();
             let refresh_result = refresh_response.get().unwrap().get_result().unwrap();
             let failed_snapshot = match refresh_result.which().unwrap() {
@@ -1509,13 +1509,13 @@ async fn wire_rejects_wrong_hash_and_uuid_widths_as_typed_results() {
             ));
 
             let mut wrong_target = request();
-            wrong_target.target_definition_hash = TargetDefinitionHash([8; 32]);
+            wrong_target.target_definition_hash = TargetDefinitionHash([8; 16]);
             assert!(matches!(
                 client.connect(&wrong_target).await.unwrap(),
                 RemoteConnectOutcome::TargetFailure(
                     ConnectError::TargetDefinitionMismatch { expected, got }
-                ) if expected == TargetDefinitionHash([7; 32])
-                    && got == TargetDefinitionHash([8; 32])
+                ) if expected == TargetDefinitionHash([7; 16])
+                    && got == TargetDefinitionHash([8; 16])
             ));
 
             let mut malformed = client.root().connect_request();
@@ -1885,7 +1885,7 @@ fn pipeline_failure_capnp_decode_rejects_unknown_width_and_matrix_failures() {
     let mut unknown = capnp::message::Builder::new_default();
     {
         let mut root = unknown.init_root::<schema::pipeline_failure::Builder<'_>>();
-        initialize(root.reborrow(), &[0; 32]);
+        initialize(root.reborrow(), &[0; 16]);
         use capnp::introspect::{Introspect, TypeVariant};
         let TypeVariant::Enum(raw_schema) = schema::PipelineFailureCode::introspect().which()
         else {
@@ -1929,7 +1929,7 @@ fn pipeline_failure_capnp_decode_rejects_unknown_width_and_matrix_failures() {
         root.set_code(schema::PipelineFailureCode::CandidateCleanup);
         root.set_origin(schema::PipelineFailureOrigin::CandidateOpen);
         root.set_cleanup(schema::CleanupDisposition::None);
-        root.set_identity(&[0; 32]);
+        root.set_identity(&[0; 16]);
         root.set_message("diagnostic only");
     }
     assert!(distill_rpc::capnp_transport::decode_pipeline_failure(
@@ -1946,7 +1946,7 @@ fn configuration_error_wire_authenticates_dscp_version_detail_code_and_digest() 
         address: "192.0.2.1:4000".to_owned(),
     };
     let error = ConfigurationError::from_reason(&detail, "loopback required");
-    let encode = |version: u16, code: u16, bytes: Vec<u8>, digest: [u8; 32]| {
+    let encode = |version: u16, code: u16, bytes: Vec<u8>, digest: [u8; 16]| {
         let mut message = capnp::message::Builder::new_default();
         {
             let mut root = message.init_root::<schema::configuration_error::Builder<'_>>();
@@ -1996,7 +1996,7 @@ fn configuration_error_wire_authenticates_dscp_version_detail_code_and_digest() 
             1,
             error.code as u16,
             error.detail.canonical_detail_bytes(),
-            [9; 32],
+            [9; 16],
         ),
     ] {
         assert!(distill_rpc::capnp_transport::decode_configuration_error(
@@ -2054,7 +2054,7 @@ fn namespace_error_capnp_decode_rejects_noncanonical_claimants_and_path_bytes() 
     {
         let mut root = short_claimant_uuid.init_root::<schema::namespace_error::Builder<'_>>();
         root.set_code(NamespaceErrorCode::DuplicateAssetUuid as u16);
-        root.set_identity(&[0; 32]);
+        root.set_identity(&[0; 16]);
         root.set_message("diagnostic only");
         let mut detail = root.init_detail().init_duplicate_asset_uuid();
         detail.reborrow().init_asset().set_bytes(&[1; 16]);
@@ -2077,7 +2077,7 @@ fn namespace_error_capnp_decode_rejects_noncanonical_claimants_and_path_bytes() 
     {
         let mut root = insufficient_claimants.init_root::<schema::namespace_error::Builder<'_>>();
         root.set_code(NamespaceErrorCode::DuplicateAssetUuid as u16);
-        root.set_identity(&[0; 32]);
+        root.set_identity(&[0; 16]);
         root.set_message("diagnostic only");
         let mut detail = root.init_detail().init_duplicate_asset_uuid();
         detail.reborrow().init_asset().set_bytes(&[1; 16]);
@@ -2096,7 +2096,7 @@ fn namespace_error_capnp_decode_rejects_noncanonical_claimants_and_path_bytes() 
     {
         let mut root = odd_windows_path.init_root::<schema::namespace_error::Builder<'_>>();
         root.set_code(NamespaceErrorCode::SameRootNormalizedPathCollision as u16);
-        root.set_identity(&[0; 32]);
+        root.set_identity(&[0; 16]);
         root.set_message("diagnostic only");
         let mut detail = root
             .init_detail()
@@ -2109,13 +2109,13 @@ fn namespace_error_capnp_decode_rejects_noncanonical_claimants_and_path_bytes() 
             .reborrow()
             .init_raw_relative_path()
             .set_windows_utf16_le(&[0x61]);
-        first.set_file_hash(&[1; 32]);
+        first.set_file_hash(&[1; 16]);
         let mut second = claims.reborrow().get(1);
         second
             .reborrow()
             .init_raw_relative_path()
             .set_unix_bytes(b"same/path");
-        second.set_file_hash(&[2; 32]);
+        second.set_file_hash(&[2; 16]);
     }
     assert!(distill_rpc::capnp_transport::decode_namespace_error(
         odd_windows_path
@@ -2641,7 +2641,7 @@ fn browsing_authorable() -> Authorable {
         types: vec![
             ty("cue", TypeDefault::Value(value(r#"{"value":3}"#))),
             ty("rules", TypeDefault::Absent),
-            ty("stale", TypeDefault::SchemaMismatch { written: LogicalHash([2; 32]) }),
+            ty("stale", TypeDefault::SchemaMismatch { written: LogicalHash([2; 16]) }),
         ],
         importers: vec![AuthorableImporter {
             id: "ngp.image".into(),

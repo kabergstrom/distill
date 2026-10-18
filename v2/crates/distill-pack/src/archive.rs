@@ -1,26 +1,28 @@
-//! Authenticated DPK1 archive records (§16).
+//! Authenticated pack archive records (§16). A pack archive and a pack
+//! manifest start with the shared file header (§5: `NGPF`, the `Domain`,
+//! [`PACK_VERSION`]) and end with the XXH3-128 of everything before.
 
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Write};
 
-use distill_bundle::crc32c;
+use distill_core::hash::{digest_bytes, Domain, Hash128};
+use distill_core::header::{read_header, write_header, HeaderError, HEADER_LEN};
 use distill_core::id::ContentHash;
 
-pub const PACK_MAGIC: [u8; 4] = *b"DPK1";
 /// 3: path-table rows carry the asset name (a local id; empty for the
-/// primary).
-pub const PACK_VERSION: u32 = 3;
+/// primary). 4: the shared file header, XXH3-128 keys and trailers, `u32`
+/// object kinds, no per-object CRC.
+pub const PACK_VERSION: u32 = 4;
+
+/// Trailer length: the file's XXH3-128.
+pub const TRAILER_LEN: usize = 16;
 pub const STRUCTURAL_CHUNK_SIZE: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EKey(pub [u8; 32]);
+pub struct EKey(pub [u8; 16]);
 
 pub fn ekey(stored_payload: &[u8]) -> EKey {
-    let mut h = blake3::Hasher::new();
-    h.update(b"DSEK");
-    h.update(&[1]);
-    h.update(stored_payload);
-    EKey(*h.finalize().as_bytes())
+    EKey(digest_bytes(Domain::PackEntry, 1, stored_payload))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,14 +86,13 @@ struct EncodedObjectIndex {
 pub enum ArchiveError {
     TooShort,
     FileHash,
-    Magic,
-    Version,
+    /// The shared file header (§5) is not this file's at [`PACK_VERSION`].
+    Header(HeaderError),
     Utf8,
     Truncated,
     UnknownKind,
     BadPadding,
     BadLength,
-    Crc,
     EKey,
     Zstd(std::io::Error),
     DuplicateEKey,
@@ -113,8 +114,7 @@ pub fn encode_archive(
     artifacts: &[ArtifactPayload],
 ) -> Result<ArchiveBuild, ArchiveError> {
     let mut out = Vec::new();
-    out.extend_from_slice(&PACK_MAGIC);
-    out.extend_from_slice(&PACK_VERSION.to_le_bytes());
+    write_header(&mut out, Domain::PackArchive, PACK_VERSION);
     out.extend_from_slice(&generation.to_le_bytes());
     out.extend_from_slice(&(encoder.len() as u32).to_le_bytes());
     out.extend_from_slice(encoder.as_bytes());
@@ -221,14 +221,16 @@ fn write_object(
         }
         return Ok(());
     }
-    out.push(match kind {
-        ArchiveObjectKind::Structural => 0x01,
-        ArchiveObjectKind::Blob => 0x02,
-    });
+    out.extend_from_slice(
+        &match kind {
+            ArchiveObjectKind::Structural => 1u32,
+            ArchiveObjectKind::Blob => 2u32,
+        }
+        .to_le_bytes(),
+    );
     out.extend_from_slice(&key.0);
     out.extend_from_slice(&raw_len.to_le_bytes());
     out.extend_from_slice(&(stored.len() as u64).to_le_bytes());
-    out.extend_from_slice(&crc32c(stored).to_le_bytes());
     pad16(out);
     let offset = out.len() as u64;
     out.extend_from_slice(stored);
@@ -251,21 +253,17 @@ pub fn validate_archive(bytes: &[u8]) -> Result<(), ArchiveError> {
 }
 
 pub(crate) fn scan_archive(bytes: &[u8]) -> Result<ScannedArchive, ArchiveError> {
-    if bytes.len() < 8 + 4 + 4 + 4 + 32 {
+    if bytes.len() < HEADER_LEN + 4 + 4 + 4 + TRAILER_LEN {
         return Err(ArchiveError::TooShort);
     }
     verify_trailer(bytes)?;
-    let body_end = bytes.len() - 32;
+    let body_end = bytes.len() - TRAILER_LEN;
     let mut r = Reader {
         bytes: &bytes[..body_end],
         pos: 0,
     };
-    if r.take(4)? != PACK_MAGIC {
-        return Err(ArchiveError::Magic);
-    }
-    if r.u32()? != PACK_VERSION {
-        return Err(ArchiveError::Version);
-    }
+    read_header(r.take(HEADER_LEN)?, Domain::PackArchive, PACK_VERSION)
+        .map_err(ArchiveError::Header)?;
     let generation = r.u32()?;
     let encoder_len = r.u32()? as usize;
     let encoder = std::str::from_utf8(r.take(encoder_len)?)
@@ -274,21 +272,17 @@ pub(crate) fn scan_archive(bytes: &[u8]) -> Result<ScannedArchive, ArchiveError>
     let zstd_level = r.i32()?;
     let mut objects = BTreeMap::new();
     while r.pos < body_end {
-        let kind = match r.u8()? {
-            0x01 => ArchiveObjectKind::Structural,
-            0x02 => ArchiveObjectKind::Blob,
+        let kind = match r.u32()? {
+            1 => ArchiveObjectKind::Structural,
+            2 => ArchiveObjectKind::Blob,
             _ => return Err(ArchiveError::UnknownKind),
         };
-        let key = EKey(r.array32()?);
+        let key = EKey(r.array16()?);
         let raw_len = r.u64()?;
         let stored_len = usize::try_from(r.u64()?).map_err(|_| ArchiveError::BadLength)?;
-        let crc = r.u32()?;
         r.align16_zero()?;
         let offset = r.pos as u64;
         let stored = r.take(stored_len)?;
-        if crc32c(stored) != crc {
-            return Err(ArchiveError::Crc);
-        }
         if ekey(stored) != key {
             return Err(ArchiveError::EKey);
         }
@@ -332,16 +326,16 @@ fn pad16(out: &mut Vec<u8>) {
 }
 
 pub(crate) fn append_trailer(out: &mut Vec<u8>) {
-    let hash = *blake3::hash(out).as_bytes();
+    let hash = distill_core::hash::hash(out);
     out.extend_from_slice(&hash);
 }
 
 pub(crate) fn verify_trailer(bytes: &[u8]) -> Result<(), ArchiveError> {
-    if bytes.len() < 32 {
+    if bytes.len() < TRAILER_LEN {
         return Err(ArchiveError::TooShort);
     }
-    let split = bytes.len() - 32;
-    if blake3::hash(&bytes[..split]).as_bytes() != &bytes[split..] {
+    let split = bytes.len() - TRAILER_LEN;
+    if distill_core::hash::hash(&bytes[..split]) != bytes[split..] {
         return Err(ArchiveError::FileHash);
     }
     Ok(())
@@ -361,9 +355,6 @@ impl<'a> Reader<'a> {
         self.pos = end;
         Ok(out)
     }
-    fn u8(&mut self) -> Result<u8, ArchiveError> {
-        Ok(self.take(1)?[0])
-    }
     fn u32(&mut self) -> Result<u32, ArchiveError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
@@ -373,8 +364,8 @@ impl<'a> Reader<'a> {
     fn u64(&mut self) -> Result<u64, ArchiveError> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
-    fn array32(&mut self) -> Result<[u8; 32], ArchiveError> {
-        Ok(self.take(32)?.try_into().unwrap())
+    fn array16(&mut self) -> Result<Hash128, ArchiveError> {
+        Ok(self.take(16)?.try_into().unwrap())
     }
     fn align16_zero(&mut self) -> Result<(), ArchiveError> {
         let end = (self.pos + 15) & !15;
@@ -426,7 +417,7 @@ mod tests {
             "test",
             3,
             &[ArtifactPayload {
-                content_hash: ContentHash([1; 32]),
+                content_hash: ContentHash([1; 16]),
                 structural,
                 blobs: vec![frame.clone()],
             }],

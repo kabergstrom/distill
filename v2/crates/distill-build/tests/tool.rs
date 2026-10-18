@@ -50,7 +50,7 @@ fn ambient_registration(trusted: bool) -> ToolRegistrationV2 {
         source: ResolvedToolSourceV2::Ambient {
             launcher: launcher.to_string_lossy().into_owned(),
             toolchain_id: "system-shell".into(),
-            trusted_fingerprint: trusted.then_some([9; 32]),
+            trusted_fingerprint: trusted.then_some([9; 16]),
         },
         environment: vec![("FOO".into(), "ambient".into())],
         cwd_policy: ToolCwdPolicy::EmptyScratch,

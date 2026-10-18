@@ -352,7 +352,7 @@ fn run_cell(
     store: &mut Store,
     worker: &CellWorker<BuildOutcome>,
     target: &str,
-    key: [u8; 32],
+    key: [u8; 16],
     asset: AssetUuid,
 ) -> BuildOutcome {
     let opened = coordinator
@@ -392,7 +392,7 @@ fn build_cell(
     store: &mut Store,
     worker: &CellWorker<BuildOutcome>,
     target: &str,
-    key: [u8; 32],
+    key: [u8; 16],
     asset: AssetUuid,
     view: StoreSnapshot,
     latest: StoreReader,
@@ -443,8 +443,8 @@ struct NodeEnv {
     pipeline: PipelineSnapshot,
     registry: PipelineRegistry,
     target: Target,
-    target_definition: [u8; 32],
-    dylib_hash: [u8; 32],
+    target_definition: [u8; 16],
+    dylib_hash: [u8; 16],
     max_depth: usize,
     /// The loaded pipeline's capabilities, derived from its epoch.
     current_load: CurrentLoadSource,
@@ -524,7 +524,7 @@ fn pipeline_registry(epoch: &PipelineEpoch) -> Result<PipelineRegistry, String> 
 
 /// A node's DSNK key.
 struct NodeKey {
-    digest: [u8; 32],
+    digest: [u8; 16],
 }
 
 /// The key of `asset`'s node at `reader`'s state under `env`, or `None`
@@ -1604,7 +1604,7 @@ pub(crate) fn doctor_verify_builds(
 /// order the walk reaches them so an unrelated type elsewhere in the schema
 /// leaves it unchanged. Tag extraction and `load_current` read nothing else
 /// of the authority, so a type whose epoch holds keeps its tag rows.
-pub(crate) fn type_tag_epochs(authority: &ProjectSchemaAuthority) -> BTreeMap<TypeUuid, [u8; 32]> {
+pub(crate) fn type_tag_epochs(authority: &ProjectSchemaAuthority) -> BTreeMap<TypeUuid, [u8; 16]> {
     use distill_schema::ngp_schema::SchemaTypeId;
     let types = &authority.schema().types;
     authority
@@ -1630,7 +1630,7 @@ pub(crate) fn type_tag_epochs(authority: &ProjectSchemaAuthority) -> BTreeMap<Ty
                 }
             }
             let renumber = |id: SchemaTypeId| SchemaTypeId(local[&id]);
-            let epoch = distill_core::canonical::domain_digest(*b"DSTE", 1, |encoder| {
+            let epoch = distill_core::hash::digest(distill_core::hash::Domain::TypeEpoch, 1, |encoder| {
                 encoder.raw(&type_uuid.0);
                 encoder.raw(&project.logical_hash.0);
                 for id in &order {
@@ -1807,7 +1807,7 @@ fn read_tag_bundle(
     let bytes = scanner
         .read_identity_checked(&path)
         .map_err(|_| BuildError::Drifted(DriftedInput::File(bundle_meta.path.clone())))?;
-    if ContentHash(*blake3::hash(&bytes).as_bytes()) != bundle_meta.content_hash {
+    if ContentHash(distill_core::hash::hash(&bytes)) != bundle_meta.content_hash {
         return Err(BuildError::Drifted(DriftedInput::File(bundle_meta.path)));
     }
     let parsed = distill_bundle::parse_bundle(&bytes).map_err(BuildError::failed)?;
@@ -2451,7 +2451,7 @@ fn process_chain(
             load_current_value(context, loaded, project, current_load, &mut trace)?
         }
     };
-    let mut current_hash = ContentHash(*blake3::hash(&imported.bytes).as_bytes());
+    let mut current_hash = ContentHash(distill_core::hash::hash(&imported.bytes));
     let mut extras = BTreeMap::<String, EncodedNodeOutput>::new();
     let mut final_primary = None;
     for stage in &chain.stages {
@@ -2473,7 +2473,7 @@ fn process_chain(
             .find(|output| output.output_key.is_empty())
             .cloned()
             .expect("closed processor output always has a primary");
-        current_hash = ContentHash(*blake3::hash(&primary.bytes).as_bytes());
+        current_hash = ContentHash(distill_core::hash::hash(&primary.bytes));
         current_value = next_value;
         for output in encoded {
             if output.output_key.is_empty() {
@@ -2606,7 +2606,7 @@ fn hydrate_complete_chain(
     chain: &PipelineChain,
     imported: &EncodedNodeOutput,
 ) -> Result<Option<(Vec<EncodedNodeOutput>, Vec<TraceOp>)>, BuildError> {
-    let mut input_hash = ContentHash(*blake3::hash(&imported.bytes).as_bytes());
+    let mut input_hash = ContentHash(distill_core::hash::hash(&imported.bytes));
     let mut extras = BTreeMap::<String, EncodedNodeOutput>::new();
     let mut final_primary = None;
     let mut traces = Vec::new();
@@ -2623,7 +2623,7 @@ fn hydrate_complete_chain(
             .find(|output| output.output_key.is_empty())
             .cloned()
             .expect("hydrated stage was shape checked");
-        input_hash = ContentHash(*blake3::hash(&primary.bytes).as_bytes());
+        input_hash = ContentHash(distill_core::hash::hash(&primary.bytes));
         for output in outputs {
             if output.output_key.is_empty() {
                 final_primary = Some(output);
@@ -2763,7 +2763,7 @@ fn hydrate_processor_stage(
 fn persisted_hit(
     context: &mut BuildContext,
     key_kind: KeyKind,
-    static_key: &[u8; 32],
+    static_key: &[u8; 16],
     asset: AssetUuid,
 ) -> Result<Option<PersistedHit>, BuildError> {
     let rows = latest_store(context)
@@ -3125,7 +3125,7 @@ fn prepare_outputs(
         let view = parse_artifact(&output.bytes).map_err(BuildError::failed)?;
         let load_edges =
             load_edges_for_output(context, output.asset, &view.load_deps, &output.references)?;
-        let content_hash = ContentHash(*blake3::hash(&output.bytes).as_bytes());
+        let content_hash = ContentHash(distill_core::hash::hash(&output.bytes));
         rows.insert(
             output.output_key.clone(),
             BuildOutputRow {
@@ -3249,7 +3249,7 @@ fn assemble_pending(
         );
     }
     for artifact in pending {
-        let content_hash = ContentHash(*blake3::hash(&artifact.bytes).as_bytes());
+        let content_hash = ContentHash(distill_core::hash::hash(&artifact.bytes));
         context
             .artifacts
             .borrow_mut()
@@ -3502,7 +3502,7 @@ fn migration_ops_use_defaults(ops: &[MigrationOp]) -> bool {
 fn migration_key_inputs(
     loaded: &LoadedAsset,
     project: &ProjectTypeAuthority,
-    dylib_hash: [u8; 32],
+    dylib_hash: [u8; 16],
 ) -> (Vec<AppliedMigration>, Option<AutomaticMigration>) {
     if loaded.entry.schema_hash == project.logical_hash {
         return (Vec::new(), None);
@@ -3625,8 +3625,7 @@ fn artifact_encoding_failure(error: &ArtifactEncodeError) -> Option<ArtifactEnco
             | EncodeError::DepthExceeded,
         )
         | ArtifactEncodeError::Artifact(
-            ArtifactError::BadMagic
-            | ArtifactError::UnsupportedVersion { .. }
+            ArtifactError::Header(_)
             | ArtifactError::Truncated { .. }
             | ArtifactError::TrailingBytes { .. }
             | ArtifactError::Overflow
@@ -3642,7 +3641,7 @@ fn artifact_encoding_failure(error: &ArtifactEncodeError) -> Option<ArtifactEnco
 fn commit_build_import_failure(
     context: &BuildContext,
     loaded: &LoadedAsset,
-    key: [u8; 32],
+    key: [u8; 16],
     trace: &[TraceOp],
     facts: Option<&DslfV1>,
 ) -> Result<(), BuildError> {
@@ -3884,7 +3883,7 @@ fn encode_or_hydrate(
     loaded: &LoadedAsset,
     project: &ProjectTypeAuthority,
     terminal_type: TypeUuid,
-    validator_dylib_hash: Option<[u8; 32]>,
+    validator_dylib_hash: Option<[u8; 16]>,
     trace_out: &mut Vec<TraceOp>,
 ) -> Result<EncodedBuildImport, BuildError> {
     let current_load = &context.env.current_load;
@@ -4224,7 +4223,7 @@ fn load_asset(
     let bundle_bytes = scanner
         .read_identity_checked(&path)
         .map_err(|_| BuildError::Drifted(DriftedInput::File(bundle_meta.path.clone())))?;
-    if ContentHash(*blake3::hash(&bundle_bytes).as_bytes()) != bundle_meta.content_hash {
+    if ContentHash(distill_core::hash::hash(&bundle_bytes)) != bundle_meta.content_hash {
         return Err(BuildError::Drifted(DriftedInput::File(
             bundle_meta.path.clone(),
         )));
@@ -4263,11 +4262,11 @@ fn find_bundle_asset(bundle: &Bundle, asset: AssetUuid) -> Option<(&str, &AssetE
 /// migration functions), each answering with the pipeline's dylib hash.
 #[derive(Clone)]
 struct CurrentLoadSource {
-    capabilities: Vec<(CapabilityKey, [u8; 32])>,
+    capabilities: Vec<(CapabilityKey, [u8; 16])>,
 }
 
 impl CurrentLoadSource {
-    fn capture(epoch: &PipelineEpoch, dylib_hash: [u8; 32]) -> Self {
+    fn capture(epoch: &PipelineEpoch, dylib_hash: [u8; 16]) -> Self {
         let capabilities = epoch
             .default_table_types()
             .into_iter()
@@ -4283,7 +4282,7 @@ impl CurrentLoadSource {
         Self { capabilities }
     }
 
-    fn capability(&self, key: &CapabilityKey) -> Observed<[u8; 32]> {
+    fn capability(&self, key: &CapabilityKey) -> Observed<[u8; 16]> {
         self.capabilities
             .iter()
             .find_map(|(registered, hash)| (registered == key).then_some(*hash))
@@ -4297,7 +4296,7 @@ impl CurrentLoadSource {
 fn no_trace<T>() -> Observed<T> {
     Observed::Err(StableFailureFingerprint::Local {
         class: LocalFailureClass::ArtifactEncoding,
-        detail: [0; 32],
+        detail: [0; 16],
     })
 }
 
@@ -4395,7 +4394,7 @@ mod tests {
         let normal = authority();
         let mut schema = normal.schema().clone();
         schema.types[0].attrs.build_only = true;
-        let build_only = ProjectSchemaAuthority::from_schema(schema, [9; 32]).unwrap();
+        let build_only = ProjectSchemaAuthority::from_schema(schema, [9; 16]).unwrap();
         let chain = PipelineChain {
             authored: TYPE,
             terminal: TYPE,
@@ -4533,7 +4532,7 @@ mod tests {
                     ],
                 }],
             },
-            [9; 32],
+            [9; 16],
         )
         .unwrap()
     }
@@ -4626,7 +4625,7 @@ mod tests {
                     ],
                 }],
             },
-            [10; 32],
+            [10; 16],
         )
         .unwrap()
     }
@@ -5034,7 +5033,7 @@ mod tests {
         let migration_calls = Arc::new(AtomicUsize::new(0));
         let callback_calls = Arc::clone(&migration_calls);
         coordinator.install_pipeline_epoch_for_test(crate::epoch::processor_test_epoch_with_dylib(
-            [10; 32],
+            [10; 16],
             "dev",
             target_hash.0,
             crate::callbacks::ProcessorDescriptor {
@@ -5193,7 +5192,7 @@ mod tests {
         let normal = authority();
         let mut schema = normal.schema().clone();
         schema.types[2].attrs.build_only = true;
-        let build_only = ProjectSchemaAuthority::from_schema(schema, [9; 32]).unwrap();
+        let build_only = ProjectSchemaAuthority::from_schema(schema, [9; 16]).unwrap();
         let (was, now) = (
             normal.project_type(TERMINAL).unwrap(),
             build_only.project_type(TERMINAL).unwrap(),
@@ -5585,7 +5584,7 @@ mod tests {
             layout: project.layout_hash,
             migrations: Vec::new(),
             automatic_migration: None,
-            validator_dylib_hash: Some([9; 32]),
+            validator_dylib_hash: Some([9; 16]),
             artifact_format_version: ARTIFACT_FORMAT_VERSION,
         });
         let import_candidates = coordinator

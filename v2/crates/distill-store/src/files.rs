@@ -552,7 +552,7 @@ impl StoreReader {
                     size: r.get::<_, i64>(1)? as u64,
                     kind: FileKind::from_i64(r.get(2)?),
                     content_hash: r.get::<_, Option<Vec<u8>>>(3)?.map(|b| {
-                        let mut h = [0u8; 32];
+                        let mut h = [0u8; 16];
                         h.copy_from_slice(&b);
                         ContentHash(h)
                     }),
@@ -576,7 +576,7 @@ fn observed_file_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObservedFile> 
                 size: row.get::<_, i64>(3)? as u64,
                 kind: FileKind::from_i64(row.get(4)?),
                 content_hash: row.get::<_, Option<Vec<u8>>>(5)?.map(|bytes| {
-                    let mut hash = [0u8; 32];
+                    let mut hash = [0u8; 16];
                     hash.copy_from_slice(&bytes);
                     ContentHash(hash)
                 }),
@@ -679,7 +679,7 @@ impl StoreReader {
         &self,
         root_name: &str,
         prefix: &str,
-    ) -> Result<Vec<(String, [u8; 32])>, StoreError> {
+    ) -> Result<Vec<(String, [u8; 16])>, StoreError> {
         self.query_rows(
             &format!(
                 "SELECT t.path, t.content_hash FROM files t JOIN roots r USING (root_id)
@@ -688,7 +688,7 @@ impl StoreReader {
                 under_sql(prefix)
             ),
             rusqlite::params![root_name, prefix],
-            |row| Ok((row.get(0)?, crate::bundles::blob32(row.get(1)?))),
+            |row| Ok((row.get(0)?, crate::bundles::blob16(row.get(1)?))),
         )
     }
 
@@ -718,7 +718,7 @@ impl StoreReader {
             .query_row(rusqlite::params![root_name, path], |row| row.get(0))
             .optional()?;
         Ok(hash.flatten().map(|bytes| {
-            let mut hash = [0u8; 32];
+            let mut hash = [0u8; 16];
             hash.copy_from_slice(&bytes);
             ContentHash(hash)
         }))
@@ -900,7 +900,7 @@ impl StoreReader {
     /// in (root name, path) order: its `files` content hash.
     pub fn for_each_bundle_file_hash(
         &self,
-        mut visit: impl FnMut(String, String, [u8; 32]) -> Result<(), StoreError>,
+        mut visit: impl FnMut(String, String, [u8; 16]) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
         let mut statement = self.conn.prepare_cached(
             "SELECT r.name, t.path, t.content_hash
@@ -913,7 +913,7 @@ impl StoreReader {
             visit(
                 row.get(0)?,
                 row.get(1)?,
-                crate::bundles::blob32(row.get(2)?),
+                crate::bundles::blob16(row.get(2)?),
             )?;
         }
         Ok(())

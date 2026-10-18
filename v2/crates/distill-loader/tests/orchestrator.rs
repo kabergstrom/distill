@@ -270,7 +270,7 @@ fn basis() -> IoBasis {
 
 fn basis_with(manifest_byte: u8) -> IoBasis {
     IoBasis::Pack {
-        manifest: ManifestHash([manifest_byte; 32]),
+        manifest: ManifestHash([manifest_byte; 16]),
     }
 }
 
@@ -352,7 +352,7 @@ fn register(loader: &mut Loader<MockIo>, epoch: u64, token: &ModuleEpochToken) {
         .register_types(
             GameModuleEpoch(epoch),
             token.clone(),
-            [7; 32],
+            [7; 16],
             &[
                 A::descriptor(),
                 B::descriptor(),
@@ -372,7 +372,7 @@ fn successor_registration_cannot_overwrite_a_live_descriptor() {
     let second = ModuleEpochToken::new(2);
 
     assert_eq!(
-        loader.register_types(GameModuleEpoch(2), second, [7; 32], &[A::descriptor()],),
+        loader.register_types(GameModuleEpoch(2), second, [7; 16], &[A::descriptor()],),
         Err(RegistrationError::DuplicateType(A::TYPE_UUID)),
     );
 }
@@ -560,7 +560,7 @@ fn equal_fetch_hashes_are_owned_by_asset_and_cannot_wedge_a_sweep() {
     let mut storage = Storage::default();
     loader.process(&mut storage).unwrap();
 
-    let shared_hash = ContentHash([0xaa; 32]);
+    let shared_hash = ContentHash([0xaa; 16]);
     resolve(&mut loader, first_uuid, shared_hash);
     resolve(&mut loader, second_uuid, shared_hash);
     loader.process(&mut storage).unwrap();
@@ -1538,7 +1538,7 @@ fn a_reconnect_fences_old_resolve_and_requires_target_binding() {
         req: old_req,
         uuid: asset_uuid,
         result: ResolveResult::Built {
-            content_hash: ContentHash([3; 32]),
+            content_hash: ContentHash([3; 16]),
         },
         basis: old_basis,
     });
@@ -2226,7 +2226,7 @@ fn a_delta_keeps_a_fetched_payload_and_refetches_only_changed_content() {
     fetched(&mut loader, parent_hash, parent_artifact);
     loader.process(&mut storage).unwrap();
     loader.process(&mut storage).unwrap();
-    let old_child_hash = ContentHash([0x11; 32]);
+    let old_child_hash = ContentHash([0x11; 16]);
     resolve(&mut loader, child_uuid, old_child_hash);
     loader.process(&mut storage).unwrap();
     let (_, old_basis) = loader.io().fetch_for(old_child_hash);

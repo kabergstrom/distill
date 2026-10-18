@@ -18,7 +18,7 @@ use crate::import::DefaultImportRule;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetDefinition {
     pub name: String,
-    pub fingerprint: [u8; 32],
+    pub fingerprint: [u8; 16],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

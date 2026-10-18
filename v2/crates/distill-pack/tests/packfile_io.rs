@@ -14,7 +14,7 @@ use distill_pack::{
     RuntimeTarget,
 };
 use distill_wire::artifact::{
-    content_hash, parse_artifact, write_artifact, ArtifactHeader, ARTIFACT_MAGIC,
+    content_hash, parse_artifact, write_artifact, ArtifactHeader,
 };
 use distill_wire::dswl::{dswl_bytes, dswl_hash};
 use distill_wire::native::ScalarKind;
@@ -46,7 +46,7 @@ fn fixture(
             authored_type: type_uuid,
             terminal_type: type_uuid,
             encoded_type: type_uuid,
-            logical_hash: LogicalHash([6; 32]),
+            logical_hash: LogicalHash([6; 16]),
             layout_hash,
         },
         &[],
@@ -72,10 +72,10 @@ fn fixture(
     let encoding = &archive.encodings[&content_hash];
     let manifest = PackManifest {
         target: PackTarget { name: "dev".into() },
-        target_def_hash: [4; 32],
+        target_def_hash: [4; 16],
         archives: vec![ArchiveRef {
             generation: 7,
-            file_hash: *blake3::hash(&archive.bytes).as_bytes(),
+            file_hash: distill_core::hash::hash(&archive.bytes),
         }],
         assets: vec![ManifestAssetRow {
             asset_uuid,
@@ -119,7 +119,7 @@ fn fixture(
         archive.bytes,
         RuntimeTarget {
             target: "dev".into(),
-            target_def_hash: [4; 32],
+            target_def_hash: [4; 16],
         },
         asset_uuid,
         content_hash,
@@ -140,7 +140,7 @@ fn mount_pack(
 
 fn mount_pack_as(
     manifest: &[u8],
-    archive_hash: [u8; 32],
+    archive_hash: [u8; 16],
     archive: &[u8],
     runtime: &RuntimeTarget,
 ) -> Result<PackfileIO, MountError> {
@@ -175,7 +175,7 @@ fn resolves_fetches_and_paths_under_one_manifest_basis() {
     } if *got == content_hash && outer == &basis));
     assert!(
         matches!(&events[1], IoEvent::Fetched { req: ReqId(2), artifact, basis: got, .. }
-        if artifact.structural.starts_with(&ARTIFACT_MAGIC)
+        if artifact.structural.starts_with(&distill_core::header::MAGIC)
         && artifact.blobs[0].as_bytes() == b"blob"
         && artifact.load_edges.is_empty()
         && !artifact.wire_layout.is_empty()
@@ -235,14 +235,14 @@ fn static_mount_serves_the_same_pack_as_a_directory() {
 fn target_binding_checks_only_the_module_target_definition_hash() {
     let (manifest, archive, runtime, _, _) = fixture(true);
     let mut io = mount_pack(&manifest, &archive, &runtime).unwrap();
-    let target = LoaderRuntimeTarget::new(GameModuleEpoch(1), [4; 32]);
+    let target = LoaderRuntimeTarget::new(GameModuleEpoch(1), [4; 16]);
     io.bind_target(target.clone());
     assert!(
         matches!(io.poll().as_slice(), [IoEvent::TargetBound { target: got, basis }]
         if got == &target && basis == &io.begin_sweep())
     );
 
-    io.bind_target(LoaderRuntimeTarget::new(GameModuleEpoch(2), [9; 32]));
+    io.bind_target(LoaderRuntimeTarget::new(GameModuleEpoch(2), [9; 16]));
     assert!(matches!(
         io.poll().as_slice(),
         [IoEvent::TargetRejected { .. }]
@@ -297,7 +297,7 @@ fn path_queries_are_normalized_before_lookup() {
 #[test]
 fn mount_refuses_wrong_runtime_or_archive_identity() {
     let (manifest, archive, mut runtime, _, _) = fixture(true);
-    runtime.target_def_hash = [0; 32];
+    runtime.target_def_hash = [0; 16];
     assert!(matches!(
         mount_pack(&manifest, &archive, &runtime),
         Err(MountError::TargetMismatch)
@@ -348,7 +348,7 @@ fn mount_authenticates_complete_manifest_before_serving_any_asset() {
 fn internal_archive_trailer_is_not_the_archive_file_hash() {
     let (manifest, archive, runtime, _, _) = fixture(true);
     let mut decoded = distill_pack::manifest::decode_manifest(&manifest).unwrap();
-    decoded.archives[0].file_hash = archive[archive.len() - 32..].try_into().unwrap();
+    decoded.archives[0].file_hash = archive[archive.len() - 16..].try_into().unwrap();
     let archive_hash = decoded.archives[0].file_hash;
     let manifest = encode_manifest(&decoded).unwrap();
 
@@ -363,7 +363,7 @@ fn stale_pack_basis_cannot_read() {
     let (manifest, archive, runtime, asset_uuid, _) = fixture(true);
     let mut io = mount_pack(&manifest, &archive, &runtime).unwrap();
     let stale = IoBasis::Pack {
-        manifest: distill_loader::ManifestHash([0; 32]),
+        manifest: distill_loader::ManifestHash([0; 16]),
     };
     io.resolve(ReqId(1), asset_uuid, &stale);
     assert!(matches!(

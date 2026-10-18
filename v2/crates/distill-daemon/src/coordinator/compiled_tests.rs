@@ -67,7 +67,7 @@ fn authority(source: u8) -> Arc<ProjectSchemaAuthority> {
                     layouts: Vec::new(),
                 }],
             },
-            [source; 32],
+            [source; 16],
         )
         .unwrap(),
     )
@@ -150,8 +150,8 @@ impl Fixture {
             requirements: CandidateRequirements {
                 module_abi: ModuleAbiIdentity {
                     rustc: "rustc test".into(),
-                    interface_fingerprint: [1; 32],
-                    measured_interface: [1; 32],
+                    interface_fingerprint: [1; 16],
+                    measured_interface: [1; 16],
                     panic_strategy: "unwind".into(),
                     allocator: "system".into(),
                 },
@@ -469,7 +469,7 @@ fn typed_authority(edited: bool) -> Arc<ProjectSchemaAuthority> {
                     layouts: vec![layout(slot()), layout(Vec::new()), layout(slot())],
                 }],
             },
-            [u8::from(edited) + 10; 32],
+            [u8::from(edited) + 10; 16],
         )
         .unwrap(),
     )
@@ -628,7 +628,7 @@ fn bytes_only_authority() -> Arc<ProjectSchemaAuthority> {
     let mut schema = full.schema().clone();
     schema.types.truncate(2);
     schema.layouts[0].layouts.truncate(2);
-    Arc::new(ProjectSchemaAuthority::from_schema(schema, [20; 32]).unwrap())
+    Arc::new(ProjectSchemaAuthority::from_schema(schema, [20; 16]).unwrap())
 }
 
 /// The projection of module `dylib` under which the bytes type cooks to
@@ -648,7 +648,7 @@ fn bytes_projection(terminal: Option<TypeUuid>, dylib: u8) -> PipelineProjection
         .collect();
     PipelineProjection::build(
         descriptors,
-        [dylib; 32],
+        [dylib; 16],
         &BTreeMap::from([("dev".to_owned(), build_target(false))]),
         [BYTES_TYPE, EDITED_TYPE],
     )
@@ -937,7 +937,7 @@ fn labeled_authority(tagged: bool) -> Arc<ProjectSchemaAuthority> {
                     ],
                 }],
             },
-            [u8::from(tagged) + 30; 32],
+            [u8::from(tagged) + 30; 16],
         )
         .unwrap(),
     )
@@ -987,7 +987,7 @@ fn a_complete_publication_revalidates_a_poisoned_skeleton_after_a_schema_edit() 
         Configuration {
             projection: PipelineProjection::build(
                 Vec::new(),
-                [9; 32],
+                [9; 16],
                 &BTreeMap::from([("dev".to_owned(), build_target(false))]),
                 [LABEL_TYPE],
             )
@@ -1097,7 +1097,7 @@ fn assert_republication_matches_a_fresh_one(
     let configuration = Configuration {
         projection: PipelineProjection::build(
             Vec::new(),
-            [9; 32],
+            [9; 16],
             &BTreeMap::from([("dev".to_owned(), build_target(false))]),
             [LABEL_TYPE],
         )
@@ -1134,7 +1134,7 @@ fn labeled_store(temp: &tempfile::TempDir, files: &[(&str, Vec<u8>)]) -> (Store,
     let configuration = Configuration {
         projection: PipelineProjection::build(
             Vec::new(),
-            [9; 32],
+            [9; 16],
             &BTreeMap::from([("dev".to_owned(), build_target(false))]),
             [LABEL_TYPE],
         )

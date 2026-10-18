@@ -1,11 +1,14 @@
-//! DPK1 manifest file and its five authenticated tables (§16).
+//! The pack manifest file and its five authenticated tables (§16).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash, TypeUuid};
 use unicode_normalization::{is_nfc, UnicodeNormalization};
 
-use crate::archive::{append_trailer, EKey, ObjectLocation, PACK_MAGIC, PACK_VERSION};
+use distill_core::hash::{digest_bytes, Domain, Hash128};
+use distill_core::header::{read_header, write_header, HeaderError, HEADER_LEN};
+
+use crate::archive::{append_trailer, EKey, ObjectLocation, PACK_VERSION, TRAILER_LEN};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackTarget {
@@ -15,7 +18,7 @@ pub struct PackTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ArchiveRef {
     pub generation: u32,
-    pub file_hash: [u8; 32],
+    pub file_hash: [u8; 16],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -63,7 +66,7 @@ pub struct PathRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackManifest {
     pub target: PackTarget,
-    pub target_def_hash: [u8; 32],
+    pub target_def_hash: [u8; 16],
     pub archives: Vec<ArchiveRef>,
     pub assets: Vec<ManifestAssetRow>,
     pub encodings: Vec<EncodingRow>,
@@ -76,8 +79,9 @@ pub struct PackManifest {
 pub enum ManifestError {
     TooShort,
     FileHash,
-    Magic,
-    Version,
+    /// The shared file header (§5) is not a pack manifest's at
+    /// [`PACK_VERSION`].
+    Header(HeaderError),
     Truncated,
     Utf8,
     Duplicate,
@@ -150,7 +154,7 @@ pub fn encode_manifest(manifest: &PackManifest) -> Result<Vec<u8>, ManifestError
     }
 
     let mut tables = vec![
-        (1u8, encode_assets(&manifest.assets)),
+        (1u32, encode_assets(&manifest.assets)),
         (2, encode_encodings(&manifest.encodings)),
         (3, encode_index(&manifest.index)),
         (4, encode_wire_trees(&manifest.wire_trees)),
@@ -158,20 +162,19 @@ pub fn encode_manifest(manifest: &PackManifest) -> Result<Vec<u8>, ManifestError
     if let Some(paths) = &manifest.paths {
         tables.push((5, encode_paths(paths)));
     }
-    let directory_len = 4 + tables.len() * 17;
-    let mut offset = 8 + header.len() + directory_len;
+    let directory_len = 4 + tables.len() * 20;
+    let mut offset = HEADER_LEN + header.len() + directory_len;
     let mut directory = Vec::with_capacity(directory_len);
     directory.extend_from_slice(&(tables.len() as u32).to_le_bytes());
     for (kind, table) in &tables {
-        directory.push(*kind);
+        directory.extend_from_slice(&kind.to_le_bytes());
         directory.extend_from_slice(&(offset as u64).to_le_bytes());
         directory.extend_from_slice(&(table.len() as u64).to_le_bytes());
         offset += table.len();
     }
 
-    let mut out = Vec::with_capacity(offset + 32);
-    out.extend_from_slice(&PACK_MAGIC);
-    out.extend_from_slice(&PACK_VERSION.to_le_bytes());
+    let mut out = Vec::with_capacity(offset + TRAILER_LEN);
+    write_header(&mut out, Domain::PackManifest, PACK_VERSION);
     out.extend_from_slice(&header);
     out.extend_from_slice(&directory);
     for (_, table) in tables {
@@ -182,50 +185,46 @@ pub fn encode_manifest(manifest: &PackManifest) -> Result<Vec<u8>, ManifestError
 }
 
 pub fn decode_manifest(bytes: &[u8]) -> Result<PackManifest, ManifestError> {
-    if bytes.len() < 40 {
+    if bytes.len() < HEADER_LEN + TRAILER_LEN {
         return Err(ManifestError::TooShort);
     }
-    let split = bytes.len() - 32;
-    if blake3::hash(&bytes[..split]).as_bytes() != &bytes[split..] {
+    let split = bytes.len() - TRAILER_LEN;
+    if distill_core::hash::hash(&bytes[..split]) != bytes[split..] {
         return Err(ManifestError::FileHash);
     }
     let mut r = Reader {
         bytes: &bytes[..split],
         pos: 0,
     };
-    if r.take(4)? != PACK_MAGIC {
-        return Err(ManifestError::Magic);
-    }
-    if r.u32()? != PACK_VERSION {
-        return Err(ManifestError::Version);
-    }
+    read_header(r.take(HEADER_LEN)?, Domain::PackManifest, PACK_VERSION)
+        .map_err(ManifestError::Header)?;
     let target_len = usize::try_from(r.u32()?).map_err(|_| ManifestError::Truncated)?;
     let target = decode_target(r.take(target_len)?)?;
-    let target_def_hash = r.a32()?;
-    let archive_count = r.bounded_count(36)?;
+    let target_def_hash = r.a16()?;
+    let archive_count = r.bounded_count(20)?;
     let mut archives = Vec::with_capacity(archive_count);
     for _ in 0..archive_count {
         archives.push(ArchiveRef {
             generation: r.u32()?,
-            file_hash: r.a32()?,
+            file_hash: r.a16()?,
         });
     }
     check_sorted(&archives, |v| v.generation)?;
 
-    let dir_count = r.bounded_count(17)?;
+    let dir_count = r.bounded_count(20)?;
     if !(4..=5).contains(&dir_count) {
         return Err(ManifestError::InvalidDirectory);
     }
     let mut dirs = Vec::with_capacity(dir_count);
     for _ in 0..dir_count {
         dirs.push((
-            r.u8()?,
+            r.u32()?,
             usize::try_from(r.u64()?).map_err(|_| ManifestError::InvalidDirectory)?,
             usize::try_from(r.u64()?).map_err(|_| ManifestError::InvalidDirectory)?,
         ));
     }
     let table_start = r.pos;
-    let mut expected_kind = 1u8;
+    let mut expected_kind = 1u32;
     let mut expected_offset = table_start;
     let mut seen = BTreeSet::new();
     for (kind, offset, len) in &dirs {
@@ -242,7 +241,7 @@ pub fn decode_manifest(bytes: &[u8]) -> Result<PackManifest, ManifestError> {
         return Err(ManifestError::MissingTable);
     }
 
-    let table = |kind: u8| -> Result<&[u8], ManifestError> {
+    let table = |kind: u32| -> Result<&[u8], ManifestError> {
         let (_, offset, len) = dirs
             .iter()
             .find(|v| v.0 == kind)
@@ -360,11 +359,11 @@ fn encode_paths(rows: &[PathRow]) -> Vec<u8> {
 
 fn decode_assets(bytes: &[u8]) -> Result<Vec<ManifestAssetRow>, ManifestError> {
     let mut r = Reader { bytes, pos: 0 };
-    let count = r.bounded_count(52)?;
+    let count = r.bounded_count(36)?;
     let mut rows = Vec::with_capacity(count);
     for _ in 0..count {
         let asset_uuid = AssetUuid(r.a16()?);
-        let content_hash = ContentHash(r.a32()?);
+        let content_hash = ContentHash(r.a16()?);
         let n = r.bounded_count(32)?;
         let mut load_deps = Vec::with_capacity(n);
         for _ in 0..n {
@@ -384,19 +383,19 @@ fn decode_assets(bytes: &[u8]) -> Result<Vec<ManifestAssetRow>, ManifestError> {
 }
 fn decode_encodings(bytes: &[u8]) -> Result<Vec<EncodingRow>, ManifestError> {
     let mut r = Reader { bytes, pos: 0 };
-    let count = r.bounded_count(40)?;
+    let count = r.bounded_count(24)?;
     let mut rows = Vec::with_capacity(count);
     for _ in 0..count {
-        let content_hash = ContentHash(r.a32()?);
-        let bn = r.bounded_count(32)?;
+        let content_hash = ContentHash(r.a16()?);
+        let bn = r.bounded_count(16)?;
         let mut blocks = Vec::with_capacity(bn);
         for _ in 0..bn {
-            blocks.push(EKey(r.a32()?));
+            blocks.push(EKey(r.a16()?));
         }
-        let nn = r.bounded_count(32)?;
+        let nn = r.bounded_count(16)?;
         let mut blobs = Vec::with_capacity(nn);
         for _ in 0..nn {
-            blobs.push(EKey(r.a32()?));
+            blobs.push(EKey(r.a16()?));
         }
         rows.push(EncodingRow {
             content_hash,
@@ -408,11 +407,11 @@ fn decode_encodings(bytes: &[u8]) -> Result<Vec<EncodingRow>, ManifestError> {
 }
 fn decode_index(bytes: &[u8]) -> Result<Vec<IndexRow>, ManifestError> {
     let mut r = Reader { bytes, pos: 0 };
-    let count = r.bounded_count(52)?;
+    let count = r.bounded_count(36)?;
     let mut rows = Vec::with_capacity(count);
     for _ in 0..count {
         rows.push(IndexRow {
-            ekey: EKey(r.a32()?),
+            ekey: EKey(r.a16()?),
             location: ObjectLocation {
                 generation: r.u32()?,
                 offset: r.u64()?,
@@ -424,10 +423,10 @@ fn decode_index(bytes: &[u8]) -> Result<Vec<IndexRow>, ManifestError> {
 }
 fn decode_wire_trees(bytes: &[u8]) -> Result<Vec<WireTreeRow>, ManifestError> {
     let mut r = Reader { bytes, pos: 0 };
-    let count = r.bounded_count(36)?;
+    let count = r.bounded_count(20)?;
     let mut rows = Vec::with_capacity(count);
     for _ in 0..count {
-        let layout_hash = LayoutHash(r.a32()?);
+        let layout_hash = LayoutHash(r.a16()?);
         let len = usize::try_from(r.u32()?).map_err(|_| ManifestError::Truncated)?;
         rows.push(WireTreeRow {
             layout_hash,
@@ -497,12 +496,8 @@ fn string(out: &mut Vec<u8>, value: &str) {
     out.extend_from_slice(value.as_bytes());
 }
 
-pub fn manifest_hash(bytes: &[u8]) -> [u8; 32] {
-    let mut h = blake3::Hasher::new();
-    h.update(b"DSPM");
-    h.update(&[2]);
-    h.update(bytes);
-    *h.finalize().as_bytes()
+pub fn manifest_hash(bytes: &[u8]) -> Hash128 {
+    digest_bytes(Domain::PackManifest, 2, bytes)
 }
 
 pub fn verify_artifact_header(
@@ -591,9 +586,6 @@ impl<'a> Reader<'a> {
         self.pos = end;
         Ok(v)
     }
-    fn u8(&mut self) -> Result<u8, ManifestError> {
-        Ok(self.take(1)?[0])
-    }
     fn u32(&mut self) -> Result<u32, ManifestError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
@@ -602,9 +594,6 @@ impl<'a> Reader<'a> {
     }
     fn a16(&mut self) -> Result<[u8; 16], ManifestError> {
         Ok(self.take(16)?.try_into().unwrap())
-    }
-    fn a32(&mut self) -> Result<[u8; 32], ManifestError> {
-        Ok(self.take(32)?.try_into().unwrap())
     }
     fn string(&mut self) -> Result<String, ManifestError> {
         let n = self.u32()? as usize;

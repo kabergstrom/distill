@@ -1,6 +1,7 @@
 //! Outcome-bearing build/import traces and verifying-trace lookup (§§8–10).
 
-use distill_core::canonical::{CanonicalEncoder, DSTR};
+use distill_core::encoding::Encoder;
+use distill_core::hash::Domain;
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use ngp_schema::Value;
 
@@ -28,7 +29,7 @@ pub enum Observed<T> {
 /// was decoded. A successful ControlRead traces this identity, not an
 /// artifact/content dependency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ControlValueHash(pub [u8; 32]);
+pub struct ControlValueHash(pub [u8; 16]);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackDefinitionControlValue {
@@ -145,15 +146,15 @@ pub enum TraceOp {
     },
     Query {
         query: Box<AssetQuery>,
-        observed: Observed<[u8; 32]>,
+        observed: Observed<[u8; 16]>,
     },
     Tool {
         id: String,
-        observed: Observed<[u8; 32]>,
+        observed: Observed<[u8; 16]>,
     },
     Capability {
         key: CapabilityKey,
-        observed: Observed<[u8; 32]>,
+        observed: Observed<[u8; 16]>,
     },
     RefCheck {
         asset: AssetUuid,
@@ -166,7 +167,7 @@ pub enum TraceOp {
     },
     Control {
         query: ControlQuery,
-        observed: Observed<[u8; 32]>,
+        observed: Observed<[u8; 16]>,
     },
     ControlRead {
         subject: ControlSubject,
@@ -193,12 +194,12 @@ pub trait TraceSource {
     fn authoring_read(&self, asset: AssetUuid) -> Observed<Option<BundleFileHash>>;
     fn read(&self, asset: AssetUuid) -> Observed<ContentHash>;
     fn resolve(&self, path: &str) -> Observed<Option<AssetUuid>>;
-    fn query(&self, query: &AssetQuery) -> Observed<[u8; 32]>;
-    fn tool(&self, id: &str) -> Observed<[u8; 32]>;
-    fn capability(&self, key: &CapabilityKey) -> Observed<[u8; 32]>;
+    fn query(&self, query: &AssetQuery) -> Observed<[u8; 16]>;
+    fn tool(&self, id: &str) -> Observed<[u8; 16]>;
+    fn capability(&self, key: &CapabilityKey) -> Observed<[u8; 16]>;
     fn ref_check(&self, asset: AssetUuid, expected: TypeUuid) -> Observed<Option<TypeUuid>>;
     fn role_check(&self, asset: AssetUuid) -> Observed<Option<EntryRole>>;
-    fn control(&self, query: &ControlQuery) -> Observed<[u8; 32]>;
+    fn control(&self, query: &ControlQuery) -> Observed<[u8; 16]>;
     fn control_read(&self, subject: &ControlSubject) -> Observed<ControlValueHash>;
 }
 
@@ -221,28 +222,27 @@ pub fn revalidate(trace: &[TraceOp], source: &impl TraceSource) -> bool {
     })
 }
 
-pub fn trace_digest(trace: &[TraceOp]) -> [u8; 32] {
-    distill_core::canonical::domain_digest(DSTR, 1, |encoder| {
+pub fn trace_digest(trace: &[TraceOp]) -> [u8; 16] {
+    distill_core::hash::digest(Domain::Trace, 1, |encoder| {
         encoder.raw(&trace_payload_bytes(trace));
     })
 }
 
-/// The exact DSTR v1 hash preimage. Exposing the bytes makes protocol tests
+/// The exact trace digest preimage (`u32 Domain::Trace ‖ u32 1 ‖ body`). Exposing the bytes makes protocol tests
 /// pin enum tags, integer widths, and variable-length framing directly.
 pub fn trace_canonical_bytes(trace: &[TraceOp]) -> Vec<u8> {
-    let mut encoder = CanonicalEncoder::new();
-    encoder.raw(&DSTR);
-    encoder.u8(1);
+    let mut encoder = Encoder::new();
+    encoder.raw(&distill_core::hash::digest_prefix(Domain::Trace, 1));
     encoder.raw(&trace_payload_bytes(trace));
     encoder.into_bytes()
 }
 
 /// The serialized trace body stored in a `results` row. The CAS applies the
-/// `DSTR` domain and version to these bytes when deriving the candidate's
+/// trace digest domain and version to these bytes when deriving the candidate's
 /// secondary key, so storing the already-prefixed preimage would apply the
 /// domain twice.
 pub fn trace_payload_bytes(trace: &[TraceOp]) -> Vec<u8> {
-    let mut encoder = CanonicalEncoder::new();
+    let mut encoder = Encoder::new();
     encoder.seq(trace, encode_trace_op);
     encoder.into_bytes()
 }
@@ -276,9 +276,9 @@ pub fn trace_reads(trace: &[TraceOp]) -> Vec<distill_store::cas::BuildRead> {
 }
 
 fn observed<T>(
-    e: &mut CanonicalEncoder,
+    e: &mut Encoder,
     value: &Observed<T>,
-    ok: impl Fn(&mut CanonicalEncoder, &T),
+    ok: impl Fn(&mut Encoder, &T),
 ) {
     match value {
         Observed::Ok(v) => {
@@ -292,7 +292,7 @@ fn observed<T>(
     }
 }
 
-fn encode_trace_op(e: &mut CanonicalEncoder, op: &TraceOp) {
+fn encode_trace_op(e: &mut Encoder, op: &TraceOp) {
     match op {
         TraceOp::AuthoringRead { asset, observed: o } => {
             e.enum_variant(11);
@@ -339,7 +339,7 @@ fn encode_trace_op(e: &mut CanonicalEncoder, op: &TraceOp) {
         TraceOp::RoleCheck { asset, observed: o } => {
             e.enum_variant(7);
             e.raw(&asset.0);
-            observed(e, o, |e, role| e.option(*role, |e, role| e.u8(*role as u8)));
+            observed(e, o, |e, role| e.option(*role, |e, role| e.enum_variant(*role as u32)));
         }
         TraceOp::Control { query, observed: o } => {
             e.enum_variant(8);
@@ -357,13 +357,13 @@ fn encode_trace_op(e: &mut CanonicalEncoder, op: &TraceOp) {
     }
 }
 
-fn encode_control_query(e: &mut CanonicalEncoder, query: &ControlQuery) {
+fn encode_control_query(e: &mut Encoder, query: &ControlQuery) {
     match query {
         ControlQuery::DirectoryImportRuleSet => e.enum_variant(2),
     }
 }
 
-fn encode_control_subject(e: &mut CanonicalEncoder, subject: &ControlSubject) {
+fn encode_control_subject(e: &mut Encoder, subject: &ControlSubject) {
     match subject {
         ControlSubject::PackDefinition(asset) => {
             e.enum_variant(2);
@@ -381,7 +381,7 @@ fn encode_control_subject(e: &mut CanonicalEncoder, subject: &ControlSubject) {
     }
 }
 
-fn encode_control_failure_subject(e: &mut CanonicalEncoder, subject: &ControlFailureSubject) {
+fn encode_control_failure_subject(e: &mut Encoder, subject: &ControlFailureSubject) {
     match subject {
         ControlFailureSubject::Query(query) => {
             e.enum_variant(1);
@@ -394,7 +394,7 @@ fn encode_control_failure_subject(e: &mut CanonicalEncoder, subject: &ControlFai
     }
 }
 
-fn encode_capability(e: &mut CanonicalEncoder, key: &CapabilityKey) {
+fn encode_capability(e: &mut Encoder, key: &CapabilityKey) {
     match key {
         CapabilityKey::MigrationFn(v) => {
             e.enum_variant(1);
@@ -419,7 +419,7 @@ fn encode_capability(e: &mut CanonicalEncoder, key: &CapabilityKey) {
     }
 }
 
-fn encode_query(e: &mut CanonicalEncoder, q: &AssetQuery) {
+fn encode_query(e: &mut Encoder, q: &AssetQuery) {
     e.option(q.uuid, |e, v| e.raw(&v.0));
     e.option(q.bundle_path.as_deref(), |e, v| e.str(v));
     e.option(q.local_id.as_deref(), |e, v| e.str(v));
@@ -435,7 +435,7 @@ fn encode_query(e: &mut CanonicalEncoder, q: &AssetQuery) {
     e.option(q.authoring_only, |e, v| e.bool(*v));
 }
 
-fn encode_failure(e: &mut CanonicalEncoder, failure: &StableFailureFingerprint, depth: usize) {
+fn encode_failure(e: &mut Encoder, failure: &StableFailureFingerprint, depth: usize) {
     assert!(depth < 256, "failure fingerprint nesting exceeds cap");
     match failure {
         StableFailureFingerprint::Ambiguous { conflicting } => {
@@ -460,12 +460,12 @@ fn encode_failure(e: &mut CanonicalEncoder, failure: &StableFailureFingerprint, 
         } => {
             e.enum_variant(8);
             e.raw(&asset.0);
-            e.u8(*observed_role as u8);
+            e.enum_variant(*observed_role as u32);
         }
         StableFailureFingerprint::Control(failure) => {
             e.enum_variant(9);
             encode_control_failure_subject(e, failure.subject());
-            e.u16(failure.code() as u16);
+            e.enum_variant(failure.code() as u32);
             e.set(failure.entries(), |e, id| e.raw(&id.0));
         }
         StableFailureFingerprint::Descendant { asset, fingerprint } => {
@@ -475,7 +475,7 @@ fn encode_failure(e: &mut CanonicalEncoder, failure: &StableFailureFingerprint, 
         }
         StableFailureFingerprint::RawFile { op, subject, class } => {
             e.enum_variant(5);
-            e.u8(*op as u8);
+            e.enum_variant(*op as u32);
             match subject {
                 RawFileSubject::Path(path) => {
                     e.enum_variant(0);
@@ -487,7 +487,7 @@ fn encode_failure(e: &mut CanonicalEncoder, failure: &StableFailureFingerprint, 
                     e.option(q.path_glob.as_deref(), |e, v| e.str(v));
                 }
             }
-            e.u8(*class as u8);
+            e.enum_variant(*class as u32);
         }
         StableFailureFingerprint::MissingCapability { key } => {
             e.enum_variant(6);
@@ -495,7 +495,7 @@ fn encode_failure(e: &mut CanonicalEncoder, failure: &StableFailureFingerprint, 
         }
         StableFailureFingerprint::Local { class, detail } => {
             e.enum_variant(7);
-            e.u16(*class as u16);
+            e.enum_variant(*class as u32);
             e.raw(detail);
         }
     }

@@ -236,7 +236,7 @@ fn in_root_file_symlinks_are_identity_checked_and_reported() {
     assert_eq!(
         alias.content_hash,
         Some(distill_core::id::ContentHash(
-            *blake3::hash(b"trusted").as_bytes()
+            distill_core::hash::hash(b"trusted")
         ))
     );
 }
@@ -290,7 +290,7 @@ fn incremental_target_edit_reobserves_file_symlink_alias() {
         .unwrap()
         .unwrap();
     let expected = Some(distill_core::id::ContentHash(
-        *blake3::hash(b"second").as_bytes(),
+        distill_core::hash::hash(b"second"),
     ));
     assert_eq!(
         next.file_rows()

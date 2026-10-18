@@ -101,7 +101,7 @@ pub fn ptxt(node: &SchemaNode, value: &Patch) -> String {
 // --- identity builders ----------------------------------------------------
 
 pub fn hash(n: u8) -> LogicalHash {
-    LogicalHash([n; 32])
+    LogicalHash([n; 16])
 }
 
 pub fn bundle(n: u8) -> BundleUuid {

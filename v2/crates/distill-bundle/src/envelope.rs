@@ -2,7 +2,7 @@
 //!
 //! Top-level keys: `format_version` (1, or 2 with directory import rules:
 //! `format_version_for`), `uuid`, `primary`
-//! (optional, must name an existing entry), `schemas` (64-hex LogicalHash →
+//! (optional, must name an existing entry), `schemas` (32-hex LogicalHash →
 //! schema snapshot JSON, key verified to equal the snapshot's own hash),
 //! `types` (optional, the dynamic-type closure: type path →
 //! {schema_hash, type_uuid}, each schema in `schemas`), `assets` (local_id →

@@ -8,7 +8,7 @@ fn file(path: &str, executable: bool, byte: u8) -> ToolPackageFile {
         path: path.to_owned(),
         executable,
         len: 1,
-        bytes_hash: [byte; 32],
+        bytes_hash: [byte; 16],
     }
 }
 
@@ -23,7 +23,7 @@ fn package() -> ToolExecutionIdentityV2 {
     }
 }
 
-fn ambient(fingerprint: Option<[u8; 32]>) -> ToolExecutionIdentityV2 {
+fn ambient(fingerprint: Option<[u8; 16]>) -> ToolExecutionIdentityV2 {
     ToolExecutionIdentityV2 {
         source: ToolSourceIdentityV2::Ambient {
             launcher: if cfg!(windows) {
@@ -41,11 +41,11 @@ fn ambient(fingerprint: Option<[u8; 32]>) -> ToolExecutionIdentityV2 {
 }
 
 #[test]
-fn package_identity_roundtrips_under_dsct_v2() {
+fn package_identity_roundtrips_at_its_record_version() {
     let identity = package();
     let record = identity.encode_record().unwrap();
 
-    assert_eq!(record[0], 2);
+    assert_eq!(record[0], ToolExecutionIdentityV2::RECORD_VERSION);
     assert_eq!(
         ToolExecutionIdentityV2::decode_record(&record).unwrap(),
         identity
@@ -120,7 +120,7 @@ fn environment_is_canonical_and_part_of_identity() {
 #[test]
 fn ambient_cacheability_requires_a_trusted_fingerprint() {
     let untrusted = ambient(None);
-    let trusted = ambient(Some([7; 32]));
+    let trusted = ambient(Some([7; 16]));
 
     assert!(!untrusted.is_cacheable());
     assert!(trusted.is_cacheable());

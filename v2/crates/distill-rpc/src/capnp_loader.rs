@@ -714,7 +714,7 @@ impl RemoteAuthoringSnapshot {
                 Ok(RemoteCall::Success(if value.is_empty() {
                     None
                 } else {
-                    Some(ContentHash(fixed::<32>(value, "file.content_hash")?))
+                    Some(ContentHash(fixed::<16>(value, "file.content_hash")?))
                 }))
             }
             schema::data_call::Which::ReconnectRequired(value) => Ok(
@@ -1438,7 +1438,7 @@ fn decode_resolve(
 ) -> Result<ResolveResult, capnp::Error> {
     Ok(match value.which()? {
         schema::resolve_result::Which::Built(hash) => ResolveResult::Built {
-            content_hash: ContentHash(fixed::<32>(hash?, "resolve.built")?),
+            content_hash: ContentHash(fixed::<16>(hash?, "resolve.built")?),
         },
         schema::resolve_result::Which::Drifted(drifted) => {
             let (input, current) = decode_drifted(drifted?)?;
@@ -1537,7 +1537,7 @@ fn decode_entry(value: schema::entry_meta::Reader<'_>) -> Result<MetadataEntry, 
             value.get_terminal_type()?.get_bytes()?,
             "entry.terminalType",
         )?),
-        schema_hash: LogicalHash(fixed::<32>(value.get_schema_hash()?, "entry.schemaHash")?),
+        schema_hash: LogicalHash(fixed::<16>(value.get_schema_hash()?, "entry.schemaHash")?),
         role: decode_role(value.get_role()?),
         tags,
     })

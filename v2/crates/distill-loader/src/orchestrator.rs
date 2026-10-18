@@ -372,7 +372,7 @@ impl<I: LoaderIO> Loader<I> {
         &mut self,
         epoch: GameModuleEpoch,
         token: ModuleEpochToken,
-        target_definition_hash: [u8; 32],
+        target_definition_hash: [u8; 16],
         descriptors: &[&'static AssetRuntimeDescriptor],
     ) -> Result<(), RegistrationError> {
         let mut seen = BTreeSet::new();

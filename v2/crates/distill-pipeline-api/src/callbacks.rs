@@ -108,7 +108,7 @@ pub enum ToolSource {
     Ambient {
         launcher: PathBuf,
         toolchain_id: String,
-        trusted_fingerprint: Option<[u8; 32]>,
+        trusted_fingerprint: Option<[u8; 16]>,
     },
 }
 

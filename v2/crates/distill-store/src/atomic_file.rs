@@ -199,7 +199,7 @@ fn io_at(path: &Path) -> impl Fn(io::Error) -> AtomicWriteError + '_ {
 }
 
 pub fn content_hash(bytes: &[u8]) -> ContentHash {
-    ContentHash(*blake3::hash(bytes).as_bytes())
+    ContentHash(distill_core::hash::hash(bytes))
 }
 
 /// The target's current hash, `None` when it does not exist.

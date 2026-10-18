@@ -56,7 +56,7 @@ fn ordinary_bundle() -> (Vec<u8>, LogicalSchema, distill_core::id::LogicalHash) 
 }
 
 fn target() -> TargetDefinition {
-    TargetDefinition::new("dev", TargetDefinitionHash([4; 32]))
+    TargetDefinition::new("dev", TargetDefinitionHash([4; 16]))
 }
 
 /// Configure the project at `dir`, whose root "main" is `root`, with the
@@ -1343,7 +1343,7 @@ fn generated_values(
             let hash = hash?;
             let bytes = std::fs::read(assets.join(format!("{stem}.bundle"))).unwrap();
             assert_eq!(
-                *blake3::hash(&bytes).as_bytes(),
+                distill_core::hash::hash(&bytes),
                 hash.0,
                 "{stem}.bundle is the published file"
             );
@@ -3533,7 +3533,7 @@ fn authorable_lists_the_authored_types_and_importers() {
     assert_eq!(rules.default, TypeDefault::Absent);
     assert_eq!(
         authorable.types[2].default,
-        TypeDefault::SchemaMismatch { written: distill_core::id::LogicalHash([0; 32]) }
+        TypeDefault::SchemaMismatch { written: distill_core::id::LogicalHash([0; 16]) }
     );
 
     let ids: Vec<_> = authorable.importers.iter().map(|importer| importer.id.as_str()).collect();

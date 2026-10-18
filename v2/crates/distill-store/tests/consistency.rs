@@ -25,7 +25,7 @@ fn namespace_error(message: &str) -> NamespaceError {
             source: ReadableBundleSource {
                 root_name: "main".into(),
                 normalized_path: "broken.bundle".into(),
-                file_hash: BundleFileHash([9; 32]),
+                file_hash: BundleFileHash([9; 16]),
             },
             failure: SkeletonFailureCode::IncompleteAssetIdentity,
         },
@@ -40,7 +40,7 @@ fn commit(store: &mut Store, key: u8) {
             reads: Vec::new(),
             wire_trees: Vec::new(),
             key_kind: KeyKind::Processor,
-            static_input_key: [key; 32],
+            static_input_key: [key; 16],
             asset_uuid: AssetUuid([7u8; 16]),
             trace: vec![key],
             outcome: CommitOutcome::Success {
@@ -77,7 +77,7 @@ fn the_two_sequencing_domains_are_independent() {
     // semantic, not a leak.
     assert_eq!(
         store
-            .lookup_candidates(KeyKind::Processor, &[1u8; 32])
+            .lookup_candidates(KeyKind::Processor, &[1u8; 16])
             .unwrap()
             .len(),
         1
@@ -109,7 +109,7 @@ fn multi_table_input_transactions_are_all_or_nothing() {
                 root,
                 path: "a.bundle".into(),
                 format_version: 1,
-                content_hash: ContentHash([1u8; 32]),
+                content_hash: ContentHash([1u8; 16]),
                 origin: None,
                 import_watched: false,
             })?;
@@ -118,7 +118,7 @@ fn multi_table_input_transactions_are_all_or_nothing() {
                 bundle: BundleUuid([1u8; 16]),
                 local_id: "e".into(),
                 type_uuid: TypeUuid([3u8; 16]),
-                logical_hash: LogicalHash([4u8; 32]),
+                logical_hash: LogicalHash([4u8; 16]),
                 authoring_only: false,
                 terminal_type: None,
                 content: None,
@@ -249,7 +249,7 @@ fn a_namespace_error_does_not_gate_the_namespace() {
     // CAS reads are pure metadata.
     commit(&mut store, 3);
     assert_eq!(
-        store.cas_read(blake3::hash(&[3u8; 64]).as_bytes()).unwrap(),
+        store.cas_read(&distill_core::hash::hash(&[3u8; 64])).unwrap(),
         vec![3u8; 64]
     );
 }

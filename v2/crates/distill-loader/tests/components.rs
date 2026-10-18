@@ -11,7 +11,7 @@ fn id(n: u8) -> AssetUuid {
 }
 fn basis(seed: u8, _build_only: &[u8]) -> IoBasis {
     IoBasis::Pack {
-        manifest: ManifestHash([seed; 32]),
+        manifest: ManifestHash([seed; 16]),
     }
 }
 
@@ -21,7 +21,7 @@ fn ready(uuid: u8, deps: &[u8], basis: &IoBasis) -> CandidateAsset {
         basis: basis.clone(),
         load_deps: deps.iter().copied().map(id).collect(),
         outcome: CandidateOutcome::Ready {
-            content_hash: ContentHash([uuid; 32]),
+            content_hash: ContentHash([uuid; 16]),
         },
     }
 }
@@ -133,7 +133,7 @@ fn component_discovery_is_stack_safe_for_deep_closures() {
                 basis: basis.clone(),
                 load_deps: if n + 1 == 20_000 { vec![] } else { vec![next] },
                 outcome: CandidateOutcome::Ready {
-                    content_hash: ContentHash([1; 32]),
+                    content_hash: ContentHash([1; 16]),
                 },
             },
         );

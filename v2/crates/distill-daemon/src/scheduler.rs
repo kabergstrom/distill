@@ -232,7 +232,7 @@ type Job = Box<dyn FnOnce(&mut Store) + Send>;
 // Build cells
 
 /// The key of a build cell: the static-input key of the build it runs.
-pub(crate) type CellKey = [u8; 32];
+pub(crate) type CellKey = [u8; 16];
 
 /// What a build cell produces. Every waiter of one cell shares one outcome.
 pub(crate) trait CellOutcome: Send + Sync + 'static {
@@ -1051,7 +1051,7 @@ mod tests {
         let tickets = (0..8)
             .map(|_| {
                 let runs = Arc::clone(&runs);
-                pool.request([1; 32], WorkClass::Interactive, move |_, _| {
+                pool.request([1; 16], WorkClass::Interactive, move |_, _| {
                     runs.fetch_add(1, Ordering::SeqCst);
                     TestOutcome::Value(7)
                 })
@@ -1075,13 +1075,13 @@ mod tests {
         let (_temp, pool) = pool(1);
         let (release, released) = mpsc::channel::<()>();
         let (started, running) = mpsc::sync_channel(1);
-        let first = pool.request([1; 32], WorkClass::Interactive, move |_, _| {
+        let first = pool.request([1; 16], WorkClass::Interactive, move |_, _| {
             started.send(()).unwrap();
             let _ = released.recv();
             TestOutcome::Value(1)
         });
         running.recv_timeout(WATCHDOG).unwrap();
-        let second = pool.request([1; 32], WorkClass::Interactive, |_, _| {
+        let second = pool.request([1; 16], WorkClass::Interactive, |_, _| {
             unreachable!("joined the running cell")
         });
         drop(first);
@@ -1089,7 +1089,7 @@ mod tests {
         let ran = Arc::new(AtomicUsize::new(0));
         let queued = {
             let ran = Arc::clone(&ran);
-            pool.request([2; 32], WorkClass::Interactive, move |_, _| {
+            pool.request([2; 16], WorkClass::Interactive, move |_, _| {
                 ran.fetch_add(1, Ordering::SeqCst);
                 TestOutcome::Value(2)
             })
@@ -1123,11 +1123,11 @@ mod tests {
         pool.submit(WorkClass::Batch, record("batch-1"));
         pool.submit(WorkClass::Batch, record("batch-2"));
         let cell_order = Arc::clone(&order);
-        let batch = pool.request([3; 32], WorkClass::Batch, move |_, _| {
+        let batch = pool.request([3; 16], WorkClass::Batch, move |_, _| {
             cell_order.lock().unwrap().push("cell");
             TestOutcome::Value(3)
         });
-        let interactive = pool.request([3; 32], WorkClass::Interactive, |_, _| {
+        let interactive = pool.request([3; 16], WorkClass::Interactive, |_, _| {
             unreachable!("joined the queued cell")
         });
         drop(blocker);
@@ -1145,9 +1145,9 @@ mod tests {
         // The dependencies are queued behind the root on the only worker;
         // claiming them takes them over instead of waiting.
         let blocker = occupy(&pool, WorkClass::Interactive);
-        let root = pool.request([10; 32], WorkClass::Interactive, |_, worker| {
+        let root = pool.request([10; 16], WorkClass::Interactive, |_, worker| {
             let mut total = 0;
-            for key in [[11; 32], [12; 32]] {
+            for key in [[11; 16], [12; 16]] {
                 match worker.claim(key) {
                     Claim::Run(run) => {
                         total += 1;
@@ -1158,7 +1158,7 @@ mod tests {
             }
             TestOutcome::Value(total)
         });
-        let dependency = pool.request([11; 32], WorkClass::Interactive, |_, _| {
+        let dependency = pool.request([11; 16], WorkClass::Interactive, |_, _| {
             unreachable!("the root's worker took the queued dependency over")
         });
         drop(blocker);
@@ -1175,9 +1175,9 @@ mod tests {
         // Worker A runs [20] and needs [21]; worker B runs [21] and needs
         // [20]. A waits on B; B waiting on A would close the cycle, so B
         // builds [20] privately and both finish.
-        let a = pool.request([20; 32], WorkClass::Interactive, move |_, worker| {
+        let a = pool.request([20; 16], WorkClass::Interactive, move |_, worker| {
             b_claim.recv_timeout(WATCHDOG).unwrap();
-            match worker.claim([21; 32]) {
+            match worker.claim([21; 16]) {
                 Claim::Wait(wait) => {
                     a_waiting.send(()).unwrap();
                     match &*wait.wait() {
@@ -1188,10 +1188,10 @@ mod tests {
                 _ => TestOutcome::Failed("expected to wait".to_owned()),
             }
         });
-        let b = pool.request([21; 32], WorkClass::Batch, move |_, worker| {
+        let b = pool.request([21; 16], WorkClass::Batch, move |_, worker| {
             b_claimed.send(()).unwrap();
             a_wait.recv_timeout(WATCHDOG).unwrap();
-            match worker.claim([20; 32]) {
+            match worker.claim([20; 16]) {
                 Claim::Private => TestOutcome::Value(21),
                 _ => TestOutcome::Failed("expected a private build".to_owned()),
             }
@@ -1206,12 +1206,12 @@ mod tests {
         let blocker = occupy(&pool, WorkClass::Interactive);
         let tickets = (0..3)
             .map(|_| {
-                pool.request([30; 32], WorkClass::Interactive, |_, _| {
+                pool.request([30; 16], WorkClass::Interactive, |_, _| {
                     TestOutcome::Failed("rejected".to_owned())
                 })
             })
             .collect::<Vec<_>>();
-        let panicking = pool.request([31; 32], WorkClass::Interactive, |_, _| {
+        let panicking = pool.request([31; 16], WorkClass::Interactive, |_, _| {
             panic!("the build panicked")
         });
         drop(blocker);

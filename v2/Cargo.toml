@@ -27,7 +27,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-blake3 = "1"
+xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 ryu = "1"
 unicode-normalization = "0.1"
 globset = "0.4"

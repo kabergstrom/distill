@@ -41,12 +41,12 @@ fn uuid_parse_rejects_bad_shapes() {
 }
 
 #[test]
-fn hash_display_is_64_hex_and_parses_back() {
-    let h = ContentHash([0x0F; 32]);
+fn hash_display_is_32_hex_and_parses_back() {
+    let h = ContentHash([0x0F; 16]);
     let s = h.to_string();
-    assert_eq!(s.len(), 64);
+    assert_eq!(s.len(), 32);
     assert_eq!(ContentHash::from_str(&s).unwrap(), h);
-    assert!(ContentHash::from_str(&s[..63]).is_err());
+    assert!(ContentHash::from_str(&s[..31]).is_err());
     assert!(ContentHash::from_str(&format!("{}0", s)).is_err());
 }
 
@@ -55,16 +55,16 @@ fn bundle_file_hash_accepts_exact_malformed_observed_bytes() {
     let malformed = b"{ not a canonical bundle\xff";
     assert_eq!(
         BundleFileHash::of_observed_bytes(malformed),
-        BundleFileHash(*blake3::hash(malformed).as_bytes())
+        BundleFileHash(distill_core::hash::hash(malformed))
     );
 }
 
 #[test]
 fn hash_types_are_distinct_types() {
-    // Compile-time property really; pin the constructors exist and carry 32 bytes.
-    let _l = LogicalHash([1; 32]);
-    let _y = LayoutHash([2; 32]);
-    let _c = ContentHash([3; 32]);
+    // Compile-time property really; pin the constructors exist and carry 16 bytes.
+    let _l = LogicalHash([1; 16]);
+    let _y = LayoutHash([2; 16]);
+    let _c = ContentHash([3; 16]);
 }
 
 #[test]

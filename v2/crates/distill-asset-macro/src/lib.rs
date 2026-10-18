@@ -371,7 +371,7 @@ fn struct_reflect(ident: &Ident, fields: &[FieldInfo], rev: u32) -> syn::Result<
                     builder.backref(distance);
                     return;
                 }
-                builder.byte(0x02);
+                builder.kind(0x02);
                 builder.u32(#rev);
                 builder.u32(#serializable_count);
                 #(#logical_fields)*
@@ -638,7 +638,7 @@ fn enum_reflect(
         quote! {
             builder.string(#name);
             builder.u32(#variant_rev);
-            builder.byte(0x02);
+            builder.kind(0x02);
             builder.u32(0);
             builder.u32(#field_count);
             #(#fields)*
@@ -690,7 +690,7 @@ fn enum_reflect(
                     builder.backref(distance);
                     return;
                 }
-                builder.byte(0x03);
+                builder.kind(0x03);
                 builder.u32(#rev);
                 builder.u32(#variant_count);
                 #(#logical_variants)*

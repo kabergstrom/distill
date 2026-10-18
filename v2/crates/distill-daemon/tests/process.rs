@@ -227,8 +227,8 @@ fn a_write_whose_rows_were_never_committed_is_adopted_on_restart() {
     let config = config(&temp);
     let target = assets.join("pending.txt");
     std::fs::write(&target, b"old").unwrap();
-    let old_hash = ContentHash(*blake3::hash(b"old").as_bytes());
-    let new_hash = ContentHash(*blake3::hash(b"new").as_bytes());
+    let old_hash = ContentHash(distill_core::hash::hash(b"old"));
+    let new_hash = ContentHash(distill_core::hash::hash(b"new"));
     let indexed = |process: &DaemonProcess, hash: ContentHash| {
         process
             .coordinator()
@@ -876,7 +876,7 @@ fn same_path_schema_edits_publish_exactly_one_atomic_candidate_version() {
         .version;
     assert_eq!(after.0, before.0 + 1);
     let expected_schema_hash =
-        *blake3::hash(&std::fs::read(temp.path().join("schema.json")).unwrap()).as_bytes();
+        distill_core::hash::hash(&std::fs::read(temp.path().join("schema.json")).unwrap());
     assert_eq!(
         compiled(&process)
             .and_then(|compiled| compiled.schema_authority())
@@ -1442,11 +1442,11 @@ fn start_gate_daemon(temp: &tempfile::TempDir, variant: &GateVariant) -> DaemonP
     process
 }
 
-fn dylib_hash(variant: &GateVariant) -> [u8; 32] {
-    *blake3::hash(&std::fs::read(&variant.dylib).unwrap()).as_bytes()
+fn dylib_hash(variant: &GateVariant) -> [u8; 16] {
+    distill_core::hash::hash(&std::fs::read(&variant.dylib).unwrap())
 }
 
-fn ready_dylib_hash(process: &DaemonProcess) -> Option<[u8; 32]> {
+fn ready_dylib_hash(process: &DaemonProcess) -> Option<[u8; 16]> {
     let store = process.coordinator().open_reader().unwrap();
     match process.coordinator().pipeline_failure(&store).unwrap() {
         None => process.coordinator().ready_dylib_hash(),

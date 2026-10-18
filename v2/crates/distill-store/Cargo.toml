@@ -10,7 +10,6 @@ distill-core = { path = "../distill-core" }
 distill-schema = { path = "../distill-schema" }
 distill-wire = { path = "../distill-wire" }
 ngp-schema = { path = "../../../../newgameplus/ngp-schema" }
-blake3 = { workspace = true }
 # Bundled SQLite: compiled from source, no system dependency (§13's
 # metadata layer must not vary by host library version).
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -29,7 +28,6 @@ test-hooks = ["rusqlite/trace"]
 tempfile = "3"
 # The integration tests use the test hooks.
 distill-store = { path = ".", features = ["test-hooks"] }
-blake3 = { workspace = true }
 # `trace` lets the query-plan tests capture the statements readers issue.
 rusqlite = { version = "0.32", features = ["bundled", "trace"] }
 

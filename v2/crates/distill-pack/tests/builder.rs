@@ -29,7 +29,7 @@ use distill_wire::dswl::{dswl_bytes, dswl_hash};
 use distill_wire::wire::WireNode;
 use tokio::task::LocalSet;
 
-const TARGET_HASH: [u8; 32] = [7; 32];
+const TARGET_HASH: [u8; 16] = [7; 16];
 
 struct Fixture {
     // The daemon and its files, held for the fixture's lifetime.
@@ -84,7 +84,7 @@ fn fixture_with_policy(build_only: bool) -> Fixture {
 /// root back. Their builds answer the artifacts installed here.
 fn fixture_with_policy_and_cycle(build_only: bool, cycle: bool) -> Fixture {
     let runtime_type = TypeUuid([21; 16]);
-    let logical_hash = LogicalHash([31; 32]);
+    let logical_hash = LogicalHash([31; 16]);
     let target_definition = TargetDefinition::new("dev", TargetDefinitionHash(TARGET_HASH));
     let mut project = TestProject::new(vec![target_definition]);
     let server = project.server();
@@ -338,7 +338,7 @@ fn build_pack_pulls_the_typed_closure_and_emits_mountable_files() {
     );
     assert_eq!(
         output.archive_file_hash,
-        *blake3::hash(&output.archive_bytes).as_bytes()
+        distill_core::hash::hash(&output.archive_bytes)
     );
 
     let directory = tempfile::tempdir().unwrap();

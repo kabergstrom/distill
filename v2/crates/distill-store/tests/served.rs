@@ -92,9 +92,9 @@ fn a_target_is_installed_replaced_and_removed_without_a_fence() {
     let (_dir, mut store) = store();
     store
         .served_transaction(|txn| {
-            txn.set_rpc_target("pc", [1; 32])?;
-            txn.set_rpc_target("console", [3; 32])?;
-            txn.set_rpc_target("pc", [2; 32])?;
+            txn.set_rpc_target("pc", [1; 16])?;
+            txn.set_rpc_target("console", [3; 16])?;
+            txn.set_rpc_target("pc", [2; 16])?;
             txn.remove_rpc_target("console")
         })
         .unwrap();
@@ -102,7 +102,7 @@ fn a_target_is_installed_replaced_and_removed_without_a_fence() {
     assert_eq!(targets.len(), 1);
     assert_eq!(
         (targets[0].name.as_str(), targets[0].definition_hash),
-        ("pc", [2; 32])
+        ("pc", [2; 16])
     );
     assert_eq!(store.rpc_pipeline_generation().unwrap(), 0);
     assert_eq!(store.change_log_head().unwrap(), 0);
@@ -148,7 +148,7 @@ fn commit_reading(
     store
         .commit_build(BuildCommit {
             key_kind: KeyKind::Processor,
-            static_input_key: [key; 32],
+            static_input_key: [key; 16],
             asset_uuid: parent,
             trace: vec![key],
             reads,

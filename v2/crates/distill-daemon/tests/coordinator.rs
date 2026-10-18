@@ -86,7 +86,7 @@ fn incremental_bundle_edit_does_not_invalidate_an_unrelated_bundle() {
     let hub = match coordinator
         .server()
         .root()
-        .connect(ConnectRequest::new("dev", TargetDefinitionHash([4; 32])))
+        .connect(ConnectRequest::new("dev", TargetDefinitionHash([4; 16])))
     {
         ConnectOutcome::Connected(connected) => connected.hub,
         outcome => panic!("target connection failed: {outcome:?}"),
@@ -363,7 +363,7 @@ fn claims_survive_a_restart_whose_first_scan_is_rejected() {
 }
 
 fn target() -> TargetDefinition {
-    TargetDefinition::new("dev", TargetDefinitionHash([4; 32]))
+    TargetDefinition::new("dev", TargetDefinitionHash([4; 16]))
 }
 
 fn coordinator(temp: &tempfile::TempDir) -> DaemonCoordinator {
@@ -535,7 +535,7 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
         [WrittenFile {
             root: "main".into(),
             path: "ordinary.bundle".into(),
-            content_hash: Some(ContentHash(*blake3::hash(&bytes).as_bytes())),
+            content_hash: Some(ContentHash(distill_core::hash::hash(&bytes))),
         }]
     );
     let rewritten = distill_bundle::parse_bundle(&bytes).unwrap();
@@ -1078,7 +1078,7 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
     let hub = match coordinator
         .server()
         .root()
-        .connect(ConnectRequest::new("dev", TargetDefinitionHash([4; 32])))
+        .connect(ConnectRequest::new("dev", TargetDefinitionHash([4; 16])))
     {
         ConnectOutcome::Connected(connected) => connected.hub,
         outcome => panic!("target connection failed: {outcome:?}"),
@@ -1495,7 +1495,7 @@ fn a_configuration_error_publishes_nothing() {
     let before = writer.pages_fetched().unwrap();
     coordinator
         .reject_configuration(
-            DscpV1::MalformedConfiguration { file_hash: [5; 32] },
+            DscpV1::MalformedConfiguration { file_hash: [5; 16] },
             "malformed",
         )
         .unwrap();
@@ -1608,7 +1608,7 @@ fn restart_required_is_told_as_it_changes_and_clears() {
         let hub = match coordinator
             .server()
             .root()
-            .connect(ConnectRequest::new("dev", TargetDefinitionHash([4; 32])))
+            .connect(ConnectRequest::new("dev", TargetDefinitionHash([4; 16])))
         {
             ConnectOutcome::Connected(connected) => connected.hub,
             outcome => panic!("target connection failed: {outcome:?}"),
@@ -1820,7 +1820,7 @@ fn type_descriptions_read_the_type_files_at_the_snapshot() {
     let hub = match coordinator
         .server()
         .root()
-        .connect(ConnectRequest::new("dev", TargetDefinitionHash([4; 32])))
+        .connect(ConnectRequest::new("dev", TargetDefinitionHash([4; 16])))
     {
         ConnectOutcome::Connected(connected) => connected.hub,
         outcome => panic!("target connection failed: {outcome:?}"),
@@ -1908,7 +1908,7 @@ fn an_index_subscription_is_told_every_entry_file_and_type_change() {
     let connect = || match coordinator
         .server()
         .root()
-        .connect(ConnectRequest::new("dev", TargetDefinitionHash([4; 32])))
+        .connect(ConnectRequest::new("dev", TargetDefinitionHash([4; 16])))
     {
         ConnectOutcome::Connected(connected) => connected.hub,
         outcome => panic!("target connection failed: {outcome:?}"),

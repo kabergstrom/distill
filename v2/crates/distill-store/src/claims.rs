@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use distill_core::canonical::CanonicalEncoder;
+use distill_core::encoding::Encoder;
 use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
 
 use crate::db::{InputTxn, StoreReader};
@@ -85,8 +85,8 @@ pub struct PendingClaims {
 }
 
 fn claim_row(claim: &SourceClaim) -> Result<(i64, Vec<u8>, Vec<u8>, Vec<u8>), StoreError> {
-    let encoded = |encode: &dyn Fn(&mut CanonicalEncoder)| {
-        let mut encoder = CanonicalEncoder::new();
+    let encoded = |encode: &dyn Fn(&mut Encoder)| {
+        let mut encoder = Encoder::new();
         encode(&mut encoder);
         encoder.into_bytes()
     };

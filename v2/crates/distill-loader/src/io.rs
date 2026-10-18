@@ -15,11 +15,11 @@ pub struct ReqId(pub u64);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeTarget {
     pub epoch: crate::GameModuleEpoch,
-    pub target_definition_hash: [u8; 32],
+    pub target_definition_hash: [u8; 16],
 }
 
 impl RuntimeTarget {
-    pub fn new(epoch: crate::GameModuleEpoch, target_definition_hash: [u8; 32]) -> Self {
+    pub fn new(epoch: crate::GameModuleEpoch, target_definition_hash: [u8; 16]) -> Self {
         Self {
             epoch,
             target_definition_hash,

@@ -202,8 +202,8 @@ fn tagged_schema() -> Schema {
 
 #[test]
 fn schema_projection_produces_logical_registry_and_authenticated_wire() {
-    let authority = ProjectSchemaAuthority::from_schema(project_schema(), [7; 32]).unwrap();
-    assert_eq!(authority.source_hash(), [7; 32]);
+    let authority = ProjectSchemaAuthority::from_schema(project_schema(), [7; 16]).unwrap();
+    assert_eq!(authority.source_hash(), [7; 16]);
 
     let project = authority.project_type(PROJECT_UUID).unwrap();
     assert_eq!(project.schema_type, SchemaTypeId(0));
@@ -225,16 +225,16 @@ fn schema_projection_produces_logical_registry_and_authenticated_wire() {
 fn project_authority_preserves_build_only_policy() {
     let mut schema = project_schema();
     schema.types[0].attrs.build_only = true;
-    let authority = ProjectSchemaAuthority::from_schema(schema, [7; 32]).unwrap();
+    let authority = ProjectSchemaAuthority::from_schema(schema, [7; 16]).unwrap();
     assert!(authority.project_type(PROJECT_UUID).unwrap().build_only);
 }
 
 #[test]
 fn project_authority_carries_renamed_fields_outside_the_hash() {
-    let plain = ProjectSchemaAuthority::from_schema(project_schema(), [7; 32]).unwrap();
+    let plain = ProjectSchemaAuthority::from_schema(project_schema(), [7; 16]).unwrap();
     let mut schema = project_schema();
     schema.types[0].fields[1].attrs.renamed_from = Some("gamma".to_owned());
-    let renamed = ProjectSchemaAuthority::from_schema(schema, [7; 32]).unwrap();
+    let renamed = ProjectSchemaAuthority::from_schema(schema, [7; 16]).unwrap();
     let (plain, renamed) = (
         plain.project_type(PROJECT_UUID).unwrap(),
         renamed.project_type(PROJECT_UUID).unwrap(),
@@ -274,7 +274,7 @@ fn layout_tables_must_be_positionally_parallel_to_the_shared_model() {
     let mut schema = project_schema();
     schema.layouts[0].layouts[0].fields.pop();
     assert!(matches!(
-        ProjectSchemaAuthority::from_schema(schema, [0; 32]),
+        ProjectSchemaAuthority::from_schema(schema, [0; 16]),
         Err(SchemaAuthorityError::FieldLayoutLength { .. })
     ));
 }
@@ -284,7 +284,7 @@ fn project_types_cannot_override_a_sealed_bootstrap_uuid() {
     let mut schema = project_schema();
     schema.types[0].uuid = Some(distill_core::bootstrap::PACK_DEFINITION_TYPE_UUID);
     assert!(matches!(
-        ProjectSchemaAuthority::from_schema(schema, [0; 32]),
+        ProjectSchemaAuthority::from_schema(schema, [0; 16]),
         Err(SchemaAuthorityError::BootstrapTypeCollision { .. })
     ));
 }

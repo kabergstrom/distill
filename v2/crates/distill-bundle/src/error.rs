@@ -11,49 +11,30 @@ use ngp_schema::SnapshotError;
 #[derive(Debug, Clone, PartialEq)]
 pub enum BundleError {
     // ---- container framing (§6) ----
-    /// Shorter than the fixed 36-byte container header.
+    /// Shorter than the fixed 28-byte container header.
     TooShortForHeader {
         len: usize,
     },
-    /// First byte was 0x89 (container dispatch) but the 8-byte magic does
-    /// not match. `line_ending_mangled` is set when the bytes look like the
-    /// magic after LF→CRLF or CRLF→LF translation — the PNG-style magic
-    /// exists to detect exactly that, loudly.
-    BadMagic {
-        found: [u8; 8],
-        line_ending_mangled: bool,
-    },
-    /// Header `version` field is not a supported container encoding version.
-    UnsupportedContainerVersion {
-        found: u32,
-    },
-    /// `36 + json_len + pad + blob_len` overflowed u64 — the header lengths
+    /// The shared file header (§5) is not a bundle container's at
+    /// `CONTAINER_VERSION`: wrong magic, domain or version, by name.
+    Header(distill_core::header::HeaderError),
+    /// `28 + json_len + pad + blob_len` overflowed u64 — the header lengths
     /// are garbage. Checked before any allocation.
     HeaderOverflow {
         json_len: u64,
         blob_len: u64,
     },
-    /// File is shorter than the header's `36 + json_len + pad + blob_len`.
+    /// File is shorter than the header's `28 + json_len + pad + blob_len`.
     /// Checked before any allocation.
     Truncated {
         expected: u64,
         actual: u64,
     },
-    /// File is longer than the header's `36 + json_len + pad + blob_len` —
+    /// File is longer than the header's `28 + json_len + pad + blob_len` —
     /// exact size is normative.
     TrailingBytes {
         expected: u64,
         actual: u64,
-    },
-    /// CRC-32C of the JSON chunk does not match the header field.
-    JsonCrcMismatch {
-        expected: u32,
-        actual: u32,
-    },
-    /// CRC-32C of the blob chunk does not match the header field.
-    BlobCrcMismatch {
-        expected: u32,
-        actual: u32,
     },
     /// A pad byte between the JSON chunk and the blob chunk is nonzero.
     /// `file_offset` is absolute in the file.
@@ -124,7 +105,7 @@ pub enum BundleError {
     AssetsNotObject {
         found: &'static str,
     },
-    /// A `schemas` key is not a 64-char hex LogicalHash.
+    /// A `schemas` key is not a 32-char hex LogicalHash.
     BadSchemaKey {
         key: String,
     },
@@ -353,21 +334,9 @@ impl fmt::Display for BundleError {
         match self {
             E::TooShortForHeader { len } => write!(
                 f,
-                "container is {len} bytes, shorter than the 36-byte header"
+                "container is {len} bytes, shorter than the 28-byte header"
             ),
-            E::BadMagic {
-                found,
-                line_ending_mangled,
-            } => {
-                write!(f, "bad container magic {found:02x?}")?;
-                if *line_ending_mangled {
-                    write!(f, " — looks like line-ending translation mangled the file")?;
-                }
-                Ok(())
-            }
-            E::UnsupportedContainerVersion { found } => {
-                write!(f, "unsupported container version {found} (supported: 1)")
-            }
+            E::Header(error) => write!(f, "container: {error}"),
             E::HeaderOverflow { json_len, blob_len } => write!(
                 f,
                 "header lengths overflow: json_len {json_len} + blob_len {blob_len}"
@@ -379,14 +348,6 @@ impl fmt::Display for BundleError {
             E::TrailingBytes { expected, actual } => write!(
                 f,
                 "file too long: header accounts for {expected} bytes, file has {actual}"
-            ),
-            E::JsonCrcMismatch { expected, actual } => write!(
-                f,
-                "json chunk CRC-32C mismatch: header says {expected:#010x}, bytes hash to {actual:#010x}"
-            ),
-            E::BlobCrcMismatch { expected, actual } => write!(
-                f,
-                "blob chunk CRC-32C mismatch: header says {expected:#010x}, bytes hash to {actual:#010x}"
             ),
             E::NonzeroPadByte { file_offset } => {
                 write!(f, "nonzero pad byte at file offset {file_offset}")
@@ -436,7 +397,7 @@ impl fmt::Display for BundleError {
             }
             E::BadSchemaKey { key } => write!(
                 f,
-                "schemas key {key:?} is not a 64-char hex logical hash"
+                "schemas key {key:?} is not a 32-char hex logical hash"
             ),
             E::DuplicateSchema { hash } => {
                 write!(f, "schemas spells hash {hash} twice")

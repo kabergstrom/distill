@@ -47,7 +47,7 @@ fn namespace_error(message: &str) -> NamespaceError {
             source: ReadableBundleSource {
                 root_name: "main".into(),
                 normalized_path: "broken.bundle".into(),
-                file_hash: BundleFileHash([9; 32]),
+                file_hash: BundleFileHash([9; 16]),
             },
             failure: SkeletonFailureCode::IncompleteAssetIdentity,
         },
@@ -62,7 +62,7 @@ fn bundle_meta(root: RootId, n: u8) -> BundleMeta {
         root,
         path: format!("tex/{n}.bundle"),
         format_version: 1,
-        content_hash: ContentHash([n; 32]),
+        content_hash: ContentHash([n; 16]),
         origin: None,
         import_watched: false,
     }
@@ -74,7 +74,7 @@ fn asset_record(asset_n: u8, bundle_n: u8, tags: &[&str]) -> AssetRecord {
         bundle: BundleUuid([bundle_n; 16]),
         local_id: format!("entry-{asset_n}"),
         type_uuid: TypeUuid([9u8; 16]),
-        logical_hash: LogicalHash([8u8; 32]),
+        logical_hash: LogicalHash([8u8; 16]),
         authoring_only: false,
         tags: tags.iter().map(|tag| ((*tag).to_owned(), None)).collect(),
         terminal_type: None,
@@ -105,13 +105,13 @@ fn bundle_and_asset_rows_roundtrip() {
     let bundle = store.bundle(BundleUuid([1u8; 16])).unwrap().unwrap();
     assert_eq!(bundle.root, root);
     assert_eq!(bundle.path, "tex/1.bundle");
-    assert_eq!(bundle.content_hash, ContentHash([1u8; 32]));
+    assert_eq!(bundle.content_hash, ContentHash([1u8; 16]));
 
     let entry = store.entry(AssetUuid([10u8; 16])).unwrap().unwrap();
     assert_eq!(entry.bundle, BundleUuid([1u8; 16]));
     assert_eq!(entry.local_id, "entry-10");
     assert_eq!(entry.type_uuid, TypeUuid([9u8; 16]));
-    assert_eq!(entry.logical_hash, LogicalHash([8u8; 32]));
+    assert_eq!(entry.logical_hash, LogicalHash([8u8; 16]));
     assert_eq!(
         entry.tags,
         BTreeMap::from([("hero".to_owned(), None), ("texture".to_owned(), None)])
@@ -282,7 +282,7 @@ fn tag_index_refinement_is_value_aware_and_pending_state_never_underapproximates
         .refine_unpublished_tag_index(&[TagIndexUpdate {
             asset: AssetUuid([10; 16]),
             tags: BTreeMap::from([("category".to_owned(), Some("enemy".to_owned()))]),
-            dylib_hash: Some([8; 32]),
+            dylib_hash: Some([8; 16]),
             poison: None,
         }])
         .unwrap();
@@ -294,7 +294,7 @@ fn tag_index_refinement_is_value_aware_and_pending_state_never_underapproximates
         .unwrap()
         .is_empty());
     let state = store.tag_index_state(AssetUuid([10; 16])).unwrap().unwrap();
-    assert_eq!(state.dylib_hash, Some([8; 32]));
+    assert_eq!(state.dylib_hash, Some([8; 16]));
     assert_eq!(state.poison, None);
 }
 
@@ -352,7 +352,7 @@ fn skeleton(root: RootId, entries: Vec<SkeletonEntry>) -> NamespaceSkeleton {
         root,
         path: "tex/1.bundle".to_owned(),
         format_version: 1,
-        content_hash: ContentHash([0xEE; 32]),
+        content_hash: ContentHash([0xEE; 16]),
         entries,
     }
 }
@@ -459,7 +459,7 @@ fn bundle_scoped_poison_needs_no_prior_row() {
         root,
         path: "tex/77.bundle".to_owned(),
         format_version: 1,
-        content_hash: ContentHash([0x77; 32]),
+        content_hash: ContentHash([0x77; 16]),
         entries: vec![skeleton_entry(78, &["fresh-tag"])],
     };
     store
@@ -485,7 +485,7 @@ fn tooling_authoring_query_propagates_matching_bundle_poison() {
         root,
         path: "tex/77.bundle".to_owned(),
         format_version: 1,
-        content_hash: ContentHash([0x77; 32]),
+        content_hash: ContentHash([0x77; 16]),
         entries: vec![control],
     };
     store
@@ -584,7 +584,7 @@ fn namespace_errors_read_in_canonical_order() {
                 source: ReadableBundleSource {
                     root_name: "main".into(),
                     normalized_path: path.into(),
-                    file_hash: BundleFileHash([byte; 32]),
+                    file_hash: BundleFileHash([byte; 16]),
                 },
                 failure: SkeletonFailureCode::EnvelopeMalformed,
             },

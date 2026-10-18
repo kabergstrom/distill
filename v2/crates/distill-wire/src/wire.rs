@@ -22,7 +22,7 @@ pub enum SlotKind {
 
 impl SlotKind {
     /// The DSWL grammar id, pinned.
-    pub fn grammar_id(self) -> u8 {
+    pub fn grammar_id(self) -> u32 {
         match self {
             SlotKind::Vec => 0x00,
             SlotKind::String => 0x01,

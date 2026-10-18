@@ -35,7 +35,7 @@ use crate::manifest::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackBuildTarget {
     pub name: String,
-    pub definition_hash: [u8; 32],
+    pub definition_hash: [u8; 16],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,7 +43,7 @@ pub struct PackBuildOutput {
     pub manifest: PackManifest,
     pub manifest_bytes: Vec<u8>,
     pub archive_bytes: Vec<u8>,
-    pub archive_file_hash: [u8; 32],
+    pub archive_file_hash: [u8; 16],
 }
 
 #[derive(Debug)]
@@ -528,7 +528,7 @@ pub async fn build_pack(
             })
             .collect::<Vec<_>>(),
     )?;
-    let archive_file_hash = *blake3::hash(&archive.bytes).as_bytes();
+    let archive_file_hash = distill_core::hash::hash(&archive.bytes);
     let manifest = canonicalize(PackManifest {
         target: PackTarget { name: target_name },
         target_def_hash: target.definition_hash,

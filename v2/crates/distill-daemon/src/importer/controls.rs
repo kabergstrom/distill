@@ -479,7 +479,7 @@ fn basis_schema() -> &'static SchemaNode {
                     "Local",
                     node_struct(vec![
                         ("class", SchemaNode::Primitive(PrimitiveKind::U16)),
-                        ("detail", bytes(32)),
+                        ("detail", bytes(16)),
                     ]),
                 ),
                 ("MissingCapability", node_struct(vec![("key", capability())])),
@@ -508,11 +508,11 @@ fn basis_schema() -> &'static SchemaNode {
         let dep = node_enum(vec![
             (
                 "Capability",
-                node_struct(vec![("key", capability()), ("observed", attempt(bytes(32)))]),
+                node_struct(vec![("key", capability()), ("observed", attempt(bytes(16)))]),
             ),
             (
                 "Listing",
-                node_struct(vec![("observed", attempt(bytes(32))), ("query", query())]),
+                node_struct(vec![("observed", attempt(bytes(16))), ("query", query())]),
             ),
             (
                 "Probe",
@@ -526,7 +526,7 @@ fn basis_schema() -> &'static SchemaNode {
                 node_struct(vec![
                     (
                         "observed",
-                        attempt(node_struct(vec![("hash", bytes(32)), ("path", rooted())])),
+                        attempt(node_struct(vec![("hash", bytes(16)), ("path", rooted())])),
                     ),
                     ("path", string()),
                 ]),
@@ -779,7 +779,7 @@ mod tests {
                 path: "models/chest.glb".into(),
                 observed: Observed::Ok(FileContentObservation {
                     path: rooted("assets", "models/chest.glb"),
-                    hash: [3; 32],
+                    hash: [3; 16],
                 }),
             },
             FileDep::Probe {
@@ -792,29 +792,29 @@ mod tests {
             },
             FileDep::Listing {
                 query: query(Some("models"), Some("**/*.png")),
-                observed: Observed::Ok([5; 32]),
+                observed: Observed::Ok([5; 16]),
             },
             FileDep::Capability {
                 key: CapabilityKey::Importer("ngp.gltf".into()),
-                observed: Observed::Ok([7; 32]),
+                observed: Observed::Ok([7; 16]),
             },
             FileDep::Capability {
                 key: CapabilityKey::DefaultTable(TypeUuid([9; 16])),
-                observed: Observed::Ok([11; 32]),
+                observed: Observed::Ok([11; 16]),
             },
             FileDep::Capability {
                 key: CapabilityKey::Processor {
                     input: TypeUuid([13; 16]),
                 },
-                observed: Observed::Ok([15; 32]),
+                observed: Observed::Ok([15; 16]),
             },
             FileDep::Capability {
                 key: CapabilityKey::MigrationFn("mesh.v2".into()),
-                observed: Observed::Ok([17; 32]),
+                observed: Observed::Ok([17; 16]),
             },
             FileDep::Capability {
                 key: CapabilityKey::Tool("ktx".into()),
-                observed: Observed::Ok([19; 32]),
+                observed: Observed::Ok([19; 16]),
             },
         ]
     }
@@ -857,7 +857,7 @@ mod tests {
                 path: "a.glb".into(),
                 observed: Observed::Err(StableFailureFingerprint::Local {
                     class: LocalFailureClass::Importer,
-                    detail: [0; 32],
+                    detail: [0; 16],
                 }),
             }],
             origin: None,
@@ -873,7 +873,7 @@ mod tests {
                 path: "a.glb".into(),
                 observed: Observed::Err(StableFailureFingerprint::Local {
                     class: LocalFailureClass::ArtifactEncoding,
-                    detail: [21; 32],
+                    detail: [21; 16],
                 }),
             },
             FileDep::Capability {

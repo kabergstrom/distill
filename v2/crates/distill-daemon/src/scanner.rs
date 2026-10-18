@@ -631,7 +631,7 @@ impl ScanSnapshot {
     #[cfg(test)]
     fn from_rows(
         files: Vec<ObservedFile>,
-        bundles: Vec<(String, String, [u8; 32])>,
+        bundles: Vec<(String, String, [u8; 16])>,
     ) -> Result<Self, StoreError> {
         let mut snapshot = Self::default();
         for row in files {
@@ -1278,7 +1278,7 @@ impl RootedScanner {
         let bytes = self
             .read_identity_checked(&physical)
             .map_err(|_| drifted())?;
-        let hash = *blake3::hash(&bytes).as_bytes();
+        let hash = distill_core::hash::hash(&bytes);
         if ContentHash(hash) != expected {
             return Err(drifted());
         }
@@ -1683,7 +1683,7 @@ fn observe_opened_file(
     let normalized_path = relative.join("/");
     let raw_relative_path = raw_relative_path(roots, root_name, &physical);
     // One hash of the bytes: the file content hash, a bundle's file hash.
-    let hash = *blake3::hash(&bytes).as_bytes();
+    let hash = distill_core::hash::hash(&bytes);
     let file_hash = BundleFileHash(hash);
     if let Some(existing) = snapshot
         .files
@@ -2573,7 +2573,7 @@ mod tests {
                 modified_nanos: 1,
                 size: 1,
                 content_hash: (kind != ScannedFileKind::Directory)
-                    .then_some(ContentHash([hash; 32])),
+                    .then_some(ContentHash([hash; 16])),
                 raw_relative_path: PlatformPathBytes::Unix(path.as_bytes().to_vec()),
                 canonical_path: None,
             },

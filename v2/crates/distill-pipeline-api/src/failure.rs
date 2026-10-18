@@ -40,7 +40,7 @@ impl LocalFailureClass {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolLaunchDiagnostic {
     pub id: String,
-    pub tool_hash: [u8; 32],
+    pub tool_hash: [u8; 16],
     pub class: ToolLaunchFailureClass,
 }
 
@@ -221,7 +221,7 @@ pub enum StableFailureFingerprint {
     },
     Local {
         class: LocalFailureClass,
-        detail: [u8; 32],
+        detail: [u8; 16],
     },
 }
 

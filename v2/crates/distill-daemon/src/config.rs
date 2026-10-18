@@ -755,7 +755,7 @@ fn target_matches_layout_identity(target: &TargetSection, identity: &LayoutIdent
 /// bind to the exact source bytes through `MalformedConfiguration`.
 pub(crate) fn config_error_reason(error: &DaemonConfigError, source: &[u8]) -> DscpV1 {
     let malformed = || DscpV1::MalformedConfiguration {
-        file_hash: *blake3::hash(source).as_bytes(),
+        file_hash: distill_core::hash::hash(source),
     };
     let path_text = |path: &Path| path.to_str().filter(|text| is_nfc(text)).map(str::to_owned);
     match error {
@@ -824,7 +824,7 @@ pub(crate) fn config_error_reason(error: &DaemonConfigError, source: &[u8]) -> D
     }
 }
 
-pub(crate) fn candidate_error_reason(error: &DaemonConfigError, file_hash: [u8; 32]) -> DscpV1 {
+pub(crate) fn candidate_error_reason(error: &DaemonConfigError, file_hash: [u8; 16]) -> DscpV1 {
     match error {
         DaemonConfigError::UnsupportedTargetIdentity {
             target,

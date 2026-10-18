@@ -45,7 +45,7 @@ fn raw_epoch(n: u8) -> PipelineEpoch {
     PipelineEpoch {
         target_set: CanonicalTargetSet::canonical(vec![TargetSetRow {
             name: format!("target-{n}"),
-            target_definition_hash: [n.wrapping_add(3); 32],
+            target_definition_hash: [n.wrapping_add(3); 16],
         }])
         .unwrap(),
         schema_registry: bootstrap_control_logical_registry_v1().unwrap(),
@@ -66,7 +66,7 @@ fn ready_requires_exact_bootstrap_logical_projection() {
     let mut changed = raw_epoch(2);
     changed
         .schema_registry
-        .insert(type_uuid, LogicalHash([9; 32]));
+        .insert(type_uuid, LogicalHash([9; 16]));
     assert!(matches!(
         ValidatedPipelineEpoch::validate(changed),
         Err(StoreError::InvalidBootstrapRegistry { .. })
@@ -97,7 +97,7 @@ fn registering_a_package_tool_is_content_addressed_and_input_versioned() {
     assert!(root.join("bin/tool").is_file());
     assert_eq!(std::fs::read(root.join("bin/tool")).unwrap(), binary);
     assert_eq!(std::fs::read(root.join("share/config")).unwrap(), b"cfg v1");
-    assert_ne!(registered.tool_hash, *blake3::hash(binary).as_bytes());
+    assert_ne!(registered.tool_hash, distill_core::hash::hash(binary));
 
     let resolved = store.tool("shaderc").unwrap().expect("registered");
     assert_eq!(resolved.tool_hash, registered.tool_hash);
@@ -263,7 +263,7 @@ fn ambient_registration_is_not_staged_and_trust_controls_cacheability() {
         source: ResolvedToolSourceV2::Ambient {
             launcher: launcher.to_string_lossy().into_owned(),
             toolchain_id: "developer-tools".into(),
-            trusted_fingerprint: Some([7; 32]),
+            trusted_fingerprint: Some([7; 16]),
         },
         environment: vec![],
         cwd_policy: ToolCwdPolicy::EmptyScratch,

@@ -62,7 +62,7 @@ pub(crate) struct RegisteredImporter {
     pub(crate) settings_schema: LogicalSchema,
     pub(crate) settings_hash: LogicalHash,
     pub(crate) default_settings: Value,
-    capability_hash: [u8; 32],
+    capability_hash: [u8; 16],
     executor: Arc<dyn AuthoringImporter>,
 }
 
@@ -187,7 +187,7 @@ impl RegisteredImporter {
         distill_migrate::conforms(&default_settings, &settings_schema.root)
             .map_err(|error| invalid(format!("invalid importer default settings: {error}")))?;
         let version = importer.version();
-        let capability_hash = distill_core::canonical::domain_digest(*b"DSIC", 1, |encoder| {
+        let capability_hash = distill_core::hash::digest(distill_core::hash::Domain::ImporterCapability, 1, |encoder| {
             encoder.str(&id);
             encoder.u32(version);
             encoder.raw(&settings_type_uuid.0);
@@ -407,7 +407,7 @@ impl AuthoringService {
         path: String,
         root_name: String,
         bundle: &Bundle,
-        file_hash: [u8; 32],
+        file_hash: [u8; 16],
     ) -> Result<ImportIndexSource, RpcFailure> {
         let uuid = bundle.uuid;
         let mut directory_rules = Vec::new();
@@ -1207,7 +1207,7 @@ impl AuthoringService {
         store: &mut Store,
         bundles: &[BundleMeta],
         active_origins: &BTreeSet<StoredDirectoryOrigin>,
-        capabilities: &BTreeMap<String, [u8; 32]>,
+        capabilities: &BTreeMap<String, [u8; 16]>,
     ) -> Result<(), RpcFailure> {
         let orphaned = bundles
             .iter()
@@ -1226,7 +1226,7 @@ impl AuthoringService {
         touched: &BTreeSet<StoredDirectoryOrigin>,
         active: &BTreeSet<StoredDirectoryOrigin>,
         adopted: &BTreeSet<BundleUuid>,
-        capabilities: &BTreeMap<String, [u8; 32]>,
+        capabilities: &BTreeMap<String, [u8; 16]>,
     ) -> Result<(), RpcFailure> {
         let mut orphaned = Vec::new();
         for origin in touched.difference(active) {
@@ -1255,7 +1255,7 @@ impl AuthoringService {
         &self,
         store: &mut Store,
         orphaned: Vec<&BundleMeta>,
-        capabilities: &BTreeMap<String, [u8; 32]>,
+        capabilities: &BTreeMap<String, [u8; 16]>,
     ) -> Result<(), RpcFailure> {
         let mut failures = Vec::new();
         {
@@ -1627,7 +1627,7 @@ impl AuthoringService {
         &self,
         store: &StoreReader,
         task: &DirectoryImportTask,
-        capabilities: &BTreeMap<String, [u8; 32]>,
+        capabilities: &BTreeMap<String, [u8; 16]>,
         overlay: Option<&FileOverlay>,
     ) -> Result<bool, RpcFailure> {
         let destination = self.resolve_directory_destination(
@@ -2511,7 +2511,7 @@ impl AuthoringService {
     }
 
     /// Every importer's capability at `compiled`.
-    fn importer_capabilities(&self, compiled: &Compiled) -> BTreeMap<String, [u8; 32]> {
+    fn importer_capabilities(&self, compiled: &Compiled) -> BTreeMap<String, [u8; 16]> {
         compiled
             .pipeline_importers()
             .iter()
@@ -2808,7 +2808,7 @@ impl AuthoringService {
             .scanner()
             .read_identity_checked(&target)
             .map_err(invalid)?;
-        if ContentHash(*blake3::hash(&bytes).as_bytes()) != meta.content_hash {
+        if ContentHash(distill_core::hash::hash(&bytes)) != meta.content_hash {
             return Err(invalid("import destination changed since the durable base"));
         }
         let bundle = distill_bundle::parse_bundle(&bytes).map_err(invalid)?;
@@ -3340,8 +3340,8 @@ fn stored_origin(origin: &DirectoryOrigin) -> StoredDirectoryOrigin {
 /// bundle to hold it stands for the task that digests the same; one that
 /// digests otherwise runs again (an edited rule's settings, a group that
 /// gained a source).
-fn directory_task_digest(task: &DirectoryImportTask) -> Result<[u8; 32], RpcFailure> {
-    Ok(distill_core::canonical::domain_digest(*b"DSDT", 1, |encoder| {
+fn directory_task_digest(task: &DirectoryImportTask) -> Result<[u8; 16], RpcFailure> {
+    Ok(distill_core::hash::digest(distill_core::hash::Domain::DirectoryTask, 1, |encoder| {
         encoder.str(&task.importer);
         encoder.u32(task.sources.len() as u32);
         for source in &task.sources {
@@ -3435,7 +3435,7 @@ impl AuthoringImportContext for TracedImportContext<'_, '_> {
         self.context.enumerate(query)
     }
 
-    fn importer_capability(&mut self, id: &str) -> Result<[u8; 32], ImportError> {
+    fn importer_capability(&mut self, id: &str) -> Result<[u8; 16], ImportError> {
         self.context.importer_capability(id)
     }
 }
@@ -3444,7 +3444,7 @@ impl AuthoringImportContext for TracedImportContext<'_, '_> {
 struct RootedImportBackend<'a> {
     scanner: &'a RootedScanner,
     rows: ImportRows<'a>,
-    capabilities: &'a BTreeMap<String, [u8; 32]>,
+    capabilities: &'a BTreeMap<String, [u8; 16]>,
 }
 
 /// The store connection an import backend reads `files` through: the
@@ -3584,7 +3584,7 @@ impl FileOverlay {
                         mtime: 0,
                         size: output.bytes.len() as u64,
                         kind: FileKind::File,
-                        content_hash: Some(ContentHash(*blake3::hash(&output.bytes).as_bytes())),
+                        content_hash: Some(ContentHash(distill_core::hash::hash(&output.bytes))),
                     }
                     .into(),
                 }),
@@ -3649,7 +3649,7 @@ impl<'a> RootedImportBackend<'a> {
     fn new(
         scanner: &'a RootedScanner,
         reader: &'a StoreReader,
-        capabilities: &'a BTreeMap<String, [u8; 32]>,
+        capabilities: &'a BTreeMap<String, [u8; 16]>,
     ) -> Self {
         Self {
             scanner,
@@ -3662,7 +3662,7 @@ impl<'a> RootedImportBackend<'a> {
     fn over(
         scanner: &'a RootedScanner,
         reader: &'a StoreReader,
-        capabilities: &'a BTreeMap<String, [u8; 32]>,
+        capabilities: &'a BTreeMap<String, [u8; 16]>,
         overlay: Option<&'a FileOverlay>,
     ) -> Self {
         Self {
@@ -3676,7 +3676,7 @@ impl<'a> RootedImportBackend<'a> {
     fn open(
         scanner: &'a RootedScanner,
         opener: &StoreOpener,
-        capabilities: &'a BTreeMap<String, [u8; 32]>,
+        capabilities: &'a BTreeMap<String, [u8; 16]>,
         overlay: Option<&'a FileOverlay>,
     ) -> Result<Self, RpcFailure> {
         let reader = opener.open_reader().map_err(invalid)?;
@@ -3723,7 +3723,7 @@ impl RootedImportBackend<'_> {
     fn read_checked(
         &mut self,
         path: &str,
-    ) -> Result<(RootedPath, Vec<u8>, [u8; 32]), RawFileFailureClass> {
+    ) -> Result<(RootedPath, Vec<u8>, [u8; 16]), RawFileFailureClass> {
         let matches = self
             .files_at(path)?
             .into_iter()
@@ -3740,7 +3740,7 @@ impl RootedImportBackend<'_> {
             RootedPath::new(&row.root_name, path).map_err(|_| RawFileFailureClass::OtherStable)?;
         if let Some(bytes) = self.rows.output(&row.root_name, path) {
             // An earlier import of the pass publishes these bytes here.
-            let hash = *blake3::hash(bytes).as_bytes();
+            let hash = distill_core::hash::hash(bytes);
             return Ok((rooted, bytes.to_vec(), hash));
         }
         let physical = self
@@ -3751,7 +3751,7 @@ impl RootedImportBackend<'_> {
             .scanner
             .read_identity_checked(&physical)
             .map_err(scan_failure)?;
-        let hash = *blake3::hash(&bytes).as_bytes();
+        let hash = distill_core::hash::hash(&bytes);
         if Some(ContentHash(hash)) != row.file.state.content_hash {
             return Err(RawFileFailureClass::OtherStable);
         }
@@ -3768,7 +3768,7 @@ impl ImportBackend for RootedImportBackend<'_> {
     fn read_hashed(
         &mut self,
         path: &str,
-    ) -> Result<(RootedPath, Vec<u8>, [u8; 32]), RawFileFailureClass> {
+    ) -> Result<(RootedPath, Vec<u8>, [u8; 16]), RawFileFailureClass> {
         self.read_checked(path)
     }
 
@@ -3826,7 +3826,7 @@ impl ImportBackend for RootedImportBackend<'_> {
         Ok(results)
     }
 
-    fn capability(&mut self, key: &CapabilityKey) -> Option<[u8; 32]> {
+    fn capability(&mut self, key: &CapabilityKey) -> Option<[u8; 16]> {
         match key {
             CapabilityKey::Importer(id) => self.capabilities.get(id).copied(),
             _ => None,
@@ -4200,17 +4200,17 @@ pub(crate) struct ImportControls {
 /// cleared when it reaches `IMPORT_CONTROLS_LIMIT` entries.
 #[derive(Default)]
 pub(crate) struct ImportControlsCache(
-    std::sync::Mutex<std::collections::HashMap<[u8; 32], Arc<ImportControls>>>,
+    std::sync::Mutex<std::collections::HashMap<[u8; 16], Arc<ImportControls>>>,
 );
 
 const IMPORT_CONTROLS_LIMIT: usize = 1 << 16;
 
 impl ImportControlsCache {
-    fn get(&self, hash: &[u8; 32]) -> Option<Arc<ImportControls>> {
+    fn get(&self, hash: &[u8; 16]) -> Option<Arc<ImportControls>> {
         self.lock().get(hash).cloned()
     }
 
-    fn insert(&self, hash: [u8; 32], controls: Arc<ImportControls>) {
+    fn insert(&self, hash: [u8; 16], controls: Arc<ImportControls>) {
         let mut map = self.lock();
         if map.len() >= IMPORT_CONTROLS_LIMIT {
             map.clear();
@@ -4220,7 +4220,7 @@ impl ImportControlsCache {
 
     fn lock(
         &self,
-    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<[u8; 32], Arc<ImportControls>>> {
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<[u8; 16], Arc<ImportControls>>> {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -4290,7 +4290,7 @@ pub(crate) struct ImportRun {
     outcome: Result<ImportOutput, ImportRunFailure>,
     /// A directory task's digest ([`directory_task_digest`]): what a
     /// failure with no bundle to hold it is recorded under.
-    directory_task: Option<[u8; 32]>,
+    directory_task: Option<[u8; 16]>,
 }
 
 impl ImportRun {
@@ -4310,7 +4310,7 @@ enum FailureHolder<'a> {
     Bundle(&'a BundleMeta),
     Origin {
         origin: StoredDirectoryOrigin,
-        task: [u8; 32],
+        task: [u8; 16],
         root: &'a str,
         path: &'a str,
     },
@@ -4349,7 +4349,7 @@ struct ImportInvocation {
     origin: Option<DirectoryOrigin>,
     basis_deps: Vec<FileDep>,
     /// A directory task's digest ([`directory_task_digest`]).
-    directory_task: Option<[u8; 32]>,
+    directory_task: Option<[u8; 16]>,
 }
 
 struct ImportExecutionError {
@@ -4388,7 +4388,7 @@ impl ImportExecutionError {
     }
 }
 
-/// The seed of the UUIDs one import run mints: 32 bytes of OS randomness,
+/// The seed of the UUIDs one import run mints: 16 bytes of OS randomness,
 /// drawn once per run. Fresh identity depends on nothing a bundle could
 /// later be reimported from (source path, input version, importer), so a
 /// bundle keeps its UUIDs only through its prior (DESIGN §7, §8). Every
@@ -4396,18 +4396,18 @@ impl ImportExecutionError {
 /// which the imports chained to it read, and the output it publishes carry
 /// the same UUIDs.
 #[derive(Clone, Copy)]
-struct IdentitySeed([u8; 32]);
+struct IdentitySeed([u8; 16]);
 
 impl IdentitySeed {
     fn random() -> Self {
-        let mut seed = [0; 32];
+        let mut seed = [0; 16];
         getrandom::getrandom(&mut seed).expect("OS randomness unavailable");
         Self(seed)
     }
 }
 
-/// UUIDv4s expanded from an [`IdentitySeed`]: BLAKE3 of the seed and a
-/// counter, a PRF keyed by the random seed.
+/// UUIDv4s expanded from an [`IdentitySeed`]: the digest of the seed and a
+/// counter, keyed by the random seed.
 struct SeededIdentitySource {
     seed: IdentitySeed,
     next: u64,
@@ -4418,17 +4418,16 @@ impl SeededIdentitySource {
         Self { seed, next: 0 }
     }
 
-    fn mint(&mut self, domain: &[u8]) -> [u8; 16] {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(domain);
-        hasher.update(&self.seed.0);
-        hasher.update(&self.next.to_le_bytes());
+    fn mint(&mut self, domain: distill_core::hash::Domain) -> [u8; 16] {
+        let (seed, next) = (self.seed.0, self.next);
+        let mut bytes = distill_core::hash::digest(domain, 1, |encoder| {
+            encoder.raw(&seed);
+            encoder.u64(next);
+        });
         self.next = self
             .next
             .checked_add(1)
             .expect("one import cannot mint u64::MAX identities");
-        let mut bytes = [0; 16];
-        bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
         bytes[6] = (bytes[6] & 0x0f) | 0x40;
         bytes[8] = (bytes[8] & 0x3f) | 0x80;
         bytes
@@ -4437,11 +4436,11 @@ impl SeededIdentitySource {
 
 impl IdentitySource for SeededIdentitySource {
     fn next_asset(&mut self) -> AssetUuid {
-        AssetUuid(self.mint(b"DSIA"))
+        AssetUuid(self.mint(distill_core::hash::Domain::MintedAsset))
     }
 
     fn next_bundle(&mut self) -> BundleUuid {
-        BundleUuid(self.mint(b"DSIB"))
+        BundleUuid(self.mint(distill_core::hash::Domain::MintedBundle))
     }
 }
 
@@ -4479,7 +4478,7 @@ mod tests {
     fn capability_changes_select_only_read_sets_that_record_capabilities() {
         let capability = FileDep::Capability {
             key: CapabilityKey::Importer("image".to_owned()),
-            observed: Observed::Ok([7; 32]),
+            observed: Observed::Ok([7; 16]),
         };
 
         assert!(!read_set_intersects_work(
@@ -4555,7 +4554,7 @@ mod enumerate_tests {
                                 mtime: version,
                                 size: index as u64,
                                 kind: kind(index),
-                                content_hash: Some(ContentHash([index as u8; 32])),
+                                content_hash: Some(ContentHash([index as u8; 16])),
                             }),
                             observation,
                         )?;

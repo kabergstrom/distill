@@ -3,7 +3,7 @@
 use distill_store::state::SnapshotStamp;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ManifestHash(pub [u8; 32]);
+pub struct ManifestHash(pub [u8; 16]);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IoBasis {

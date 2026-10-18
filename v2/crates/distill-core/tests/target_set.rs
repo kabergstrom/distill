@@ -3,7 +3,7 @@ use distill_core::target_set::{CanonicalTargetSet, TargetSetError, TargetSetRow}
 fn row(name: &str, byte: u8) -> TargetSetRow {
     TargetSetRow {
         name: name.to_owned(),
-        target_definition_hash: [byte; 32],
+        target_definition_hash: [byte; 16],
     }
 }
 

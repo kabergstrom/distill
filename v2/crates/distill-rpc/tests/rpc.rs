@@ -22,7 +22,7 @@ fn asset_id(byte: u8) -> AssetUuid {
 }
 
 fn content_hash(byte: u8) -> ContentHash {
-    ContentHash([byte; 32])
+    ContentHash([byte; 16])
 }
 
 #[allow(clippy::too_many_arguments)] // Test fixture mirrors the authenticated DSTL header/parts tuple.
@@ -42,7 +42,7 @@ fn canonical_artifact(
         authored_type,
         terminal_type,
         encoded_type,
-        logical_hash: LogicalHash([77; 32]),
+        logical_hash: LogicalHash([77; 16]),
         layout_hash,
     };
     let load_deps = load_edges.iter().map(|edge| edge.asset).collect::<Vec<_>>();
@@ -67,7 +67,7 @@ fn canonical_artifact(
 }
 
 fn target_hash(byte: u8) -> TargetDefinitionHash {
-    TargetDefinitionHash([byte; 32])
+    TargetDefinitionHash([byte; 16])
 }
 
 fn target_with(definition_hash: u8, _policies: &[(u8, bool)]) -> TargetDefinition {
@@ -210,7 +210,7 @@ fn record_directory_import_failure(
             },
             destination_root: ROOT.to_owned(),
             destination_path: destination.to_owned(),
-            task: [3; 32],
+            task: [3; 16],
             attempted_input_version,
             basis: vec![1],
             reads: vec![distill_store::imports::ImportReadKey::Path("rig.bundle".into())],
@@ -1150,7 +1150,7 @@ fn authoring_commit_authenticates_schema_and_exact_blob_index_coverage() {
     ));
 
     let mut tampered_schema = valid;
-    tampered_schema.schema_hash = LogicalHash([0; 32]);
+    tampered_schema.schema_hash = LogicalHash([0; 16]);
     assert!(matches!(
         offer(
             &server,
@@ -1386,7 +1386,7 @@ fn unbound_metadata_bootstrap_survives_a_configuration_error_and_has_no_runtime_
         type_id(1),
         type_id(1),
         type_id(1),
-        LayoutHash([4; 32]),
+        LayoutHash([4; 16]),
         Vec::new(),
         vec![1, 2, 3],
         Vec::new(),
@@ -1395,7 +1395,7 @@ fn unbound_metadata_bootstrap_survives_a_configuration_error_and_has_no_runtime_
         distill_test_project::put_artifact(&server.handle(), &payload),
         hash
     );
-    let reason = DscpV1::MalformedConfiguration { file_hash: [4; 32] };
+    let reason = DscpV1::MalformedConfiguration { file_hash: [4; 16] };
     let error = ConfigurationError::from_reason(&reason, "invalid staged configuration");
     publish_entry(&mut project, &entry);
     let stamp = reject_configuration(&project, reason, "invalid staged configuration");
@@ -1677,7 +1677,7 @@ fn authoring_inspection_is_a_pinned_pure_metadata_read_under_configuration_error
     publish_entry(&mut project, &entry);
     let failed_stamp = reject_configuration(
         &project,
-        DscpV1::MalformedConfiguration { file_hash: [9; 32] },
+        DscpV1::MalformedConfiguration { file_hash: [9; 16] },
         "invalid staged configuration",
     );
 
@@ -1746,14 +1746,14 @@ fn connect_rejects_protocol_target_and_definition_mismatches() {
 fn connect_canonicalizes_equivalent_target_names() {
     let project = TestProject::new(vec![TargetDefinition::new(
         "t\u{e9}st",
-        TargetDefinitionHash([7; 32]),
+        TargetDefinitionHash([7; 16]),
     )]);
     let server = project.server();
 
     assert!(matches!(
         server.root().connect(ConnectRequest::new(
             "te\u{301}st",
-            TargetDefinitionHash([7; 32]),
+            TargetDefinitionHash([7; 16]),
         )),
         ConnectOutcome::Connected(_)
     ));
@@ -1774,7 +1774,7 @@ fn resolve_path_and_fetch_terminal_outcomes_all_carry_the_snapshot_basis() {
         type_id(1),
         type_id(1),
         type_id(1),
-        LayoutHash([11; 32]),
+        LayoutHash([11; 16]),
         Vec::new(),
         vec![5_u8; 70_000],
         vec![Arc::from(vec![8_u8; 3])],
@@ -1917,7 +1917,7 @@ fn snapshots_pin_old_metadata_and_refresh_repins_latest() {
         type_id(1),
         type_id(1),
         type_id(1),
-        LayoutHash([1; 32]),
+        LayoutHash([1; 16]),
         Vec::new(),
         vec![1],
         Vec::new(),
@@ -1927,7 +1927,7 @@ fn snapshots_pin_old_metadata_and_refresh_repins_latest() {
         type_id(1),
         type_id(1),
         type_id(1),
-        LayoutHash([1; 32]),
+        LayoutHash([1; 16]),
         Vec::new(),
         vec![2],
         Vec::new(),
@@ -1986,7 +1986,7 @@ fn configuration_error_is_snapshot_pinned_and_typed_without_blocking_safe_reads(
         type_id(1),
         type_id(1),
         type_id(1),
-        LayoutHash([1; 32]),
+        LayoutHash([1; 16]),
         Vec::new(),
         vec![1, 2, 3],
         Vec::new(),
@@ -3106,7 +3106,7 @@ fn an_artifact_with_an_unresolved_direct_load_edge_stays_fetchable() {
         type_id(2),
         type_id(2),
         type_id(2),
-        LayoutHash([1; 32]),
+        LayoutHash([1; 16]),
         vec![ServedLoadEdge {
             asset: asset_id(2),
             expected_terminal: type_id(2),
@@ -3306,7 +3306,7 @@ fn a_commit_logs_the_assets_whose_builds_read_what_changed() {
     store
         .commit_build(BuildCommit {
             key_kind: KeyKind::Processor,
-            static_input_key: [7; 32],
+            static_input_key: [7; 16],
             asset_uuid: reader,
             trace: vec![7],
             reads: vec![BuildRead::Asset(read)],
@@ -3351,7 +3351,7 @@ fn content_keys_follow_values_not_versions() {
     write_entry(&mut project, &a);
     publish_entry(&mut project, &b);
     let hub = connect(&server, &[]);
-    let keys = || -> BTreeMap<AssetUuid, [u8; 32]> {
+    let keys = || -> BTreeMap<AssetUuid, [u8; 16]> {
         let snapshot = authoring_snapshot(&hub);
         let rows = match snapshot.list(AssetQuery { path_glob: Some("**".into()), ..AssetQuery::default() }) { RpcResult::Success(rows) => rows, other => panic!("list: {other:?}") };
         for row in &rows {

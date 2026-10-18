@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use distill_build::dslf::{DslfError, DslfV1};
 use distill_build::query::AssetQuery;
 use distill_build::trace::*;
+use distill_core::hash::{digest_prefix, Domain};
 use distill_core::id::{AssetUuid, BundleFileHash, ContentHash, LogicalHash, TypeUuid};
 use distill_migrate::FieldPath;
 
@@ -12,7 +13,7 @@ struct Snapshot {
     reads: BTreeMap<AssetUuid, Observed<ContentHash>>,
     resolves: BTreeMap<String, Observed<Option<AssetUuid>>>,
     roles: BTreeMap<AssetUuid, Observed<Option<EntryRole>>>,
-    controls: BTreeMap<ControlQuery, Observed<[u8; 32]>>,
+    controls: BTreeMap<ControlQuery, Observed<[u8; 16]>>,
     control_reads: BTreeMap<ControlSubject, Observed<ControlValueHash>>,
 }
 
@@ -29,14 +30,14 @@ impl TraceSource for Snapshot {
     fn resolve(&self, path: &str) -> Observed<Option<AssetUuid>> {
         self.resolves[path].clone()
     }
-    fn query(&self, _: &AssetQuery) -> Observed<[u8; 32]> {
-        Observed::Ok([3; 32])
+    fn query(&self, _: &AssetQuery) -> Observed<[u8; 16]> {
+        Observed::Ok([3; 16])
     }
-    fn tool(&self, _: &str) -> Observed<[u8; 32]> {
-        Observed::Ok([4; 32])
+    fn tool(&self, _: &str) -> Observed<[u8; 16]> {
+        Observed::Ok([4; 16])
     }
-    fn capability(&self, _: &CapabilityKey) -> Observed<[u8; 32]> {
-        Observed::Ok([5; 32])
+    fn capability(&self, _: &CapabilityKey) -> Observed<[u8; 16]> {
+        Observed::Ok([5; 16])
     }
     fn ref_check(&self, _: AssetUuid, _: TypeUuid) -> Observed<Option<TypeUuid>> {
         Observed::Ok(None)
@@ -47,7 +48,7 @@ impl TraceSource for Snapshot {
             .cloned()
             .unwrap_or(Observed::Ok(None))
     }
-    fn control(&self, query: &ControlQuery) -> Observed<[u8; 32]> {
+    fn control(&self, query: &ControlQuery) -> Observed<[u8; 16]> {
         self.controls[query].clone()
     }
     fn control_read(&self, subject: &ControlSubject) -> Observed<ControlValueHash> {
@@ -56,9 +57,9 @@ impl TraceSource for Snapshot {
 }
 
 #[test]
-fn dstr_authoring_read_pins_tag_eleven_and_optional_bundle_identity() {
+fn trace_authoring_read_pins_tag_eleven_and_optional_bundle_identity() {
     let asset = AssetUuid([0x33; 16]);
-    let hash = BundleFileHash([0x44; 32]);
+    let hash = BundleFileHash([0x44; 16]);
     let op = TraceOp::AuthoringRead {
         asset,
         observed: Observed::Ok(Some(hash)),
@@ -66,12 +67,11 @@ fn dstr_authoring_read_pins_tag_eleven_and_optional_bundle_identity() {
     let actual = trace_canonical_bytes(std::slice::from_ref(&op));
 
     let mut expected = Vec::new();
-    expected.extend_from_slice(b"DSTR");
-    expected.push(1);
+    expected.extend_from_slice(&digest_prefix(Domain::Trace, 1));
     expected.extend_from_slice(&1_u32.to_le_bytes());
-    expected.push(11); // TraceOp::AuthoringRead
+    expected.extend_from_slice(&11_u32.to_le_bytes()); // TraceOp::AuthoringRead
     expected.extend_from_slice(&asset.0);
-    expected.push(1); // Observed::Ok
+    expected.extend_from_slice(&1_u32.to_le_bytes()); // Observed::Ok
     expected.push(1); // Some
     expected.extend_from_slice(&hash.0);
     assert_eq!(actual, expected);
@@ -79,21 +79,20 @@ fn dstr_authoring_read_pins_tag_eleven_and_optional_bundle_identity() {
 }
 
 #[test]
-fn dstr_read_success_bytes_pin_one_based_operation_and_outcome_tags() {
+fn trace_read_success_bytes_pin_one_based_operation_and_outcome_tags() {
     let asset = AssetUuid([0x11; 16]);
-    let hash = ContentHash([0x22; 32]);
+    let hash = ContentHash([0x22; 16]);
     let actual = trace_canonical_bytes(&[TraceOp::Read {
         asset,
         observed: Observed::Ok(hash),
     }]);
 
     let mut expected = Vec::new();
-    expected.extend_from_slice(b"DSTR");
-    expected.push(1);
+    expected.extend_from_slice(&digest_prefix(Domain::Trace, 1));
     expected.extend_from_slice(&1_u32.to_le_bytes());
-    expected.push(1); // TraceOp::Read
+    expected.extend_from_slice(&1_u32.to_le_bytes()); // TraceOp::Read
     expected.extend_from_slice(&asset.0);
-    expected.push(1); // Observed::Ok
+    expected.extend_from_slice(&1_u32.to_le_bytes()); // Observed::Ok
     expected.extend_from_slice(&hash.0);
     assert_eq!(actual, expected);
     assert_eq!(
@@ -124,23 +123,23 @@ fn trace_digest_applies_the_dstr_domain_exactly_once() {
     }];
     assert_eq!(
         trace_digest(&trace),
-        *blake3::hash(&trace_canonical_bytes(&trace)).as_bytes()
+        distill_core::hash::hash(&trace_canonical_bytes(&trace))
     );
     assert_eq!(
         trace_digest(&trace),
-        distill_core::canonical::domain_digest(distill_core::canonical::DSTR, 1, |encoder| encoder
+        distill_core::hash::digest(distill_core::hash::Domain::Trace, 1, |encoder| encoder
             .raw(&trace_payload_bytes(&trace)),)
     );
 }
 
 #[test]
-fn dstr_distinguishes_an_explicit_runtime_role_and_rejects_authoring_queries() {
+fn trace_distinguishes_an_explicit_runtime_role_and_rejects_authoring_queries() {
     let implicit = TraceOp::Query {
         query: Box::new(AssetQuery {
             uuid: Some(AssetUuid([9; 16])),
             ..AssetQuery::default()
         }),
-        observed: Observed::Ok([3; 32]),
+        observed: Observed::Ok([3; 16]),
     };
     let explicit = TraceOp::Query {
         query: Box::new(AssetQuery {
@@ -148,7 +147,7 @@ fn dstr_distinguishes_an_explicit_runtime_role_and_rejects_authoring_queries() {
             authoring_only: Some(false),
             ..AssetQuery::default()
         }),
-        observed: Observed::Ok([3; 32]),
+        observed: Observed::Ok([3; 16]),
     };
     let implicit_bytes = trace_payload_bytes(std::slice::from_ref(&implicit));
     let explicit_bytes = trace_payload_bytes(std::slice::from_ref(&explicit));
@@ -164,7 +163,7 @@ fn dstr_distinguishes_an_explicit_runtime_role_and_rejects_authoring_queries() {
             authoring_only: Some(true),
             ..AssetQuery::default()
         }),
-        observed: Observed::Ok([3; 32]),
+        observed: Observed::Ok([3; 16]),
     };
     assert_eq!(
         decode_trace_payload_bytes(&trace_payload_bytes(&[forbidden])),
@@ -175,7 +174,7 @@ fn dstr_distinguishes_an_explicit_runtime_role_and_rejects_authoring_queries() {
 #[test]
 fn persisted_trace_decoder_rejects_reserved_noncanonical_and_trailing_forms() {
     assert_eq!(
-        decode_trace_payload_bytes(&[1, 0, 0, 0, 4]),
+        decode_trace_payload_bytes(&[1, 0, 0, 0, 4, 0, 0, 0]),
         Err(TraceDecodeError::ReservedToolLaunch)
     );
 
@@ -206,7 +205,7 @@ fn persisted_trace_decoder_rejects_reserved_noncanonical_and_trailing_forms() {
 }
 
 #[test]
-fn dstr_tool_capability_miss_pins_typed_tool_key() {
+fn trace_tool_capability_miss_pins_typed_tool_key() {
     let id = "shaderc".to_owned();
     let actual = trace_canonical_bytes(&[TraceOp::Tool {
         id: id.clone(),
@@ -216,37 +215,35 @@ fn dstr_tool_capability_miss_pins_typed_tool_key() {
     }]);
 
     let mut expected = Vec::new();
-    expected.extend_from_slice(b"DSTR");
-    expected.push(1); // domain version
+    expected.extend_from_slice(&digest_prefix(Domain::Trace, 1));
     expected.extend_from_slice(&1_u32.to_le_bytes());
-    expected.push(10); // TraceOp::Tool; historical ToolLaunch tag 4 is reserved
+    expected.extend_from_slice(&10_u32.to_le_bytes()); // TraceOp::Tool; historical ToolLaunch tag 4 is reserved
     expected.extend_from_slice(&(id.len() as u32).to_le_bytes());
     expected.extend_from_slice(id.as_bytes());
-    expected.push(2); // Observed::Err
-    expected.push(6); // StableFailureFingerprint::MissingCapability
-    expected.push(5); // CapabilityKey::Tool
+    expected.extend_from_slice(&2_u32.to_le_bytes()); // Observed::Err
+    expected.extend_from_slice(&6_u32.to_le_bytes()); // StableFailureFingerprint::MissingCapability
+    expected.extend_from_slice(&5_u32.to_le_bytes()); // CapabilityKey::Tool
     expected.extend_from_slice(&(id.len() as u32).to_le_bytes());
     expected.extend_from_slice(id.as_bytes());
     assert_eq!(actual, expected);
 }
 
 #[test]
-fn dstr_tool_lookup_hit_records_the_exact_staged_hash() {
+fn trace_tool_lookup_hit_records_the_exact_staged_hash() {
     let id = "shaderc".to_owned();
-    let staged_hash = [0x5a; 32];
+    let staged_hash = [0x5a; 16];
     let actual = trace_canonical_bytes(&[TraceOp::Tool {
         id: id.clone(),
         observed: Observed::Ok(staged_hash),
     }]);
 
     let mut expected = Vec::new();
-    expected.extend_from_slice(b"DSTR");
-    expected.push(1);
+    expected.extend_from_slice(&digest_prefix(Domain::Trace, 1));
     expected.extend_from_slice(&1_u32.to_le_bytes());
-    expected.push(10);
+    expected.extend_from_slice(&10_u32.to_le_bytes());
     expected.extend_from_slice(&(id.len() as u32).to_le_bytes());
     expected.extend_from_slice(id.as_bytes());
-    expected.push(1);
+    expected.extend_from_slice(&1_u32.to_le_bytes());
     expected.extend_from_slice(&staged_hash);
     assert_eq!(actual, expected);
 }
@@ -254,7 +251,7 @@ fn dstr_tool_lookup_hit_records_the_exact_staged_hash() {
 #[test]
 fn revalidation_compares_labeled_outcomes_in_order() {
     let asset = AssetUuid([1; 16]);
-    let hash = ContentHash([2; 32]);
+    let hash = ContentHash([2; 16]);
     let trace = vec![
         TraceOp::Resolve {
             path: "a".into(),
@@ -296,7 +293,7 @@ fn stable_failure_heals_when_observed_outcome_changes() {
     assert!(revalidate(&trace, &snapshot));
     snapshot
         .reads
-        .insert(asset, Observed::Ok(ContentHash([1; 32])));
+        .insert(asset, Observed::Ok(ContentHash([1; 16])));
     assert!(!revalidate(&trace, &snapshot));
 }
 
@@ -320,11 +317,11 @@ fn local_failure_details_are_dslf_domain_separated_typed_facts() {
     let StableFailureFingerprint::Local { detail, .. } = a else {
         unreachable!()
     };
-    assert_ne!(detail, *blake3::hash(b"field").as_bytes());
+    assert_ne!(detail, distill_core::hash::hash(b"field"));
 }
 
 #[test]
-fn dslf_processor_bytes_pin_class_width_field_order_and_framing() {
+fn local_failure_processor_bytes_pin_class_width_field_order_and_framing() {
     let facts = DslfV1::Processor {
         asset: AssetUuid([0x11; 16]),
         processor_id: "p".into(),
@@ -340,16 +337,15 @@ fn dslf_processor_bytes_pin_class_width_field_order_and_framing() {
     assert_eq!(class, LocalFailureClass::Processor);
 
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"DSLF");
-    bytes.push(1);
-    bytes.extend_from_slice(&3u16.to_le_bytes());
+    bytes.extend_from_slice(&digest_prefix(Domain::LocalFailure, 1));
+    bytes.extend_from_slice(&3u32.to_le_bytes());
     bytes.extend_from_slice(&[0x11; 16]);
     bytes.extend_from_slice(&1u32.to_le_bytes());
     bytes.push(b'p');
     bytes.extend_from_slice(&0x0403_0201u32.to_le_bytes());
     bytes.extend_from_slice(&0x0605u16.to_le_bytes());
     bytes.extend_from_slice(&0x0a09_0807u32.to_le_bytes());
-    assert_eq!(detail, *blake3::hash(&bytes).as_bytes());
+    assert_eq!(detail, distill_core::hash::hash(&bytes));
 }
 
 #[test]
@@ -358,8 +354,8 @@ fn dslf_canonicalizes_declared_sets_but_retains_validator_multiplicity() {
     let b = AssetUuid([2; 16]);
     let migration = |edges| DslfV1::MigrationPlan {
         type_uuid: TypeUuid([3; 16]),
-        from: LogicalHash([4; 32]),
-        to: LogicalHash([5; 32]),
+        from: LogicalHash([4; 16]),
+        to: LogicalHash([5; 16]),
         failure: distill_build::dslf::MigrationPlanFailureV1::AmbiguousEdge {
             conflicting_edges: edges,
         },
@@ -445,7 +441,7 @@ fn every_dslf_local_failure_class_has_a_stable_nonzero_code() {
 }
 
 #[test]
-fn dstr_control_failure_bytes_pin_tags_u16_codes_and_framing() {
+fn trace_control_failure_bytes_pin_u32_tags_codes_and_framing() {
     let query = ControlQuery::DirectoryImportRuleSet;
     let a = AssetUuid([1; 16]);
     let b = AssetUuid([2; 16]);
@@ -461,16 +457,15 @@ fn dstr_control_failure_bytes_pin_tags_u16_codes_and_framing() {
     }]);
 
     let mut expected = Vec::new();
-    expected.extend_from_slice(b"DSTR");
-    expected.push(1); // domain version
+    expected.extend_from_slice(&digest_prefix(Domain::Trace, 1));
     expected.extend_from_slice(&1_u32.to_le_bytes()); // trace entry count
-    expected.push(8); // TraceOp::Control
-    expected.push(2); // ControlQuery::DirectoryImportRuleSet
-    expected.push(2); // Observed::Err
-    expected.push(9); // StableFailureFingerprint::Control
-    expected.push(1); // ControlFailureSubject::Query
-    expected.push(2); // ControlQuery::DirectoryImportRuleSet
-    expected.extend_from_slice(&3_u16.to_le_bytes()); // Ambiguous
+    expected.extend_from_slice(&8_u32.to_le_bytes()); // TraceOp::Control
+    expected.extend_from_slice(&2_u32.to_le_bytes()); // ControlQuery::DirectoryImportRuleSet
+    expected.extend_from_slice(&2_u32.to_le_bytes()); // Observed::Err
+    expected.extend_from_slice(&9_u32.to_le_bytes()); // StableFailureFingerprint::Control
+    expected.extend_from_slice(&1_u32.to_le_bytes()); // ControlFailureSubject::Query
+    expected.extend_from_slice(&2_u32.to_le_bytes()); // ControlQuery::DirectoryImportRuleSet
+    expected.extend_from_slice(&3_u32.to_le_bytes()); // Ambiguous
     expected.extend_from_slice(&2_u32.to_le_bytes()); // sorted/dedup entries
     expected.extend_from_slice(&a.0);
     expected.extend_from_slice(&b.0);
@@ -478,7 +473,7 @@ fn dstr_control_failure_bytes_pin_tags_u16_codes_and_framing() {
 }
 
 #[test]
-fn dstr_control_read_failure_pins_read_subject_tag() {
+fn trace_control_read_failure_pins_read_subject_tag() {
     let asset = AssetUuid([21; 16]);
     let subject = ControlSubject::PackDefinition(asset);
     let failure = control_failure_fingerprint(
@@ -493,24 +488,23 @@ fn dstr_control_read_failure_pins_read_subject_tag() {
     }]);
 
     let mut expected = Vec::new();
-    expected.extend_from_slice(b"DSTR");
-    expected.push(1);
+    expected.extend_from_slice(&digest_prefix(Domain::Trace, 1));
     expected.extend_from_slice(&1_u32.to_le_bytes());
-    expected.push(9); // TraceOp::ControlRead
-    expected.push(2); // ControlSubject::PackDefinition
+    expected.extend_from_slice(&9_u32.to_le_bytes()); // TraceOp::ControlRead
+    expected.extend_from_slice(&2_u32.to_le_bytes()); // ControlSubject::PackDefinition
     expected.extend_from_slice(&asset.0);
-    expected.push(2); // Observed::Err
-    expected.push(9); // StableFailureFingerprint::Control
-    expected.push(2); // ControlFailureSubject::Read
-    expected.push(2); // ControlSubject::PackDefinition
+    expected.extend_from_slice(&2_u32.to_le_bytes()); // Observed::Err
+    expected.extend_from_slice(&9_u32.to_le_bytes()); // StableFailureFingerprint::Control
+    expected.extend_from_slice(&2_u32.to_le_bytes()); // ControlFailureSubject::Read
+    expected.extend_from_slice(&2_u32.to_le_bytes()); // ControlSubject::PackDefinition
     expected.extend_from_slice(&asset.0);
-    expected.extend_from_slice(&2_u16.to_le_bytes()); // Missing
+    expected.extend_from_slice(&2_u32.to_le_bytes()); // Missing
     expected.extend_from_slice(&0_u32.to_le_bytes()); // no conflicting entries
     assert_eq!(actual, expected);
 }
 
 #[test]
-fn every_control_failure_code_has_its_pinned_nonzero_u16_value() {
+fn every_control_failure_code_has_its_pinned_nonzero_value() {
     let codes = [
         ControlFailureCode::RoleViolation,
         ControlFailureCode::Missing,
@@ -551,7 +545,7 @@ fn control_failure_entries_are_sorted_and_deduplicated_before_revalidation() {
 fn successful_and_failed_control_reads_revalidate_and_heal() {
     let asset = AssetUuid([12; 16]);
     let subject = ControlSubject::PackDefinition(asset);
-    let identity = ControlValueHash([13; 32]);
+    let identity = ControlValueHash([13; 16]);
     let success = TraceOp::ControlRead {
         subject: subject.clone(),
         observed: Observed::Ok(identity),
@@ -563,7 +557,7 @@ fn successful_and_failed_control_reads_revalidate_and_heal() {
     assert!(revalidate(std::slice::from_ref(&success), &snapshot));
     snapshot
         .control_reads
-        .insert(subject.clone(), Observed::Ok(ControlValueHash([14; 32])));
+        .insert(subject.clone(), Observed::Ok(ControlValueHash([14; 16])));
     assert!(!revalidate(std::slice::from_ref(&success), &snapshot));
 
     let failure = control_failure_fingerprint(

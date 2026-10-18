@@ -1,4 +1,4 @@
-//! DSTL artifact container (§12): pinned layout, canonical writer,
+//! The artifact image (§12): pinned layout, canonical writer,
 //! strict reader — negatives for every validation rule.
 
 use distill_bundle::PathComponent;
@@ -6,8 +6,10 @@ use distill_core::id::{AssetUuid, LayoutHash, LogicalHash, TypeUuid};
 use distill_wire::artifact::{
     artifact_header_layout_hash, assemble_artifact, canonical_blob_order, content_hash,
     parse_artifact, parse_artifact_parts, split_artifact, write_artifact, ArtifactError,
-    ArtifactHeader, ARTIFACT_FORMAT_VERSION, ARTIFACT_MAGIC,
+    ArtifactHeader, ARTIFACT_FORMAT_VERSION, ARTIFACT_HEADER_LEN,
 };
+use distill_core::hash::Domain;
+use distill_core::header::HeaderError;
 
 fn header() -> ArtifactHeader {
     ArtifactHeader {
@@ -15,8 +17,8 @@ fn header() -> ArtifactHeader {
         authored_type: TypeUuid([0x22; 16]),
         terminal_type: TypeUuid([0x33; 16]),
         encoded_type: TypeUuid([0x44; 16]),
-        logical_hash: LogicalHash([0x55; 32]),
-        layout_hash: LayoutHash([0x66; 32]),
+        logical_hash: LogicalHash([0x55; 16]),
+        layout_hash: LayoutHash([0x66; 16]),
     }
 }
 
@@ -40,19 +42,21 @@ fn minimal_artifact_bytes_pinned() {
     let bytes = write_simple(&[], &[0xAA, 0xAA, 0xAA, 0xAA], &[], &[]);
 
     let mut expected = Vec::new();
-    expected.extend_from_slice(&[0x89, 0x44, 0x53, 0x54, 0x4C, 0x0D, 0x1A, 0x0A]); // magic
+    expected.extend_from_slice(b"NGPF"); // shared file header: magic
+    expected.extend_from_slice(&(Domain::ArtifactImage as u32).to_le_bytes()); // domain
     expected.extend_from_slice(&1u32.to_le_bytes()); // version
     expected.extend_from_slice(&[0x11; 16]); // asset_uuid
     expected.extend_from_slice(&[0x22; 16]); // authored_type
     expected.extend_from_slice(&[0x33; 16]); // terminal_type
     expected.extend_from_slice(&[0x44; 16]); // encoded_type
-    expected.extend_from_slice(&[0x55; 32]); // logical_hash
-    expected.extend_from_slice(&[0x66; 32]); // layout_hash
+    expected.extend_from_slice(&[0x55; 16]); // logical_hash
+    expected.extend_from_slice(&[0x66; 16]); // layout_hash
     expected.extend_from_slice(&0u32.to_le_bytes()); // dep_count
     expected.extend_from_slice(&0u32.to_le_bytes()); // blob_count
     expected.extend_from_slice(&4u32.to_le_bytes()); // fixed_len
     expected.extend_from_slice(&0u64.to_le_bytes()); // var_len
-    assert_eq!(expected.len(), 160); // header size, pinned
+    assert_eq!(expected.len(), 128); // header size, pinned
+    assert_eq!(ARTIFACT_HEADER_LEN, 128);
     expected.extend_from_slice(&[0xAA, 0xAA, 0xAA, 0xAA]); // fixed
     expected.extend_from_slice(&[0u8; 12]); // pad to 16
 
@@ -60,19 +64,19 @@ fn minimal_artifact_bytes_pinned() {
 }
 
 #[test]
-fn magic_constant_is_pinned() {
+fn file_header_is_pinned() {
+    let bytes = write_simple(&[], &[], &[], &[]);
     assert_eq!(
-        ARTIFACT_MAGIC,
-        [0x89, 0x44, 0x53, 0x54, 0x4C, 0x0D, 0x1A, 0x0A]
+        &bytes[..12],
+        &distill_core::header::header(Domain::ArtifactImage, ARTIFACT_FORMAT_VERSION)
     );
     assert_eq!(ARTIFACT_FORMAT_VERSION, 1);
 }
 
 #[test]
-fn content_hash_is_blake3_of_raw_bytes() {
+fn content_hash_is_xxh3_of_raw_bytes() {
     let bytes = write_simple(&[], &[1, 2, 3], &[], &[]);
-    let expected = blake3::hash(&bytes);
-    assert_eq!(content_hash(&bytes).0, *expected.as_bytes());
+    assert_eq!(content_hash(&bytes).0, distill_core::hash::hash(&bytes));
 }
 
 // --- roundtrips --------------------------------------------------------------
@@ -93,8 +97,8 @@ fn roundtrip_sections_and_header() {
     assert_eq!(view.authored_type, TypeUuid([0x22; 16]));
     assert_eq!(view.terminal_type, TypeUuid([0x33; 16]));
     assert_eq!(view.encoded_type, TypeUuid([0x44; 16]));
-    assert_eq!(view.logical_hash, LogicalHash([0x55; 32]));
-    assert_eq!(view.layout_hash, LayoutHash([0x66; 32]));
+    assert_eq!(view.logical_hash, LogicalHash([0x55; 16]));
+    assert_eq!(view.layout_hash, LayoutHash([0x66; 16]));
     // Sorted lexicographically by the writer.
     assert_eq!(view.load_deps, vec![AssetUuid([3; 16]), AssetUuid([9; 16])]);
     assert_eq!(view.fixed, &fixed);
@@ -132,7 +136,7 @@ fn split_transport_reconstructs_metadata_and_complete_content_identity() {
 #[test]
 fn header_layout_hash_reads_the_header_alone() {
     let bytes = write_simple(&[AssetUuid([9; 16])], &[1, 2, 3, 4], &[5, 6], &[]);
-    let header_len = 8 + 4 + 4 * 16 + 32 + 32;
+    let header_len = 12 + 4 * 16 + 16 + 16;
     assert_eq!(
         artifact_header_layout_hash(&bytes).unwrap(),
         header().layout_hash
@@ -149,7 +153,7 @@ fn header_layout_hash_reads_the_header_alone() {
     bad[0] ^= 1;
     assert!(matches!(
         artifact_header_layout_hash(&bad),
-        Err(ArtifactError::BadMagic)
+        Err(ArtifactError::Header(HeaderError::BadMagic { .. }))
     ));
 }
 
@@ -226,7 +230,7 @@ fn empty_artifact_roundtrips() {
     assert!(view.fixed.is_empty());
     assert!(view.variable.is_empty());
     assert_eq!(view.blob_table.len(), 0);
-    assert_eq!(bytes.len(), 160); // header only, no padding needed
+    assert_eq!(bytes.len(), 128); // header only, no padding needed
 }
 
 // --- blob table: structural-path order, offsets, gaps ------------------------
@@ -293,7 +297,7 @@ fn blob_offsets_are_ascending_16_aligned_with_alignment_gaps_only() {
     let view = parse_artifact(&bytes).expect("parse");
     assert_eq!(view.blob_table, vec![(0, 5), (16, 16), (32, 1)]);
     // File ends exactly at the last blob's end.
-    assert_eq!(bytes.len() as u64, 160 + 3 * 16 + 32 + 1);
+    assert_eq!(bytes.len() as u64, 128 + 3 * 16 + 32 + 1);
 }
 
 #[test]
@@ -316,7 +320,7 @@ fn rejects_bad_magic() {
     bytes[0] = 0x88;
     assert!(matches!(
         parse_artifact(&bytes),
-        Err(ArtifactError::BadMagic)
+        Err(ArtifactError::Header(HeaderError::BadMagic { .. }))
     ));
 }
 
@@ -326,7 +330,11 @@ fn rejects_unsupported_version() {
     bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
     assert!(matches!(
         parse_artifact(&bytes),
-        Err(ArtifactError::UnsupportedVersion { got: 2 })
+        Err(ArtifactError::Header(HeaderError::UnsupportedVersion {
+            domain: Domain::ArtifactImage,
+            expected: 1,
+            found: 2,
+        }))
     ));
 }
 
@@ -362,8 +370,8 @@ fn rejects_trailing_bytes() {
 fn rejects_unsorted_load_deps() {
     let bytes = write_simple(&[AssetUuid([1; 16]), AssetUuid([2; 16])], &[], &[], &[]);
     let mut swapped = bytes.clone();
-    // deps live at 160..192; swap the two entries
-    let (a, b) = (160, 176);
+    // deps live at 128..160; swap the two entries
+    let (a, b) = (128, 144);
     for i in 0..16 {
         swapped.swap(a + i, b + i);
     }
@@ -377,7 +385,7 @@ fn rejects_unsorted_load_deps() {
 fn rejects_duplicate_load_deps() {
     let bytes = write_simple(&[AssetUuid([1; 16]), AssetUuid([2; 16])], &[], &[], &[]);
     let mut dup = bytes.clone();
-    let (a, b) = (160, 176);
+    let (a, b) = (128, 144);
     for i in 0..16 {
         dup[b + i] = dup[a + i];
     }
@@ -390,8 +398,8 @@ fn rejects_duplicate_load_deps() {
 #[test]
 fn rejects_nonzero_padding_after_fixed() {
     let mut bytes = write_simple(&[], &[1, 2, 3], &[], &[]);
-    // fixed at 160..163, pad at 163..176
-    bytes[165] = 1;
+    // fixed at 128..131, pad at 131..144
+    bytes[133] = 1;
     assert!(matches!(
         parse_artifact(&bytes),
         Err(ArtifactError::NonzeroPadding { .. })
@@ -401,8 +409,8 @@ fn rejects_nonzero_padding_after_fixed() {
 #[test]
 fn rejects_nonzero_padding_after_variable() {
     let mut bytes = write_simple(&[], &[], &[1, 2, 3], &[]);
-    // variable at 160..163, pad at 163..176
-    bytes[175] = 7;
+    // variable at 128..131, pad at 131..144
+    bytes[143] = 7;
     assert!(matches!(
         parse_artifact(&bytes),
         Err(ArtifactError::NonzeroPadding { .. })
@@ -415,8 +423,8 @@ fn rejects_nonzero_blob_gap() {
     let b: &[u8] = &[0xB; 1];
     let blobs = vec![(vec![field("a")], a), (vec![field("b")], b)];
     let mut bytes = write_simple(&[], &[], &[], &blobs);
-    // blob section starts at 160 + 2*16 = 192; gap is 192+5 .. 192+16
-    bytes[192 + 9] = 0xFF;
+    // blob section starts at 128 + 2*16 = 160; gap is 160+5 .. 160+16
+    bytes[160 + 9] = 0xFF;
     assert!(matches!(
         parse_artifact(&bytes),
         Err(ArtifactError::NonzeroPadding { .. })
@@ -426,7 +434,7 @@ fn rejects_nonzero_blob_gap() {
 #[test]
 fn rejects_var_len_at_or_above_2_pow_32() {
     let mut bytes = write_simple(&[], &[], &[], &[]);
-    bytes[152..160].copy_from_slice(&(1u64 << 32).to_le_bytes());
+    bytes[120..128].copy_from_slice(&(1u64 << 32).to_le_bytes());
     assert!(matches!(
         parse_artifact(&bytes),
         Err(ArtifactError::VarLenTooLarge { .. })
@@ -436,26 +444,26 @@ fn rejects_var_len_at_or_above_2_pow_32() {
 #[test]
 fn rejects_huge_dep_count_without_overflow_panic() {
     let mut bytes = write_simple(&[], &[], &[], &[]);
-    bytes[140..144].copy_from_slice(&u32::MAX.to_le_bytes());
+    bytes[108..112].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(parse_artifact(&bytes).is_err());
 }
 
 #[test]
 fn rejects_huge_blob_count_without_overflow_panic() {
     let mut bytes = write_simple(&[], &[], &[], &[]);
-    bytes[144..148].copy_from_slice(&u32::MAX.to_le_bytes());
+    bytes[112..116].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(parse_artifact(&bytes).is_err());
 }
 
 fn patch_blob_table(bytes: &mut [u8], entry: usize, offset: u64, len: u64) {
-    let base = 160 + entry * 16;
+    let base = 128 + entry * 16;
     bytes[base..base + 8].copy_from_slice(&offset.to_le_bytes());
     bytes[base + 8..base + 16].copy_from_slice(&len.to_le_bytes());
 }
 
 #[test]
 fn rejects_blob_table_first_offset_nonzero() {
-    // One blob of len 16: table (0,16), section 16 bytes at 192.
+    // One blob of len 16: table (0,16), section 16 bytes at 160.
     let b: &[u8] = &[0xB; 16];
     let mut bytes = write_simple(&[], &[], &[], &[(vec![field("a")], b)]);
     patch_blob_table(&mut bytes, 0, 16, 16);

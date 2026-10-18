@@ -1,4 +1,5 @@
-use distill_core::canonical::{CanonicalEncoder, DSPP};
+use distill_core::encoding::Encoder;
+use distill_core::hash::{digest_prefix, Domain};
 use distill_store::state::{
     CleanupDisposition, PipelineFailure, PipelineFailureCode, PipelineFailureDecodeError,
     PipelineFailureOrigin,
@@ -45,15 +46,14 @@ fn identity_pins_dspp_v1_and_excludes_message() {
     .unwrap();
     assert_eq!(first.identity, second.identity);
 
-    let mut expected = CanonicalEncoder::new();
-    expected.raw(&DSPP);
-    expected.u8(1);
-    expected.u16(2);
-    expected.u16(1);
-    expected.u16(1);
+    let mut expected = Encoder::new();
+    expected.raw(&digest_prefix(Domain::PipelineFailure, 1));
+    expected.enum_variant(2);
+    expected.enum_variant(1);
+    expected.enum_variant(1);
     assert_eq!(
         first.identity,
-        *blake3::hash(&expected.into_bytes()).as_bytes()
+        distill_core::hash::hash(&expected.into_bytes())
     );
 }
 
@@ -132,15 +132,15 @@ fn closed_matrix_accepts_each_cleanup_class_and_rejects_cross_origin_rows() {
 #[test]
 fn wire_decoder_rejects_unknown_tags_and_identity_mismatch() {
     assert_eq!(
-        PipelineFailure::from_wire(99, 1, 0, [0; 32], "unknown").unwrap_err(),
+        PipelineFailure::from_wire(99, 1, 0, [0; 16], "unknown").unwrap_err(),
         PipelineFailureDecodeError::UnknownCode(99)
     );
     assert_eq!(
-        PipelineFailure::from_wire(1, 99, 0, [0; 32], "unknown").unwrap_err(),
+        PipelineFailure::from_wire(1, 99, 0, [0; 16], "unknown").unwrap_err(),
         PipelineFailureDecodeError::UnknownOrigin(99)
     );
     assert_eq!(
-        PipelineFailure::from_wire(1, 1, 99, [0; 32], "unknown").unwrap_err(),
+        PipelineFailure::from_wire(1, 1, 99, [0; 16], "unknown").unwrap_err(),
         PipelineFailureDecodeError::UnknownCleanup(99)
     );
     let failure = PipelineFailure::new(
@@ -151,7 +151,7 @@ fn wire_decoder_rejects_unknown_tags_and_identity_mismatch() {
     )
     .unwrap();
     assert_eq!(
-        PipelineFailure::from_wire(1, 1, 0, [7; 32], failure.message).unwrap_err(),
+        PipelineFailure::from_wire(1, 1, 0, [7; 16], failure.message).unwrap_err(),
         PipelineFailureDecodeError::IdentityMismatch
     );
 }

@@ -92,7 +92,7 @@ pub struct AssetRecord {
     pub terminal_type: Option<TypeUuid>,
     /// The entry's authoring content key (§17 "Content keys"); `None` where
     /// `terminal_type` is.
-    pub content: Option<[u8; 32]>,
+    pub content: Option<[u8; 16]>,
 }
 
 /// The fully validated, complete namespace skeleton a malformed file's
@@ -143,14 +143,14 @@ pub struct EntryMeta {
 pub struct TagIndexUpdate {
     pub asset: AssetUuid,
     pub tags: BTreeMap<String, Option<String>>,
-    pub dylib_hash: Option<[u8; 32]>,
+    pub dylib_hash: Option<[u8; 16]>,
     pub poison: Option<String>,
 }
 
 /// An asset's tag state (its `tag_module` and `tag_poison`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagIndexState {
-    pub dylib_hash: Option<[u8; 32]>,
+    pub dylib_hash: Option<[u8; 16]>,
     pub poison: Option<String>,
 }
 
@@ -596,7 +596,7 @@ impl Store {
     /// the authored types plus the assets of the changed ones.
     pub fn replace_tag_epochs(
         &mut self,
-        epochs: &BTreeMap<TypeUuid, [u8; 32]>,
+        epochs: &BTreeMap<TypeUuid, [u8; 16]>,
     ) -> Result<BTreeSet<TypeUuid>, StoreError> {
         let changed = self.tag_epoch_changes(epochs)?;
         if changed.is_empty() {
@@ -632,7 +632,7 @@ impl StoreReader {
             .prepare_cached("SELECT tag_module, tag_poison FROM assets WHERE asset_uuid = ?1")?
             .query_row([asset.0.as_slice()], |row| {
                 Ok(TagIndexState {
-                    dylib_hash: row.get::<_, Option<Vec<u8>>>(0)?.map(blob32),
+                    dylib_hash: row.get::<_, Option<Vec<u8>>>(0)?.map(blob16),
                     poison: row.get(1)?,
                 })
             })
@@ -836,7 +836,7 @@ impl StoreReader {
     /// is one search of its index, so this costs the rows it returns.
     pub fn stale_tag_index_assets(
         &self,
-        dylib_hash: Option<[u8; 32]>,
+        dylib_hash: Option<[u8; 16]>,
     ) -> Result<BTreeMap<AssetUuid, BundleUuid>, StoreError> {
         // No module: every migrated row is stale, and every blob sorts
         // after the empty one.
@@ -864,7 +864,7 @@ impl StoreReader {
     /// `tag_epochs`, whose size is the number of authored types.
     pub fn tag_epoch_changes(
         &self,
-        epochs: &BTreeMap<TypeUuid, [u8; 32]>,
+        epochs: &BTreeMap<TypeUuid, [u8; 16]>,
     ) -> Result<BTreeSet<TypeUuid>, StoreError> {
         let mut statement = self
             .conn
@@ -873,7 +873,7 @@ impl StoreReader {
             .query_map([], |row| {
                 Ok((
                     TypeUuid(blob16(row.get::<_, Vec<u8>>(0)?)),
-                    blob32(row.get::<_, Vec<u8>>(1)?),
+                    blob16(row.get::<_, Vec<u8>>(1)?),
                 ))
             })?
             .collect::<Result<BTreeMap<_, _>, _>>()?;
@@ -1071,7 +1071,7 @@ impl StoreReader {
                 bundle,
                 local_id,
                 type_uuid,
-                logical_hash: LogicalHash(blob32(logical_hash)),
+                logical_hash: LogicalHash(blob16(logical_hash)),
                 authoring_only,
                 tags,
             },
@@ -1135,7 +1135,7 @@ fn bundle_meta_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BundleMeta> {
         root: RootId(row.get(1)?),
         path: row.get(2)?,
         format_version: row.get(3)?,
-        content_hash: ContentHash(blob32(row.get(4)?)),
+        content_hash: ContentHash(blob16(row.get(4)?)),
         origin,
         import_watched: row.get(9)?,
     })
@@ -1544,12 +1544,6 @@ pub struct MatchedAsset {
 
 pub(crate) fn blob16(bytes: Vec<u8>) -> [u8; 16] {
     let mut out = [0u8; 16];
-    out.copy_from_slice(&bytes);
-    out
-}
-
-pub(crate) fn blob32(bytes: Vec<u8>) -> [u8; 32] {
-    let mut out = [0u8; 32];
     out.copy_from_slice(&bytes);
     out
 }

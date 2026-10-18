@@ -122,7 +122,7 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
     .unwrap();
 
     let schema = fixture_schema(source_identity);
-    let authority = ProjectSchemaAuthority::from_schema(schema.clone(), [0x51; 32]).unwrap();
+    let authority = ProjectSchemaAuthority::from_schema(schema.clone(), [0x51; 16]).unwrap();
     for descriptor in [
         TextureAsset::descriptor(),
         MeshTerminal::descriptor(),
@@ -418,7 +418,7 @@ fn assert_loaded_game_assets(
 
 fn register_runtime<I: distill_loader::LoaderIO>(
     loader: &mut Loader<I>,
-    target_hash: [u8; 32],
+    target_hash: [u8; 16],
     epoch: u64,
 ) {
     loader
@@ -1035,7 +1035,7 @@ fn rpc_io_authoring_writes_watches_and_renames_through_a_live_daemon() {
     .unwrap();
     std::fs::write(assets.join("shaders/common.inc"), b"const uint VALUE = 1;\n").unwrap();
     let schema = fixture_schema(source_identity);
-    let authority = ProjectSchemaAuthority::from_schema(schema.clone(), [0x51; 32]).unwrap();
+    let authority = ProjectSchemaAuthority::from_schema(schema.clone(), [0x51; 16]).unwrap();
     std::fs::write(temp.path().join("schema.json"), serde_json::to_vec(&schema).unwrap()).unwrap();
     let config = write_config(&temp, &module, authority.identity());
     let process = DaemonProcess::start(config.clone()).unwrap();

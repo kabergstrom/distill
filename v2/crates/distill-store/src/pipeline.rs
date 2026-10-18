@@ -36,7 +36,7 @@ pub enum ResolvedToolSourceV2 {
     Ambient {
         launcher: String,
         toolchain_id: String,
-        trusted_fingerprint: Option<[u8; 32]>,
+        trusted_fingerprint: Option<[u8; 16]>,
     },
 }
 
@@ -54,7 +54,7 @@ pub struct RegisteredTool {
     pub key: String,
     pub root: Option<PathBuf>,
     pub identity: ToolExecutionIdentityV2,
-    pub tool_hash: [u8; 32],
+    pub tool_hash: [u8; 16],
     pub input_version: InputVersion,
 }
 
@@ -95,7 +95,7 @@ impl ToolRegistrationV2 {
                         path: file.path.clone(),
                         executable: file.executable,
                         len: file.bytes.len() as u64,
-                        bytes_hash: *blake3::hash(&file.bytes).as_bytes(),
+                        bytes_hash: distill_core::hash::hash(&file.bytes),
                     })
                     .collect();
                 (
@@ -131,7 +131,7 @@ impl ToolRegistrationV2 {
     }
 }
 
-fn hex_hash(hash: &[u8; 32]) -> String {
+fn hex_hash(hash: &[u8; 16]) -> String {
     hash.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -356,7 +356,7 @@ fn verify_package_file(
         path: path.to_path_buf(),
         detail: "staged package member is unreadable",
     })?;
-    if blake3::hash(&bytes).as_bytes() != &expected.bytes_hash {
+    if distill_core::hash::hash(&bytes) != expected.bytes_hash {
         return Err(StoreError::ToolUnavailable {
             key: key.to_owned(),
             path: path.to_path_buf(),
@@ -564,7 +564,7 @@ impl InputTxn<'_> {
                    identity_object = X'',
                    tool_hash = excluded.tool_hash",
                 )?
-                .execute(rusqlite::params![removed, [0_u8; 32].as_slice(), self.version().0 as i64,])?;
+                .execute(rusqlite::params![removed, [0_u8; 16].as_slice(), self.version().0 as i64,])?;
         }
         Ok(staged)
     }
@@ -612,7 +612,7 @@ impl StoreReader {
     pub fn tool_hashes_at(
         &self,
         basis: InputVersion,
-    ) -> Result<BTreeMap<String, [u8; 32]>, StoreError> {
+    ) -> Result<BTreeMap<String, [u8; 16]>, StoreError> {
         let mut statement = self.conn.prepare(
             "SELECT candidate.tool_key, candidate.tool_hash
                FROM tools AS candidate
@@ -674,7 +674,7 @@ impl StoreReader {
         }
         let identity = ToolExecutionIdentityV2::decode_record(&record)
             .map_err(StoreError::InvalidToolIdentity)?;
-        let tool_hash: [u8; 32] = hash.try_into().map_err(|_| {
+        let tool_hash: [u8; 16] = hash.try_into().map_err(|_| {
             StoreError::InvalidToolIdentity(distill_core::tool::ToolIdentityError::Truncated)
         })?;
         if identity.digest().map_err(StoreError::InvalidToolIdentity)? != tool_hash {

@@ -47,7 +47,7 @@ fn registry() -> PipelineRegistry {
             TA,
             any(),
             OutputDecls::new(TERM_A, vec![("meta".to_owned(), EXTRA_A)]).unwrap(),
-            [1; 32],
+            [1; 16],
         )
         .unwrap(),
         ProcessorRegistration::new(
@@ -56,7 +56,7 @@ fn registry() -> PipelineRegistry {
             TC,
             any(),
             OutputDecls::new(TB, Vec::<(String, TypeUuid)>::new()).unwrap(),
-            [1; 32],
+            [1; 16],
         )
         .unwrap(),
         ProcessorRegistration::new(
@@ -65,7 +65,7 @@ fn registry() -> PipelineRegistry {
             TD,
             TargetSelector::new(Some(BTreeSet::from([TargetOs::Windows])), None).unwrap(),
             OutputDecls::new(TB, Vec::<(String, TypeUuid)>::new()).unwrap(),
-            [1; 32],
+            [1; 16],
         )
         .unwrap(),
     ])
@@ -86,7 +86,7 @@ fn target() -> Target {
 
 fn current_load() -> CurrentLoadSource {
     CurrentLoadSource {
-        capabilities: vec![(CapabilityKey::DefaultTable(TA), [9; 32])],
+        capabilities: vec![(CapabilityKey::DefaultTable(TA), [9; 16])],
     }
 }
 
@@ -176,7 +176,7 @@ fn put_bundle(
         root: RootId(root),
         path: path.to_owned(),
         format_version: 1,
-        content_hash: ContentHash([hash; 32]),
+        content_hash: ContentHash([hash; 16]),
         origin: None,
         import_watched: false,
     })
@@ -196,7 +196,7 @@ fn put_asset(
         bundle: owner,
         local_id: local_id.to_owned(),
         type_uuid,
-        logical_hash: LogicalHash([7; 32]),
+        logical_hash: LogicalHash([7; 16]),
         authoring_only,
         tags: tags
             .iter()
@@ -336,8 +336,8 @@ fn memo() -> BTreeMap<AssetUuid, NodeResult> {
             NodeResult {
                 trace: Vec::new(),
                 outputs: BTreeMap::from([
-                    (String::new(), ContentHash([0x11; 32])),
-                    ("meta".to_owned(), ContentHash([0x12; 32])),
+                    (String::new(), ContentHash([0x11; 16])),
+                    ("meta".to_owned(), ContentHash([0x12; 16])),
                 ]),
             },
         ),
@@ -345,7 +345,7 @@ fn memo() -> BTreeMap<AssetUuid, NodeResult> {
             asset(5),
             NodeResult {
                 trace: Vec::new(),
-                outputs: BTreeMap::from([(String::new(), ContentHash([0x15; 32]))]),
+                outputs: BTreeMap::from([(String::new(), ContentHash([0x15; 16]))]),
             },
         ),
     ])
@@ -797,7 +797,7 @@ fn a_poisoned_bundle_fails_only_the_questions_that_reach_it() {
                 root: RootId(1),
                 path: "broken.bundle".to_owned(),
                 format_version: 1,
-                content_hash: ContentHash([7; 32]),
+                content_hash: ContentHash([7; 16]),
                 entries: vec![SkeletonEntry {
                     asset: asset(70),
                     local_id: "one".to_owned(),
@@ -831,7 +831,7 @@ fn a_poisoned_bundle_fails_only_the_questions_that_reach_it() {
     let source = lazy(&view, &registry, &target, tools_at, &load, &memo);
     assert_eq!(
         source.authoring_read(asset(1)),
-        Observed::Ok(Some(BundleFileHash([1; 32])))
+        Observed::Ok(Some(BundleFileHash([1; 16])))
     );
     assert_eq!(
         source.query(&AssetQuery {

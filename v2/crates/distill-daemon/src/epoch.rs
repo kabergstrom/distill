@@ -603,7 +603,7 @@ pub struct CandidateRequirements {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagedModule {
     pub path: PathBuf,
-    pub content_hash: [u8; 32],
+    pub content_hash: [u8; 16],
 }
 
 fn boundary_panic(operation: &str) -> ModuleCallError {
@@ -738,7 +738,7 @@ impl PipelineEpoch {
         self.0.id
     }
 
-    pub fn dylib_hash(&self) -> [u8; 32] {
+    pub fn dylib_hash(&self) -> [u8; 16] {
         self.0.staged.content_hash
     }
 
@@ -2117,7 +2117,7 @@ impl LoadedPipelineModule for TestNoopModule {
 #[cfg(test)]
 pub(crate) fn processor_test_epoch<P: crate::callbacks::PipelineProcessor>(
     target: &str,
-    target_definition_hash: [u8; 32],
+    target_definition_hash: [u8; 16],
     descriptor: crate::callbacks::ProcessorDescriptor,
     processor: P,
 ) -> PipelineEpoch {
@@ -2133,7 +2133,7 @@ pub(crate) fn processor_test_epoch<P: crate::callbacks::PipelineProcessor>(
 #[cfg(test)]
 pub(crate) fn empty_test_epoch() -> PipelineEpoch {
     let target = "test".to_owned();
-    let target_definition_hash = [7; 32];
+    let target_definition_hash = [7; 16];
     let token = ModuleEpochToken::new(9001);
     let arena = CandidateRegistrationArena::new(token.clone());
     let target_set = CanonicalTargetSet::canonical(vec![TargetSetRow {
@@ -2145,7 +2145,7 @@ pub(crate) fn empty_test_epoch() -> PipelineEpoch {
         9001,
         StagedModule {
             path: PathBuf::from("pipeline-empty-test"),
-            content_hash: [7; 32],
+            content_hash: [7; 16],
         },
         token,
         PreparedEpochRegistration {
@@ -2167,13 +2167,13 @@ pub(crate) fn processor_test_epoch_with<
     F: FnOnce(&mut CandidateRegistrationArena),
 >(
     target: &str,
-    target_definition_hash: [u8; 32],
+    target_definition_hash: [u8; 16],
     descriptor: crate::callbacks::ProcessorDescriptor,
     processor: P,
     configure: F,
 ) -> PipelineEpoch {
     processor_test_epoch_with_dylib(
-        [9; 32],
+        [9; 16],
         target,
         target_definition_hash,
         descriptor,
@@ -2188,9 +2188,9 @@ pub(crate) fn processor_test_epoch_with_dylib<
     P: crate::callbacks::PipelineProcessor,
     F: FnOnce(&mut CandidateRegistrationArena),
 >(
-    dylib_hash: [u8; 32],
+    dylib_hash: [u8; 16],
     target: &str,
-    target_definition_hash: [u8; 32],
+    target_definition_hash: [u8; 16],
     descriptor: crate::callbacks::ProcessorDescriptor,
     processor: P,
     configure: F,
@@ -2265,14 +2265,14 @@ mod lifecycle_tests {
         let token = ModuleEpochToken::new(9100);
         let target_set = CanonicalTargetSet::canonical(vec![TargetSetRow {
             name: "test".to_owned(),
-            target_definition_hash: [1; 32],
+            target_definition_hash: [1; 16],
         }])
         .unwrap();
         let epoch = PipelineEpoch::new(
             9100,
             StagedModule {
                 path: PathBuf::from("pipeline-failing-unload-test"),
-                content_hash: [1; 32],
+                content_hash: [1; 16],
             },
             token.clone(),
             PreparedEpochRegistration {
@@ -2355,14 +2355,14 @@ mod callback_tests {
         let registration = arena.registration_set(BTreeSet::from(["desktop".to_owned()]));
         let target_set = CanonicalTargetSet::canonical(vec![TargetSetRow {
             name: "desktop".to_owned(),
-            target_definition_hash: [1; 32],
+            target_definition_hash: [1; 16],
         }])
         .unwrap();
         PipelineEpoch::new(
             9003,
             StagedModule {
                 path: PathBuf::from("pipeline-test"),
-                content_hash: [9; 32],
+                content_hash: [9; 16],
             },
             token,
             PreparedEpochRegistration {
@@ -2410,7 +2410,7 @@ mod callback_tests {
             unreachable!()
         }
 
-        fn importer_capability(&mut self, _id: &str) -> Result<[u8; 32], ImportError> {
+        fn importer_capability(&mut self, _id: &str) -> Result<[u8; 16], ImportError> {
             unreachable!()
         }
     }
@@ -2447,7 +2447,7 @@ mod callback_tests {
             unreachable!()
         }
 
-        fn importer_capability(&mut self, _id: &str) -> Result<[u8; 32], ImportError> {
+        fn importer_capability(&mut self, _id: &str) -> Result<[u8; 16], ImportError> {
             unreachable!()
         }
     }
@@ -2532,7 +2532,7 @@ mod callback_tests {
     fn processor_output_shape_failures_remain_typed_at_the_epoch_boundary() {
         let epoch = processor_test_epoch(
             "desktop",
-            [1; 32],
+            [1; 16],
             ProcessorDescriptor {
                 id: "broken".into(),
                 version: 1,
@@ -2720,8 +2720,8 @@ mod callback_tests {
             .register_migration(
                 crate::callbacks::MigrationKey {
                     type_uuid: TypeUuid([2; 16]),
-                    from: distill_core::id::LogicalHash([3; 32]),
-                    to: distill_core::id::LogicalHash([4; 32]),
+                    from: distill_core::id::LogicalHash([3; 16]),
+                    to: distill_core::id::LogicalHash([4; 16]),
                 },
                 |value| -> Result<_, MigrationFunctionError> { Ok(value) },
             )
@@ -2766,16 +2766,16 @@ mod callback_tests {
             .unwrap();
 
         let complete_registry = BTreeMap::from([
-            (TypeUuid([1; 16]), distill_core::id::LogicalHash([1; 32])),
-            (TypeUuid([2; 16]), distill_core::id::LogicalHash([2; 32])),
-            (TypeUuid([3; 16]), distill_core::id::LogicalHash([3; 32])),
+            (TypeUuid([1; 16]), distill_core::id::LogicalHash([1; 16])),
+            (TypeUuid([2; 16]), distill_core::id::LogicalHash([2; 16])),
+            (TypeUuid([3; 16]), distill_core::id::LogicalHash([3; 16])),
         ]);
         validate_registered_schema_types(&arena, &complete_registry).unwrap();
         let error = validate_registered_schema_types(
             &arena,
             &BTreeMap::from([
-                (TypeUuid([1; 16]), distill_core::id::LogicalHash([1; 32])),
-                (TypeUuid([2; 16]), distill_core::id::LogicalHash([2; 32])),
+                (TypeUuid([1; 16]), distill_core::id::LogicalHash([1; 16])),
+                (TypeUuid([2; 16]), distill_core::id::LogicalHash([2; 16])),
             ]),
         )
         .unwrap_err();
@@ -2785,14 +2785,14 @@ mod callback_tests {
         let registration = arena.registration_set(BTreeSet::from(["desktop".into()]));
         let target_set = CanonicalTargetSet::canonical(vec![TargetSetRow {
             name: "desktop".into(),
-            target_definition_hash: [1; 32],
+            target_definition_hash: [1; 16],
         }])
         .unwrap();
         let mut epoch = PipelineEpoch::new(
             91,
             StagedModule {
                 path: PathBuf::from("pipeline-test"),
-                content_hash: [9; 32],
+                content_hash: [9; 16],
             },
             token,
             PreparedEpochRegistration {
@@ -2836,8 +2836,8 @@ mod callback_tests {
                 .invoke_migration(
                     &crate::callbacks::MigrationKey {
                         type_uuid: TypeUuid([2; 16]),
-                        from: distill_core::id::LogicalHash([3; 32]),
-                        to: distill_core::id::LogicalHash([4; 32]),
+                        from: distill_core::id::LogicalHash([3; 16]),
+                        to: distill_core::id::LogicalHash([4; 16]),
                     }
                     .id(),
                     Value::U32(13),
@@ -2891,7 +2891,7 @@ mod callback_tests {
     fn authored_types_need_a_distinct_extension_and_an_authorable_local_id() {
         let descriptor = |uuid: u8, extension: &str, local_id: &str| crate::callbacks::AuthoredDescriptor {
             type_uuid: TypeUuid([uuid; 16]),
-            logical_hash: distill_core::id::LogicalHash([0; 32]),
+            logical_hash: distill_core::id::LogicalHash([0; 16]),
             extension: extension.into(),
             local_id: local_id.into(),
             doc: String::new(),

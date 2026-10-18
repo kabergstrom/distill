@@ -31,7 +31,7 @@ pub struct DirectoryOrigin {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FileContentObservation {
     pub path: RootedPath,
-    pub hash: [u8; 32],
+    pub hash: [u8; 16],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -46,11 +46,11 @@ pub enum FileDep {
     },
     Listing {
         query: FileQuery,
-        observed: Observed<[u8; 32]>,
+        observed: Observed<[u8; 16]>,
     },
     Capability {
         key: CapabilityKey,
-        observed: Observed<[u8; 32]>,
+        observed: Observed<[u8; 16]>,
     },
 }
 
@@ -62,19 +62,19 @@ pub trait ImportBackend {
     fn read_hashed(
         &mut self,
         path: &str,
-    ) -> Result<(RootedPath, Vec<u8>, [u8; 32]), RawFileFailureClass> {
+    ) -> Result<(RootedPath, Vec<u8>, [u8; 16]), RawFileFailureClass> {
         let (path, bytes) = self.read(path)?;
-        let hash = *blake3::hash(&bytes).as_bytes();
+        let hash = distill_core::hash::hash(&bytes);
         Ok((path, bytes, hash))
     }
     /// The hash `read_hashed` answers, without the bytes: what a read-set
     /// revalidation compares.
-    fn read_hash(&mut self, path: &str) -> Result<(RootedPath, [u8; 32]), RawFileFailureClass> {
+    fn read_hash(&mut self, path: &str) -> Result<(RootedPath, [u8; 16]), RawFileFailureClass> {
         self.read_hashed(path).map(|(path, _, hash)| (path, hash))
     }
     fn probe(&mut self, path: &str) -> Result<Option<RootName>, RawFileFailureClass>;
     fn enumerate(&mut self, query: &FileQuery) -> Result<Vec<RootedPath>, RawFileFailureClass>;
-    fn capability(&mut self, key: &CapabilityKey) -> Option<[u8; 32]>;
+    fn capability(&mut self, key: &CapabilityKey) -> Option<[u8; 16]>;
 }
 
 pub struct ImportContext<'a, B: ImportBackend + ?Sized> {
@@ -190,7 +190,7 @@ impl<'a, B: ImportBackend + ?Sized> ImportContext<'a, B> {
         }
     }
 
-    pub fn importer_capability(&mut self, id: &str) -> Result<[u8; 32], ImportError> {
+    pub fn importer_capability(&mut self, id: &str) -> Result<[u8; 16], ImportError> {
         let id = normalize_identifier(id).map_err(|error| self.intake_failure(error))?;
         let key = CapabilityKey::Importer(id);
         match self.backend.capability(&key) {

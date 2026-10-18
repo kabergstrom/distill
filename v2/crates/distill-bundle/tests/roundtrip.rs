@@ -1,12 +1,12 @@
 //! §6 happy paths: byte-identical roundtrips for both encodings,
 //! deterministic blob layout by canonical structural path, and the pinned
-//! path/CRC encodings.
+//! path encodings.
 
 mod common;
 
 use common::*;
 use distill_bundle::{
-    crc32c, encode_path, parse_bundle, write_bundle, PathComponent as P, CONTAINER_MAGIC,
+    encode_path, parse_bundle, write_bundle, PathComponent as P,
 };
 use ngp_schema::{PrimitiveKind as PK, SchemaNode as N};
 
@@ -112,7 +112,7 @@ fn container_roundtrip_with_blobs_byte_identical() {
     let b = bundle(&[&sc], vec![("x", entry(UUID_A, &sc, data))], None);
 
     let bytes = write_bundle(&b).unwrap();
-    assert_eq!(&bytes[..8], &CONTAINER_MAGIC, "blobs => container");
+    assert_eq!(&bytes[..12], &distill_core::header::header(distill_core::hash::Domain::Bundle, distill_bundle::CONTAINER_VERSION), "blobs => container");
 
     let p = parse_bundle(&bytes).unwrap();
     assert_eq!(p, b, "blob bytes survive the roundtrip");
@@ -401,7 +401,7 @@ fn option_none_walks_nothing_option_some_walks_inner() {
         None,
     );
     let bytes = write_bundle(&b_some).unwrap();
-    assert_eq!(&bytes[..8], &CONTAINER_MAGIC);
+    assert_eq!(&bytes[..12], &distill_core::header::header(distill_core::hash::Domain::Bundle, distill_bundle::CONTAINER_VERSION));
     assert_eq!(parse_bundle(&bytes).unwrap(), b_some);
     assert_eq!(write_bundle(&parse_bundle(&bytes).unwrap()).unwrap(), bytes);
 }
@@ -505,11 +505,6 @@ fn container_with_zero_blobs_parses_but_writer_picks_plain() {
         plain,
         "the writer never produces a zero-blob container"
     );
-}
-
-#[test]
-fn crc32c_check_vector() {
-    assert_eq!(crc32c(b"123456789"), 0xE306_9283);
 }
 
 #[test]

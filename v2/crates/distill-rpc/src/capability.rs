@@ -622,7 +622,7 @@ impl<'s> BundleReads<'s> {
             .authoring_backend()
             .read_file(self.snapshot, &root, &bundle.path);
         let bytes = match read {
-            Ok(bytes) if ContentHash(*blake3::hash(&bytes).as_bytes()) == bundle.content_hash => bytes,
+            Ok(bytes) if ContentHash(distill_core::hash::hash(&bytes)) == bundle.content_hash => bytes,
             _ => return Ok(Err(DriftedInput::File(bundle.path))),
         };
         let origin = bundle_origin(self.snapshot, bundle_uuid)
@@ -948,7 +948,7 @@ impl TypeFiles<'_> {
             return Ok(None);
         };
         match self.server.inner.handle.authoring_backend().read_file(self.snapshot, root, path) {
-            Ok(bytes) if ContentHash(*blake3::hash(&bytes).as_bytes()) == hash => Ok(Some((hash, bytes))),
+            Ok(bytes) if ContentHash(distill_core::hash::hash(&bytes)) == hash => Ok(Some((hash, bytes))),
             _ => Err(TypeFileError::Drifted(path.to_owned())),
         }
     }
@@ -2974,7 +2974,7 @@ mod query_tests {
 
     use super::*;
 
-    const SCHEMA: LogicalHash = LogicalHash([0x5c; 32]);
+    const SCHEMA: LogicalHash = LogicalHash([0x5c; 16]);
     const MESH: TypeUuid = TypeUuid([0x71; 16]);
     const TEXTURE: TypeUuid = TypeUuid([0x72; 16]);
     const GPU_MESH: TypeUuid = TypeUuid([0x73; 16]);
@@ -3023,7 +3023,7 @@ mod query_tests {
                         root,
                         path: path.clone(),
                         format_version: 1,
-                        content_hash: ContentHash([index as u8; 32]),
+                        content_hash: ContentHash([index as u8; 16]),
                         origin: None,
                         import_watched: false,
                     })?;
@@ -3061,7 +3061,7 @@ mod query_tests {
                         root,
                         path: "dir0".into(),
                         format_version: 1,
-                        content_hash: ContentHash([0xee; 32]),
+                        content_hash: ContentHash([0xee; 16]),
                         entries: Vec::new(),
                     },
                     "malformed",
@@ -3344,7 +3344,7 @@ mod query_tests {
                         root,
                         path: "dir0".into(),
                         format_version: 1,
-                        content_hash: ContentHash([0xee; 32]),
+                        content_hash: ContentHash([0xee; 16]),
                         entries: vec![distill_store::bundles::SkeletonEntry {
                             asset: AssetUuid(uuid(0x21, dir0)),
                             local_id: "main".into(),

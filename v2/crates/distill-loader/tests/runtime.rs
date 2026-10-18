@@ -6,7 +6,7 @@ use distill_loader::{
 
 fn basis(seed: u8) -> IoBasis {
     IoBasis::Pack {
-        manifest: ManifestHash([seed; 32]),
+        manifest: ManifestHash([seed; 16]),
     }
 }
 
@@ -91,7 +91,7 @@ fn successful_completion_is_consumed_exactly_once() {
         .issue(
             RequestOwner::Content {
                 asset: AssetUuid([2; 16]),
-                hash: ContentHash([1; 32]),
+                hash: ContentHash([1; 16]),
             },
             OutstandingPurpose::Fetch,
             basis(1),
@@ -109,7 +109,7 @@ fn successful_completion_is_consumed_exactly_once() {
 
 #[test]
 fn typed_deletion_and_return_preserve_client_relative_semantics() {
-    let hash = ContentHash([1; 32]);
+    let hash = ContentHash([1; 16]);
     let mut live = ManifestEntry {
         state: ManifestState::Current { content_hash: hash },
         adopted_at: AdoptionId(1),
@@ -132,7 +132,7 @@ fn typed_deletion_and_return_preserve_client_relative_semantics() {
 
 #[test]
 fn missing_after_daemon_state_loss_is_deleted_for_a_previously_resolved_handle() {
-    let hash = ContentHash([5; 32]);
+    let hash = ContentHash([5; 16]);
     let mut entry = ManifestEntry {
         state: ManifestState::Invalidated { last: hash },
         adopted_at: AdoptionId(9),

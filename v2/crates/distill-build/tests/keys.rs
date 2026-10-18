@@ -16,15 +16,15 @@ fn statics() -> StaticInputs {
     StaticInputs {
         asset: AssetUuid([1; 16]),
         stage: 2,
-        input_hash: ContentHash([3; 32]),
-        target_def_hash: [4; 32],
+        input_hash: ContentHash([3; 16]),
+        target_def_hash: [4; 16],
         processor_id: "proc".into(),
         processor_version: 5,
-        dylib_hash: [6; 32],
+        dylib_hash: [6; 16],
         output_hashes: vec![OutputHash {
             key: "".into(),
-            logical: LogicalHash([7; 32]),
-            layout: LayoutHash([8; 32]),
+            logical: LogicalHash([7; 16]),
+            layout: LayoutHash([8; 16]),
         }],
         artifact_format_version: 9,
     }
@@ -38,7 +38,7 @@ fn static_key_changes_for_every_static_determinant() {
     changed.stage += 1;
     assert_ne!(digest, static_inputs_digest(&changed));
     let mut changed = base.clone();
-    changed.output_hashes[0].layout = LayoutHash([0; 32]);
+    changed.output_hashes[0].layout = LayoutHash([0; 16]);
     assert_ne!(digest, static_inputs_digest(&changed));
     let mut changed = base.clone();
     changed.dylib_hash[0] ^= 1;
@@ -54,11 +54,11 @@ fn build_import_key_names_the_sibling_entry_and_bundle_bytes() {
         authored_type: TypeUuid([3; 16]),
         terminal_type: TypeUuid([4; 16]),
         canonical_bundle_bytes: b"bundle".to_vec(),
-        logical: LogicalHash([5; 32]),
-        layout: LayoutHash([6; 32]),
+        logical: LogicalHash([5; 16]),
+        layout: LayoutHash([6; 16]),
         migrations: vec![],
         automatic_migration: None,
-        validator_dylib_hash: Some([7; 32]),
+        validator_dylib_hash: Some([7; 16]),
         artifact_format_version: 1,
     };
     let mut sibling = base.clone();
@@ -68,13 +68,13 @@ fn build_import_key_names_the_sibling_entry_and_bundle_bytes() {
     edited.canonical_bundle_bytes.push(0);
     assert_ne!(build_import_digest(&base), build_import_digest(&edited));
     let mut validator = base.clone();
-    validator.validator_dylib_hash = Some([8; 32]);
+    validator.validator_dylib_hash = Some([8; 16]);
     assert_ne!(build_import_digest(&base), build_import_digest(&validator));
 
     let mut automatic = base.clone();
     automatic.automatic_migration = Some(AutomaticMigration {
-        from: LogicalHash([9; 32]),
-        to: LogicalHash([10; 32]),
+        from: LogicalHash([9; 16]),
+        to: LogicalHash([10; 16]),
         planner_version: 1,
         dylib_hash: None,
     });
@@ -192,11 +192,11 @@ fn node_inputs() -> distill_build::keys::NodeInputs {
         asset: AssetUuid([1; 16]),
         bundle: distill_core::id::BundleUuid([2; 16]),
         local_id: "entry".to_owned(),
-        bundle_hash: ContentHash([3; 32]),
+        bundle_hash: ContentHash([3; 16]),
         authored_type: TypeUuid([4; 16]),
-        authored_logical: LogicalHash([5; 32]),
-        target_def_hash: [6; 32],
-        dylib_hash: [7; 32],
+        authored_logical: LogicalHash([5; 16]),
+        target_def_hash: [6; 16],
+        dylib_hash: [7; 16],
         validated: false,
         terminal_type: TypeUuid([8; 16]),
         extras: vec![
@@ -212,14 +212,14 @@ fn node_inputs() -> distill_build::keys::NodeInputs {
         types: vec![
             NodeType {
                 type_uuid: TypeUuid([8; 16]),
-                logical: LogicalHash([11; 32]),
-                layout: LayoutHash([12; 32]),
+                logical: LogicalHash([11; 16]),
+                layout: LayoutHash([12; 16]),
                 build_only: false,
             },
             NodeType {
                 type_uuid: TypeUuid([4; 16]),
-                logical: LogicalHash([5; 32]),
-                layout: LayoutHash([13; 32]),
+                logical: LogicalHash([5; 16]),
+                layout: LayoutHash([13; 16]),
                 build_only: false,
             },
         ],
@@ -249,15 +249,15 @@ fn the_node_key_covers_static_inputs_only_and_ignores_declaration_order() {
     );
 
     let mut edited = inputs.clone();
-    edited.bundle_hash = ContentHash([99; 32]);
+    edited.bundle_hash = ContentHash([99; 16]);
     assert_ne!(node_digest(&edited), key);
 
     let mut rebuilt_pipeline = inputs.clone();
-    rebuilt_pipeline.dylib_hash = [99; 32];
+    rebuilt_pipeline.dylib_hash = [99; 16];
     assert_ne!(node_digest(&rebuilt_pipeline), key);
 
     let mut relaid = inputs.clone();
-    relaid.types[0].layout = LayoutHash([99; 32]);
+    relaid.types[0].layout = LayoutHash([99; 16]);
     assert_ne!(node_digest(&relaid), key);
 
     let mut build_only = inputs.clone();

@@ -94,7 +94,7 @@ pub enum StoreError {
         detail: String,
     },
     /// A read named a hash the extent index does not hold.
-    NotFound { hash: [u8; 32] },
+    NotFound { hash: [u8; 16] },
     /// A wire-tree body or stored DSWL preimage was malformed, noncanonical,
     /// or did not authenticate to the requested LayoutHash.
     InvalidWireTree { detail: String },
@@ -114,7 +114,7 @@ pub enum StoreError {
     /// A build-import result must carry exactly one output row (§13).
     BuildImportOutputArity { got: usize },
     /// A build commit names a wire tree the CAS does not hold.
-    MissingWireTree { hash: [u8; 32] },
+    MissingWireTree { hash: [u8; 16] },
     /// A malformed result payload (decode failure on lookup or rebuild).
     BadResultPayload { detail: String },
 }
@@ -233,7 +233,7 @@ impl fmt::Display for StoreError {
     }
 }
 
-fn hex(bytes: &[u8; 32]) -> String {
+fn hex(bytes: &[u8; 16]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
