@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 
 use ngp_schema::{blob_sites, encode_path, node_hash, write_value, SnapshotError, WriteOptions};
 
-use crate::crc32c::crc32c;
+use distill_core::crc32c::crc32c;
 use crate::envelope;
 use crate::error::BundleError;
 use crate::data::{display, map_error, text_depth, BlobSite, Blobs, LayoutSink, MAX_DATA_DEPTH};

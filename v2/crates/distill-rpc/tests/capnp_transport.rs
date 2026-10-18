@@ -481,7 +481,7 @@ impl BuildBackend for BlockingBuildBackend {
 #[test]
 fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
     // A Windows checkout may carry CRLF line ends.
-    let source = include_str!("../schema/distill_rpc.capnp").replace("\r\n", "\n");
+    let source = include_str!("../../distill-client/schema/distill_rpc.capnp").replace("\r\n", "\n");
     assert!(!source.contains("CallStatus"));
     assert!(!source.contains("AnyPointer"));
     assert!(!source.contains("-> (status"));
@@ -589,7 +589,7 @@ fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
 /// reconnect arm: success, expiry, error.
 #[test]
 fn schema_metadata_calls_have_no_reconnect_arm() {
-    let source = include_str!("../schema/distill_rpc.capnp").replace("\r\n", "\n");
+    let source = include_str!("../../distill-client/schema/distill_rpc.capnp").replace("\r\n", "\n");
     assert!(!source.contains("MetadataReconnect"));
     for name in [
         "MetadataSnapshotCall",
@@ -621,7 +621,7 @@ fn schema_metadata_calls_have_no_reconnect_arm() {
 /// reconnect is a pipeline change.
 #[test]
 fn schema_reconnect_reason_is_the_pipeline_epoch_alone() {
-    let source = include_str!("../schema/distill_rpc.capnp").replace("\r\n", "\n");
+    let source = include_str!("../../distill-client/schema/distill_rpc.capnp").replace("\r\n", "\n");
     assert!(
         source.contains("enum ReconnectReason {\n  pipelineEpochChanged @0;\n}\n"),
         "ReconnectReason has one arm"

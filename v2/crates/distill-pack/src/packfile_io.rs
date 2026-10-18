@@ -386,7 +386,7 @@ fn decode_fetched(
     let load_edges = row
         .load_deps
         .iter()
-        .map(|edge| distill_rpc::ServedLoadEdge {
+        .map(|edge| distill_protocol::ServedLoadEdge {
             asset: edge.asset_uuid,
             expected_terminal: edge.expected_terminal,
         })
@@ -529,11 +529,11 @@ impl LoaderIO for PackfileIO {
                 error: "pack remounted: stale manifest basis".into(),
             }
         } else if let Some(paths) = &self.manifest.paths {
-            let key = distill_build::query::normalize_path(&path.path).and_then(|normalized| {
+            let key = distill_core::path::normalize_path(&path.path).and_then(|normalized| {
                 let name = path
                     .name
                     .as_deref()
-                    .map(distill_build::query::normalize_identifier)
+                    .map(distill_core::path::normalize_identifier)
                     .transpose()?;
                 Ok((normalized, name))
             });

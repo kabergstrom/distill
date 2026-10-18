@@ -1,6 +1,6 @@
 //! IO-neutral sweep bases.
 
-use distill_store::state::SnapshotStamp;
+use distill_protocol::state::SnapshotStamp;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ManifestHash(pub [u8; 32]);

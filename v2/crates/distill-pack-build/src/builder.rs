@@ -24,9 +24,10 @@ use distill_rpc::{
 use distill_wire::artifact::{parse_artifact_parts, ArtifactError};
 use unicode_normalization::UnicodeNormalization;
 
-use crate::activation::{activate, publish_archive, publish_manifest, PointerError};
-use crate::archive::{encode_archive, ArchiveError, ArtifactPayload};
-use crate::manifest::{
+use crate::publish::{activate, publish_archive, publish_manifest};
+use distill_pack::PointerError;
+use distill_pack::archive::{encode_archive, ArchiveError, ArtifactPayload};
+use distill_pack::manifest::{
     canonicalize, encode_manifest, verify_expected_terminals, ArchiveRef, EncodingRow, IndexRow,
     ManifestAssetRow, ManifestError, ManifestLoadEdge, PackManifest, PackTarget, PathRow,
     WireTreeRow,
@@ -579,7 +580,7 @@ pub async fn build_publish_and_activate_pack(
     hub: &RemoteHub,
 ) -> Result<PackBuildOutput, PackBuildError> {
     let output = build_pack(definition, target, encoder_identity, snapshot, hub).await?;
-    crate::activation::open_pack_directory(directory)?;
+    crate::publish::open_pack_directory(directory)?;
     let archive_hash = publish_archive(directory, &output.archive_bytes)?;
     debug_assert_eq!(archive_hash, output.archive_file_hash);
     let manifest_hash = publish_manifest(directory, &output.manifest_bytes)?;

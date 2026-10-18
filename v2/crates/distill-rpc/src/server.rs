@@ -43,12 +43,11 @@ use distill_store::served::{Change, ChangeEntry};
 use distill_store::{Store, StoreConfig, StoreError, StoreOpener, StoreReader, StoreWriter};
 
 use crate::apply::{
-    apply_commit, configuration_status, publish_pipeline_fence, publish_target_set, ApplyError,
+    apply_commit, configuration_status, publish_pipeline_fence, publish_target_set,
 };
 use crate::persist::delta_state;
 use crate::*;
 
-pub(crate) const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
 const MAX_PENDING_STREAM_EVENTS: usize = 1024;
 /// How long a snapshot capability served over the wire lives.
 pub const DEFAULT_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
@@ -149,7 +148,6 @@ pub enum CoordinatedCommitError {
         observed: InputVersion,
     },
     Publication(String),
-    Invalid(AdminError),
 }
 
 // ---------------------------------------------------------------------------
@@ -160,7 +158,6 @@ enum PublishError {
         expected: InputVersion,
         observed: InputVersion,
     },
-    Invalid(AdminError),
     Store(StoreError),
 }
 
@@ -384,16 +381,7 @@ impl ServerHandle {
         targets: Option<BTreeMap<String, TargetDefinitionHash>>,
     ) -> Result<SnapshotStamp, PublishError> {
         let result = (|| {
-            let mut rejection = None;
             let mut stale = None;
-            let mut reject = |error: ApplyError| match error {
-                ApplyError::Invalid(error) => {
-                    let detail = format!("{error:?}");
-                    rejection = Some(PublishError::Invalid(error));
-                    StoreError::Rejected { detail }
-                }
-                ApplyError::Store(error) => error,
-            };
             let observed = store.input_version().map_err(PublishError::Store)?;
             let base = base.unwrap_or(observed);
             let result = if observed == base {
@@ -406,7 +394,7 @@ impl ServerHandle {
                                 detail: "stale publication base".to_owned(),
                             });
                         }
-                        apply_commit(txn, &commit).map_err(&mut reject)?;
+                        apply_commit(txn, &commit)?;
                         if let Some(targets) = &targets {
                             publish_target_set(txn, targets)?;
                         }
@@ -415,7 +403,7 @@ impl ServerHandle {
                     .map(|((), version)| version)
             } else if observed.0 == base.0 + 1 {
                 store.served_transaction(|txn| {
-                    apply_commit(txn, &commit).map_err(&mut reject)?;
+                    apply_commit(txn, &commit)?;
                     if let Some(targets) = &targets {
                         publish_target_set(txn, targets)?;
                     }
@@ -432,13 +420,13 @@ impl ServerHandle {
                     instance: store.instance_id(),
                     version,
                 }),
-                Err(error) => Err(rejection.unwrap_or(match stale {
+                Err(error) => Err(match stale {
                     Some(observed) => PublishError::Stale {
                         expected: base,
                         observed,
                     },
                     None => PublishError::Store(error),
-                })),
+                }),
             }
         })();
         // Inside an open input, readers are told once it commits.
@@ -831,7 +819,6 @@ impl ServerHandle {
                 PublishError::Stale { expected, observed } => {
                     CoordinatedCommitError::Stale { expected, observed }
                 }
-                PublishError::Invalid(error) => CoordinatedCommitError::Invalid(error),
                 PublishError::Store(error) => {
                     CoordinatedCommitError::Publication(error.to_string())
                 }

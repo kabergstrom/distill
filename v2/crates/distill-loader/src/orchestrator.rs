@@ -14,7 +14,7 @@ use distill_asset::{
     AssetRuntimeDescriptor, AssetType, ErasedValue, ModuleEpochPoisonCause, ModuleEpochToken,
 };
 use distill_core::id::{AssetUuid, ContentHash, TypeUuid};
-use distill_store::state::SnapshotStamp;
+use distill_protocol::state::SnapshotStamp;
 use distill_wire::artifact::parse_artifact_parts;
 use distill_wire::dswl::{decode_dswl, dswl_hash};
 use distill_wire::exec::{execute_fixup, ExecEnv, ExecError, ExecLimits};
@@ -94,7 +94,7 @@ pub enum LoaderDiagnostic {
     },
     RoleIneligible {
         uuid: AssetUuid,
-        role: distill_build::trace::EntryRole,
+        role: distill_core::id::EntryRole,
     },
     ComponentPoisoned {
         members: Vec<AssetUuid>,

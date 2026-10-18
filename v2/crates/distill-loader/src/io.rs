@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
-use distill_build::trace::EntryRole;
+use distill_core::id::EntryRole;
 use distill_core::id::{AssetUuid, ContentHash};
-use distill_store::state::SnapshotStamp;
+use distill_protocol::state::SnapshotStamp;
 use distill_wire::exec::Blob;
 
 use crate::basis::IoBasis;
@@ -112,7 +112,7 @@ pub enum PathResolveResult {
 pub struct FetchedArtifact {
     pub structural: Arc<[u8]>,
     pub blobs: Vec<Blob>,
-    pub load_edges: Vec<distill_rpc::ServedLoadEdge>,
+    pub load_edges: Vec<distill_protocol::ServedLoadEdge>,
     /// Canonical DSWL body authenticated by the artifact header's
     /// `layout_hash`; LoaderIO resolves this before completing the fetch.
     pub wire_layout: Blob,

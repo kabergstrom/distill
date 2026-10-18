@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
-use distill_store::state::{InputVersion, SnapshotStamp, StoreInstanceId};
+use distill_protocol::state::{InputVersion, SnapshotStamp, StoreInstanceId};
 
 pub use crate::capnp_transport::RemoteError;
 use crate::capnp_transport::{
@@ -1305,7 +1305,7 @@ impl RemoteChunkStream {
             return Ok(None);
         }
         let unread = self.total_bytes.saturating_sub(self.received);
-        let needed = unread.div_ceil(crate::server::DEFAULT_CHUNK_SIZE as u64) + 1;
+        let needed = unread.div_ceil(crate::DEFAULT_CHUNK_SIZE as u64) + 1;
         let window = usize::try_from(needed).map_or(CHUNK_PIPELINE, |n| n.min(CHUNK_PIPELINE));
         while self.pending.len() < window {
             self.pending

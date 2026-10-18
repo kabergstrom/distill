@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use distill_core::id::LayoutHash;
-use distill_rpc::RpcBasis;
+use distill_client::RpcBasis;
 use distill_wire::exec::Blob;
 
 use crate::basis::IoBasis;
@@ -18,7 +18,7 @@ pub(crate) fn io_basis(basis: &RpcBasis) -> IoBasis {
 pub(crate) fn fetched_artifact(
     layout_hash: LayoutHash,
     payload: crate::capnp_io::RemotePayload,
-    load_edges: Vec<distill_rpc::ServedLoadEdge>,
+    load_edges: Vec<distill_client::ServedLoadEdge>,
     wire_layout: Blob,
     timing: crate::stats::FetchTiming,
 ) -> Result<FetchedArtifact, String> {

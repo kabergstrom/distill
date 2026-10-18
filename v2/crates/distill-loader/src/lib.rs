@@ -4,22 +4,31 @@
 //! over the union of old and candidate dependency graphs, rejects stale
 //! completions by request and connection epoch, and makes module poisoning
 //! observable at the storage boundary.
+//!
+//! Feature `rpc` (default): the daemon connection, [`RpcIo`] and its
+//! authoring calls, over `distill-client` and tokio. Without it the loader
+//! reads packs only (`distill-pack`'s `PackfileIO`).
 
 pub mod admission;
+#[cfg(feature = "rpc")]
 pub mod authoring;
 pub mod basis;
+#[cfg(feature = "rpc")]
 pub mod capnp_io;
 pub mod component;
 pub mod io;
 pub mod orchestrator;
+#[cfg(feature = "rpc")]
 mod rpc_decode;
 pub mod runtime;
 pub mod stats;
 pub mod storage;
 
 pub use admission::{Admit, FetchAdmission, Reservation};
+#[cfg(feature = "rpc")]
 pub use authoring::{AuthoringAnswer, AuthoringRequest, IndexChange};
 pub use basis::{IoBasis, ManifestHash};
+#[cfg(feature = "rpc")]
 pub use capnp_io::{RpcIo, RpcIoConfig, RpcIoInitError, RpcIoStats, StepStats, TypeName};
 pub use component::{
     load_cycles, AdoptionDecision, CandidateAsset, CandidateOutcome, ComponentPlanner,

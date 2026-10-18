@@ -10,14 +10,14 @@
 use std::time::{Duration, Instant};
 
 use distill_core::id::{AssetUuid, BundleUuid};
-use distill_rpc::capnp_loader::{RemoteAuthoringSnapshot, RemoteCall, RemoteHub};
-use distill_rpc::{
+use distill_client::capnp_loader::{RemoteAuthoringSnapshot, RemoteCall, RemoteHub};
+use distill_client::{
     AssetQuery, Authorable, AuthoringInspectResult, AuthoringInspection, AuthoringOp, AuthoringProgressState, AuthoringRow,
     BundleReferences, ImportRequest, SourceFile,
     DescribableType, DescribableTypesResult, LongRunningOp, RenameWithFixupsRequest, RpcFailure,
     TypeDescription, WriteReceipt,
 };
-use distill_store::state::InputVersion;
+use distill_protocol::state::InputVersion;
 
 use crate::capnp_io::{describe, remote, TypeName};
 

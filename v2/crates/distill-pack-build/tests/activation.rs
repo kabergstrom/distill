@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use distill_core::id::ContentHash;
 use distill_pack::activation::*;
+use distill_pack_build::publish::*;
 use distill_pack::archive::{encode_archive, ArtifactPayload};
 
 #[test]

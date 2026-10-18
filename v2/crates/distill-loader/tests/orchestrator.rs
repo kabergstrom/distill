@@ -11,7 +11,7 @@ use distill_loader::{
     ResolveResult, RuntimeTarget, StorageError, TargetBindingState, UpdateResult,
 };
 use distill_rpc::ServedLoadEdge;
-use distill_store::state::{InputVersion, StoreInstanceId};
+use distill_protocol::state::{InputVersion, StoreInstanceId};
 use distill_wire::artifact::{content_hash, write_artifact, ArtifactHeader};
 use distill_wire::dswl::{dswl_bytes, dswl_hash};
 use distill_wire::native::CallbackPanic;
@@ -274,8 +274,8 @@ fn basis_with(manifest_byte: u8) -> IoBasis {
     }
 }
 
-fn stamp(version: u64) -> distill_store::state::SnapshotStamp {
-    distill_store::state::SnapshotStamp {
+fn stamp(version: u64) -> distill_protocol::state::SnapshotStamp {
+    distill_protocol::state::SnapshotStamp {
         instance: StoreInstanceId([7; 16]),
         version: InputVersion(version),
     }
@@ -1783,7 +1783,7 @@ fn role_ineligible_is_a_typed_failure_not_a_missing_asset() {
         uuid: asset,
         result: ResolveResult::RoleIneligible {
             uuid: asset,
-            role: distill_build::trace::EntryRole::AuthoringOnly,
+            role: distill_core::id::EntryRole::AuthoringOnly,
         },
         basis: request_basis,
     });
@@ -1794,7 +1794,7 @@ fn role_ineligible_is_a_typed_failure_not_a_missing_asset() {
         diagnostic,
         LoaderDiagnostic::RoleIneligible {
             uuid,
-            role: distill_build::trace::EntryRole::AuthoringOnly,
+            role: distill_core::id::EntryRole::AuthoringOnly,
         } if *uuid == asset
     )));
     assert!(storage.updates.is_empty());

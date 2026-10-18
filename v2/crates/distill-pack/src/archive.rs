@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Write};
 
-use distill_bundle::crc32c;
+use distill_core::crc32c::crc32c;
 use distill_core::id::ContentHash;
 
 pub const PACK_MAGIC: [u8; 4] = *b"DPK1";

@@ -20,7 +20,7 @@ pub mod imports;
 pub mod opener;
 pub mod pipeline;
 pub mod served;
-pub mod state;
+pub use distill_protocol::state;
 pub mod trace_reads;
 
 #[cfg(test)]

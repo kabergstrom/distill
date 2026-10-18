@@ -23,12 +23,11 @@ use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
 use ngp_schema::{DynamicType, LogicalSchema, TypeTable, Value};
 
 mod container;
-mod crc32c;
 mod data;
 mod envelope;
 mod error;
 
-pub use crc32c::crc32c;
+pub use distill_core::crc32c::crc32c;
 pub use error::BundleError;
 pub use ngp_schema::{encode_path, PathComponent};
 

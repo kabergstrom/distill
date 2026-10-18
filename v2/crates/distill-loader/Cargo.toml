@@ -7,15 +7,20 @@ license.workspace = true
 [dependencies]
 blake3.workspace = true
 distill-asset = { path = "../distill-asset" }
-distill-build = { path = "../distill-build" }
 distill-core = { path = "../distill-core" }
-distill-rpc = { path = "../distill-rpc" }
-distill-schema = { path = "../distill-schema" }
-distill-store = { path = "../distill-store" }
+distill-protocol = { path = "../distill-protocol" }
+distill-client = { path = "../distill-client", optional = true }
 distill-wire = { path = "../distill-wire" }
-tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"], optional = true }
+
+[features]
+default = ["rpc"]
+# The daemon connection (`RpcIo`, authoring calls); off, packs only.
+rpc = ["dep:distill-client", "dep:tokio"]
 
 [dev-dependencies]
+# The RPC tests run a daemon-side server on a store.
+distill-store = { path = "../distill-store" }
 capnp = "0.26.2"
 capnp-futures = "0.26.1"
 futures = "0.3"

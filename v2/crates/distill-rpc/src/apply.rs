@@ -10,42 +10,10 @@ use distill_store::served::{Change, ServedWrite};
 use distill_store::StoreError;
 
 use crate::persist::delta_state_code;
-use crate::validate::validate_commit;
 use crate::*;
 
 /// Input versions of subscription history kept in the change log.
 pub const RETAINED_HISTORY_VERSIONS: u64 = 4096;
-
-/// Why a commit could not be applied. `Invalid` rejects the commit itself;
-/// either way the caller's transaction must roll back.
-#[derive(Debug)]
-pub enum ApplyError {
-    Invalid(AdminError),
-    Store(StoreError),
-}
-
-impl From<StoreError> for ApplyError {
-    fn from(error: StoreError) -> Self {
-        Self::Store(error)
-    }
-}
-
-impl From<AdminError> for ApplyError {
-    fn from(error: AdminError) -> Self {
-        Self::Invalid(error)
-    }
-}
-
-impl From<ApplyError> for StoreError {
-    fn from(error: ApplyError) -> Self {
-        match error {
-            ApplyError::Invalid(error) => StoreError::Rejected {
-                detail: format!("{error:?}"),
-            },
-            ApplyError::Store(error) => error,
-        }
-    }
-}
 
 /// The RPC view of the configuration error the daemon serves, if any.
 pub(crate) fn configuration_status(error: Option<ConfigurationError>) -> ConfigurationStatus {
@@ -56,8 +24,7 @@ pub(crate) fn configuration_status(error: Option<ConfigurationError>) -> Configu
 /// `txn` (or published just before it) already holds the namespace the
 /// commit describes; this writes the fences and change log that go with
 /// it.
-pub fn apply_commit<W: ServedWrite>(txn: &mut W, commit: &Commit) -> Result<(), ApplyError> {
-    validate_commit(commit)?;
+pub fn apply_commit<W: ServedWrite>(txn: &mut W, commit: &Commit) -> Result<(), StoreError> {
     let version = txn.change_version();
     // The fence row comes first: a front end fences its connections on it
     // before it reaches this version's deltas.

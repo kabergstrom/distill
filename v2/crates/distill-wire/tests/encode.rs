@@ -3,7 +3,7 @@
 mod common;
 
 use common::*;
-use distill_bundle::PathComponent;
+use ngp_schema::PathComponent;
 use distill_core::id::{AssetUuid, TypeUuid};
 use distill_wire::encode::{encode_value, EncodeError};
 use distill_wire::native::ScalarKind;
