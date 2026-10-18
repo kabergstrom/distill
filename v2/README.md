@@ -27,7 +27,9 @@ edge cases, and negatives), test-first.
 
 A runtime reading packs only (the loader without `rpc`) links `distill-asset`,
 `distill-core`, `distill-loader`, `distill-pack`, `distill-protocol` and
-`distill-wire`.
+`distill-wire`, and newgameplus's `ngp-schema`, which still names `distill-json`
+(its text codecs: cooked prefabs are parsed from text until newgameplus GAP 23
+§17.11 step 5).
 
 Schema-model code here is destined to merge into `newgameplus`'s
 `ngp-schema`/`source-walk` per §5 ("One model, split — not a second one");

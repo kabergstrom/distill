@@ -1215,7 +1215,7 @@ The local-failure record is `digest(Domain::LocalFailure, 1,
 LocalFailureClass:u32 ‖ variant fields)` (`DslfV1::digest`,
 `distill-build/src/dslf.rs`) and the configuration-poison record
 `digest(Domain::ConfigError, 1, ConfigurationPoisonCode:u32 ‖ variant
-fields)` (`ConfigurationPoison::reason_hash`, `distill-store/src/state.rs`).
+fields)` (`ConfigurationPoison::reason_hash`, `distill-protocol/src/state.rs`).
 Fields are encoded in the orders above. Every tag — the class or code, each
 nested `*FailureV1`/`*SlotV1`/`ReferenceObservationV1` variant,
 `ImportEntryRoleV1`, `ConfigurationPathKey`, `OwnedPathKind`,
@@ -2397,7 +2397,7 @@ pub struct VersionPoison {
 ```
 
 `VersionPoison.identity = digest(Domain::NamespaceError, 1,
-VersionPoisonCode:u32 ‖ exact variant fields)` (`distill-store/src/state.rs`
+VersionPoisonCode:u32 ‖ exact variant fields)` (`distill-protocol/src/state.rs`
 `namespace_error_identity`); nested tags are `u32` discriminants. A code admits only its same-named payload variant. A
 `DuplicateAssetUuid` has at least two strictly sorted, deduplicated tagged
 `AssetClaimant` rows ordered by their complete canonical bytes; this represents
@@ -5968,7 +5968,7 @@ pub struct PipelinePoison {
 /// No other origin/code/disposition tuple is canonical.
 ///
 /// `identity = digest(Domain::PipelineFailure, 1, code:u32 ‖ origin:u32 ‖
-/// cleanup:u32)` (`distill-store/src/state.rs` `pipeline_failure_identity`).
+/// cleanup:u32)` (`distill-protocol/src/state.rs` `pipeline_failure_identity`).
 /// The message is excluded. Persistence and RPC decode recompute identity and
 /// reject unknown versions/values, a matrix mismatch, wrong-width identity,
 /// or a digest mismatch; evolution requires digest version 2.
