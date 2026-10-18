@@ -328,6 +328,7 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
         output.manifest.paths.is_none(),
         "production UUID loading must not depend on the optional path table"
     );
+    assert_pack_v4_files(pack_dir.path());
 
     let pack_io = PackfileIO::mount_current(
         pack_dir.path(),
@@ -357,6 +358,41 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
         packed_mesh.id(),
         packed_shader.id(),
     );
+}
+
+/// The published pack is v4 (§16): `pack.current` holds the manifest hash
+/// as 32 hex digits and a newline; the manifest and every archive start with
+/// the shared NGPF header at `PACK_VERSION` 4, end with the XXH3-128 of
+/// everything before, and are named by their hash.
+fn assert_pack_v4_files(dir: &Path) {
+    use distill_core::hash::{hash, Domain};
+    use distill_core::header::header;
+    use distill_pack::{archive_filename, manifest_filename, manifest_hash, read_current, PACK_VERSION};
+
+    assert_eq!(PACK_VERSION, 4);
+    let pointer = std::fs::read(dir.join("pack.current")).unwrap();
+    assert_eq!(pointer.len(), 33, "32 hex digits and a newline");
+    let current = read_current(dir).unwrap();
+    let manifest = std::fs::read(dir.join(manifest_filename(current))).unwrap();
+    assert_eq!(manifest[..12], header(Domain::PackManifest, 4));
+    let (body, trailer) = manifest.split_at(manifest.len() - 16);
+    assert_eq!(trailer, hash(body), "manifest trailer");
+    assert_eq!(manifest_hash(&manifest), current, "pack.current names the manifest");
+
+    let mut archives = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let name = entry.unwrap().file_name().into_string().unwrap();
+        if !name.starts_with("archive-") {
+            continue;
+        }
+        let bytes = std::fs::read(dir.join(&name)).unwrap();
+        assert_eq!(bytes[..12], header(Domain::PackArchive, 4), "{name}");
+        let (body, trailer) = bytes.split_at(bytes.len() - 16);
+        assert_eq!(trailer, hash(body), "{name}: trailer");
+        assert_eq!(name, archive_filename(hash(&bytes)), "an archive is named by its file hash");
+        archives += 1;
+    }
+    assert!(archives > 0, "the pack has an archive");
 }
 
 fn assert_loaded_game_assets(
