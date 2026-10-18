@@ -155,7 +155,7 @@ fn codegen_command_generates_each_roots_namespace_and_check_reports_drift() {
     assert_eq!(run.status.code(), Some(0), "{}", describe(&run));
     assert_eq!(lines(&run), would);
     let main = project.module("main");
-    assert!(main.starts_with("#![allow(dead_code)]\n\nmod sp_"), "{main}");
+    assert!(main.starts_with("#![allow(dead_code)]\n\n#[doc(hidden)]\npub mod sp_"), "{main}");
     assert!(main.contains(" as tens_1;\n"), "{main}");
     assert!(main.ends_with("pub const ROOT: &str = \"main\";\npub const COUNT: usize = 1;\n"), "{main}");
     let extra = project.module("extra");

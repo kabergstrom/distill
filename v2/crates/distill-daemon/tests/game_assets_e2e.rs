@@ -739,19 +739,23 @@ fn fixture_schema(source_identity: (String, String)) -> Schema {
             path: type_path("newgameplus_assets", "CookedPipeline"),
             uuid: Some(CookedPipeline::TYPE_UUID),
             attrs: TypeAttrs::default(),
-            fields: vec![Field {
-                attrs: FieldAttrs {
-                    blob: true,
-                    ..FieldAttrs::default()
+            fields: vec![
+                Field {
+                    attrs: FieldAttrs {
+                        blob: true,
+                        ..FieldAttrs::default()
+                    },
+                    ..field("cooked", 5)
                 },
-                ..field("cooked", 5)
-            }],
+                field("bindings_hash", 12),
+            ],
             generic_parameters: Vec::new(),
             generic_argument_ids: Vec::new(),
             has_default: false,
             generic_const_arguments: Vec::new(),
             has_explicit_discriminants: false,
         },
+        leaf(12, PrimitiveType::U64, "core", "u64"),
     ]);
     let string_layout = TypeLayout {
         size: Some(size_of::<String>() as u64),
@@ -864,10 +868,18 @@ fn fixture_schema(source_identity: (String, String)) -> Schema {
                 terminal_layout(
                     size_of::<CookedPipeline>() as u64,
                     align_of::<CookedPipeline>() as u64,
-                    vec![layout_field::<CookedPipeline, distill_asset::Blob>(
-                        std::mem::offset_of!(CookedPipeline, cooked),
-                    )],
+                    vec![
+                        layout_field::<CookedPipeline, distill_asset::Blob>(std::mem::offset_of!(
+                            CookedPipeline,
+                            cooked
+                        )),
+                        layout_field::<CookedPipeline, u64>(std::mem::offset_of!(
+                            CookedPipeline,
+                            bindings_hash
+                        )),
+                    ],
                 ),
+                scalar_layout(8, 8),
             ],
         }],
     }

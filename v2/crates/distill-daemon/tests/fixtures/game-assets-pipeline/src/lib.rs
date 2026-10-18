@@ -166,11 +166,12 @@ fn cook_shader(value: &str) -> Result<Value, ProcessorError> {
             source: value,
         }],
         &BTreeMap::new(),
-        false,
+        &rafx_shader_processor::CookOptions { vulkan: true, ..Default::default() },
     )
     .map_err(|error| ProcessorError::new(30, error.to_string()))?;
     Ok(newgameplus_assets::CookedPipeline {
         cooked: cooked.into(),
+        bindings_hash: 0,
     }
     .to_value())
 }

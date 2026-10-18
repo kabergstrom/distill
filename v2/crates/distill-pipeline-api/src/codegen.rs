@@ -51,7 +51,8 @@ pub fn alias_defect(alias: &str) -> Option<&'static str> {
 }
 
 /// One generated unit, `sp_<hex>.rs`, named by its asset's UUID. An alias
-/// adds `pub use self::sp_<hex> as <alias>;` to the namespace's `mod.rs`.
+/// adds `pub use self::sp_<hex> as <alias>;` to the namespace's `mod.rs`
+/// (the module itself then `#[doc(hidden)]`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedFile {
     asset: AssetUuid,

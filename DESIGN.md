@@ -3062,7 +3062,7 @@ Each rule has a fixed id (`ENGINE_DEFAULT_IMPORTS` in `newgameplus-pipeline/src/
 | `ngp.font` | `FontImportSettings` (`face`) | `**/*.{ttf,otf,ttc}` | Explicit imports today (`Roboto-Regular.ttf.bundle`): precedence 1 keeps them. `NotoSansSC-Regular.otf` is CFF, which `ngp.font` rejects (TrueType only): excluded in `example-module/assets/distill.toml` |
 | `ngp.sound` | none | `**/*.{wav,ogg,flac}` | |
 | `ngp.prefab` | none | `**/*.prefab` | |
-| `ngp.glsl` | `GlslSettings` | `**/*.{vert,frag,comp}` | Includes (`.glsl`) have no rule. deferred-ngp excludes its `glsl` root (`["**"]`): its stages are cooked by `compile_shaders.sh` and embedded, but the explicitly imported ones |
+| `ngp.glsl` | `GlslSettings` | `**/*.{frag,comp}` (a `.frag` pairs with its `.vert`) | Includes (`.glsl`) and `.vert` stages have no rule. Every stage in newgameplus's `glsl` roots is a default import (newgameplus GAP 28) |
 
 #### Pipeline updates
 
@@ -8471,8 +8471,9 @@ change without identity or path churn. A generated file may also carry an
 bytes, not `_` and not a Rust keyword (`alias_defect`; a bad one fails
 the batch as `CodegenFailure::InvalidAlias`). The physical name stays the
 identity — file, module, mark — and the alias is a re-export: `mod.rs`
-holds `mod sp_<32hex>;` and `pub use self::sp_<32hex> as <alias>;` for an
-aliased file, `pub mod sp_<32hex>;` otherwise. Renaming the source a
+holds `#[doc(hidden)] pub mod sp_<32hex>;` and `pub use self::sp_<32hex> as
+<alias>;` for an aliased file (a private module cannot be re-exported),
+`pub mod sp_<32hex>;` otherwise. Renaming the source a
 codegen derives the alias from changes the re-export only, so call sites
 naming the old alias break at compile time, never silently.
 Authored strings embedded in generated

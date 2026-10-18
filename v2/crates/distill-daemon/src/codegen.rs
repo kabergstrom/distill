@@ -555,9 +555,10 @@ impl CodegenWorld<'_> {
 /// Every generated file's path and exact bytes, each under its generated
 /// mark. `mod.rs` holds, each section ending in a newline and the
 /// sections apart by a blank line: the codegen's preamble, the module
-/// lines by physical name (`pub mod sp_<hex>;`, or `mod sp_<hex>;` and
-/// `pub use self::sp_<hex> as <alias>;` for an aliased file), and the
-/// codegen's items. An empty section is left out.
+/// lines by physical name (`pub mod sp_<hex>;`; for an aliased file
+/// `#[doc(hidden)]` and `pub use self::sp_<hex> as <alias>;`, since a
+/// private module cannot be re-exported), and the codegen's items. An
+/// empty section is left out.
 fn desired_namespace(output: &CodegenOutput) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let mut desired = BTreeMap::new();
     let mut modules = Vec::with_capacity(output.files.len());
@@ -579,7 +580,7 @@ fn desired_namespace(output: &CodegenOutput) -> Result<BTreeMap<String, Vec<u8>>
     for (name, alias) in modules {
         match alias {
             Some(alias) => {
-                lines.push_str(&format!("mod {name};\npub use self::{name} as {alias};\n"));
+                lines.push_str(&format!("#[doc(hidden)]\npub mod {name};\npub use self::{name} as {alias};\n"));
             }
             None => lines.push_str(&format!("pub mod {name};\n")),
         }
@@ -1397,9 +1398,9 @@ mod tests {
             concat!(
                 "#![allow(dead_code)]\n",
                 "\n",
-                "mod sp_01010101010101010101010101010101;\n",
+                "#[doc(hidden)]\npub mod sp_01010101010101010101010101010101;\n",
                 "pub use self::sp_01010101010101010101010101010101 as gtao;\n",
-                "mod sp_02020202020202020202020202020202;\n",
+                "#[doc(hidden)]\npub mod sp_02020202020202020202020202020202;\n",
                 "pub use self::sp_02020202020202020202020202020202 as scene;\n",
                 "pub mod sp_03030303030303030303030303030303;\n",
                 "\n",
