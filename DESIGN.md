@@ -7069,8 +7069,9 @@ set, expansion protocol, or mutable compatibility handshake.
 - While no connection serves (none yet, or one that reported
   `ReconnectRequired`, until the rebind binds), requests are answered at
   once:
-  - a resolve or path this IO never named: `Missing`, so the layers under
-    it answer (§16, "Layer stack");
+  - a resolve or path this IO never named: `Missing`; as a `LayeredIO`
+    layer it is then unavailable, not "not named" (§16, "Layer stack"):
+    lower layers answer what they name, the rest waits for it;
   - one whose last answer named it: `RequestError`, so its component
     freezes with what is resident instead of turning `Dead`;
   - a fetch: `RequestError`.
@@ -7566,9 +7567,21 @@ pub struct PackDefinition {
   `Drifted`, `RoleIneligible`, `RequestError`, `SnapshotExpired`). Named
   by none: the topmost `Deleted`, else `Missing`; a path `Missing` when
   any layer has a path table, else `Unsupported`.
+- **Unavailable layers**: an optional layer that is not bound (never
+  connected, or its connection lost) is unavailable; its "not named"
+  answer means nothing.
+  - What an available lower layer names is answered by it, as above (the
+    engine pack's shaders load with no daemon).
+  - What no available layer names stays pending, with no terminal event,
+    while a layer above is unavailable. Once that layer binds, the request
+    is asked of it again at its newest basis (ended with the request's
+    stack basis), and the top-down rule applies to its answer. The stack
+    sets no timeout: the engine's startup timeout names what is pending.
+  - What the unavailable layer named before fails (`RequestError`), so
+    resident values stay (§15, "RpcIO without a daemon").
 - **Fetch** goes to the layer whose resolve answered that `ContentHash`
-  under the request's basis (else under any live basis: a payload carried
-  across a rebase).
+  under the request's basis, at the layer basis it was asked at (else
+  under any live basis: a payload carried across a rebase).
 - **Closure edges resolve through the stack**: a daemon asset may
   load-reference an engine pack asset. A pack's mount still requires its
   own closure inside it (`verify_expected_terminals`).
@@ -7588,9 +7601,10 @@ pub struct PackDefinition {
 - **An optional layer** (the daemon):
   - never delays or fails the binding; its rejections are
     `ConnectionError` diagnostics;
-  - its `ReconnectRequired` stays inside the stack: it alone rebinds,
-    requests it still owed fail (`RequestError`), nothing re-resolves or
-    is deleted (§15, "RpcIO without a daemon");
+  - its `ReconnectRequired` stays inside the stack: it alone rebinds;
+    resolves it still owed are asked of it again unbound (unavailable, or
+    `RequestError` for what it named), fetches it owed fail; nothing
+    re-resolves or is deleted (§15, "RpcIO without a daemon");
   - binding after the stack did (the daemon connects or reconnects) is a
     change: every subscribed asset and path is published `Changed`, so
     what it now names (an engine shader edited under a daemon mounting

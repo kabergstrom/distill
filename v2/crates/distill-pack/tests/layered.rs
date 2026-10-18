@@ -639,3 +639,81 @@ fn layer_answers_settle_top_down_under_the_stack_basis() {
     io.end_sweep(&basis);
     assert!(io.poll().is_empty());
 }
+
+#[test]
+fn a_path_only_the_daemon_names_resolves_once_the_daemon_connects() {
+    let engine = built(uuid(1), 1, &[]);
+    let game = built(uuid(2), 2, &[]);
+    let game_hash = game.hash;
+    let mut daemon = FakeDaemon::new(false, vec![game]);
+    daemon.paths.insert("prefabs/game.prefab".into(), uuid(2));
+    let mut loader = loader(vec![
+        Layer::new(pack(ENGINE, &[&engine], &[])).with_target(ENGINE),
+        Layer::new(daemon).optional(),
+    ]);
+    let mut storage = Storage::default();
+    let shader = loader.add_ref::<A>(uuid(1)).unwrap();
+    let root = loader.add_ref_indirect::<A>("prefabs/game.prefab").unwrap();
+    // The engine pack loads with the daemon down; the game's path waits.
+    process_until(&mut loader, &mut storage, |loader| {
+        loader.status(&shader) == LoadStatus::Loaded
+    });
+    for _ in 0..10 {
+        loader.process(&mut storage).unwrap();
+    }
+    assert_ne!(loader.status(&root), LoadStatus::Loaded);
+    assert_ne!(loader.status(&root), LoadStatus::Dead);
+    assert_eq!(current(&loader, uuid(2)), None);
+
+    loader
+        .io_mut()
+        .layer_mut::<FakeDaemon>()
+        .unwrap()
+        .connect();
+    process_until(&mut loader, &mut storage, |loader| {
+        loader.status(&root) == LoadStatus::Loaded
+    });
+    assert_eq!(current(&loader, uuid(2)), Some(game_hash));
+    assert_eq!(loader.status(&shader), LoadStatus::Loaded);
+}
+
+#[test]
+fn what_nobody_names_stays_unanswered_while_the_daemon_is_down() {
+    let engine = built(uuid(1), 1, &[]);
+    let mut io = LayeredIO::new(vec![
+        Layer::new(pack(ENGINE, &[&engine], &[("engine/a.bundle", uuid(1))])).with_target(ENGINE),
+        Layer::new(FakeDaemon::new(false, Vec::new())).optional(),
+    ]);
+    let target = RuntimeTarget::new(GameModuleEpoch(1), GAME);
+    io.bind_target(target);
+    assert!(matches!(io.poll().as_slice(), [IoEvent::TargetBound { .. }]));
+
+    let basis = io.begin_sweep();
+    io.resolve_path(ReqId(1), &AssetPath::from("nowhere/b.bundle"), &basis);
+    io.resolve(ReqId(2), uuid(9), &basis);
+    // What the pack names answers at once.
+    io.resolve_path(ReqId(3), &AssetPath::from("engine/a.bundle"), &basis);
+    let events = io.poll();
+    assert!(
+        matches!(events.as_slice(), [IoEvent::PathResolved {
+            req: ReqId(3), result: PathResolveResult::Resolved(found), basis: got, ..
+        }] if *found == uuid(1) && *got == basis),
+        "{events:?}"
+    );
+    for _ in 0..10 {
+        let events = io.poll();
+        assert!(events.is_empty(), "answered while the daemon is down: {events:?}");
+    }
+
+    io.layer_mut::<FakeDaemon>().unwrap().connect();
+    // Asked again once it binds; it answers at the next poll.
+    let mut events = io.poll();
+    events.extend(io.poll());
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert!(events.iter().any(|event| matches!(event, IoEvent::PathResolved {
+        req: ReqId(1), result: PathResolveResult::Missing, basis: got, ..
+    } if *got == basis)));
+    assert!(events.iter().any(|event| matches!(event, IoEvent::Resolved {
+        req: ReqId(2), result: ResolveResult::Missing, basis: got, ..
+    } if *got == basis)));
+}

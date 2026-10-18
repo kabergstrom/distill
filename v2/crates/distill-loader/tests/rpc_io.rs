@@ -974,3 +974,79 @@ fn rpc_io_in_background_names_nothing_until_it_connects() {
     drop(io);
     server_thread.join().unwrap();
 }
+
+/// The engine's first frames: a path requested of a stack whose daemon
+/// layer has not connected yet waits for it instead of answering missing.
+#[test]
+fn a_layer_stack_waits_for_its_daemon_before_answering_what_nothing_names() {
+    let Fixture {
+        project: _project,
+        server,
+        request,
+        asset,
+        ..
+    } = fixture();
+    let address = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let target = RuntimeTarget {
+        epoch: distill_loader::GameModuleEpoch(1),
+        target_definition_hash: request.target_definition_hash.0,
+    };
+    let daemon = RpcIo::connect_in_background(address, request).unwrap();
+    let mut io = distill_loader::LayeredIO::new(vec![distill_loader::Layer::new(daemon).optional()]);
+    io.bind_target(target);
+    assert!(matches!(io.poll().as_slice(), [IoEvent::TargetBound { .. }]));
+    let basis = io.begin_sweep();
+    io.resolve_path(ReqId(1), &AssetPath::from(PATH), &basis);
+    let deadline = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < deadline {
+        let events = io.poll();
+        assert!(
+            events.iter().all(|event| matches!(event, IoEvent::ConnectionError { .. })),
+            "answered before the daemon connected: {events:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let root = server.root();
+    let server_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&runtime, async move {
+            let listener = StagedListener::bind(root, &address.to_string())
+                .await
+                .unwrap();
+            let connection = listener.accept_one().await.unwrap();
+            drop(listener);
+            connection.await.unwrap().unwrap();
+        });
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let resolved = loop {
+        let events = io.poll();
+        if let Some(event) = events
+            .into_iter()
+            .find(|event| matches!(event, IoEvent::PathResolved { .. }))
+        {
+            break event;
+        }
+        assert!(Instant::now() < deadline, "the path was never answered");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(
+        matches!(&resolved, IoEvent::PathResolved {
+            req: ReqId(1),
+            result: distill_loader::PathResolveResult::Resolved(found),
+            basis: got,
+            ..
+        } if *found == asset && *got == basis),
+        "{resolved:?}"
+    );
+
+    drop(io);
+    server_thread.join().unwrap();
+}

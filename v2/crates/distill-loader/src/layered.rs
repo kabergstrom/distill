@@ -7,10 +7,15 @@
 //! - A resolve (UUID or path) goes to every layer under that layer's basis;
 //!   the answer is the topmost layer naming it, taken once every higher
 //!   layer has answered "not named" (`Missing`, `Deleted`, a path's
-//!   `Unsupported`). A disconnected `RpcIo` answers `Missing` for what it
-//!   never named, so the layers under it answer.
-//! - A fetch goes to the layer whose resolve answered that content hash
-//!   under the request's basis.
+//!   `Unsupported`) or is unavailable.
+//! - An optional layer that is not bound (never connected, or its
+//!   connection lost) is unavailable: its "not named" answer means nothing.
+//!   A request no available layer names stays unanswered while a layer above
+//!   is unavailable; once that layer binds it is asked again, and the
+//!   top-down rule applies to its answer. What the unavailable layer named
+//!   before fails (`RpcIo` answers `RequestError`), so resident values stay.
+//! - A fetch goes to the layer whose resolve answered that content hash,
+//!   under the layer basis that resolve was asked at.
 //! - The stack's basis is `IoBasis::Layers`, one basis per layer; a delta
 //!   in any layer moves the loader to a new round. A layer's basis is ended
 //!   at the layer only once no live stack basis shares it.
@@ -63,7 +68,8 @@ impl Layer {
     }
 
     /// The stack binds without waiting for this layer; its rejections are
-    /// diagnostics, and a lost connection is rebound inside the stack.
+    /// diagnostics, a lost connection is rebound inside the stack, and
+    /// while unbound it is unavailable (module docs).
     pub fn optional(mut self) -> Self {
         self.optional = true;
         self
@@ -92,16 +98,33 @@ struct LayerState {
     bound: bool,
 }
 
+/// One layer's part of a resolve.
+#[derive(Clone)]
+enum Answer {
+    Waiting,
+    Got(IoEvent),
+    /// "Not named" from an optional layer that is not bound: asked again
+    /// once it binds.
+    Unavailable,
+}
+
+#[derive(Clone)]
+struct Slot {
+    answer: Answer,
+    /// The layer basis the layer was asked at.
+    basis: IoBasis,
+}
+
+enum Asked {
+    Asset(AssetUuid),
+    Path(AssetPath),
+}
+
 enum Pending {
     Resolve {
-        uuid: AssetUuid,
+        asked: Asked,
         basis: IoBasis,
-        answers: Vec<Option<IoEvent>>,
-    },
-    Path {
-        path: AssetPath,
-        basis: IoBasis,
-        answers: Vec<Option<IoEvent>>,
+        slots: Vec<Slot>,
     },
     Fetch {
         basis: IoBasis,
@@ -119,8 +142,12 @@ pub struct LayeredIO {
     live: Vec<IoBasis>,
     last_basis: IoBasis,
     pending: HashMap<ReqId, Pending>,
-    /// Per live stack basis: the layer that answered each content hash.
-    routes: Vec<(IoBasis, HashMap<ContentHash, usize>)>,
+    /// Per live stack basis: the layer that answered each content hash, and
+    /// the layer basis it answered at.
+    routes: Vec<(IoBasis, HashMap<ContentHash, (usize, IoBasis)>)>,
+    /// Layer bases a request was asked again at (stack basis, layer, layer
+    /// basis), ended with the stack basis.
+    reasked: Vec<(IoBasis, usize, IoBasis)>,
     assets: BTreeSet<AssetUuid>,
     paths: BTreeSet<String>,
     events: VecDeque<IoEvent>,
@@ -144,6 +171,7 @@ impl LayeredIO {
             last_basis: IoBasis::Layers(Arc::from(Vec::new())),
             pending: HashMap::new(),
             routes: Vec::new(),
+            reasked: Vec::new(),
             assets: BTreeSet::new(),
             paths: BTreeSet::new(),
             events: VecDeque::new(),
@@ -169,6 +197,11 @@ impl LayeredIO {
     /// Whether layer `index` (bottom 0) is bound to its target.
     pub fn layer_bound(&self, index: usize) -> bool {
         self.layers.get(index).is_some_and(|state| state.bound)
+    }
+
+    fn unavailable(&self, index: usize) -> bool {
+        let state = &self.layers[index];
+        state.layer.optional && !state.bound
     }
 
     fn layer_target(&self, index: usize) -> Option<RuntimeTarget> {
@@ -213,6 +246,88 @@ impl LayeredIO {
         });
     }
 
+    fn ask(&mut self, index: usize, req: ReqId, asked: &Asked, layer_basis: &IoBasis) {
+        let io = &mut self.layers[index].layer.io;
+        match asked {
+            Asked::Asset(uuid) => io.resolve(req, *uuid, layer_basis),
+            Asked::Path(path) => io.resolve_path(req, path, layer_basis),
+        }
+    }
+
+    fn issue(&mut self, req: ReqId, asked: Asked, basis: &IoBasis) {
+        let Some(bases) = self.layer_bases(basis) else {
+            return self.foreign_basis(req, basis);
+        };
+        let slots = bases
+            .iter()
+            .map(|layer_basis| Slot {
+                answer: Answer::Waiting,
+                basis: layer_basis.clone(),
+            })
+            .collect::<Vec<_>>();
+        for (index, slot) in slots.iter().enumerate() {
+            self.ask(index, req, &asked, &slot.basis);
+        }
+        self.pending.insert(
+            req,
+            Pending::Resolve {
+                asked,
+                basis: basis.clone(),
+                slots,
+            },
+        );
+    }
+
+    /// Ask layer `index` again, at its newest basis, every request whose
+    /// answer from it is still owed (`owed`) or was unavailable.
+    fn ask_again(&mut self, index: usize, owed: bool) {
+        let reqs = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| match pending {
+                Pending::Resolve { slots, .. } => match slots[index].answer {
+                    Answer::Unavailable => true,
+                    Answer::Waiting => owed,
+                    Answer::Got(_) => false,
+                },
+                Pending::Fetch { .. } => false,
+            })
+            .map(|(req, _)| *req)
+            .collect::<Vec<_>>();
+        if reqs.is_empty() {
+            return;
+        }
+        let layer_basis = self.layers[index].layer.io.begin_sweep();
+        for req in reqs {
+            let Some(Pending::Resolve {
+                asked,
+                basis,
+                slots,
+            }) = self.pending.remove(&req)
+            else {
+                continue;
+            };
+            let mut slots = slots;
+            slots[index] = Slot {
+                answer: Answer::Waiting,
+                basis: layer_basis.clone(),
+            };
+            let entry = (basis.clone(), index, layer_basis.clone());
+            if !self.reasked.contains(&entry) {
+                self.reasked.push(entry);
+            }
+            self.ask(index, req, &asked, &layer_basis);
+            self.pending.insert(
+                req,
+                Pending::Resolve {
+                    asked,
+                    basis,
+                    slots,
+                },
+            );
+        }
+    }
+
     fn layer_event(&mut self, index: usize, event: IoEvent) {
         match event {
             IoEvent::Resolved { req, .. }
@@ -250,6 +365,7 @@ impl LayeredIO {
                     return;
                 }
                 self.layers[index].bound = true;
+                self.ask_again(index, false);
                 if self.bound {
                     self.publish_newly_named(&basis);
                 }
@@ -288,8 +404,9 @@ impl LayeredIO {
     }
 
     /// An optional layer lost its connection: rebind it alone. Its
-    /// requests were dropped with the connection; each still owed fails,
-    /// so the loader keeps what is resident.
+    /// requests were dropped with the connection; each resolve still owed
+    /// is asked again of the unbound layer (what it named fails, the rest
+    /// is unavailable), each fetch fails.
     fn lose_layer(&mut self, index: usize, reason: String) {
         let message = format!("layer {index} lost its connection ({reason}); reconnecting");
         self.layers[index].bound = false;
@@ -299,18 +416,13 @@ impl LayeredIO {
         if let Some(target) = self.layer_target(index) {
             self.layers[index].layer.io.bind_target(target);
         }
-        let owed = self
+        let fetches = self
             .pending
             .iter()
-            .filter(|(_, pending)| match pending {
-                Pending::Resolve { answers, .. } | Pending::Path { answers, .. } => {
-                    answers[index].is_none()
-                }
-                Pending::Fetch { layer, .. } => *layer == index,
-            })
+            .filter(|(_, pending)| matches!(pending, Pending::Fetch { layer, .. } if *layer == index))
             .map(|(req, _)| *req)
             .collect::<Vec<_>>();
-        for req in owed {
+        for req in fetches {
             let event = IoEvent::RequestError {
                 req,
                 message: message.clone(),
@@ -318,9 +430,11 @@ impl LayeredIO {
             };
             self.answer(index, req, event);
         }
+        self.ask_again(index, true);
     }
 
     fn answer(&mut self, index: usize, req: ReqId, event: IoEvent) {
+        let unavailable = self.unavailable(index);
         let Some(pending) = self.pending.get_mut(&req) else {
             return;
         };
@@ -333,13 +447,18 @@ impl LayeredIO {
                 self.pending.remove(&req);
                 self.events.push_back(rebased(event, basis));
             }
-            Pending::Resolve { answers, .. } | Pending::Path { answers, .. } => {
-                // The first answer stands: a layer that lost its
-                // connection was answered for when it did.
-                if matches!(event, IoEvent::Fetched { .. }) || answers[index].is_some() {
+            Pending::Resolve { slots, .. } => {
+                // The first answer stands.
+                if matches!(event, IoEvent::Fetched { .. })
+                    || !matches!(slots[index].answer, Answer::Waiting)
+                {
                     return;
                 }
-                answers[index] = Some(event);
+                slots[index].answer = if unavailable && !names(&event) {
+                    Answer::Unavailable
+                } else {
+                    Answer::Got(event)
+                };
                 self.settle(req);
             }
         }
@@ -347,101 +466,70 @@ impl LayeredIO {
 
     /// Answer `req` once the topmost layer naming it is known.
     fn settle(&mut self, req: ReqId) {
-        let answers = match &self.pending[&req] {
-            Pending::Resolve { answers, .. } | Pending::Path { answers, .. } => answers,
-            Pending::Fetch { .. } => return,
+        let Some(Pending::Resolve { slots, .. }) = self.pending.get(&req) else {
+            return;
         };
         let mut chosen = None;
-        for (index, answer) in answers.iter().enumerate().rev() {
-            match answer {
-                None => return,
-                Some(event) if names(event) => {
+        for (index, slot) in slots.iter().enumerate().rev() {
+            match &slot.answer {
+                Answer::Waiting => return,
+                Answer::Got(event) if names(event) => {
                     chosen = Some(index);
                     break;
                 }
-                Some(_) => {}
+                Answer::Got(_) | Answer::Unavailable => {}
             }
         }
-        let event = match self.pending.remove(&req).expect("settled request is pending") {
-            Pending::Resolve {
-                uuid,
-                basis,
-                mut answers,
-            } => match chosen {
-                Some(index) => {
-                    let event = answers[index].take().expect("chosen answer");
-                    if let IoEvent::Resolved {
-                        result: ResolveResult::Built { content_hash },
-                        ..
-                    } = &event
-                    {
-                        self.route(&basis, *content_hash, index);
-                    }
-                    rebased(event, basis)
+        // Nothing available names it: wait for the unavailable layers.
+        if chosen.is_none()
+            && slots
+                .iter()
+                .any(|slot| matches!(slot.answer, Answer::Unavailable))
+        {
+            return;
+        }
+        let Some(Pending::Resolve {
+            asked,
+            basis,
+            mut slots,
+        }) = self.pending.remove(&req)
+        else {
+            unreachable!("settled request is pending");
+        };
+        let event = match chosen {
+            Some(index) => {
+                let slot = std::mem::replace(&mut slots[index].answer, Answer::Waiting);
+                let Answer::Got(event) = slot else {
+                    unreachable!("chosen answer");
+                };
+                if let IoEvent::Resolved {
+                    result: ResolveResult::Built { content_hash },
+                    ..
+                } = &event
+                {
+                    self.route(&basis, *content_hash, index, slots[index].basis.clone());
                 }
-                // Nothing names it: the topmost deletion, else missing.
-                None => IoEvent::Resolved {
-                    req,
-                    uuid,
-                    result: answers
-                        .iter()
-                        .rev()
-                        .find_map(|answer| match answer {
-                            Some(IoEvent::Resolved {
-                                result: result @ ResolveResult::Deleted { .. },
-                                ..
-                            }) => Some(result.clone()),
-                            _ => None,
-                        })
-                        .unwrap_or(ResolveResult::Missing),
-                    basis,
-                },
-            },
-            Pending::Path {
-                path,
-                basis,
-                mut answers,
-            } => match chosen {
-                Some(index) => rebased(answers[index].take().expect("chosen answer"), basis),
-                // Missing where any layer has a path table to look in.
-                None => IoEvent::PathResolved {
-                    req,
-                    path,
-                    result: if answers.iter().any(|answer| {
-                        matches!(
-                            answer,
-                            Some(IoEvent::PathResolved {
-                                result: PathResolveResult::Missing,
-                                ..
-                            })
-                        )
-                    }) {
-                        PathResolveResult::Missing
-                    } else {
-                        PathResolveResult::Unsupported
-                    },
-                    basis,
-                },
-            },
-            Pending::Fetch { .. } => unreachable!("fetches settle in answer"),
+                rebased(event, basis)
+            }
+            None => not_named(req, asked, basis, &slots),
         };
         self.events.push_back(event);
     }
 
-    fn route(&mut self, basis: &IoBasis, content_hash: ContentHash, layer: usize) {
+    fn route(&mut self, basis: &IoBasis, content_hash: ContentHash, layer: usize, at: IoBasis) {
         match self.routes.iter_mut().find(|(live, _)| live == basis) {
             Some((_, routes)) => {
-                routes.insert(content_hash, layer);
+                routes.insert(content_hash, (layer, at));
             }
             None => self
                 .routes
-                .push((basis.clone(), HashMap::from([(content_hash, layer)]))),
+                .push((basis.clone(), HashMap::from([(content_hash, (layer, at))]))),
         }
     }
 
     /// The layer that answered `content_hash` under `basis`, else under any
     /// live basis (a payload carried across a rebase).
-    fn route_of(&self, basis: &IoBasis, content_hash: ContentHash) -> Option<usize> {
+    fn route_of(&self, basis: &IoBasis, content_hash: ContentHash) -> Option<(usize, IoBasis)> {
         self.routes
             .iter()
             .find(|(live, _)| live == basis)
@@ -452,7 +540,64 @@ impl LayeredIO {
                     .rev()
                     .find_map(|(_, routes)| routes.get(&content_hash))
             })
-            .copied()
+            .cloned()
+    }
+
+    /// Whether a live stack basis or a live re-ask still uses `layer_basis`
+    /// at layer `index`.
+    fn layer_basis_in_use(&self, index: usize, layer_basis: &IoBasis) -> bool {
+        self.live
+            .iter()
+            .any(|live| live.layers().is_some_and(|live| live[index] == *layer_basis))
+            || self
+                .reasked
+                .iter()
+                .any(|(_, layer, basis)| *layer == index && basis == layer_basis)
+    }
+}
+
+/// The answer when no layer names the request: the topmost deletion, else
+/// missing; a path is missing when any layer has a path table to look in.
+fn not_named(req: ReqId, asked: Asked, basis: IoBasis, slots: &[Slot]) -> IoEvent {
+    let answers = || {
+        slots.iter().rev().filter_map(|slot| match &slot.answer {
+            Answer::Got(event) => Some(event),
+            _ => None,
+        })
+    };
+    match asked {
+        Asked::Asset(uuid) => IoEvent::Resolved {
+            req,
+            uuid,
+            result: answers()
+                .find_map(|event| match event {
+                    IoEvent::Resolved {
+                        result: result @ ResolveResult::Deleted { .. },
+                        ..
+                    } => Some(result.clone()),
+                    _ => None,
+                })
+                .unwrap_or(ResolveResult::Missing),
+            basis,
+        },
+        Asked::Path(path) => IoEvent::PathResolved {
+            req,
+            path,
+            result: if answers().any(|event| {
+                matches!(
+                    event,
+                    IoEvent::PathResolved {
+                        result: PathResolveResult::Missing,
+                        ..
+                    }
+                )
+            }) {
+                PathResolveResult::Missing
+            } else {
+                PathResolveResult::Unsupported
+            },
+            basis,
+        },
     }
 }
 
@@ -517,6 +662,7 @@ impl LoaderIO for LayeredIO {
         self.bound = false;
         self.pending.clear();
         self.routes.clear();
+        self.reasked.clear();
         self.live.clear();
         for index in 0..self.layers.len() {
             self.layers[index].bound = false;
@@ -547,43 +693,37 @@ impl LoaderIO for LayeredIO {
         self.live.retain(|live| live != basis);
         self.routes.retain(|(live, _)| live != basis);
         self.pending.retain(|_, pending| match pending {
-            Pending::Resolve { basis: issued, .. }
-            | Pending::Path { basis: issued, .. }
-            | Pending::Fetch { basis: issued, .. } => issued != basis,
+            Pending::Resolve { basis: issued, .. } | Pending::Fetch { basis: issued, .. } => {
+                issued != basis
+            }
         });
-        for (index, layer_basis) in bases.iter().enumerate() {
-            let shared = self
-                .live
-                .iter()
-                .any(|live| live.layers().is_some_and(|live| live[index] == *layer_basis));
-            if !shared {
-                self.layers[index].layer.io.end_sweep(layer_basis);
+        let mut ended = bases.iter().cloned().enumerate().collect::<Vec<_>>();
+        let reasked = std::mem::take(&mut self.reasked);
+        for (stack, index, layer_basis) in reasked {
+            if stack == *basis {
+                if !ended.contains(&(index, layer_basis.clone())) {
+                    ended.push((index, layer_basis));
+                }
+            } else {
+                self.reasked.push((stack, index, layer_basis));
+            }
+        }
+        for (index, layer_basis) in ended {
+            if !self.layer_basis_in_use(index, &layer_basis) {
+                self.layers[index].layer.io.end_sweep(&layer_basis);
             }
         }
     }
 
     fn resolve(&mut self, req: ReqId, uuid: AssetUuid, basis: &IoBasis) {
-        let Some(bases) = self.layer_bases(basis) else {
-            return self.foreign_basis(req, basis);
-        };
-        self.pending.insert(
-            req,
-            Pending::Resolve {
-                uuid,
-                basis: basis.clone(),
-                answers: vec![None; bases.len()],
-            },
-        );
-        for (state, layer_basis) in self.layers.iter_mut().zip(bases) {
-            state.layer.io.resolve(req, uuid, layer_basis);
-        }
+        self.issue(req, Asked::Asset(uuid), basis);
     }
 
     fn fetch(&mut self, req: ReqId, content_hash: ContentHash, basis: &IoBasis) {
-        let Some(bases) = self.layer_bases(basis) else {
+        if self.layer_bases(basis).is_none() {
             return self.foreign_basis(req, basis);
-        };
-        let Some(layer) = self.route_of(basis, content_hash) else {
+        }
+        let Some((layer, at)) = self.route_of(basis, content_hash) else {
             self.events.push_back(IoEvent::RequestError {
                 req,
                 message: format!("no layer answered content hash {content_hash:?}"),
@@ -598,27 +738,11 @@ impl LoaderIO for LayeredIO {
                 layer,
             },
         );
-        self.layers[layer]
-            .layer
-            .io
-            .fetch(req, content_hash, &bases[layer]);
+        self.layers[layer].layer.io.fetch(req, content_hash, &at);
     }
 
     fn resolve_path(&mut self, req: ReqId, path: &AssetPath, basis: &IoBasis) {
-        let Some(bases) = self.layer_bases(basis) else {
-            return self.foreign_basis(req, basis);
-        };
-        self.pending.insert(
-            req,
-            Pending::Path {
-                path: path.clone(),
-                basis: basis.clone(),
-                answers: vec![None; bases.len()],
-            },
-        );
-        for (state, layer_basis) in self.layers.iter_mut().zip(bases) {
-            state.layer.io.resolve_path(req, path, layer_basis);
-        }
+        self.issue(req, Asked::Path(path.clone()), basis);
     }
 
     fn subscribe(&mut self, uuid: AssetUuid) {
