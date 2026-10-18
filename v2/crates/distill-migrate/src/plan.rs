@@ -479,9 +479,9 @@ impl Ctx<'_> {
         let mut nf = new_frames.to_vec();
         nf.push(new);
         let mut ops = Vec::new();
-        for (nname, nrev, npayload) in new_variants {
-            let by_name = old_variants.iter().find(|(oname, _, _)| oname == nname);
-            let Some((_, orev, opayload)) = by_name else {
+        for (nindex, (nname, nrev, npayload)) in new_variants.iter().enumerate() {
+            let by_name = old_variants.iter().enumerate().find(|(_, (oname, _, _))| oname == nname);
+            let Some((oindex, (_, orev, opayload))) = by_name else {
                 continue; // new-only variants need no op
             };
             let vdisp = format!("{disp}{{{nname}}}");
@@ -508,7 +508,10 @@ impl Ctx<'_> {
                         fields: pf2,
                     },
                 ) => {
-                    if payload_identical(opayload, npayload, &of, &nf) {
+                    // A value names its variant by index: one an added or
+                    // removed variant moved is mapped by name even when
+                    // its payload is unchanged.
+                    if oindex == nindex && payload_identical(opayload, npayload, &of, &nf) {
                         continue; // unchanged variants pass through
                     }
                     if pr1 != pr2 {
@@ -558,8 +561,8 @@ impl Ctx<'_> {
             // output conformance check surfaces it (§11 integrity).
         }
         if ops.is_empty() && self.refusals.len() == refusals_before {
-            // Only additions / droppable removals: surviving variants pass
-            // through — one plain copy covers the enum leaf (PINNED).
+            // Only additions / droppable removals that moved no surviving
+            // variant's index: surviving variants pass through — one plain copy covers the enum leaf (PINNED).
             return vec![MigrationOp::CopyField {
                 from: FieldPath(at.clone()),
                 to: FieldPath(at),
