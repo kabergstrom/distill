@@ -984,6 +984,11 @@ impl RootedScanner {
         event_key(&self.root_snapshot(), path)
     }
 
+    /// Whether `root` names one of the current roots.
+    pub fn has_root(&self, root: &str) -> bool {
+        self.root_snapshot().contains_key(root)
+    }
+
     pub fn physical_path(&self, root: &str, path: &str) -> Result<PathBuf, ScanError> {
         let roots = self.root_snapshot();
         let root = roots

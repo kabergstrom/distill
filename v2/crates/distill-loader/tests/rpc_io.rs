@@ -712,11 +712,11 @@ fn rpc_io_reports_a_restart_requirement_and_its_clearing() {
 
     project
         .coordinator()
-        .set_restart_required(&[RestartOnlyChange::AutoCodegen(true)])
+        .set_restart_required(&[RestartOnlyChange::CodegenOutputs("main generated bindings\n".into())])
         .unwrap();
     assert!(matches!(
         poll_until(&mut io, 1).as_slice(),
-        [IoEvent::RestartRequired { keys }] if keys == &["codegen.auto_codegen"]
+        [IoEvent::RestartRequired { keys }] if keys == &["codegen.output"]
     ));
     // The file again matches what the daemon runs with: the requirement
     // clears with an empty key set.
@@ -864,6 +864,187 @@ fn rpc_io_index_changes_share_the_stream_with_the_loaders_deltas() {
                 if assets == &vec![(first, distill_loader::AssetDeltaState::Changed)]
         )),
         "{events:?}"
+    );
+
+    drop(io);
+    server_thread.join().unwrap();
+}
+
+/// An `RpcIo` started in the background answers as a daemon naming nothing
+/// until it connects, keeps retrying, and reports its status. After losing
+/// the connection, what it named fails instead of going missing.
+#[test]
+fn rpc_io_in_background_names_nothing_until_it_connects() {
+    let Fixture {
+        project: _project,
+        server,
+        request,
+        asset,
+        ..
+    } = fixture();
+    // A port nothing listens on yet.
+    let address = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let target = RuntimeTarget {
+        epoch: distill_loader::GameModuleEpoch(1),
+        target_definition_hash: request.target_definition_hash.0,
+    };
+    let mut io = RpcIo::connect_in_background(address, request).unwrap();
+    assert!(!io.status().connected);
+    io.bind_target(target);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while io.status().last_error.is_none() {
+        io.poll();
+        assert!(Instant::now() < deadline, "no connection error reported");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let disconnected = io.begin_sweep();
+    assert_eq!(disconnected, IoBasis::Disconnected);
+    io.resolve(ReqId(1), asset, &disconnected);
+    io.resolve_path(ReqId(2), &AssetPath::from(PATH), &disconnected);
+    io.fetch(ReqId(3), distill_core::id::ContentHash([0; 16]), &disconnected);
+    let unreachable = poll_until(&mut io, 3);
+    assert!(unreachable.iter().any(|event| matches!(event,
+        IoEvent::Resolved { req: ReqId(1), result: ResolveResult::Missing, basis, .. }
+            if *basis == disconnected)));
+    assert!(unreachable.iter().any(|event| matches!(event,
+        IoEvent::PathResolved { req: ReqId(2), result: distill_loader::PathResolveResult::Missing, .. })));
+    assert!(unreachable.iter().any(|event| matches!(event,
+        IoEvent::RequestError { req: ReqId(3), .. })));
+
+    // The daemon starts: the retry connects.
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
+    let root = server.root();
+    let server_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&runtime, async move {
+            let listener = StagedListener::bind(root, &address.to_string())
+                .await
+                .unwrap();
+            let connection = listener.accept_one().await.unwrap();
+            drop(listener);
+            close_rx.await.unwrap();
+            connection.close();
+            connection.await.unwrap().unwrap();
+        });
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let events = io.poll();
+        if events.iter().any(|event| matches!(event, IoEvent::TargetBound { .. })) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the background connect never bound");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(io.status().last_error, None);
+    assert!(io.status().connected);
+    let basis = io.begin_sweep();
+    assert!(matches!(basis, IoBasis::Rpc { .. }));
+    io.resolve(ReqId(4), asset, &basis);
+    assert!(poll_until(&mut io, 1).iter().any(|event| matches!(event,
+        IoEvent::Resolved { req: ReqId(4), result: ResolveResult::Built { .. }, .. })));
+    // The stream notices the connection go.
+    io.subscribe(asset);
+    poll_for(&mut io, Duration::from_millis(100));
+
+    // The connection goes: no delta, and the asset it named fails rather
+    // than going missing.
+    close_tx.send(()).unwrap();
+    let lost = poll_until(&mut io, 1);
+    assert!(
+        matches!(lost.as_slice(), [IoEvent::ReconnectRequired { .. }]),
+        "{lost:?}"
+    );
+    assert!(!io.status().connected);
+    assert!(io.status().last_error.is_some());
+    io.resolve(ReqId(5), asset, &basis);
+    io.resolve(ReqId(6), AssetUuid([99; 16]), &basis);
+    let answers = poll_until(&mut io, 2);
+    assert!(answers.iter().any(|event| matches!(event,
+        IoEvent::RequestError { req: ReqId(5), .. })), "{answers:?}");
+    assert!(answers.iter().any(|event| matches!(event,
+        IoEvent::Resolved { req: ReqId(6), result: ResolveResult::Missing, .. })), "{answers:?}");
+
+    drop(io);
+    server_thread.join().unwrap();
+}
+
+/// The engine's first frames: a path requested of a stack whose daemon
+/// layer has not connected yet waits for it instead of answering missing.
+#[test]
+fn a_layer_stack_waits_for_its_daemon_before_answering_what_nothing_names() {
+    let Fixture {
+        project: _project,
+        server,
+        request,
+        asset,
+        ..
+    } = fixture();
+    let address = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let target = RuntimeTarget {
+        epoch: distill_loader::GameModuleEpoch(1),
+        target_definition_hash: request.target_definition_hash.0,
+    };
+    let daemon = RpcIo::connect_in_background(address, request).unwrap();
+    let mut io = distill_loader::LayeredIO::new(vec![distill_loader::Layer::new(daemon).optional()]);
+    io.bind_target(target);
+    assert!(matches!(io.poll().as_slice(), [IoEvent::TargetBound { .. }]));
+    let basis = io.begin_sweep();
+    io.resolve_path(ReqId(1), &AssetPath::from(PATH), &basis);
+    let deadline = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < deadline {
+        let events = io.poll();
+        assert!(
+            events.iter().all(|event| matches!(event, IoEvent::ConnectionError { .. })),
+            "answered before the daemon connected: {events:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let root = server.root();
+    let server_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&runtime, async move {
+            let listener = StagedListener::bind(root, &address.to_string())
+                .await
+                .unwrap();
+            let connection = listener.accept_one().await.unwrap();
+            drop(listener);
+            connection.await.unwrap().unwrap();
+        });
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let resolved = loop {
+        let events = io.poll();
+        if let Some(event) = events
+            .into_iter()
+            .find(|event| matches!(event, IoEvent::PathResolved { .. }))
+        {
+            break event;
+        }
+        assert!(Instant::now() < deadline, "the path was never answered");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(
+        matches!(&resolved, IoEvent::PathResolved {
+            req: ReqId(1),
+            result: distill_loader::PathResolveResult::Resolved(found),
+            basis: got,
+            ..
+        } if *found == asset && *got == basis),
+        "{resolved:?}"
     );
 
     drop(io);

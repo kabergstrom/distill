@@ -33,9 +33,10 @@ apis = ["vulkan"]
 optimize = false
 debug_info = true
 
-[codegen]
+[[codegen.output]]
+root = "main"
 rs_mod_path = '{}'
-auto_codegen = true
+codegen = "bindings"
 
 [pipeline]
 parallelism = 8
@@ -158,6 +159,86 @@ fn rejects_empty_target_apis_retired_lineage_key_and_watched_output_nesting() {
         matches!(result, Err(DaemonConfigError::PathOverlap { .. })),
         "unexpected result: {result:?}"
     );
+}
+
+#[test]
+fn codegen_outputs_name_configured_roots_and_disjoint_namespaces() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("distill.toml");
+    std::fs::create_dir_all(temp.path().join("shaders")).unwrap();
+    let two_roots = valid_config(&temp).replace(
+        "roots = { main = ",
+        &format!(
+            "roots = {{ shaders = '{}', main = ",
+            temp.path().join("shaders").display()
+        ),
+    );
+    let second = |rs_mod_path: &str, root: &str| {
+        format!(
+            "{two_roots}\n[[codegen.output]]\nroot = \"{root}\"\nrs_mod_path = '{rs_mod_path}'\ncodegen = \"bindings\"\n"
+        )
+    };
+
+    // Two outputs on two roots, in order.
+    let config = DaemonConfig::parse(&path, &second("engine/shaders", "shaders")).unwrap();
+    let outputs = &config.codegen.outputs;
+    assert_eq!(outputs.len(), 2);
+    assert_eq!((outputs[0].root.as_str(), outputs[1].root.as_str()), ("main", "shaders"));
+    assert!(outputs[1].rs_mod_path.ends_with("engine/shaders"));
+    assert!(outputs[1].rs_mod_path.is_absolute());
+
+    // No output: no codegen, and the section may be left out.
+    let none = valid_config(&temp).replace(
+        &format!(
+            "[[codegen.output]]\nroot = \"main\"\nrs_mod_path = '{}'\ncodegen = \"bindings\"\n",
+            temp.path().join("generated").display()
+        ),
+        "",
+    );
+    assert!(!none.contains("codegen"));
+    assert!(DaemonConfig::parse(&path, &none).unwrap().codegen.outputs.is_empty());
+
+    // The retired keys are unknown fields.
+    let retired = format!("{none}\n[codegen]\nrs_mod_path = \"generated\"\nauto_codegen = true\n");
+    assert!(matches!(
+        DaemonConfig::parse(&path, &retired),
+        Err(DaemonConfigError::Toml(_))
+    ));
+
+    // An unknown root.
+    let error = DaemonConfig::parse(&path, &second("engine/shaders", "glsl")).unwrap_err();
+    assert!(
+        matches!(&error, DaemonConfigError::CodegenOutput(detail) if detail.contains("glsl")),
+        "{error:?}"
+    );
+
+    // A namespace inside another, or the same one twice.
+    for nested in [
+        temp.path().join("generated/inner"),
+        temp.path().join("generated"),
+        temp.path().to_path_buf(),
+    ] {
+        let error = DaemonConfig::parse(&path, &second(&nested.display().to_string(), "shaders"))
+            .unwrap_err();
+        assert!(
+            matches!(error, DaemonConfigError::CodegenOutputOverlap { .. } | DaemonConfigError::PathOverlap { .. }),
+            "{nested:?}: {error:?}"
+        );
+    }
+    let error = DaemonConfig::parse(
+        &path,
+        &second(&temp.path().join("generated/inner").display().to_string(), "shaders"),
+    )
+    .unwrap_err();
+    assert!(matches!(error, DaemonConfigError::CodegenOutputOverlap { .. }), "{error:?}");
+
+    // A namespace inside another output's root.
+    let error = DaemonConfig::parse(
+        &path,
+        &second(&temp.path().join("shaders/generated").display().to_string(), "main"),
+    )
+    .unwrap_err();
+    assert!(matches!(error, DaemonConfigError::PathOverlap { .. }), "{error:?}");
 }
 
 #[test]

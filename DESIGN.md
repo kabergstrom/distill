@@ -3112,7 +3112,7 @@ Each rule has a fixed id (`ENGINE_DEFAULT_IMPORTS` in `newgameplus-pipeline/src/
 | `ngp.font` | `FontImportSettings` (`face`) | `**/*.{ttf,otf,ttc}` | Explicit imports today (`Roboto-Regular.ttf.bundle`): precedence 1 keeps them. `NotoSansSC-Regular.otf` is CFF, which `ngp.font` rejects (TrueType only): excluded in `example-module/assets/distill.toml` |
 | `ngp.sound` | none | `**/*.{wav,ogg,flac}` | |
 | `ngp.prefab` | none | `**/*.prefab` | |
-| `ngp.glsl` | `GlslSettings` | `**/*.{vert,frag,comp}` | Includes (`.glsl`) have no rule. deferred-ngp excludes its `glsl` root (`["**"]`): its stages are cooked by `compile_shaders.sh` and embedded, but the explicitly imported ones |
+| `ngp.glsl` | `GlslSettings` | `**/*.{frag,comp}` (a `.frag` pairs with its `.vert`) | Includes (`.glsl`) and `.vert` stages have no rule. Every stage in newgameplus's `glsl` roots is a default import (newgameplus GAP 28) |
 
 #### Pipeline updates
 
@@ -6669,6 +6669,10 @@ pub enum ManifestState {
 pub enum IoBasis {
     Rpc { snapshot: SnapshotStamp },
     Pack { manifest: ManifestHash },
+    /// RpcIO before its first connection (RpcIO without a daemon, below).
+    Disconnected,
+    /// LayeredIO: one basis per layer, bottom to top (§16, "Layer stack").
+    Layers(Arc<[IoBasis]>),
 }
 /// A pack manifest's manifest hash (§16): the mounted pack's identity.
 pub struct ManifestHash(pub [u8; 16]);
@@ -7021,7 +7025,8 @@ waits for admission, so a waiting fetch cannot stall a frame.
 /// connection epoch, and stale completions are discarded explicitly.
 pub struct ReqId(pub u64);
 
-pub trait LoaderIO {                     // RpcIO (dev) | PackfileIO (ship), no third path
+pub trait LoaderIO {                     // RpcIO (dev) | PackfileIO (ship), no third path;
+                                         // LayeredIO stacks them (§16)
     /// The basis every call of the coming sweep is issued under: RpcIO
     /// returns the stamp of the newest snapshot it holds (never waiting:
     /// an event that starts a new round is published only once such a
@@ -7118,6 +7123,29 @@ TypeUuid and logical hash to match the current local descriptor, rejects a local
 native layout. Plans are owned by the resident game-module epoch and are
 dropped during its drain. There is no global registry comparison, accepted
 set, expansion protocol, or mutable compatibility handshake.
+
+### RpcIO without a daemon
+
+- `RpcIo::connect` waits for the daemon (`connect_timeout`) and fails the
+  caller without one. `RpcIo::connect_in_background` never waits: it
+  starts unconnected (basis `IoBasis::Disconnected`), and the first
+  `bind_target` starts connecting.
+- A failed attempt retries with backoff, 25 ms doubling to 1 s, as every
+  rebind does; `TargetRejected` once per rebind after
+  `target_rejection_after` failures, retries continuing.
+- While no connection serves (none yet, or one that reported
+  `ReconnectRequired`, until the rebind binds), requests are answered at
+  once:
+  - a resolve or path this IO never named: `Missing`; as a `LayeredIO`
+    layer it is then unavailable, not "not named" (§16, "Layer stack"):
+    lower layers answer what they name, the rest waits for it;
+  - one whose last answer named it: `RequestError`, so its component
+    freezes with what is resident instead of turning `Dead`;
+  - a fetch: `RequestError`.
+- Losing a connection publishes no delta: nothing resident is deleted.
+- `RpcIo::status()` → `RpcIoStatus { address, connected, last_error }`;
+  `last_error` is the last failed attempt or the lost connection, `None`
+  once a connection binds. The engine shows "Distill unreachable" from it.
 
 ### Carried over from v1
 
@@ -7592,6 +7620,69 @@ pub struct PackDefinition {
                                       // Unsupported at request time (§15)
 }
 ```
+
+### Layer stack
+
+- `LayeredIO` (`distill-loader/src/layered.rs`): one `LoaderIO` over
+  ordered `Layer`s, bottom to top, each a `PackfileIO` (on disk or
+  `mount_static`) or an `RpcIo`. It composes the two IO paths; it is not a
+  third. Stacks: dev `[engine pack, daemon]`; ship `[engine pack, game
+  pack]`, DLC/mod packs above.
+- **Lookup is first hit from the top**: layers add or replace, never
+  delete.
+- **Resolve and resolve_path** go to every layer, each under its own
+  basis. The answer is the topmost layer naming it, taken once every
+  higher layer answered "not named" (`Missing`, `Deleted`, a path's
+  `Unsupported`). Every other answer names it (`Built`, `Failed`,
+  `Drifted`, `RoleIneligible`, `RequestError`, `SnapshotExpired`). Named
+  by none: the topmost `Deleted`, else `Missing`; a path `Missing` when
+  any layer has a path table, else `Unsupported`.
+- **Unavailable layers**: an optional layer that is not bound (never
+  connected, or its connection lost) is unavailable; its "not named"
+  answer means nothing.
+  - What an available lower layer names is answered by it, as above (the
+    engine pack's shaders load with no daemon).
+  - What no available layer names stays pending, with no terminal event,
+    while a layer above is unavailable. Once that layer binds, the request
+    is asked of it again at its newest basis (ended with the request's
+    stack basis), and the top-down rule applies to its answer. The stack
+    sets no timeout: the engine's startup timeout names what is pending.
+  - What the unavailable layer named before fails (`RequestError`), so
+    resident values stay (§15, "RpcIO without a daemon").
+- **Fetch** goes to the layer whose resolve answered that `ContentHash`
+  under the request's basis, at the layer basis it was asked at (else
+  under any live basis: a payload carried across a rebase).
+- **Closure edges resolve through the stack**: a daemon asset may
+  load-reference an engine pack asset. A pack's mount still requires its
+  own closure inside it (`verify_expected_terminals`).
+- **Basis** `IoBasis::Layers`: one basis per layer; a delta in any layer
+  is a new loader round. `end_sweep` ends a layer basis at its layer only
+  once no live stack basis shares it (a pack's unchanged basis outlives a
+  daemon delta).
+- **Events**: one terminal event per request, carrying the stack basis it
+  was issued under; `end_sweep` and `bind_target` cancel without one. A
+  delta from any layer but the bottom publishes `Deleted` as `Changed`:
+  the asset re-resolves and the stack answers whether it is gone.
+- **Subscriptions** go to every layer (no-ops on packs).
+- **Targets**: each layer binds its own (`Layer::with_target`: the engine
+  pack's target under the game's loader). The stack's `TargetBound` waits
+  for every layer not marked `Layer::optional`; a required layer's
+  `TargetRejected` is the stack's.
+- **An optional layer** (the daemon):
+  - never delays or fails the binding; its rejections are
+    `ConnectionError` diagnostics;
+  - its `ReconnectRequired` stays inside the stack: it alone rebinds;
+    resolves it still owed are asked of it again unbound (unavailable, or
+    `RequestError` for what it named), fetches it owed fail; nothing
+    re-resolves or is deleted (§15, "RpcIO without a daemon");
+  - binding after the stack did (the daemon connects or reconnects) is a
+    change: every subscribed asset and path is published `Changed`, so
+    what it now names (an engine shader edited under a daemon mounting
+    its sources) becomes a new revision.
+- **Engine access**: `LayeredIO::layer::<T>()` / `layer_mut::<T>()` return
+  the topmost layer of a type (`RpcIo::status`, authoring calls);
+  `layer_bound(index)`.
+- Patches stay within a layer: a new manifest plus missing blobs (above).
 
 ## 17. RPC Interface
 
@@ -8085,9 +8176,13 @@ macos-dev = { os = "macos", arch = "aarch64", apis = ["metal"] }
 # item); a non-host target like this is illustrative until that lands.
 win-ship  = { os = "windows", arch = "x86_64", apis = ["vulkan", "dx12"] }
 
-[codegen]
+# One generated Rust namespace per entry (§20): the registered codegen
+# `codegen` generates `rs_mod_path` from the assets under the root `root`.
+# No entry, no codegen.
+[[codegen.output]]
+root = "engine"
 rs_mod_path = "../newgameplus-api/src/shaders/"
-auto_codegen = true
+codegen = "ngp.glsl-rust"
 
 [pipeline]
 parallelism = 8
@@ -8144,8 +8239,8 @@ root, `daemon.address` **loopback**
 (a non-loopback bind is a typed error at staging: the RPC surface is
 unauthenticated by design, §17, and remote access is a named open item,
 §22), `state_path`, module artifact paths, and every daemon-owned
-output directory (`rs_mod_path` included) **disjoint from — never
-nested inside — every asset root** (a violation is a staging-time
+output directory (each `[[codegen.output]]` `rs_mod_path` included) **disjoint from — never
+nested inside — every asset root**, the codegen namespaces disjoint from each other too (a violation is a staging-time
 error naming both paths: a daemon writing inside a watched root would
 advance input versions with its own outputs, an unbounded feedback
 loop; §14's scanner excludes daemon-owned directories by identity as
@@ -8239,7 +8334,7 @@ ships; an unclassified key is a spec defect:
 | `daemon.displaced_retention_days` | operational-live | applies at the next retention sweep (§14) |
 | `daemon.state_path` | restart-only | daemon state is disposable (§2): relocation is stop, move-or-rebuild, start |
 | `daemon.address` | restart-only | rebinding requires a restart; loopback is validated at staging either way (above) |
-| `[codegen]` (`rs_mod_path`, `auto_codegen`) | restart-only | the codegen service reconfigures at startup — retargeting `rs_mod_path` mid-flight would orphan generated files and their journal pre-images (§20) |
+| `[[codegen.output]]` (`root`, `rs_mod_path`, `codegen`) | restart-only | the codegen service reconfigures at startup — retargeting an `rs_mod_path` mid-flight would orphan generated files and their journal pre-images (§20); staging requires each `root` to name a configured root and each `rs_mod_path` to be disjoint from every root and every other output; the restart key is `codegen.output` |
 
 **Restart-only keys still stage and validate.** An edit to a
 restart-only key follows the same staged-candidate validation as every
@@ -8370,7 +8465,7 @@ input hash.
 An authoring-side service, like auto-migration — not a build-graph node. It
 runs the `RUST_CODEGEN` reflection pass against source bundles under its own
 recorded dep trace, generates `<pipeline>.rs`, diffs against the tree, and
-writes only on change (gated by `auto_codegen`); the `mod.rs` chain is
+writes only on change; the `mod.rs` chain is
 maintained under a recorded query over all `ShaderPipeline` assets. A
 body-only edit diffs to a no-op — no `.rs` mtime bump, no cargo rebuild
 cascade. A new pipeline gets its `.rs` as soon as its import lands, with no
@@ -8380,6 +8475,26 @@ Every source-entry hit or miss is recorded as a trace
 identity; query membership remains an ordinary `TraceOp::Query`. This keeps
 codegen on the shared outcome-bearing trace/revalidation path without treating
 authored bundle bytes as artifact ContentHashes.
+
+**Outputs, one namespace each.** The configuration declares the generated
+namespaces as `[[codegen.output]] { root, rs_mod_path, codegen }` (§18):
+the codegen the pipeline module registered as `codegen`
+(`register_codegen`, `CodegenDescriptor::id`) generates the directory
+`rs_mod_path` from the assets under the asset root `root`. No entry, no
+codegen. Each output is its own namespace — its own `mod.rs`, collision
+check, mark checks, stale-file deletion, installed trace and attempted
+basis — and one output's failure fails only that output. Two outputs may
+name one root (two codegens over it) or one codegen (one generator, two
+crates). An output whose codegen the module does not register fails at
+each basis as a codegen failure (the background error), naming the id;
+the module can be fixed and reloaded without a restart.
+
+**Root-restricted reads.** A run's `PipelineCodegenContext` serves one
+output: `root()` names its root, `query` answers only assets whose bundle
+lies under it (a poisoned bundle under another root never fails it), and
+`read` of an asset under another root answers `None`. Trace observations
+revalidate under the same restriction, so an edit under another root never
+reruns the output.
 
 Each codegen attempt returns a single `CodegenAttempt { basis, trace,
 outcome }`: the pinned input/configuration basis, the complete outcome-bearing
@@ -8426,19 +8541,55 @@ Generated physical names have exactly one grammar and one authority:
 `sp_<32hex>.rs`; neither contains `local_id`, title, path, or an escaped
 human spelling. An optional display slug may be emitted in a comment or
 side-table only if it is at most 32 ASCII bytes and matches
-`[a-z0-9_]+`; it is non-authoritative, never a filename/module/key, and may
-change without identity or path churn. Authored strings embedded in generated
+`[a-z0-9_]+`; it is non-authoritative, never a filename or key, and may
+change without identity or path churn. A generated file may also carry an
+**alias** (`GeneratedFile::with_alias`): `[a-z_][a-z0-9_]*`, at most 64
+bytes, not `_` and not a Rust keyword (`alias_defect`; a bad one fails
+the batch as `CodegenFailure::InvalidAlias`). The physical name stays the
+identity — file, module, mark — and the alias is a re-export: `mod.rs`
+holds `#[doc(hidden)] pub mod sp_<32hex>;` and `pub use self::sp_<32hex> as
+<alias>;` for an aliased file (a private module cannot be re-exported),
+`pub mod sp_<32hex>;` otherwise. Renaming the source a
+codegen derives the alias from changes the re-export only, so call sites
+naming the old alias break at compile time, never silently.
+Authored strings embedded in generated
 content use ordinary Rust string escaping and never influence token or path
 boundaries. Before writing anything, the generator materializes and
 validates the **entire generated namespace** — filenames, module names,
-and `mod.rs` entries — for collisions. Any collision is a build/codegen
-failure naming every claimant, and the batch writes nothing; replacement
+aliases and `mod.rs` entries — for collisions (an alias against every
+other alias and every physical module name). Any collision is a
+build/codegen failure (`CodegenFailure::NamespaceCollision`) naming every
+claimant, and the batch writes nothing; replacement
 is never a collision policy. Before each batch the codegen service canonicalizes
 and revalidates `rs_mod_path`, and it rejects symlinked destination entries;
 filesystem drift fails or retries the batch without publishing state (§14).
 Generated content is escaped as data: every
 string literal is emitted through Rust string escaping — authored
 text can never terminate a literal or smuggle tokens into generated source.
+
+**`mod.rs`.** `PipelineCodegen::generate` returns a `CodegenOutput { files,
+mod_preamble, mod_items }`. The namespace's `mod.rs`, under its generated
+mark like every unit, holds three sections, each ending in a newline, a
+blank line between them, an empty one left out:
+
+- `mod_preamble` (e.g. `#![allow(dead_code)]`);
+- the module lines, by physical name;
+- `mod_items` (e.g. `pub const ALL: &[ShaderAsset] = &[…];` listing every
+  unit).
+
+The bytes depend on the output alone, so a run that generates what stands
+rewrites nothing.
+
+**One-shot codegen.** `distilld codegen <config> [--check]` runs without a
+daemon: it opens the configuration's state, reconciles the roots as a
+starting daemon does (imports included; import failures are logged and the
+bundles read as they are), runs every output once and publishes. It prints
+one line per generated file it created, updated or deleted. With `--check`
+it writes no generated file: it prints each file that would change and
+exits 1 if any would, 0 if every output is current. Any failure (a
+codegen failure, a collision, an unregistered codegen, a running daemon)
+exits 2. A daemon serving the configuration holds its state lock, and the
+command refuses to run beside it: that daemon generates the outputs itself.
 
 ### Invalidation walk-through
 

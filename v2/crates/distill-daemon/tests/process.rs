@@ -37,9 +37,6 @@ os = "macos"
 arch = "aarch64"
 apis = ["vulkan"]
 optimize = false
-[codegen]
-rs_mod_path = '{}'
-auto_codegen = false
 [pipeline]
 parallelism = 2
 max_dependency_depth = 64
@@ -52,7 +49,15 @@ cache_limit = "8MiB"
         assets.display(),
         temp.path().join("schema.json").display(),
         temp.path().join("pipeline.so").display(),
-        temp.path().join("generated").display(),
+    )
+}
+
+/// `source` with the one `[[codegen.output]]`: root `main` to `generated`,
+/// by the codegen `bindings`.
+fn with_codegen_output(temp: &tempfile::TempDir, source: &str) -> String {
+    format!(
+        "{source}[[codegen.output]]\nroot = \"main\"\nrs_mod_path = '{}'\ncodegen = \"bindings\"\n",
+        temp.path().join("generated").display()
     )
 }
 
@@ -215,7 +220,7 @@ fn process_serves_rpc_and_consumes_watcher_changes_until_drop() {
     assert!(process.last_background_error().is_none());
     assert!(
         !temp.path().join("generated").exists(),
-        "disabled codegen must not create its output directory"
+        "a configuration without codegen outputs creates no output directory"
     );
     drop(process);
 }
@@ -315,11 +320,16 @@ fn state_from_an_older_store_schema_is_recreated_and_the_daemon_starts() {
 
 #[cfg(unix)]
 #[test]
-fn disabled_existing_codegen_output_is_still_excluded() {
+fn an_existing_codegen_output_is_excluded_from_the_namespace() {
     use std::os::unix::fs::symlink;
 
     let temp = tempfile::tempdir().unwrap();
-    let config = config(&temp);
+    // The assets root and the schema.
+    config(&temp);
+    let path = temp.path().join("distill.toml");
+    std::fs::write(&path, with_codegen_output(&temp, &config_source(&temp))).unwrap();
+    let config = DaemonConfig::load(path).unwrap();
+    assert_eq!(config.codegen.outputs.len(), 1);
     let output = temp.path().join("generated");
     std::fs::create_dir_all(&output).unwrap();
     std::fs::write(output.join("owned.rs"), b"daemon owned").unwrap();
@@ -669,11 +679,11 @@ fn restart_only_configuration_is_announced_without_an_input_version() {
         .current_stamp()
         .unwrap()
         .version;
-    let edited = config_source(&temp).replace("auto_codegen = false", "auto_codegen = true");
+    let edited = with_codegen_output(&temp, &config_source(&temp));
     std::fs::write(temp.path().join("distill.toml"), edited).unwrap();
 
     wait_until(
-        || process.coordinator().server_handle().restart_required().1 == ["codegen.auto_codegen"],
+        || process.coordinator().server_handle().restart_required().1 == ["codegen.output"],
         "restart-only edit was not announced",
     );
     assert_eq!(
@@ -692,14 +702,14 @@ fn restart_only_configuration_is_announced_without_an_input_version() {
 }
 
 #[test]
-fn startup_auto_codegen_activates_the_service_and_surfaces_pipeline_unavailability() {
+fn a_startup_codegen_output_activates_the_service_and_surfaces_pipeline_unavailability() {
     let temp = tempfile::tempdir().unwrap();
     let assets = temp.path().join("assets");
     std::fs::create_dir_all(&assets).unwrap();
     let path = temp.path().join("distill.toml");
     std::fs::write(
         &path,
-        config_source(&temp).replace("auto_codegen = false", "auto_codegen = true"),
+        with_codegen_output(&temp, &config_source(&temp)),
     )
     .unwrap();
     write_schema(&temp, "initial");

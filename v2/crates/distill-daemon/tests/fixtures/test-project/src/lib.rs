@@ -782,9 +782,6 @@ os = "{os}"
 arch = "{arch}"
 apis = ["vulkan"]
 optimize = {optimize}
-[codegen]
-rs_mod_path = '{generated}'
-auto_codegen = false
 [pipeline]
 parallelism = 2
 max_dependency_depth = 64
@@ -799,7 +796,6 @@ cache_limit = "16MiB"
         module = toml_path(pipeline_module().0.clone()),
         os = std::env::consts::OS,
         arch = std::env::consts::ARCH,
-        generated = toml_path(dir.join("generated")),
         excludes = excludes,
     );
     let path = dir.join("distill.toml");

@@ -7,7 +7,7 @@ use distill_core::id::AssetUuid;
 use distill_daemon::bootstrap;
 use distill_daemon::config::DaemonConfig;
 use distill_daemon::pack_command::build_configured_pack;
-use distill_daemon::process::DaemonProcess;
+use distill_daemon::process::{codegen_once, DaemonProcess};
 use distill_rpc::{AuthoringValue, ImportRequest};
 
 // Pipeline modules allocate with System and hand those allocations to the
@@ -20,7 +20,8 @@ const USAGE: &str = "usage:
   distilld import <config-path> <source> <dest-bundle> --importer <id> --settings <json>
                   [--root <name>] [--target <name>] [--no-watch] [--if-missing | --if-changed] [--wait <seconds>]
   distilld engine-args <config-path> [target]
-  distilld pack <config-path> <definition-uuid> <output-directory>";
+  distilld pack <config-path> <definition-uuid> <output-directory>
+  distilld codegen <config-path> [--check]";
 
 /// How long `import` waits for a starting daemon by default.
 const DEFAULT_IMPORT_WAIT: Duration = Duration::from_secs(120);
@@ -42,6 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("import") => import(rest),
         Some("engine-args") => engine_args(rest),
         Some("pack") => pack(rest),
+        Some("codegen") => codegen(rest),
         Some("-h" | "--help") => {
             println!("{USAGE}");
             Ok(())
@@ -158,6 +160,37 @@ fn pack(args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
         distill_pack::manifest_filename(distill_pack::manifest_hash(&output.manifest_bytes)),
         distill_pack::archive_filename(output.archive_file_hash)
     );
+    Ok(())
+}
+
+/// One reconciliation and one run of every `[[codegen.output]]`, without a
+/// running daemon. Prints each file written (with `--check`: each file
+/// that would change, writing nothing). Exit 0: done, or with `--check`
+/// every file current; 1: with `--check`, files would change; 2: failed.
+fn codegen(args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
+    let (config_path, check) = match args.as_slice() {
+        [config] => (config, false),
+        [config, flag] if flag == "--check" => (config, true),
+        [flag, config] if flag == "--check" => (config, true),
+        _ => return Err(USAGE.into()),
+    };
+    let changes = DaemonConfig::load(config_path)
+        .map_err(|error| error.to_string())
+        .and_then(|config| codegen_once(config, check).map_err(|error| error.to_string()));
+    let changes = match changes {
+        Ok(changes) => changes,
+        Err(error) => {
+            eprintln!("distilld codegen: {error}");
+            std::process::exit(2);
+        }
+    };
+    for change in &changes {
+        println!("{change}");
+    }
+    if check && !changes.is_empty() {
+        eprintln!("distilld codegen: {} generated file(s) are not current", changes.len());
+        std::process::exit(1);
+    }
     Ok(())
 }
 

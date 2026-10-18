@@ -81,10 +81,37 @@ pub struct TargetSection {
     pub debug_info: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `[codegen]`: the generated Rust namespaces (§20). No output, no codegen.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CodegenSection {
+    pub outputs: Vec<CodegenOutputConfig>,
+}
+
+/// One `[[codegen.output]]`: the namespace at `rs_mod_path` the registered
+/// codegen `codegen` generates from the assets under the asset root `root`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodegenOutputConfig {
+    pub root: String,
     pub rs_mod_path: PathBuf,
-    pub auto_codegen: bool,
+    pub codegen: String,
+}
+
+impl CodegenSection {
+    /// The outputs as one text, a line `root rs_mod_path codegen` each: the
+    /// value of the restart-only key `codegen.output`.
+    pub fn canonical_text(&self) -> String {
+        self.outputs
+            .iter()
+            .map(|output| {
+                format!(
+                    "{} {} {}\n",
+                    output.root,
+                    output.rs_mod_path.display(),
+                    output.codegen
+                )
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +174,13 @@ pub enum DaemonConfigError {
         controlled_path: PathBuf,
         role: &'static str,
     },
+    /// Two `[[codegen.output]]` namespaces nest or coincide.
+    CodegenOutputOverlap {
+        first: PathBuf,
+        second: PathBuf,
+    },
+    /// A `[[codegen.output]]` defect: an unknown root, an empty codegen id.
+    CodegenOutput(String),
     UnsupportedTargetIdentity {
         target: String,
         expected: Box<LayoutIdentity>,
@@ -173,6 +207,7 @@ struct RawConfig {
     assets: RawAssets,
     modules: RawModules,
     targets: BTreeMap<String, RawTarget>,
+    #[serde(default)]
     codegen: RawCodegen,
     pipeline: RawPipeline,
     cas: RawCas,
@@ -237,11 +272,19 @@ enum RawTargetArch {
     Host,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawCodegen {
+    #[serde(default)]
+    output: Vec<RawCodegenOutput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCodegenOutput {
+    root: String,
     rs_mod_path: PathBuf,
-    auto_codegen: bool,
+    codegen: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -334,14 +377,14 @@ impl DaemonConfig {
         let state_path = resolve(base, &raw.daemon.state_path)?;
         let schema_path = resolve(base, &raw.assets.schema_path)?;
         let pipeline_dylib = resolve(base, &library_path(&raw.modules.pipeline_dylib))?;
-        let rs_mod_path = resolve(base, &raw.codegen.rs_mod_path)?;
+        let codegen_outputs = codegen_outputs(&raw.codegen, base, &roots)
+            .map_err(|mut errors| errors.remove(0))?;
 
         for root in roots.values() {
             for (role, controlled) in [
                 ("daemon.state_path", &state_path),
                 ("assets.schema_path", &schema_path),
                 ("modules.pipeline_dylib", &pipeline_dylib),
-                ("codegen.rs_mod_path", &rs_mod_path),
             ] {
                 if nested_either_way(root, controlled) {
                     return Err(DaemonConfigError::PathOverlap {
@@ -391,8 +434,7 @@ impl DaemonConfig {
             modules: ModulesSection { pipeline_dylib },
             targets,
             codegen: CodegenSection {
-                rs_mod_path,
-                auto_codegen: raw.codegen.auto_codegen,
+                outputs: codegen_outputs,
             },
             pipeline: PipelineSection {
                 parallelism: raw.pipeline.parallelism,
@@ -609,6 +651,7 @@ fn validate_raw_candidate(raw: &RawConfig, base: &Path) -> Vec<DaemonConfigError
 
     let mut normalized_roots = BTreeSet::new();
     let mut resolved_roots = Vec::new();
+    let mut root_paths = BTreeMap::new();
     for (raw_name, path) in &raw.assets.roots {
         if let Err(error) = validate_name("asset root", raw_name) {
             errors.push(error);
@@ -625,6 +668,7 @@ fn validate_raw_candidate(raw: &RawConfig, base: &Path) -> Vec<DaemonConfigError
                 if !path.is_dir() {
                     errors.push(DaemonConfigError::RootUnavailable(path.clone()));
                 }
+                root_paths.insert(raw_name.nfc().collect::<String>(), path.clone());
                 resolved_roots.push(path);
             }
             Err(error) => errors.push(error),
@@ -644,7 +688,6 @@ fn validate_raw_candidate(raw: &RawConfig, base: &Path) -> Vec<DaemonConfigError
         ("daemon.state_path", &raw.daemon.state_path),
         ("assets.schema_path", &raw.assets.schema_path),
         ("modules.pipeline_dylib", &pipeline_dylib),
-        ("codegen.rs_mod_path", &raw.codegen.rs_mod_path),
     ]
     .into_iter()
     .filter_map(|(role, path)| match resolve(base, path) {
@@ -665,6 +708,10 @@ fn validate_raw_candidate(raw: &RawConfig, base: &Path) -> Vec<DaemonConfigError
                 });
             }
         }
+    }
+
+    if let Err(codegen_errors) = codegen_outputs(&raw.codegen, base, &root_paths) {
+        errors.extend(codegen_errors);
     }
 
     // Staged validation is deliberately exhaustive.  The sealed StoreConfig
@@ -811,6 +858,21 @@ pub(crate) fn config_error_reason(error: &DaemonConfigError, source: &[u8]) -> D
             },
             _ => malformed(),
         },
+        DaemonConfigError::CodegenOutputOverlap { first, second } => {
+            match (path_text(first), path_text(second)) {
+                (Some(first), Some(second)) => DscpV1::OwnedPathOverlap {
+                    first: OwnedPathSide {
+                        kind: OwnedPathKind::CodegenOutput,
+                        path: first,
+                    },
+                    second: OwnedPathSide {
+                        kind: OwnedPathKind::CodegenOutput,
+                        path: second,
+                    },
+                },
+                _ => malformed(),
+            }
+        }
         DaemonConfigError::UnsupportedTargetIdentity {
             target,
             expected,
@@ -931,6 +993,66 @@ fn normalize_paths(
         }
     }
     Ok(paths)
+}
+
+/// The `[[codegen.output]]` entries: each names a configured root (by NFC
+/// name) and a codegen id; each namespace, `rs_mod_path` resolved against
+/// `base`, is disjoint from every asset root and from every other
+/// namespace. Every defect, in order.
+fn codegen_outputs(
+    raw: &RawCodegen,
+    base: &Path,
+    roots: &BTreeMap<String, PathBuf>,
+) -> Result<Vec<CodegenOutputConfig>, Vec<DaemonConfigError>> {
+    let mut errors = Vec::new();
+    let mut outputs: Vec<CodegenOutputConfig> = Vec::new();
+    for raw_output in &raw.output {
+        let root = raw_output.root.nfc().collect::<String>();
+        if !roots.contains_key(&root) {
+            errors.push(DaemonConfigError::CodegenOutput(format!(
+                "codegen.output root {root:?} names no asset root"
+            )));
+        }
+        if raw_output.codegen.is_empty() {
+            errors.push(DaemonConfigError::CodegenOutput(format!(
+                "codegen.output for root {root:?} names no codegen"
+            )));
+        }
+        let rs_mod_path = match resolve(base, &raw_output.rs_mod_path) {
+            Ok(path) => path,
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        };
+        for asset_root in roots.values() {
+            if nested_either_way(asset_root, &rs_mod_path) {
+                errors.push(DaemonConfigError::PathOverlap {
+                    asset_root: asset_root.clone(),
+                    controlled_path: rs_mod_path.clone(),
+                    role: "codegen.rs_mod_path",
+                });
+            }
+        }
+        for other in &outputs {
+            if nested_either_way(&other.rs_mod_path, &rs_mod_path) {
+                errors.push(DaemonConfigError::CodegenOutputOverlap {
+                    first: other.rs_mod_path.clone(),
+                    second: rs_mod_path.clone(),
+                });
+            }
+        }
+        outputs.push(CodegenOutputConfig {
+            root,
+            rs_mod_path,
+            codegen: raw_output.codegen.clone(),
+        });
+    }
+    if errors.is_empty() {
+        Ok(outputs)
+    } else {
+        Err(errors)
+    }
 }
 
 /// `assets.default_imports_exclude`, keyed by NFC root name: every key names a
@@ -1135,10 +1257,7 @@ mod tests {
                     debug_info: true,
                 },
             )]),
-            codegen: RawCodegen {
-                rs_mod_path: temp.path().join("generated"),
-                auto_codegen: false,
-            },
+            codegen: RawCodegen::default(),
             pipeline: RawPipeline {
                 parallelism: 0,
                 max_dependency_depth: 32,
@@ -1189,9 +1308,10 @@ pipeline_dylib = "target/{DLL_PREFIX}pipeline{DLL_SUFFIX}"
 os = "host"
 arch = "host"
 apis = ["vulkan"]
-[codegen]
+[[codegen.output]]
+root = "main"
 rs_mod_path = "generated"
-auto_codegen = false
+codegen = "bindings"
 [pipeline]
 parallelism = 2
 batch_reserved_workers = 1
@@ -1214,6 +1334,14 @@ cache_limit = "8MiB"
                 std::env::consts::DLL_PREFIX,
                 std::env::consts::DLL_SUFFIX
             )
+        );
+        assert_eq!(
+            config.codegen.outputs,
+            [CodegenOutputConfig {
+                root: "main".into(),
+                rs_mod_path: temp.path().canonicalize().unwrap().join("generated"),
+                codegen: "bindings".into(),
+            }]
         );
         let target = &config.targets["dev"];
         assert_eq!(target.os, host_target_os().unwrap());

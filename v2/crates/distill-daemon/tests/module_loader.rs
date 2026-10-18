@@ -156,6 +156,7 @@ fn compiled_pipeline_cdylib_opens_registers_unloads_and_closes() {
             &distill_core::id::AssetUuid(distill_pipeline_fixture::DEFAULT_RULE).to_string(),
             &distill_pipeline_fixture::PARENT_TYPE.to_string(),
             &distill_pipeline_fixture::VALUE_TYPE.to_string(),
+            distill_pipeline_fixture::BINDINGS,
         ]
     );
 

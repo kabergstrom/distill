@@ -13,16 +13,17 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use distill_core::id::TypeUuid;
 use distill_pipeline_api::callbacks::{
-    AuthoredDescriptor,
+    AuthoredDescriptor, CodegenDescriptor, PipelineCodegen, PipelineCodegenContext,
     ImporterDescriptor, PipelineImporter, PipelineProcessContext, PipelineProcessor,
     ProcessorDescriptor, ProcessorError, ProcessorProduct, ProcessorProducts,
 };
+use distill_pipeline_api::codegen::{CodegenFailure, CodegenOutput, GeneratedFile};
 use distill_pipeline_api::import::{
     DefaultImportRule, DirectoryGrouping, ImportOutput, ImportRuleId,
 };
 use distill_pipeline_api::importer::{AuthoringImportContext, AuthoringImporterError};
 use distill_pipeline_api::outputs::OutputDecls;
-use distill_pipeline_api::query::FileQuery;
+use distill_pipeline_api::query::{AssetQuery, FileQuery};
 use distill_pipeline_api::registration::{ModuleCallError, RegistrationArena, TargetDefinition};
 use distill_pipeline_api::target::TargetSelector;
 use distill_schema::ngp_schema::{LogicalSchema, PrimitiveKind, SchemaNode, Value};
@@ -418,6 +419,50 @@ fn importer(id: &str) -> ImporterDescriptor {
 #[derive(newgameplus_api_macros::NgpSourceIdentity)]
 pub struct SourceIdentity;
 
+/// The codegen: per [`VALUE_TYPE`] asset of its root one unit
+/// `pub const TENS: u128 = n / 10;`, aliased `tens_{n / 10}`, so the units
+/// of 12 and 13 are equal (a body-only edit) and those of 21 and 27
+/// collide. Its `mod.rs` preamble is `#![allow(dead_code)]`; its items name
+/// the root and count the units.
+pub const BINDINGS: &str = "fixture-bindings";
+
+struct Bindings;
+
+impl PipelineCodegen for Bindings {
+    fn generate(
+        &self,
+        context: &mut dyn PipelineCodegenContext,
+    ) -> Result<CodegenOutput, CodegenFailure> {
+        let failed = |error: &dyn std::fmt::Debug| CodegenFailure::Generation(format!("{error:?}"));
+        let assets = context
+            .query(&AssetQuery {
+                authored_type: Some(VALUE_TYPE),
+                ..AssetQuery::default()
+            })
+            .map_err(|error| failed(&error))?;
+        let mut files = Vec::new();
+        for asset in assets {
+            let read = context
+                .read(asset)
+                .map_err(|error| failed(&error))?
+                .ok_or_else(|| failed(&"a queried asset is not readable"))?;
+            let tens = value_of(&read.value).ok_or_else(|| failed(&read.value))? / 10;
+            files.push(
+                GeneratedFile::new(asset, format!("pub const TENS: u128 = {tens};\n").into_bytes())
+                    .with_alias(format!("tens_{tens}")),
+            );
+        }
+        let items = format!(
+            "pub const ROOT: &str = {:?};\npub const COUNT: usize = {};\n",
+            context.root(),
+            files.len()
+        );
+        Ok(CodegenOutput::new(files)
+            .with_mod_preamble("#![allow(dead_code)]\n")
+            .with_mod_items(items))
+    }
+}
+
 struct Reflect;
 
 impl PipelineProcessor for Reflect {
@@ -505,6 +550,15 @@ fn register(
             doc: "Declared under another schema.".to_owned(),
             default: value(1),
         })
+        .into_result()?;
+    arena
+        .register_codegen(
+            CodegenDescriptor {
+                id: BINDINGS.to_owned(),
+                version: 1,
+            },
+            Bindings,
+        )
         .into_result()?;
     Ok(targets.iter().map(|target| target.name.clone()).collect())
 }

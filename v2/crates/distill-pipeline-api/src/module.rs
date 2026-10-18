@@ -27,7 +27,7 @@ use crate::callbacks::{
     ProcessorDescriptor, ProcessorError, ProcessorProducts, ToolDescriptor, ToolRegistration,
     ToolSource, ValidatorDescriptor,
 };
-use crate::codegen::{CodegenFailure, GeneratedFile};
+use crate::codegen::{CodegenFailure, CodegenOutput, GeneratedFile};
 use crate::failure::StableFailureFingerprint;
 use crate::import::ImportOutput;
 use crate::importer::{AuthoringImportContext, AuthoringImporterError};
@@ -157,6 +157,7 @@ pub fn host_module_abi_identity() -> ModuleAbiIdentity {
         encode_measurement::<Target>(encoder);
         encode_measurement::<StableFailureFingerprint>(encoder);
         encode_measurement::<GeneratedFile>(encoder);
+        encode_measurement::<CodegenOutput>(encoder);
         encode_measurement::<CodegenFailure>(encoder);
         encode_measurement::<ToolOutput>(encoder);
         encode_measurement::<ToolRunError>(encoder);

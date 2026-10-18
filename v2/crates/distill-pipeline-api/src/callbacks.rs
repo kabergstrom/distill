@@ -18,7 +18,7 @@ use ngp_schema::{AssetRefValue, TypeTable, Value};
 use distill_migrate::FieldPath;
 use ngp_schema::{LogicalSchema, SchemaNode};
 
-use crate::codegen::{CodegenFailure, GeneratedFile};
+use crate::codegen::{CodegenFailure, CodegenOutput};
 use crate::failure::StableFailureFingerprint;
 use crate::import::{DefaultImportRule, ImportOutput};
 use crate::importer::{AuthoringImportContext, AuthoringImporter, AuthoringImporterError};
@@ -402,8 +402,13 @@ pub trait PipelineProcessContext {
     ) -> Result<ToolOutput, ToolRunError>;
 }
 
-/// Snapshot-pinned authored reads available only to codegen callbacks.
+/// Snapshot-pinned authored reads available only to codegen callbacks. A
+/// context serves one `[[codegen.output]]`: `query` and `read` see only the
+/// assets whose bundle lies under that output's asset root.
 pub trait PipelineCodegenContext {
+    /// The name of the asset root the output being generated serves.
+    fn root(&self) -> &str;
+
     fn query(&mut self, _query: &AssetQuery) -> Result<Vec<AssetUuid>, CodegenContextError> {
         Err(CodegenContextError::Unavailable("query"))
     }
@@ -425,7 +430,7 @@ pub trait PipelineCodegen: Send + Sync + 'static {
     fn generate(
         &self,
         context: &mut dyn PipelineCodegenContext,
-    ) -> Result<Vec<GeneratedFile>, CodegenFailure>;
+    ) -> Result<CodegenOutput, CodegenFailure>;
 }
 
 pub trait PipelineValidator: Send + Sync + 'static {
@@ -487,7 +492,7 @@ pub type CodegenCall =
     unsafe fn(
         *const u8,
         &mut dyn PipelineCodegenContext,
-    ) -> Result<Result<Vec<GeneratedFile>, CodegenFailure>, CallbackPanic>;
+    ) -> Result<Result<CodegenOutput, CodegenFailure>, CallbackPanic>;
 pub type ValidatorCall = unsafe fn(
     *const u8,
     &Value,
@@ -642,7 +647,7 @@ unsafe fn call_processor<T: PipelineProcessor>(
 unsafe fn call_codegen<T: PipelineCodegen>(
     pointer: *const u8,
     context: &mut dyn PipelineCodegenContext,
-) -> Result<Result<Vec<GeneratedFile>, CodegenFailure>, CallbackPanic> {
+) -> Result<Result<CodegenOutput, CodegenFailure>, CallbackPanic> {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         (&*pointer.cast::<T>()).generate(context)
     }))

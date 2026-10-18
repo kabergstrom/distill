@@ -1630,7 +1630,7 @@ fn restart_required_is_told_as_it_changes_and_clears() {
         }
         keys
     };
-    let auto_codegen = vec!["codegen.auto_codegen".to_owned()];
+    let codegen_outputs = vec!["codegen.output".to_owned()];
     {
         let coordinator = coordinator(&temp);
         let mut writer = coordinator.open_writer().unwrap();
@@ -1641,22 +1641,22 @@ fn restart_required_is_told_as_it_changes_and_clears() {
         let installed = connect(&coordinator);
         assert_eq!(restart_events(&installed), Vec::<Vec<String>>::new());
         coordinator
-            .set_restart_required(&[RestartOnlyChange::AutoCodegen(true)])
+            .set_restart_required(&[RestartOnlyChange::CodegenOutputs("main generated bindings\n".into())])
             .unwrap();
-        assert_eq!(restart_events(&installed), vec![auto_codegen.clone()]);
+        assert_eq!(restart_events(&installed), vec![codegen_outputs.clone()]);
         // The same values again are no change.
         coordinator
-            .set_restart_required(&[RestartOnlyChange::AutoCodegen(true)])
+            .set_restart_required(&[RestartOnlyChange::CodegenOutputs("main generated bindings\n".into())])
             .unwrap();
         assert_eq!(restart_events(&installed), Vec::<Vec<String>>::new());
         // A stream installed now is told the keys as they are.
         let late = connect(&coordinator);
-        assert_eq!(restart_events(&late), vec![auto_codegen.clone()]);
+        assert_eq!(restart_events(&late), vec![codegen_outputs.clone()]);
         // Another value of the same key is a change.
         coordinator
-            .set_restart_required(&[RestartOnlyChange::AutoCodegen(false)])
+            .set_restart_required(&[RestartOnlyChange::CodegenOutputs(String::new())])
             .unwrap();
-        assert_eq!(restart_events(&installed), vec![auto_codegen]);
+        assert_eq!(restart_events(&installed), vec![codegen_outputs]);
         // The file back at the running values clears it.
         coordinator.set_restart_required(&[]).unwrap();
         assert_eq!(restart_events(&installed), vec![Vec::<String>::new()]);
@@ -1674,7 +1674,7 @@ fn restart_required_is_told_as_it_changes_and_clears() {
             "restart-only changes publish nothing"
         );
         coordinator
-            .set_restart_required(&[RestartOnlyChange::AutoCodegen(true)])
+            .set_restart_required(&[RestartOnlyChange::CodegenOutputs("main generated bindings\n".into())])
             .unwrap();
     }
     let coordinator = coordinator(&temp);
