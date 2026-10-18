@@ -5,7 +5,10 @@ use ngp_schema::{encode_path, PathComponent};
 use distill_core::frames::{reenter, resolve_backref};
 use distill_core::id::{AssetUuid, TypeUuid};
 use ngp_schema::node::{PrimitiveKind, SchemaNode};
-use ngp_schema::{write_value, AssetRefValue, TypeTable, Value, WriteOptions};
+use ngp_schema::{AssetRefValue, TypeTable, Value};
+use ngp_value::encoding::{key_bytes, Cx};
+use ngp_value::node::LogicalSchema;
+use ngp_value::value::Frames;
 
 use crate::wire::{SlotKind, WireEnumForm, WireNode, WireVariant};
 
@@ -129,8 +132,9 @@ pub fn encode_value(
 }
 
 /// [`encode_value`] for a value holding dynamic values (GAP 23 §3): each
-/// is a string slot holding its canonical text, its type named through
-/// `types` (the bundle's type closure).
+/// is a byte slot holding its type uuid and its payload in the value
+/// encoding ([`Encoder::dynamic`]), the type taken from `types` (the
+/// bundle's type closure).
 pub fn encode_value_with_types(
     schema: &SchemaNode,
     wire: &WireNode,
@@ -508,7 +512,9 @@ impl<'a, R: ReferenceResolver + ?Sized> Encoder<'a, R> {
         self.write_var_ref(location.shifted(offset)?, variable, value.len())
     }
 
-    /// A dynamic value: a string slot holding its canonical text.
+    /// A dynamic value: a byte slot (`Vec<u8>`) holding the carried type's
+    /// uuid and the value encoding of its payload (a patch when the node is
+    /// sparse), as `ngp_value::encoding` writes a `Dynamic` node.
     fn dynamic(
         &mut self,
         schema: &SchemaNode,
@@ -517,22 +523,31 @@ impl<'a, R: ReferenceResolver + ?Sized> Encoder<'a, R> {
         location: Location,
         offset: u32,
     ) -> Result<(), EncodeError> {
-        let Some(mut types) = self.types else {
+        let Some(types) = self.types else {
             return self.invalid_wire("a dynamic value without a type table");
         };
-        let text = write_value(
-            schema,
-            value,
-            WriteOptions {
-                blobs: None,
-                types: Some(&mut types),
-            },
-        )
-        .map_err(|error| EncodeError::InvalidDynamic {
-            path: self.path_string(),
-            detail: error.render("value"),
+        let root = LogicalSchema { root: schema.clone() };
+        let bytes = ngp_value::encoding::encode_value(Cx::new(&root, types), value).map_err(|error| {
+            EncodeError::InvalidDynamic {
+                path: self.path_string(),
+                detail: format!("{error:?}"),
+            }
         })?;
-        self.slot_string(wire, &Value::String(text), location, offset)
+        let (size, _, kind, pointee) =
+            slot_parts(wire).ok_or_else(|| EncodeError::InvalidWireShape {
+                path: self.path_string(),
+                detail: "dynamic value is not a wire slot",
+            })?;
+        let byte_elements = matches!(
+            pointee,
+            [WireNode::Primitive { size: 1, align: 1, kind: crate::native::ScalarKind::U8, .. }]
+        );
+        if size < 8 || kind != SlotKind::Vec || !byte_elements {
+            return self.invalid_wire("dynamic slot is not a byte vector");
+        }
+        let variable = self.reserve_variable(bytes.len(), 1)?;
+        self.write(Location::variable(variable), &bytes)?;
+        self.write_var_ref(location.shifted(offset)?, variable, bytes.len())
     }
 
     fn blob(
@@ -1211,13 +1226,11 @@ fn align_up_usize(value: usize, align: usize) -> Option<usize> {
     }
 }
 
-/// The canonical JSON text of a map key or set element (§6): what both
-/// sorts by and the `MapKey` path payload. Key and element nodes are
+/// The value encoding of a map key or set element (GAP 23 §17.3): what
+/// both sorts by and the `MapKey` path payload. Key and element nodes are
 /// blob-free (§5) and walked with no frames open.
 fn canonical_value_bytes(schema: &SchemaNode, value: &Value) -> Option<Vec<u8>> {
-    write_value(schema, value, WriteOptions::default())
-        .ok()
-        .map(String::into_bytes)
+    key_bytes(schema, value, &mut Frames::new())
 }
 
 fn entries_len(value: &Value) -> usize {

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use distill_core::id::{AssetUuid, ContentHash};
 use distill_loader::{
-    load_cycles, AdoptionDecision, CandidateAsset, CandidateOutcome, ComponentPlanner, IoBasis,
+    dependency_order, load_cycles, AdoptionDecision, CandidateAsset, CandidateOutcome, ComponentPlanner, IoBasis,
     ManifestHash, MemberFailure,
 };
 
@@ -167,4 +167,22 @@ fn load_cycle_reports_the_complete_path_and_is_stack_safe() {
         })
         .collect();
     assert!(load_cycles(&deep).is_empty());
+}
+
+#[test]
+fn a_component_updates_dependencies_before_dependents() {
+    // 1 → 3 → 2 (1 depends on 3, 3 on 2), 4 alone, 5 → outside member 9.
+    let graph = BTreeMap::from([
+        (id(1), vec![id(3)]),
+        (id(2), vec![]),
+        (id(3), vec![id(2)]),
+        (id(4), vec![]),
+        (id(5), vec![id(9)]),
+    ]);
+    let members = [id(1), id(2), id(3), id(4), id(5)];
+    assert_eq!(dependency_order(&members, &graph), vec![id(2), id(3), id(1), id(4), id(5)]);
+
+    // A cycle (rejected before staging) still lists every member once.
+    let cycle = BTreeMap::from([(id(1), vec![id(2)]), (id(2), vec![id(1)])]);
+    assert_eq!(dependency_order(&[id(1), id(2)], &cycle), vec![id(2), id(1)]);
 }

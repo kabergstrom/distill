@@ -1241,7 +1241,7 @@ mod tests {
             },
             assets: RawAssets {
                 roots: BTreeMap::from([("main".to_owned(), assets)]),
-                schema_path: temp.path().join("schema.json"),
+                schema_path: temp.path().join("schema.bin"),
                 default_imports_exclude: BTreeMap::new(),
             },
             modules: RawModules {
@@ -1301,7 +1301,7 @@ address = "127.0.0.1:0"
 state_path = "state"
 [assets]
 roots = { main = "assets" }
-schema_path = "schema.json"
+schema_path = "schema.bin"
 [modules]
 pipeline_dylib = "target/{DLL_PREFIX}pipeline{DLL_SUFFIX}"
 [targets.dev]

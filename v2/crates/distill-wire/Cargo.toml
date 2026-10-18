@@ -11,4 +11,11 @@ distill-core = { path = "../distill-core" }
 # Its canonical structural blob path encoding (§6, `encode_path`) is the
 # bundles' too: the §12 artifact blob table sorts by the same encoded path
 # bytes — one encoder, never two.
+ngp-schema = { path = "../../../../newgameplus/ngp-schema", default-features = false }
+# The value encoding (GAP 23 §17.3): an artifact image's dynamic slots hold it,
+# and map keys and set elements sort by it.
+ngp-value = { path = "../../../../newgameplus/ngp-value" }
+
+[dev-dependencies]
+# Tests read values and schemas as text.
 ngp-schema = { path = "../../../../newgameplus/ngp-schema" }

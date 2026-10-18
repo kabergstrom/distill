@@ -695,7 +695,7 @@ should reach zero by the end of phase 6.
   - **source-walk `--pipeline-manifest <crate>`** walks the pipeline crate
     plus each path dependency that declares `#[asset(uuid)]` types (depends
     on distill-asset and its sources spell `asset(uuid`), and writes
-    `<target-dir>/distill-pipeline-schema.json`: real layouts under the
+    `<target-dir>/distill-pipeline-schema.bin`: real layouts under the
     rustc identity, `source_hashes` with the pipeline crate's hash. For
     that, deferred-ngp's importer settings and imported source became
     `#[distill_asset::asset]` types (`GlslSettings`, `GlslSource`, same

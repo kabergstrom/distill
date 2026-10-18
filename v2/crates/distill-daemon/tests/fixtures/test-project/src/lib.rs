@@ -746,7 +746,7 @@ fn host_triple() -> String {
 /// Write the configuration of the project at `dir` whose root [`ROOT`] is
 /// `root`: `dir/distill.toml` (state under `dir/.distill`, the target
 /// "dev", `optimize` as given, the pipeline module
-/// `distill-pipeline-fixture`) and `dir/schema.json` ([`project_schema`]).
+/// `distill-pipeline-fixture`) and `dir/schema.bin` ([`project_schema`]).
 /// Returns it loaded.
 pub fn write_configuration(dir: &Path, root: &Path, optimize: bool) -> DaemonConfig {
     write_configuration_excluding(dir, root, optimize, &[])
@@ -761,8 +761,8 @@ pub fn write_configuration_excluding(
     excludes: &[&str],
 ) -> DaemonConfig {
     std::fs::write(
-        dir.join("schema.json"),
-        serde_json::to_vec(&project_schema()).unwrap(),
+        dir.join("schema.bin"),
+        project_schema().to_file_bytes(),
     )
     .unwrap();
     let toml_path = |path: PathBuf| path.display().to_string().replace('\\', "/");
@@ -792,7 +792,7 @@ cache_limit = "16MiB"
 "#,
         state = toml_path(dir.join(".distill")),
         root = toml_path(root.to_owned()),
-        schema = toml_path(dir.join("schema.json")),
+        schema = toml_path(dir.join("schema.bin")),
         module = toml_path(pipeline_module().0.clone()),
         os = std::env::consts::OS,
         arch = std::env::consts::ARCH,
@@ -824,7 +824,7 @@ pub fn publish_configuration(
 /// reads it.
 fn configuration_authority(config: &DaemonConfig) -> Arc<ProjectSchemaAuthority> {
     let bytes = std::fs::read(&config.assets.schema_path).unwrap();
-    Arc::new(ProjectSchemaAuthority::from_json(&bytes).unwrap())
+    Arc::new(ProjectSchemaAuthority::from_file_bytes(&bytes).unwrap())
 }
 
 /// The pipeline module `distill-pipeline-fixture`, built once per test

@@ -44,7 +44,7 @@ fn minimal_artifact_bytes_pinned() {
     let mut expected = Vec::new();
     expected.extend_from_slice(b"NGPF"); // shared file header: magic
     expected.extend_from_slice(&(Domain::ArtifactImage as u32).to_le_bytes()); // domain
-    expected.extend_from_slice(&1u32.to_le_bytes()); // version
+    expected.extend_from_slice(&2u32.to_le_bytes()); // version
     expected.extend_from_slice(&[0x11; 16]); // asset_uuid
     expected.extend_from_slice(&[0x22; 16]); // authored_type
     expected.extend_from_slice(&[0x33; 16]); // terminal_type
@@ -70,7 +70,7 @@ fn file_header_is_pinned() {
         &bytes[..12],
         &distill_core::header::header(Domain::ArtifactImage, ARTIFACT_FORMAT_VERSION)
     );
-    assert_eq!(ARTIFACT_FORMAT_VERSION, 1);
+    assert_eq!(ARTIFACT_FORMAT_VERSION, 2);
 }
 
 #[test]
@@ -327,13 +327,13 @@ fn rejects_bad_magic() {
 #[test]
 fn rejects_unsupported_version() {
     let mut bytes = write_simple(&[], &[], &[], &[]);
-    bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+    bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
     assert!(matches!(
         parse_artifact(&bytes),
         Err(ArtifactError::Header(HeaderError::UnsupportedVersion {
             domain: Domain::ArtifactImage,
-            expected: 1,
-            found: 2,
+            expected: 2,
+            found: 1,
         }))
     ));
 }

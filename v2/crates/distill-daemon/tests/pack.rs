@@ -31,8 +31,8 @@ fn config(temp: &tempfile::TempDir) -> DaemonConfig {
         }],
     };
     std::fs::write(
-        temp.path().join("schema.json"),
-        serde_json::to_vec(&schema).unwrap(),
+        temp.path().join("schema.bin"),
+        schema.to_file_bytes(),
     )
     .unwrap();
     let path = temp.path().join("distill.toml");
@@ -63,7 +63,7 @@ cache_limit = "8MiB"
 "#,
             temp.path().join("state").display(),
             assets.display(),
-            temp.path().join("schema.json").display(),
+            temp.path().join("schema.bin").display(),
             temp.path().join("pipeline.so").display(),
         ),
     )

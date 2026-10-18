@@ -138,8 +138,8 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
         );
     }
     std::fs::write(
-        temp.path().join("schema.json"),
-        serde_json::to_vec(&schema).unwrap(),
+        temp.path().join("schema.bin"),
+        schema.to_file_bytes(),
     )
     .unwrap();
     let config = write_config(&temp, &module, authority.identity());
@@ -1000,7 +1000,7 @@ cache_limit = "16MiB"
 "#,
         temp.path().join("state").display(),
         temp.path().join("assets").display(),
-        temp.path().join("schema.json").display(),
+        temp.path().join("schema.bin").display(),
         module.display(),
         os,
         std::env::consts::ARCH,
@@ -1076,7 +1076,7 @@ fn rpc_io_authoring_writes_watches_and_renames_through_a_live_daemon() {
     std::fs::write(assets.join("shaders/common.inc"), b"const uint VALUE = 1;\n").unwrap();
     let schema = fixture_schema(source_identity);
     let authority = ProjectSchemaAuthority::from_schema(schema.clone(), [0x51; 16]).unwrap();
-    std::fs::write(temp.path().join("schema.json"), serde_json::to_vec(&schema).unwrap()).unwrap();
+    std::fs::write(temp.path().join("schema.bin"), schema.to_file_bytes()).unwrap();
     let config = write_config(&temp, &module, authority.identity());
     let process = DaemonProcess::start(config.clone()).unwrap();
     let [_, _, shader] = import_assets(&process, &config, &assets);

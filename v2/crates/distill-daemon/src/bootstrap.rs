@@ -44,7 +44,7 @@ pub fn load_authority(config: &DaemonConfig) -> Result<ProjectSchemaAuthority, B
         path: path.clone(),
         source,
     })?;
-    ProjectSchemaAuthority::from_json(&bytes)
+    ProjectSchemaAuthority::from_file_bytes(&bytes)
         .map_err(|error| BootstrapError::Schema(format!("{}: {error}", path.display())))
 }
 

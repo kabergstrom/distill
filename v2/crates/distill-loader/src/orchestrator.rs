@@ -22,7 +22,7 @@ use distill_wire::native::validate_native_descriptor;
 use distill_wire::plan::{compile_plans, CompiledPlans, PlanId};
 
 use crate::component::{
-    decide, load_cycles, AdoptionDecision, CandidateAsset, CandidateOutcome, ComponentPlanner,
+    decide, dependency_order, load_cycles, AdoptionDecision, CandidateAsset, CandidateOutcome, ComponentPlanner,
     MemberFailure,
 };
 use crate::io::{
@@ -2347,7 +2347,13 @@ impl<I: LoaderIO> Loader<I> {
         let adoption = self.mint_adoption()?;
         let mut updates = Vec::new();
         let mut removals = Vec::new();
-        for uuid in members.iter().copied() {
+        // Dependencies update first: an update may read what its load deps
+        // staged in this adoption.
+        let graph = members
+            .iter()
+            .filter_map(|uuid| Some((*uuid, self.candidate_deps(sweep.candidates.get(uuid)?))))
+            .collect::<BTreeMap<_, _>>();
+        for uuid in dependency_order(members, &graph) {
             let Some(candidate) = sweep.candidates.get_mut(&uuid) else {
                 continue;
             };

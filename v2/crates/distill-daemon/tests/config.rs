@@ -49,7 +49,7 @@ cache_limit = "20GiB"
 "#,
         temp.path().join("state").display(),
         temp.path().join("assets").display(),
-        temp.path().join("schema.json").display(),
+        temp.path().join("schema.bin").display(),
         temp.path().join("pipeline.dylib").display(),
         temp.path().join("generated").display(),
     )

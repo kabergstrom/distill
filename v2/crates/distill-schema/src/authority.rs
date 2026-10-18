@@ -45,9 +45,9 @@ pub struct ProjectTypeAuthority {
 }
 
 impl ProjectSchemaAuthority {
-    pub fn from_json(bytes: &[u8]) -> Result<Self, SchemaAuthorityError> {
-        let schema = Schema::from_json(bytes)
-            .map_err(|error| SchemaAuthorityError::Json(error.to_string()))?;
+    /// The authority of a schema file (`ngp_schema::file`).
+    pub fn from_file_bytes(bytes: &[u8]) -> Result<Self, SchemaAuthorityError> {
+        let schema = Schema::from_file_bytes(bytes).map_err(|error| SchemaAuthorityError::File(error.to_string()))?;
         Self::from_schema(schema, distill_core::hash::hash(bytes))
     }
 
@@ -163,7 +163,7 @@ impl ProjectSchemaAuthority {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchemaAuthorityError {
-    Json(String),
+    File(String),
     NonContiguousTypeId {
         index: usize,
         observed: SchemaTypeId,

@@ -47,7 +47,7 @@ cache_limit = "8MiB"
 "#,
         temp.path().join("state").display(),
         assets.display(),
-        temp.path().join("schema.json").display(),
+        temp.path().join("schema.bin").display(),
         temp.path().join("pipeline.so").display(),
     )
 }
@@ -71,7 +71,7 @@ fn config(temp: &tempfile::TempDir) -> DaemonConfig {
 }
 
 fn write_schema(temp: &tempfile::TempDir, marker: &str) {
-    write_schema_path(&temp.path().join("schema.json"), marker);
+    write_schema_path(&temp.path().join("schema.bin"), marker);
 }
 
 fn write_schema_path(path: &std::path::Path, marker: &str) {
@@ -87,7 +87,7 @@ fn write_schema_path(path: &std::path::Path, marker: &str) {
             layouts: Vec::new(),
         }],
     };
-    std::fs::write(path, serde_json::to_vec(&schema).unwrap()).unwrap();
+    std::fs::write(path, schema.to_file_bytes()).unwrap();
 }
 
 /// The compiled state the process's latest committed version sees.
@@ -549,7 +549,7 @@ fn valid_configuration_with_malformed_schema_fails_only_the_pipeline() {
         "malformed configuration was not published",
     );
 
-    std::fs::write(temp.path().join("schema.json"), b"not-json").unwrap();
+    std::fs::write(temp.path().join("schema.bin"), b"not a schema file").unwrap();
     std::fs::write(&config_path, config_source(&temp)).unwrap();
     wait_until(
         || {
@@ -886,7 +886,7 @@ fn same_path_schema_edits_publish_exactly_one_atomic_candidate_version() {
         .version;
     assert_eq!(after.0, before.0 + 1);
     let expected_schema_hash =
-        distill_core::hash::hash(&std::fs::read(temp.path().join("schema.json")).unwrap());
+        distill_core::hash::hash(&std::fs::read(temp.path().join("schema.bin")).unwrap());
     assert_eq!(
         compiled(&process)
             .and_then(|compiled| compiled.schema_authority())
@@ -911,7 +911,7 @@ fn same_path_schema_edits_publish_exactly_one_atomic_candidate_version() {
 fn config_retargets_native_schema_watch_without_polling_the_old_path() {
     let temp = tempfile::tempdir().unwrap();
     let process = DaemonProcess::start(config(&temp)).unwrap();
-    let old_schema = temp.path().join("schema.json");
+    let old_schema = temp.path().join("schema.bin");
     let next_schema = temp.path().join("schema-next.json");
     write_schema_path(&next_schema, "next-initial");
     let before = process
@@ -992,7 +992,7 @@ fn malformed_schema_is_a_stable_pipeline_failure_and_a_valid_edit_retries() {
         .current_stamp()
         .unwrap()
         .version;
-    std::fs::write(temp.path().join("schema.json"), b"not-json").unwrap();
+    std::fs::write(temp.path().join("schema.bin"), b"not a schema file").unwrap();
 
     wait_until(
         || {
@@ -1405,9 +1405,9 @@ fn write_gate_schema(temp: &tempfile::TempDir, variant: &GateVariant) {
             ],
         }],
     };
-    let schema_path = temp.path().join("schema.json");
-    let staging = temp.path().join("schema.json.next");
-    std::fs::write(&staging, serde_json::to_vec(&schema).unwrap()).unwrap();
+    let schema_path = temp.path().join("schema.bin");
+    let staging = temp.path().join("schema.bin.next");
+    std::fs::write(&staging, schema.to_file_bytes()).unwrap();
     std::fs::rename(staging, schema_path).unwrap();
 }
 

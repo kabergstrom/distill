@@ -177,6 +177,38 @@ pub fn load_cycles(graph: &BTreeMap<AssetUuid, Vec<AssetUuid>>) -> Vec<Vec<Asset
     cycles
 }
 
+/// `members` with each member after the members it load-depends on
+/// (`graph`: member → its load deps), ties in `members` order: the order a
+/// component's storage updates run, so an asset's update can read what its
+/// dependencies staged in the same adoption (a cooked prefab's schemas,
+/// newgameplus GAP 23 §17.7). Edges to non-members are ignored; on a cycle
+/// (rejected before staging, [`load_cycles`]) the member that closes it
+/// goes in visit order.
+pub fn dependency_order(members: &[AssetUuid], graph: &BTreeMap<AssetUuid, Vec<AssetUuid>>) -> Vec<AssetUuid> {
+    let member: BTreeSet<AssetUuid> = members.iter().copied().collect();
+    let mut entered = BTreeSet::new();
+    let mut order = Vec::with_capacity(members.len());
+    for &root in members {
+        if !entered.insert(root) {
+            continue;
+        }
+        let mut stack = vec![(root, 0usize)];
+        while let Some((node, next)) = stack.last_mut() {
+            let deps = graph.get(node).map(Vec::as_slice).unwrap_or_default();
+            if let Some(&dep) = deps.get(*next) {
+                *next += 1;
+                if member.contains(&dep) && entered.insert(dep) {
+                    stack.push((dep, 0));
+                }
+                continue;
+            }
+            order.push(*node);
+            stack.pop();
+        }
+    }
+    order
+}
+
 fn union_edges<'a>(
     parent: AssetUuid,
     children: impl IntoIterator<Item = &'a AssetUuid>,

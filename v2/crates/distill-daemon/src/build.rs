@@ -1630,7 +1630,7 @@ pub(crate) fn type_tag_epochs(authority: &ProjectSchemaAuthority) -> BTreeMap<Ty
                 }
             }
             let renumber = |id: SchemaTypeId| SchemaTypeId(local[&id]);
-            let epoch = distill_core::hash::digest(distill_core::hash::Domain::TypeEpoch, 1, |encoder| {
+            let epoch = distill_core::hash::digest(distill_core::hash::Domain::TypeEpoch, 2, |encoder| {
                 encoder.raw(&type_uuid.0);
                 encoder.raw(&project.logical_hash.0);
                 for id in &order {
@@ -1646,7 +1646,7 @@ pub(crate) fn type_tag_epochs(authority: &ProjectSchemaAuthority) -> BTreeMap<Ty
                     for argument in &mut ty.generic_argument_ids {
                         *argument = renumber(*argument);
                     }
-                    encoder.str(&serde_json::to_string(&ty).expect("a schema type serializes"));
+                    encoder.bytes(&ty.file_bytes());
                 }
             });
             (*type_uuid, epoch)

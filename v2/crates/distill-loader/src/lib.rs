@@ -34,7 +34,7 @@ pub use capnp_io::{
     RpcIo, RpcIoConfig, RpcIoInitError, RpcIoStats, RpcIoStatus, StepStats, TypeName,
 };
 pub use component::{
-    load_cycles, AdoptionDecision, CandidateAsset, CandidateOutcome, ComponentPlanner,
+    dependency_order, load_cycles, AdoptionDecision, CandidateAsset, CandidateOutcome, ComponentPlanner,
     MemberFailure,
 };
 pub use io::{

@@ -35,8 +35,10 @@ use distill_core::header::{read_header, write_header, HeaderError, HEADER_LEN};
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
 
 /// Artifact format version (the shared header's version, §5) — an
-/// input-hash input (§12).
-pub const ARTIFACT_FORMAT_VERSION: u32 = 1;
+/// input-hash input (§12). Version 2: dynamic slots hold the type uuid and
+/// the value encoding (GAP 23 §17.7); map and set entries order by their
+/// keys' value encoding.
+pub const ARTIFACT_FORMAT_VERSION: u32 = 2;
 
 /// Fixed header size in bytes (file header through `var_len`), pinned.
 pub const ARTIFACT_HEADER_LEN: usize = 128;

@@ -12,5 +12,5 @@ distill-core = { path = "../distill-core" }
 distill-wire = { path = "../distill-wire" }
 # The typed value model (`to_value`, default writers) is the shared schema
 # crate's.
-ngp-schema = { path = "../../../../newgameplus/ngp-schema" }
+ngp-schema = { path = "../../../../newgameplus/ngp-schema", default-features = false }
 distill-asset-macro = { path = "../distill-asset-macro" }

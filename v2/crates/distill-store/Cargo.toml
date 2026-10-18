@@ -10,7 +10,7 @@ distill-core = { path = "../distill-core" }
 distill-protocol = { path = "../distill-protocol" }
 distill-schema = { path = "../distill-schema" }
 distill-wire = { path = "../distill-wire" }
-ngp-schema = { path = "../../../../newgameplus/ngp-schema" }
+ngp-schema = { path = "../../../../newgameplus/ngp-schema", default-features = false }
 # Bundled SQLite: compiled from source, no system dependency (§13's
 # metadata layer must not vary by host library version).
 rusqlite = { version = "0.32", features = ["bundled"] }

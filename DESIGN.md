@@ -181,7 +181,7 @@ any edit that raced publication.
 │        │                    processors,         code          │
 │        │                    migration fns          │          │
 │        ▼                        │                  │          │
-│  source-walk ──► schema.json    ▼                  ▼          │
+│  source-walk ──► schema.bin     ▼                  ▼          │
 │                             pipeline.cdylib   game.cdylib     │
 └──────────┬──────────────────────┬──────────────────┬──────────┘
            │                      │                  │
@@ -1015,6 +1015,7 @@ is a spec defect, since that is how two meanings come to share bytes:
 | `ArtifactImage`, `PackArchive`, `Bundle`, `SchemaFile` (27–30) | file formats only (shared header below) |
 | `ModuleLayout` (31) | `ModuleAbiIdentity.measured_interface` — the measured layouts of the boundary types (§3) |
 | `BootstrapSpec` (32) | file format only: the bootstrap control spec (§3) |
+| `TypeDefault` (33) | file format only: a newgameplus type-default file (`defaults/<path>.bin`, GAP 23 §6.1) |
 
 A schema-lineage chain digest (§6, §11, §13) is not built; it takes a new
 `Domain` when it is.
@@ -1024,7 +1025,7 @@ bytes `NGPF`, the `u32` `Domain` naming its format and the `u32` version of
 that format (`distill_core::header`; one reader refuses a wrong magic,
 domain or version by name): the artifact image (§12), pack archive and
 manifest (§16), bundle container (§6), the bootstrap control spec (§3) and
-the newgameplus schema file.
+the newgameplus schema and type-default files.
 There are no checksums: files are named or observed by their hash.
 
 The local deterministic-failure and configuration-poison records are
@@ -4895,7 +4896,7 @@ header `ARTIFACT_HEADER_LEN` = 128 bytes):
 ```
 header        [u8; 12]    shared file header (§5): "NGPF",
                           u32 Domain::ArtifactImage, u32 version
-                          (ARTIFACT_FORMAT_VERSION = 1; an input-hash input)
+                          (ARTIFACT_FORMAT_VERSION = 2; an input-hash input)
 asset_uuid    [u8; 16]
 authored_type [u8; 16]
 terminal_type [u8; 16]
@@ -4924,10 +4925,14 @@ bump. Unordered source data is canonicalized: `load_deps` are sorted
 lexicographically and deduplicated — bare UUIDs by design; the expected
 terminal type of every emitted reference lives in the producing job's
 trace as a revalidated `RefCheck` entry (§9) — and map entries flatten into the
-variable section sorted by canonical encoded key bytes (blob-free by
-§5's serializability rule) — a `HashMap`'s
-iteration order never reaches the artifact, so identical values produce
-identical bytes and one ContentHash (the collapse §9's early cutoff rests on).
+variable section sorted by their keys' value encoding (§5,
+`ngp_value::encoding::key_bytes`; blob-free by §5's serializability rule) —
+a `HashMap`'s iteration order never reaches the artifact, so identical
+values produce identical bytes and one ContentHash (the collapse §9's early
+cutoff rests on). A `Dynamic` slot (`DynamicPatch`) holds its value
+encoding (§5: the type UUID and the full or sparse payload) as a byte
+slice, decoded natively, never text (format version 2; version 1 held
+canonical text, so every older result re-cooks once).
 The encoder's input for a processor output is the type's generated
 encode visitor's event stream (§4's `encode` entry): flat bytes,
 container events already in canonical §5 order, blob handoffs, and
@@ -6840,7 +6845,11 @@ mid-sweep `Drifted` rule below — re-resolve every member at the newer
 basis, never adopt a mix. The sweep also validates each authenticated
 artifact's terminal TypeUuid and logical hash against the live descriptor, rejects a
 locally build-only descriptor, authenticates its wire tree, and compiles the
-fixup plan against that descriptor's native layout. A module epoch change
+fixup plan against that descriptor's native layout. A component's storage
+updates run each member after the members it load-depends on
+(`distill_loader::component::dependency_order`), so an update reads what a
+dependency staged in the same commit (newgameplus GAP 23 §17.7: a cooked
+prefab's `SchemaSet` before the prefab). A module epoch change
 reconnects RpcIO before new work and causes held closures to re-resolve
 normally. If **any** member of a
 component's expanded closure fails to resolve (build error, `Missing`
@@ -8201,7 +8210,7 @@ displaced_retention_days = 7
 # selects a physical destination by name — paths stay root-relative in
 # one merged namespace for every read and query.
 roots = { main = "assets/", engine = "engine-assets/" }
-schema_path = "target/asset-schema.json"
+schema_path = "target/asset-schema.bin"
 # Source-controlled destination used only when the explicit local lineage
 # repair command creates a missing manifest. Discovery still rejects any
 # second SchemaLineageManifest anywhere in the configured roots.

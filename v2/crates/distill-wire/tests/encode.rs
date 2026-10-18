@@ -650,3 +650,57 @@ fn structs_reject_a_value_count_other_than_their_field_count() {
         Err(EncodeError::Shape { .. })
     ));
 }
+
+/// Artifact image v2: map entries order by their keys' value encoding,
+/// not their text: `"b"` (length 1) sorts before `"aa"` (length 2).
+#[test]
+fn map_entries_sort_by_key_encoding() {
+    let schema = SchemaNode::Map { key: Box::new(SchemaNode::String), value: Box::new(SchemaNode::Primitive(PrimitiveKind::U8)) };
+    let wire = wmap_slot(0, wstring_slot(0), wprim(0, ScalarKind::U8));
+    let value = Value::Map(vec![(Value::String("aa".into()), Value::U8(1)), (Value::String("b".into()), Value::U8(2))]);
+    let encoded = encode_value(&schema, &wire, &value, &mut no_references).unwrap();
+    // Two 24-byte pairs (string slot, u8, padding); the strings' bytes
+    // follow in entry order.
+    let tail = &encoded.variable[encoded.variable.len() - 3..];
+    assert_eq!(tail, b"baa", "{:?}", encoded.variable);
+}
+
+/// Artifact image v2: a dynamic value is a byte slot holding its type
+/// uuid and its payload in the value encoding, decodable against the
+/// bundle's types.
+#[test]
+fn a_dynamic_value_is_its_value_encoding_in_a_byte_slot() {
+    use ngp_schema::{DynamicPayload, DynamicType, DynamicValue, LogicalSchema, Patch, Renames, TypeTable};
+    use std::sync::Arc;
+    let tint = SchemaNode::Struct { rev: 0, fields: vec![("hue".into(), 0, SchemaNode::Primitive(PrimitiveKind::F32))] };
+    let ty = TypeUuid([7; 16]);
+    let types = TypeTable::new(vec![DynamicType {
+        uuid: ty,
+        path: "game::Tint".into(),
+        schema: Arc::new(LogicalSchema { root: tint }),
+        renames: Arc::new(Renames::new()),
+    }])
+    .unwrap();
+    let schema = SchemaNode::Dynamic { sparse: true };
+    let patch = Patch::Struct(vec![Some(Patch::Replace(Value::F32(0.5)))].into());
+    let value = Value::Dynamic(Box::new(DynamicValue { ty, value: DynamicPayload::Sparse(patch) }));
+    let wire = wvec_slot(0, wprim(0, ScalarKind::U8));
+    let encoded = distill_wire::encode::encode_value_with_types(&schema, &wire, &value, &mut no_references, Some(&types)).unwrap();
+    let expected = ngp_value::encoding::encode_value(
+        ngp_value::encoding::Cx::new(&LogicalSchema { root: schema.clone() }, &types),
+        &value,
+    )
+    .unwrap();
+    assert_eq!(&expected[..16], &ty.0, "the type uuid leads");
+    assert_eq!(encoded.variable, expected);
+    let decoded = ngp_value::encoding::decode_value(
+        ngp_value::encoding::Cx::new(&LogicalSchema { root: schema.clone() }, &types),
+        &encoded.variable,
+    )
+    .unwrap();
+    assert_eq!(decoded, value);
+    assert!(
+        encode_value(&schema, &wire, &value, &mut no_references).is_err(),
+        "no type table: refused"
+    );
+}

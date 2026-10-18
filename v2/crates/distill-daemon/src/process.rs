@@ -173,7 +173,7 @@ impl DaemonProcess {
                 source,
             }
         })?;
-        let authority = ProjectSchemaAuthority::from_json(&schema_bytes)?;
+        let authority = ProjectSchemaAuthority::from_file_bytes(&schema_bytes)?;
         Self::start_with_authority(config, authority)
     }
 
@@ -365,7 +365,7 @@ pub fn codegen_once(
             source,
         }
     })?;
-    let authority = ProjectSchemaAuthority::from_json(&schema_bytes)?;
+    let authority = ProjectSchemaAuthority::from_file_bytes(&schema_bytes)?;
     let targets = config.target_definitions(authority.identity())?;
     let coordinator = match DaemonCoordinator::open(
         config.store_config(),
@@ -800,7 +800,7 @@ fn observe_schema_source(path: &Path) -> SchemaObservation {
     match std::fs::read(path) {
         Ok(bytes) => SchemaObservation {
             state: ArtifactSourceState::Bytes(distill_core::hash::hash(&bytes)),
-            outcome: ProjectSchemaAuthority::from_json(&bytes)
+            outcome: ProjectSchemaAuthority::from_file_bytes(&bytes)
                 .map(Arc::new)
                 .map_err(|error| error.to_string()),
         },
@@ -1625,7 +1625,7 @@ mod tests {
     #[test]
     fn control_invalidation_rereads_only_the_named_source() {
         let config = PathBuf::from("/project/distill.toml");
-        let schema = PathBuf::from("/project/schema.json");
+        let schema = PathBuf::from("/project/schema.bin");
         let pipeline = PathBuf::from("/project/pipeline.so");
 
         let schema_only = control_invalidation_for(
@@ -1673,7 +1673,7 @@ mod tests {
         assert!(configuration.schema);
         assert!(configuration.pipeline);
 
-        let nested_schema = PathBuf::from("/project/schema/schema.json");
+        let nested_schema = PathBuf::from("/project/schema/schema.bin");
         let schema_parent = control_invalidation_for(
             &crate::watcher::WatcherBatch {
                 paths: vec![nested_schema.parent().unwrap().to_path_buf()],

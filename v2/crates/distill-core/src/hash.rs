@@ -127,11 +127,14 @@ pub enum Domain {
     ModuleLayout = 31,
     /// The bootstrap control spec file format (§3).
     BootstrapSpec = 32,
+    /// A type's default value file (newgameplus `type-defaults`, GAP 23
+    /// §6): the value encoding under the schema hash it names.
+    TypeDefault = 33,
 }
 
 impl Domain {
     /// Every domain, in discriminant order.
-    pub const ALL: [Domain; 32] = [
+    pub const ALL: [Domain; 33] = [
         Domain::Schema,
         Domain::Layout,
         Domain::ModuleInterface,
@@ -164,6 +167,7 @@ impl Domain {
         Domain::SchemaFile,
         Domain::ModuleLayout,
         Domain::BootstrapSpec,
+        Domain::TypeDefault,
     ];
 
     pub fn from_u32(value: u32) -> Option<Domain> {
