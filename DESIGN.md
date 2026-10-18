@@ -66,27 +66,29 @@ There are three independent boundaries:
    authored-value stream and are encoded from the paired schema.
 2. **Runtime artifact loading.** The authenticated artifact header's terminal
    `TypeUuid` and `LogicalHash` must equal the selected live runtime descriptor;
-   `build_only` is rejected from that local descriptor. The artifact's DSWL
-   bytes must hash to its `LayoutHash`, and the loader must successfully compile
+   `build_only` is rejected from that local descriptor. The artifact's
+   wire-tree bytes (layout encoding, §12) must hash to its `LayoutHash`, and the loader must successfully compile
    a fixup plan from that producer wire tree to the exact live
    `NativeLayoutNode`. Execution uses the size, alignment, ctor, drop, and skip
    tables from that same descriptor. Different producer and consumer native
-   layouts are supported; DSNL equality is neither required nor sufficient.
+   layouts are supported; native-layout digest equality is neither required
+   nor sufficient.
    There is no cross-epoch fixup-plan cache, so a second digest over local table
    assignments adds no safety and is removed. A future cache must be scoped to
    one live module epoch and keyed by `(TypeUuid, LayoutHash)`.
-3. **Target selection.** `DSTG` remains the compact commitment to one complete
-   target definition and crosses RPC/build/pack boundaries. A candidate target
-   set is stored and compared as its canonical sorted `(name, DSTG)` rows;
-   `DSTS`, a second digest stored beside those rows, adds no authority and is
-   removed.
+3. **Target selection.** The target-definition hash remains the compact
+   commitment to one complete target definition and crosses RPC/build/pack
+   boundaries. A candidate target set is stored and compared as its canonical
+   sorted `(name, target-definition hash)` rows; a second digest over those
+   rows would add no authority and does not exist.
 
 RPC validates each fetched artifact at the load boundary above. Artifact fetch
 exists only on a pinned `Snapshot` capability, so resolve and fetch return the
 same `SnapshotStamp`; there is no target-bound “fetch latest” Hub bypass. A
 module epoch change advances the connection fence and returns
 `PipelineEpochChanged`; clients reconnect and resubscribe instead of mutating
-an existing Hub with `reattest`. Packs carry their target/DSTG,
+an existing Hub with `reattest`. Packs carry their target and
+target-definition hash,
 artifact content hashes, authenticated artifact bytes, wire trees, and typed
 dependency edges; mount/load applies the same live-descriptor checks. Pack
 construction enforces build-only policy, and runtime loading independently
@@ -103,7 +105,7 @@ generic registry-extras attestation grammar.
 Every live descriptor must be locally sound. In particular, generic `Option<T>`
 uses a typed contained construction thunk and never guesses a niche layout.
 That local validation/construction boundary is what made removal of the
-cross-binary DSNL comparison safe.
+cross-binary native-layout digest comparison safe.
 
 ## 2. Source-of-Truth Hierarchy
 
@@ -137,7 +139,7 @@ This invariant governs the whole design:
    logical authority plus the closed bundle-format bootstrap exception (§3): a
    `Ready(PipelineEpoch)` exists iff every non-bootstrap candidate schema row
    has one `Active` manifest row, every `Active` row has one candidate row, and
-   each candidate DSLH equals that row's selected `current` digest. Every
+   each candidate logical hash equals that row's selected `current` digest. Every
    bootstrap-control row instead equals
    its format-derived logical row under the separate bootstrap-authority gate.
    No other exception exists. `Retired` rows preserve accepted history but are
@@ -443,10 +445,12 @@ pub struct PipelineModuleTableV2 {
 /// each authenticated artifact against its live descriptor.
 pub struct ModuleAbiIdentity {
     pub rustc: String,                    // must equal the daemon's exactly
-    pub interface_fingerprint: [u8; 32],  // shared host-interface build
+    pub interface_fingerprint: [u8; 16],  // shared host-interface build
                                           // fingerprint, computed identically
-                                          // by both workspace builds
-    pub measured_interface: [u8; 32],     // measured layout digest (§5) over
+                                          // by both workspace builds:
+                                          // digest(Domain::ModuleAbi, 1, …)
+    pub measured_interface: [u8; 16],     // measured layout digest (§5),
+                                          // digest(Domain::ModuleAbi, 2, …), over
                                           // the boundary types themselves —
                                           // Registry, Outputs, Value, Patch,
                                           // error types — the backstop no
@@ -461,8 +465,10 @@ pub struct ModuleAbiIdentity {
 /// The bundle decoder's sealed logical bootstrap. It has exactly five rows:
 /// SchemaLineageManifest, Migration, ImportRecord, DirectoryImportRules, and
 /// PackDefinition. Each row is `(symbol, TypeUuid, canonical logical-schema
-/// bytes, DSLH)` and rows are strictly TypeUuid-sorted. The checked-in byte
-/// resource is parsed and rehashed by every bundle consumer; it contains no
+/// bytes, logical hash)` and rows are strictly TypeUuid-sorted. The checked-in byte
+/// resource (`distill-core/src/bootstrap.rs`, spec version 2: `u32` symbols and
+/// schema encodings with `u32` node kinds) is parsed and rehashed by every
+/// bundle consumer; it contains no
 /// native layout, build-policy projection, or consumer-specific brand.
 pub struct BootstrapControlSpecV1(pub [BootstrapControlSpecRowV1; 5]);
 
@@ -491,7 +497,7 @@ pub struct ErasedRegistrationPayload { pub ptr: *mut u8, pub kind: u32 }
 /// Stack-owned by the host thunk from its first instruction inside
 /// catch_unwind until the intrusive node is linked. No construction or move
 /// allocates. If linking fails, this guard invokes contained cleanup or
-/// deliberately leaks and latches CandidateOpen-origin DSPP poison.
+/// deliberately leaks and latches CandidateOpen-origin pipeline poison.
 pub struct RegistrationIngressGuard {
     capsule: ManuallyDrop<ErasedRegistrationCapsule>,
     linked: bool,
@@ -547,7 +553,7 @@ impl Registry {
     /// Tool registry behind ctx.run_tool (§9). Registration is an input
     /// event: the daemon snapshots a complete package directory or records an
     /// explicitly ambient toolchain identity, then publishes (id → execution
-    /// identity + DSCT hash) as input-versioned state (§9, §13). Jobs resolve
+    /// identity + its hash) as input-versioned state (§9, §13). Jobs resolve
     /// the tool through their pinned snapshot; an ambient registration without
     /// a trusted fingerprint makes every calling attempt nonmemoizable.
     pub fn tool(&mut self, id: &str, spec: ToolRegistration) -> RegistrationStatus;
@@ -616,7 +622,7 @@ pub struct CandidateRegistrationArena {
 pub enum CandidateCleanupState {
     Clean,
     MustCleanup,
-    /// Exact DSPP disposition, restricted here to
+    /// Exact pipeline-poison disposition, restricted here to
     /// RegistrationCleanupFailed..DlcloseFailed (§13).
     MustLeak(CleanupDisposition),
 }
@@ -679,12 +685,12 @@ Identity and hash types, used throughout:
 pub struct AssetUuid(pub [u8; 16]);   // minted at authoring; UUIDv5 for derived outputs (§7, §9)
 pub struct BundleUuid(pub [u8; 16]);
 pub struct TypeUuid(pub [u8; 16]);    // #[asset(uuid = "…")]
-pub struct LogicalHash(pub [u8; 32]); // blake3 over the §5 grammar
-pub struct LayoutHash(pub [u8; 32]);  // blake3 over the §12 DSWL grammar
-pub struct ContentHash(pub [u8; 32]);        // blake3 of artifact bytes (§12)
-/// Raw blake3 of the exact observed bundle-file bytes, valid or malformed.
+pub struct LogicalHash(pub [u8; 16]); // digest(Domain::Schema, …) of the §5 schema encoding
+pub struct LayoutHash(pub [u8; 16]);  // digest(Domain::Layout, …) of the §12 layout encoding
+pub struct ContentHash(pub [u8; 16]); // XXH3-128 of artifact bytes (§12)
+/// Plain XXH3-128 of the exact observed bundle-file bytes, valid or malformed.
 /// This is byte identity only; canonical bundle validation is a separate gate.
-pub struct BundleFileHash(pub [u8; 32]);
+pub struct BundleFileHash(pub [u8; 16]);
 
 /// Implemented by #[asset]; never hand-written.
 pub trait AssetType: 'static {
@@ -706,7 +712,7 @@ pub trait AssetType: 'static {
 /// generated facts only the descriptor can supply.
 pub struct AssetRuntimeDescriptor {
     pub type_uuid: TypeUuid,
-    /// Checked against the authenticated artifact terminal DSLH. A mismatch
+    /// Checked against the authenticated artifact's terminal logical hash. A mismatch
     /// is registry disagreement, never a migration trigger.
     pub logical_hash: LogicalHash,
     /// Local runtime policy. A loader rejects this descriptor before plan
@@ -911,11 +917,12 @@ before any Rust-ABI registration call; the staged dylib hash identifies
 pipeline behavior and `ModuleAbiIdentity` separately covers the host interface.
 Runtime consumers do not need the pipeline module's native layout: each
 authenticated artifact carries its terminal `TypeUuid`, `LogicalHash`, and
-DSWL tree, and the loader compiles that tree against its own live descriptor.
+wire tree (layout encoding, §12), and the loader compiles that tree against
+its own live descriptor.
 
 Each target resolves to a bound `LayoutIdentity` (§18) that must match the
 layout table used to encode its artifacts. Actual output keys additionally
-bind their logical and DSWL layout hashes (§9), so a changed table cannot reuse
+bind their logical and layout hashes (§9), so a changed table cannot reuse
 old artifacts merely because it was produced by the same target/toolchain.
 Until per-target layout emission lands (§22), the only layout table is the
 host's, so buildable targets degenerate to host-identity targets.
@@ -928,52 +935,78 @@ pub struct LayoutIdentity {
 }
 ```
 
-Identity records hash and compare by a **canonical record encoding**,
-normative here: fields in declaration order; integers LE fixed-width;
-`str` as `u32` length + NFC UTF-8 bytes; `[u8; 32]` raw; sets sorted,
-deduplicated, and encoded as `u32` count + elements; sequences as `u32`
-count + elements; `Option` as a `u8` presence marker + payload; enums as
-a `u8` discriminant in declaration order + payload; domain-prefixed and
-versioned — `blake3("DSLI" ‖ version:u8 ‖ fields)` for
-`LayoutIdentity`, `blake3("DSMA" ‖ version:u8 ‖ fields)` for
-`ModuleAbiIdentity` (distinct meanings never share a domain — the two
-records answer different questions and must never alias), `blake3("DSTG" ‖
-version:u8 ‖ fields)` for the target-definition hash (§18). Two builds
-of any component can never disagree on an identity's bytes. The same
-encoding serializes **every composite this document hashes or stores as
-a key** — `StaticInputs` (domain `"DSSI"`), `TraceOp` sequences (`"DSTR"`),
-the `AssetQuery` inside a trace entry, output tables — so no `‖` formula
-in this document can repartition variable-length fields.
+`LayoutIdentity` compares by equality; it has no digest of its own (its
+fields enter the target-definition hash, §18).
 
-Every **semantic or composite** hash in this document is domain-prefixed;
-the domain strings form one table, no two of which may ever prefix the
-same byte meaning. The rule is total over that class: every semantic or
-composite hash construction must appear here; an unregistered one is a
-spec defect, since that is how two meanings come to share bytes:
+Every record this document hashes, keys or stores as binary uses **one
+encoding** (`distill_core::encoding`, normative here; newgameplus GAP 23
+§17.2): fields in declaration order; integers LE fixed-width; `str` as
+`u32` length + raw UTF-8 bytes (names are NFC-normalized once, at intake:
+source-walk, the macro, configuration and path validation — never at
+encode time); fixed byte arrays raw; sequences as `u32` count + elements;
+sets and maps as `u32` count + elements sorted by their encoded bytes,
+strictly increasing; `Option` as a `u8` presence flag (0 or 1) + payload;
+enums as a `u32` discriminant + payload (a Rust `#[repr(u8)]`/`#[repr(u16)]`
+in this document fixes discriminant values, not encoded width). The decoder
+is strict: truncation,
+trailing bytes, a count past the bytes left, an unsorted or duplicate set
+element, a flag other than 0/1, invalid UTF-8 and nesting past 256 frames
+are named refusals (`DecodeErrorKind`). Two builds of any component can
+never disagree on a record's bytes, and no `‖` formula in this document can
+repartition variable-length fields.
 
-| Domain | Hashes |
+**Hashes** (`distill_core::hash`; GAP 23 §17.4): every content hash, digest
+and identity is XXH3-128 (`xxhash-rust`, named by distill-core only),
+16 little-endian bytes, printed as 32 lowercase hex characters. Content
+hashes are `hash(bytes)` over exactly the bytes they name. Every
+**semantic or composite** hash is a digest: `digest(domain, version, body)
+= XXH3-128(u32 domain ‖ u32 version ‖ body)`, the body in the one
+encoding. The domain is one `#[repr(u32)] enum Domain`; a discriminant is
+never reused, and the version changes when the body's fields change. The
+rule is total: every digest construction appears here; an unregistered one
+is a spec defect, since that is how two meanings come to share bytes:
+
+| `Domain` | Digest |
 |---|---|
-| `"DSLI"` | `LayoutIdentity` records (§5) |
-| `"DSMA"` | `ModuleAbiIdentity` records (§3, §5) — the host-interface identity, never sharing `LayoutIdentity`'s domain |
-| `"DSTG"` | target-definition hash (§18) |
-| `"DSSL"` | schema-lineage chain digest — a type's accepted epoch records, explicit parent links, and current cursor (§6, §11, §13) |
-| `"DSLH"` | logical hash — the schema AST grammar (§5) |
-| `"DSCT"` | tool-execution identity — complete packaged-directory bytes or explicit ambient toolchain identity, plus sanitized environment and cwd policy (§9, §13) |
-| `"DSWL"` | layout hash — the wire tree (§12) |
-| `"DSSI"` | static-input key (§9) |
-| `"DSIH"` | full input hash — the witnessed all-inputs composite a validated hit implies (§9); never stored as an index |
-| `"DSTR"` | dependency-trace digest (§9) |
-| `"DSBI"` | build-import pre-key (§8) |
-| `"ASTQ"` / `"FILQ"` | asset-namespace / raw-file query result hashes (§10, §8) |
-| `"DSEK"` | pack encoding key (§16) |
-| `"DSPM"` | pack manifest hash (§16) |
-| `"DSLF"` | canonical local deterministic-failure detail (§9) |
-| `"DSCP"` | canonical configuration-poison reason (§13, §17, §18) |
-| `"DSVP"` | canonical version-global poison identity (§7, §13, §17) |
-| `"DSPP"` | canonical pipeline-poison identity (§3, §13, §17) |
+| `Schema` (1) | logical hash — the schema encoding of a root node (§5) |
+| `Layout` (2) | layout hash — the layout encoding of a wire tree (§12) |
+| `ModuleAbi` (3) | `ModuleAbiIdentity` — the host-interface identity (§3): `interface_fingerprint` at version 1, `measured_interface` at version 2 (`distill-pipeline-api/src/module.rs`) |
+| `TargetDefinition` (4) | target-definition hash (§18) |
+| `ProcessorInputs` (5) | static-input key (§9) |
+| `Trace` (6) | dependency-trace digest (§9) |
+| `LocalFailure` (7) | local deterministic-failure detail (§9) |
+| `ConfigError` (8) | configuration-poison reason (§13, §17, §18) |
+| `NamespaceError` (9) | version-global poison identity (§7, §13, §17) |
+| `PipelineFailure` (10) | pipeline-poison identity (§3, §13, §17) |
+| `ToolCapsule` (11) | tool-execution identity — packaged-directory bytes or ambient toolchain identity, sanitized environment, cwd policy (§9, §13) |
+| `ImportKey` (12) | build-import pre-key (§8) |
+| `InputHash` (13) | full input hash — the witnessed all-inputs composite a validated hit implies (§9); never stored as an index |
+| `NodeKey` (14) | asset node key (§9) |
+| `ImporterCapability` (15) | importer capability (§8) |
+| `DirectoryTask` (16) | directory import task (§8) |
+| `MintedAsset` / `MintedBundle` (17, 18) | importer-minted asset and bundle UUIDs (§8) |
+| `TypeEpoch` (19) | type epoch (§9) |
+| `DefaultRulesBundle` (20) | a root's default-import rules-bundle UUID (§8) |
+| `PackEntry` (21) | pack encoding key (§16) |
+| `PackManifest` (22) | pack manifest hash and file format (§16) |
+| `AssetQuery` / `FileQuery` (23, 24) | asset-namespace / raw-file query result hashes (§10, §8) |
+| `ContentKey` (25) | authoring entry content key (§17) |
+| `Value` (26) | a value's identity under its schema (GAP 23 §17.3) |
+| `ArtifactImage`, `PackArchive`, `Bundle`, `SchemaFile` (27–30) | file formats only (shared header below) |
 
-`DSLF` and `DSCP` are declared tagged-record grammars encoded only through the
-canonical record codec above. Their v1 declarations are exhaustive:
+A schema-lineage chain digest (§6, §11, §13) is not built; it takes a new
+`Domain` when it is.
+
+**Shared file header:** every standalone binary file starts with 4 magic
+bytes `NGPF`, the `u32` `Domain` naming its format and the `u32` version of
+that format (`distill_core::header`; one reader refuses a wrong magic,
+domain or version by name): the artifact image (§12), pack archive and
+manifest (§16), bundle container (§6) and the newgameplus schema file.
+There are no checksums: files are named or observed by their hash.
+
+The local deterministic-failure and configuration-poison records are
+declared tagged records encoded only through the one encoding. Their v1
+declarations are exhaustive:
 
 ```rust
 #[repr(u16)]
@@ -1121,7 +1154,7 @@ pub enum ConfigurationPoisonCode {
     ConfigurationSourceUnavailable = 14,
 }
 pub enum DscpV1 { // tag is the ConfigurationPoisonCode value
-    MalformedConfiguration { file_hash: [u8; 32] },
+    MalformedConfiguration { file_hash: [u8; 16] },
     NonLoopbackAddress { address: String },
     DuplicateRootName { normalized_name: String },
     InvalidPath { key: ConfigurationPathKey,
@@ -1170,22 +1203,27 @@ pub enum ConfigurationSourceFailure {
 }
 pub struct ConfigurationPoison {
     pub code: ConfigurationPoisonCode,
-    /// Exact same-code canonical DSCP v1 payload. This is the typed reason;
-    /// `message` is never allowed to substitute for it.
+    /// Exact same-code configuration-poison v1 payload. This is the typed
+    /// reason; `message` is never allowed to substitute for it.
     pub detail: DscpV1,
-    pub reason_hash: [u8; 32],
+    pub reason_hash: [u8; 16],
     pub message: String, // presentation only; never hashed
 }
 ```
 
-`DSLF v1 = blake3("DSLF" || 0x01 || LocalFailureClass:u16 || variant
-fields)` and `DSCP v1 = blake3("DSCP" || 0x01 ||
-ConfigurationPoisonCode:u16 || variant fields)`. Fields are encoded in the
-orders above. Every nested `*FailureV1`/`*SlotV1`/`ReferenceObservationV1`
-variant begins with its pinned `u16` tag shown above; `ImportEntryRoleV1` uses
-its pinned `u8` tag. Each is followed by exactly that variant's required
+The local-failure record is `digest(Domain::LocalFailure, 1,
+LocalFailureClass:u32 ‖ variant fields)` (`DslfV1::digest`,
+`distill-build/src/dslf.rs`) and the configuration-poison record
+`digest(Domain::ConfigError, 1, ConfigurationPoisonCode:u32 ‖ variant
+fields)` (`ConfigurationPoison::reason_hash`, `distill-store/src/state.rs`).
+Fields are encoded in the orders above. Every tag — the class or code, each
+nested `*FailureV1`/`*SlotV1`/`ReferenceObservationV1` variant,
+`ImportEntryRoleV1`, `ConfigurationPathKey`, `OwnedPathKind`,
+`ConfigurationSourcePathBytes`, `ConfigurationSourceFailure` — encodes as a
+`u32` discriminant with the pinned value shown above (the Rust `repr` widths
+are storage only). Each is followed by exactly that variant's required
 fields: absent data is represented by a different variant, never by an
-optional catch-all field. Strings/paths are normalized and
+optional catch-all field. Strings/paths are normalized at intake and
 length-framed, and every unordered vector is sorted as its comment states
 with duplicates rejected unless multiplicity is explicitly retained.
 `DuplicateLineageManifest.claimants` sorts and deduplicates the complete
@@ -1193,8 +1231,8 @@ injective `(root_name, normalized_path, bundle, normalized local_id, asset,
 file_hash)` rows, so two entries in one bundle remain distinct. Every
 semantically symmetric
 pair is canonically ordered before encoding: `ConfigurationPathKey` and
-`OwnedPathKind` are their fixed `u8` values above (unknown values reject),
-`OwnedPathOverlap` sorts the two `(kind:u8, path)` records by canonical bytes,
+`OwnedPathKind` are their fixed values above (unknown values reject),
+`OwnedPathOverlap` sorts the two `(kind:u32, path)` records by encoded bytes,
 and `DirectoryAlias` sorts its two `normalized_path` records the same way. A new symmetric
 variant must state its pair ordering explicitly.
 `DuplicateTargetName` is code 13 everywhere (candidate validation, persisted
@@ -1209,8 +1247,8 @@ unreadable, changes to a disallowed file type, or cannot be read without data
 loss publishes this poison; the daemon never silently reverts to defaults.
 
 Configuration validation enumerates the complete canonical defect set before
-choosing authority. Candidate DSCP values are canonical-encoded, deduplicated,
-and sorted by `(ConfigurationPoisonCode:u16, detail bytes)`; the first row is
+choosing authority. Candidate configuration-poison values are encoded,
+deduplicated, and sorted by `(ConfigurationPoisonCode, detail bytes)`; the first row is
 the sole persisted/snapshot/RPC `ConfigurationPoison`, while `doctor` may show
 the complete sorted set. Parser, watcher, and validation completion order can
 never select the winner. The lineage-repair bootstrap is enabled only when
@@ -1218,7 +1256,7 @@ that authoritative first defect is `MissingLineageManifest` or
 `DuplicateLineageManifest`; the presence of either defect later in the
 doctor-only set grants no repair capability.
 Presentation messages, backtraces, OS prose, and parser prose are excluded.
-`ConfigurationPoison` persistence stores the explicit DSCP version plus the
+`ConfigurationPoison` persistence stores the explicit detail version (1) plus the
 complete canonical detail bytes, never only the code/digest. Decode requires
 the detail variant's tag to equal `code`, recomputes `reason_hash`, and rejects
 an unknown version/tag, a wrong code/detail pair, noncanonical detail, or a
@@ -1227,18 +1265,18 @@ An unknown version/code is a hard failure on persisted or RPC decode; a new
 variant requires a grammar version bump unless it consumes a previously
 reserved discriminant whose optional-field framing was already pinned. These
 grammars are the sole inputs to `StableFailureFingerprint::Local.detail` and
-`ConfigurationPoison.reason_hash`. The DSLF class list is total over every
+`ConfigurationPoison.reason_hash`. The local-failure class list is total over every
 memoizable local producer named by this design: importer-returned failures,
 daemon import-intake/fold failures, migration-function returns, output
 binding, and artifact encoding join validators, migration planning, and
 processor returns. Callback panics and transient infrastructure failures stay
-outside DSLF because they poison or do not memoize; another deterministic
+outside the local-failure record because they poison or do not memoize; another deterministic
 local producer requires a class and exact v1 arm before it may memoize.
 
 Candidate target sets are canonical rows, not a digest plus rows. Names are
 NFC-normalized, rows sort by name bytes, duplicate normalized names reject,
-and each row is `(name:str, target_definition_hash:[u8;32])` with a recomputed
-DSTG (§18). Candidate staging, schema acceptance, and commit compare the exact
+and each row is `(name:str, target_definition_hash:[u8;16])` with a recomputed
+target-definition hash (§18). Candidate staging, schema acceptance, and commit compare the exact
 rows transactionally. Persisting or transmitting a second hash beside the
 complete rows adds no stale-work or atomicity guarantee.
 
@@ -1247,25 +1285,26 @@ uses the authenticated schema file's source hash as a conservative local
 tag-index generation: any schema edit invalidates the projection, while tag
 facts are never copied into a second cross-binary registry grammar.
 
-The explicit exception class is **byte-identity digests**. These are raw
-`blake3` over exactly the bytes their name identifies, deliberately
-domainless because their meaning is byte equality rather than a semantic
-record: `ContentHash` over complete DSTL artifact bytes; tracked raw-file and
+The explicit exception class is **byte-identity hashes**. These are plain
+`hash(bytes)` (XXH3-128) over exactly the bytes their name identifies,
+deliberately domainless because their meaning is byte equality rather than a
+semantic record: `ContentHash` over complete artifact-image bytes; tracked raw-file and
 `BundleFileHash` values over the exact observed file bytes, whether valid or
 malformed (canonical bundle validation is independent); staged pipeline-
 dylib hashes over the executable bytes; each `ToolPackageFile.bytes_hash` over
-that exact packaged member's bytes (the DSCT aggregate remains semantic); CAS record
-`content_hash` values over payload bytes; and pack/archive per-file
-trailers and archive-reference file hashes over the preceding/full named
-file bytes as §16 specifies. This list is closed: a new domainless digest
-must first be added to this exception class. `DSEK` and `DSPM` remain
-semantic/composite hashes and therefore remain domain-prefixed.
+that exact packaged member's bytes (the tool-execution identity aggregate
+remains semantic); CAS record `content_hash` values over payload bytes;
+authoring blob hashes; and pack archive/manifest trailers and
+archive-reference file hashes over the preceding/full named file bytes as
+§16 specifies. This list is closed: a new domainless hash must first be
+added to this exception class. The pack encoding key and the manifest hash
+remain semantic/composite and are digests (§16).
 
-**Local layout soundness.** Source-walk emits the authenticated DSWL producer
+**Local layout soundness.** Source-walk emits the authenticated producer wire
 tree used to encode artifacts. Each consuming binary independently generates
 the exact `NativeLayoutNode`, constructor, drop, and skip tables used to load
-into its own Rust type. The loader authenticates DSWL, checks terminal
-TypeUuid/DSLH against the local descriptor, and compiles a plan from the wire
+into its own Rust type. The loader authenticates the wire tree, checks terminal
+TypeUuid/logical hash against the local descriptor, and compiles a plan from the wire
 tree to that descriptor. A successful plan is the compatibility proof; no
 cross-binary native-layout equality is required.
 
@@ -1375,7 +1414,7 @@ host pipeline module could not even construct the foreign field it
 doesn't have. So per-target layout emission (§22) must re-run extraction
 under each configured target's cfg evaluation and verify that every
 asset-reachable type produces an identical **registry projection**: the
-logical AST node for node (equal DSLH hashes), the stable type UUID,
+logical AST node for node (equal logical hashes), the stable type UUID,
 and the full attribute channel *including the bits the hash deliberately
 excludes* (`tag`, `build_only`) — equality over everything the shared
 `TypeDef` represents, not merely what migration identity retains, since
@@ -1392,8 +1431,8 @@ An enum's fields reference `EnumVariant` TypeDefs. A variant's
 `attrs.rev`, not the enclosing enum field's `FieldAttrs.rev`. Both the
 source-walk emitter and logical projection use this existing attribute
 channel; no separate variant-attribute record is needed. Native matching
-metadata and the operational Schema metadata above do not enter DSLH or
-DSWL grammar bytes.
+metadata and the operational Schema metadata above do not enter the schema
+or layout encoding.
 
 From these records, two distinct schemas per type are derived:
 
@@ -1424,7 +1463,7 @@ identity, so no bundle files churn and no migrations are minted.
 
 ### Logical hash, precisely
 
-`blake3` over a canonical byte form defined by these rules:
+A digest (§5 hashes) over the **schema encoding**, defined by these rules:
 
 - **Structural, not nominal.** Nested types expand inline; the hash covers
   shape, never type names (field and variant *names* do count — they are
@@ -1465,13 +1504,17 @@ identity, so no bundle files churn and no migrations are minted.
   item carrying `#[asset]` with any generic parameters is rejected by both
   macro expansion and extraction (§4), rather than assigning one TypeUuid to
   an unbounded family.
-- **Versioned binary encoding.** The hash input is the binary grammar
-  below — JSON is never the hash input.
+- **Versioned binary encoding.** The hash input is the schema encoding
+  below, versioned by its digest's `(Domain::Schema, 1)` — JSON is never
+  the hash input.
 
-#### Normative hash grammar (v1)
+#### Normative schema encoding
 
-All integers little-endian, fixed width. `str` = `u32` byte length + UTF-8
-bytes (NFC-normalized). Every node begins with a `u8` kind tag:
+The one encoding (§5): integers little-endian, fixed width; `str` = `u32`
+byte length + raw UTF-8 bytes (names arrive NFC-normalized from source-walk;
+the encoder never normalizes). Every node begins with its kind as a `u32`
+discriminant (`ngp-schema/src/node.rs` `node_bytes`; strict decoder
+`node_from_bytes`):
 
 ```
 0x01 primitive   name:str            canonical names: bool, u8…u128,
@@ -1503,11 +1546,11 @@ bytes (NFC-normalized). Every node begins with a `u8` kind tag:
                                      by element's encoded bytes (§6);
                                      duplicate elements are a parse
                                      error, never a silent dedup
-0x0F dynamic    sparse:u8            a value of the type its data names
+0x0F dynamic    sparse:bool          a value of the type its data names
                                      (newgameplus GAP 23 §3); JSON
                                      {"type": path, "value": …}; sparse=1:
                                      the value is a Patch (§6)
-0x10 noderef    has:u8 [type_uuid:[u8;16]]
+0x10 noderef    Option<type_uuid:[u8;16]>
                                      a prefab node reference (`Entity`;
                                      `CRef<T>` names T's type UUID); JSON
                                      {"node": path} or null
@@ -1522,9 +1565,10 @@ matched by path, `ngp-schema/src/engine.rs`); asset-type schemas hold
 none today.
 
 `rev` is the `#[asset(rev = N)]` value, 0 when absent. The logical hash is
-`blake3("DSLH" ‖ 0x01 ‖ root node)` — domain-prefixed and versioned. It
-is computed by a **hand-written walk over the `types` records directly**
-— `ngp_schema::logical_hash(&Schema, SchemaTypeId) -> [u8; 32]` — never
+`digest(Domain::Schema, SCHEMA_DIGEST_VERSION = 1, root node)`
+(`ngp_schema::node_hash`). It is computed by a **hand-written walk over the
+`types` records directly** — `ngp_schema::logical_hash(&Schema,
+SchemaTypeId) -> LogicalHash` — never
 by serializing the model structs: the grammar above is the pinned spec of
 the bytes that walk emits, so refactoring `ngp-schema`'s own types can
 never move an asset's identity. A
@@ -1633,35 +1677,36 @@ The parser dispatches on the first bytes of the file:
 - **Container** — used whenever blobs are present:
 
 ```
-magic     [u8; 8]  = 89 44 53 42 0D 0A 1A 0A   ("\x89DSB\r\n\x1a\n")
-version   u32 LE
+header    [u8; 12]            shared file header (§5): "NGPF",
+                              u32 Domain::Bundle, u32 CONTAINER_VERSION (2)
 json_len  u64 LE
 blob_len  u64 LE
-json_crc  u32 LE
-blob_crc  u32 LE
 json      [u8; json_len]      UTF-8, identical structure to plain JSON;
                               blob fields become { "offset": n, "len": n }
-pad       zeros to 16-byte alignment
+pad       zeros to 16-byte alignment of (28 + json_len)
 blob      [u8; blob_len]      individual blobs 16-byte aligned
 ```
 
-The PNG-style magic (`\x89` high-bit byte, `\r\n`, `\x1a`, `\n`) is invalid as
-UTF-8/JSON at byte zero and detects line-ending mangling loudly at open time.
-Projects should still set `*.<ext> -text` in `.gitattributes` and may install a
-`textconv` driver that prints the JSON chunk.
+The fixed header is 28 bytes (`distill-bundle/src/container.rs`). `NGPF` is
+not a JSON document's first byte, so the parser dispatches on it: the magic
+selects the container, anything else the plain-JSON envelope. Projects should
+set `*.<ext> -text` in `.gitattributes` and may install a `textconv` driver
+that prints the JSON chunk.
 
-Integrity and parsing rules, pinned:
+Parsing rules, pinned:
 
-- CRCs are CRC-32C (Castagnoli). File size must equal header + `json_len` +
-  pad + `blob_len` exactly; all offset/length arithmetic is checked, and
+- No checksum (§5): a bundle file is hashed whole on every observation
+  (`BundleFileHash`), and a truncated one fails the length checks. File size
+  must equal 28 + `json_len` + pad + `blob_len` exactly; all offset/length arithmetic is checked, and
   `json_len`/`blob_len` are validated against the file size before any
   allocation.
 - Blob offsets are relative to the start of the blob chunk. Ranges must be
   in-bounds, non-overlapping, 16-byte aligned, and sorted ascending in
   canonical structural-path order (below); zero-length blobs are legal. All padding bytes must
   be zero and are verified.
-- Writers use temp-file + fsync + atomic rename + directory fsync. Header
-  `version` covers the container encoding; the JSON `format_version` covers
+- Writers use temp-file + fsync + atomic rename + directory fsync. The
+  header's version covers the container encoding (a wrong magic, domain or
+  version is refused by name); the JSON `format_version` covers
   envelope semantics; a parser accepts a file only when it supports both.
 
 **Writer determinism is part of the spec**: canonical JSON serialization, zero
@@ -1707,8 +1752,10 @@ variants, array elements, or map values — a `Value` permits all
 of those shapes — letting two writers produce different bytes (and
 ContentHashes) for one value; the full path names each blob uniquely,
 so ordering is total by construction. The same key orders the artifact
-blob table (§12). The magic `DSB` is distinct from the
-artifact format's `DSTL` (§12).
+blob table (§12). The header's `Domain::Bundle` distinguishes a bundle
+container from an artifact image (`Domain::ArtifactImage`, §12). Committed
+bundles from before container version 2 were rewritten once; no reader of
+the old container remains.
 
 ### Envelope
 
@@ -1759,11 +1806,10 @@ pub struct AssetEntry {
     pub data: Value,
 }
 
-/// Closed entry-lineage carrier. Its canonical record encoding is
-/// `version:u8=1 || tag:u8 || payload`, with `Manifest=1` followed by the
-/// canonical LineageStamp record and `Bootstrap=2` followed by
-/// `bundle_format_version:u32-LE`; unknown versions/tags and trailing bytes
-/// reject. Canonical JSON is exactly the one-member object
+/// Closed entry-lineage carrier (not built, §5). Its encoding is the one
+/// encoding (§5): `tag:u32 ‖ payload`, with `Manifest=1` followed by the
+/// LineageStamp record and `Bootstrap=2` followed by
+/// `bundle_format_version:u32`; unknown tags and trailing bytes reject. Canonical JSON is exactly the one-member object
 /// `{ "manifest": <LineageStamp> }` or
 /// `{ "bootstrap": { "bundle_format_version": 1 } }`; those lowercase keys,
 /// the nested key, and the numeric value are literal, and aliases, additional
@@ -1781,8 +1827,8 @@ It requires both the enclosing bundle and arm to say the type's format
 version (1; 2 for `DirectoryImportRules`, whose sealed row's
 `ImportRule.settings` is `Dynamic { sparse: true }`, the one row format 2
 changed),
-`schema_hash` to equal that type's sealed table-row DSLH, and the bundle's
-`schemas[schema_hash]` canonical logical graph to equal the DSB-sealed logical
+`schema_hash` to equal that type's sealed table-row logical hash, and the bundle's
+`schemas[schema_hash]` canonical logical graph to equal the bootstrap-sealed logical
 graph, not merely hash to caller-supplied bytes. It also enforces that type's
 closed control role and namespace rules (including `authoring_only = true`,
 `$record` only for `ImportRecord`, and every type-specific control-value
@@ -1791,7 +1837,7 @@ become its type rows, and never enter user lineage comparison or migration.
 
 `EntryLineageV1::Manifest` is legal and mandatory for every other TypeUuid.
 Its stamp must validate as the exact accepted manifest prefix, parent graph,
-cursor, schema equality, and DSSL commitment described below. Entry decode,
+cursor, schema equality, and lineage chain commitment described below. Entry decode,
 bundle schema-closure validation, scanner publication, adoption, importer and
 editor/RPC writes, disk migration, repair validation, and every `ControlRead`
 all call this same arm/type validator; none may accept a bootstrap type with a
@@ -1801,9 +1847,10 @@ manifest stamp or a non-bootstrap type with the bootstrap arm.
 /// exact prefix of the durable manifest's append-only epoch vector, including
 /// each epoch's explicit forward parent. `cursor` selects the writing epoch;
 /// it need not be the final vector element after an accepted rollback.
-/// `schema_hash == epochs[cursor].digest` is mandatory. `chain` is
-/// `blake3("DSSL" ‖ version:u8 ‖ type_uuid ‖ count:u32 ‖
-/// each(digest ‖ parent:Option<u32>) ‖ cursor:u32)`, recomputed on read.
+/// `schema_hash == epochs[cursor].digest` is mandatory. `chain` is the
+/// schema-lineage chain digest over `type_uuid ‖ count:u32 ‖
+/// each(digest ‖ parent:Option<u32>) ‖ cursor:u32`, recomputed on read
+/// (not built; it takes its own `Domain` when it is, §5).
 /// A stamp whose prefix, parents, cursor, or commitment disagrees with the
 /// source-controlled manifest is malformed. A valid stamp proves only what
 /// the manifest already accepted; it can never replace a missing manifest or
@@ -1811,7 +1858,7 @@ manifest stamp or a non-bootstrap type with the bootstrap arm.
 pub struct LineageStamp {
     pub epochs: Vec<AcceptedSchemaEpoch>,
     pub cursor: u32,
-    pub chain: [u8; 32],
+    pub chain: [u8; 16],
 }
 
 pub struct AcceptedSchemaEpoch {
@@ -1884,8 +1931,8 @@ pub struct LineageManifestClaimant {
     pub local_id: String,
     pub root_name: RootName,
     pub normalized_path: String,
-    /// Raw blake3 of the exact physical preimage bytes (§5), not a canonicality
-    /// assertion.
+    /// Plain XXH3-128 of the exact physical preimage bytes (§5), not a
+    /// canonicality assertion.
     pub file_hash: BundleFileHash,
 }
 #[repr(u8)]
@@ -1915,7 +1962,7 @@ pub struct LineageRepairInspection {
 ```
 
 `Root.lineageRepair` (§17) is unbound and is usable only by the explicit local
-repair command while the **current** DSCP detail is exactly
+repair command while the **current** configuration-poison detail is exactly
 `MissingLineageManifest` or `DuplicateLineageManifest`. It is not
 `MetadataHub`, never consults `last_good`, and exposes no query, inspection of
 ordinary authored values, build, resolve, import, general write, acceptance,
@@ -1927,14 +1974,14 @@ CanonicalBundle|Opaque }` repair basis, or every
 duplicate physical claimant strictly sorted and deduplicated by
 `(root_name, normalized_path, raw BundleUuid bytes, normalized local_id, raw
 AssetUuid bytes, file_hash)` canonical bytes. That tuple is injective even when
-one physical bundle contains multiple manifest entries; DSCP detail, repair
+one physical bundle contains multiple manifest entries; configuration-poison detail, repair
 inspection, stale comparison, and survivor selection all carry these exact
 rows.
 
 `createMissing` accepts that complete `Missing` inspection as its exact
 destination-aware basis plus proposed canonical bundle bytes. Inside one
 coordinator action
-it requires StoreInstanceId/stamp/configured path and missing DSCP to remain
+it requires StoreInstanceId/stamp/configured path and the missing-manifest poison to remain
 exact, revalidates and reopens the destination under its configured root, requires its
 `Absent|Occupied { file_hash, kind }` state to match byte-for-byte, and checks
 that no manifest claimant has appeared. It validates the proposed bytes as one
@@ -2114,8 +2161,10 @@ affects only newly adopted assets, never silently reinterpreting old ones.
   and moves trivially because it travels inside the file — and survives daemon
   downtime, git operations, and daemon-state loss for the same reason.
 - Import minting (§8): a first import's UUIDs (bundle, entries, `$settings`,
-  `$record`) are random UUIDv4s, expanded by BLAKE3 from one 32-byte OS-random
-  seed drawn per import run.
+  `$record`) are random UUIDv4s, expanded from one 16-byte OS-random seed drawn per
+  import run: `digest(Domain::MintedAsset | MintedBundle, 1, seed ‖
+  counter:u64)` with the version and variant bits set
+  (`SeededIdentitySource`, `distill-daemon/src/importer.rs`).
   - They depend on nothing a bundle can be reimported from (source path,
     input version, importer): identical sources at two paths get distinct
     UUIDs; a bundle moved with its source keeps its own.
@@ -2232,8 +2281,9 @@ pub struct ReadableBundleSource {
     pub file_hash: BundleFileHash,
 }
 /// Exact claimant identity for an AssetUuid collision. Variant tags are the
-/// fixed, nonzero u8 values below; local_id/output_key are NFC-normalized by
-/// the §10 identifier grammar before comparison or encoding.
+/// fixed, nonzero values below, encoded as `u32` discriminants; local_id/
+/// output_key are NFC-normalized by the §10 identifier grammar at intake,
+/// before comparison or encoding.
 #[repr(u8)]
 pub enum AssetClaimant {
     Authored {
@@ -2247,9 +2297,9 @@ pub enum AssetClaimant {
     } = 2,
 }
 /// The scanner's lossless platform/path byte grammar. Unix carries the exact
-/// root-relative pathname bytes as tag 1 || len:u32-LE || bytes. Windows
-/// carries the exact root-relative UTF-16 code-unit sequence as tag 2 ||
-/// len:u32-LE || each unit:u16-LE. Neither arm normalizes, case-folds, repairs,
+/// root-relative pathname bytes as tag 1:u32 ‖ len:u32 ‖ bytes. Windows
+/// carries the exact root-relative UTF-16 code-unit sequence as tag 2:u32 ‖
+/// len:u32 ‖ each unit:u16. Neither arm normalizes, case-folds, repairs,
 /// or converts through Unicode, so NFC and case aliases remain distinct.
 #[repr(u8)]
 pub enum PlatformPathBytes {
@@ -2340,14 +2390,15 @@ pub enum VersionPoisonV1 {
 }
 pub struct VersionPoison {
     pub code: VersionPoisonCode,
-    pub identity: [u8; 32],
+    pub identity: [u8; 16],
     pub detail: VersionPoisonV1,
     pub message: String, // presentation only
 }
 ```
 
-`VersionPoison.identity = blake3("DSVP" || 0x01 || code:u16-LE || exact
-variant fields)`. A code admits only its same-named payload variant. A
+`VersionPoison.identity = digest(Domain::NamespaceError, 1,
+VersionPoisonCode:u32 ‖ exact variant fields)` (`distill-store/src/state.rs`
+`namespace_error_identity`); nested tags are `u32` discriminants. A code admits only its same-named payload variant. A
 `DuplicateAssetUuid` has at least two strictly sorted, deduplicated tagged
 `AssetClaimant` rows ordered by their complete canonical bytes; this represents
 authored/authored, authored/derived, and derived/derived collisions even when
@@ -2361,7 +2412,7 @@ distinct. It is the scan-time integrity error for two physical names within
 one root that collapse under §10 NFC normalization. The lossless claim keeps
 the original case bytes/code units as well as distinguishing NFC aliases; no
 case fold is introduced into §10's case-sensitive logical path key. The same normalized
-logical path in two different roots is never DSVP: it remains the ordinary
+logical path in two different roots is never version poison: it remains the ordinary
 `Ambiguous(roots)` multimap state and only path-dependent operations fail.
 Root names, normalized paths, local ids, and output keys use §10 normalization;
 raw physical names use the lossless platform/path grammar above. An
@@ -2399,7 +2450,7 @@ one exact lossless raw relative subtree path, with fixed tags `Root=1` and
 `Subtree=2`; its failure is exactly `PermissionDenied`, `NotFound`,
 `InvalidFileType`, `SymlinkIdentityChanged`, or `IoDataLoss` with codes 1..5.
 The scanner canonically enumerates all such failures alongside every other
-DSVP candidate, deduplicates exact `(subject, failure)` rows, and includes them
+version-poison candidate, deduplicates exact `(subject, failure)` rows, and includes them
 in the ordinary `(code, detail bytes)` authority sort. It never publishes an
 apparently complete version after silently skipping a root or subtree.
 
@@ -2417,8 +2468,8 @@ version whose global validation succeeds.
 
 One published header still carries exactly one `VersionPoison`, but selection
 is not scan-order-dependent. Before publication the scanner enumerates the
-complete candidate set of version-global defects, canonical-encodes each
-`(code:u16-LE, exact VersionPoisonV1 detail)`, sorts by `(code, detail bytes)`,
+complete candidate set of version-global defects, encodes each
+`(code:u32, exact VersionPoisonV1 detail)`, sorts by `(code, detail bytes)`,
 deduplicates identical encodings, and publishes the first row. Presentation messages
 never participate. `doctor` may retain and display the complete sorted set as
 non-authoritative diagnostics, but persistence, snapshots, invalidations, RPC,
@@ -2487,7 +2538,7 @@ pub trait Importer: Send + Sync {
 
 /// Importer-authored stable failure. `code = 0` is reserved; meaning is stable
 /// within Importer::ID and the staged dylib identity observed by the attempt.
-/// The message is presentation-only; DSLF::Importer carries the code/id and
+/// The message is presentation-only; the local-failure record's Importer arm carries the code/id and
 /// canonical source set. Daemon fold/intake failures instead use the fixed
 /// per-code ImportIntakeFailureV1 variants (§5).
 pub struct ImportError { pub code: u32, pub message: String }
@@ -2498,7 +2549,7 @@ impl ImportContext {
     /// each source is part of the group's identity (output lands beside it).
     pub fn sources(&self) -> &[RootedPath];
     /// Outcome-bearing content dep: success records the rooted path and
-    /// blake3(raw bytes); stable failure (including NotFound) records an
+    /// hash(raw bytes); stable failure (including NotFound) records an
     /// Observed::Err entry before returning Err. Paths are root-relative
     /// and normalized (§10 path rules).
     pub fn read(&mut self, path: &str) -> Result<Vec<u8>, ImportError>;
@@ -2551,13 +2602,13 @@ no prior primary, it is the primary; otherwise — multiple content
 entries, no declaration, no prior — the fold fails asking for an
 explicit `primary()`, never guesses.
 
-Importer-returned deterministic failures use the importer `code` and DSLF
-Importer arm; daemon-owned output intake/fold checks use the fixed
+Importer-returned deterministic failures use the importer `code` and the
+local-failure record's Importer arm; daemon-owned output intake/fold checks use the fixed
 `ImportIntakeFailureV1` variants (§5), including duplicate/reserved local ids,
 primary violations, role/type mismatch, noncanonical values, and invalid
 settings. Stable failure messages are presentation-only. A newly introduced
 memoizable intake failure is not eligible for attempted-basis persistence
-until it has an exact code/field mapping in DSLF v1 (or a bumped grammar).
+until it has an exact code/field mapping in the local-failure record v1 (or a bumped version).
 
 ### Read-sets and watched imports
 
@@ -2591,7 +2642,7 @@ loss.
 /// reinterpret every committed record as naming a different physical
 /// root. This is the type every bundle-visible or persisted record
 /// declares and serializes — `RootedPath.root`, `FileDep::Probe`'s
-/// observation, everything in `ImportRecord` — and the form FILQ
+/// observation, everything in `ImportRecord` — and the form file-query
 /// result hashes frame (length-prefixed name bytes): the generic
 /// schema codec sees a name, never an integer whose meaning lives in
 /// process state.
@@ -2613,13 +2664,13 @@ pub struct FileQuery {                 // path selectors only (§10), raw-file n
 }
 // ≥1 selector; result: sorted (root, normalized path) pairs — sorted
 // by root name bytes then path bytes — recorded as
-// blake3("FILQ" ‖ version:u8 ‖ count:u32 ‖
+// digest(Domain::FileQuery, 1, count:u32 ‖
 //        (root_name: len:u32+bytes ‖ path: len:u32+bytes)*) —
 // length-framed, so ["a","bc"] and ["ab","c"] can never alias;
 // root-framed, so identical bytes moving between roots at the same
 // logical path change the result; framed by root NAME, never ordinal,
 // so reordering or adding configured roots can never reinterpret a
-// committed hash — and never aliasing an "ASTQ" hash (§10)
+// committed hash — and never aliasing an asset-query hash (§10)
 
 #[asset(uuid = "…")]                   // built-in type; daemon-written (§6)
 pub struct ImportRecord {
@@ -2647,7 +2698,7 @@ pub struct DirectoryOrigin {
 
 pub struct FileContentObservation {
     pub path: RootedPath,              // the root that satisfied the read
-    pub hash: [u8; 32],                // raw byte-identity digest (§5)
+    pub hash: [u8; 16],                // byte-identity hash (§5)
 }
 
 pub enum RawFileOp { Read, Probe, Enumerate }
@@ -2662,13 +2713,13 @@ pub enum FileDep {                     // outcome-bearing raw-file basis
     /// index verdict; Ambiguous/Missing/a different root, or a changed
     /// stable error fingerprint, invalidates.
     Probe { path: String, observed: Observed<Option<RootName>> },
-    /// Ok is the "FILQ" result hash (§10); Err includes stable listing
+    /// Ok is the file-query result hash (§10); Err includes stable listing
     /// failure. A failed enumeration therefore has the operation that
     /// heals it in its basis.
-    Listing { query: FileQuery, observed: Observed<[u8; 32]> },
+    Listing { query: FileQuery, observed: Observed<[u8; 16]> },
     /// Importer resolution against the snapshot's pipeline epoch, hit and
     /// miss alike. A missing importer heals when a later epoch registers it.
-    Capability { key: CapabilityKey, observed: Observed<[u8; 32]> },
+    Capability { key: CapabilityKey, observed: Observed<[u8; 16]> },
 }
 ```
 
@@ -2995,9 +3046,8 @@ A default import records an ordinary `DirectoryOrigin`, so the `ImportRecord`
 schema (a bootstrap control type) does not change:
 
 - `rules_bundle`: the root's **default-rules UUID**, derived, never stored:
-  `distill_core::id::default_rules_bundle`, the first 16 bytes of
-  `domain_digest("DSDR", version 1, str(root name))` (§13 canonical
-  encoding). Reserved: no bundle file may claim it. The daemon does not yet
+  `distill_core::id::default_rules_bundle`,
+  `digest(Domain::DefaultRulesBundle, 1, str(root name))` (§5). Reserved: no bundle file may claim it. The daemon does not yet
   check that a bundle file's own UUID differs (open question below).
 - `rule`: the `DefaultImportRule.id`.
 - `group`: the group key, as for authored rules.
@@ -3027,7 +3077,7 @@ registering a rule id, orphans its outputs (§8), never deletes them.
 - **Extension only.** The engine's formats are all named by extension; no
   default mapping needs content to decide.
 - **No content sniffing in selection.** Selection today is a pure function of
-  the listing (`FILQ`, §8), which is why `touch_directory_path` can find a
+  the listing (the file-query result, §8), which is why `touch_directory_path` can find a
   path's owner without reading it. Sniffing would make ownership depend on
   bytes: an edit could move a file between importers (a new owner, the old
   output orphaned), and every listing evaluation would read file heads. A file
@@ -3112,7 +3162,8 @@ Each rule has a fixed id (`ENGINE_DEFAULT_IMPORTS` in `newgameplus-pipeline/src/
   `$.ozz`, `$.samples`: the tag walk in `distill-schema/src/tags.rs` expects
   an object where the loaded value of a blob-backed field is a blob). After
   the fixes below a warm start took 36.8 s, against 72 s before (16 s with
-  `test` excluded); blake3 over the two scans was a third of it, tag
+  `test` excluded); blake3 over the two scans was a third of it (since
+  replaced by XXH3-128, §5), tag
   refinement a sixth. Merging the scans touches the startup protocol (the
   watcher arms before the scan); fixing the tag walk changes which tags
   extract. Both open.
@@ -3155,7 +3206,8 @@ Resolved (2026-10-12, branch `recheck-perf`):
   `scanned_bundle`; 35% of the pass), its container CRC-32C ran on a table
   at 0.45 GB/s (31% with the JSON parse), and its entry data was cloned to
   decode `$record`/`$settings` (7%). Fixed within the design: hardware
-  CRC-32C (SSE4.2, AArch64 CRC), one hash per read, controls cached by file
+  CRC-32C (SSE4.2, AArch64 CRC; the container has since dropped CRCs, §6),
+  one hash per read, controls cached by file
   hash and seeded from a full scan's parse, per-pass listing memo, cached
   statements. A whole pass now takes 1.3-1.8 s (0.5-0.7 ms per bundle).
 - A rules source that changed or went revalidates the default layer only
@@ -3190,12 +3242,14 @@ heal it.
 
 Build import is **per entry** — each entry gets its own artifact under
 its own key, and the key follows the processor model (§9): a **static
-pre-key** plus a **discovered-trace bucket**. The pre-key —
-`blake3("DSBI" ‖ version ‖ entry AssetUuid ‖
+pre-key** plus a **discovered-trace bucket**. The pre-key (the import key,
+`distill-build/src/keys.rs` `build_import_digest`) —
+`digest(Domain::ImportKey, 1, entry AssetUuid ‖
 bundle uuid ‖ local_id ‖ entry type uuid ‖ the entry's terminal type
 uuid (pipeline map, §9) ‖ canonical bundle bytes ‖ the entry's current
-logical hash ‖ layout hash ‖
-artifact-format version)` — §5's canonical record encoding — carries
+logical hash ‖ layout hash ‖ applied migrations ‖ optional automatic
+migration ‖ optional validator dylib hash ‖ artifact-format version)` in the
+one encoding (§5) — carries
 everything computable before work: the bundle
 bytes already include the source content, blob bytes, settings entries,
 the `ImportRecord`'s importer id, and embedded schemas; the entry
@@ -3210,7 +3264,7 @@ means running `load_current` (§11) — acknowledged as execution, not
 lookup: each resolution records the resolved UUID and the referenced
 asset's *observed terminal type* (misses first-class) as trace entries,
 memoized and revalidated under exactly the processor rules — a bucket
-of candidates per pre-key, keyed secondarily by trace digest (`"DSTR"`),
+of candidates per pre-key, keyed secondarily by trace digest,
 revalidated most-recent-first on lookup (§9, §13).
 **Pipeline-map retyping is therefore visible per entry**: a module
 reload that retypes a referenced asset from `T` to `U` fails exactly
@@ -3267,7 +3321,7 @@ pub trait Processor: Send + Sync {
 /// Processor-visible failure payload. `code = 0` is reserved; every nonzero
 /// code's meaning is stable within `(Processor::ID, Processor::VERSION)`.
 /// Reusing a code for a different meaning requires a VERSION bump. `message`
-/// is presentation-only and is excluded from DSLF; the Processor DSLF row
+/// is presentation-only and is excluded from the local-failure record; its Processor row
 /// carries this `code` as `build_error_code` together with id/version/stage.
 pub struct BuildError { pub code: u32, pub message: String }
 
@@ -3327,7 +3381,7 @@ impl Outputs {
 Every deterministic daemon-side rejection while binding that closed table —
 missing/duplicate primary or extra, undeclared key, type mismatch, invalid
 debug/output key, or deterministic encode rejection — maps to the fixed
-`OutputBindingFailureV1` variant and DSLF arm (§5). A processor's own returned
+`OutputBindingFailureV1` variant and local-failure arm (§5). A processor's own returned
 `BuildError` remains the Processor arm; a callback panic is epoch poison, not a
 local memo. The same totality rule maps deterministic artifact-encoder
 rejections to `ArtifactEncodingFailureV1` rather than ad-hoc prose.
@@ -3370,7 +3424,7 @@ rejections to `ArtifactEncodingFailureV1` rather than ad-hoc prose.
   processor declares ≤ 256 outputs, and a chain has ≤ 65,535 stages
   (`StaticInputs::stage` is `u16`). Serialized static-input keys are unbounded
   composites, so the CAS never stores them raw: records key on the
-  32-byte `"DSSI"` digest (§13). Overlong identifiers are registration
+  16-byte static-input key (§13). Overlong identifiers are registration
   errors, and the store rejects rather than truncates, so framing limits
   can never alias two keys.
 - **1→N is reachable only through the parent.** The build is pull-based: work
@@ -3503,7 +3557,7 @@ pub enum ToolSource {
     Ambient {
         launcher: PathBuf,
         toolchain_id: String,
-        trusted_fingerprint: Option<[u8; 32]>,
+        trusted_fingerprint: Option<[u8; 16]>,
     },
 }
 pub struct ToolExecutionIdentityV2 {
@@ -3516,14 +3570,14 @@ pub enum ToolSourceIdentityV2 {
     Ambient {
         launcher: String,
         toolchain_id: String,
-        trusted_fingerprint: Option<[u8; 32]>,
+        trusted_fingerprint: Option<[u8; 16]>,
     } = 2,
 }
 pub struct ToolPackageFile {
     pub path: String,
     pub executable: bool,
     pub len: u64,
-    pub bytes_hash: [u8; 32],
+    pub bytes_hash: [u8; 16],
 }
 #[repr(u8)]
 pub enum ToolCwdPolicy {
@@ -3538,7 +3592,7 @@ every regular file below `root`, rejects symlinks and special files, requires
 `launcher` to be a canonical relative path naming an executable package file,
 and stages the complete directory no-replace. Package paths are NFC UTF-8 with
 `/`, relative, traversal-free, unique, and raw-byte sorted; each `bytes_hash` is
-raw blake3 of the staged bytes and `len` is checked. Distill deliberately does
+the plain XXH3-128 of the staged bytes and `len` is checked. Distill deliberately does
 not parse ELF, Mach-O, PE, shebangs, or native loader search metadata. Producing
 a self-contained package for the target host is the responsibility of the tool
 package/build system; all packaged bytes, including any bundled interpreters,
@@ -3548,7 +3602,7 @@ plugins, resources, or libraries, are already covered by the directory snapshot.
 `toolchain_id`. It is not copied and Distill does not inspect its adjacent files
 or native dependencies. With `trusted_fingerprint: Some`, the caller asserts a
 stable toolchain/package identity and the invocation may memoize; the fingerprint
-and toolchain ID both enter DSCT. With `None`, the tool may run but every build
+and toolchain ID both enter the tool-execution identity. With `None`, the tool may run but every build
 attempt that calls it is nonmemoizable: no success or failure record from that
 attempt enters a candidate bucket. This makes local SDK discovery usable without
 pretending that an ambient installation is reproducible.
@@ -3559,11 +3613,13 @@ ambient variables including `PATH`, locale, home, and temp are cleared unless
 present literally. `ReadOnlyPackageRoot` and `ReadOnlyPackageSubdir` are valid
 only for package tools; ambient tools use `EmptyScratch`.
 
-`DSCT v2 = blake3("DSCT" || 0x02 || canonical ToolExecutionIdentityV2)` using
-§5's record codec and the fixed tags above. A package DSCT commits every package
-file row plus launch/environment/cwd metadata. An ambient DSCT commits the exact
+The tool-execution identity hash is `digest(Domain::ToolCapsule,
+RECORD_VERSION = 3, ToolExecutionIdentityV2)` (`distill-core/src/tool.rs`)
+in the one encoding (§5), tags as `u32` discriminants with the fixed values
+above. A package identity commits every package file row plus
+launch/environment/cwd metadata. An ambient identity commits the exact
 launcher path, toolchain ID, optional trusted fingerprint, environment, and cwd
-policy. Registration publishes the identity and DSCT hash as snapshot input.
+policy. Registration publishes the identity and its hash as snapshot input.
 Packaged files are reopened and verified at launch; an unavailable package or
 ambient executable yields only the transient nonmemoized launch outcome below.
 
@@ -3623,7 +3679,7 @@ Typing rules that follow:
   rejects forbidden pack/build closures; the loader repeats the check while
   adopting a closure. A module edit that changes the bit is an ordinary
   PipelineEpoch change: affected live RPC clients reconnect and rebuild their
-  closures. `build_only` is deliberately absent from DSLH, so toggling a
+  closures. `build_only` is deliberately absent from the logical hash, so toggling a
   deployment policy never invents a schema migration.
 
 ### Input hashes
@@ -3633,19 +3689,20 @@ are lookup keys:
 
 | Identifier | Hash of | Lookup key into |
 |---|---|---|
-| **Content hash** (`ContentHash`) | raw blake3 of an artifact's *bytes* — §5's domainless byte-identity exception | the CAS extent index: `ContentHash → segment, offset, len` (§13) |
-| **Static-input key** (`StaticInputs` digest, `"DSSI"`) | a processor run's *static* inputs, computable before work | the `artifacts` table: digest → (trace, output table) (§13) |
-| **Build-import input hash** (`"DSBI"`, §8) | a build import's *static pre-key* — the reference resolutions the migrated value produces are discovered by execution and live in the trace bucket (§8) | the `artifacts` table: digest → candidate bucket (§13) |
+| **Content hash** (`ContentHash`) | plain XXH3-128 of an artifact's *bytes* — §5's domainless byte-identity exception | the CAS extent index: `ContentHash → segment, offset, len` (§13) |
+| **Static-input key** (`StaticInputs` digest, `Domain::ProcessorInputs`) | a processor run's *static* inputs, computable before work | the `artifacts` table: digest → (trace, output table) (§13) |
+| **Build-import input hash** (the import key, `Domain::ImportKey`, §8) | a build import's *static pre-key* — the reference resolutions the migrated value produces are discovered by execution and live in the trace bucket (§8) | the `artifacts` table: digest → candidate bucket (§13) |
 | **Full input hash** | *all* processor inputs, discovered trace included | nothing — never stored as an index; it is what a validated hit *witnesses* (below) |
 
 The content hash identifies what came out; the input hashes identify what
-went in. The full input hash is
-`blake3("DSIH" ‖ version:u8 ‖ input artifact ContentHash ‖ dependency
-trace ‖ processor id + version ‖
-pipeline dylib hash ‖ target-definition hash ‖ output logical + layout
-hashes ‖ artifact-format version)` — domain-registered like every hash
-construction (§5's table) even though it is never stored as an index. The target-definition hash is the
-canonical encoding of the full target struct (§18) — os, arch, API set,
+went in. The static-input key is `digest(Domain::ProcessorInputs, 1,
+StaticInputs)` and the full input hash `digest(Domain::InputHash, 1,
+StaticInputs ‖ trace digest)` (`distill-build/src/keys.rs`), `StaticInputs`
+being asset ‖ stage ‖ input artifact ContentHash ‖ target-definition hash ‖
+processor id + version ‖ pipeline dylib hash ‖ output (key, logical, layout)
+rows sorted by key ‖ artifact-format version — registered in §5's table like
+every digest even though the full input hash is never stored as an index. The target-definition hash is the
+digest of the full target struct (§18) — os, arch, API set,
 options — never a config name. The dylib hash means a manually unbumped
 processor version can never serve a stale artifact — the worst case is
 over-invalidation after a rebuild, never wrong reuse. The
@@ -3654,7 +3711,7 @@ canonically ordered sequence of every context operation *with its label
 and its observed outcome*: each entry records
 `Observed<T> = Ok(T) | Err(StableFailureFingerprint)` (declared below) —
 `read(uuid) → ContentHash`, `resolve(path) → uuid | NONE`,
-`query(selector) → result-set hash`, `tool(id) → DSCT execution-identity hash` on
+`query(selector) → result-set hash`, `tool(id) → tool-execution identity hash` on
 success; on failure a typed, content-derived fingerprint (ambiguity: the
 sorted conflicting ids; poison: the poison row's identity; a missing
 strong reference: the query and expected terminal; a descendant build
@@ -3670,19 +3727,19 @@ unmemoized. External tool
 binaries invoked as subprocesses are trace operations, never static
 inputs (which tool runs can depend on inputs, and the dylib hash cannot
 see them), revalidated on every lookup like all trace entries.
-Pipeline-dylib hashes are §5 byte-identity digests over the staged dylib.
-Tool identity is instead the domain-separated semantic/composite DSCT aggregate
+Pipeline-dylib hashes are §5 byte-identity hashes over the staged dylib.
+Tool identity is instead the semantic/composite tool-execution identity digest
 above; a launcher byte hash alone is never a trace identity.
 Subprocesses launch only through `ctx.run_tool(id, args)`, and the tool
 a job runs is a **snapshot input**: registering or replacing a tool
 (`Registry::tool`, §3) snapshots a package directory or records an explicit
-ambient toolchain and publishes the (tool key → execution identity + DSCT hash)
+ambient toolchain and publishes the (tool key → execution identity + its hash)
 mapping as
 input-versioned **ToolEpoch** state (§13) — a registration change
 advances the input version like any other input event. An epoch writes a
 row only for a key whose tool changed or that it drops. A job resolves
 `id` through its pinned snapshot. Package tools launch only the staged package
-the published DSCT names; ambient tools launch their explicit path, and only a
+the published identity names; ambient tools launch their explicit path, and only a
 trusted fingerprint makes that call memoizable. A swap mid-epoch invalidates
 traces into rebuilds that run the new registration. Staged package
 versions coexist; `DriftedInput::Tool` (§15) covers an old basis whose
@@ -3720,7 +3777,7 @@ trace as the only discovered part. One static-input key does not determine
 one result: two snapshots can share every static determinant while a path
 resolves or a query answers differently, yielding distinct valid traces —
 so the store maps static-input key → a **bucket of result candidates**,
-each secondarily identified by its trace digest (`"DSTR"`, §5), and a
+each secondarily identified by its trace digest (§5), and a
 lookup revalidates candidates most-recently-committed-first against the
 current snapshot (re-resolve the path, re-hash the query result set,
 compare the read content hashes, re-check emitted-reference
@@ -3744,9 +3801,9 @@ pub struct StaticInputs {
     pub asset: AssetUuid,
     pub stage: u16,                        // index in the type's chain (pipeline map)
     pub input_hash: ContentHash,       // the input artifact's content hash
-    pub target_def_hash: [u8; 32],         // canonical Target ‖ bound identity (§18)
+    pub target_def_hash: [u8; 16],         // canonical Target ‖ bound identity (§18)
     pub processor: (&'static str, u32),    // Processor::ID, Processor::VERSION
-    pub dylib_hash: [u8; 32],
+    pub dylib_hash: [u8; 16],
     /// Per declared output key: (logical, layout) hashes from the current
     /// registries, in key order.
     pub output_hashes: Vec<(String, LogicalHash, LayoutHash)>,
@@ -3776,8 +3833,8 @@ pub enum StableFailureFingerprint {
     /// is not eligible for the attempted carrier. Revalidation consults the
     /// role index, so an explicit role edit wakes the memo.
     RoleIneligible { asset: AssetUuid, observed_role: EntryRole },
-    /// Coordinator-private control query/read failure. Subject, fixed u16
-    /// code, and entries obey §9's exact sorted/deduplicated per-code DSTR
+    /// Coordinator-private control query/read failure. Subject, fixed
+    /// code, and entries obey §9's exact sorted/deduplicated per-code trace
     /// grammar; presentation text is excluded.
     Control { subject: ControlFailureSubject, code: ControlFailureCode,
               entries: Vec<AssetUuid> },
@@ -3796,23 +3853,23 @@ pub enum StableFailureFingerprint {
     MissingCapability { key: CapabilityKey },
     /// A deterministic LOCAL failure that arose from no context
     /// operation (FailureCause::Local, below): fingerprinted by class
-    /// plus `blake3("DSLF" || v1 canonical local-failure detail)` (§5).
-    Local { class: LocalFailureClass, detail: [u8; 32] },
+    /// plus the local-failure record digest (§5).
+    Local { class: LocalFailureClass, detail: [u8; 16] },
 }
 pub enum ToolErrorClass {
     NotExecutable, SpawnDenied, PackageUnavailable, AmbientUnavailable,
 }
 /// A post-lookup execution outcome. It is returned only to the attempted
-/// caller and never enters StableFailureFingerprint, DSTR, or a memo bucket.
+/// caller and never enters StableFailureFingerprint, the trace, or a memo bucket.
 pub struct TransientToolLaunchFailure {
     pub id: String,
-    pub tool_hash: [u8; 32],
+    pub tool_hash: [u8; 16],
     pub class: ToolErrorClass,
 }
-// LocalFailureClass and its exact DSLF payload grammar are declared in §5.
+// LocalFailureClass and its exact local-failure payload grammar are declared in §5.
 
 /// What a capability lookup asked the pipeline or ToolEpoch for — the
-/// identity a recorded miss carries. Tags are fixed by the DSTR grammar.
+/// identity a recorded miss carries. Tags are fixed by the trace grammar.
 #[repr(u8)]
 pub enum CapabilityKey {
     MigrationFn(String) = 1,
@@ -3846,11 +3903,11 @@ pub enum TraceOp {                         // the labeled, outcome-bearing trace
     Resolve { path: String, observed: Observed<Option<AssetUuid>> },
                                            // Ok(None) is a first-class miss,
                                            // never a failure
-    Query   { query: AssetQuery, observed: Observed<[u8; 32]> },  // domain-prefixed (§10)
-    /// The tool key and aggregate DSCT execution hash the snapshot's ToolEpoch
+    Query   { query: AssetQuery, observed: Observed<[u8; 16]> },  // asset-query digest (§10)
+    /// The tool key and aggregate tool-execution identity hash the snapshot's ToolEpoch
     /// (§13) resolved it to — snapshot-pinned, never a live path. A miss is
     /// Observed::Err(MissingCapability { key: CapabilityKey::Tool(id) }).
-    Tool    { id: String, observed: Observed<[u8; 32]> },
+    Tool    { id: String, observed: Observed<[u8; 16]> },
     /// Pipeline capability resolution (§8, §11): every lookup of a
     /// registered capability — MigrationFn key, DefaultTable, importer,
     /// processor for (input type, target) — records what the snapshot's
@@ -3858,7 +3915,7 @@ pub enum TraceOp {                         // the labeled, outcome-bearing trace
     /// on hit, Err(MissingCapability) on miss. Without the recorded
     /// miss, a failure minted before any code ran would carry no module
     /// dependency and could never heal when the registration lands.
-    Capability { key: CapabilityKey, observed: Observed<[u8; 32]> },
+    Capability { key: CapabilityKey, observed: Observed<[u8; 16]> },
     /// Emitted-reference validation at result binding (load-dependency
     /// bullet, above): the reference's target UUID, the declared T's
     /// terminal type, and the snapshot's observed terminal type —
@@ -3875,7 +3932,7 @@ pub enum TraceOp {                         // the labeled, outcome-bearing trace
                 observed: Observed<Option<EntryRole>> },
     /// Coordinator-private control-plane query (§6, §10). It is canonical
     /// trace data but its type cannot be constructed by pipeline/runtime code.
-    Control { query: ControlQuery, observed: Observed<[u8; 32]> },
+    Control { query: ControlQuery, observed: Observed<[u8; 16]> },
     /// Non-artifact control value read. The canonical subject plus observed
     /// whole-bundle byte identity revalidates at the attempted basis.
     ControlRead { subject: ControlSubject,
@@ -3883,13 +3940,14 @@ pub enum TraceOp {                         // the labeled, outcome-bearing trace
 }
 ```
 
-The dependency digest has one exact v1 wire grammar:
-`DSTR v1 = blake3("DSTR" || 0x01 || op_count:u32 || ops...)`. Operations
-remain in observation order (they are a sequence, not a set), with `u8` tags
+The trace digest has one exact v1 grammar:
+`digest(Domain::Trace, 1, op_count:u32 ‖ ops…)` (`distill-build/src/trace.rs`
+`trace_digest`). Operations remain in observation order (they are a
+sequence, not a set), with `u32` tags
 `Read=1`, `Resolve=2`, `Query=3`, reserved `ToolLaunch=4`, `Capability=5`,
 `RefCheck=6`, `RoleCheck=7`, `Control=8`, `ControlRead=9`, and `Tool=10`; each
 payload is encoded in the
-field order declared above by the §5 canonical record codec. `Observed` uses
+field order declared above by the one encoding (§5). `Observed` uses
 `Ok=1` and `Err=2`, followed by its declared payload. Repeated operations are
 retained because multiplicity and order are part of the witnessed attempt.
 `AuthoringRead=11` follows the same record rules and encodes its optional
@@ -3898,7 +3956,7 @@ daemon authoring services such as codegen: ordinary processor `Read` remains
 the ContentHash-bearing artifact operation and the two meanings never share a
 tag.
 
-`CapabilityKey` has its own fixed `u8` tags:
+`CapabilityKey` has its own fixed `u32` tags:
 `MigrationFn=1`, `DefaultTable=2`, `Importer=3`, `Processor=4`, and `Tool=5`,
 followed by the declared NFC string or raw TypeUuid fields. A ToolEpoch lookup
 miss records `TraceOp::Tool { id, observed:
@@ -3913,33 +3971,33 @@ attempted result and its trace are discarded and the caller receives
 An unfingerprinted ambient hit may return a successful `ToolOutput`, but it marks
 the complete calling processor attempt nonmemoizable, so neither success nor a
 later deterministic failure from that attempt enters a candidate bucket.
-DSTR v1 tag 4 is permanently reserved under the historical name `ToolLaunch`
+Trace tag 4 is permanently reserved under the historical name `ToolLaunch`
 and every decoder MUST reject it. It has no payload grammar and can never be an
 alias for a ToolEpoch miss, a successful `Tool` observation, or a transient
 execution outcome.
 
 The control subgrammar is fixed rather than inheriting declaration order.
-`ControlQuery` uses the `ControlQueryTag` `u8` above followed by
-`MigrationEdges(type_uuid:[u8;16], from_hash:[u8;32])` or no payload for
-`DirectoryImportRuleSet`. `ControlSubject` similarly uses its fixed `u8` tag
+`ControlQuery` uses the `ControlQueryTag` above as a `u32` followed by
+`MigrationEdges(type_uuid:[u8;16], from_hash:[u8;16])` or no payload for
+`DirectoryImportRuleSet`. `ControlSubject` similarly uses its fixed tag as a `u32`
 followed by: `Migration(asset:[u8;16])`, `PackDefinition(asset:[u8;16])`,
 `DirectoryImportRules(asset:[u8;16])`,
 `ImportSettings(bundle:[u8;16], local_id:str)`, or no payload for
 `SchemaLineageManifest`. A control `Observed::Err` encodes
 `StableFailureFingerprint::Control` as
-`ControlFailureSubjectTag:u8 || subject || ControlFailureCode:u16-LE ||
-entry_count:u32 || entries`; entries are raw AssetUuid bytes sorted and
+`ControlFailureSubjectTag:u32 ‖ subject ‖ ControlFailureCode:u32 ‖
+entry_count:u32 ‖ entries`; entries are raw AssetUuid bytes sorted and
 deduplicated, with the per-code cardinalities declared on
 `StableControlError`. A noncanonical order, duplicate, wrong cardinality,
 unknown tag, or unknown numeric failure code rejects at persisted-trace and
 RPC decode. This grammar is shared by trace creation and revalidation; no
-presentation message enters DSTR.
+presentation message enters the trace.
 
 **A build result is a named output table, committed atomically.** The unit
 the cache stores is not one ContentHash but the whole result: `output_key →
 (type uuids, ContentHash)` — the primary output under a reserved key plus every
 extra output — together with the discovered trace. Each output is its own
-DSTL artifact with its own ContentHash and load-dep list. One coordinator
+artifact image with its own ContentHash and load-dep list. One coordinator
 transaction commits the CAS index rows for every output and the
 static-input-key → (trace, result) row. It writes no child row: an extra
 output's `child uuid → (parent uuid, output_key)` lives only in the
@@ -4069,7 +4127,7 @@ Everything a build step consumes is recorded as one of three dependency kinds:
 |------|-------------|----------------|
 | **Content** | asset UUID → artifact ContentHash read | that asset's artifact changing |
 | **Resolution** | path → resolved UUID *or NONE* | the path's mapping changing (create, delete, rename, primary change). Negative results are first-class: a file appearing at a previously-missed path invalidates. |
-| **Query** | structured query → `blake3(sorted result UUIDs)` | the result set changing membership |
+| **Query** | structured query → digest of the sorted result UUIDs | the result set changing membership |
 
 Rule of thumb: *content deps for what you read, resolution deps for how you
 found it, query deps for sets you enumerated.* Reference resolution (§4) is
@@ -4087,9 +4145,9 @@ after reading; correctness holds via the content deps.
 Queries come in two domains: `AssetQuery` over the asset namespace (result:
 sorted UUIDs) and `FileQuery` over the raw-file namespace (§8; result:
 sorted rooted normalized paths). Their result hashes are domain-separated and
-length-framed — `blake3("ASTQ" ‖ version:u8 ‖ count:u32 ‖ uuids)` vs
-`blake3("FILQ" ‖ version:u8 ‖ count:u32 ‖ (root_name: len:u32+bytes ‖
-path: len:u32+bytes)*)` — root names, never ordinals (§8) — so
+length-framed — `digest(Domain::AssetQuery, 1, count:u32 ‖ uuids)` vs
+`digest(Domain::FileQuery, 1, count:u32 ‖ (root_name: len:u32+bytes ‖
+path: len:u32+bytes)*)` (`distill-pipeline-api/src/query.rs`) — root names, never ordinals (§8) — so
 identical selectors over the two namespaces can never alias, and
 variable-length path lists cannot collide by re-splitting
 (fixed 16-byte UUIDs need only the count). Query results
@@ -4165,7 +4223,7 @@ pub struct AssetQuery {                    // present selectors AND together; �
 }
 pub struct TagSelector { pub tag: String, pub value: Option<String> }
 // result: matching entry UUIDs, canonically sorted, recorded as
-// blake3("ASTQ" ‖ version:u8 ‖ count:u32 ‖ uuids)
+// digest(Domain::AssetQuery, 1, count:u32 ‖ uuids)
 
 /// Coordinator-private control authority. Constructors and the token type are
 /// not exported through Registry, ProcessContext, MetadataSnapshot's public
@@ -4177,7 +4235,7 @@ pub struct ControlSnapshot<'a> {
 struct ControlAuthorityToken { /* coordinator-minted, basis-bound */ }
 
 /// The only authoring-control query whose result participates in build/migrate
-/// dependency traces. Its result UUIDs use the ASTQ sorted-set hash, while the
+/// dependency traces. Its result UUIDs use the asset-query sorted-set hash, while the
 /// TraceOp::Control label and this canonical argument distinguish its meaning.
 pub enum ControlQuery {
     MigrationEdges { type_uuid: TypeUuid, from_hash: LogicalHash },
@@ -4303,7 +4361,7 @@ lexical, by construction — and the lexical rule governs path *strings* only.
 What the daemon physically opens is additionally governed by §14's canonical
 root containment and observe/revalidate/retry rules.
 For a physical scan name rejected before this normalized String exists, the
-scanner publishes §7's `InvalidPhysicalPath` DSVP using the complete lossless
+scanner publishes §7's `InvalidPhysicalPath` version poison using the complete lossless
 Unix-byte or Windows-UTF-16 arm and exact failure code; it never repairs the
 name or invents a lossy `normalized_path`.
 Comparison is byte-exact after NFC normalization (case-sensitive; `doctor`
@@ -4434,8 +4492,8 @@ pub struct Migration {                  // schema pinned by format_version (boot
     pub from_hash: LogicalHash,         // fields behind ControlQuery::MigrationEdges (§10)
     pub to_hash: LogicalHash,
     /// Complete predecessor records for the embedded endpoint snapshots;
-    /// each list ends in its corresponding hash and verifies its DSSL
-    /// commitment (§6). Reconstruction includes both lists (§11).
+    /// each list ends in its corresponding hash and verifies its lineage
+    /// chain commitment (§6). Reconstruction includes both lists (§11).
     pub from_lineage: LineageStamp,
     pub to_lineage: LineageStamp,
     pub kind: MigrationKind,
@@ -4453,8 +4511,8 @@ pub enum MigrationKind {
 /// not registrable, so panic containment cannot be forgotten.
 pub struct MigrationFn(fn(Value) -> Result<Value, MigrationError>);
 /// `code = 0` is reserved; meaning is stable within the registered function
-/// key and its staged dylib identity. Message is presentation-only; DSLF's
-/// MigrationFunction arm carries the code and exact edge identity.
+/// key and its staged dylib identity. Message is presentation-only; the
+/// local-failure record's MigrationFunction arm carries the code and exact edge identity.
 pub struct MigrationError { pub code: u32, pub message: String }
 ```
 
@@ -4573,7 +4631,7 @@ surfaced before tag extraction, validators, or artifact encoding can
 consume the value; the final automatic diff validates against the
 current schema the same way.
 `MigrationFn`'s own deterministic `Err` uses its nonzero stable code and the
-DSLF MigrationFunction arm; endpoint nonconformance remains the fixed
+local-failure MigrationFunction arm; endpoint nonconformance remains the fixed
 MigrationPlan `NonConformingOutput` code. Presentation messages never enter
 either fingerprint.
 
@@ -4609,7 +4667,7 @@ cannot create a `LoadContext` or run an automatic segment. Only then is the
 trailing automatic diff authorized. A source selected after
 current, on another accepted branch, absent from the manifest, or carrying an
 unknown/empty/malformed stamp supplies no proof and hard-stops with a
-staleness/divergence error. Vector order and opaque `DSSL` equality never
+staleness/divergence error. Vector order and opaque lineage chain equality never
 establish ancestry.
 
 Acceptance and selection are separate operations over the source-controlled
@@ -4645,7 +4703,7 @@ Migration endpoint for a Retired type publishes typed
 Reactivation requires candidate inclusion and selects exactly that candidate
 row's digest, reusing or appending history under the normal forward/rollback
 rules; it may admit waiting bytes only atomically with the Active transition.
-`Ready` separately validates DSLI-keyed bootstrap authority rows, then
+`Ready` separately validates the TypeUuid-keyed bootstrap authority rows, then
 compares the candidate's remaining set exactly with Active rows; Retired rows remain
 verifiable authority but are excluded from that set.
 
@@ -4750,12 +4808,12 @@ pub struct LoadInputs {
     /// the final element and no operation follows it.
     pub trace: Vec<TraceOp>,
     pub planner_version: u32,
-    pub dylib_hash: Option<[u8; 32]>,  // present iff pipeline code ran
+    pub dylib_hash: Option<[u8; 16]>,  // present iff pipeline code ran
 }
 ```
 
 Appending to `LoadInputs.trace` happens at observation time, before decoding
-or invoking code. DSTR hashes this one vector directly. Implementations MUST
+or invoking code. The trace digest hashes this one vector directly. Implementations MUST
 reject a serialized `LoadInputs` that also supplies legacy split migration,
 plan-selection, control-read, or capability vectors, whose interleaving could
 not be reconstructed; convenience accessors are projections over `trace` only.
@@ -4796,17 +4854,19 @@ layout knowledge (offsets, sizes, alignment, niche/tag encodings) per target
 already stand on. Layout encoding does **not** mean casting bytes to Rust
 values: flat data is copied; every indirection is constructed.
 
-Layout, pinned (magic `89 44 53 54 4C 0D 1A 0A`, `"\x89DSTL\r\x1a\n"`):
+The **artifact image** layout, pinned (`distill-wire/src/artifact.rs`; fixed
+header `ARTIFACT_HEADER_LEN` = 128 bytes):
 
 ```
-magic         [u8; 8]
-version       u32 LE      artifact format version (a input-hash input)
+header        [u8; 12]    shared file header (§5): "NGPF",
+                          u32 Domain::ArtifactImage, u32 version
+                          (ARTIFACT_FORMAT_VERSION = 1; an input-hash input)
 asset_uuid    [u8; 16]
 authored_type [u8; 16]
 terminal_type [u8; 16]
 encoded_type  [u8; 16]
-logical_hash  [u8; 32]
-layout_hash   [u8; 32]
+logical_hash  [u8; 16]
+layout_hash   [u8; 16]
 dep_count     u32 LE
 blob_count    u32 LE
 fixed_len     u32 LE
@@ -4856,17 +4916,17 @@ chains — one rule, so cache-hit validation and loader header checks
 cannot be implemented two ways. The
 child's provenance (parent, output key) lives in the derived-output
 index (§13), never in the header.
-No CRCs: an artifact's identity **is** its blake3
+No checksums: an artifact's identity **is** its XXH3-128
 (the ContentHash), and every fetch verifies the payload against the ContentHash it asked
-for. `ContentHash` is the named §5 byte-identity exception — raw blake3
-over the complete DSTL bytes, deliberately domainless. There is deliberately **no target field**: the layout hash is the only
+for. `ContentHash` is the named §5 byte-identity exception — plain XXH3-128
+over the complete artifact-image bytes, deliberately domainless. There is deliberately **no target field**: the layout hash is the only
 target-dependent property of an encoded artifact, so layout-identical
 targets share artifacts and cache entries (§8); which target an artifact
 was built for is manifest metadata, not artifact content.
 
 The blob section is the pack split point (§16): structural bytes (header
 through the variable section's trailing pad, so the blob section begins
-where they end) and each blob are separable, and the ContentHash is blake3 over
+where they end) and each blob are separable, and the ContentHash is the XXH3-128 of
 the whole raw file — a pack loader verifies without materializing it by
 hashing the structural buffer, then each gap and extent in blob-table
 order, synthesizing the zero padding between extents from the table's own
@@ -4906,7 +4966,7 @@ over RpcIO; a buffer plus mmap extents from a pack.
   layout identity**): the wire side comes from the artifact's layout
   hash, the native destinations (offsets, skip-field placement, tag
   writes) from the consumer's own layout table, and the plan cache is
-  keyed on both — DSWL deliberately hashes only the wire tree, so a consumer
+  keyed on both — the layout hash deliberately covers only the wire tree, so a consumer
   relayout that leaves wire bytes untouched (an enlarged `#[asset(skip)]`
   field shifting later native offsets; a niche flipping under a rebuilt
   module) must drop cached plans by the native key: the consumer's
@@ -4915,7 +4975,7 @@ over RpcIO; a buffer plus mmap extents from a pack.
   index (`CtorId`, `DropId`, `SkipDefaultId`) paired with the nominal
   monomorphized key of what it constructs, drops, or writes. Plans name
   slots in those tables, so a rebuild that reorders them without moving
-  any layout byte, or swaps two DSWL-identical types' entries, changes
+  any layout byte, or swaps two layout-identical types' entries, changes
   the native key and the stale plans are simply never looked up again —
   the binary-local key for the binary-local fact (cross-binary
   comparisons use the layout-only digest, §5). The plan is
@@ -4981,7 +5041,7 @@ over RpcIO; a buffer plus mmap extents from a pack.
   are `max_depth = 128` and `max_allocations = 2^32`. The checks are
   normative, while those defaults are deployment policy. Slot padding and
   structural gaps are not described by fixup ops and therefore are not an
-  executor obligation: the reader that holds and validates the DSWL wire
+  executor obligation: the reader that holds and validates the wire
   tree verifies them as zero before execution. The
   executor is **new work patterned on** newgameplus's offset-directed
   default/drop tables (`ngp-defaults`, `ngp-drops`) — those tables exist;
@@ -5161,7 +5221,7 @@ pub enum NativeLayoutNode {
 
 pub struct NativeField {
     pub name: &'static str,                       // decimal for tuples (§5)
-    /// The source declaration index: the native/DSWL physical order is
+    /// The source declaration index: the native/wire physical order is
     /// (offset ascending, declaration index ascending), and after wire
     /// repacking this is the only tie-break for equal offsets — native
     /// slice order alone cannot supply it.
@@ -5270,7 +5330,7 @@ pub struct SkipDefaultId(pub u32);
 inside each consuming binary and are intentionally binary-local. They have no
 stable cross-binary serialization or digest. Registration validates their
 internal indexes, geometry, and callback ownership; fixup-plan compilation
-matches an authenticated DSWL wire tree directly against the current
+matches an authenticated wire tree directly against the current
 descriptor. Plans and every referenced thunk are scoped to that descriptor's
 resident game-module epoch and are discarded during drain.
 
@@ -5322,22 +5382,25 @@ Derived recursively from the native layout; these rules are normative:
   fields (§5's `TypeLayout`) deliberately stay `u64` — the schema model
   describes what Rust can express; the bound is enforced at the
   boundary where the u32 grammars (`NativeLayoutNode`, wire trees,
-  fixup plans, the DSTL header) begin.
-- The **layout hash** is blake3 over the DSWL serialization of the wire
-  tree: `"DSWL" ‖ version:u8 ‖ root`, nodes depth-first in **physical
+  fixup plans, the artifact-image header) begin.
+- The **layout hash** is the digest of the wire tree's **layout encoding**
+  (`distill-wire/src/dswl.rs`): `digest(Domain::Layout, DSWL_VERSION = 2,
+  root)`, nodes depth-first in **physical
   field order** — (wire offset ascending, then the field's own
   `declaration_index`, §12's `NativeField`), the
   same total order the native tree pins (equal-offset ZSTs and
   equal-offset fields after wire repacking tie-break by that recorded
   index; "native order" alone names nothing deterministic
   under reordering, and repacked wire offsets no longer follow native
-  slice order at all) — integers LE; each node is `kind:u8, wire_offset:u32,
-  wire_size:u32, wire_align:u32` plus kind payload. **Node payloads carry
+  slice order at all) — the one encoding (§5): integers LE, every kind,
+  scalar id, slot kind and enum tag form a `u32` discriminant; each node is
+  `kind:u32, wire_offset:u32, wire_size:u32, wire_align:u32` plus kind
+  payload. **Node payloads carry
   semantic identity, not just geometry** — two same-shaped layouts whose
   names or native encodings differ must never hash equal, or a cached
   artifact could be flat-copied into a reordered struct with its fields
-  silently swapped. Payloads: primitive: id `u8`; indirection slot: slot
-  kind `u8` **plus the pointee's node** (`vec`/`set`/`box`/`arc`: the element
+  silently swapped. Payloads: primitive: id `u32`; indirection slot: slot
+  kind `u32` **plus the pointee's node** (`vec`/`set`/`box`/`arc`: the element
   node; `map`: key node then value node; `string`/`blob`: none — the set
   element node is mandatory for exactly the reason vec's is: a set-element
   relayout under an unchanged logical hash must change the layout hash, or
@@ -5347,12 +5410,12 @@ Derived recursively from the native layout; these rules are normative:
   indirection (a `Vec` element struct changing stride) changes the hash
   even though the slot itself stays 8 opaque bytes; struct: field count
   `u32` + per-field (`name:str`, node) in
-  physical order (as above); enum: tag-form `u8`, then for the fully-flat form the
+  physical order (as above); enum: tag-form `u32`, then for the fully-flat form the
   native tag offset `u32`, tag size `u8`, **variant count `u32`**, and per-variant (`name:str`,
   native discriminant raw bits `u128` LE — tag-width bits zero-extended,
   as everywhere, node), and for the other forms
   **variant count `u32`** followed by per-variant (`name:str`, node) in
-  name-sorted order (`str` as in §5). DSWL always carries the count; without
+  name-sorted order (`str` as in §5). The layout encoding always carries the count; without
   it the enum grammar is not injective.
   Recursion terminates exactly as §5's grammar does: re-entering a type
   on the current expansion path emits a back-reference node (its own
@@ -5361,7 +5424,7 @@ Derived recursively from the native layout; these rules are normative:
   the type is reached: a slot's pointee, or inline as a field of another
   record (`Node { children: Vec<Child> }`, `Child { node: Node }`).
   - An inline back-reference occupies the referenced frame's size and
-    alignment; DSWL infers them from that frame. The deriver takes them
+    alignment; the layout encoding infers them from that frame. The deriver takes them
     from the frame's geometry derived without expanding slot pointees
     (a slot's geometry is its own).
   - Frames counted, each tree on its own: wire — records, enums,
@@ -5389,8 +5452,8 @@ Hashes in the header:
 - `layout_hash` — per (target, toolchain) wire-layout identity. **A hash
   is not the tree**: plan compilation needs the producing wire tree
   itself, so the daemon persists every wire tree it encodes under its
-  DSWL hash (§13), serves it over RPC (§17), and packs embed a
-  wire-tree table (§16). A consumer recomputes the DSWL hash of any
+  layout hash (§13), serves it over RPC (§17), and packs embed a
+  wire-tree table (§16). A consumer recomputes the layout hash of any
   tree it receives and requires it to equal the artifact header's
   `layout_hash` before compiling a plan — trees authenticate by
   recomputation, never by trust. Artifacts
@@ -5461,7 +5524,7 @@ that published it, never copied into a table.
 | `cas_extents` | ContentHash → segment, offset, length: the CAS extent index. Segments hold raw bytes; an extent is its row, and live bytes are covering-index sums |
 | `cas_refs` | what an install holds: an installed artifact or wire tree holds itself and the wire tree an artifact names. Releasing a holder (or a result) deletes in its transaction each extent nothing else references; a foreign key refuses to drop one still referenced |
 | `cas_segments` | every segment file and its state (open, sealed, dead); a writer's one open segment is unique, and a dead file is deleted only once no read can reach it |
-| `tools` | **ToolEpoch** state (§9): tool key → (`ToolExecutionIdentityV2`, DSCT hash, optional staged package root) — input-versioned. Package registrations snapshot and stage their complete directory no-replace; ambient registrations retain an explicit absolute launcher and toolchain identity, and are nonmemoizable unless they carry a trusted fingerprint. No row resolves to a library handle: runtime `dlopen` in pipeline code and a staged-library API are banned (§3, §9) |
+| `tools` | **ToolEpoch** state (§9): tool key → (`ToolExecutionIdentityV2`, its identity hash, optional staged package root) — input-versioned. Package registrations snapshot and stage their complete directory no-replace; ambient registrations retain an explicit absolute launcher and toolchain identity, and are nonmemoizable unless they carry a trusted fingerprint. No row resolves to a library handle: runtime `dlopen` in pipeline code and a staged-library API are banned (§3, §9) |
 | `watched_import_failures` | bundle uuid → a watched import's last failure: the attempted version, the basis it read and the terminal error. The basis is what decides whether the import is due again |
 | `directory_import_failures` | directory-import origin (rules bundle, rule id, group root and path) → the last failure of an import that has written no bundle yet (§8): the output it would write, the digest of the task it ran, the attempted version, the basis, the terminal error. Cleared when the import succeeds or its origin is no longer produced |
 | `directory_import_failure_keys` | a `directory_import_failures` row → what its basis reads (a path, a listing, an importer capability; `import_keys` kinds 0 to 2), indexed by (kind, key): the failures a changed path or capability may heal. Its rows go with the failure's |
@@ -5484,7 +5547,7 @@ false` alone, selects every runtime entry (or every file): the only
 queries that read the whole namespace.
 
 Each published input-version header stores either no global poison or the exact
-canonical `VersionPoisonV1` code/detail plus recomputed DSVP identity (§7).
+canonical `VersionPoisonV1` code/detail plus recomputed version-poison identity (§7).
 If validation discovers more than one global defect, this is §7's first
 canonical `(code, detail-bytes)` row after complete-set enumeration, never the
 first filesystem/scanner result; the remaining sorted rows are doctor-only
@@ -5564,7 +5627,7 @@ fails the build.
 ### Log-structured CAS (artifact store)
 
 Append-only segment files of content-addressed bytes and nothing else: an
-extent is the raw bytes whose blake3 is its `ContentHash` (§5 byte-identity
+extent is the raw bytes whose XXH3-128 is its `ContentHash` (§5 byte-identity
 exception), with no frame, header, checksum or padding. What an extent is
 lives in SQLite: `cas_extents` maps `ContentHash → segment, offset, len`,
 and the rows that hold an extent say what it is for. Reads check the bytes
@@ -5585,19 +5648,21 @@ install's `cas_refs` row names it, and deleting a `results` row takes its
 outputs with it (`ON DELETE CASCADE`).
 Results are **tagged by key kind**: the two lookup keys have different
 shapes, and neither is shoehorned into the other's grammar. A
-**build-import result** (`key_kind = DSBI`) is keyed by the §8 `"DSBI"`
-pre-key digest and carries the entry's UUID, its discovered trace — the
+**build-import result** (`key_kind = BuildImport`) is keyed by the §8
+import key and carries the entry's UUID, its discovered trace — the
 reference resolutions and plan-selection queries `load_current` produced
 (§8, §11) — and its single output row. A **processor result**
-(`key_kind = DSSI`) is keyed by the `StaticInputs`' 32-byte `"DSSI"`
-digest (§5's canonical encoding); the raw `StaticInputs` are not stored —
+(`key_kind = Processor`) is keyed by the 16-byte static-input key
+(`Domain::ProcessorInputs`, §9); the raw `StaticInputs` are not stored —
 nothing reads them back.
 Auxiliary payloads pin and evict with the result exactly like outputs but
 never appear in derived-output rows, manifests, or load-dep closures.
 **Wire trees are first-class CAS extents** (§12's persistence promise
-made concrete): every DSWL tree the daemon encodes against commits as an
-extent whose bytes are the canonical DSWL serialization — its blake3 *is*
-the LayoutHash — committed in the same transaction as any result whose
+made concrete): every wire tree the daemon encodes against commits as an
+extent whose bytes are the layout hash's digest preimage — the `u32
+Domain::Layout ‖ u32 DSWL_VERSION` prefix and the layout encoding — so its
+plain XXH3-128 *is* the LayoutHash and typed reads strip the prefix
+(`distill-store/src/cas/store.rs`) — committed in the same transaction as any result whose
 output headers name that `layout_hash`. Results **pin their wire trees
 exactly like outputs** (role 2): the pin/evict unit extends to every wire
 tree any output's header references, and eviction may retire a wire-tree
@@ -5722,7 +5787,7 @@ token/arena, exact registry↔manifest-cursor equality, and configuration
 validation — *before* publishing the input version that pins it. Success
 publishes `Ready` only when every bootstrap-control row equals its §3 format
 constant and every other registered TypeUuid has exactly one Active manifest
-authority row at the same DSLH, with no missing/extra Active rows. Retired rows
+authority row at the same logical hash, with no missing/extra Active rows. Retired rows
 preserve history but are excluded from this equality; only
 the explicit retire/reactivate commands can change that classification, and
 Ready additionally requires that no current entry or Migration endpoint names
@@ -5758,7 +5823,7 @@ succeeds and no pin remains. Any failure deliberately leaks arena + library
 and the typed poison records that cleanup disposition (§3).
 `PublishedRuntime` is an already-published epoch whose status-returning
 drop/free/update path reports callback panic/rejection, or whose retirement
-cleanup fails. These are respectively DSPP codes `PublishedCallbackPanic`,
+cleanup fails. These are respectively pipeline-poison codes `PublishedCallbackPanic`,
 `PublishedCallbackRejected`, and `PublishedCleanup`, all with the exact
 `PublishedEpochLeaked` disposition: the shared
 `ModuleEpochToken` atomically changes every snapshot pinning that epoch
@@ -5885,11 +5950,11 @@ pub struct PipelinePoison {
     pub code: PipelinePoisonCode,
     pub origin: PipelinePoisonOrigin,
     pub cleanup: CleanupDisposition,
-    pub identity: [u8; 32],
+    pub identity: [u8; 16],
     pub message: String, // presentation only
 }
 
-/// DSPP v1 admits exactly this matrix:
+/// Pipeline-poison v1 admits exactly this matrix:
 /// - CandidateOpen origin + codes CandidateOpen..CandidateValidation +
 ///   cleanup None or CleanedAndClosed. `None` means failure preceded resource
 ///   acquisition; `CleanedAndClosed` means every acquired resource closed.
@@ -5902,10 +5967,11 @@ pub struct PipelinePoison {
 /// Every published-runtime poison fences the epoch and leaks it permanently.
 /// No other origin/code/disposition tuple is canonical.
 ///
-/// `identity = blake3("DSPP" || 0x01 || code:u16-LE || origin:u16-LE ||
-/// cleanup:u16-LE)`. The message is excluded. Persistence and RPC decode
-/// recompute identity and reject unknown versions/values, a matrix mismatch,
-/// wrong-width identity, or a digest mismatch; evolution requires DSPP v2.
+/// `identity = digest(Domain::PipelineFailure, 1, code:u32 ‖ origin:u32 ‖
+/// cleanup:u32)` (`distill-store/src/state.rs` `pipeline_failure_identity`).
+/// The message is excluded. Persistence and RPC decode recompute identity and
+/// reject unknown versions/values, a matrix mismatch, wrong-width identity,
+/// or a digest mismatch; evolution requires digest version 2.
 
 pub enum PipelineUnavailable {
     Poisoned(PipelinePoison),
@@ -5938,7 +6004,7 @@ pub struct SchemaAcceptanceRequired {
     pub mismatches: Vec<(TypeUuid, Option<LogicalHash>, Option<LogicalHash>)>,
 }
 pub struct CandidateEpochIdentity {
-    pub dylib_hash: [u8; 32],
+    pub dylib_hash: [u8; 16],
     pub target_set: CanonicalTargetSet,
 }
 
@@ -5953,7 +6019,7 @@ pub struct StagedPipelineEpoch { /* identity, library, token, arena, map, target
 pub enum PipelineState {
     /// Invariant: every §3 bootstrap-control row passed its separate logical
     /// format-authority gate; for every other candidate schema row, exactly
-    /// one Active manifest type row exists and its DSLH equals the digest at
+    /// one Active manifest type row exists and its logical hash equals the digest at
     /// the current cursor; the manifest has no extra Active row.
     /// Retired rows are retained authority/history but intentionally excluded.
     Ready(Arc<PipelineEpoch>),
@@ -5998,7 +6064,7 @@ asks for pipeline-derived terminal type is not pure). Authoring operations
 all fail with `ConfigurationPoisoned(reason)`: they may depend on roots,
 output paths, or publication policy and never silently use `last_good`.
 The sole mutation exception is §6/§17's unbound `LineageRepair`, and only for
-current MissingLineageManifest or DuplicateLineageManifest DSCP: it can create
+current MissingLineageManifest or DuplicateLineageManifest configuration poison: it can create
 the configured missing file or remove explicitly rejected duplicate claimants,
 but exposes no ordinary authoring operation and still never uses `last_good`.
 Build/resolve and every target/config-dependent RPC operation fail with
@@ -6110,7 +6176,8 @@ state. The daemon therefore keys, schedules and shares builds by node, not
 by requester.
 
 **Keys and traces.** A node is one asset's import plus its processor chain
-for one target. Its key (`KeyKind::Node`, canonical `DSNK` bytes) holds
+for one target. Its key (`KeyKind::Node`, the node key `digest(Domain::NodeKey,
+2, NodeInputs)`, `distill-build/src/keys.rs`) holds
 only its *static* inputs: the asset uuid, its entry metadata and its
 bundle's content hash, the chain (each stage's processor identity and
 types, the terminal and extra types, the pipeline dylib hash), the target
@@ -6592,7 +6659,7 @@ pub enum ManifestState {
 ```rust
 /// The IO-neutral basis token: what a sweep's answers are answered
 /// *under*. RpcIO realizes it as the adopted snapshot's stamp.
-/// PackfileIO uses the mounted manifest's own "DSPM" hash (§16) — a pack
+/// PackfileIO uses the mounted manifest's own manifest hash (§16) — a pack
 /// carries no InputVersion, which is exactly why the loader cannot key
 /// consistency on SnapshotStamp. Obtained from LoaderIO::begin_sweep,
 /// passed into every resolution, and carried exactly once by the outer
@@ -6603,8 +6670,8 @@ pub enum IoBasis {
     Rpc { snapshot: SnapshotStamp },
     Pack { manifest: ManifestHash },
 }
-/// A pack manifest's "DSPM" hash (§16): the mounted pack's identity.
-pub struct ManifestHash(pub [u8; 32]);
+/// A pack manifest's manifest hash (§16): the mounted pack's identity.
+pub struct ManifestHash(pub [u8; 16]);
 
 pub enum ResolveResult {
     Built   { content_hash: ContentHash },
@@ -6732,8 +6799,8 @@ basis rides in every outcome (`IoEvent`, below), so a mixed-basis
 component is detectable by inspection, and the rule for it is the
 mid-sweep `Drifted` rule below — re-resolve every member at the newer
 basis, never adopt a mix. The sweep also validates each authenticated
-artifact's terminal TypeUuid and DSLH against the live descriptor, rejects a
-locally build-only descriptor, authenticates its DSWL tree, and compiles the
+artifact's terminal TypeUuid and logical hash against the live descriptor, rejects a
+locally build-only descriptor, authenticates its wire tree, and compiles the
 fixup plan against that descriptor's native layout. A module epoch change
 reconnects RpcIO before new work and causes held closures to re-resolve
 normally. If **any** member of a
@@ -6941,7 +7008,7 @@ Admission for oversized payloads is pinned (§13's oversize records): a
 payload larger than the whole budget is admitted alone, once nothing else
 is held, and is read into memory like any other; admission is FIFO, so
 later small payloads never overtake (and starve) a waiting large one. The
-DSWL tree that completes a payload grows its reservation without waiting,
+wire tree that completes a payload grows its reservation without waiting,
 even past the budget, which then holds later admissions back until it is
 released. Nothing spills to disk. Memory is freed only by the loader
 taking payloads in `poll`, or by a fetch being dropped; the engine never
@@ -7038,15 +7105,15 @@ pub struct FetchedArtifact { pub structural: Arc<[u8]>, pub blobs: Vec<Blob> }
 ```
 
 **Runtime compatibility is artifact-local.** An RPC connection binds one
-canonical target name and DSTG. Target, store, protocol, or PipelineEpoch drift
+canonical target name and target-definition hash. Target, store, protocol, or PipelineEpoch drift
 returns the corresponding `ReconnectRequired`; RpcIO tears down the old Hub,
 reconnects, obtains a fresh snapshot, resubscribes, and re-resolves held
 closures. Every target-bound method is fenced server-side, so the stream event
 is only a prompt and a client cannot keep using a stale capability.
 
-PackfileIO verifies the mounted pack's target and DSTG. For both IO paths the
-loader then authenticates each artifact and its DSWL tree, requires terminal
-TypeUuid and DSLH to match the current local descriptor, rejects a local
+PackfileIO verifies the mounted pack's target and target-definition hash. For both IO paths the
+loader then authenticates each artifact and its wire tree, requires terminal
+TypeUuid and logical hash to match the current local descriptor, rejects a local
 `build_only` descriptor, and compiles a fresh plan against that descriptor's
 native layout. Plans are owned by the resident game-module epoch and are
 dropped during its drain. There is no global registry comparison, accepted
@@ -7244,8 +7311,8 @@ owning subsystem's responsibility and are re-imported after device creation.
 
 Content-addressed, patch-friendly (CASC-inspired):
 
-- **ContentHash** = raw blake3 of a built artifact — §5's deliberately
-  domainless byte-identity digest, the same identity
+- **ContentHash** = plain XXH3-128 of a built artifact — §5's deliberately
+  domainless byte-identity hash, the same identity
   build results record in their output tables and `fetch` serves (§9), so
   packing is selection + encoding of the reachable set from
   root assets, never re-cooking.
@@ -7266,25 +7333,27 @@ Content-addressed, patch-friendly (CASC-inspired):
   builds carry only their own backend's artifacts.
 - **Tables:** manifest (`AssetUuid → ContentHash + typed load deps`), encoding
   (`ContentHash → block EKeys + blob-extent EKeys`), index (`EKey → archive,
-  offset, len`), a **wire-tree table** (`LayoutHash → canonical DSWL bytes`),
+  offset, len`), a **wire-tree table** (`LayoutHash → layout encoding`),
   and an optional normalized path table. The header carries the canonical
-  target name, its DSTG, and authenticated archive references. Pack
+  target name, its target-definition hash, and authenticated archive references. Pack
   construction derives the exact closure from typed load dependencies under
   one snapshot and rejects authoring-only or build-only members using the
   pinned daemon schema. At mount, PackfileIO verifies the manifest and archive
-  trailers, target/DSTG, canonical table ordering, closure edges, and DSWL
-  hashes. Runtime TypeUuid/DSLH/build-only/native-layout compatibility is then
+  trailers, target and target-definition hash, canonical table ordering,
+  closure edges, and layout hashes. Runtime TypeUuid/logical-hash/build-only/native-layout compatibility is then
   checked per artifact against the current local descriptor (§15). A mounted
-  pack's adoption identity is the manifest's own `"DSPM"` hash; a pack carries
+  pack's adoption identity is the manifest's own manifest hash; a pack carries
   no `InputVersion`, and remounting a different manifest mints fresh
   loader-side `AdoptionId`s.
 - **Byte grammar (normative):** every pack file — manifest,
-  archive; there is no other file kind — begins
-  `magic "DPK1"` ‖ format version `u32 LE`; all
-  integers little-endian, and every file ends with a **per-file blake3
-  trailer**: the raw, domainless byte-identity blake3 (§5) of *all
+  archive; there is no other file kind — begins with the shared file
+  header (§5: `NGPF`, `u32 Domain::PackManifest` or `Domain::PackArchive`,
+  `u32 PACK_VERSION` = 4; `distill-pack/src/archive.rs`, `manifest.rs`); all
+  integers little-endian, and every file ends with a **per-file
+  trailer**: the plain, domainless byte-identity XXH3-128 (§5) of *all
   preceding bytes of that file*, stored
-  as the final 32 bytes and excluded from its own input; the reader
+  as the final 16 bytes and excluded from its own input; there are no other
+  checksums; the reader
   verifies it before using any table (an unverified table would turn
   silent corruption into misdirected fetches rather than a named
   integrity error). The manifest file's layout is pinned whole, **to
@@ -7293,13 +7362,13 @@ Content-addressed, patch-friendly (CASC-inspired):
   readable files (all integers LE, as everywhere in the format):
 
   ```
-  magic "DPK1" (4 bytes) ‖ version u32 LE
+  file header [u8; 12]: "NGPF" ‖ u32 Domain::PackManifest ‖ u32 PACK_VERSION
   header, fields in this order, no padding between them:
     target            u32 byte length ‖ UTF-8 canonical target name
-    target_def_hash   [u8; 32]                       ("DSTG", §18)
-    archive_refs      u32 count ‖ (generation u32 ‖ file_hash [u8;32])*
+    target_def_hash   [u8; 16]                       (target-definition hash, §18)
+    archive_refs      u32 count ‖ (generation u32 ‖ file_hash [u8;16])*
                       sorted by generation ascending, generations unique
-  table directory     u32 count ‖ (kind u8 ‖ offset u64 ‖ len u64)*
+  table directory     u32 count ‖ (kind u32 ‖ offset u64 ‖ len u64)*
                       sorted by kind, each kind at most once; offsets
                       from file start; table regions contiguous in
                       directory order, no padding between them. Kinds:
@@ -7312,21 +7381,22 @@ Content-addressed, patch-friendly (CASC-inspired):
                       error at this format version.
   tables              each: u32 entry count ‖ rows, keys sorted, no
                       padding between rows; row grammars:
-    manifest   asset_uuid [16] ‖ content_hash [32] ‖ dep_count u32
+    manifest   asset_uuid [16] ‖ content_hash [16] ‖ dep_count u32
                ‖ load_deps (asset_uuid [16] ‖ expected_terminal [16])
                ×dep_count, sorted/deduplicated by both fields. Expected
                terminals equal the producing result's verified
                `TraceOp::RefCheck` observations (§§9, 12).
-    encoding   content_hash [32] ‖ block_count u32 ‖ block EKeys
-               [32]×block_count (structural stream order) ‖
-               blob_count u32 ‖ blob EKeys [32]×blob_count
+    encoding   content_hash [16] ‖ block_count u32 ‖ block EKeys
+               [16]×block_count (structural stream order) ‖
+               blob_count u32 ‖ blob EKeys [16]×blob_count
                (blob-table order, §12)
-    index      ekey [32] ‖ generation u32 ‖ offset u64 ‖ len u64
+    index      ekey [16] ‖ generation u32 ‖ offset u64 ‖ len u64
                (offset and len name the payload bytes exactly — the
                EKey's hash input — never record framing)
-    wire-tree  layout_hash [32] ‖ len u32 ‖ canonical DSWL bytes (§12)
-    path       len u32 ‖ normalized path bytes (§10) ‖ asset_uuid [16]
-  trailer             blake3 of all preceding bytes of this file [32]
+    wire-tree  layout_hash [16] ‖ len u32 ‖ layout encoding (§12)
+    path       len u32 ‖ normalized path bytes (§10) ‖ len u32 ‖ name
+               bytes (empty for the primary) ‖ asset_uuid [16]
+  trailer             XXH3-128 of all preceding bytes of this file [16]
   ```
 
   **Index data is manifest tables — there are no separate index
@@ -7337,21 +7407,21 @@ Content-addressed, patch-friendly (CASC-inspired):
   index by EKey bytes, wire-tree by LayoutHash bytes, path table by
   path bytes — so two writers
   cannot order one table two ways. **Archive files share the outer
-  framing** — `magic "DPK1"` ‖ version `u32 LE` — followed by the
+  framing** — the file header with `Domain::PackArchive` — followed by the
   archive header (`generation u32` ‖ encoder identity: `u32` length ‖
   UTF-8 library+version string ‖ `zstd_level i32` — diagnostics only,
   per the reproducibility rule below), then records, then the same
-  per-file blake3 trailer. The **record grammar**: `kind u8` (0x01
-  structural block, 0x02 blob extent) ‖ `ekey [u8; 32]` ‖ `raw_len u64`
+  per-file trailer. The **record grammar**: `kind u32` (1
+  structural block, 2 blob extent) ‖ `ekey [u8; 16]` ‖ `raw_len u64`
   (decoded length — ≤ 256 KiB for blocks) ‖ `stored_len u64` ‖
-  `crc32c u32` over the payload bytes ‖ zero pad to 16-byte alignment ‖
+  zero pad to 16-byte alignment ‖
   payload `[u8; stored_len]` ‖ zero pad to 16-byte alignment. Blob
   extents store raw bytes (`stored_len = raw_len`, uncompressed,
   unbounded); block payloads are one zstd frame each. **The EKey's hash
   scope is the payload exactly as stored** — for a block, the zstd
   frame bytes; for a blob, the raw extent — and it **excludes record
-  framing**: kind, lengths, CRC, and padding are transport, whose
-  integrity is the CRC's job; content authentication is the EKey's.
+  framing**: kind, lengths, and padding are transport, covered by the
+  file trailer; content authentication is the EKey's.
   A future framing revision therefore cannot move any EKey, and the
   index's (offset, len) points at payload bytes, so a blob extent is
   mmap-served without touching framing. The **path table**
@@ -7368,11 +7438,11 @@ Content-addressed, patch-friendly (CASC-inspired):
   the pack build (§18's error — never a tiebreak row); a path whose
   primary is outside the closure is omitted, so `resolve_path` answers
   `Missing` (§15). The table rides in the manifest file — covered by
-  its blake3 trailer, replaced atomically with it under patching: same
+  its trailer, replaced atomically with it under patching: same
   authentication, same activation. **EKey** =
-  `blake3("DSEK" ‖ version:u8 ‖ encoded bytes)` over the encoded block
-  or extent exactly as stored — domain-separated like every hash in
-  this document, so an EKey can never alias a ContentHash. Structural
+  `digest(Domain::PackEntry, 1, encoded bytes)` over the encoded block
+  or extent exactly as stored (`distill-pack/src/archive.rs` `ekey`) — a
+  digest, so an EKey can never alias a ContentHash. Structural
   bytes chunk at **fixed 256 KiB boundaries** — the canonical rule;
   writers must not choose other boundaries, or identical structural
   bytes in two packs would chunk differently and dedup across versions
@@ -7397,18 +7467,18 @@ Content-addressed, patch-friendly (CASC-inspired):
   client never downloaded. A manifest references archives by
   generation id, each paired with the archive file's hash — every file
   a manifest references is named by hash in the manifest body. An archive's
-  physical filename is exactly `archive-<64hex>.dpk`, where `<64hex>` is the
-  lowercase hexadecimal raw blake3 of the **complete archive file bytes,
+  physical filename is exactly `archive-<32hex>.dpk`, where `<32hex>` is the
+  lowercase hexadecimal plain XXH3-128 of the **complete archive file bytes,
   including its per-file trailer**. Any other spelling, abbreviated hash,
   generation-derived name, or uppercase digit is invalid; the manifest's
   `file_hash` is the same full-file hash and generation never participates in
   naming. **The
   bootstrap has no circularity**: the manifest is a plain file at a
   pinned name — `manifest-<hex>.dpk`, `<hex>` the lowercase hex of its
-  **manifest hash** `blake3("DSPM" ‖ version:u8 ‖ manifest file
-  bytes)` — and the root pointer file (path pinned: `pack.current`)
-  contains exactly the hash as **64 lowercase ASCII hex bytes followed
-  by one `\n` byte** — 65 bytes total, no other whitespace. A reader
+  **manifest hash** `digest(Domain::PackManifest, 2, complete manifest
+  file bytes)` (`manifest_hash`) — and the root pointer file (path pinned:
+  `pack.current`) contains exactly the hash as **32 lowercase ASCII hex
+  bytes followed by one `\n` byte** — 33 bytes total, no other whitespace. A reader
   rejects any other length or spelling and opens the named manifest file
   directly — no index lookup to find the index, which lives *inside*
   the manifest's tables — and authenticates it by recomputing the hash
@@ -7424,14 +7494,14 @@ Content-addressed, patch-friendly (CASC-inspired):
   archive is fsynced and its containing directory fsynced before manifest
   publication begins. The hash-named manifest follows the **same immutable
   protocol**: write its complete bytes to a unique same-directory no-replace
-  temporary, fsync it, compute the DSPM hash/name, and link/rename it
-  no-replace to exactly `manifest-<64 lowercase hex>.dpk`. If that final name
-  already exists, recompute its full DSPM hash and compare complete bytes with
+  temporary, fsync it, compute the manifest hash/name, and link/rename it
+  no-replace to exactly `manifest-<32 lowercase hex>.dpk`. If that final name
+  already exists, recompute its full manifest hash and compare complete bytes with
   the temporary; only an exact match permits discarding the temporary. A
   mismatch is a hard integrity error, and the final manifest path is never
   truncated or overwritten. The published manifest and containing directory
   are fsynced. Finally activation
-  writes the 65 pointer bytes to a uniquely named **no-replace** temp in
+  writes the 33 pointer bytes to a uniquely named **no-replace** temp in
   the same directory as `pack.current`, fsyncs that temp file, renames it
   over `pack.current`, and fsyncs the directory — in exactly that order.
   Directory fsync alone makes the rename durable but does not guarantee
@@ -7447,8 +7517,8 @@ Content-addressed, patch-friendly (CASC-inspired):
   content hashes — never across assets: the asset UUID rides inside the artifact
   bytes, so identical values under two identities are distinct content hashes by
   construction.
-- **Integrity & determinism:** every block record carries raw and compressed
-  lengths and CRCs. Pack construction verifies the manifest AssetUuid and
+- **Integrity & determinism:** every block record carries raw and stored
+  lengths; the file trailer covers the records. Pack construction verifies the manifest AssetUuid and
   typed load-dependency projection against each ContentHash-authenticated
   artifact header (any mismatch is a pack-build failure naming the asset). It
   also verifies every manifest load edge's
@@ -7469,7 +7539,7 @@ Content-addressed, patch-friendly (CASC-inspired):
   `zstd_level` alone cannot pin (encoder library version, strategy, and
   internal parameters all move them). EKeys hash encoded bytes, so the
   encoding and location tables — and with them the physical manifest
-  hash (`"DSPM"`) — identify a particular pack **build**, encoder
+  hash — identify a particular pack **build**, encoder
   included: the manifest hash is deliberately not promised byte-stable
   across encoder implementations. The archive header records the
   **encoder identity and settings** (library + version, level) for
@@ -7533,8 +7603,8 @@ separate authenticated-transport design item (§22).
 
 The checked-in `distill_rpc.capnp` schema is the normative ordinal and union
 grammar. Fixed-size `Data` fields are length-checked before semantic decode:
-UUID and StoreInstanceId are 16 bytes, while content, schema, target-definition,
-and layout hashes are 32 bytes. Unknown union arms, bad widths, malformed
+UUID and StoreInstanceId are 16 bytes, and so are content, schema,
+target-definition, and layout hashes (XXH3-128, §5; protocol 32). Unknown union arms, bad widths, malformed
 canonical records, and trailing data fail closed.
 
 ### Connection and epoch fencing
@@ -7560,9 +7630,10 @@ enum ReconnectReason {
 }
 ```
 
-`Root.connect` canonicalizes the target name, recomputes its DSTG, validates
-the protocol epoch, and requires a usable current PipelineEpoch. Success binds
-the returned Hub and every child capability to that target, DSTG,
+`Root.connect` canonicalizes the target name, recomputes its target-definition
+hash, validates the protocol epoch, and requires a usable current PipelineEpoch.
+Success binds the returned Hub and every child capability to that target,
+target-definition hash,
 StoreInstanceId, protocol epoch, and PipelineEpoch. Drift in any bound value is
 checked on every target-bound call and returns the exact
 `ReconnectRequired` reason before data or a nested capability is exposed.
@@ -7649,7 +7720,8 @@ Values on the wire (`AuthoringValue`):
   schema at once, never into an untyped tree.
 - `blobs` is the blob table the text's `{"len","offset"}` placements
   index (`offset` is the index). Since protocol 28 each blob is a
-  `BlobRef { len, hash }` (blake3) or its bytes:
+  `BlobRef { len, hash }` (the blob's plain XXH3-128, 16 bytes since
+  protocol 32) or its bytes:
   - an inspection carries refs only, so a value's size is its text's,
     whatever its blobs weigh; `AuthoringSnapshot.blob(uuid, index)`
     streams one blob's bytes as a `ChunkStream` of one structural section;
@@ -7677,7 +7749,7 @@ typed built, drifted, failed, missing, deleted, or role-ineligible result.
 `fetch` is immutable and content-addressed. Artifact payloads stream through a
 bounded `ChunkStream`; the adapter verifies the requested ContentHash and
 serves the authenticated typed load edges with the payload. Wire trees are
-looked up by LayoutHash, returned as canonical DSWL bytes, and rehashed by the
+looked up by LayoutHash, returned as their layout encoding, and rehashed by the
 consumer.
 
 `Snapshot.importFailures` (protocol 18; protocols 10 to 17 had it on the
@@ -7869,9 +7941,9 @@ role-ineligible or drifted. A bundle holding several of them is read,
 verified and parsed once for the call.
 Each listed row (`AuthoringRow.content`) and inspection
 (`AuthoringInspection.content`) carries the entry's content key
-(protocol 29): a blake3 key over the value's schema hash, its canonical
-text, its blob refs and the schema hash of each carried type
-(`content_key`, `content_key_of`), stored in `assets.content` when the
+(protocol 29): `digest(Domain::ContentKey, 1, schema hash ‖ canonical text ‖
+blob refs (len, hash) ‖ (type UUID, schema hash) of each carried type, sorted)`
+(`distill-rpc/src/validate.rs` `content_key`, `content_key_of`), stored in `assets.content` when the
 coordinator publishes the bundle. A version that leaves an entry's value
 as it was leaves its key as it was: a client compares keys instead of
 fetching values to find what changed.
@@ -7962,8 +8034,8 @@ at the thread boundary, logged, and ends only that connection.
 
 RPC transports artifacts, wire trees, target identity, and snapshot identity;
 it does not transport native layout tables or a global compiled registry. The
-loader authenticates each artifact and DSWL tree locally, requires terminal
-TypeUuid and DSLH to match the current descriptor, rejects a local
+loader authenticates each artifact and wire tree locally, requires terminal
+TypeUuid and logical hash to match the current descriptor, rejects a local
 `build_only` descriptor, and compiles the fixup plan against the current
 native layout (§§12, 15). A PipelineEpoch change reconnects the Hub. This keeps
 module/schema freshness at the source-identity boundary and artifact
@@ -7987,7 +8059,7 @@ displaced_retention_days = 7
 
 [assets]
 # Named roots: the normalized name IS the root's persistent identity —
-# committed records and FILQ hashes carry it (§8); numeric root ids are
+# committed records and file-query hashes carry it (§8); numeric root ids are
 # process-local interning, never serialized. ImportRequest.root (§17)
 # selects a physical destination by name — paths stay root-relative in
 # one merged namespace for every read and query.
@@ -8045,7 +8117,7 @@ quiet_ms = 250
 Multiple asset roots form one namespace. Paths are root-relative; a relative
 path resolvable in more than one root is retained as the ordinary
 `Ambiguous(roots)` index state and is an error only for path-dependent
-operations (§4, §10); it never creates DSVP. By contrast, two distinct raw
+operations (§4, §10); it never creates version poison. By contrast, two distinct raw
 physical names inside one root that collapse to one normalized path publish
 §7's `SameRootNormalizedPathCollision` version poison with lossless raw-path
 claimants before any file row is chosen.
@@ -8089,7 +8161,7 @@ publish (§3, §13). Module, schemas, and target configuration validate
 as **one candidate**: a target edit stages through the same candidate
 mechanism as a module swap, and the candidate's pipeline map is
 constructed and validated against the candidate's exact canonical
-(normalized name, recomputed DSTG) rows (§3, §5) — never an opaque caller
+(normalized name, recomputed target-definition hash) rows (§3, §5) — never an opaque caller
 hash —
 adding or changing a target can force new chain selection and new
 terminal/extras-invariance validation, so a snapshot never pairs a
@@ -8104,7 +8176,7 @@ subscribe stream (§17) (schema-min, protocol 15: there is no distinct
 reason; a target edit publishes with its configuration's pipeline fence,
 so the Hub receives `PipelineEpochChanged`, and a reconnect under the stale
 definition is rejected with `TargetDefinitionMismatch`): RpcIO tears down the Hub, reconnects —
-`Root.connect` re-verifies target/DSTG and the current PipelineEpoch — and
+`Root.connect` re-verifies target, target-definition hash and the current PipelineEpoch — and
 resumes with ordinary `Drifted`
 re-resolution. The change is connection-level, deliberately not a
 `DriftedInput` variant: per-input drift would loop the retry-refreshed
@@ -8139,7 +8211,7 @@ overflow/incomplete-observation recovery), never by periodic hash polling. If
 the configuration source's exact raw
 Unix path or Windows UTF-16 path is missing, permission-denied, not a permitted
 regular file, or unreadable without I/O data loss, the candidate publishes
-DSCP code 14 `ConfigurationSourceUnavailable`; deletion never means “reload
+configuration-poison code 14 `ConfigurationSourceUnavailable`; deletion never means “reload
 defaults.” Configuration staging enumerates every simultaneous defect and uses
 §5's canonical `(code, detail bytes)` first row as the sole authority. In
 particular, lineage repair is unavailable when missing/duplicate lineage is
@@ -8157,7 +8229,7 @@ ships; an unclassified key is a spec defect:
 | `assets.default_imports_exclude` | input-versioned epoch | joins the compiled state's default import layer (§8 "Default imports"); staging requires configured root names and valid globs; the next pass revalidates the layer whole (outputs of newly excluded files orphan, released files import) |
 | `[targets]` definitions | input-versioned epoch | joins the combined execution candidate (§3): the pipeline map re-validates against the new target set; bound Hubs receive `ReconnectRequired` (§17) |
 | `modules.pipeline_dylib` | input-versioned epoch | module epoch rotation (§3) through the staged-candidate mechanism |
-| tool registrations (§3, §9) | input-versioned epoch | ToolEpoch (§13): a complete staged package or explicit ambient toolchain identity plus DSCT hash publishes at an input version |
+| tool registrations (§3, §9) | input-versioned epoch | ToolEpoch (§13): a complete staged package or explicit ambient toolchain identity plus its identity hash publishes at an input version |
 | `pipeline.parallelism` | operational-live | must remain ≥1; the pool resizes, re-clamps `batch_reserved_workers`, and lets already-active excess slots drain; no identity, key, or version implication |
 | `pipeline.max_dependency_depth` | operational-live | must remain in `1..=64` (default 32); the next request runs under the new bound and depth exhaustion is never memoized (§9) |
 | `pipeline.batch_reserved_workers` | operational-live | staging requires `1 <= value <= max(1, parallelism - 1)`; live changes re-clamp at the next scheduling decision while active slots drain (§13) |
@@ -8190,17 +8262,19 @@ pub struct Target {
     pub arch: TargetArch,
     pub apis: BTreeSet<GraphicsApi>,  // enabled API set — non-empty (§9's
                                       // match rule), canonically sorted
-                                      // (§5's record encoding)
+                                      // (§5's one encoding)
     pub optimize: bool,
     pub debug_info: bool,
 }
 pub enum TargetOs    { Macos, Windows, Linux }
 pub enum TargetArch  { Aarch64, X86_64 }
 pub enum GraphicsApi { Metal, Vulkan, Dx12, Gles2, Gles3 }
-// target-definition hash (§9) = blake3("DSTG" ‖ version ‖ canonical Target
-// ‖ bound LayoutIdentity) — §5's record encoding, never the config name.
+// target-definition hash (§9) = digest(Domain::TargetDefinition, 1,
+// os:u32 ‖ arch:u32 ‖ api set ‖ optimize ‖ debug_info ‖ bound LayoutIdentity
+// (triple, rustc, algorithm_version)) — §5's one encoding, never the config
+// name (`distill-build/src/keys.rs` `target_definition_hash`).
 // Candidate target sets retain exact name-sorted (NFC normalized name,
-// recomputed DSTG) rows; normalized-name duplicates reject. Candidate,
+// recomputed target-definition hash) rows; normalized-name duplicates reject. Candidate,
 // request, and commit compare those rows and never trust caller ordering.
 ```
 
@@ -8301,7 +8375,7 @@ maintained under a recorded query over all `ShaderPipeline` assets. A
 body-only edit diffs to a no-op — no `.rs` mtime bump, no cargo rebuild
 cascade. A new pipeline gets its `.rs` as soon as its import lands, with no
 game demand — the bootstrap path for referencing a new shader from code.
-Every source-entry hit or miss is recorded as DSTR v1
+Every source-entry hit or miss is recorded as a trace
 `TraceOp::AuthoringRead`, committing the owning bundle's exact raw byte
 identity; query membership remains an ordinary `TraceOp::Query`. This keeps
 codegen on the shared outcome-bearing trace/revalidation path without treating
@@ -8331,7 +8405,9 @@ surface, never content to merge. Every write publishes by §14's full
 protocol, generated sources being authored-tree files like any other:
 write-intent journal, then atomic rename-aside, then displaced-byte
 verification against the generated mark (the first line of every
-generated file, the blake3 of the rest: a file whose mark matches is
+generated file, `// @generated by distill; do not edit. xxh3:` and the
+XXH3-128 of the rest as 32 hex characters (`GENERATED_MARK`,
+`distill-daemon/src/codegen.rs`): a file whose mark matches is
 distill's unedited output), the displaced inode quarantined in the
 output directory's
 same-filesystem quarantine under its journal-assigned intent ID (§14)
@@ -8412,6 +8488,10 @@ put production image codecs, mesh optimization, or shader compilers in core.
 > chronology and may name mechanisms later removed; R34 supersedes every older
 > occurrence of compiled-registry attestation, accepted-set expansion,
 > in-place reattestation, native-layout comparison, and target-set digests.
+> Hash, encoding and file-format facts below (blake3, CRC-32C, four-letter
+> digest tags, `u8` kind tags, encoder-side NFC, 32-byte hashes, the `DPK1`,
+> `\x89DSTL` and `\x89DSB` magics) are superseded by XXH3-128, the one
+> encoding and the `NGPF` file header (§5; newgameplus doc 23 §17).
 
 ### Resolved
 
@@ -10666,7 +10746,7 @@ work itself.
 ### Accepted risks (validate early)
 
 - source-walk layout fidelity vs. actual rustc `repr(Rust)` layout: validate
-  the emitted DSWL tables early against compiler-derived fixtures for generics
+  the emitted wire layout tables early against compiler-derived fixtures for generics
   and exotic enums. Runtime consumers still require a successful plan against
   their compiler-generated live descriptor, but that does not independently
   attest the producer table used during encoding.
@@ -10694,7 +10774,7 @@ tools are already subprocesses. RPC auth/TLS — the loopback bind is a
 validated invariant (§17, §18: non-loopback addresses are rejected at
 config staging), and remote access is an Open item above, never a
 config knob. Pack signing —
-CRCs detect corruption, not adversaries. Flow-control QoS — bounded queues,
+the non-cryptographic XXH3-128 trailers and keys detect corruption, not adversaries. Flow-control QoS — bounded queues,
 disconnect slow clients. Multi-daemon / shared caches — one daemon per
 checkout. Exotic filesystems — document supported setups.
 
