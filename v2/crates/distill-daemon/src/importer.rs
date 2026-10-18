@@ -210,14 +210,16 @@ impl AuthoringService {
     /// a pass consumes: it is current but for the bundle sources pending
     /// work names (every bundle publication queues its paths, and work is
     /// acknowledged only after a pass reindexed it). Each source is parsed
-    /// once.
+    /// once. A source that changed on disk since the input observed it is
+    /// `Ok(Err(StoreError::Drifted))`, typed so the pass retries (nothing of
+    /// the refresh is kept).
     pub(crate) fn refresh_import_index(
         &self,
         store: &mut Store,
         dirty: &[distill_store::files::DirtyEntry],
         written: &BTreeSet<(String, String)>,
         fresh: impl Fn(&str, &str) -> Option<Arc<ScannedBundle>>,
-    ) -> Result<IndexRefresh, RpcFailure> {
+    ) -> Result<Result<IndexRefresh, StoreError>, RpcFailure> {
         self.refresh_dirty_import_index(store, dirty, written, fresh)
     }
 
@@ -229,8 +231,11 @@ impl AuthoringService {
         dirty: &[distill_store::files::DirtyEntry],
         written: &BTreeSet<(String, String)>,
         fresh: impl Fn(&str, &str) -> Option<Arc<ScannedBundle>>,
-    ) -> Result<IndexRefresh, RpcFailure> {
-        store.write_transaction_with(invalid, |store| {
+    ) -> Result<Result<IndexRefresh, StoreError>, RpcFailure> {
+        // A drift fails the transaction (rolling it back) and is reported
+        // from here, typed.
+        let drifted = std::cell::Cell::new(None);
+        let refreshed = store.write_transaction_with(invalid, |store| {
             let compiled = self.compiled(store)?;
             let keys = dirty
                 .iter()
@@ -254,12 +259,15 @@ impl AuthoringService {
                         {
                             continue;
                         }
-                        Arc::new(
-                            compiled
-                                .scanner()
-                                .read_published_bundle(store, root, path)
-                                .map_err(invalid)?,
-                        )
+                        match compiled.scanner().read_published_bundle(store, root, path) {
+                            Ok(source) => Arc::new(source),
+                            Err(drift @ StoreError::Drifted { .. }) => {
+                                let error = invalid(&drift);
+                                drifted.set(Some(drift));
+                                return Err(error);
+                            }
+                            Err(error) => return Err(invalid(error)),
+                        }
                     }
                 };
                 let Ok(bundle) = source.parsed.as_ref() else {
@@ -396,7 +404,11 @@ impl AuthoringService {
                 explicit,
                 rule_dirs,
             })
-        })
+        });
+        match drifted.into_inner() {
+            Some(drift) => Ok(Err(drift)),
+            None => refreshed.map(Ok),
+        }
     }
 
     /// The import index rows of the published bundle `meta` in the root
@@ -563,7 +575,8 @@ impl AuthoringService {
         store: &mut Store,
     ) -> Result<Vec<BundleUuid>, RpcFailure> {
         let pending = store.pending_file_work().map_err(invalid)?;
-        self.refresh_import_index(store, &pending.dirty, &BTreeSet::new(), |_, _| None)?;
+        self.refresh_import_index(store, &pending.dirty, &BTreeSet::new(), |_, _| None)?
+            .map_err(invalid)?;
         self.watched_imports_due(store, None, None)
     }
 

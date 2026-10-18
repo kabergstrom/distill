@@ -397,7 +397,9 @@ impl DaemonCoordinator {
                         .pending_file_work()
                         .map_err(|error| error.to_string())?,
                 };
-                let imports = self.discover(store, &step, &work, &written, scope, None)?;
+                let imports = self
+                    .discover(store, &step, &work, &written, scope, None)
+                    .map_err(|failure| failure.noted(&drift))?;
                 if !imports.is_empty() {
                     let mut plans = Vec::with_capacity(imports.len());
                     for import in imports {
@@ -488,8 +490,9 @@ impl DaemonCoordinator {
                 } else {
                     BTreeSet::new()
                 };
-                for import in
-                    self.discover(store, &step, &level_work, &written, level_scope, None)?
+                for import in self
+                    .discover(store, &step, &level_work, &written, level_scope, None)
+                    .map_err(|failure| failure.noted(&drift))?
                 {
                     let Some(index) = levels[level]
                         .iter()
@@ -707,7 +710,10 @@ impl DaemonCoordinator {
                         .map_err(publication)?;
                     for import in self
                         .discover(store, step, &work, &BTreeSet::new(), scope.chained(), Some(&overlay))
-                        .map_err(publication)?
+                        .map_err(|failure| match failure {
+                            StepFailure::Drifted { root, path } => CoordinatorError::Drifted { root, path },
+                            StepFailure::Failed(error) => publication(error),
+                        })?
                     {
                         let Some(destination) = self
                             .authoring
@@ -833,7 +839,7 @@ impl DaemonCoordinator {
         written: &BTreeSet<ScanKey>,
         scope: ImportScope<'_>,
         outputs: Option<&FileOverlay>,
-    ) -> Result<Vec<PassImport>, String> {
+    ) -> Result<Vec<PassImport>, StepFailure> {
         let failure = |error: RpcFailure| format!("{error:?}");
         // A full scan read and parsed every bundle: what revalidating them
         // reads of each (`ImportControls`) is taken from there, not read again.
@@ -846,7 +852,7 @@ impl DaemonCoordinator {
             .refresh_import_index(store, &work.dirty, written, |root, path| {
                 step.fresh_bundle(root, path)
             })
-            .map_err(failure)?;
+            .map_err(failure)??;
         // `None` revalidates every import.
         let affected = scope.affected.map(|affected| {
             (

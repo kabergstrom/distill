@@ -312,6 +312,52 @@ fn directory_rules_bundle_for(
     )
 }
 
+/// A bundle source rewritten on disk after its publication, while its path
+/// is still pending, drifts under a pass that reads it from disk (one with
+/// no scan of it, as a startup pass racing a checkout): the pass fails
+/// typed, `Drifted`, which the process loop retries, not as a
+/// publication failure. Once the change is scanned the pass succeeds.
+#[test]
+fn a_pending_bundle_rewritten_on_disk_fails_the_pass_as_drifted() {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("source.txt"), b"7").unwrap();
+    let coordinator = DaemonCoordinator::open(
+        StoreConfig::new(temp.path().join(".distill")),
+        vec![AssetRoot::new("main", &assets)],
+        vec![target()],
+        64,
+    )
+    .unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    configure(&coordinator, temp.path(), &assets);
+    import(&coordinator, BYTE_IMPORTER, &["source.txt"], "imported.bundle");
+
+    let path = assets.join("imported.bundle");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.push(b'\n');
+    std::fs::write(&path, &bytes).unwrap();
+    match coordinator.reconcile_watched_imports(&mut writer) {
+        Err(distill_daemon::coordinator::CoordinatorError::Drifted { root, path }) => {
+            assert_eq!((root.as_str(), path.as_str()), ("main", "imported.bundle"));
+        }
+        other => panic!("expected the pass to drift on imported.bundle, got {other:?}"),
+    }
+
+    coordinator
+        .reconcile_incremental(
+            &mut writer,
+            &WatcherBatch {
+                paths: vec![event_root(&assets).join("imported.bundle")],
+                renames: Vec::new(),
+            },
+        )
+        .unwrap();
+    coordinator.reconcile_watched_imports(&mut writer).unwrap();
+}
+
 #[test]
 fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities() {
     let temp = tempfile::tempdir().unwrap();
