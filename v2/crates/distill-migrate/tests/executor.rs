@@ -566,3 +566,21 @@ fn sparse_grow_array_inherits_the_added_slots() {
     let out = distill_migrate::execute_sparse(&ops, &input, &from, &to).unwrap();
     assert_eq!(ptxt(&to, &out), r#"{"a":[{"x":1},{},{},{}]}"#);
 }
+
+#[test]
+fn an_added_variant_moving_the_others_keeps_values_by_name() {
+    // "Body" sorts between "Board" and "Tie": "Tie" moves from 1 to 2. The
+    // planner maps it by name; a plain copy would read it as "Body".
+    let tie = strct(0, &[("lead", 0, p(PK::F32)), ("turns", 0, p(PK::Bool))]);
+    let old = strct(0, &[("kind", 0, enm(0, &[("Board", 0, unit_payload()), ("Tie", 0, tie.clone())]))]);
+    let new = strct(
+        0,
+        &[("kind", 0, enm(0, &[("Board", 0, unit_payload()), ("Body", 0, unit_payload()), ("Tie", 0, tie)]))],
+    );
+    let ops = distill_migrate::plan_automatic(&old, &new).unwrap();
+    for input in [r#"{"kind":{"Tie":{"lead":0.5,"turns":true}}}"#, r#"{"kind":{"Board":{}}}"#] {
+        assert_eq!(run(&ops, input, &old, &new), input);
+        let out = distill_migrate::execute_sparse(&ops, &patch(&old, input), &old, &new).unwrap();
+        assert_eq!(ptxt(&new, &out), input);
+    }
+}
