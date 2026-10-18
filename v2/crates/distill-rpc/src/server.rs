@@ -181,6 +181,9 @@ pub struct ServerHandle {
     next_connection_id: AtomicU64,
     /// Bundle files authoring inspections and blob reads have parsed.
     pub(crate) authoring_bundle_parses: AtomicU64,
+    /// Parsed bundles by content hash (GAP 23 §17.6 "Read"), so repeated
+    /// inspections of unchanged bundles parse each once.
+    pub(crate) authoring_bundles: Mutex<ParsedBundles>,
     /// Opens each owner's own reader and writer.
     opener: Arc<StoreOpener>,
     /// The restart-only values the configuration file asks for that this
@@ -189,6 +192,35 @@ pub struct ServerHandle {
     /// What the daemon cannot accept now, which no snapshot carries
     /// ([`Self::set_scan_rejection`], [`Self::set_configuration_source_`]).
     rejections: Mutex<Rejections>,
+}
+
+/// The last [`ParsedBundles::CAPACITY`] bundles authoring reads parsed, by
+/// content hash, least recently used first. A bundle's bytes are still read
+/// and checked against the snapshot's hash on every read (drift); only the
+/// parse is shared.
+#[derive(Default)]
+pub(crate) struct ParsedBundles {
+    entries: VecDeque<(distill_core::id::ContentHash, Arc<distill_bundle::Bundle>)>,
+}
+
+impl ParsedBundles {
+    const CAPACITY: usize = 64;
+
+    /// The bundle parsed from bytes hashing to `hash`, moved to the back.
+    pub(crate) fn get(&mut self, hash: distill_core::id::ContentHash) -> Option<Arc<distill_bundle::Bundle>> {
+        let at = self.entries.iter().position(|(held, _)| *held == hash)?;
+        let entry = self.entries.remove(at)?;
+        let bundle = entry.1.clone();
+        self.entries.push_back(entry);
+        Some(bundle)
+    }
+
+    pub(crate) fn insert(&mut self, hash: distill_core::id::ContentHash, bundle: Arc<distill_bundle::Bundle>) {
+        if self.entries.len() == Self::CAPACITY {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((hash, bundle));
+    }
 }
 
 /// Process state, in no store row: the process compares the values it
@@ -249,6 +281,7 @@ impl ServerHandle {
             open_connections: AtomicUsize::new(0),
             next_connection_id: AtomicU64::new(1),
             authoring_bundle_parses: AtomicU64::new(0),
+            authoring_bundles: Mutex::default(),
             opener,
             restart: Mutex::default(),
             rejections: Mutex::default(),
@@ -291,8 +324,9 @@ impl ServerHandle {
         }
     }
 
-    /// Bundle files authoring inspections and blob reads have read and
-    /// parsed: one per bundle per call (§17 "Authoring snapshots").
+    /// Bundle files authoring inspections and blob reads have parsed: one
+    /// per bundle content (§17 "Authoring snapshots"; the last 64 contents
+    /// stay parsed).
     pub fn authoring_bundle_parses(&self) -> u64 {
         self.authoring_bundle_parses.load(Ordering::Relaxed)
     }

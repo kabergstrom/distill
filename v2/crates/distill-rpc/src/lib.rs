@@ -32,5 +32,5 @@ pub use server::{
 };
 pub use validate::{
     authoring_value, authoring_value_by_ref, check_authoring_value, complete_settings, content_key, content_key_of,
-    decode_asset_reference_query, names_blob_ref, resolve_blob_refs, settings_value, stored_value, value_blob, value_blobs,
+    decode_asset_reference_query, names_blob_ref, resolve_blob_refs, resolve_value_blob_refs, settings_value, stored_value, value_blob, value_blobs,
 };

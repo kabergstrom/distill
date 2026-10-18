@@ -968,7 +968,11 @@ items (set elements and map keys sorted by their encoding, strictly
 increasing), a blob as `u32` 0 and its bytes or 1 and a `BlobRef { len,
 hash }`, a dynamic value as its carried type's UUID and the payload under
 that type's schema. A patch is a `u32` `Patch` tag per node, struct and
-enum patches as `(u32 field index, patch)` pairs. Decoding is strict
+enum patches as `(u32 field index, patch)` pairs. A patch has one
+spelling, the text reader's: a whole value of a node that takes a structural
+patch (struct, enum, option or sequence of those, map) travels as that
+patch, every field, element and entry present (`ngp_value::full_patch`);
+only `None` and leaves are tag 0 (replace). Decoding is strict
 (counts bounded by the schema's minimum element size, depth 256, one byte
 string per value, trailing bytes refused). A value's digest is
 `digest(Domain::Value, 1, schema hash ‖ carried types (UUID, schema hash)
@@ -7868,6 +7872,11 @@ travels on the authoring path:
     resolves against the blobs the target bundle's entries hold now, so an
     edit of a value with a blob field re-sends no bytes. A ref the bundle
     does not hold fails the write (`UnknownBlobRef`);
+  - import settings (`ImportRequest.settings`) name a blob the same way: a
+    ref resolves against the blobs the destination bundle holds
+    (`resolve_settings_blobs` in `distill-daemon/src/importer.rs`), so a
+    re-import with edited settings holding a blob re-sends no bytes; a ref
+    it lacks, or a new destination, fails the request;
   - type defaults and importer default settings carry bytes: a client
     writes them into new entries.
 - `types` (protocol 20) lists each type the value's dynamic values name
@@ -8082,8 +8091,10 @@ or, unnamed, in the one configured root (several configured: refused).
 An inspection names the root it read the bundle from (protocol 22).
 `inspect` takes a list of UUIDs (protocol 28; one before) and answers one
 result per UUID, in order, at the snapshot: inspection, missing,
-role-ineligible or drifted. A bundle holding several of them is read,
-verified and parsed once for the call.
+role-ineligible or drifted. A bundle holding several of them is read and
+verified once for the call; its parse is shared across calls by content
+hash (the last 64 contents, `ParsedBundles` in `distill-rpc/src/server.rs`;
+newgameplus GAP 23 §17.6 "Read").
 Each listed row (`AuthoringRow.content`) and inspection
 (`AuthoringInspection.content`) carries the entry's content key
 (protocol 29; since protocol 33 the value digest, newgameplus GAP 23

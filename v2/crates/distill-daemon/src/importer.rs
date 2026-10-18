@@ -26,7 +26,7 @@ use distill_core::bootstrap::{
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_schema::ngp_schema::{parse_patch, write_value, Options, Value, WriteOptions};
 use distill_rpc::{
-    complete_settings, settings_value, ImportRequest, InputVersion, PreparedImportCommit,
+    complete_settings, names_blob_ref, resolve_value_blob_refs, settings_value, value_blobs, ImportRequest, InputVersion, PreparedImportCommit,
     RpcFailure,
 };
 use distill_schema::ngp_schema::{node_hash, LogicalSchema};
@@ -1803,8 +1803,9 @@ impl AuthoringService {
                 request.settings_hash, importer.settings_hash
             )));
         }
-        let settings = settings_value(&importer.settings_schema, &request.settings, &importer.default_settings)
-        .map_err(|error| invalid(format!("invalid importer settings: {error:?}")))?;
+        let mut settings =
+            settings_value(&importer.settings_schema, &request.settings, &importer.default_settings)
+                .map_err(|error| invalid(format!("invalid importer settings: {error:?}")))?;
 
         let dest = normalize_path(&request.dest).map_err(invalid)?;
         require_base(store, base)?;
@@ -1814,6 +1815,7 @@ impl AuthoringService {
             .as_ref()
             .map(|meta| self.read_prior_import(store, meta))
             .transpose()?;
+        resolve_settings_blobs(&mut settings, prior.as_ref().map(|prior| &prior.bundle))?;
         let capabilities = self.importer_capabilities(&compiled);
         let mut backend =
             RootedImportBackend::open(compiled.scanner(), &self.opener, &capabilities, None)?;
@@ -4177,6 +4179,22 @@ struct ImportDestination {
     meta: Option<BundleMeta>,
 }
 
+/// Import settings naming a blob by reference keep the bytes the
+/// destination bundle (`prior`, the bundle being re-imported) holds under it
+/// (§17 "Authoring snapshots"): an edit of settings holding a blob re-sends
+/// no bytes. A reference the bundle lacks fails the request.
+fn resolve_settings_blobs(settings: &mut Value, prior: Option<&Bundle>) -> Result<(), RpcFailure> {
+    if !names_blob_ref(settings) {
+        return Ok(());
+    }
+    let mut held = BTreeMap::new();
+    for asset in prior.iter().flat_map(|bundle| bundle.assets.values()) {
+        value_blobs(&asset.data, &mut held);
+    }
+    resolve_value_blob_refs(settings, &held)
+        .map_err(|error| invalid(format!("invalid importer settings: {error:?}")))
+}
+
 struct PriorImport {
     model: ImportedBundle,
     settings_type_uuid: TypeUuid,
@@ -4472,6 +4490,40 @@ mod tests {
             assert_eq!(uuid[6] >> 4, 4, "version 4");
             assert_eq!(uuid[8] >> 6, 0b10, "RFC 4122 variant");
         }
+    }
+
+    /// Settings naming a blob by reference take the bytes the destination
+    /// bundle holds; a reference it lacks, or no bundle, fails naming it.
+    #[test]
+    fn settings_blob_refs_resolve_against_the_destination_bundle() {
+        use distill_schema::ngp_schema::{BlobData, BlobRef};
+        let bytes: Arc<[u8]> = Arc::from(&b"lut bytes"[..]);
+        let by_ref = |bytes: &[u8]| Value::Blob(BlobData::Ref(BlobRef::of(bytes)));
+        let settings_entry = AssetEntry {
+            uuid: AssetUuid([2; 16]),
+            type_uuid: TypeUuid([3; 16]),
+            schema_hash: distill_core::id::LogicalHash([0; 16]),
+            authoring_only: true,
+            data: Value::Struct(Box::new([Value::Bool(true), Value::Blob(BlobData::Bytes(bytes.clone()))])),
+        };
+        let bundle = Bundle {
+            format_version: BUNDLE_FORMAT_VERSION,
+            uuid: BundleUuid([1; 16]),
+            primary: None,
+            schemas: BTreeMap::new(),
+            types: BTreeMap::new(),
+            assets: BTreeMap::from([("$settings".to_owned(), settings_entry)]),
+        };
+
+        let mut settings = Value::Struct(Box::new([Value::Bool(false), by_ref(&bytes)]));
+        resolve_settings_blobs(&mut settings, Some(&bundle)).unwrap();
+        assert_eq!(settings, Value::Struct(Box::new([Value::Bool(false), Value::Blob(BlobData::Bytes(bytes.clone()))])));
+
+        let mut unknown = Value::Struct(Box::new([Value::Bool(false), by_ref(b"other")]));
+        let error = resolve_settings_blobs(&mut unknown, Some(&bundle)).unwrap_err();
+        assert!(format!("{error:?}").contains("UnknownBlobRef"), "{error:?}");
+        let mut fresh = Value::Struct(Box::new([Value::Bool(false), by_ref(&bytes)]));
+        assert!(resolve_settings_blobs(&mut fresh, None).is_err());
     }
 
     #[test]

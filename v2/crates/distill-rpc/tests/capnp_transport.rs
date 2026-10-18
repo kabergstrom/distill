@@ -2731,8 +2731,8 @@ async fn browsing_calls_round_trip_over_tcp() {
 
 /// Inspections carry blob refs, never bytes, so an entry whose blob alone
 /// is past capnp's 64 MiB traversal limit inspects; `blob` streams the
-/// bytes; one `inspect` call reads and parses each bundle once (protocol
-/// 28).
+/// bytes; each bundle content is parsed once, however many entries and
+/// calls read it (protocol 28; GAP 23 §17.6).
 #[tokio::test(flavor = "current_thread")]
 async fn inspect_batches_by_bundle_and_blobs_travel_by_reference() {
     LocalSet::new()
@@ -2772,6 +2772,10 @@ async fn inspect_batches_by_bundle_and_blobs_travel_by_reference() {
                 .success()
                 .unwrap();
             assert_eq!(handle.authoring_bundle_parses() - parses, 2, "one parse per bundle");
+            // Unchanged bundles stay parsed by content hash (GAP 23 §17.6).
+            let again = snapshot.inspect(&[a, b, other.uuid]).await.unwrap().success().unwrap();
+            assert_eq!(again[..], answers[..3]);
+            assert_eq!(handle.authoring_bundle_parses() - parses, 2, "a second inspect parses nothing");
             let blobs = |answer: &AuthoringInspectResult| match answer {
                 AuthoringInspectResult::Inspection(inspection) => blobs_of(&inspection.value.value),
                 other => panic!("expected an inspection, got {other:?}"),
