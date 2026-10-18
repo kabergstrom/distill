@@ -21,8 +21,7 @@ const USAGE: &str = "usage:
                   [--root <name>] [--target <name>] [--no-watch] [--if-missing | --if-changed] [--wait <seconds>]
   distilld engine-args <config-path> [target]
   distilld pack <config-path> <definition-uuid> <output-directory>
-  distilld codegen <config-path> [--check]
-  distilld migrate-bundles <config.toml | directory | bundle>... (one-time: old bundle format to the current one)";
+  distilld codegen <config-path> [--check]";
 
 /// How long `import` waits for a starting daemon by default.
 const DEFAULT_IMPORT_WAIT: Duration = Duration::from_secs(120);
@@ -45,7 +44,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("engine-args") => engine_args(rest),
         Some("pack") => pack(rest),
         Some("codegen") => codegen(rest),
-        Some("migrate-bundles") => migrate_bundles(rest),
         Some("-h" | "--help") => {
             println!("{USAGE}");
             Ok(())
@@ -53,23 +51,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ if rest.is_empty() => run_daemon(PathBuf::from(first)),
         _ => Err(USAGE.into()),
     }
-}
-
-fn migrate_bundles(args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
-    if args.is_empty() {
-        return Err(USAGE.into());
-    }
-    let paths: Vec<PathBuf> = args.into_iter().map(PathBuf::from).collect();
-    let report = distill_daemon::migrate_bundles::migrate_paths(&paths)?;
-    for path in &report.migrated {
-        println!("migrated {}", path.display());
-    }
-    println!(
-        "{} migrated, {} already current",
-        report.migrated.len(),
-        report.current.len()
-    );
-    Ok(())
 }
 
 fn run_daemon(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
