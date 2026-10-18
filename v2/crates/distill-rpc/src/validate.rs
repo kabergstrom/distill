@@ -14,118 +14,6 @@ use distill_schema::ngp_schema::{
 
 use crate::*;
 
-pub(crate) fn validate_commit(commit: &Commit) -> Result<(), AdminError> {
-    let mut tag_assets = BTreeSet::new();
-    for mutation in &commit.tag_projection_mutations {
-        let (asset, tags) = match mutation {
-            TagProjectionMutation::Set { asset, tags } => (*asset, Some(tags)),
-            TagProjectionMutation::Remove { asset } => (*asset, None),
-        };
-        if !tag_assets.insert(asset) {
-            return Err(AdminError::InvalidAuthoringIdentity {
-                uuid: asset,
-                detail: "duplicate tag-projection mutation".to_owned(),
-            });
-        }
-        if tags.is_some_and(|tags| {
-            tags.iter().any(|(tag, value)| {
-                !valid_identifier(tag)
-                    || value
-                        .as_deref()
-                        .is_some_and(|value| !valid_identifier(value))
-            })
-        }) {
-            return Err(AdminError::InvalidAuthoringIdentity {
-                uuid: asset,
-                detail: "tag projection contains a noncanonical name or value".to_owned(),
-            });
-        }
-    }
-    let mut poison_assets = BTreeSet::new();
-    for mutation in &commit.tag_poison_mutations {
-        let asset = match mutation {
-            TagPoisonMutation::Set { asset, .. } | TagPoisonMutation::Remove { asset } => *asset,
-        };
-        if !poison_assets.insert(asset) {
-            return Err(AdminError::InvalidAuthoringIdentity {
-                uuid: asset,
-                detail: "duplicate tag-poison mutation".to_owned(),
-            });
-        }
-    }
-    let mut assets = BTreeSet::new();
-    for mutation in &commit.assets {
-        let uuid = mutation.uuid;
-        if !assets.insert(uuid) {
-            return Err(AdminError::DuplicateAssetMutation { uuid });
-        }
-    }
-    let mut authoring = BTreeSet::new();
-    for mutation in &commit.authoring {
-        let uuid = match mutation {
-            AuthoringMutation::Set(entry) => {
-                if !valid_bundle_local_id(&entry.local_id) {
-                    return Err(AdminError::InvalidAuthoringIdentity {
-                        uuid: entry.uuid,
-                        detail: "local ID is noncanonical or uses the reserved '$' namespace"
-                            .to_owned(),
-                    });
-                }
-                if !valid_logical_path(&entry.normalized_path) {
-                    return Err(AdminError::InvalidAuthoringIdentity {
-                        uuid: entry.uuid,
-                        detail: "normalized path is not canonical".to_owned(),
-                    });
-                }
-                if entry.tags.iter().any(|(tag, value)| {
-                    !valid_identifier(tag)
-                        || value
-                            .as_deref()
-                            .is_some_and(|value| !valid_identifier(value))
-                }) {
-                    return Err(AdminError::InvalidAuthoringIdentity {
-                        uuid: entry.uuid,
-                        detail: "tag name or value is not canonical".to_owned(),
-                    });
-                }
-                validate_authoring_entry(entry).map_err(|error| {
-                    AdminError::InvalidAuthoringValue {
-                        uuid: entry.uuid,
-                        error,
-                    }
-                })?;
-                entry.uuid
-            }
-            AuthoringMutation::Remove { uuid } => *uuid,
-        };
-        if !authoring.insert(uuid) {
-            return Err(AdminError::DuplicateAuthoringMutation { uuid });
-        }
-    }
-    let mut paths = BTreeSet::new();
-    for mutation in &commit.paths {
-        let path = match mutation {
-            PathMutation::Set { path, .. } | PathMutation::Remove { path } => path,
-        };
-        if !valid_logical_path(path) {
-            return Err(AdminError::InvalidPath { path: path.clone() });
-        }
-        if !paths.insert(path.clone()) {
-            return Err(AdminError::DuplicatePathMutation { path: path.clone() });
-        }
-        if let PathMutation::Set { candidates, .. } = mutation {
-            if candidates.is_empty() {
-                return Err(AdminError::EmptyPathCandidates { path: path.clone() });
-            }
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_authoring_entry(entry: &AuthoringEntry) -> Result<(), AuthoringValueError> {
-    decode_authoring_payload(entry.schema_hash, &entry.logical_schema, &entry.value).map(drop)
-}
-
 /// Authenticate and decode an RPC authored-value carrier into the exact
 /// schema-shaped value stored in a bundle: canonical text parsed against
 /// the schema (`ngp_schema::parse_value`), blobs as `{"len","offset"}`
@@ -779,10 +667,6 @@ pub(crate) fn valid_identifier(value: &str) -> bool {
 
 pub(crate) fn valid_reference_local_id(value: &str) -> bool {
     valid_identifier(value) && !value.starts_with('$')
-}
-
-pub(crate) fn valid_bundle_local_id(value: &str) -> bool {
-    valid_reference_local_id(value) || matches!(value, "$settings" | "$record")
 }
 
 pub(crate) fn valid_logical_path(path: &str) -> bool {

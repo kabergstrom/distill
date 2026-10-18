@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 tracing.workspace = true
 distill-core = { path = "../distill-core" }
+distill-protocol = { path = "../distill-protocol" }
 distill-schema = { path = "../distill-schema" }
 distill-wire = { path = "../distill-wire" }
 ngp-schema = { path = "../../../../newgameplus/ngp-schema" }

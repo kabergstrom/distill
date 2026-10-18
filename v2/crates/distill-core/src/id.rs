@@ -219,3 +219,11 @@ pub fn default_rules_bundle(root: &str) -> BundleUuid {
         |encoder| encoder.str(root),
     ))
 }
+
+/// Whether an entry is served to runtimes or to authoring tools only (§8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum EntryRole {
+    Runtime = 0,
+    AuthoringOnly = 1,
+}

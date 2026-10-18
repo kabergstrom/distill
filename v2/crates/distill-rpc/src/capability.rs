@@ -24,7 +24,7 @@ use distill_store::{Store, StoreError, StoreReader};
 
 use crate::server::{
     entry_role, has_file_changes, history_deltas, pipeline_failure, store_failure, types_root,
-    ConnectionState, HistoryDelta, MetadataBinding, SnapshotHold, SnapshotTxn, DEFAULT_CHUNK_SIZE,
+    ConnectionState, HistoryDelta, MetadataBinding, SnapshotHold, SnapshotTxn,
 };
 use crate::validate::{
     path_glob_matches, valid_identifier, valid_logical_path, valid_logical_path_prefix,
@@ -1236,9 +1236,6 @@ fn coordinated_failure(error: CoordinatedCommitError) -> RpcFailure {
             expected: observed,
             got: expected,
         },
-        CoordinatedCommitError::Invalid(error) => RpcFailure::InvalidAuthoringRequest {
-            detail: format!("authoring backend produced an invalid commit: {error:?}"),
-        },
         CoordinatedCommitError::Publication(detail) => {
             RpcFailure::InvalidAuthoringRequest { detail }
         }
@@ -1340,16 +1337,6 @@ impl MetadataHub {
         match load_artifact(&self.server.inner.reader, hash) {
             Ok((payload, _)) => MetadataCall::Success(chunk_payload(&payload, DEFAULT_CHUNK_SIZE)),
             Err(error) => MetadataCall::Error(error),
-        }
-    }
-}
-
-impl<T> MetadataCall<T> {
-    fn retype<U>(self) -> MetadataCall<U> {
-        match self {
-            Self::Success(_) => unreachable!("only failures are retyped"),
-            Self::SnapshotExpired => MetadataCall::SnapshotExpired,
-            Self::Error(error) => MetadataCall::Error(error),
         }
     }
 }

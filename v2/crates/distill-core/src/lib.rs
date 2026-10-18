@@ -8,5 +8,6 @@ pub mod frames;
 pub mod hash;
 pub mod header;
 pub mod id;
+pub mod path;
 pub mod target_set;
 pub mod tool;

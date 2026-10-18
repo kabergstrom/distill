@@ -1,10 +1,9 @@
-//! Durable `pack.current` activation (§16).
+//! Reading the durable `pack.current` activation (§16); `distill-pack-build`
+//! publishes and activates.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-
-use distill_store::atomic_file::{self, AtomicWriteError, Expected};
 
 #[derive(Debug)]
 pub enum PointerError {
@@ -17,15 +16,6 @@ pub enum PointerError {
 impl From<io::Error> for PointerError {
     fn from(value: io::Error) -> Self {
         Self::Io(value)
-    }
-}
-
-impl From<AtomicWriteError> for PointerError {
-    fn from(value: AtomicWriteError) -> Self {
-        match value {
-            AtomicWriteError::Io { source, .. } => Self::Io(source),
-            AtomicWriteError::Conflict { path } => Self::ImmutableConflict(path),
-        }
     }
 }
 
@@ -75,60 +65,4 @@ pub fn archive_filename(file_hash: [u8; 16]) -> String {
         "archive-{}.dpk",
         std::str::from_utf8(&pointer[..32]).expect("hex")
     )
-}
-
-/// Publish an authenticated archive under its immutable content-addressed
-/// physical name: an fsynced temp in the directory's staging directory is
-/// hard-linked into place, which is atomic and no-replace. An existing
-/// equal file is idempotent; different bytes under the same name are fatal.
-pub fn publish_archive(directory: &Path, bytes: &[u8]) -> Result<[u8; 16], PointerError> {
-    crate::archive::validate_archive(bytes).map_err(|_| PointerError::InvalidPack)?;
-    let hash = distill_core::hash::hash(bytes);
-    publish_immutable(directory, &archive_filename(hash), bytes)?;
-    Ok(hash)
-}
-
-pub fn publish_manifest(directory: &Path, bytes: &[u8]) -> Result<[u8; 16], PointerError> {
-    crate::manifest::decode_manifest(bytes).map_err(|_| PointerError::InvalidPack)?;
-    let hash = crate::manifest::manifest_hash(bytes);
-    publish_immutable(directory, &manifest_filename(hash), bytes)?;
-    Ok(hash)
-}
-
-fn publish_immutable(directory: &Path, name: &str, bytes: &[u8]) -> Result<(), PointerError> {
-    let destination = directory.join(name);
-    if destination.exists() {
-        return verify_existing(&destination, bytes);
-    }
-    if !atomic_file::stage(directory, &destination, bytes)?.commit_new()? {
-        verify_existing(&destination, bytes)?;
-    }
-    Ok(())
-}
-
-fn verify_existing(path: &Path, bytes: &[u8]) -> Result<(), PointerError> {
-    if fs::read(path)? == bytes {
-        Ok(())
-    } else {
-        Err(PointerError::ImmutableConflict(path.to_owned()))
-    }
-}
-
-/// Empty `directory`'s staging directory: the temps an earlier pack command
-/// left there never committed. Call it before publishing into `directory`.
-pub fn open_pack_directory(directory: &Path) -> Result<(), PointerError> {
-    atomic_file::open_staging(directory)?;
-    Ok(())
-}
-
-/// The manifest/archives must already have been published. This atomically
-/// replaces `pack.current` (fsynced temp, rename, directory fsync).
-pub fn activate(directory: &Path, hash: [u8; 16]) -> Result<(), PointerError> {
-    atomic_file::write(
-        directory,
-        &directory.join("pack.current"),
-        &pointer_bytes(hash),
-        Expected::Any,
-    )?;
-    Ok(())
 }

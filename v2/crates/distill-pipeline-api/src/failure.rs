@@ -52,12 +52,7 @@ pub enum ToolLaunchFailureClass {
     AmbientUnavailable,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum EntryRole {
-    Runtime = 0,
-    AuthoringOnly = 1,
-}
+pub use distill_core::id::EntryRole;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RawFileOp {

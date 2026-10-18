@@ -1,4 +1,4 @@
-use distill_bundle::PathComponent;
+use ngp_schema::PathComponent;
 use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
 use distill_loader::{
     AssetPath, GameModuleEpoch, IoBasis, IoEvent, LoaderIO, PathResolveResult, ReqId,
@@ -10,7 +10,7 @@ use distill_pack::manifest::{
     PathRow, WireTreeRow,
 };
 use distill_pack::{
-    activate, archive_filename, manifest_filename, manifest_hash, MountError, PackfileIO,
+    archive_filename, manifest_filename, manifest_hash, pointer_bytes, MountError, PackfileIO,
     RuntimeTarget,
 };
 use distill_wire::artifact::{
@@ -156,7 +156,8 @@ fn mount_pack_as(
         archive,
     )
     .unwrap();
-    activate(directory.path(), manifest_hash).unwrap();
+    // What `distill_pack_build::activate` writes, without its staging.
+    std::fs::write(directory.path().join("pack.current"), pointer_bytes(manifest_hash)).unwrap();
     PackfileIO::mount_current(directory.path(), runtime)
 }
 

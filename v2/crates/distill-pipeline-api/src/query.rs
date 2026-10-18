@@ -41,40 +41,24 @@ impl fmt::Display for IntakeError {
 
 impl std::error::Error for IntakeError {}
 
+impl From<distill_core::path::NormalizeError> for IntakeError {
+    fn from(error: distill_core::path::NormalizeError) -> Self {
+        use distill_core::path::NormalizeError;
+        match error {
+            NormalizeError::EmptyIdentifier => Self::EmptyIdentifier,
+            NormalizeError::IdentifierTooLong => Self::IdentifierTooLong,
+            NormalizeError::Nul => Self::Nul,
+            NormalizeError::InvalidPath => Self::InvalidPath,
+        }
+    }
+}
+
 pub fn normalize_identifier(value: &str) -> Result<String, IntakeError> {
-    if value.contains('\0') {
-        return Err(IntakeError::Nul);
-    }
-    let value: String = value.nfc().collect();
-    if value.is_empty() {
-        return Err(IntakeError::EmptyIdentifier);
-    }
-    if value.len() > 255 {
-        return Err(IntakeError::IdentifierTooLong);
-    }
-    Ok(value)
+    Ok(distill_core::path::normalize_identifier(value)?)
 }
 
 pub fn normalize_path(value: &str) -> Result<String, IntakeError> {
-    if value.is_empty()
-        || value.starts_with('/')
-        || value.ends_with('/')
-        || value.contains(['\\', '\0'])
-    {
-        return Err(IntakeError::InvalidPath);
-    }
-    let mut normalized = Vec::new();
-    for component in value.split('/') {
-        if component.is_empty() || matches!(component, "." | "..") {
-            return Err(IntakeError::InvalidPath);
-        }
-        let component: String = component.nfc().collect();
-        if component.is_empty() || matches!(component.as_str(), "." | "..") {
-            return Err(IntakeError::InvalidPath);
-        }
-        normalized.push(component);
-    }
-    Ok(normalized.join("/"))
+    Ok(distill_core::path::normalize_path(value)?)
 }
 
 fn normalize_glob(value: &str) -> Result<String, IntakeError> {

@@ -6,16 +6,17 @@ use std::time::Duration;
 
 use distill_build::query::AssetQuery as BuildAssetQuery;
 use distill_build::trace::PackDefinitionControlValue;
-use distill_bundle::PathComponent;
+use ngp_schema::PathComponent;
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
-use distill_pack::builder::{
+use distill_pack_build::builder::{
     build_pack, build_publish_and_activate_pack, decode_pack_definition, PackBuildError,
     PackBuildOutput, PackBuildTarget,
 };
 use distill_pack::{
-    activate, archive_filename, manifest_filename, manifest_hash, publish_archive,
-    publish_manifest, read_current, PackTarget, PackfileIO, RuntimeTarget,
+    archive_filename, manifest_filename, manifest_hash, read_current, PackTarget, PackfileIO,
+    RuntimeTarget,
 };
+use distill_pack_build::{activate, publish_archive, publish_manifest};
 use distill_rpc::capnp_loader::{RemoteHub, RemoteSnapshot};
 use distill_rpc::capnp_transport::{CapnpClient, StagedListener};
 use distill_rpc::{

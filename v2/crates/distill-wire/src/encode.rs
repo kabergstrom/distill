@@ -1,7 +1,7 @@
 //! Schema-directed typed values (`ngp_schema::Value`) to canonical wire
 //! sections (§12).
 
-use distill_bundle::{encode_path, PathComponent};
+use ngp_schema::{encode_path, PathComponent};
 use distill_core::frames::{reenter, resolve_backref};
 use distill_core::id::{AssetUuid, TypeUuid};
 use ngp_schema::node::{PrimitiveKind, SchemaNode};

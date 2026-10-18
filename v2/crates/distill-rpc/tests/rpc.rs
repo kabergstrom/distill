@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -763,23 +763,6 @@ fn snapshot(hub: &Hub) -> Snapshot {
     }
 }
 
-/// Offer `commit` to the server as the next version: what its commit
-/// validation makes of it. A rejected commit publishes nothing.
-fn offer(server: &Server, commit: Commit) -> Result<SnapshotStamp, AdminError> {
-    let before = server.current_stamp().unwrap();
-    let offered = coordinated(server, |handle, store| {
-        handle.coordinated_commit(store, before.version, |_| Ok(commit))
-    });
-    match offered {
-        Ok(stamp) => Ok(stamp),
-        Err(CoordinatedCommitError::Invalid(error)) => {
-            assert_eq!(server.current_stamp().unwrap(), before);
-            Err(error)
-        }
-        Err(other) => panic!("expected a validated commit, got {other:?}"),
-    }
-}
-
 /// The daemon publishes `failure` as a rejected pipeline candidate.
 fn reject_pipeline(project: &TestProject, failure: PipelineFailure) -> SnapshotStamp {
     let mut writer = project.coordinator().open_writer().unwrap();
@@ -983,6 +966,12 @@ fn record(fields: Vec<(&str, SchemaNode)>) -> SchemaNode {
     }
 }
 
+/// What a write of `entry` meets at intake: its value decoded against its
+/// schema (`decode_authoring_payload`).
+fn decode_entry(entry: &AuthoringEntry) -> Result<(), AuthoringValueError> {
+    decode_authoring_payload(entry.schema_hash, &entry.logical_schema, &entry.value).map(drop)
+}
+
 fn decode_plain(root: SchemaNode, canonical: &str) -> Result<Value, AuthoringValueError> {
     let schema = LogicalSchema { root };
     decode_authoring_payload(
@@ -1113,17 +1102,8 @@ fn authoring_commit_authenticates_schema_and_exact_blob_index_coverage() {
     let mut malformed = valid.clone();
     malformed.value.canonical_value = Arc::from(&b"0"[..]);
     assert!(matches!(
-        offer(
-            &server,
-            Commit {
-                authoring: vec![AuthoringMutation::Set(malformed)],
-                ..Commit::default()
-            }
-        ),
-        Err(AdminError::InvalidAuthoringValue {
-            error: AuthoringValueError::SchemaValueShape { .. },
-            ..
-        })
+        decode_entry(&malformed),
+        Err(AuthoringValueError::SchemaValueShape { .. })
     ));
 
     let mut duplicate = valid.clone();
@@ -1136,40 +1116,20 @@ fn authoring_commit_authenticates_schema_and_exact_blob_index_coverage() {
     duplicate.value.canonical_value =
         Arc::from(&b"[{\"len\":1,\"offset\":0},{\"len\":1,\"offset\":0}]"[..]);
     assert!(matches!(
-        offer(
-            &server,
-            Commit {
-                authoring: vec![AuthoringMutation::Set(duplicate)],
-                ..Commit::default()
-            }
-        ),
-        Err(AdminError::InvalidAuthoringValue {
-            error: AuthoringValueError::DuplicateBlobIndex { index: 0 },
-            ..
-        })
+        decode_entry(&duplicate),
+        Err(AuthoringValueError::DuplicateBlobIndex { index: 0 })
     ));
 
     let mut tampered_schema = valid;
     tampered_schema.schema_hash = LogicalHash([0; 16]);
     assert!(matches!(
-        offer(
-            &server,
-            Commit {
-                authoring: vec![AuthoringMutation::Set(tampered_schema)],
-                ..Commit::default()
-            }
-        ),
-        Err(AdminError::InvalidAuthoringValue {
-            error: AuthoringValueError::LogicalSchemaInvalid(_),
-            ..
-        })
+        decode_entry(&tampered_schema),
+        Err(AuthoringValueError::LogicalSchemaInvalid(_))
     ));
 }
 
 #[test]
 fn authoring_schema_walk_type_checks_primitive_and_reference_leaves() {
-    let project = project();
-    let server = project.server();
     let mut entry = authoring_entry(1, AuthoringEntryRole::Runtime);
     let primitive = SchemaNode::Primitive(PrimitiveKind::U8);
     entry.schema_hash = node_hash(&primitive).unwrap();
@@ -1181,17 +1141,8 @@ fn authoring_schema_walk_type_checks_primitive_and_reference_leaves() {
     entry.value.canonical_value = Arc::from(&b"{\"len\":1,\"offset\":0}"[..]);
     entry.value.blobs.clear();
     assert!(matches!(
-        offer(
-            &server,
-            Commit {
-                authoring: vec![AuthoringMutation::Set(entry.clone())],
-                ..Commit::default()
-            }
-        ),
-        Err(AdminError::InvalidAuthoringValue {
-            error: AuthoringValueError::SchemaValueShape { .. },
-            ..
-        })
+        decode_entry(&entry.clone()),
+        Err(AuthoringValueError::SchemaValueShape { .. })
     ));
 
     let reference = SchemaNode::AssetRef(type_id(1));
@@ -1203,17 +1154,8 @@ fn authoring_schema_walk_type_checks_primitive_and_reference_leaves() {
     );
     entry.value.canonical_value = Arc::from(&b"{\"len\":1,\"offset\":0}"[..]);
     assert!(matches!(
-        offer(
-            &server,
-            Commit {
-                authoring: vec![AuthoringMutation::Set(entry)],
-                ..Commit::default()
-            }
-        ),
-        Err(AdminError::InvalidAuthoringValue {
-            error: AuthoringValueError::SchemaValueShape { .. },
-            ..
-        })
+        decode_entry(&entry),
+        Err(AuthoringValueError::SchemaValueShape { .. })
     ));
 }
 
@@ -2919,111 +2861,6 @@ fn expired_and_foreign_snapshots_fail_without_serving_data() {
         first.refresh(),
         RpcResult::Failure(RpcFailure::SnapshotExpired)
     ));
-}
-
-#[test]
-fn commit_validation_is_atomic_for_duplicate_names_and_invalid_paths() {
-    let project = project();
-    let server = project.server();
-    let before = server.current_stamp().unwrap();
-    let deleted = AssetMutation {
-        uuid: asset_id(1),
-        delta: AssetDeltaState::Deleted,
-    };
-    assert!(matches!(
-        offer(
-            &server,
-            Commit {
-                assets: vec![deleted.clone(), deleted],
-                ..Commit::default()
-            }
-        ),
-        Err(AdminError::DuplicateAssetMutation { .. })
-    ));
-    assert!(matches!(
-        offer(
-            &server,
-            Commit {
-                paths: vec![PathMutation::Remove {
-                    path: "../escape".to_owned(),
-                }],
-                ..Commit::default()
-            }
-        ),
-        Err(AdminError::InvalidPath { .. })
-    ));
-    assert!(matches!(
-        offer(
-            &server,
-            Commit {
-                paths: vec![PathMutation::Remove {
-                    path: "cafe\u{301}.asset".to_owned(),
-                }],
-                ..Commit::default()
-            }
-        ),
-        Err(AdminError::InvalidPath { .. })
-    ));
-    assert!(matches!(
-        offer(
-            &server,
-            Commit {
-                paths: vec![PathMutation::Remove {
-                    path: "nul\0.asset".to_owned(),
-                }],
-                ..Commit::default()
-            }
-        ),
-        Err(AdminError::InvalidPath { .. })
-    ));
-    assert_eq!(
-        offer(
-            &server,
-            Commit {
-                paths: vec![PathMutation::Set {
-                    path: "empty.asset".to_owned(),
-                    candidates: BTreeSet::new(),
-                }],
-                ..Commit::default()
-            }
-        ),
-        Err(AdminError::EmptyPathCandidates {
-            path: "empty.asset".to_owned()
-        })
-    );
-    assert_eq!(server.current_stamp().unwrap(), before);
-}
-
-#[test]
-fn authoring_identity_validation_rejects_reserved_local_ids_and_noncanonical_tags_atomically() {
-    let project = project();
-    let server = project.server();
-    let before = server.current_stamp().unwrap();
-    let mut reserved = authoring_entry(1, AuthoringEntryRole::Runtime);
-    reserved.local_id = "$generated".to_owned();
-    assert!(matches!(
-        offer(
-            &server,
-            Commit {
-                authoring: vec![AuthoringMutation::Set(reserved)],
-                ..Commit::default()
-            }
-        ),
-        Err(AdminError::InvalidAuthoringIdentity { .. })
-    ));
-    let mut bad_tag = authoring_entry(1, AuthoringEntryRole::Runtime);
-    bad_tag.tags = std::collections::BTreeMap::from([("bad\0tag".to_owned(), None)]);
-    assert!(matches!(
-        offer(
-            &server,
-            Commit {
-                authoring: vec![AuthoringMutation::Set(bad_tag)],
-                ..Commit::default()
-            }
-        ),
-        Err(AdminError::InvalidAuthoringIdentity { .. })
-    ));
-    assert_eq!(server.current_stamp().unwrap(), before);
 }
 
 #[test]

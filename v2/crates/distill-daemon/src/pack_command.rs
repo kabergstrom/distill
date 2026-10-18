@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use distill_core::bootstrap::{bootstrap_control_logical_registry_v1, PACK_DEFINITION_TYPE_UUID};
 use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
-use distill_pack::builder::{
+use distill_pack_build::builder::{
     build_publish_and_activate_pack, decode_pack_definition, encoder_identity, PackBuildError,
     PackBuildOutput, PackBuildTarget,
 };

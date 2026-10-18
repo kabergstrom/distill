@@ -119,10 +119,10 @@ pub fn canonicalize(mut manifest: PackManifest) -> Result<PackManifest, Manifest
     sort_unique(&mut manifest.wire_trees, |v| v.layout_hash)?;
     if let Some(paths) = &mut manifest.paths {
         for row in paths.iter_mut() {
-            row.path = distill_build::query::normalize_path(&row.path)
+            row.path = distill_core::path::normalize_path(&row.path)
                 .map_err(|_| ManifestError::BadPath)?;
             if let Some(name) = &mut row.name {
-                *name = distill_build::query::normalize_identifier(name)
+                *name = distill_core::path::normalize_identifier(name)
                     .map_err(|_| ManifestError::BadPath)?;
             }
         }
@@ -442,7 +442,7 @@ fn decode_paths(bytes: &[u8]) -> Result<Vec<PathRow>, ManifestError> {
     for _ in 0..count {
         let path = r.string()?;
         let normalized =
-            distill_build::query::normalize_path(&path).map_err(|_| ManifestError::BadPath)?;
+            distill_core::path::normalize_path(&path).map_err(|_| ManifestError::BadPath)?;
         if normalized != path {
             return Err(ManifestError::BadPath);
         }
@@ -450,7 +450,7 @@ fn decode_paths(bytes: &[u8]) -> Result<Vec<PathRow>, ManifestError> {
         let name = if name.is_empty() {
             None
         } else {
-            let normalized = distill_build::query::normalize_identifier(&name)
+            let normalized = distill_core::path::normalize_identifier(&name)
                 .map_err(|_| ManifestError::BadPath)?;
             if normalized != name {
                 return Err(ManifestError::BadPath);

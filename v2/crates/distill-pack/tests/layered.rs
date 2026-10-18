@@ -19,8 +19,8 @@ use distill_pack::manifest::{
     PackManifest, PackTarget, PathRow, WireTreeRow,
 };
 use distill_pack::{PackfileIO, RuntimeTarget as PackTarget_};
-use distill_rpc::ServedLoadEdge;
-use distill_store::state::{InputVersion, SnapshotStamp, StoreInstanceId};
+use distill_protocol::ServedLoadEdge;
+use distill_protocol::state::{InputVersion, SnapshotStamp, StoreInstanceId};
 use distill_wire::artifact::{content_hash, parse_artifact, write_artifact, ArtifactHeader};
 use distill_wire::dswl::{dswl_bytes, dswl_hash};
 use distill_wire::native::CallbackPanic;
@@ -470,7 +470,7 @@ fn a_daemon_layer_that_never_connects_leaves_the_lower_layers_loading() {
         .unwrap();
     let daemon = RpcIo::connect_in_background(
         address,
-        distill_rpc::ConnectRequest::new("dev", distill_rpc::TargetDefinitionHash(GAME)),
+        distill_protocol::ConnectRequest::new("dev", distill_protocol::TargetDefinitionHash(GAME)),
     )
     .unwrap();
     let mut loader = loader(vec![

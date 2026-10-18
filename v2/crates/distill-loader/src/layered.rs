@@ -36,7 +36,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
 use distill_core::id::{AssetUuid, ContentHash};
-use distill_store::state::{InputVersion, SnapshotStamp, StoreInstanceId};
+use distill_protocol::state::{InputVersion, SnapshotStamp, StoreInstanceId};
 
 use crate::basis::IoBasis;
 use crate::io::{

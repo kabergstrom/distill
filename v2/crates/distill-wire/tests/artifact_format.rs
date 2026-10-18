@@ -1,7 +1,7 @@
 //! The artifact image (§12): pinned layout, canonical writer,
 //! strict reader — negatives for every validation rule.
 
-use distill_bundle::PathComponent;
+use ngp_schema::PathComponent;
 use distill_core::id::{AssetUuid, LayoutHash, LogicalHash, TypeUuid};
 use distill_wire::artifact::{
     artifact_header_layout_hash, assemble_artifact, canonical_blob_order, content_hash,

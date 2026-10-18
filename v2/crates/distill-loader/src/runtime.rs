@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use distill_core::id::{AssetUuid, ContentHash};
-use distill_store::state::SnapshotStamp;
+use distill_protocol::state::SnapshotStamp;
 
 use crate::basis::IoBasis;
 use crate::io::{AssetDeltaState, ReqId};

@@ -1184,18 +1184,20 @@ impl TryFrom<u32> for NamespaceErrorCode {
     }
 }
 
-pub(crate) struct NamespaceErrorDecoder<'a> {
+/// The store reads its claim rows' namespace errors with it (`distill-store` `claims.rs`).
+#[doc(hidden)]
+pub struct NamespaceErrorDecoder<'a> {
     bytes: &'a [u8],
     cursor: usize,
 }
 
 impl<'a> NamespaceErrorDecoder<'a> {
-    pub(crate) fn new(bytes: &'a [u8]) -> Self {
+    pub fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, cursor: 0 }
     }
 
     /// Fails unless every byte was consumed.
-    pub(crate) fn finish(&self) -> Result<(), NamespaceErrorDecodeError> {
+    pub fn finish(&self) -> Result<(), NamespaceErrorDecodeError> {
         if self.cursor == self.bytes.len() {
             Ok(())
         } else {
@@ -1224,18 +1226,18 @@ impl<'a> NamespaceErrorDecoder<'a> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
 
-    pub(crate) fn array<const N: usize>(&mut self) -> Result<[u8; N], NamespaceErrorDecodeError> {
+    pub fn array<const N: usize>(&mut self) -> Result<[u8; N], NamespaceErrorDecodeError> {
         Ok(self.take(N)?.try_into().unwrap())
     }
 
-    pub(crate) fn string(&mut self) -> Result<String, NamespaceErrorDecodeError> {
+    pub fn string(&mut self) -> Result<String, NamespaceErrorDecodeError> {
         let len = usize::try_from(self.u32()?).map_err(|_| NamespaceErrorDecodeError::Truncated)?;
         std::str::from_utf8(self.take(len)?)
             .map(str::to_owned)
             .map_err(|_| NamespaceErrorDecodeError::InvalidUtf8)
     }
 
-    pub(crate) fn source(&mut self) -> Result<ReadableBundleSource, NamespaceErrorDecodeError> {
+    pub fn source(&mut self) -> Result<ReadableBundleSource, NamespaceErrorDecodeError> {
         Ok(ReadableBundleSource {
             root_name: self.string()?,
             normalized_path: self.string()?,
@@ -1261,7 +1263,7 @@ impl<'a> NamespaceErrorDecoder<'a> {
         (0..count).map(|_| self.claimant()).collect()
     }
 
-    pub(crate) fn claimant(&mut self) -> Result<AssetClaimant, NamespaceErrorDecodeError> {
+    pub fn claimant(&mut self) -> Result<AssetClaimant, NamespaceErrorDecodeError> {
         match self.u32()? {
             1 => Ok(AssetClaimant::Authored {
                 source: self.source()?,
@@ -1465,7 +1467,7 @@ fn encode_namespace_error_detail(encoder: &mut Encoder, detail: &NamespaceErrorV
     }
 }
 
-pub(crate) fn encode_asset_claimant(encoder: &mut Encoder, claimant: &AssetClaimant) {
+pub fn encode_asset_claimant(encoder: &mut Encoder, claimant: &AssetClaimant) {
     match claimant {
         AssetClaimant::Authored {
             source,
@@ -1511,7 +1513,7 @@ fn encode_bundle_sources(encoder: &mut Encoder, sources: &[ReadableBundleSource]
     encoder.seq(sources, encode_bundle_source);
 }
 
-pub(crate) fn encode_bundle_source(encoder: &mut Encoder, source: &ReadableBundleSource) {
+pub fn encode_bundle_source(encoder: &mut Encoder, source: &ReadableBundleSource) {
     encoder.str(&source.root_name);
     encoder.str(&source.normalized_path);
     encoder.raw(&source.file_hash.0);

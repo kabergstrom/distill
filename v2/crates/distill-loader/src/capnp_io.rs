@@ -92,15 +92,15 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
-use distill_build::trace::EntryRole;
+use distill_core::id::EntryRole;
 use distill_core::id::{AssetUuid, ContentHash, TypeUuid};
-use distill_rpc::capnp_loader::{RemoteCall, RemoteHub, RemoteSnapshot, RemoteSubscription};
-use distill_rpc::capnp_transport::{CapnpClient, RemoteConnectOutcome, RemoteError};
-use distill_rpc::{
+use distill_client::capnp_loader::{RemoteCall, RemoteHub, RemoteSnapshot, RemoteSubscription};
+use distill_client::capnp_transport::{CapnpClient, RemoteConnectOutcome, RemoteError};
+use distill_client::{
     AssetEvent, ConnectRequest, DescribableTypesResult, DescribeTypeResult, DriftedInput as RpcDriftedInput,
     ImportFailure, RpcFailure, StreamEvent, TypeDescription,
 };
-use distill_store::state::{InputVersion, SnapshotStamp};
+use distill_protocol::state::{InputVersion, SnapshotStamp};
 use tokio::task::{AbortHandle, LocalSet};
 
 use crate::admission::{FetchAdmission, Reservation};
@@ -1597,17 +1597,17 @@ async fn resolve_event(
             req,
             uuid,
             result: match terminal.value {
-                distill_rpc::ResolveResult::Built { content_hash } => {
+                distill_client::ResolveResult::Built { content_hash } => {
                     ResolveResult::Built { content_hash }
                 }
-                distill_rpc::ResolveResult::Drifted { input, current } => ResolveResult::Drifted {
+                distill_client::ResolveResult::Drifted { input, current } => ResolveResult::Drifted {
                     input: drifted_input(input),
                     current,
                 },
-                distill_rpc::ResolveResult::Failed { error } => ResolveResult::Failed { error },
-                distill_rpc::ResolveResult::Missing => ResolveResult::Missing,
-                distill_rpc::ResolveResult::Deleted { at } => ResolveResult::Deleted { at },
-                distill_rpc::ResolveResult::RoleIneligible { observed } => {
+                distill_client::ResolveResult::Failed { error } => ResolveResult::Failed { error },
+                distill_client::ResolveResult::Missing => ResolveResult::Missing,
+                distill_client::ResolveResult::Deleted { at } => ResolveResult::Deleted { at },
+                distill_client::ResolveResult::RoleIneligible { observed } => {
                     ResolveResult::RoleIneligible {
                         uuid,
                         role: entry_role(observed),
@@ -1636,9 +1636,9 @@ async fn path_event(
             req,
             path,
             result: match terminal.value {
-                distill_rpc::PathResolveResult::Resolved(uuid) => PathResolveResult::Resolved(uuid),
-                distill_rpc::PathResolveResult::Missing => PathResolveResult::Missing,
-                distill_rpc::PathResolveResult::Failed(error) => PathResolveResult::Failed {
+                distill_client::PathResolveResult::Resolved(uuid) => PathResolveResult::Resolved(uuid),
+                distill_client::PathResolveResult::Missing => PathResolveResult::Missing,
+                distill_client::PathResolveResult::Failed(error) => PathResolveResult::Failed {
                     error: format!("{error:?}"),
                 },
             },
@@ -1735,7 +1735,7 @@ const SECTION_ALIGN: usize = 16;
 /// then blob 0, 1, ... in order, each section's chunks contiguous.
 async fn collect_remote_chunks(
     shared: &Shared,
-    stream: &mut distill_rpc::capnp_loader::RemoteChunkStream,
+    stream: &mut distill_client::capnp_loader::RemoteChunkStream,
     total_bytes: usize,
     timing: &mut crate::stats::FetchTiming,
 ) -> Result<RemotePayload, String> {
@@ -1749,8 +1749,8 @@ async fn collect_remote_chunks(
         match stream.next_chunk().await {
             Ok(Some(chunk)) => {
                 let section = match chunk.kind {
-                    distill_rpc::ArtifactChunkKind::Structural => 0usize,
-                    distill_rpc::ArtifactChunkKind::Blob { index } => index as usize + 1,
+                    distill_client::ArtifactChunkKind::Structural => 0usize,
+                    distill_client::ArtifactChunkKind::Blob { index } => index as usize + 1,
                 };
                 if sections.is_empty() && section == 1 {
                     sections.push(0..0); // no structural chunk: an empty section
@@ -1901,7 +1901,7 @@ fn init_remote_failure<T: std::fmt::Debug>(call: RemoteCall<T>) -> RpcIoInitErro
 fn connect_request(target: &str, binding: &RuntimeTarget) -> ConnectRequest {
     ConnectRequest::new(
         target,
-        distill_rpc::TargetDefinitionHash(binding.target_definition_hash),
+        distill_client::TargetDefinitionHash(binding.target_definition_hash),
     )
 }
 
@@ -1910,20 +1910,20 @@ fn connect_request(target: &str, binding: &RuntimeTarget) -> ConnectRequest {
 /// loader's are the assets and paths it subscribed.
 fn stream_events(event: StreamEvent, subscriptions: &Subscriptions) -> (Vec<IoEvent>, Vec<IndexChange>) {
     let mut changes = Vec::new();
-    let mut delta = |delta: distill_rpc::Delta| {
+    let mut delta = |delta: distill_client::Delta| {
         if subscriptions.index {
             changes.push(IndexChange {
                 version: delta.basis.snapshot.version,
                 entries: delta
                     .assets
                     .iter()
-                    .map(|(asset, state)| (*asset, *state == distill_rpc::AssetDeltaState::Deleted))
+                    .map(|(asset, state)| (*asset, *state == distill_client::AssetDeltaState::Deleted))
                     .collect(),
                 files: delta
                     .files
                     .iter()
                     .map(|file| {
-                        let deleted = file.state == distill_rpc::AssetDeltaState::Deleted;
+                        let deleted = file.state == distill_client::AssetDeltaState::Deleted;
                         (file.root.clone(), file.path.clone(), deleted)
                     })
                     .collect(),
@@ -1978,23 +1978,23 @@ fn stream_events(event: StreamEvent, subscriptions: &Subscriptions) -> (Vec<IoEv
     (events, changes)
 }
 
-fn reconnect_reason(reason: distill_rpc::ReconnectReason) -> ReconnectReason {
+fn reconnect_reason(reason: distill_client::ReconnectReason) -> ReconnectReason {
     match reason {
-        distill_rpc::ReconnectReason::PipelineEpochChanged => ReconnectReason::PipelineEpochChanged,
+        distill_client::ReconnectReason::PipelineEpochChanged => ReconnectReason::PipelineEpochChanged,
     }
 }
 
-fn delta_state(state: distill_rpc::AssetDeltaState) -> AssetDeltaState {
+fn delta_state(state: distill_client::AssetDeltaState) -> AssetDeltaState {
     match state {
-        distill_rpc::AssetDeltaState::Changed => AssetDeltaState::Changed,
-        distill_rpc::AssetDeltaState::Deleted => AssetDeltaState::Deleted,
+        distill_client::AssetDeltaState::Changed => AssetDeltaState::Changed,
+        distill_client::AssetDeltaState::Deleted => AssetDeltaState::Deleted,
     }
 }
 
-fn entry_role(role: distill_rpc::AuthoringEntryRole) -> EntryRole {
+fn entry_role(role: distill_client::AuthoringEntryRole) -> EntryRole {
     match role {
-        distill_rpc::AuthoringEntryRole::Runtime => EntryRole::Runtime,
-        distill_rpc::AuthoringEntryRole::AuthoringOnly => EntryRole::AuthoringOnly,
+        distill_client::AuthoringEntryRole::Runtime => EntryRole::Runtime,
+        distill_client::AuthoringEntryRole::AuthoringOnly => EntryRole::AuthoringOnly,
     }
 }
 

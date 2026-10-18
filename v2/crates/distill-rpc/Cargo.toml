@@ -8,6 +8,8 @@ license.workspace = true
 tracing.workspace = true
 capnp = "0.26.2"
 capnp-rpc = "0.26.1"
+distill-client = { path = "../distill-client" }
+distill-protocol = { path = "../distill-protocol" }
 distill-core = { path = "../distill-core" }
 distill-bundle = { path = "../distill-bundle" }
 distill-schema = { path = "../distill-schema" }
@@ -17,9 +19,6 @@ futures = "0.3"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 unicode-normalization.workspace = true
-
-[build-dependencies]
-capnpc = "0.26.0"
 
 [features]
 # Test instruments and setup drivers: `Server::install_snapshot_policy`,

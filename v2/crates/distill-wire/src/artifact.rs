@@ -27,9 +27,9 @@
 //!
 //! Total size must match the header exactly; all arithmetic is checked;
 //! padding must be zero. Blob-table entry order is the canonical structural
-//! path key (§6): entries sorted by `distill_bundle::encode_path` bytes.
+//! path key (§6): entries sorted by `ngp_schema::encode_path` bytes.
 
-use distill_bundle::{encode_path, PathComponent};
+use ngp_schema::{encode_path, PathComponent};
 use distill_core::hash::Domain;
 use distill_core::header::{read_header, write_header, HeaderError, HEADER_LEN};
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};

@@ -1,5 +1,5 @@
 use distill_loader::{IoBasis, ManifestHash};
-use distill_store::state::{InputVersion, SnapshotStamp, StoreInstanceId};
+use distill_protocol::state::{InputVersion, SnapshotStamp, StoreInstanceId};
 
 #[test]
 fn rpc_basis_is_exactly_the_snapshot_stamp() {

@@ -1,0 +1,11 @@
+[package]
+name = "distill-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+distill-core = { path = "../distill-core" }
+ngp-schema = { path = "../../../../newgameplus/ngp-schema" }
+getrandom = "0.2"
+unicode-normalization.workspace = true
