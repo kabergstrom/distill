@@ -141,11 +141,18 @@ pub enum Domain {
     /// A per-type schema file of a type-description tree (GAP 23 §6): the
     /// type's value projection and its renamed fields, or a redirect.
     TypeSchema = 37,
+    /// A save slot file (newgameplus GAP 29 §5): sequence, parent version,
+    /// origin, root type, the root's value projection and the value; its
+    /// digest is the file's version.
+    SaveFile = 38,
+    /// A shipped save schema file (newgameplus GAP 29 §9): a slot root
+    /// type's value projection as a save file embeds it.
+    SaveSchema = 39,
 }
 
 impl Domain {
     /// Every domain, in discriminant order.
-    pub const ALL: [Domain; 37] = [
+    pub const ALL: [Domain; 39] = [
         Domain::Schema,
         Domain::Layout,
         Domain::ModuleInterface,
@@ -183,6 +190,8 @@ impl Domain {
         Domain::TypeDescription,
         Domain::TypeIndex,
         Domain::TypeSchema,
+        Domain::SaveFile,
+        Domain::SaveSchema,
     ];
 
     pub fn from_u32(value: u32) -> Option<Domain> {

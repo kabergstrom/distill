@@ -998,6 +998,7 @@ is a spec defect, since that is how two meanings come to share bytes:
 | `TypeDefault` (33) | file format only: a newgameplus type-default file (`defaults/<path>.bin`, GAP 23 §6.1) |
 | `InputRecording` (34) | file format only: a newgameplus raw input recording (`record-input`, GAP 23 §18.4) |
 | `TypeDescription`, `TypeIndex`, `TypeSchema` (35–37) | file formats only: a newgameplus type-description tree's `descriptions/<path>.bin`, `type-index.bin` and `schemas/<path>.bin` (GAP 23 §6) |
+| `SaveFile`, `SaveSchema` (38–39) | file formats only: a newgameplus save slot file (`<slot>.a`, `.b`, `.prev`) and a shipped save schema (`saves/shipped/<type path>/<hash>.bin`, GAP 29 §5, §9); a save file's version is its body's `SaveFile` digest |
 
 **Shared file header** (`distill_core::header`, `HEADER_LEN` = 12): every
 standalone binary file starts with the 4 magic bytes `NGPF`, the `u32`
