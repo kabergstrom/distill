@@ -152,11 +152,14 @@ pub enum Domain {
     /// each module edge by its from- and to-types and their value
     /// projections' hashes.
     SaveEdges = 40,
+    /// A world snapshot slot file (newgameplus GAP 32 §5): a save slot file
+    /// (as [`Domain::SaveFile`]) whose value is the engine's snapshot body.
+    WorldSave = 41,
 }
 
 impl Domain {
     /// Every domain, in discriminant order.
-    pub const ALL: [Domain; 40] = [
+    pub const ALL: [Domain; 41] = [
         Domain::Schema,
         Domain::Layout,
         Domain::ModuleInterface,
@@ -197,6 +200,7 @@ impl Domain {
         Domain::SaveFile,
         Domain::SaveSchema,
         Domain::SaveEdges,
+        Domain::WorldSave,
     ];
 
     pub fn from_u32(value: u32) -> Option<Domain> {

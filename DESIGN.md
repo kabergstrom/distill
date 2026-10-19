@@ -1000,6 +1000,7 @@ is a spec defect, since that is how two meanings come to share bytes:
 | `TypeDescription`, `TypeIndex`, `TypeSchema` (35–37) | file formats only: a newgameplus type-description tree's `descriptions/<path>.bin`, `type-index.bin` and `schemas/<path>.bin` (GAP 23 §6) |
 | `SaveFile`, `SaveSchema` (38–39) | file formats only: a newgameplus save slot file (`<slot>.a`, `.b`, `.prev`) and a shipped save schema (`saves/shipped/<type path>/<hash>.bin`, GAP 29 §5, §9); a save file's version is its body's `SaveFile` digest |
 | `SaveEdges` (40) | file format only: the edge list of a newgameplus type-description tree (`save-edges.bin`, GAP 29 §8), which the daemon's lossless-write check reads |
+| `WorldSave` (41) | file format only: a newgameplus world snapshot slot file (GAP 32 §5): a save slot file whose value is the snapshot body |
 
 **Shared file header** (`distill_core::header`, `HEADER_LEN` = 12): every
 standalone binary file starts with the 4 magic bytes `NGPF`, the `u32`
