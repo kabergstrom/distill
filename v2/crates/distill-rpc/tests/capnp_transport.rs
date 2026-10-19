@@ -2417,7 +2417,17 @@ async fn type_descriptions_round_trip_over_tcp() {
             project.write_in(
                 "types",
                 &prefab_types::description_file("game::Spinner"),
-                r#"{"members":{"$.rate":{"doc":"Degrees per second.","editor":{"unit":"deg/s","position":true}}}}"#,
+                prefab_types::write_description(&prefab_types::Description {
+                    members: [(
+                        "$.rate".to_owned(),
+                        distill_schema::ngp_schema::describe::Member {
+                            doc: Some("Degrees per second.".into()),
+                            editor: EditorHints { unit: Some("deg/s".into()), position: true, ..EditorHints::default() },
+                            ..Default::default()
+                        },
+                    )]
+                    .into(),
+                }),
             );
             let type_uuid = schema.types[spinner.0].stable_type_uuid();
             let projected = distill_schema::ngp_schema::project_values(&schema, spinner).unwrap().0;
