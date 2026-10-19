@@ -141,11 +141,14 @@ pub enum Domain {
     /// A per-type schema file of a type-description tree (GAP 23 §6): the
     /// type's value projection and its renamed fields, or a redirect.
     TypeSchema = 37,
+    /// A kernel's access file of a type-description tree (newgameplus GAP
+    /// 31 §5): its domain and the fields its `run` reads and writes.
+    KernelAccess = 38,
 }
 
 impl Domain {
     /// Every domain, in discriminant order.
-    pub const ALL: [Domain; 37] = [
+    pub const ALL: [Domain; 38] = [
         Domain::Schema,
         Domain::Layout,
         Domain::ModuleInterface,
@@ -183,6 +186,7 @@ impl Domain {
         Domain::TypeDescription,
         Domain::TypeIndex,
         Domain::TypeSchema,
+        Domain::KernelAccess,
     ];
 
     pub fn from_u32(value: u32) -> Option<Domain> {
