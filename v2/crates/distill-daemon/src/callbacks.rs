@@ -196,6 +196,14 @@ impl PipelineProcessContext for ContainedProcessContext<'_> {
         catch_unwind(AssertUnwindSafe(|| self.inner.query(query))).unwrap_or_else(|_| self.failed())
     }
 
+    fn read_type_file(&mut self, path: &str) -> Result<Option<Vec<u8>>, ProcessContextError> {
+        if self.panicked.get() {
+            return self.failed();
+        }
+        catch_unwind(AssertUnwindSafe(|| self.inner.read_type_file(path)))
+            .unwrap_or_else(|_| self.failed())
+    }
+
     fn target(&self) -> Result<&Target, ProcessContextError> {
         if self.panicked.get() {
             return self.failed();

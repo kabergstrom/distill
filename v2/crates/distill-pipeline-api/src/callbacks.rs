@@ -386,6 +386,16 @@ pub trait PipelineProcessContext {
         Err(ProcessContextError::Unavailable("query"))
     }
 
+    /// The bytes of the type file at `path` (`ngp_schema::prefab_types`;
+    /// relative to the root holding the marker file, e.g.
+    /// `kernels/game::Heat.bin`) at the build's snapshot; `None` when no
+    /// root holds the marker or the root has no file there. Observes the
+    /// file's content: a change reruns the processor, a rewrite with the
+    /// same bytes does not. Two roots holding the marker fail the read.
+    fn read_type_file(&mut self, _path: &str) -> Result<Option<Vec<u8>>, ProcessContextError> {
+        Err(ProcessContextError::Unavailable("read_type_file"))
+    }
+
     fn target(&self) -> Result<&Target, ProcessContextError> {
         Err(ProcessContextError::Unavailable("target"))
     }

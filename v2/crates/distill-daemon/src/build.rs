@@ -1319,6 +1319,51 @@ impl PipelineProcessContext for BuildProcessContext<'_, '_> {
         }
     }
 
+    fn read_type_file(&mut self, path: &str) -> Result<Option<Vec<u8>>, ProcessContextError> {
+        self.ensure_active()?;
+        let path = match normalize_path(path) {
+            Ok(path) => path,
+            Err(detail) => {
+                let callback_error = ProcessContextError::InvalidQuery(detail.clone());
+                return Err(self.abort(BuildError::Failed(detail.to_string()), callback_error));
+            }
+        };
+        let observed = self.ask(|source| source.type_file_at(&path))?;
+        self.trace.push(TraceOp::TypeFile {
+            path: path.clone(),
+            observed: match &observed {
+                Observed::Ok(file) => Observed::Ok(file.as_ref().map(|(_, hash)| *hash)),
+                Observed::Err(failure) => Observed::Err(failure.clone()),
+            },
+        });
+        let (root, hash) = match observed {
+            Observed::Ok(Some(file)) => file,
+            Observed::Ok(None) => return Ok(None),
+            Observed::Err(failure) => {
+                let detail = format!(
+                    "type file {path}: more than one root holds {}",
+                    distill_schema::ngp_schema::prefab_types::MARKER
+                );
+                return Err(self.abort(BuildError::Failed(detail), ProcessContextError::Observed(failure)));
+            }
+        };
+        // The bytes the snapshot observed; a file since changed on disk is
+        // a newer version's input.
+        let scanner = &self.context.scanner;
+        let bytes = scanner
+            .physical_path(&root, &path)
+            .ok()
+            .and_then(|physical| scanner.read_identity_checked(&physical).ok())
+            .filter(|bytes| ContentHash(distill_core::hash::hash(bytes)) == hash);
+        match bytes {
+            Some(bytes) => Ok(Some(bytes)),
+            None => {
+                let error = BuildError::Drifted(DriftedInput::File(path.clone()));
+                Err(self.abort(error, ProcessContextError::Failed(format!("type file {path} drifted"))))
+            }
+        }
+    }
+
     fn input_asset(&self) -> Result<AssetUuid, ProcessContextError> {
         self.ensure_active()?;
         Ok(self.input)
@@ -5122,6 +5167,19 @@ mod tests {
     fn identity_fixture(
         temp: &tempfile::TempDir,
     ) -> (Arc<DaemonCoordinator>, BuildRequest, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (coordinator, request) =
+            processor_fixture(temp, Vec::new(), PrimaryCountingProcessor(Arc::clone(&calls)));
+        (coordinator, request, calls)
+    }
+
+    /// A coordinator serving one byte asset from root `main` (beside
+    /// `roots`) through `processor`, and the request for its terminal.
+    fn processor_fixture(
+        temp: &tempfile::TempDir,
+        roots: Vec<AssetRoot>,
+        processor: impl PipelineProcessor,
+    ) -> (Arc<DaemonCoordinator>, BuildRequest) {
         let assets = temp.path().join("assets");
         std::fs::create_dir_all(&assets).unwrap();
         let authority = Arc::new(authority());
@@ -5162,7 +5220,7 @@ mod tests {
         let coordinator = Arc::new(
             DaemonCoordinator::open(
                 StoreConfig::new(temp.path().join("state")),
-                vec![AssetRoot::new("main", &assets)],
+                std::iter::once(AssetRoot::new("main", &assets)).chain(roots).collect(),
                 vec![rpc_target(target_hash)],
                 64,
             )
@@ -5172,7 +5230,6 @@ mod tests {
         coordinator.reconcile_full_scan(&mut writer).unwrap();
         coordinator.install_schema_authority_for_test(Arc::clone(&authority));
         coordinator.install_build_target_for_test("dev", build_target);
-        let calls = Arc::new(AtomicUsize::new(0));
         coordinator.install_pipeline_epoch_for_test(crate::epoch::processor_test_epoch(
             "dev",
             target_hash.0,
@@ -5183,7 +5240,7 @@ mod tests {
                 selector: TargetSelector::new(None, None).unwrap(),
                 outputs: OutputDecls::new(TERMINAL, Vec::<(String, TypeUuid)>::new()).unwrap(),
             },
-            PrimaryCountingProcessor(Arc::clone(&calls)),
+            processor,
         ));
         let request = BuildRequest {
             work_class: BuildWorkClass::Interactive,
@@ -5199,7 +5256,165 @@ mod tests {
             },
             drifted_input: DriftedInput::Asset(ASSET),
         };
-        (coordinator, request, calls)
+        (coordinator, request)
+    }
+
+    const HEAT: &str = "kernels/game::Heat.bin";
+
+    /// An identity processor that reads type file [`HEAT`] and records
+    /// what each of its runs read.
+    struct TypeFileProcessor(Arc<std::sync::Mutex<Vec<Option<Vec<u8>>>>>);
+
+    impl PipelineProcessor for TypeFileProcessor {
+        fn process(
+            &self,
+            input: Value,
+            context: &mut dyn PipelineProcessContext,
+        ) -> Result<ProcessorProducts, ProcessorError> {
+            let read = context.read_type_file(HEAT)?;
+            self.0.lock().unwrap().push(read);
+            Ok(ProcessorProducts {
+                primary: Some(ProcessorProduct::new(TERMINAL, input)),
+                extras: BTreeMap::new(),
+                debug: BTreeMap::new(),
+            })
+        }
+    }
+
+    /// A type-file-reading processor over root `types` holding the marker
+    /// and `files`, and the runs it records.
+    fn type_file_fixture(
+        temp: &tempfile::TempDir,
+        files: &[(&str, &[u8])],
+    ) -> (Arc<DaemonCoordinator>, BuildRequest, Arc<std::sync::Mutex<Vec<Option<Vec<u8>>>>>) {
+        let types = temp.path().join("types");
+        std::fs::create_dir_all(types.join("kernels")).unwrap();
+        std::fs::write(types.join(distill_schema::ngp_schema::prefab_types::MARKER), "").unwrap();
+        for (path, bytes) in files {
+            std::fs::write(types.join(path), bytes).unwrap();
+        }
+        let runs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (coordinator, request) = processor_fixture(
+            temp,
+            vec![AssetRoot::new("types", &types)],
+            TypeFileProcessor(Arc::clone(&runs)),
+        );
+        (coordinator, request, runs)
+    }
+
+    /// A processor reading a type file reruns when the file's content
+    /// changes or it goes, and its asset's subscribers are told; a rewrite
+    /// with the same bytes, or another type file's change, reruns nothing
+    /// and tells nobody.
+    #[test]
+    fn a_type_file_read_reruns_its_processor_only_when_the_file_changes() {
+        use distill_rpc::{AssetDeltaState, ConnectOutcome, ConnectRequest, Delta, StreamEvent};
+
+        let temp = tempfile::tempdir().unwrap();
+        let (coordinator, request, runs) =
+            type_file_fixture(&temp, &[(HEAT, b"one"), ("kernels/game::Other.bin", b"x")]);
+        let types = temp.path().join("types");
+        let runs = || runs.lock().unwrap().clone();
+        let first = build(&coordinator, &request).unwrap();
+        assert_eq!(runs(), [Some(b"one".to_vec())]);
+        assert_eq!(build(&coordinator, &request).unwrap(), first);
+        assert_eq!(runs().len(), 1);
+
+        let hub = match coordinator
+            .server()
+            .root()
+            .connect(ConnectRequest::new("dev", request.target_definition))
+        {
+            ConnectOutcome::Connected(connected) => connected.hub,
+            outcome => panic!("target connection failed: {outcome:?}"),
+        };
+        let at = coordinator.open_reader().unwrap().input_version().unwrap();
+        let subscription = hub.subscribe(at, vec![ASSET], vec![]).success().unwrap();
+        assert!(matches!(
+            subscription.deltas.next(),
+            Some(StreamEvent::InitialDelta { .. })
+        ));
+        let mut writer = coordinator.open_writer().unwrap();
+        let mut edit = |path: &str, bytes: Option<&[u8]>| {
+            let file = types.join(path);
+            match bytes {
+                Some(bytes) => std::fs::write(&file, bytes).unwrap(),
+                None => std::fs::remove_file(&file).unwrap(),
+            }
+            coordinator
+                .reconcile_incremental(
+                    &mut writer,
+                    &crate::watcher::WatcherBatch {
+                        paths: vec![file],
+                        renames: Vec::new(),
+                    },
+                )
+                .unwrap();
+        };
+
+        // Another type file: nothing reruns, nobody is told.
+        edit("kernels/game::Other.bin", Some(b"y"));
+        assert!(subscription.deltas.next().is_none());
+        assert_eq!(build(&coordinator, &request).unwrap(), first);
+        assert_eq!(runs().len(), 1);
+
+        // The same bytes written again: the result serves.
+        edit(HEAT, Some(b"one"));
+        while subscription.deltas.next().is_some() {}
+        assert_eq!(build(&coordinator, &request).unwrap(), first);
+        assert_eq!(runs().len(), 1);
+
+        // Other bytes: the asset is told changed and its processor reruns.
+        edit(HEAT, Some(b"two"));
+        assert!(matches!(
+            subscription.deltas.next(),
+            Some(StreamEvent::Delta(Delta { assets, .. }))
+                if assets == vec![(ASSET, AssetDeltaState::Changed)]
+        ));
+        build(&coordinator, &request).unwrap();
+        assert_eq!(runs().last(), Some(&Some(b"two".to_vec())));
+        assert_eq!(runs().len(), 2);
+
+        // Gone: read as none.
+        edit(HEAT, None);
+        assert!(matches!(
+            subscription.deltas.next(),
+            Some(StreamEvent::Delta(Delta { assets, .. }))
+                if assets == vec![(ASSET, AssetDeltaState::Changed)]
+        ));
+        build(&coordinator, &request).unwrap();
+        assert_eq!(runs().last(), Some(&None));
+        assert_eq!(runs().len(), 3);
+    }
+
+    /// Without a root holding the marker a type file reads as none, and the
+    /// result serves. Two marker roots fail the read.
+    #[test]
+    fn a_type_file_reads_as_none_without_a_type_root_and_fails_with_two() {
+        let temp = tempfile::tempdir().unwrap();
+        let runs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (coordinator, request) =
+            processor_fixture(&temp, Vec::new(), TypeFileProcessor(Arc::clone(&runs)));
+        let first = build(&coordinator, &request).unwrap();
+        assert_eq!(build(&coordinator, &request).unwrap(), first);
+        assert_eq!(*runs.lock().unwrap(), [None]);
+
+        let temp = tempfile::tempdir().unwrap();
+        let (coordinator, request, runs) = type_file_fixture(&temp, &[(HEAT, b"one")]);
+        assert_eq!(*runs.lock().unwrap(), Vec::<Option<Vec<u8>>>::new());
+        // A second root holding the marker.
+        std::fs::write(
+            temp.path().join("assets").join(distill_schema::ngp_schema::prefab_types::MARKER),
+            "",
+        )
+        .unwrap();
+        let mut writer = coordinator.open_writer().unwrap();
+        coordinator.reconcile_full_scan(&mut writer).unwrap();
+        assert!(matches!(
+            build(&coordinator, &request),
+            Err(BuildError::Failed(message)) if message.contains("more than one root")
+        ));
+        assert!(runs.lock().unwrap().is_empty());
     }
 
     /// The schema authority's build-only policy is a node input: marking the
