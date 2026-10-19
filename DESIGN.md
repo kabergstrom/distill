@@ -3307,6 +3307,15 @@ impl ProcessContext {
     /// authored sources (newgameplus GAP 23 §4.2, the prefab cook).
     pub fn read_authored(&mut self, r: &AssetRefValue, expected: TypeUuid)
         -> Result<AuthoredAsset, BuildError>;
+    /// A type file's bytes (§17 "Type descriptions"; `path` under the root
+    /// holding `prefab-types.root`, e.g. `kernels/game::Heat.bin`) at the
+    /// snapshot, checked against its observed content hash; None without
+    /// such a root or file, a failure with two such roots. Traced as
+    /// `TypeFile`: other bytes there rebuild this result and tell its
+    /// subscribers (§15), the same bytes rewritten do not. For cooks that
+    /// check values against code's signatures (newgameplus GAP 31 §6, the
+    /// cue cook reading kernel files).
+    pub fn read_type_file(&mut self, path: &str) -> Result<Option<Vec<u8>>, BuildError>;
     pub fn target(&self) -> Result<&Target, HostCallbackError>;       // §18
     /// The only way to obtain an Outputs: bound at creation to this
     /// job's (parent uuid, declared output set).
@@ -3725,6 +3734,11 @@ pub enum TraceOp {                         // the labeled, outcome-bearing trace
     /// Non-artifact control value read. Not built, as Control.
     ControlRead { subject: ControlSubject,
                   observed: Observed<BundleFileHash> },
+    /// Type file read (`read_type_file`): its path under the one root
+    /// holding `prefab-types.root` and the snapshot's content hash of it;
+    /// Ok(None) for no such root or file. Two such roots: Err(RawFile {
+    /// Read, Path("prefab-types.root"), OtherStable }).
+    TypeFile { path: String, observed: Observed<Option<ContentHash>> },
 }
 ```
 
@@ -3742,7 +3756,10 @@ retained because multiplicity and order are part of the witnessed attempt.
 `BundleFileHash` with the canonical `Option` tag. It is available only to
 daemon authoring services such as codegen: ordinary processor `Read` remains
 the ContentHash-bearing artifact operation and the two meanings never share a
-tag.
+tag. `TypeFile=12` encodes its path as a string and its optional
+`ContentHash` with the canonical `Option` tag; revalidation asks the
+snapshot's `files` row (`TraceSource::type_file`), so a source-walk that
+leaves a file untouched keeps every result that read it.
 
 `CapabilityKey` has its own fixed `u32` tags:
 `MigrationFn=1`, `DefaultTable=2`, `Importer=3`, `Processor=4`, and `Tool=5`,
@@ -5120,7 +5137,7 @@ that published it, never copied into a table.
 | `tag_epochs` | authored type → the tag epoch its rows were refined under (a digest of what the schema authority says about the type); a changed epoch marks the type's rows pending in the input that changes it |
 | `results` | static-input-key digest → candidate bucket: (trace digest → trace, deterministic failure or success), revalidated most-recent-first on lookup (§9 — the build-cache lookup; the full input hash is never stored; a re-commit of one key and trace replaces its result, others append) |
 | `result_outputs` | a result's output table, one row per entry: its outputs (output key → type uuids, ContentHash), aux payloads and wire tree. The rows are the result's pins in the CAS and go with the result |
-| `result_reads` | what a result's trace read of the namespace, one row per subject: assets (authoring and artifact reads, reference and role checks) and resolved paths. The build reverse index §15's deltas walk; goes with the result |
+| `result_reads` | what a result's trace read of the namespace, one row per subject: assets (authoring and artifact reads, reference and role checks), resolved paths and (schema 70) type files by their path under the type root. The build reverse index §15's deltas walk; goes with the result |
 | `cas_extents` | ContentHash → segment, offset, length: the CAS extent index. Segments hold raw bytes; an extent is its row, and live bytes are covering-index sums |
 | `cas_refs` | what an install holds: an installed artifact or wire tree holds itself and the wire tree an artifact names. Releasing a holder (or a result) deletes in its transaction each extent nothing else references; a foreign key refuses to drop one still referenced |
 | `cas_segments` | every segment file and its state (open, sealed, dead); a writer's one open segment is unique, and a dead file is deleted only once no read can reach it |
@@ -6179,12 +6196,16 @@ delta covering `(since, installed]` for the named assets and paths — a
 commit landing between a client's initial resolves and subscription
 installation is delivered, never permanently missed. On every commit the daemon
 re-hashes changed inputs and walks the reverse-dep indexes; the build reverse index is
-`result_reads` (§13): each committed result's asset and path subjects,
-taken from its trace (`AuthoringRead`, `Read`, `RefCheck`, `RoleCheck`
-assets; `Resolve` paths), so a publication that changes an asset or a
-path also logs, as changed, the parent and derived outputs of every
-result that read it, transitively (`ServedWrite::build_dependents`,
-applied by `distill_rpc::apply_commit`). Results of older traces count
+`result_reads` (§13): each committed result's asset, path and type file
+subjects, taken from its trace (`AuthoringRead`, `Read`, `RefCheck`,
+`RoleCheck` assets; `Resolve` paths; `TypeFile` paths), so a publication
+that changes an asset, a path or a type file also logs, as changed, the
+parent and derived outputs of every result that read it, transitively
+(`ServedWrite::build_dependents`, applied by `distill_rpc::apply_commit`).
+A publication's changed type files are the source file changes the scan
+logged at its version (change log kind 4) under a root holding
+`prefab-types.root` (`ServedWrite::changed_type_files`); a changed marker,
+in any root, changes every type file read. Results of older traces count
 too; the over-approximation costs a re-resolve that finds the hash the
 client holds. Asset queries are not indexed (no one subject): a query
 result's change reaches a build only on that build's next pull; affected manifest
@@ -7295,7 +7316,9 @@ type files: the per-type files a schema walk writes (New Game Plus
 header) and the default files the game's build writes (`defaults/<path>.bin`, from the built module's
 `Default` impls). They live in the one asset root holding the marker file
 `prefab-types.root` (two such roots are an error); no importer reads the
-descriptions, defaults or index, so editing them re-imports nothing.
+descriptions, defaults or index, so editing them re-imports nothing. A
+processor may read any type file through `read_type_file` (§9), traced
+by content (`TypeFile`): other bytes in a file it read rebuild its result.
 - `describeType(typeUuid)` answers a `TypeDescription`: the type's path,
   the canonical logical schema of its value projection with its hash, its
   default, its members: per planner path (`$`, `$.rate`,
