@@ -9,7 +9,7 @@
 
 use distill_asset::reflect::interp::TypeReflect;
 use distill_asset::{AssetType, CallbackPanic};
-use distill_migrate::FieldPath;
+use ngp_migrate::FieldPath;
 use ngp_schema::{SchemaNode, Value};
 
 use crate::callbacks::PipelineDefaults;

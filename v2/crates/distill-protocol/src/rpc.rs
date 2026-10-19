@@ -967,7 +967,7 @@ pub struct TypeDescription {
     /// The renamed fields of the projection (`#[asset(renamed_from)]`):
     /// planner path → the name it was renamed from (protocol 25). An
     /// automatic migration of a value to `schema` follows them
-    /// (`distill_migrate::plan_automatic_renamed`).
+    /// (`ngp_migrate::plan_automatic_renamed`).
     pub renames: BTreeMap<String, String>,
 }
 

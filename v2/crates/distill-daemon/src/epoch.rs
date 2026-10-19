@@ -1092,7 +1092,7 @@ impl PipelineEpoch {
         &self,
         type_uuid: TypeUuid,
         schema: &distill_schema::ngp_schema::SchemaNode,
-        at: &distill_migrate::FieldPath,
+        at: &ngp_migrate::FieldPath,
     ) -> Result<Option<Value>, InfallibleCallbackError> {
         self.invoke_default(type_uuid, schema, at, false)
     }
@@ -1101,7 +1101,7 @@ impl PipelineEpoch {
         &self,
         type_uuid: TypeUuid,
         schema: &distill_schema::ngp_schema::SchemaNode,
-        at: &distill_migrate::FieldPath,
+        at: &ngp_migrate::FieldPath,
     ) -> Result<Option<Value>, InfallibleCallbackError> {
         self.invoke_default(type_uuid, schema, at, true)
     }
@@ -1110,7 +1110,7 @@ impl PipelineEpoch {
         &self,
         type_uuid: TypeUuid,
         schema: &distill_schema::ngp_schema::SchemaNode,
-        at: &distill_migrate::FieldPath,
+        at: &ngp_migrate::FieldPath,
         parent: bool,
     ) -> Result<Option<Value>, InfallibleCallbackError> {
         self.ensure_healthy()?;
@@ -2310,7 +2310,7 @@ mod callback_tests {
     use distill_build::tool::{ToolOutput, ToolRunError};
     use distill_core::id::AssetUuid;
     use distill_core::tool::ToolCwdPolicy;
-    use distill_migrate::FieldPath;
+    use ngp_migrate::FieldPath;
     use distill_schema::ngp_schema::{LogicalSchema, SchemaNode};
 
     struct NoopModule;

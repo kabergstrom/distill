@@ -16,7 +16,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use distill_core::callback::CallbackPanic;
 use distill_core::hash::digest;
 use distill_core::hash::Domain;
-use distill_migrate::FieldPath;
+use ngp_migrate::FieldPath;
 use ngp_schema::{Patch, SchemaNode, Value};
 use unicode_normalization::is_nfc;
 
@@ -461,8 +461,8 @@ mod tests {
             BTreeSet::from([
                 "distill-core",
                 "distill-json",
-                "distill-migrate",
                 "distill-pipeline-api",
+                "ngp-migrate",
                 "ngp-schema",
                 "ngp-source-hash",
             ])

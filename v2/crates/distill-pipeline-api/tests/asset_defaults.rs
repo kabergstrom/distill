@@ -1,6 +1,6 @@
 use distill_asset::{to_value, AssetType};
 use ngp_schema::Value;
-use distill_migrate::{
+use ngp_migrate::{
     conforms, execute_ops, plan_automatic, validate_plan, DefaultProvider, FieldPath,
 };
 use distill_pipeline_api::asset_defaults::AssetTableDefaults;

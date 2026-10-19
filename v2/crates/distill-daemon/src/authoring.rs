@@ -13,7 +13,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use distill_bundle::{AssetEntry, Bundle, BUNDLE_FORMAT_VERSION};
 use distill_core::bootstrap::{is_bootstrap_control_type, DIRECTORY_IMPORT_RULES_TYPE_UUID};
 use distill_core::id::{BundleUuid, ContentHash, LogicalHash};
-use distill_migrate::{lossy_drops, plan_automatic_renamed};
+use ngp_migrate::{lossy_drops, plan_automatic_renamed};
 use distill_pipeline_api::callbacks::MigrationKey;
 use distill_rpc::{
     names_blob_ref, resolve_blob_refs, stored_value, value_blobs, AuthoringBackend, AuthoringEntry, AuthoringEntryRole, AuthoringOp,

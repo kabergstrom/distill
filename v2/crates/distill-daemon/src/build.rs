@@ -46,7 +46,7 @@ use distill_build::trace::{
 use distill_bundle::{AssetEntry, Bundle};
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
 use distill_schema::ngp_schema::{AssetRefValue, TypeTable, Value};
-use distill_migrate::{
+use ngp_migrate::{
     conforms, execute_ops, plan_automatic_renamed, validate_plan, DefaultProvider,
     FieldPath, MigrationError, MigrationOp,
 };

@@ -5,7 +5,7 @@ use distill_build::query::AssetQuery;
 use distill_build::trace::*;
 use distill_core::hash::{digest_prefix, Domain};
 use distill_core::id::{AssetUuid, BundleFileHash, ContentHash, TypeUuid};
-use distill_migrate::FieldPath;
+use ngp_migrate::FieldPath;
 
 #[derive(Default)]
 struct Snapshot {

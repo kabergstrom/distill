@@ -15,7 +15,7 @@ use distill_core::callback::CallbackPanic;
 use distill_core::id::{AssetUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_core::tool::ToolCwdPolicy;
 use ngp_schema::{AssetRefValue, TypeTable, Value};
-use distill_migrate::FieldPath;
+use ngp_migrate::FieldPath;
 use ngp_schema::{LogicalSchema, SchemaNode};
 
 use crate::codegen::{CodegenFailure, CodegenOutput};

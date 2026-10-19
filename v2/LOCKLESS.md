@@ -644,7 +644,7 @@ should reach zero by the end of phase 6.
     `GeneratedFile`/`CodegenFailure`, `ToolOutput`/`ToolRunError`). The
     daemon and `distill-build` re-export them at their old paths.
     `CallbackPanic` moved to `distill-core`; `distill-wire` re-exports it.
-  - **Closure:** distill-core, distill-json, distill-migrate, ngp-schema,
+  - **Closure:** distill-core, distill-json, ngp-migrate, ngp-schema,
     ngp-source-hash (plus blake3, globset, unicode-normalization, serde).
     No distill-store, rusqlite, distill-build or distill-daemon.
   - **Registration.** `register` receives the API's `RegistrationArena`,
@@ -752,7 +752,7 @@ should reach zero by the end of phase 6.
     (PROTOCOL_VERSION 8). A write replacing an entry stored under another
     schema is refused with `RpcFailure::LossyWrite { type_uuid, asset,
     fields, detail }` when a `DropField` hits a non-default value
-    (`distill_migrate::lossy_drops`, paths like `$.items[].gone`), or when
+    (`ngp_migrate::lossy_drops`, paths like `$.items[].gone`), or when
     the planner refuses and no migration function is registered.
   - **`renamed_from`** (`d439f55`, newgameplus `7631c8f`): source-walk
     parses `#[asset(renamed_from = "old")]` into `FieldAttrs`; it is never

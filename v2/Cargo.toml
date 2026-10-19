@@ -12,7 +12,6 @@ members = [
     "crates/distill-daemon/tests/fixtures/test-project",
     "crates/distill-json",
     "crates/distill-loader",
-    "crates/distill-migrate",
     "crates/distill-pack",
     "crates/distill-pack-build",
     "crates/distill-pipeline-api",

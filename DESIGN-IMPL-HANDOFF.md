@@ -228,7 +228,7 @@ storage candidates.
 | `distill-json` | Canonical authored JSON parsing/writing and typed authored values |
 | `distill-schema` | Distill-facing shared-schema integration |
 | `distill-bundle` | Plain/container bundle parsing, canonical writing, blobs, lineage, exact schema repair |
-| `distill-migrate` | Automatic/custom migration validation, planning, and disk execution |
+| `ngp-migrate` (newgameplus workspace) | Automatic/custom migration validation, planning, and disk execution |
 | `distill-wire` | Artifact grammar, DSWL trees, canonical encoding, plan compilation, contained fixup execution |
 | `distill-store` | SQLite authority, versions/poison, journal/quarantine, append-only CAS, recovery, pins, GC |
 | `distill-asset` | Runtime descriptors, erased ownership, placeholders, deterministic containers, callback status surfaces |

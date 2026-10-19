@@ -1856,7 +1856,7 @@ the value type `load_current_entry` yields (§11), migration functions transform
   (container chunk bytes), `NodeRef`, `Handle`, `Dynamic` (§5).
 - `Patch` is its sparse overlay (absent = inherited): `Replace`, `Struct`
   (per field `Option<Patch>`), `Enum`, `Some`, `Seq`, `Map { set, remove }`.
-  `distill_migrate::execute_sparse` migrates a patch between schemas.
+  `ngp_migrate::execute_sparse` migrates a patch between schemas.
 - Text: `ngp_schema::text` parses canonical JSON straight against the node
   (no untyped tree; errors name the schema path) and writes it back
   canonically; `distill-json` is only the lexer and the canonical scalar
@@ -4314,7 +4314,7 @@ no op ever observes another op's writes, so op order can never make two
 conforming executors produce different authored values, and `CopyField`
 **copies** — the source stays readable to later ops; a move is spelled copy
 plus an explicit `DropField`. Plans are validated before execution
-(`validate_plan`, `distill-migrate/src/validate.rs`) against both endpoint
+(`validate_plan`, `newgameplus/ngp-migrate/src/validate.rs`) against both endpoint
 schemas: every `from` path must resolve in the snapshot and every `to` path
 in the current schema — a missing path is a typed `PlanError` naming the path
 — and plans are **total and disjoint over the output**: every serializable
