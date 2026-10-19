@@ -1141,8 +1141,30 @@ fn rewrite_under_a_new_schema(
     written: (LogicalSchema, Value),
     force_lossy: bool,
 ) -> Result<Value, distill_rpc::RpcFailure> {
+    rewrite_with_edges(stored, written, force_lossy, false)
+}
+
+/// `edge`: the root holds type files whose edges file lists one from the
+/// stored schema to the written one (newgameplus GAP 29 §8).
+fn rewrite_with_edges(
+    stored: (LogicalSchema, Value),
+    written: (LogicalSchema, Value),
+    force_lossy: bool,
+    edge: bool,
+) -> Result<Value, distill_rpc::RpcFailure> {
+    use distill_schema::ngp_schema::prefab_types;
     let temp = tempfile::tempdir().unwrap();
     let coordinator = coordinator(&temp);
+    if edge {
+        let row = prefab_types::EdgeEntry {
+            from: "game::RunV1".into(),
+            to: "game::Run".into(),
+            from_hash: node_hash(&stored.0.root).unwrap(),
+            to_hash: node_hash(&written.0.root).unwrap(),
+        };
+        std::fs::write(temp.path().join("assets").join(prefab_types::MARKER), "types").unwrap();
+        std::fs::write(temp.path().join("assets").join(prefab_types::EDGES), prefab_types::write_edges(&[row])).unwrap();
+    }
     let mut writer = coordinator.open_writer().unwrap();
     let type_uuid = TypeUuid([71; 16]);
     let (bundle_uuid, asset_uuid) = (BundleUuid([73; 16]), AssetUuid([72; 16]));
@@ -1242,7 +1264,7 @@ fn a_write_that_drops_data_is_refused_unless_forced() {
 }
 
 #[test]
-fn a_write_the_planner_refuses_needs_a_migration_function() {
+fn a_write_the_planner_refuses_needs_an_edge() {
     let stored = (u8_struct(&["a"]), u8_object(&[("a", 1)]));
     let written = (
         LogicalSchema {
@@ -1254,9 +1276,15 @@ fn a_write_the_planner_refuses_needs_a_migration_function() {
         Value::Struct(Box::new([Value::String("one".into())])),
     );
     assert!(matches!(
-        rewrite_under_a_new_schema(stored, written, false),
+        rewrite_under_a_new_schema(stored.clone(), written.clone(), false),
         Err(distill_rpc::RpcFailure::LossyWrite { .. })
     ));
+    // The game's edge from the stored schema to the written one covers it.
+    let written_value = written.1.clone();
+    assert_eq!(
+        rewrite_with_edges(stored, written, false, true).unwrap(),
+        written_value
+    );
 }
 
 #[test]

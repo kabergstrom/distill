@@ -13,8 +13,8 @@ use std::sync::{Arc, OnceLock, Weak};
 use distill_bundle::{AssetEntry, Bundle, BUNDLE_FORMAT_VERSION};
 use distill_core::bootstrap::{is_bootstrap_control_type, DIRECTORY_IMPORT_RULES_TYPE_UUID};
 use distill_core::id::{BundleUuid, ContentHash, LogicalHash};
-use ngp_migrate::{lossy_drops, plan_automatic_renamed};
-use distill_pipeline_api::callbacks::MigrationKey;
+use distill_schema::ngp_schema::{prefab_types, Patch, Value};
+use ngp_migrate::{lossy_drops, plan_with_edges, Edges};
 use distill_rpc::{
     names_blob_ref, resolve_blob_refs, stored_value, value_blobs, AuthoringBackend, AuthoringEntry, AuthoringEntryRole, AuthoringOp,
     Commit, ImportJob, ImportRequest, InputVersion, LongRunningOp, PreparedImportCommit,
@@ -417,7 +417,7 @@ impl AuthoringService {
             .map_err(|error| invalid(format!("invalid authored value: {error:?}")))?;
         if !force_lossy {
             if let Some(existing) = bundle.assets.get(&entry.local_id) {
-                self.check_lossless(compiled, bundle, existing, schema, entry.schema_hash)?;
+                self.check_lossless(store, compiled, bundle, existing, schema, entry.schema_hash)?;
             }
         }
         bundle.schemas.insert(entry.schema_hash, schema.clone());
@@ -457,9 +457,11 @@ impl AuthoringService {
     /// A write replacing an entry stored under another schema must not drop
     /// its data: every field the automatic plan from the stored schema to
     /// the written one drops must hold its default. A schema change the
-    /// planner refuses needs a registered migration function.
+    /// planner refuses needs an edge of the game module (newgameplus GAP 29
+    /// §8) covering it, which the type-files root lists ([`TypeRootEdges`]).
     fn check_lossless(
         &self,
+        store: &StoreReader,
         compiled: &Compiled,
         bundle: &Bundle,
         existing: &AssetEntry,
@@ -480,7 +482,8 @@ impl AuthoringService {
             detail,
         };
         let renames = current_renames(compiled, existing.type_uuid, written_hash);
-        match plan_automatic_renamed(&stored.root, &written.root, &renames) {
+        let edges = self.type_root_edges(store)?;
+        match plan_with_edges(&stored.root, &written.root, &renames, &edges) {
             Ok(ops) => {
                 let fields = lossy_drops(&ops, &stored.root, &existing.data);
                 if fields.is_empty() {
@@ -493,24 +496,33 @@ impl AuthoringService {
                 }
             }
             Err(refusal) => {
-                let key = MigrationKey {
-                    type_uuid: existing.type_uuid,
-                    from: existing.schema_hash,
-                    to: written_hash,
-                };
-                if migration_function_registered(compiled, &key) {
-                    return Ok(());
-                }
                 Err(lossy(
                     refusal
                         .reasons
                         .iter()
                         .map(|(path, _)| path.clone())
                         .collect(),
-                    format!("no registered migration function and {refusal}"),
+                    format!("no edge covers the change and {refusal}"),
                 ))
             }
         }
+    }
+}
+
+impl AuthoringService {
+    /// The edges file of the root holding the type files; none without one.
+    fn type_root_edges(&self, store: &StoreReader) -> Result<TypeRootEdges, RpcFailure> {
+        let rows = store.observed_files_at(prefab_types::MARKER).map_err(invalid)?;
+        let Some(root) = rows.into_iter().next().map(|row| row.root_name) else {
+            return Ok(TypeRootEdges::default());
+        };
+        if store.file_content_hash(&root, prefab_types::EDGES).map_err(invalid)?.is_none() {
+            return Ok(TypeRootEdges::default());
+        }
+        let bytes = AuthoringBackend::read_file(self, store, &root, prefab_types::EDGES).map_err(invalid)?;
+        let rows = prefab_types::read_edges(&bytes)
+            .map_err(|error| invalid(format!("type file {}: {error}", prefab_types::EDGES)))?;
+        Ok(TypeRootEdges(rows.into_iter().map(|row| (row.from_hash, row.to_hash)).collect()))
     }
 }
 
@@ -530,10 +542,24 @@ fn current_renames(
         .unwrap_or_default()
 }
 
-fn migration_function_registered(compiled: &Compiled, key: &MigrationKey) -> bool {
-    compiled
-        .pipeline_epoch()
-        .is_ok_and(|epoch| epoch.migration_function_keys().contains(&key.id()))
+/// The game module's edges as the type-files root lists them
+/// (`prefab_types::EDGES`): pairs of value-projection hashes. The daemon
+/// checks that an edge covers a change; the engine runs it.
+#[derive(Default)]
+struct TypeRootEdges(BTreeSet<(LogicalHash, LogicalHash)>);
+
+impl Edges for TypeRootEdges {
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn has(&self, from: &LogicalHash, to: &LogicalHash) -> bool {
+        self.0.contains(&(*from, *to))
+    }
+
+    fn convert(&self, _: &LogicalHash, _: &LogicalHash, _: &Patch) -> Result<Value, String> {
+        Err("the daemon checks edges; the game module runs them".to_owned())
+    }
 }
 
 impl AuthoringBackend for AuthoringService {

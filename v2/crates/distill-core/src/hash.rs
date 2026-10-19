@@ -148,11 +148,15 @@ pub enum Domain {
     /// A shipped save schema file (newgameplus GAP 29 §9): a slot root
     /// type's value projection as a save file embeds it.
     SaveSchema = 39,
+    /// The edge list of a type-description tree (newgameplus GAP 29 §8):
+    /// each module edge by its from- and to-types and their value
+    /// projections' hashes.
+    SaveEdges = 40,
 }
 
 impl Domain {
     /// Every domain, in discriminant order.
-    pub const ALL: [Domain; 39] = [
+    pub const ALL: [Domain; 40] = [
         Domain::Schema,
         Domain::Layout,
         Domain::ModuleInterface,
@@ -192,6 +196,7 @@ impl Domain {
         Domain::TypeSchema,
         Domain::SaveFile,
         Domain::SaveSchema,
+        Domain::SaveEdges,
     ];
 
     pub fn from_u32(value: u32) -> Option<Domain> {

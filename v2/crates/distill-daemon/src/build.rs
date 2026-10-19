@@ -3514,6 +3514,7 @@ fn migration_ops_use_defaults(ops: &[MigrationOp]) -> bool {
         MigrationOp::MigrateElements { element, .. } => migration_ops_use_defaults(element),
         MigrationOp::MigrateMapKeys { key, .. } => migration_ops_use_defaults(key),
         MigrationOp::MigrateInline { ops, .. } => migration_ops_use_defaults(ops),
+        MigrationOp::Edge { prepare, .. } => migration_ops_use_defaults(prepare),
         MigrationOp::CopyField { .. }
         | MigrationOp::Widen { .. }
         | MigrationOp::WriteValue { .. }
@@ -3572,6 +3573,7 @@ fn migration_execution_failure(error: &MigrationError) -> MigrationPlanFailureV1
         | MigrationError::DuplicateWrite { path }
         | MigrationError::MissingWrite { path }
         | MigrationError::PlanShape { path, .. }
+        | MigrationError::Edge { path, .. }
         | MigrationError::Unencodable { path } => field_path_from_display(path),
         MigrationError::DuplicateMapVariantFrom { at, .. } => field_path_from_display(at),
     };
