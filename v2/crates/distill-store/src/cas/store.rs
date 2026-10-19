@@ -95,8 +95,8 @@ pub struct BuildCommit {
     /// failing op for failures).
     pub trace: Vec<u8>,
     pub outcome: CommitOutcome,
-    /// What the trace read of the namespace (its asset and path subjects,
-    /// each once), indexed so a publication changing one finds the
+    /// What the trace read of the namespace (its asset, path and type file
+    /// subjects, each once), indexed so a publication changing one finds the
     /// result's assets (§15, [`crate::served::ServedWrite::build_dependents`]).
     pub reads: Vec<BuildRead>,
     /// Canonical layout encodings of the wire trees the outputs name, committed
@@ -105,11 +105,13 @@ pub struct BuildCommit {
 }
 
 /// One namespace subject a build read (§10): an asset (authored or
-/// artifact read, reference or role check) or a resolved path.
+/// artifact read, reference or role check), a resolved path, or a type
+/// file (`ngp_schema::prefab_types`) by its path under the type root.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BuildRead {
     Asset(AssetUuid),
     Path(String),
+    TypeFile(String),
 }
 
 /// What a commit returns.
@@ -150,10 +152,11 @@ pub(crate) const CANDIDATE: &str =
 pub(crate) const ROLE_OUTPUT: i64 = 0;
 pub(crate) const ROLE_AUX: i64 = 1;
 pub(crate) const ROLE_WIRE_TREE: i64 = 2;
-/// `result_reads.kind`: an asset subject (its uuid bytes) or a path (its
-/// text bytes).
+/// `result_reads.kind`: an asset subject (its uuid bytes), a path or a
+/// type file's path (their text bytes).
 pub(crate) const READ_ASSET: i64 = 0;
 pub(crate) const READ_PATH: i64 = 1;
+pub(crate) const READ_TYPE_FILE: i64 = 2;
 
 /// One bucket candidate, most-recently-committed-first (§13).
 #[derive(Debug, Clone)]
@@ -714,6 +717,7 @@ impl Store {
                     let (kind, subject) = match subject {
                         BuildRead::Asset(asset) => (READ_ASSET, asset.0.as_slice()),
                         BuildRead::Path(path) => (READ_PATH, path.as_bytes()),
+                        BuildRead::TypeFile(path) => (READ_TYPE_FILE, path.as_bytes()),
                     };
                     read.execute(rusqlite::params![
                         key_kind as i64,

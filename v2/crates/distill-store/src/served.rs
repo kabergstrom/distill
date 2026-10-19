@@ -38,6 +38,18 @@ pub(crate) const BUILD_DEPENDENTS: &str = "SELECT DISTINCT r.asset_uuid, o.name 
      LEFT JOIN result_outputs o ON o.key_kind = r.key_kind AND o.static_key = r.static_key
          AND o.trace_digest = r.trace_digest AND o.role = 0
      WHERE d.kind = ?1 AND d.subject = ?2";
+/// The root and path of each source file change logged at version `?1`
+/// (kind literal: [`CHANGE_FILE`]).
+pub(crate) const FILE_CHANGES_AT: &str =
+    "SELECT root, subject FROM change_log WHERE version = ?1 AND kind = 4";
+/// The roots holding a file at path `?1` (the type files' marker).
+pub(crate) const ROOTS_HOLDING: &str =
+    "SELECT r.name FROM files t JOIN roots r USING (root_id) WHERE t.path = ?1";
+/// Every type file path a result read (kind literal:
+/// [`crate::cas::store::READ_TYPE_FILE`]).
+pub(crate) const TYPE_FILE_READS: &str =
+    "SELECT DISTINCT subject FROM result_reads WHERE kind = 2";
+const _: () = assert!(CHANGE_FILE == 4 && crate::cas::store::READ_TYPE_FILE == 2);
 /// Drop an artifact's load edges ahead of recording its latest install's.
 pub(crate) const DELETE_LOAD_EDGES: &str =
     "DELETE FROM artifact_load_edges WHERE content_hash = ?1";
@@ -647,19 +659,27 @@ pub trait ServedWrite {
 
     /// The assets whose builds read what a publication changed (§15 "Watch
     /// and client-side staleness"): every committed result whose trace read
-    /// one of `assets` or resolved one of `paths` names its parent asset and
-    /// each of its derived outputs, and those are read in turn, to a
-    /// fixpoint. Ascending, `assets` themselves left out. Over-approximate
-    /// by design: a result of an older trace counts too, and a client's
-    /// re-resolve that finds the hash it holds does nothing.
-    fn build_dependents(&self, assets: &[AssetUuid], paths: &[String]) -> Result<Vec<AssetUuid>, StoreError> {
+    /// one of `assets`, resolved one of `paths` or read one of `type_files`
+    /// names its parent asset and each of its derived outputs, and those
+    /// are read in turn, to a fixpoint. Ascending, `assets` themselves left
+    /// out. Over-approximate by design: a result of an older trace counts
+    /// too, and a client's re-resolve that finds the hash it holds does
+    /// nothing.
+    fn build_dependents(
+        &self,
+        assets: &[AssetUuid],
+        paths: &[String],
+        type_files: &[String],
+    ) -> Result<Vec<AssetUuid>, StoreError> {
+        use crate::cas::store::{READ_ASSET, READ_PATH, READ_TYPE_FILE};
         let mut statement = self.served_conn().prepare_cached(BUILD_DEPENDENTS)?;
         let mut seen: BTreeSet<AssetUuid> = assets.iter().copied().collect();
         let mut found = BTreeSet::new();
         let mut queue: Vec<(i64, Vec<u8>)> = assets
             .iter()
-            .map(|asset| (crate::cas::store::READ_ASSET, asset.0.to_vec()))
-            .chain(paths.iter().map(|path| (crate::cas::store::READ_PATH, path.as_bytes().to_vec())))
+            .map(|asset| (READ_ASSET, asset.0.to_vec()))
+            .chain(paths.iter().map(|path| (READ_PATH, path.as_bytes().to_vec())))
+            .chain(type_files.iter().map(|path| (READ_TYPE_FILE, path.as_bytes().to_vec())))
             .collect();
         while let Some((kind, subject)) = queue.pop() {
             let rows = statement.query_map(rusqlite::params![kind, subject], |row| {
@@ -675,12 +695,51 @@ pub trait ServedWrite {
                 for asset in [parent, named] {
                     if seen.insert(asset) {
                         found.insert(asset);
-                        queue.push((crate::cas::store::READ_ASSET, asset.0.to_vec()));
+                        queue.push((READ_ASSET, asset.0.to_vec()));
                     }
                 }
             }
         }
         Ok(found.into_iter().collect())
+    }
+
+    /// The type files (`ngp_schema::prefab_types`) the scan logged changed
+    /// at `version` ([`Change::File`]), as [`Self::build_dependents`] takes
+    /// them: each changed path under a root holding the marker file. A
+    /// marker changed in any root moves, makes or removes the type root,
+    /// which changes what every type file read observes: then every path a
+    /// result read.
+    fn changed_type_files(&self, version: InputVersion) -> Result<Vec<String>, StoreError> {
+        let conn = self.served_conn();
+        let changes = conn
+            .prepare_cached(FILE_CHANGES_AT)?
+            .query_map([version.0 as i64], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let marker = ngp_schema::prefab_types::MARKER;
+        if changes.iter().any(|(_, path)| path == marker) {
+            return conn
+                .prepare_cached(TYPE_FILE_READS)?
+                .query_map([], |row| {
+                    String::from_utf8(row.get(0)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(error))
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from);
+        }
+        if changes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let roots = conn
+            .prepare_cached(ROOTS_HOLDING)?
+            .query_map([marker], |row| row.get::<_, String>(0))?
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let changed = changes
+            .into_iter()
+            .filter(|(root, _)| roots.contains(root))
+            .map(|(_, path)| path)
+            .collect::<BTreeSet<_>>();
+        Ok(changed.into_iter().collect())
     }
 
     /// Keep at most `retained` versions of history before `current`; older

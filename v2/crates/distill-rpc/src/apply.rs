@@ -52,10 +52,12 @@ pub fn apply_commit<W: ServedWrite>(txn: &mut W, commit: &Commit) -> Result<(), 
         .collect::<Vec<_>>();
     // A build that read what changed may build something else now (§15):
     // each dependent is told as changed. Its own bundle did not change, so
-    // the commit does not name it.
+    // the commit does not name it. The type files changed are the source
+    // files the scan logged at this version under the type root.
     let changed = asset_deltas.iter().map(|(uuid, _)| *uuid).collect::<Vec<_>>();
     let changed_paths = paths.iter().cloned().collect::<Vec<_>>();
-    for asset in txn.build_dependents(&changed, &changed_paths)? {
+    let changed_type_files = txn.changed_type_files(version)?;
+    for asset in txn.build_dependents(&changed, &changed_paths, &changed_type_files)? {
         asset_deltas.push((asset, AssetDeltaState::Changed));
     }
     asset_deltas.sort_by_key(|(uuid, _)| *uuid);

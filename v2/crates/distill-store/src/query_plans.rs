@@ -2123,7 +2123,9 @@ fn cas_statements_search_their_indexes() {
         SEGMENTS_IN_STATE, SEGMENT_EXTENTS,
     };
     use crate::cas::store::{ACTIVE_SEGMENT, SEAL_ACTIVE_SEGMENT, SEAL_SEGMENT};
-    use crate::served::{BUILD_DEPENDENTS, DELETE_LOAD_EDGES};
+    use crate::served::{
+        BUILD_DEPENDENTS, DELETE_LOAD_EDGES, FILE_CHANGES_AT, ROOTS_HOLDING, TYPE_FILE_READS,
+    };
     let (_dir, store) = store_with(10);
     let cases: &[(&str, &[&str])] = &[
         // One open regular segment per writer: `cas_segments_open` is
@@ -2203,6 +2205,21 @@ fn cas_statements_search_their_indexes() {
                 "SEARCH o USING PRIMARY KEY (key_kind=? AND static_key=? AND trace_digest=? AND role=?) LEFT-JOIN",
                 "USE TEMP B-TREE FOR DISTINCT",
             ],
+        ),
+        // A publication's type file changes: its own change-log rows, the
+        // roots holding the marker, and on a marker change every type file
+        // read (one range of the subject index).
+        (FILE_CHANGES_AT, &["SEARCH change_log USING INDEX change_log_by_version (version=?)"]),
+        (
+            ROOTS_HOLDING,
+            &[
+                "SEARCH t USING INDEX files_by_path (path=?)",
+                "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)",
+            ],
+        ),
+        (
+            TYPE_FILE_READS,
+            &["SEARCH result_reads USING COVERING INDEX result_reads_by_subject (kind=?)"],
         ),
     ];
     for (sql, expected) in cases {

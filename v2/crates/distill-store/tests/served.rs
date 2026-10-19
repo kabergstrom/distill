@@ -169,7 +169,8 @@ fn commit_reading(
 }
 
 /// A result's reads name its parent and derived outputs as dependents of
-/// what it read, transitively; a path read names them for that path.
+/// what it read, transitively; a path read names them for that path, a
+/// type file read for that type file.
 #[test]
 fn build_dependents_follow_result_reads_to_a_fixpoint() {
     use distill_store::cas::BuildRead;
@@ -178,22 +179,92 @@ fn build_dependents_follow_result_reads_to_a_fixpoint() {
     let middle = AssetUuid([11; 16]);
     let top = AssetUuid([12; 16]);
     let by_path = AssetUuid([13; 16]);
+    let by_type_file = AssetUuid([14; 16]);
     // middle reads leaf and has an extra output; top reads middle's extra.
     commit_reading(&mut store, 1, middle, &["", "extra"], vec![BuildRead::Asset(leaf)]);
     let extra = AssetUuid::v5(middle, "extra");
     commit_reading(&mut store, 2, top, &[""], vec![BuildRead::Asset(extra)]);
     commit_reading(&mut store, 3, by_path, &[""], vec![BuildRead::Path("a/b.bundle".into())]);
+    // A path and a type file of the same text are different subjects.
+    commit_reading(&mut store, 4, by_type_file, &[""], vec![BuildRead::TypeFile("a/b.bundle".into())]);
 
-    let dependents = |store: &mut Store, assets: &[AssetUuid], paths: &[String]| {
-        let (assets, paths) = (assets.to_vec(), paths.to_vec());
+    let dependents = |store: &mut Store, assets: &[AssetUuid], paths: &[String], type_files: &[String]| {
+        let (assets, paths, type_files) = (assets.to_vec(), paths.to_vec(), type_files.to_vec());
         store
-            .served_transaction(move |txn| txn.build_dependents(&assets, &paths))
+            .served_transaction(move |txn| txn.build_dependents(&assets, &paths, &type_files))
             .unwrap()
     };
     let mut expected = vec![middle, extra, top];
     expected.sort();
-    assert_eq!(dependents(&mut store, &[leaf], &[]), expected);
-    assert_eq!(dependents(&mut store, &[middle], &[]), Vec::<AssetUuid>::new());
-    assert_eq!(dependents(&mut store, &[], &["a/b.bundle".into()]), [by_path]);
-    assert_eq!(dependents(&mut store, &[], &["a/c.bundle".into()]), Vec::<AssetUuid>::new());
+    assert_eq!(dependents(&mut store, &[leaf], &[], &[]), expected);
+    assert_eq!(dependents(&mut store, &[middle], &[], &[]), Vec::<AssetUuid>::new());
+    assert_eq!(dependents(&mut store, &[], &["a/b.bundle".into()], &[]), [by_path]);
+    assert_eq!(dependents(&mut store, &[], &["a/c.bundle".into()], &[]), Vec::<AssetUuid>::new());
+    assert_eq!(dependents(&mut store, &[], &[], &["a/b.bundle".into()]), [by_type_file]);
+    assert_eq!(dependents(&mut store, &[], &[], &["a/c.bundle".into()]), Vec::<AssetUuid>::new());
+}
+
+/// The type files a version changed are the file changes the scan logged
+/// at it under the root holding the marker; a marker change, in any root,
+/// is a change of every type file a result read.
+#[test]
+fn changed_type_files_are_the_logged_file_changes_under_the_marker_root() {
+    use distill_core::id::ContentHash;
+    use distill_store::cas::BuildRead;
+    use distill_store::files::{FileKind, FileObservation, FileState};
+    use ngp_schema::prefab_types::MARKER;
+    let (_dir, mut store) = store();
+    commit_reading(&mut store, 1, AssetUuid([20; 16]), &[""], vec![BuildRead::TypeFile("kernels/a.bin".into())]);
+    commit_reading(&mut store, 2, AssetUuid([21; 16]), &[""], vec![BuildRead::TypeFile("schemas/b.bin".into())]);
+    // Version 1: the marker in `types` (the first publication logs nothing).
+    store
+        .input_transaction(|txn| {
+            let version = txn.version();
+            let types = txn.intern_root("types")?;
+            let marker = FileObservation::from(FileState {
+                mtime: 1,
+                size: 1,
+                kind: FileKind::File,
+                content_hash: Some(ContentHash([1; 16])),
+            });
+            txn.upsert_file(types, MARKER, &marker, version)?;
+            txn.push_dirty(types, "types", MARKER, true, version)
+        })
+        .unwrap();
+    // Version 2: a type file changed and removed, and a file in another root.
+    store
+        .input_transaction(|txn| {
+            let version = txn.version();
+            let types = txn.intern_root("types")?;
+            let main = txn.intern_root("main")?;
+            txn.push_dirty(types, "types", "kernels/a.bin", true, version)?;
+            txn.push_dirty(main, "main", "kernels/c.bin", true, version)?;
+            txn.push_dirty(types, "types", "kernels/a.bin", false, version)
+        })
+        .unwrap();
+    // Version 3: a type file's path in another root.
+    store
+        .input_transaction(|txn| {
+            let version = txn.version();
+            let main = txn.intern_root("main")?;
+            txn.push_dirty(main, "main", "kernels/a.bin", true, version)
+        })
+        .unwrap();
+    // Version 4: a marker in another root.
+    store
+        .input_transaction(|txn| {
+            let version = txn.version();
+            let main = txn.intern_root("main")?;
+            txn.push_dirty(main, "main", MARKER, true, version)
+        })
+        .unwrap();
+    let changed = |store: &mut Store, version: u64| {
+        store
+            .served_transaction(move |txn| txn.changed_type_files(InputVersion(version)))
+            .unwrap()
+    };
+    assert_eq!(changed(&mut store, 1), Vec::<String>::new());
+    assert_eq!(changed(&mut store, 2), ["kernels/a.bin"]);
+    assert_eq!(changed(&mut store, 3), Vec::<String>::new());
+    assert_eq!(changed(&mut store, 4), ["kernels/a.bin", "schemas/b.bin"]);
 }
