@@ -1,3 +1,5 @@
+| `InputRecording` (34) | file format only: a newgameplus raw input recording (`record-input`, GAP 23 §18.4) |
+| `TypeDescription`, `TypeIndex`, `TypeSchema` (35–37) | file formats only: a newgameplus type-description tree's `descriptions/<path>.bin`, `type-index.bin` and `schemas/<path>.bin` (GAP 23 §6) |
 # Distill v2 — Asset Pipeline for newgameplus
 
 ## 1. Overview
@@ -7924,9 +7926,9 @@ served at the output until the import succeeds.
 **Type descriptions** (protocol 21). An editor edits component values
 without loading game code; what it needs per type comes from the project's
 type files: the per-type files a schema walk writes (New Game Plus
-`ngp_schema::prefab_types`: `schemas/<path>.json`,
-`descriptions/<path>.json`, `type-index.json`) and the default files the
-game's build writes (`defaults/<path>.json`, from the built module's
+`ngp_schema::prefab_types`: `schemas/<path>.bin`,
+`descriptions/<path>.bin`, `type-index.bin`, binary files with the shared
+header) and the default files the game's build writes (`defaults/<path>.bin`, from the built module's
 `Default` impls). They live in the one asset root holding the marker file
 `prefab-types.root` (two such roots are an error); no importer reads the
 descriptions, defaults or index, so editing them re-imports nothing.

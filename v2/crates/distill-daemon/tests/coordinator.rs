@@ -1849,7 +1849,7 @@ fn type_descriptions_read_the_type_files_at_the_snapshot() {
 
     // Edited on disk, not yet observed: the snapshot's bytes are gone.
     let description_file = prefab_types::description_file("game::Spinner");
-    std::fs::write(types.join(&description_file), r#"{"members":{}}"#).unwrap();
+    std::fs::write(types.join(&description_file), prefab_types::write_description(&Default::default())).unwrap();
     assert!(matches!(
         snapshot.describe_type(type_uuid),
         RpcResult::Success(DescribeTypeResult::Drifted { input: DriftedInput::File(path), .. })
@@ -1879,7 +1879,7 @@ fn an_index_subscription_is_told_every_entry_file_and_type_change() {
     std::fs::write(assets.join("second.bundle"), second_bytes).unwrap();
     std::fs::write(assets.join("notes.txt"), "one").unwrap();
     std::fs::write(types.join(prefab_types::MARKER), "").unwrap();
-    std::fs::write(types.join(prefab_types::INDEX), "{}").unwrap();
+    std::fs::write(types.join(prefab_types::INDEX), prefab_types::write_index(&Default::default())).unwrap();
     let coordinator = DaemonCoordinator::open(
         StoreConfig::new(temp.path().join(".distill")),
         vec![AssetRoot::new("main", &assets), AssetRoot::new("types", &types)],
@@ -1916,7 +1916,12 @@ fn an_index_subscription_is_told_every_entry_file_and_type_change() {
     std::fs::write(&first_path, distill_bundle::write_bundle(&edited).unwrap()).unwrap();
     std::fs::write(assets.join("notes.txt"), "two").unwrap();
     std::fs::write(assets.join("new.txt"), "new").unwrap();
-    std::fs::write(types.join(prefab_types::INDEX), "{\"types\": []}").unwrap();
+    std::fs::write(
+        types.join(prefab_types::INDEX),
+        prefab_types::write_index(&prefab_types::Index {
+            types: vec![prefab_types::IndexEntry { path: "game::Spinner".into(), uuid: TypeUuid([7; 16]), component: false }],
+        }),
+    ).unwrap();
     let edit = coordinator
         .reconcile_incremental(
             &mut writer,

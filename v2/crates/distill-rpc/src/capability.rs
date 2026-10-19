@@ -965,14 +965,11 @@ impl TypeFiles<'_> {
             return Ok(None);
         };
         let index = prefab_types::read_index(&bytes).map_err(|error| invalid_type_file(prefab_types::INDEX, error))?;
-        let mut types = Vec::with_capacity(index.types.len());
-        for row in index.types {
-            let type_uuid = row
-                .uuid
-                .parse()
-                .map_err(|error| invalid_type_file(prefab_types::INDEX, format!("uuid {:?}: {error:?}", row.uuid)))?;
-            types.push(DescribableType { type_uuid, path: row.path, component: row.component });
-        }
+        let types = index
+            .types
+            .into_iter()
+            .map(|row| DescribableType { type_uuid: row.uuid, path: row.path, component: row.component })
+            .collect();
         Ok(Some((hash, TypeIndex { root, types })))
     }
 }

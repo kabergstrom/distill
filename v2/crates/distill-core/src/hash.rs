@@ -130,11 +130,22 @@ pub enum Domain {
     /// A type's default value file (newgameplus `type-defaults`, GAP 23
     /// §6): the value encoding under the schema hash it names.
     TypeDefault = 33,
+    /// A raw input recording file (newgameplus `record-input`, GAP 23
+    /// §18.4).
+    InputRecording = 34,
+    /// A type description file (newgameplus source-walk, GAP 23 §6):
+    /// docs and editor hints by planner path.
+    TypeDescription = 35,
+    /// The type index file of a type-description tree (GAP 23 §6).
+    TypeIndex = 36,
+    /// A per-type schema file of a type-description tree (GAP 23 §6): the
+    /// type's value projection and its renamed fields, or a redirect.
+    TypeSchema = 37,
 }
 
 impl Domain {
     /// Every domain, in discriminant order.
-    pub const ALL: [Domain; 33] = [
+    pub const ALL: [Domain; 37] = [
         Domain::Schema,
         Domain::Layout,
         Domain::ModuleInterface,
@@ -168,6 +179,10 @@ impl Domain {
         Domain::ModuleLayout,
         Domain::BootstrapSpec,
         Domain::TypeDefault,
+        Domain::InputRecording,
+        Domain::TypeDescription,
+        Domain::TypeIndex,
+        Domain::TypeSchema,
     ];
 
     pub fn from_u32(value: u32) -> Option<Domain> {
