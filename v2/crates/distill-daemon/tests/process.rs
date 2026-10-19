@@ -1642,3 +1642,38 @@ fn a_schema_refresh_observed_before_its_dylib_gives_one_epoch_change() {
     assert_eq!(pipeline_generation(&process), generation + 1);
     assert_eq!(process.last_background_error(), None);
 }
+
+/// newgameplus GAP 23 §18.5: the walked schema drives native memory only
+/// when it describes the module's sources, so a pipeline module whose
+/// source hash is not its watched schema's is refused (no epoch serves it)
+/// until source-walk writes the matching schema.
+#[test]
+fn a_pipeline_whose_schema_describes_other_sources_is_refused() {
+    let variants = gate_variants();
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("assets")).unwrap();
+    install_gate_pipeline(&temp, &variants.v1);
+    write_gate_schema(&temp, &variants.v2);
+    let path = temp.path().join("distill.toml");
+    std::fs::write(&path, config_source(&temp)).unwrap();
+    let process = DaemonProcess::start(DaemonConfig::load(path).unwrap()).unwrap();
+    wait_long(
+        || {
+            let store = process.coordinator().open_reader().unwrap();
+            matches!(
+                process.coordinator().pipeline_failure(&store).unwrap(),
+                Some(failure) if failure.message.contains("source hash mismatch")
+                    && failure.message.contains(&variants.v1.source_hash)
+            )
+        },
+        "a pipeline whose schema describes other sources was not refused",
+    );
+    assert_eq!(ready_dylib_hash(&process), None);
+
+    write_gate_schema(&temp, &variants.v1);
+    wait_long(
+        || ready_dylib_hash(&process) == Some(dylib_hash(&variants.v1)),
+        "the matching schema did not adopt the refused pipeline",
+    );
+    assert_eq!(process.last_background_error(), None);
+}

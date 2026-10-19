@@ -14,3 +14,4 @@ distill-wire = { path = "../distill-wire" }
 # crate's.
 ngp-schema = { path = "../../../../newgameplus/ngp-schema", default-features = false }
 distill-asset-macro = { path = "../distill-asset-macro" }
+unicode-normalization = "0.1"

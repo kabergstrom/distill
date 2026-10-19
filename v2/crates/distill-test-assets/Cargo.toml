@@ -1,0 +1,19 @@
+[package]
+name = "distill-test-assets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Distill's test asset types, walked like any asset crate (newgameplus GAP 23
+# §18.2: `source-walk --asset-crate`, committed `src/ngp_asset_types.rs` and
+# `.bin`). Tests of other Distill crates depend on it; it never ships.
+
+[dependencies]
+distill-asset = { path = "../distill-asset" }
+
+[dev-dependencies]
+distill-bundle = { path = "../distill-bundle" }
+distill-core = { path = "../distill-core" }
+distill-wire = { path = "../distill-wire" }
+ngp-schema = { path = "../../../../newgameplus/ngp-schema", default-features = false }

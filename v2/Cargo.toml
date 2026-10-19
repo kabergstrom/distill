@@ -21,6 +21,7 @@ members = [
     "crates/distill-rpc",
     "crates/distill-schema",
     "crates/distill-store",
+    "crates/distill-test-assets",
     "crates/distill-wire",
 ]
 

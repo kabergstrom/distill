@@ -94,6 +94,7 @@ pub struct CtorCursor {
 }
 
 /// One generated constructor-table entry (§12).
+#[derive(Clone, Copy)]
 pub struct CtorEntry {
     /// Begin a container of len elements/entries; dst is the MaybeUninit
     /// native slot, untouched on Err. Scalars/Box/Arc use len = 1.

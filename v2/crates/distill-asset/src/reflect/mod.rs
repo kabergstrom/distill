@@ -2,6 +2,10 @@
 //! a closed, typed vocabulary: serializable Rust kinds implement this
 //! trait; unsupported and nondeterministically seeded containers do not.
 
+pub mod compare;
+pub mod interp;
+pub mod table;
+
 use std::any::TypeId;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
