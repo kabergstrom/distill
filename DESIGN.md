@@ -7119,6 +7119,12 @@ pub struct PackDefinition {
   the topmost layer of a type (`RpcIo::status`, authoring calls);
   `layer_bound(index)`.
 - Patches stay within a layer: a new manifest plus missing blobs (above).
+- **Manifest diff**: `distilld pack-diff <old manifest> <new manifest>`
+  (`distill_pack::diff_manifests`) lists the assets the new manifest
+  removed (UUID, last path), whose content hash changed and whose path
+  changed. A game's dist build runs it against the manifest it shipped
+  last (newgameplus GAP 32 §12: saves hold asset UUIDs). Exit 2 when a
+  file does not read.
 
 ## 17. RPC Interface
 
