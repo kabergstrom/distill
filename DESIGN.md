@@ -4395,9 +4395,15 @@ write (§17) stores each written entry under the schema hash and snapshot the
 writer sends (`AuthoringService`, `distill-daemon/src/authoring.rs`), which
 need not be current. Replacing an entry stored under another schema first
 passes `check_lossless`: every field the automatic plan (with the written
-schema's renames, when it is current) drops must hold its default, and a
-refused plan needs a registered migration function; otherwise the write
-fails `LossyWrite` unless forced.
+schema's renames, when it is current) drops must hold its default; a
+change the planner refuses needs a game module edge covering it, by
+value-projection hash pair (`save-edges.bin` in the type-files root,
+newgameplus GAP 29 §8); and a write whose plan uses an edge, for the entry
+or a dynamic type inside it, must name the content key of the value it
+converted from (`AuthoringEntry::converted_from`, protocol 34), equal to the
+stored value's. Otherwise the write fails `LossyWrite` unless forced. The
+daemon does not load game code: it checks which value an edge converted,
+not the conversion.
 
 ### Integrity, not degradation
 

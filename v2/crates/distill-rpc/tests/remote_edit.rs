@@ -76,6 +76,7 @@ async fn edit_asset_through_hub_write() {
                 .unwrap_or_else(|error| panic!("edited text: {}", error.render("value")));
             let entry = AuthoringEntry {
                 root: String::new(),
+                converted_from: None,
                 uuid: inspection.uuid,
                 bundle: inspection.bundle,
                 local_id: inspection.local_id,

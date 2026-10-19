@@ -75,7 +75,11 @@ pub use crate::state::{
 /// settings are a `Patch` under the settings schema the request names;
 /// `TypeMember.editor` is a struct; the `content` key is the entry's value
 /// digest; `AuthoringSnapshot.blob` names a blob by reference.
-pub const PROTOCOL_VERSION: u32 = 33;
+///
+/// 34 (newgameplus GAP 29 §8): `AuthoringEntry.converted_from` names the
+/// stored value a write converted through a game edge; such a write is
+/// refused without it.
+pub const PROTOCOL_VERSION: u32 = 34;
 
 /// A watched import whose latest attempt failed. The bundle keeps serving its
 /// last good contents; the failure clears when a later import succeeds.
@@ -831,6 +835,11 @@ pub struct AuthoringEntry {
     /// The asset root of the bundle, by name. Empty: the bundle's own root;
     /// creating a bundle, the one configured root.
     pub root: String,
+    /// Replacing an entry stored under another schema through a game edge
+    /// (newgameplus GAP 29 §8): the content key (value digest) of the stored
+    /// value the writer converted. The daemon accepts such a write only when
+    /// it names the stored value (protocol 34); it cannot run the edge.
+    pub converted_from: Option<[u8; 16]>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

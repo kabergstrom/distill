@@ -857,6 +857,7 @@ fn authoring_entry(byte: u8, role: AuthoringEntryRole) -> AuthoringEntry {
     let schema_hash = node_hash(&SchemaNode::Blob).unwrap();
     AuthoringEntry {
         root: String::new(),
+        converted_from: None,
         uuid: asset_id(byte),
         bundle: BundleUuid([byte.wrapping_add(1); 16]),
         local_id: format!("entry-{byte}"),

@@ -1092,6 +1092,7 @@ fn rpc_io_authoring_writes_watches_and_renames_through_a_live_daemon() {
     let copy = AssetUuid([0xc1; 16]);
     let entry = AuthoringEntry {
         root: String::new(),
+        converted_from: None,
         uuid: copy,
         bundle: BundleUuid([0xc0; 16]),
         local_id: "copy".into(),
@@ -1134,6 +1135,7 @@ fn rpc_io_authoring_writes_watches_and_renames_through_a_live_daemon() {
     assert_ne!(text, *source.value.value);
     let edited = AuthoringEntry {
         root: String::new(),
+        converted_from: None,
         value: AuthoringValue { value: Arc::new(text), ..source.value.clone() },
         ..entry
     };

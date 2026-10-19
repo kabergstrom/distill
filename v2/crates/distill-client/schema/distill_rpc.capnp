@@ -642,6 +642,10 @@ struct AuthoringEntryValue {
   # The root of the bundle: empty for the bundle's own root, or, creating a
   # bundle, the one configured root (protocol 22).
   root @11 :Text;
+  # Replacing an entry stored under another schema through a game edge:
+  # the content key of the stored value converted; empty for none
+  # (protocol 34).
+  convertedFrom @12 :Data;
 }
 
 struct AuthoringOp {
