@@ -1,5 +1,6 @@
 //! Shared test scaffolding: leak helpers and native-tree builders (the
-//! trees #[asset] would generate as statics; tests leak instead).
+//! trees `distill-asset` builds once per process from a walked table;
+//! tests leak instead).
 #![allow(dead_code)]
 
 use distill_wire::native::{

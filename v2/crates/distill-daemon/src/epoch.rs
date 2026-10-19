@@ -42,7 +42,6 @@ pub use distill_pipeline_api::registration::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostCallbackSurface {
     Registry,
-    EncodeSink,
     AuthoringImportContext,
     ProcessContext,
     CodegenContext,
@@ -52,7 +51,6 @@ impl HostCallbackSurface {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Registry => "Registry",
-            Self::EncodeSink => "EncodeSink",
             Self::AuthoringImportContext => "AuthoringImportContext",
             Self::ProcessContext => "ProcessContext",
             Self::CodegenContext => "CodegenContext",

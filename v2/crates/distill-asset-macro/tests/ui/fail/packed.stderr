@@ -1,5 +1,0 @@
-error: packed asset structs are unsupported because generated safe encoders must borrow fields
- --> tests/ui/fail/packed.rs:5:8
-  |
-5 | struct Bad {
-  |        ^^^

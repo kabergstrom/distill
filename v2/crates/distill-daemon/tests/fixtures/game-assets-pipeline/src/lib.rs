@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use distill_asset::{AssetReflect, AssetType};
+use distill_asset::{to_value, AssetType};
 use distill_core::id::TypeUuid;
 use distill_pipeline_api::callbacks::{
     ImporterDescriptor, PipelineProcessContext, PipelineProcessor, ProcessorDescriptor,
@@ -75,7 +75,7 @@ fn cook_texture(value: &str) -> Result<Value, ProcessorError> {
         );
     }
     texel.push(255);
-    Ok(newgameplus_assets::TextureAsset {
+    Ok(to_value(&newgameplus_assets::TextureAsset {
         width: 2,
         height: 2,
         depth: 1,
@@ -84,8 +84,7 @@ fn cook_texture(value: &str) -> Result<Value, ProcessorError> {
         dimension: newgameplus_assets::TEXTURE_DIMENSION_2D,
         format: newgameplus_assets::FORMAT_R8G8B8A8_UNORM,
         data: texel.repeat(5).into(),
-    }
-    .to_value())
+    }))
 }
 
 fn cook_mesh(value: &str) -> Result<Value, ProcessorError> {
@@ -152,11 +151,10 @@ fn cook_mesh(value: &str) -> Result<Value, ProcessorError> {
         .flat_map(u16::to_le_bytes)
         .collect::<Vec<_>>();
     // The triangle's u16 indices as the terminal's blob.
-    Ok(newgameplus_assets::FontAsset {
+    Ok(to_value(&newgameplus_assets::FontAsset {
         index: 0,
         data: indices.into(),
-    }
-    .to_value())
+    }))
 }
 
 fn cook_shader(value: &str) -> Result<Value, ProcessorError> {
@@ -169,11 +167,10 @@ fn cook_shader(value: &str) -> Result<Value, ProcessorError> {
         &rafx_shader_processor::CookOptions { vulkan: true, ..Default::default() },
     )
     .map_err(|error| ProcessorError::new(30, error.to_string()))?;
-    Ok(newgameplus_assets::CookedPipeline {
+    Ok(to_value(&newgameplus_assets::CookedPipeline {
         cooked: cooked.into(),
         bindings_hash: 0,
-    }
-    .to_value())
+    }))
 }
 
 struct GameAssetsImporter;

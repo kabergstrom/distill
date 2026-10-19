@@ -32,7 +32,6 @@ pub static NGP_ASSET_TABLE: AssetTable = AssetTable {
         E { key: "distill_test_assets::recursion::Tree", size: t::size::<crate::recursion::Tree>(), align: t::align::<crate::recursion::Tree>(), drop: t::drop::<crate::recursion::Tree>(), default: Some(t::default::<crate::recursion::Tree>), finalize: Some(t::finalize::<crate::recursion::Tree>) },
         E { key: "distill_test_assets::runtime::Counted", size: t::size::<crate::runtime::Counted>(), align: t::align::<crate::runtime::Counted>(), drop: t::drop::<crate::runtime::Counted>(), default: None, finalize: Some(t::finalize::<crate::runtime::Counted>) },
         E { key: "distill_test_assets::runtime::PanickingDrop", size: t::size::<crate::runtime::PanickingDrop>(), align: t::align::<crate::runtime::PanickingDrop>(), drop: t::drop::<crate::runtime::PanickingDrop>(), default: None, finalize: Some(t::finalize::<crate::runtime::PanickingDrop>) },
-        E { key: "distill_test_assets::runtime::Plain", size: t::size::<crate::runtime::Plain>(), align: t::align::<crate::runtime::Plain>(), drop: t::drop::<crate::runtime::Plain>(), default: None, finalize: Some(t::finalize::<crate::runtime::Plain>) },
         E { key: "distill_test_assets::semantic::Example", size: t::size::<crate::semantic::Example>(), align: t::align::<crate::semantic::Example>(), drop: t::drop::<crate::semantic::Example>(), default: Some(t::default::<crate::semantic::Example>), finalize: Some(t::finalize::<crate::semantic::Example>) },
         E { key: "distill_test_assets::semantic::Inner", size: t::size::<crate::semantic::Inner>(), align: t::align::<crate::semantic::Inner>(), drop: t::drop::<crate::semantic::Inner>(), default: Some(t::default::<crate::semantic::Inner>), finalize: Some(t::finalize::<crate::semantic::Inner>) },
         E { key: "distill_test_assets::semantic::Level", size: t::size::<crate::semantic::Level>(), align: t::align::<crate::semantic::Level>(), drop: t::drop::<crate::semantic::Level>(), default: Some(t::default::<crate::semantic::Level>), finalize: Some(t::finalize::<crate::semantic::Level>) },
@@ -65,274 +64,515 @@ pub static NGP_ASSET_TABLE: AssetTable = AssetTable {
     registry: ::distill_asset::reflect::interp::Registry::new(),
 };
 
+unsafe impl ::distill_asset::AssetType for crate::defaults::Inner {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0xa5, 0xd0, 0x00, 0x02, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(0)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::defaults::Mode {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0xa5, 0xd0, 0x00, 0x03, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(1)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::defaults::OldInner {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0xa5, 0xd0, 0x00, 0x12, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(2)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::defaults::OldMode {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0xa5, 0xd0, 0x00, 0x13, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(3)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::defaults::OldOuter {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0xa5, 0xd0, 0x00, 0x11, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(4)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::defaults::Outer {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0xa5, 0xd0, 0x00, 0x01, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(5)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::loader::A {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x41, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(6)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::loader::B {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x42, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(7)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::loader::BuildOnly {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x43, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(8)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::loader::Counted {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x44, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(9)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::loader::PackA {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x61, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(10)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::loader::PanickingAssetDrop {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x30, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(11)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::loader::ProjectRow {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x91, 0x11, 0x22, 0x33, 0x44, 0x55, 0x46, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(12)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::loader::RpcA {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x51, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(13)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::recursion::Child {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(14)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::recursion::Kind {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(15)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::recursion::Node {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(16)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::recursion::Recursive {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x12, 0x11, 0x01, 0x01, 0x02, 0x02, 0x43, 0x03, 0x84, 0x04, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(17)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::recursion::Tree {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(18)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::runtime::Counted {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(19)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::runtime::PanickingDrop {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x10, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(20)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::semantic::Example {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x84, 0x44, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(21)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::semantic::Inner {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x01, 0x01, 0x01, 0x01, 0x02, 0x02, 0x43, 0x03, 0x84, 0x04, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(22)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::semantic::Level {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(23)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::semantic::Nested {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x11, 0x11, 0x01, 0x01, 0x02, 0x02, 0x43, 0x03, 0x84, 0x04, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(24)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::semantic::ReferenceTarget {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(25)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::semantic::RenamedShape {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(26)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::semantic::RevisedShape {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(27)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::semantic::SameShapeA {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(28)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::semantic::SameShapeB {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(29)
+    }
+}
+
+unsafe impl ::distill_asset::AssetType for crate::semantic::SemanticFacts {
+    const TYPE_UUID: ::distill_asset::TypeUuid = ::distill_asset::TypeUuid([0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02]);
+    fn info() -> &'static ::distill_asset::reflect::interp::TypeInfo {
+        NGP_ASSET_TABLE.info(30)
+    }
+}
+
 // Layout checks: the schema's numbers are this build's.
 
-const _: () = {
-    assert!(t::size::<crate::defaults::Inner>() == 32, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::defaults::Inner>() == 8, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::defaults::Inner, a) == 24, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::defaults::Inner, added) == 28, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::defaults::Inner, name) == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::defaults::Inner>() == 32
+        && t::align::<crate::defaults::Inner>() == 8
+        && ::core::mem::offset_of!(crate::defaults::Inner, a) == 24
+        && ::core::mem::offset_of!(crate::defaults::Inner, added) == 28
+        && ::core::mem::offset_of!(crate::defaults::Inner, name) == 0,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::defaults::Inner) { let crate::defaults::Inner { a: f0, added: f1, name: f2 } = v; let _: &u32 = f0; let _: &u32 = f1; let _: &::distill_asset::reflect::table::std_names::String = f2; }
 };
-const _: () = {
-    assert!(t::size::<crate::defaults::Mode>() == 12, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::defaults::Mode>() == 4, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align_up(1usize, t::align::<u32>()) == 4, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align_up(4 + t::size::<u32>(), t::align::<u32>()) == 8, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::defaults::Mode>() == 12
+        && t::align::<crate::defaults::Mode>() == 4
+        && t::align_up(1usize, t::align::<u32>()) == 4
+        && t::align_up(4 + t::size::<u32>(), t::align::<u32>()) == 8,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::defaults::Mode) { match v { crate::defaults::Mode::Off {  } => {  }, crate::defaults::Mode::On { level: f0, extra: f1 } => { let _: &u32 = f0; let _: &u32 = f1; } } }
 };
-const _: () = {
-    assert!(t::size::<crate::defaults::OldInner>() == 32, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::defaults::OldInner>() == 8, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::defaults::OldInner, a) == 24, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::defaults::OldInner, name) == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::defaults::OldInner>() == 32
+        && t::align::<crate::defaults::OldInner>() == 8
+        && ::core::mem::offset_of!(crate::defaults::OldInner, a) == 24
+        && ::core::mem::offset_of!(crate::defaults::OldInner, name) == 0,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::defaults::OldInner) { let crate::defaults::OldInner { a: f0, name: f1 } = v; let _: &u32 = f0; let _: &::distill_asset::reflect::table::std_names::String = f1; }
 };
-const _: () = {
-    assert!(t::size::<crate::defaults::OldMode>() == 8, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::defaults::OldMode>() == 4, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align_up(1usize, t::align::<u32>()) == 4, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::defaults::OldMode>() == 8
+        && t::align::<crate::defaults::OldMode>() == 4
+        && t::align_up(1usize, t::align::<u32>()) == 4,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::defaults::OldMode) { match v { crate::defaults::OldMode::Off {  } => {  }, crate::defaults::OldMode::On { level: f0 } => { let _: &u32 = f0; } } }
 };
-const _: () = {
-    assert!(t::size::<crate::defaults::OldOuter>() == 32, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::defaults::OldOuter>() == 8, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::defaults::OldOuter, items) == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::defaults::OldOuter, mode) == 24, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::defaults::OldOuter>() == 32
+        && t::align::<crate::defaults::OldOuter>() == 8
+        && ::core::mem::offset_of!(crate::defaults::OldOuter, items) == 0
+        && ::core::mem::offset_of!(crate::defaults::OldOuter, mode) == 24,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::defaults::OldOuter) { let crate::defaults::OldOuter { items: f0, mode: f1 } = v; let _: &::distill_asset::reflect::table::std_names::Vec<crate::defaults::OldInner> = f0; let _: &crate::defaults::OldMode = f1; }
 };
-const _: () = {
-    assert!(t::size::<crate::defaults::Outer>() == 40, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::defaults::Outer>() == 8, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::defaults::Outer, items) == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::defaults::Outer, mode) == 24, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::defaults::Outer>() == 40
+        && t::align::<crate::defaults::Outer>() == 8
+        && ::core::mem::offset_of!(crate::defaults::Outer, items) == 0
+        && ::core::mem::offset_of!(crate::defaults::Outer, mode) == 24,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::defaults::Outer) { let crate::defaults::Outer { items: f0, mode: f1 } = v; let _: &::distill_asset::reflect::table::std_names::Vec<crate::defaults::Inner> = f0; let _: &crate::defaults::Mode = f1; }
 };
-const _: () = {
-    assert!(t::size::<crate::loader::A>() == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::loader::A>() == 1, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::loader::A>() == 0
+        && t::align::<crate::loader::A>() == 1,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::loader::A) { let crate::loader::A {  } = v;  }
 };
-const _: () = {
-    assert!(t::size::<crate::loader::B>() == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::loader::B>() == 1, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::loader::B>() == 0
+        && t::align::<crate::loader::B>() == 1,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::loader::B) { let crate::loader::B {  } = v;  }
 };
-const _: () = {
-    assert!(t::size::<crate::loader::BuildOnly>() == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::loader::BuildOnly>() == 1, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::loader::BuildOnly>() == 0
+        && t::align::<crate::loader::BuildOnly>() == 1,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::loader::BuildOnly) { let crate::loader::BuildOnly {  } = v;  }
 };
-const _: () = {
-    assert!(t::size::<crate::loader::Counted>() == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::loader::Counted>() == 1, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::loader::Counted>() == 0
+        && t::align::<crate::loader::Counted>() == 1,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::loader::Counted) { let crate::loader::Counted {  } = v;  }
 };
-const _: () = {
-    assert!(t::size::<crate::loader::PackA>() == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::loader::PackA>() == 1, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::loader::PackA>() == 0
+        && t::align::<crate::loader::PackA>() == 1,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::loader::PackA) { let crate::loader::PackA {  } = v;  }
 };
-const _: () = {
-    assert!(t::size::<crate::loader::PanickingAssetDrop>() == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::loader::PanickingAssetDrop>() == 1, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::loader::PanickingAssetDrop>() == 0
+        && t::align::<crate::loader::PanickingAssetDrop>() == 1,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::loader::PanickingAssetDrop) { let crate::loader::PanickingAssetDrop {  } = v;  }
 };
-const _: () = {
-    assert!(t::size::<crate::loader::ProjectRow>() == 8, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::loader::ProjectRow>() == 4, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::loader::ProjectRow, alpha) == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::loader::ProjectRow, beta) == 4, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::loader::ProjectRow>() == 8
+        && t::align::<crate::loader::ProjectRow>() == 4
+        && ::core::mem::offset_of!(crate::loader::ProjectRow, alpha) == 0
+        && ::core::mem::offset_of!(crate::loader::ProjectRow, beta) == 4,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::loader::ProjectRow) { let crate::loader::ProjectRow { alpha: f0, beta: f1 } = v; let _: &u32 = f0; let _: &u16 = f1; }
 };
-const _: () = {
-    assert!(t::size::<crate::loader::RpcA>() == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::loader::RpcA>() == 1, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::loader::RpcA>() == 0
+        && t::align::<crate::loader::RpcA>() == 1,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::loader::RpcA) { let crate::loader::RpcA {  } = v;  }
 };
-const _: () = {
-    assert!(t::size::<crate::recursion::Child>() == 56, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::recursion::Child>() == 8, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::recursion::Child, min) == 48, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::recursion::Child, node) == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::recursion::Child, alt) == 40, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::recursion::Child>() == 56
+        && t::align::<crate::recursion::Child>() == 8
+        && ::core::mem::offset_of!(crate::recursion::Child, min) == 48
+        && ::core::mem::offset_of!(crate::recursion::Child, node) == 0
+        && ::core::mem::offset_of!(crate::recursion::Child, alt) == 40,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::recursion::Child) { let crate::recursion::Child { min: f0, node: f1, alt: f2 } = v; let _: &u32 = f0; let _: &crate::recursion::Node = f1; let _: &::distill_asset::reflect::table::std_names::Option<::distill_asset::reflect::table::std_names::Box<crate::recursion::Node>> = f2; }
 };
-const _: () = {
-    assert!(t::size::<crate::recursion::Node>() == 40, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::recursion::Node>() == 8, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::recursion::Node, kind) == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::recursion::Node, gain) == 32, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::recursion::Node>() == 40
+        && t::align::<crate::recursion::Node>() == 8
+        && ::core::mem::offset_of!(crate::recursion::Node, kind) == 0
+        && ::core::mem::offset_of!(crate::recursion::Node, gain) == 32,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::recursion::Node) { let crate::recursion::Node { kind: f0, gain: f1 } = v; let _: &crate::recursion::Kind = f0; let _: &u32 = f1; }
 };
-const _: () = {
-    assert!(t::size::<crate::recursion::Kind>() == 32, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::recursion::Kind>() == 8, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align_up(1usize, t::align::<u32>()) == 4, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align_up(1usize, t::align::<::distill_asset::reflect::table::std_names::Vec<crate::recursion::Node>>()) == 8, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align_up(1usize, t::align::<::distill_asset::reflect::table::std_names::Vec<crate::recursion::Child>>()) == 8, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::recursion::Kind>() == 32
+        && t::align::<crate::recursion::Kind>() == 8
+        && t::align_up(1usize, t::align::<u32>()) == 4
+        && t::align_up(1usize, t::align::<::distill_asset::reflect::table::std_names::Vec<crate::recursion::Node>>()) == 8
+        && t::align_up(1usize, t::align::<::distill_asset::reflect::table::std_names::Vec<crate::recursion::Child>>()) == 8,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::recursion::Kind) { match v { crate::recursion::Kind::Leaf { id: f0 } => { let _: &u32 = f0; }, crate::recursion::Kind::Many { children: f0 } => { let _: &::distill_asset::reflect::table::std_names::Vec<crate::recursion::Node> = f0; }, crate::recursion::Kind::Switch { children: f0 } => { let _: &::distill_asset::reflect::table::std_names::Vec<crate::recursion::Child> = f0; } } }
 };
-const _: () = {
-    assert!(t::size::<crate::recursion::Recursive>() == 16, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::recursion::Recursive>() == 8, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::recursion::Recursive, child) == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::recursion::Recursive, number) == 8, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::recursion::Recursive>() == 16
+        && t::align::<crate::recursion::Recursive>() == 8
+        && ::core::mem::offset_of!(crate::recursion::Recursive, child) == 0
+        && ::core::mem::offset_of!(crate::recursion::Recursive, number) == 8,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::recursion::Recursive) { let crate::recursion::Recursive { child: f0, number: f1 } = v; let _: &::distill_asset::reflect::table::std_names::Option<::distill_asset::reflect::table::std_names::Box<crate::recursion::Recursive>> = f0; let _: &u32 = f1; }
 };
-const _: () = {
-    assert!(t::size::<crate::recursion::Tree>() == 80, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::recursion::Tree>() == 8, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::recursion::Tree, root) == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::recursion::Tree, release) == 40, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::recursion::Tree>() == 80
+        && t::align::<crate::recursion::Tree>() == 8
+        && ::core::mem::offset_of!(crate::recursion::Tree, root) == 0
+        && ::core::mem::offset_of!(crate::recursion::Tree, release) == 40,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::recursion::Tree) { let crate::recursion::Tree { root: f0, release: f1 } = v; let _: &crate::recursion::Node = f0; let _: &::distill_asset::reflect::table::std_names::Option<crate::recursion::Node> = f1; }
 };
-const _: () = {
-    assert!(t::size::<crate::runtime::Counted>() == 8, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::runtime::Counted>() == 8, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::runtime::Counted, drops) == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::runtime::Counted>() == 8
+        && t::align::<crate::runtime::Counted>() == 8
+        && ::core::mem::offset_of!(crate::runtime::Counted, drops) == 0,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::runtime::Counted) { let crate::runtime::Counted { drops: f0 } = v;  }
 };
-const _: () = {
-    assert!(t::size::<crate::runtime::PanickingDrop>() == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::runtime::PanickingDrop>() == 1, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::runtime::PanickingDrop>() == 0
+        && t::align::<crate::runtime::PanickingDrop>() == 1,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::runtime::PanickingDrop) { let crate::runtime::PanickingDrop {  } = v;  }
 };
-const _: () = {
-    assert!(t::size::<crate::runtime::Plain>() == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::runtime::Plain>() == 1, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
-const _: () = {
-    fn _check(v: &crate::runtime::Plain) { let crate::runtime::Plain {  } = v;  }
-};
-const _: () = {
-    assert!(t::size::<crate::semantic::Example>() == 112, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::semantic::Example>() == 8, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::semantic::Example, z) == 104, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::semantic::Example, name) == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::semantic::Example, values) == 24, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::semantic::Example, map) == 48, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::semantic::Example, cache) == 80, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::semantic::Example>() == 112
+        && t::align::<crate::semantic::Example>() == 8
+        && ::core::mem::offset_of!(crate::semantic::Example, z) == 104
+        && ::core::mem::offset_of!(crate::semantic::Example, name) == 0
+        && ::core::mem::offset_of!(crate::semantic::Example, values) == 24
+        && ::core::mem::offset_of!(crate::semantic::Example, map) == 48
+        && ::core::mem::offset_of!(crate::semantic::Example, cache) == 80,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::semantic::Example) { let crate::semantic::Example { z: f0, name: f1, values: f2, map: f3, cache: f4 } = v; let _: &u16 = f0; let _: &::distill_asset::reflect::table::std_names::String = f1; let _: &::distill_asset::reflect::table::std_names::Vec<u32> = f2; let _: &::distill_asset::reflect::table::std_names::HashMap<u32, ::distill_asset::reflect::table::std_names::String, ::distill_asset::DeterministicState> = f3; }
 };
-const _: () = {
-    assert!(t::size::<crate::semantic::Inner>() == 4, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::semantic::Inner>() == 4, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::semantic::Inner, number) == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::semantic::Inner>() == 4
+        && t::align::<crate::semantic::Inner>() == 4
+        && ::core::mem::offset_of!(crate::semantic::Inner, number) == 0,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::semantic::Inner) { let crate::semantic::Inner { number: f0 } = v; let _: &u32 = f0; }
 };
-const _: () = {
-    assert!(t::size::<crate::semantic::Level>() == 2, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::semantic::Level>() == 2, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!((crate::semantic::Level::Low as u128) & 0xffff == 7, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!((crate::semantic::Level::High as u128) & 0xffff == 300, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::semantic::Level>() == 2
+        && t::align::<crate::semantic::Level>() == 2
+        && (crate::semantic::Level::Low as u128) & 0xffff == 7
+        && (crate::semantic::Level::High as u128) & 0xffff == 300,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::semantic::Level) { match v { crate::semantic::Level::Low {  } => {  }, crate::semantic::Level::High {  } => {  } } }
 };
-const _: () = {
-    assert!(t::size::<crate::semantic::Nested>() == 24, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::semantic::Nested>() == 8, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::semantic::Nested, values) == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::semantic::Nested>() == 24
+        && t::align::<crate::semantic::Nested>() == 8
+        && ::core::mem::offset_of!(crate::semantic::Nested, values) == 0,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::semantic::Nested) { let crate::semantic::Nested { values: f0 } = v; let _: &::distill_asset::reflect::table::std_names::Vec<crate::semantic::Inner> = f0; }
 };
-const _: () = {
-    assert!(t::size::<crate::semantic::ReferenceTarget>() == 4, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::semantic::ReferenceTarget>() == 4, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::semantic::ReferenceTarget, value) == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::semantic::ReferenceTarget>() == 4
+        && t::align::<crate::semantic::ReferenceTarget>() == 4
+        && ::core::mem::offset_of!(crate::semantic::ReferenceTarget, value) == 0,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::semantic::ReferenceTarget) { let crate::semantic::ReferenceTarget { value: f0 } = v; let _: &u32 = f0; }
 };
-const _: () = {
-    assert!(t::size::<crate::semantic::RenamedShape>() == 4, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::semantic::RenamedShape>() == 4, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::semantic::RenamedShape, value) == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::semantic::RenamedShape>() == 4
+        && t::align::<crate::semantic::RenamedShape>() == 4
+        && ::core::mem::offset_of!(crate::semantic::RenamedShape, value) == 0,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::semantic::RenamedShape) { let crate::semantic::RenamedShape { value: f0 } = v; let _: &u32 = f0; }
 };
-const _: () = {
-    assert!(t::size::<crate::semantic::RevisedShape>() == 4, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::semantic::RevisedShape>() == 4, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::semantic::RevisedShape, value) == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::semantic::RevisedShape>() == 4
+        && t::align::<crate::semantic::RevisedShape>() == 4
+        && ::core::mem::offset_of!(crate::semantic::RevisedShape, value) == 0,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::semantic::RevisedShape) { let crate::semantic::RevisedShape { value: f0 } = v; let _: &u32 = f0; }
 };
-const _: () = {
-    assert!(t::size::<crate::semantic::SameShapeA>() == 4, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::semantic::SameShapeA>() == 4, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::semantic::SameShapeA, value) == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::semantic::SameShapeA>() == 4
+        && t::align::<crate::semantic::SameShapeA>() == 4
+        && ::core::mem::offset_of!(crate::semantic::SameShapeA, value) == 0,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::semantic::SameShapeA) { let crate::semantic::SameShapeA { value: f0 } = v; let _: &u32 = f0; }
 };
-const _: () = {
-    assert!(t::size::<crate::semantic::SameShapeB>() == 4, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::semantic::SameShapeB>() == 4, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::semantic::SameShapeB, value) == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::semantic::SameShapeB>() == 4
+        && t::align::<crate::semantic::SameShapeB>() == 4
+        && ::core::mem::offset_of!(crate::semantic::SameShapeB, value) == 0,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::semantic::SameShapeB) { let crate::semantic::SameShapeB { value: f0 } = v; let _: &u32 = f0; }
 };
-const _: () = {
-    assert!(t::size::<crate::semantic::SemanticFacts>() == 88, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(t::align::<crate::semantic::SemanticFacts>() == 8, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::semantic::SemanticFacts, strong) == 56, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::semantic::SemanticFacts, weak) == 72, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::semantic::SemanticFacts, payload) == 24, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-    assert!(::core::mem::offset_of!(crate::semantic::SemanticFacts, label) == 0, "stale ngp_asset_types.rs: run source-walk --asset-crate");
-};
+const _: () = assert!(
+    t::size::<crate::semantic::SemanticFacts>() == 88
+        && t::align::<crate::semantic::SemanticFacts>() == 8
+        && ::core::mem::offset_of!(crate::semantic::SemanticFacts, strong) == 56
+        && ::core::mem::offset_of!(crate::semantic::SemanticFacts, weak) == 72
+        && ::core::mem::offset_of!(crate::semantic::SemanticFacts, payload) == 24
+        && ::core::mem::offset_of!(crate::semantic::SemanticFacts, label) == 0,
+    "stale ngp_asset_types.rs: run source-walk --asset-crate"
+);
 const _: () = {
     fn _check(v: &crate::semantic::SemanticFacts) { let crate::semantic::SemanticFacts { strong: f0, weak: f1, payload: f2, label: f3 } = v; let _: &::distill_asset::AssetRef<crate::semantic::ReferenceTarget> = f0; let _: &::distill_asset::WeakAssetRef<crate::semantic::ReferenceTarget> = f1; let _: &::distill_asset::Blob = f2; let _: &::distill_asset::reflect::table::std_names::String = f3; }
 };

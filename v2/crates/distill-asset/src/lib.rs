@@ -1,9 +1,8 @@
 //! distill-asset: the asset-types support crate — the §4 runtime
 //! declarations (`AssetType`, `AssetRuntimeDescriptor`, `ErasedValue`,
-//! `EncodeSink`, `AssetRef`/`WeakAssetRef` native forms), the §3 `DefaultTable`
-//! vocabulary, the §5 deterministic `BuildHasher`, and the reflection/
-//! builder machinery `#[asset]`-generated code (distill-asset-macro)
-//! runs against.
+//! `AssetRef`/`WeakAssetRef` native forms), the §5 deterministic
+//! `BuildHasher`, and asset reflection: the interpreter over each asset
+//! crate's walk-generated table (newgameplus GAP 23 §18).
 //!
 //! §4 pins these declarations but names no crate for them ("Native
 //! forms, defined by the asset-types crate"; §5: "the asset-types
@@ -11,23 +10,18 @@
 //! crate. The §12 generated-table types themselves live in distill-wire
 //! and are re-exported, never redeclared.
 
-pub mod build;
-pub mod defaults;
 pub mod hasher;
 pub mod reflect;
 pub mod thunks;
 pub mod types;
 
-pub use defaults::{
-    default_table, AssetDefaults, DefaultCollector, DefaultNode, DefaultNodeType, DefaultTable,
-    DefaultWriter, PathStep, SchemaNodeId,
-};
-pub use distill_asset_macro::asset;
 pub use hasher::{AssetHashMap, AssetHashSet, DeterministicState};
-pub use reflect::AssetReflect;
+/// `#[derive(Asset)]`: marks an asset type for source-walk; inert.
+pub use newgameplus_api_macros::Asset;
+pub use reflect::{default_value, logical, to_value};
 pub use types::{
-    AssetRef, AssetRuntimeDescriptor, AssetType, DynamicPatch, EncodeContainer, EncodeSink,
-    EpochToken, ErasedValue, ModuleEpochPoisonCause, ModuleEpochToken, WeakAssetRef,
+    AssetRef, AssetRuntimeDescriptor, AssetType, DynamicPatch, EpochToken, ErasedValue,
+    ModuleEpochPoisonCause, ModuleEpochToken, WeakAssetRef,
 };
 
 // The §12 vocabulary, re-exported for generated code and consumers —

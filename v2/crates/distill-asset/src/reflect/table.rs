@@ -13,12 +13,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{BuildHasher, Hash};
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use distill_wire::native::{CallbackPanic, CtorEntry, SkipEntry};
 
-use crate::{AssetType, EpochToken, ErasedValue};
+use crate::{EpochToken, ErasedValue};
 
 /// std names for the generated table.
 pub mod std_names {
@@ -117,26 +116,10 @@ pub const fn drop<T>() -> Option<DropThunk> {
     }
 }
 
-/// # Safety
-/// `dst` must be aligned, writable and uninitialized for a `T`.
-pub unsafe fn default<T: Default>(dst: *mut u8) -> Result<(), CallbackPanic> {
-    let value = catch_unwind(T::default).map_err(|_| CallbackPanic)?;
-    std::ptr::write(dst.cast::<T>(), value);
-    Ok(())
-}
-
-/// Move a complete `T` out of a plan-execution buffer into its erased form
+/// `default::<T>` writes `T::default()`; `finalize::<T>` moves a complete
+/// `T` out of a plan-execution buffer into its erased form
 /// (`AssetRuntimeDescriptor::finalize`).
-///
-/// # Safety
-/// `src` must hold a complete `T`; afterwards it is uninitialized.
-pub unsafe fn finalize<T: AssetType>(src: *mut u8, owner: EpochToken) -> Result<ErasedValue, CallbackPanic> {
-    catch_unwind(AssertUnwindSafe(|| {
-        let value = std::ptr::read(src.cast::<T>());
-        ErasedValue::new_in(value, owner)
-    }))
-    .map_err(|_| CallbackPanic)
-}
+pub use crate::thunks::{finalize, write_default as default};
 
 pub fn skip<T: Default>() -> SkipEntry {
     crate::thunks::skip_entry::<T>()

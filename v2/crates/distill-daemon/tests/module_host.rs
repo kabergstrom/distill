@@ -14,14 +14,7 @@ use distill_daemon::epoch::{
     RegistrationResource, RegistrationSet, StagedModule, TargetDefinition,
 };
 
-#[distill_asset::asset(uuid = "30112233-4455-6677-8899-aabbccddeeff")]
-struct PanickingAssetDrop;
-
-impl Drop for PanickingAssetDrop {
-    fn drop(&mut self) {
-        panic!("module asset drop failed")
-    }
-}
+use distill_test_assets::loader::PanickingAssetDrop;
 
 #[derive(Default, Debug)]
 struct Calls {
@@ -1022,7 +1015,6 @@ fn wrong_module_abi_is_rejected_before_register() {
 fn host_reverse_callback_boundary_contains_panics_on_all_audited_surfaces() {
     for surface in [
         HostCallbackSurface::Registry,
-        HostCallbackSurface::EncodeSink,
         HostCallbackSurface::AuthoringImportContext,
         HostCallbackSurface::ProcessContext,
         HostCallbackSurface::CodegenContext,

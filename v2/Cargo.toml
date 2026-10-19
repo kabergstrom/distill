@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/distill-asset",
-    "crates/distill-asset-macro",
     "crates/distill-bundle",
     "crates/distill-build",
     "crates/distill-client",

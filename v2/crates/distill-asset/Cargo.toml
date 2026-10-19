@@ -13,5 +13,6 @@ distill-wire = { path = "../distill-wire" }
 # The typed value model (`to_value`, default writers) is the shared schema
 # crate's.
 ngp-schema = { path = "../../../../newgameplus/ngp-schema", default-features = false }
-distill-asset-macro = { path = "../distill-asset-macro" }
+# `#[derive(Asset)]`, inert (newgameplus GAP 23 §18.2).
+newgameplus-api-macros = { path = "../../../../newgameplus/newgameplus-api-macros" }
 unicode-normalization = "0.1"

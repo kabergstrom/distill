@@ -13,3 +13,6 @@ distill-wire = { path = "../distill-wire" }
 # This crate holds only the daemon-side registry on top of it.
 ngp-schema = { path = "../../../../newgameplus/ngp-schema" }
 unicode-normalization = { workspace = true }
+
+[dev-dependencies]
+distill-test-assets = { path = "../distill-test-assets" }

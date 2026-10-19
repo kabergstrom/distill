@@ -237,16 +237,16 @@ impl<'a> RegistrationArena<'a> {
         self.host.install_callback(registration, callback)
     }
 
-    /// Register `T`'s generated `DefaultTable` as its migration defaults, so
-    /// an automatic migration adding a field fills it from `Default`.
-    pub fn register_asset_defaults<T: distill_asset::AssetDefaults>(
+    /// Register `T`'s reflected defaults as its migration defaults, so an
+    /// automatic migration adding a field fills it from `Default`.
+    pub fn register_asset_defaults<T: distill_asset::AssetType>(
         &mut self,
     ) -> RegistrationStatus {
         self.register_defaults(
             DefaultsDescriptor {
                 type_uuid: T::TYPE_UUID,
             },
-            crate::asset_defaults::AssetTableDefaults::<T>::new(),
+            crate::asset_defaults::AssetTableDefaults::of::<T>(),
         )
     }
 
@@ -286,13 +286,13 @@ impl<'a> RegistrationArena<'a> {
         self.host.install_callback(registration, callback)
     }
 
-    /// [`Self::register_authored`] for an `#[asset]` type: its default is
+    /// [`Self::register_authored`] for an asset type: its default is
     /// `T::default()`, its logical hash the type's own.
     pub fn register_authored_asset<T>(&mut self, extension: &str, local_id: &str, doc: &str) -> RegistrationStatus
     where
-        T: distill_asset::AssetType + distill_asset::AssetReflect + Default,
+        T: distill_asset::AssetType + Default,
     {
-        let default = match distill_asset::defaults::write_default::<T>() {
+        let default = match distill_asset::default_value::<T>() {
             Ok(value) => value,
             Err(_) => {
                 return RegistrationStatus {

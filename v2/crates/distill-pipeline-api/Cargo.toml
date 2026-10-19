@@ -12,3 +12,6 @@ distill-bundle = { path = "../distill-bundle" }
 distill-core = { path = "../distill-core" }
 distill-migrate = { path = "../distill-migrate" }
 ngp-schema = { path = "../../../../newgameplus/ngp-schema" }
+
+[dev-dependencies]
+distill-test-assets = { path = "../distill-test-assets" }

@@ -14,6 +14,7 @@ distill-protocol = { path = "../distill-protocol" }
 distill-wire = { path = "../distill-wire" }
 
 [dev-dependencies]
+distill-test-assets = { path = "../distill-test-assets" }
 distill-asset = { path = "../distill-asset" }
 # The layer-stack tests put a daemon layer (`RpcIo`) above packs.
 distill-loader = { path = "../distill-loader", features = ["rpc"] }

@@ -18,6 +18,7 @@ default = ["rpc"]
 rpc = ["dep:distill-client", "dep:tokio"]
 
 [dev-dependencies]
+distill-test-assets = { path = "../distill-test-assets" }
 # The RPC tests run a daemon-side server on a store.
 distill-store = { path = "../distill-store" }
 capnp = "0.26.2"

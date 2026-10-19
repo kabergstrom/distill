@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use distill_asset::{AssetType, ErasedValue, ModuleEpochToken};
@@ -17,25 +17,7 @@ use distill_wire::dswl::{dswl_bytes, dswl_hash};
 use distill_wire::native::CallbackPanic;
 use distill_wire::wire::WireNode;
 
-#[distill_asset::asset(uuid = "41112233-4455-6677-8899-aabbccddeeff")]
-struct A;
-
-#[distill_asset::asset(uuid = "42112233-4455-6677-8899-aabbccddeeff")]
-struct B;
-
-#[distill_asset::asset(uuid = "43112233-4455-6677-8899-aabbccddeeff", build_only)]
-struct BuildOnly;
-
-static COUNTED_DROPS: AtomicUsize = AtomicUsize::new(0);
-
-#[distill_asset::asset(uuid = "44112233-4455-6677-8899-aabbccddeeff")]
-struct Counted;
-
-impl Drop for Counted {
-    fn drop(&mut self) {
-        COUNTED_DROPS.fetch_add(1, Ordering::SeqCst);
-    }
-}
+use distill_test_assets::loader::{A, B, BuildOnly, Counted, COUNTED_DROPS};
 
 fn blob(bytes: Vec<u8>) -> distill_wire::exec::Blob {
     let len = bytes.len();

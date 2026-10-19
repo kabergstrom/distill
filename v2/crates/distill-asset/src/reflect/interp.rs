@@ -267,14 +267,9 @@ fn type_info(ops: &Ops, plan: &'static Plan, id: SchemaTypeId, entry: &TypeEntry
         drops,
         skip_writers: skips,
         finalize: entry.finalize.expect("asset type finalize thunk"),
-        encode: unsupported_encode,
     };
     let reflect = TypeReflect { logical, plan, root: plan.ids[id.0].expect("asset type read plan"), defaults: defaults(ops, plan, id) };
     TypeInfo { descriptor, id, reflect }
-}
-
-unsafe fn unsupported_encode(_: *const u8, _: &mut dyn crate::EncodeSink) -> Result<(), CallbackPanic> {
-    Err(CallbackPanic)
 }
 
 fn u32(value: impl TryInto<u32>) -> u32 {
@@ -519,7 +514,7 @@ impl<'o, 's> LayoutBuild<'o, 's> {
                     self.frames.pop();
                     let node = Self::leak(NativeLayoutNode::Struct {
                         offset: 0,
-                        size: crate::build::align_up(cursor, payload_align),
+                        size: u32(super::table::align_up(cursor as usize, payload_align.max(1) as usize)),
                         align: payload_align,
                         whole_drop: None,
                         fields: sorted(fields),

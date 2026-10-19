@@ -31,8 +31,7 @@ use distill_wire::dswl::{dswl_bytes, dswl_hash};
 use distill_wire::native::CallbackPanic;
 use distill_wire::wire::WireNode;
 
-#[distill_asset::asset(uuid = "51112233-4455-6677-8899-aabbccddeeff")]
-struct A;
+use distill_test_assets::loader::RpcA as A;
 
 const TARGET_HASH: [u8; 16] = [7; 16];
 

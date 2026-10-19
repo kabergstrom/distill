@@ -539,7 +539,7 @@ fn derive_array(
 }
 
 /// `AssetRef<T>`/`WeakAssetRef<T>`: the resolved UUID, 16 unrestricted
-/// bytes, as the native layout (`distill-asset` `AssetReflect`) describes
+/// bytes, as the native layout (`distill-asset` interpreter) describes
 /// it — a `[u8; 16]` array, not the record of its declared fields (a
 /// UUID newtype and a zero-sized marker), whose struct node the fixup
 /// planner could not pair with the native array.

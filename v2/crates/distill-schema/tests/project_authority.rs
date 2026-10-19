@@ -21,12 +21,7 @@ fn test_layout_identity() -> LayoutIdentity {
     }
 }
 
-#[repr(C)]
-#[distill_asset::asset(uuid = "91112233-4455-4677-8899-aabbccddeeff")]
-struct ProjectRow {
-    alpha: u32,
-    beta: u16,
-}
+use distill_test_assets::loader::ProjectRow;
 
 fn path(krate: &str, name: &str) -> TypePath {
     TypePath {

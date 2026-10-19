@@ -921,7 +921,7 @@ fn reentry_inline_through_another_record_emits_backref() {
 #[test]
 fn asset_refs_derive_as_the_16_byte_uuid_array_native_layouts_describe() {
     // `AssetRef<T>(AssetUuid, PhantomData<T>)`: the record of its declared
-    // fields would not pair with the native `[u8; 16]` (`AssetReflect`).
+    // fields would not pair with the native `[u8; 16]` (`distill-asset` interpreter).
     let s = schema(vec![
         prim(0, PrimitiveType::U8),
         array_ty(1, 16, 0),
