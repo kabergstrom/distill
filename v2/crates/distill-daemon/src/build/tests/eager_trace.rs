@@ -298,6 +298,12 @@ impl TraceSource for EagerTraceSource {
     fn control_read(&self, _subject: &ControlSubject) -> Observed<ControlValueHash> {
         no_trace()
     }
+
+    /// The eager capture predates type file reads; the equivalence tests
+    /// ask none.
+    fn type_file(&self, _path: &str) -> Observed<Option<ContentHash>> {
+        no_trace()
+    }
 }
 
 impl TraceQueries for EagerTraceSource {

@@ -15,6 +15,7 @@ struct Snapshot {
     roles: BTreeMap<AssetUuid, Observed<Option<EntryRole>>>,
     controls: BTreeMap<ControlQuery, Observed<[u8; 16]>>,
     control_reads: BTreeMap<ControlSubject, Observed<ControlValueHash>>,
+    type_files: BTreeMap<String, Observed<Option<ContentHash>>>,
 }
 
 impl TraceSource for Snapshot {
@@ -54,6 +55,112 @@ impl TraceSource for Snapshot {
     fn control_read(&self, subject: &ControlSubject) -> Observed<ControlValueHash> {
         self.control_reads[subject].clone()
     }
+    fn type_file(&self, path: &str) -> Observed<Option<ContentHash>> {
+        self.type_files
+            .get(path)
+            .cloned()
+            .unwrap_or(Observed::Ok(None))
+    }
+}
+
+#[test]
+fn trace_type_file_pins_tag_twelve_path_and_optional_content_hash() {
+    let path = "kernels/game::Heat.bin";
+    let hash = ContentHash([0x55; 16]);
+    let op = TraceOp::TypeFile {
+        path: path.to_owned(),
+        observed: Observed::Ok(Some(hash)),
+    };
+    let actual = trace_canonical_bytes(std::slice::from_ref(&op));
+
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&digest_prefix(Domain::Trace, 1));
+    expected.extend_from_slice(&1_u32.to_le_bytes());
+    expected.extend_from_slice(&12_u32.to_le_bytes()); // TraceOp::TypeFile
+    expected.extend_from_slice(&(path.len() as u32).to_le_bytes());
+    expected.extend_from_slice(path.as_bytes());
+    expected.extend_from_slice(&1_u32.to_le_bytes()); // Observed::Ok
+    expected.push(1); // Some
+    expected.extend_from_slice(&hash.0);
+    assert_eq!(actual, expected);
+    assert_eq!(decode_trace_canonical_bytes(&actual).unwrap(), vec![op]);
+
+    // No type root or no file: `Ok(None)`.
+    let missing = TraceOp::TypeFile {
+        path: path.to_owned(),
+        observed: Observed::Ok(None),
+    };
+    let actual = trace_canonical_bytes(std::slice::from_ref(&missing));
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&digest_prefix(Domain::Trace, 1));
+    expected.extend_from_slice(&1_u32.to_le_bytes());
+    expected.extend_from_slice(&12_u32.to_le_bytes());
+    expected.extend_from_slice(&(path.len() as u32).to_le_bytes());
+    expected.extend_from_slice(path.as_bytes());
+    expected.extend_from_slice(&1_u32.to_le_bytes());
+    expected.push(0); // None
+    assert_eq!(actual, expected);
+    assert_eq!(decode_trace_canonical_bytes(&actual).unwrap(), vec![missing.clone()]);
+
+    // Two marker roots: a failure, which ends the trace.
+    let ambiguous = TraceOp::TypeFile {
+        path: path.to_owned(),
+        observed: Observed::Err(StableFailureFingerprint::RawFile {
+            op: RawFileOp::Read,
+            subject: RawFileSubject::Path("prefab-types.root".to_owned()),
+            class: RawFileFailureClass::OtherStable,
+        }),
+    };
+    assert!(ambiguous.failed());
+    let payload = trace_payload_bytes(std::slice::from_ref(&ambiguous));
+    assert_eq!(decode_trace_payload_bytes(&payload).unwrap(), vec![ambiguous.clone()]);
+    assert_eq!(
+        decode_trace_payload_bytes(&trace_payload_bytes(&[ambiguous, missing])),
+        Err(TraceDecodeError::OperationAfterFailure)
+    );
+}
+
+/// A type file read revalidates on its content hash alone: the same bytes
+/// rewritten keep the result, other bytes or a removed file do not, nor
+/// does another type file's change. It is indexed by its path, apart from
+/// a resolved path of the same text.
+#[test]
+fn type_file_reads_revalidate_on_content_and_index_their_path() {
+    let path = "kernels/game::Heat.bin";
+    let trace = vec![
+        TraceOp::Resolve {
+            path: path.into(),
+            observed: Observed::Ok(None),
+        },
+        TraceOp::TypeFile {
+            path: path.into(),
+            observed: Observed::Ok(Some(ContentHash([1; 16]))),
+        },
+    ];
+    let mut snapshot = Snapshot::default();
+    snapshot.resolves.insert(path.into(), Observed::Ok(None));
+    snapshot
+        .type_files
+        .insert(path.into(), Observed::Ok(Some(ContentHash([1; 16]))));
+    assert!(revalidate(&trace, &snapshot));
+    snapshot
+        .type_files
+        .insert("kernels/game::Other.bin".into(), Observed::Ok(Some(ContentHash([3; 16]))));
+    assert!(revalidate(&trace, &snapshot));
+    snapshot
+        .type_files
+        .insert(path.into(), Observed::Ok(Some(ContentHash([2; 16]))));
+    assert!(!revalidate(&trace, &snapshot));
+    snapshot.type_files.insert(path.into(), Observed::Ok(None));
+    assert!(!revalidate(&trace, &snapshot));
+
+    assert_eq!(
+        trace_reads(&trace),
+        vec![
+            distill_store::cas::BuildRead::Path(path.into()),
+            distill_store::cas::BuildRead::TypeFile(path.into()),
+        ]
+    );
 }
 
 #[test]

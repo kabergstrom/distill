@@ -173,6 +173,13 @@ pub enum TraceOp {
         subject: ControlSubject,
         observed: Observed<ControlValueHash>,
     },
+    /// A type file read (`ngp_schema::prefab_types`): `path` under the one
+    /// root holding the marker file, and its content hash there; `Ok(None)`
+    /// for no such root or no file. Two marker roots fail it.
+    TypeFile {
+        path: String,
+        observed: Observed<Option<ContentHash>>,
+    },
 }
 impl TraceOp {
     pub fn failed(&self) -> bool {
@@ -187,6 +194,7 @@ impl TraceOp {
             Self::RoleCheck { observed, .. } => matches!(observed, Observed::Err(_)),
             Self::Control { observed, .. } => matches!(observed, Observed::Err(_)),
             Self::ControlRead { observed, .. } => matches!(observed, Observed::Err(_)),
+            Self::TypeFile { observed, .. } => matches!(observed, Observed::Err(_)),
         }
     }
 }
@@ -201,6 +209,7 @@ pub trait TraceSource {
     fn role_check(&self, asset: AssetUuid) -> Observed<Option<EntryRole>>;
     fn control(&self, query: &ControlQuery) -> Observed<[u8; 16]>;
     fn control_read(&self, subject: &ControlSubject) -> Observed<ControlValueHash>;
+    fn type_file(&self, path: &str) -> Observed<Option<ContentHash>>;
 }
 
 pub fn revalidate(trace: &[TraceOp], source: &impl TraceSource) -> bool {
@@ -219,6 +228,7 @@ pub fn revalidate(trace: &[TraceOp], source: &impl TraceSource) -> bool {
         TraceOp::RoleCheck { asset, observed } => &source.role_check(*asset) == observed,
         TraceOp::Control { query, observed } => &source.control(query) == observed,
         TraceOp::ControlRead { subject, observed } => &source.control_read(subject) == observed,
+        TraceOp::TypeFile { path, observed } => &source.type_file(path) == observed,
     })
 }
 
@@ -249,10 +259,11 @@ pub fn trace_payload_bytes(trace: &[TraceOp]) -> Vec<u8> {
 
 /// The namespace subjects `trace` read, each once, for the store's
 /// reverse index (`BuildCommit::reads`): the asset of every authored
-/// read, artifact read, reference and role check, and every resolved
-/// path, whatever each observed (a miss that later resolves changes the
-/// build too). An asset query has no one subject and is not indexed;
-/// tools, capabilities and control reads are not the namespace.
+/// read, artifact read, reference and role check, every resolved path and
+/// every type file read, whatever each observed (a miss that later
+/// resolves changes the build too). An asset query has no one subject and
+/// is not indexed; tools, capabilities and control reads are not the
+/// namespace.
 pub fn trace_reads(trace: &[TraceOp]) -> Vec<distill_store::cas::BuildRead> {
     use distill_store::cas::BuildRead;
     let mut reads: Vec<BuildRead> = trace
@@ -263,6 +274,7 @@ pub fn trace_reads(trace: &[TraceOp]) -> Vec<distill_store::cas::BuildRead> {
             | TraceOp::RefCheck { asset, .. }
             | TraceOp::RoleCheck { asset, .. } => Some(BuildRead::Asset(*asset)),
             TraceOp::Resolve { path, .. } => Some(BuildRead::Path(path.clone())),
+            TraceOp::TypeFile { path, .. } => Some(BuildRead::TypeFile(path.clone())),
             TraceOp::Query { .. }
             | TraceOp::Tool { .. }
             | TraceOp::Capability { .. }
@@ -353,6 +365,11 @@ fn encode_trace_op(e: &mut Encoder, op: &TraceOp) {
             e.enum_variant(9);
             encode_control_subject(e, subject);
             observed(e, o, |e, hash| e.raw(&hash.0));
+        }
+        TraceOp::TypeFile { path, observed: o } => {
+            e.enum_variant(12);
+            e.str(path);
+            observed(e, o, |e, hash| e.option(*hash, |e, hash| e.raw(&hash.0)));
         }
     }
 }

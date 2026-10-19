@@ -55,6 +55,10 @@ impl TraceSource for Snapshot {
     fn control_read(&self, _: &ControlSubject) -> Observed<ControlValueHash> {
         Observed::Ok(ControlValueHash([0; 16]))
     }
+
+    fn type_file(&self, _: &str) -> Observed<Option<ContentHash>> {
+        Observed::Ok(None)
+    }
 }
 
 fn commit(store: &mut Store, key: [u8; 16], asset: AssetUuid, trace: Vec<TraceOp>, bytes: &[u8]) {

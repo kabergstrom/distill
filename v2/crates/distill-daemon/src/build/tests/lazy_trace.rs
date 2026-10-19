@@ -631,7 +631,8 @@ fn assert_same_answers(
             }
             TraceOp::Tool { id, observed } => &lazy.tool(id) == observed,
             TraceOp::Capability { key, observed } => &lazy.capability(key) == observed,
-            TraceOp::Control { .. } | TraceOp::ControlRead { .. } => true,
+            // The eager capture asked no type files.
+            TraceOp::Control { .. } | TraceOp::ControlRead { .. } | TraceOp::TypeFile { .. } => true,
         };
         if !same {
             errors += 1;

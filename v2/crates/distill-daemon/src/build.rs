@@ -298,7 +298,9 @@ fn drifted_input(op: &TraceOp) -> DriftedInput {
         | TraceOp::Read { asset, .. }
         | TraceOp::RefCheck { asset, .. }
         | TraceOp::RoleCheck { asset, .. } => DriftedInput::Asset(*asset),
-        TraceOp::Resolve { path, .. } => DriftedInput::File(path.clone()),
+        TraceOp::Resolve { path, .. } | TraceOp::TypeFile { path, .. } => {
+            DriftedInput::File(path.clone())
+        }
         TraceOp::Query { query, .. } => DriftedInput::Query(format!("{query:?}")),
         TraceOp::Tool { id, .. } => DriftedInput::Tool(id.clone()),
         TraceOp::Capability { .. } | TraceOp::Control { .. } | TraceOp::ControlRead { .. } => {

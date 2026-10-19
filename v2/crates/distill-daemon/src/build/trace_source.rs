@@ -6,7 +6,8 @@
 //! asked, by indexed reads in the snapshot's read transaction: an entry is
 //! one primary-key read (`distill_store::trace_reads`), a path one
 //! `bundles_by_path` search, a query one asset query driven by its most selective
-//! selector (DESIGN.md §13, asset queries), a tool one ToolEpoch row.
+//! selector (DESIGN.md §13, asset queries), a tool one ToolEpoch row, a
+//! type file a search of the marker's rows and the file's primary key.
 //! Nothing reads the whole project unless a query names no indexed
 //! selector at all (its answer may then be the whole project). Nothing is
 //! kept between questions: SQLite is the one copy of the snapshot.
@@ -24,7 +25,7 @@ use distill_build::pipeline::{PipelineRegistry, Target};
 use distill_build::query::{asset_query_result_hash, AssetQuery};
 use distill_build::trace::{
     CapabilityKey, ControlQuery, ControlSubject, ControlValueHash, EntryRole, Observed,
-    StableFailureFingerprint, TraceSource,
+    RawFileFailureClass, RawFileOp, RawFileSubject, StableFailureFingerprint, TraceSource,
 };
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, TypeUuid};
 use distill_store::bundles::AssetFilter;
@@ -377,5 +378,44 @@ impl TraceSource for StoreTraceSource<'_> {
 
     fn control_read(&self, _subject: &ControlSubject) -> Observed<ControlValueHash> {
         no_trace()
+    }
+
+    fn type_file(&self, path: &str) -> Observed<Option<ContentHash>> {
+        match self.type_file_at(path) {
+            Observed::Ok(file) => Observed::Ok(file.map(|(_, hash)| hash)),
+            Observed::Err(failure) => Observed::Err(failure),
+        }
+    }
+}
+
+impl StoreTraceSource<'_> {
+    /// The type file at `path` (`ngp_schema::prefab_types`) as the snapshot
+    /// observed it: its root, the one holding the marker file, and its
+    /// content hash; `None` for no such root or no file there. Two roots
+    /// holding the marker fail it: which type is meant is ambiguous.
+    pub(super) fn type_file_at(&self, path: &str) -> Observed<Option<(String, ContentHash)>> {
+        self.answer((|| {
+            let marker = distill_schema::ngp_schema::prefab_types::MARKER;
+            let roots = self
+                .store
+                .observed_files_at(marker)
+                .map_err(BuildError::infrastructure)?;
+            let root = match roots.as_slice() {
+                [] => return Ok(Observed::Ok(None)),
+                [root] => &root.root_name,
+                _ => {
+                    return Ok(Observed::Err(StableFailureFingerprint::RawFile {
+                        op: RawFileOp::Read,
+                        subject: RawFileSubject::Path(marker.to_owned()),
+                        class: RawFileFailureClass::OtherStable,
+                    }))
+                }
+            };
+            let hash = self
+                .store
+                .file_content_hash(root, path)
+                .map_err(BuildError::infrastructure)?;
+            Ok(Observed::Ok(hash.map(|hash| (root.clone(), hash))))
+        })())
     }
 }

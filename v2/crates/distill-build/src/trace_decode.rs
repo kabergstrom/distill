@@ -200,6 +200,11 @@ impl Reader<'_> {
                     reader.option(|reader| Ok(BundleFileHash(reader.array16()?)))
                 })?,
             },
+            12 => TraceOp::TypeFile {
+                path: self.string()?,
+                observed: self
+                    .observed(|reader| reader.option(|reader| Ok(ContentHash(reader.array16()?))))?,
+            },
             tag => return Err(TraceDecodeError::UnknownOperation(tag)),
         })
     }
