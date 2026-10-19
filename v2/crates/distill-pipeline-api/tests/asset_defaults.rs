@@ -1,7 +1,7 @@
 use distill_asset::{to_value, AssetType};
 use ngp_schema::Value;
 use distill_migrate::{
-    conforms, execute_ops, plan_automatic, validate_plan, DefaultProvider, EdgeKind, FieldPath,
+    conforms, execute_ops, plan_automatic, validate_plan, DefaultProvider, FieldPath,
 };
 use distill_pipeline_api::asset_defaults::AssetTableDefaults;
 use distill_pipeline_api::callbacks::PipelineDefaults;
@@ -38,7 +38,7 @@ fn automatic_migration_fills_added_fields_from_the_generated_table() {
     });
 
     let plan = plan_automatic(&old, &new).unwrap();
-    validate_plan(&plan, &old, &new, EdgeKind::Automatic).unwrap();
+    validate_plan(&plan, &old, &new).unwrap();
     let defaults = AssetTableDefaults::of::<Outer>();
     let migrated = execute_ops(&plan, &value, &old, &new, &Provider(&defaults)).unwrap();
 

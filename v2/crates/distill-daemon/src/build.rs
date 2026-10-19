@@ -47,7 +47,7 @@ use distill_bundle::{AssetEntry, Bundle};
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
 use distill_schema::ngp_schema::{AssetRefValue, TypeTable, Value};
 use distill_migrate::{
-    conforms, execute_ops, plan_automatic_renamed, validate_plan, DefaultProvider, EdgeKind,
+    conforms, execute_ops, plan_automatic_renamed, validate_plan, DefaultProvider,
     FieldPath, MigrationError, MigrationOp,
 };
 use distill_pipeline_api::callbacks::MigrationKey;
@@ -3574,9 +3574,6 @@ fn migration_execution_failure(error: &MigrationError) -> MigrationPlanFailureV1
         | MigrationError::PlanShape { path, .. }
         | MigrationError::Unencodable { path } => field_path_from_display(path),
         MigrationError::DuplicateMapVariantFrom { at, .. } => field_path_from_display(at),
-        MigrationError::NonConforming { .. }
-        | MigrationError::PlanInvalid(_)
-        | MigrationError::FunctionFailed { .. } => FieldPath::root(),
     };
     match error {
         MigrationError::MissingDefault { .. } => MigrationPlanFailureV1::MissingDefault { path },
@@ -3774,7 +3771,6 @@ fn load_current_entry(
         &plan,
         &schema.root,
         &current_schema.root,
-        EdgeKind::Automatic,
     )
     .map_err(|errors| {
         migration_plan_error(

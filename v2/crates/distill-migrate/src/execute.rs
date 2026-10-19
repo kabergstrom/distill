@@ -8,9 +8,7 @@
 //! resolved against the frame's from- and to-schemas. [`execute_sparse`]
 //! runs the same ops over a [`Patch`].
 
-use crate::conform::{conforms, ConformError};
-use crate::validate::{validate_plan, EdgeKind, PlanError};
-use crate::{FieldPath, MigrationKind, MigrationOp};
+use crate::{FieldPath, MigrationOp};
 use ngp_schema::{sort_map, sort_set, Frames, Patch, PrimitiveKind, SchemaNode, Value};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -38,17 +36,8 @@ pub trait DefaultProvider {
     fn parent_default(&self, to_schema: &SchemaNode, at: &FieldPath) -> Option<Value>;
 }
 
-/// Runs registered migration functions (§3 module registry): a value of
-/// the edge's from-schema to one of its to-schema. An unknown key is an
-/// `Err` — there is no fallback.
-pub trait FnProvider {
-    fn run(&self, key: &str, v: Value) -> Result<Value, String>;
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum MigrationError {
-    /// execute_edge validates Ops plans (Custom edge kind) before running.
-    PlanInvalid(Vec<PlanError>),
     /// The input value has the wrong shape at a path (corrupt input).
     InputShape {
         path: String,
@@ -90,18 +79,6 @@ pub enum MigrationError {
         at: String,
         from: String,
     },
-    /// The function edge failed (or its key is unregistered).
-    FunctionFailed {
-        key: String,
-        message: String,
-    },
-    /// An edge's output failed to-schema conformance, naming the edge
-    /// (§11: surfaced before tag extraction, validators, or artifact
-    /// encoding can consume the value).
-    NonConforming {
-        edge: String,
-        error: ConformError,
-    },
     /// Canonical encoding failed where ordering/equality needed it.
     Unencodable {
         path: String,
@@ -112,13 +89,6 @@ impl fmt::Display for MigrationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use MigrationError::*;
         match self {
-            PlanInvalid(errs) => {
-                writeln!(f, "plan validation failed:")?;
-                for e in errs {
-                    writeln!(f, "  {e}")?;
-                }
-                Ok(())
-            }
             InputShape { path, expected } => {
                 write!(f, "input value at {path}: expected {expected}")
             }
@@ -141,13 +111,6 @@ impl fmt::Display for MigrationError {
                 f,
                 "two MapVariant ops at {at} name the same input variant {from:?}"
             ),
-            FunctionFailed { key, message } => {
-                write!(f, "migration function {key:?} failed: {message}")
-            }
-            NonConforming { edge, error } => write!(
-                f,
-                "edge {edge} produced a value that does not conform to its to-schema: {error}"
-            ),
             Unencodable { path } => write!(f, "value at {path} has no canonical encoding"),
         }
     }
@@ -156,7 +119,7 @@ impl fmt::Display for MigrationError {
 impl std::error::Error for MigrationError {}
 
 /// Execute an Ops plan: input (immutable) + endpoint schemas → fresh
-/// output. Does NOT validate the plan first — [`execute_edge`] does;
+/// output. Does NOT validate the plan first ([`crate::validate_plan`]);
 /// unvalidated plans surface best-effort `PlanShape`/write errors.
 ///
 /// Normative model (§11): each op computes its output value(s) from the
@@ -202,52 +165,6 @@ pub fn execute_sparse(
     to: &SchemaNode,
 ) -> Result<Patch, MigrationError> {
     sparse_frame(ops, input, from, to, &[])
-}
-
-/// Execute one custom edge: Ops plans are validated (EdgeKind::Custom —
-/// this is the bundle-authored segment; the automatic segment validates
-/// with EdgeKind::Automatic in its own driver) then executed; Function
-/// edges run through the FnProvider. EVERY edge's output — function
-/// edges included — is validated against the `to` schema before
-/// returning (§11: surfaced before tag extraction, validators, or
-/// artifact encoding can consume the value).
-pub fn execute_edge(
-    kind: &MigrationKind,
-    input: &Value,
-    from: &SchemaNode,
-    to: &SchemaNode,
-    defaults: &dyn DefaultProvider,
-    fns: &dyn FnProvider,
-) -> Result<Exec, MigrationError> {
-    let (exec, edge_name) = match kind {
-        MigrationKind::Ops(ops) => {
-            validate_plan(ops, from, to, EdgeKind::Custom).map_err(MigrationError::PlanInvalid)?;
-            (
-                execute_ops(ops, input, from, to, defaults)?,
-                "ops".to_string(),
-            )
-        }
-        MigrationKind::Function(key) => {
-            let out =
-                fns.run(key, input.clone())
-                    .map_err(|message| MigrationError::FunctionFailed {
-                        key: key.clone(),
-                        message,
-                    })?;
-            (
-                Exec {
-                    value: out,
-                    defaulted: Vec::new(),
-                },
-                format!("fn {key:?}"),
-            )
-        }
-    };
-    conforms(&exec.value, to).map_err(|error| MigrationError::NonConforming {
-        edge: edge_name,
-        error,
-    })?;
-    Ok(exec)
 }
 
 // ---------------------------------------------------------------------------

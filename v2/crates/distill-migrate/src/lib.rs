@@ -3,14 +3,13 @@
 //! This crate holds the pieces `load_current` composes (§11): the
 //! snapshot-AST automatic planner ([`plan_automatic`]), the plan validator
 //! ([`validate_plan`]), the typed executor ([`execute_ops`],
-//! [`execute_edge`]), the conformance checker ([`conforms`]), and the
+//! [`execute_sparse`]), the conformance checker ([`conforms`]), and the
 //! migration-graph walk ([`select_chain`]). Orchestration (LoadContext,
 //! MetadataSnapshot) belongs to a later crate.
 //!
 //! Pinned semantics are documented at each definition; the normative text
 //! is DESIGN.md §11.
 
-use distill_core::id::{LogicalHash, TypeUuid};
 use ngp_schema::Value;
 use std::fmt;
 
@@ -24,13 +23,13 @@ mod walk;
 
 pub use conform::{conforms, ConformError};
 pub use execute::{
-    execute_edge, execute_ops, execute_sparse, DefaultProvider, Exec, FnProvider, MigrationError,
+    execute_ops, execute_sparse, DefaultProvider, Exec, MigrationError,
 };
 pub use identical::resolve_path;
 pub use lossy::lossy_drops;
 pub use ngp_schema::zero_value;
 pub use plan::{plan_automatic, plan_automatic_renamed, PlanRefusal};
-pub use validate::{validate_plan, EdgeKind, PlanError};
+pub use validate::{validate_plan, PlanError};
 pub use walk::{select_chain, EdgeRef, SelectedChain, WalkError};
 
 /// Struct-field-name navigation only; container/variant recursion is
@@ -128,23 +127,5 @@ pub enum MigrationOp {
     },
     // NOTE: there is deliberately no per-op custom escape hatch (R20/M21
     // removed `Custom { fn_key }`): it had no path, no endpoint schemas,
-    // and no coverage participation. Whole-edge `MigrationKind::Function`
-    // is the custom-logic carrier.
-}
-
-/// A custom migration edge, as declared by a Migration asset (§11).
-#[derive(Clone, Debug, PartialEq)]
-pub struct Migration {
-    pub target_type_uuid: TypeUuid,
-    pub from_hash: LogicalHash,
-    pub to_hash: LogicalHash,
-    pub kind: MigrationKind,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum MigrationKind {
-    /// Data-driven, in the logical-plan vocabulary above.
-    Ops(Vec<MigrationOp>),
-    /// Key of a MigrationFn registered in the pipeline module (§3).
-    Function(String),
+    // and no coverage participation.
 }

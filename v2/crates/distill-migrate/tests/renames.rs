@@ -4,7 +4,7 @@
 mod common;
 use common::*;
 use distill_migrate::{
-    execute_ops, lossy_drops, plan_automatic_renamed, validate_plan, EdgeKind, MigrationOp,
+    execute_ops, lossy_drops, plan_automatic_renamed, validate_plan, MigrationOp,
 };
 use ngp_schema::{Renames, SchemaNode};
 
@@ -27,7 +27,7 @@ fn a_renamed_field_is_copied_from_its_old_name() {
     assert!(!ops
         .iter()
         .any(|op| matches!(op, MigrationOp::DropField { .. })));
-    validate_plan(&ops, &old, &new, EdgeKind::Automatic).unwrap();
+    validate_plan(&ops, &old, &new).unwrap();
     let input = val(&old, r#"{"a":1,"hp":40}"#);
     assert!(lossy_drops(&ops, &old, &input).is_empty());
     let out = execute_ops(&ops, &input, &old, &new, &NoDefaults).unwrap();
@@ -77,7 +77,7 @@ fn renames_apply_inside_elements_and_variant_payloads() {
     );
     let table = renames(&[("$.items[].name", "label"), ("$.shape{Circle}.radius", "r")]);
     let ops = plan_automatic_renamed(&old, &new, &table).unwrap();
-    validate_plan(&ops, &old, &new, EdgeKind::Automatic).unwrap();
+    validate_plan(&ops, &old, &new).unwrap();
     let input = val(&old, r#"{"items":[{"label":"one"}],"shape":{"Circle":{"r":2}}}"#);
     let out = execute_ops(&ops, &input, &old, &new, &NoDefaults).unwrap();
     assert_eq!(

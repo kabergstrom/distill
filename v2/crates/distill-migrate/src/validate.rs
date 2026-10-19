@@ -1,20 +1,11 @@
-//! Plan validation (§11): paths resolve in their endpoint schemas, edge
-//! legality (default ops are automatic-segment-only), and total, disjoint
-//! output coverage.
+//! Plan validation (§11): paths resolve in their endpoint schemas, and the
+//! plan's output coverage is total and disjoint.
 
 use crate::identical::resolve_path;
 use crate::{FieldPath, MigrationOp};
 use ngp_schema::migrate::{can_widen_float, can_widen_int};
 use ngp_schema::SchemaNode;
 use std::fmt;
-
-/// Which segment of a chain an Ops plan belongs to. Custom edges may not
-/// carry default-table ops (§11: edge authoring materializes literals).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EdgeKind {
-    Automatic,
-    Custom,
-}
 
 /// Which endpoint schema a path failed to resolve in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,12 +29,6 @@ pub enum PlanError {
     MissingAtPath {
         path: String,
         side: SchemaSide,
-    },
-    /// WriteFieldDefault/WriteParentDefault/GrowArray in a custom edge
-    /// (§11).
-    DefaultOpInCustomEdge {
-        path: String,
-        op: &'static str,
     },
     /// A coverage leaf of the to-schema no op writes.
     UncoveredLeaf {
@@ -108,11 +93,6 @@ impl fmt::Display for PlanError {
             MissingAtPath { path, side } => {
                 write!(f, "at-path {path} does not resolve in the {side:?}-schema")
             }
-            DefaultOpInCustomEdge { path, op } => write!(
-                f,
-                "{op} at {path}: default-table ops are automatic-segment-only; \
-                 custom edges carry literals (WriteValue)"
-            ),
             UncoveredLeaf { path } => write!(f, "output leaf {path} is written by no op"),
             DoubleCoveredLeaf { path } => {
                 write!(f, "output leaf {path} is written by more than one op")
@@ -150,7 +130,7 @@ impl fmt::Display for PlanError {
 
 /// Validate a plan against its edge's endpoint schemas (§11): every
 /// `from` path resolves in `from`, every `to` path in `to`, `at` paths in
-/// both; custom edges reject default-table ops; the plan is total and
+/// both; the plan is total and
 /// disjoint over the output — every coverage leaf of `to` (paths through
 /// Struct fields only whose node is not a Struct) is written by exactly
 /// one op; the MapVariant ops sharing one `at` are one composite writer.
@@ -159,10 +139,9 @@ pub fn validate_plan(
     ops: &[MigrationOp],
     from: &SchemaNode,
     to: &SchemaNode,
-    edge: EdgeKind,
 ) -> Result<(), Vec<PlanError>> {
     let mut errors = Vec::new();
-    validate_frame(ops, from, to, edge, "$", &mut errors);
+    validate_frame(ops, from, to, "$", &mut errors);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -185,7 +164,6 @@ fn validate_frame(
     ops: &[MigrationOp],
     from: &SchemaNode,
     to: &SchemaNode,
-    edge: EdgeKind,
     prefix: &str,
     errors: &mut Vec<PlanError>,
 ) {
@@ -238,27 +216,13 @@ fn validate_frame(
                     }
                 }
             }
-            // PINNED: WriteValue is legal in BOTH edge kinds — a literal
-            // is self-contained and replays byte-identically forever.
             MigrationOp::WriteValue { to: t, .. } => {
                 check_to(t, to, prefix, &mut writers, errors);
             }
             MigrationOp::WriteFieldDefault { to: t } => {
-                if edge == EdgeKind::Custom {
-                    errors.push(PlanError::DefaultOpInCustomEdge {
-                        path: disp(prefix, t),
-                        op: "WriteFieldDefault",
-                    });
-                }
                 check_to(t, to, prefix, &mut writers, errors);
             }
             MigrationOp::WriteParentDefault { to: t } => {
-                if edge == EdgeKind::Custom {
-                    errors.push(PlanError::DefaultOpInCustomEdge {
-                        path: disp(prefix, t),
-                        op: "WriteParentDefault",
-                    });
-                }
                 check_to(t, to, prefix, &mut writers, errors);
             }
             MigrationOp::WriteNone { to: t } => {
@@ -299,12 +263,6 @@ fn validate_frame(
                 }
             }
             MigrationOp::GrowArray { at, element } => {
-                if edge == EdgeKind::Custom {
-                    errors.push(PlanError::DefaultOpInCustomEdge {
-                        path: disp(prefix, at),
-                        op: "GrowArray",
-                    });
-                }
                 let Some((fnode, tnode)) = resolve_at(from, to, at, prefix, errors) else {
                     continue;
                 };
@@ -321,7 +279,7 @@ fn validate_frame(
                                 detail: format!("GrowArray needs a longer array ({l1} -> {l2})"),
                             });
                         }
-                        validate_frame(element, a, b, edge, &sub, errors);
+                        validate_frame(element, a, b, &sub, errors);
                     }
                     _ => errors.push(PlanError::ContainerMismatch {
                         path: disp(prefix, at),
@@ -336,12 +294,12 @@ fn validate_frame(
                 writers.push(at.0.clone());
                 let sub = format!("{}[]", disp(prefix, at));
                 // PINNED: MigrateElements requires the SAME container kind
-                // on both sides; shape changes are function-edge work.
+                // on both sides; shape changes are refused.
                 match (fnode, tnode) {
                     (SchemaNode::Vec(a), SchemaNode::Vec(b))
                     | (SchemaNode::Option(a), SchemaNode::Option(b))
                     | (SchemaNode::Set(a), SchemaNode::Set(b)) => {
-                        validate_frame(element, a, b, edge, &sub, errors);
+                        validate_frame(element, a, b, &sub, errors);
                     }
                     (
                         SchemaNode::Array { len: l1, elem: a },
@@ -353,11 +311,11 @@ fn validate_frame(
                                 detail: format!("array length differs ({l1} vs {l2})"),
                             });
                         }
-                        validate_frame(element, a, b, edge, &sub, errors);
+                        validate_frame(element, a, b, &sub, errors);
                     }
                     // Map: MigrateElements migrates VALUES (§11).
                     (SchemaNode::Map { value: v1, .. }, SchemaNode::Map { value: v2, .. }) => {
-                        validate_frame(element, v1, v2, edge, &sub, errors);
+                        validate_frame(element, v1, v2, &sub, errors);
                     }
                     _ => errors.push(PlanError::ContainerMismatch {
                         path: disp(prefix, at),
@@ -375,7 +333,7 @@ fn validate_frame(
                 match (fnode, tnode) {
                     (SchemaNode::Map { key: k1, .. }, SchemaNode::Map { key: k2, .. }) => {
                         let sub = format!("{}[key]", disp(prefix, at));
-                        validate_frame(key, k1, k2, edge, &sub, errors);
+                        validate_frame(key, k1, k2, &sub, errors);
                     }
                     _ => errors.push(PlanError::ContainerMismatch {
                         path: disp(prefix, at),
@@ -406,7 +364,7 @@ fn validate_frame(
                     ok = false;
                 }
                 if ok {
-                    validate_frame(inner, fnode, tnode, edge, &disp(prefix, at), errors);
+                    validate_frame(inner, fnode, tnode, &disp(prefix, at), errors);
                 }
             }
         }
@@ -463,7 +421,7 @@ fn validate_frame(
             }
             if let (Some(fp), Some(tp)) = (fpayload, tpayload) {
                 let sub = format!("{}{{{vfrom}}}", disp(prefix, &at));
-                validate_frame(payload, fp, tp, edge, &sub, errors);
+                validate_frame(payload, fp, tp, &sub, errors);
             }
         }
     }

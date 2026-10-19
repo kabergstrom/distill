@@ -2,16 +2,13 @@
 #![allow(dead_code)]
 
 use distill_core::id::{BundleUuid, LogicalHash, TypeUuid};
-use distill_migrate::{DefaultProvider, FieldPath, FnProvider};
+use distill_migrate::{DefaultProvider, FieldPath};
 pub use ngp_schema::{Patch, Value};
 use ngp_schema::{parse_patch, parse_value, write_patch, write_value, Options, PrimitiveKind, SchemaNode, WriteOptions};
 use std::collections::BTreeMap;
 
 #[allow(unused_imports)] // not every test binary uses primitives
 pub use ngp_schema::PrimitiveKind as PK;
-
-/// A registered migration function.
-pub type MigrationFn = fn(Value) -> Result<Value, String>;
 
 pub fn p(k: PrimitiveKind) -> SchemaNode {
     SchemaNode::Primitive(k)
@@ -139,20 +136,5 @@ impl DefaultProvider for TableDefaults {
     }
     fn parent_default(&self, _: &SchemaNode, at: &FieldPath) -> Option<Value> {
         self.parent.get(at).cloned()
-    }
-}
-
-/// Function registry; unknown keys are errors (no fallback).
-#[derive(Default)]
-pub struct Fns {
-    pub table: BTreeMap<String, MigrationFn>,
-}
-
-impl FnProvider for Fns {
-    fn run(&self, key: &str, v: Value) -> Result<Value, String> {
-        match self.table.get(key) {
-            Some(f) => f(v),
-            None => Err(format!("unknown migration fn {key:?}")),
-        }
     }
 }

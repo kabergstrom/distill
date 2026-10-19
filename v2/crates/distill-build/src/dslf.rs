@@ -34,16 +34,6 @@ pub enum MigrationPlanFailureV1 {
         expected_revision: u32,
         observed_revision: u32,
     },
-    AmbiguousEdge {
-        conflicting_edges: Vec<AssetUuid>,
-    },
-    Cycle {
-        cycle_edges: Vec<AssetUuid>,
-    },
-    MissingReverseEdge {
-        missing_from: LogicalHash,
-        missing_to: LogicalHash,
-    },
     NonConformingOutput {
         edge: AssetUuid,
         path: FieldPath,
@@ -368,13 +358,6 @@ fn encode_path(e: &mut Encoder, path: &FieldPath) {
     e.seq(&path.0, |e, segment| e.str(segment));
 }
 
-fn sorted_unique_assets(entries: &[AssetUuid]) -> Vec<AssetUuid> {
-    let mut entries = entries.to_vec();
-    entries.sort_unstable();
-    entries.dedup();
-    entries
-}
-
 fn encode_migration_plan_failure(e: &mut Encoder, failure: &MigrationPlanFailureV1) {
     match failure {
         MigrationPlanFailureV1::MissingPath { path } => tagged_path(e, 1, path),
@@ -390,24 +373,7 @@ fn encode_migration_plan_failure(e: &mut Encoder, failure: &MigrationPlanFailure
             e.u32(*expected_revision);
             e.u32(*observed_revision);
         }
-        MigrationPlanFailureV1::AmbiguousEdge { conflicting_edges } => {
-            e.enum_variant(5);
-            e.seq(&sorted_unique_assets(conflicting_edges), |e, id| {
-                e.raw(&id.0)
-            });
-        }
-        MigrationPlanFailureV1::Cycle { cycle_edges } => {
-            e.enum_variant(6);
-            e.seq(&sorted_unique_assets(cycle_edges), |e, id| e.raw(&id.0));
-        }
-        MigrationPlanFailureV1::MissingReverseEdge {
-            missing_from,
-            missing_to,
-        } => {
-            e.enum_variant(7);
-            e.raw(&missing_from.0);
-            e.raw(&missing_to.0);
-        }
+        // Tags 5, 6 and 7 are retired (edge planning failures, never produced).
         MigrationPlanFailureV1::NonConformingOutput { edge, path } => {
             e.enum_variant(8);
             e.raw(&edge.0);

@@ -135,25 +135,11 @@ There is no machine-owned section in committed files. Everything the daemon
 needs to persist beyond what bundles carry lives in daemon state and must be
 reconstructible by scanning the tree and re-running pure work —
 directory-import ownership included: a generated bundle's own `$record`
-carries its `DirectoryOrigin` (§8), so ownership reconstructs by scan. Two records
-in daemon state protect authored data rather than deriving from it: §14's
-**write-intent journal**, which names whose bytes sit where while a
-daemon-authored file replacement or deletion is in flight, and §14's
-**displaced-inode quarantine** — per-filesystem, daemon-owned quarantine
-directories (one per watched root, one beside each daemon-owned output
-directory), entries named by the journal's unique **intent IDs**;
-`.distill/` holds only the journal and metadata, which reference the
-physical locations — which retains
-every inode a rewrite, deletion, or conflict restoration displaces for a
-configured window — bytes a
-concurrent in-place writer may still be writing through an open
-descriptor. Their loss never loses
-content — recovery without them degrades to §14's conservative rule (nothing
-unclassified is ever deleted; unexplained files are preserved under named
-conflict or quarantine paths) — but while publication is in flight the
-journal is the crash-recovery record, fsynced before the first rename,
-and until retention expires the quarantined inode is the last holder of
-any edit that raced publication.
+carries its `DirectoryOrigin` (§8), so ownership reconstructs by scan. No
+record in daemon state protects authored data: a daemon file write is one
+atomic rename after a pre-image check (§14, `distill_store::atomic_file`),
+so no state describes a write in flight. An uncommitted temp sits in a
+staging directory and is deleted when the tree is next opened.
 
 ## 3. Architecture
 
@@ -869,7 +855,10 @@ impl Deref for Blob { type Target = [u8]; }
 
 ## 5. Schema System
 
-source-walk analyzes the asset-types crate and emits the schema file
+source-walk (`--pipeline-manifest`, `pipeline_config` in
+`newgameplus/source-walk/src/main.rs`) walks the pipeline module crate and
+each direct path dependency that declares asset types (depends on
+`distill-asset` and its sources spell `asset(uuid`), and emits the schema file
 (`ngp-schema`'s `Schema`/`TypeDef`/`Field` model in the schema file format:
 the shared file header, `Domain::SchemaFile` version 1, then the schema in the
 one encoding below; `newgameplus/ngp-schema/src/file.rs`; the pipeline's is
@@ -1077,12 +1066,7 @@ pub enum MigrationPlanFailureV1 {
     RevisionMismatch { path: FieldPath,
                        expected_revision: u32,
                        observed_revision: u32 } = 4,
-    /// 5-7 stay in the grammar but are never emitted: the daemon builds no
-    /// migration chains (§11). Both vectors sort/deduplicate raw AssetUuids.
-    AmbiguousEdge { conflicting_edges: Vec<AssetUuid> } = 5,
-    Cycle { cycle_edges: Vec<AssetUuid> } = 6,
-    MissingReverseEdge { missing_from: LogicalHash,
-                         missing_to: LogicalHash } = 7,
+    // 5-7 retired: migration-chain failures, never produced (§11).
     NonConformingOutput { edge: AssetUuid, path: FieldPath } = 8,  // edge: the entry
     MapKeyCollision { path: FieldPath } = 9,
     SetElementCollision { path: FieldPath } = 10,
@@ -1194,12 +1178,12 @@ pub enum DscpV1 { // tag is the ConfigurationErrorCode value
 #[repr(u8)]
 pub enum ConfigurationPathKey {
     AssetRoot = 1, StatePath = 2, SchemaArtifact = 3, PipelineModule = 4,
-    CodegenOutput = 5, Quarantine = 6, ImportDestination = 7,
+    CodegenOutput = 5, Quarantine = 6, ImportDestination = 7,  // 6: no quarantine is built; never emitted
 }
 #[repr(u8)]
 pub enum OwnedPathKind {
     AssetRoot = 1, DaemonState = 2, SchemaArtifact = 3, PipelineModule = 4,
-    CodegenOutput = 5, Quarantine = 6, ImportDestination = 7,
+    CodegenOutput = 5, Quarantine = 6, ImportDestination = 7,  // 6: never emitted
 }
 pub struct OwnedPathSide { pub kind: OwnedPathKind, pub path: String }
 pub struct DirectoryAliasSide {
@@ -1262,8 +1246,9 @@ fields)` (`DscpV1::reason_hash`, `distill-protocol/src/state.rs`).
 Configuration validation enumerates the complete canonical defect set before
 choosing authority. Candidate configuration errors are encoded,
 deduplicated, and sorted by `(ConfigurationErrorCode, detail bytes)`; the
-first row is the sole persisted/snapshot/RPC `ConfigurationError`, while
-`doctor` may show the complete sorted set. Parser, watcher, and validation
+first row is the sole persisted/snapshot/RPC `ConfigurationError`; the rest
+of the set is dropped (`ConfigurationError::select_canonical`), nothing
+reports it. Parser, watcher, and validation
 completion order can never select the winner.
 - Presentation messages, backtraces, OS prose, and parser prose are excluded.
 - Persistence stores the detail version (1) plus the complete canonical
@@ -1922,21 +1907,23 @@ with typed `RoleIneligible` before build import or processor lookup. Tooling
 value inspection uses the pinned authoring-inspection capability (§17), whose
 result cannot be fed to resolve, processing, dependency tracing, or packing.
 
-The daemon's own control plane is separate from that tooling mode. A private,
-capability-typed `ControlQuery`/`ControlSubject` surface has distinct
-non-artifact readers for `PackDefinition`, directory-import rules, and import
-settings (`ControlSubject`, `distill-pipeline-api/src/failure.rs`). Its one
-query, `ControlQuery::DirectoryImportRuleSet`, is a private role-inclusive
-enumeration, so discovery never falls back to ordinary role-filtered
-`AssetQuery`. Reads return only the closed branded `ControlValue` sum, never
-a raw `Value`. Its authority
-tokens and query types are coordinator-private and cannot be constructed by
-`ProcessContext`, authored references, runtime RPC, pack roots, or ordinary
-`AssetQuery`; every control read is stamped to the underlying metadata basis,
-creates its `ControlRead` observation before decode/validation, records and
-revalidates success or stable failure, and parses the built-in control value
-directly without building, processing, loading, or shipping the control asset
-itself.
+The daemon's own control plane is separate from that tooling mode. Each
+control kind has its own reader, which parses the built-in control value
+directly without building, processing, loading, or shipping the control
+asset:
+- Directory-import rules: the importer's import index finds every
+  `DirectoryImportRules` entry in published bundles (`index_import_bundle`,
+  the `generating_rules_bundles` store index) and decodes it
+  (`decode_directory_rules`, `distill-daemon/src/importer/controls.rs`);
+  discovery never goes through role-filtered `AssetQuery`.
+- Import settings and `$record`: the importer reads them from the bundle it
+  re-imports (`decode_import_record`, same file).
+- Pack definitions: the pack builder decodes them into a
+  `PackDefinitionControlValue` (`decode_pack_definition`,
+  `distill-pack-build/src/builder.rs`).
+
+None of these reads is traced. §10's control query and subject types and
+their trace grammar exist in code, but the daemon records no control traces.
 
 ### Adoption
 
@@ -2000,7 +1987,7 @@ affects only newly adopted assets, never silently reinterpreting old ones.
   one asset UUID (file copies either way), are integrity errors surfaced
   with every authored claimant; derived collisions additionally name each
   `(parent, output_key)` claimant. Nothing resolves a collision for the
-  user: `doctor` reports it, and re-minting identity in an authored copy
+  user: `MetadataHub.diagnostics` reports it (`namespace_errors`), and re-minting identity in an authored copy
   is an ordinary authoring write (`Hub.write`) to the copy the user
   designates — never a silent resolution of a derived claimant. Two
   registered types claiming one
@@ -2267,8 +2254,8 @@ is not scan-order-dependent. Before publication the scanner enumerates the
 complete candidate set of version-global defects, encodes each
 `(code:u32, exact VersionPoisonV1 detail)`, sorts by `(code, detail bytes)`,
 deduplicates identical encodings, and publishes the first row. Presentation messages
-never participate. `doctor` may retain and display the complete sorted set as
-non-authoritative diagnostics, but persistence, snapshots, invalidations, RPC,
+never participate. `MetadataHub.diagnostics` reports the complete sorted set
+(`MetadataDiagnostics.namespace_errors`) as non-authoritative diagnostics, but persistence, snapshots, invalidations, RPC,
 equality, and healing use only the selected first value; no filesystem walk or
 thread completion order is a tiebreak.
 
@@ -2293,13 +2280,14 @@ where the prior has none (no `local_id` match, or no prior bundle): the single
 nondeterministic step, random and drawn once per run (§7), never derived from
 the source path, input version or importer. Everything else is deterministic, which makes re-import a **fixpoint**: a
 bundle is in sync exactly when re-running its import over its recorded
-read-set reproduces it byte-identically. `doctor` and CI verify that
-fixpoint for every watched bundle, so the
-committed-the-source-but-not-the-bundle case fails loudly instead of
-churning working trees after checkout.
+read-set reproduces it byte-identically. The doctor operation (`Doctor(Verify)`,
+§17) checks that fixpoint for every watched bundle
+(`verify_watched_import_fixpoints`), so the
+committed-the-source-but-not-the-bundle case is reported instead of
+churning working trees after checkout. No CI job runs it.
 Publication records each bundle's watch flag in its `bundles` row
-(`import_watched`, set when the bundle's `$record` is watched). `doctor`
-finds the watched bundles through that row's partial index, without parsing
+(`import_watched`, set when the bundle's `$record` is watched). The doctor
+operation finds the watched bundles through that row's partial index, without parsing
 a bundle. A poisoned bundle's row cannot record the flag, so its file is read
 instead.
 
@@ -2593,7 +2581,8 @@ long-running-operation rules (§17): per-bundle atomic, loudly reported,
 never transactional across files. When the listing loses a group, the
 generated bundle is **orphaned, never auto-deleted** — authored files are
 sacred (§2): it enters the same error state as a watched import whose
-source vanished, is listed by `doctor`, and is deleted only by explicit
+source vanished (a `DirectoryOrphan` watched-import failure, listed by
+`Snapshot.importFailures`), and is deleted only by explicit
 user action (an orphan whose rule is gone may instead be adopted in place by
 the default layer, §8 "Default imports"). Output paths are deterministic (`<stem>.bundle`,
 `<name>.glsl.bundle`, beside their sources); a naming collision is a rules
@@ -2684,8 +2673,8 @@ from the committed file. The fix was `ImportRequest` (importer id, sources,
 destination, settings, watch) and `ImportRecord` (§6), so that:
 
 - **Reproducibility from the file alone.** `$record` names the importer,
-  sources, settings and read-set; `reimport` and the fixpoint check (`doctor`,
-  CI) run what the bundle says, never what a lookup table says today.
+  sources, settings and read-set; `reimport` and the doctor operation's fixpoint
+  check run what the bundle says, never what a lookup table says today.
 - **Selection is authored data (§2 layer 1), not code (layer 2).** A module
   rebuild that changes an extension table cannot silently re-target an
   existing bundle to another importer.
@@ -2697,7 +2686,7 @@ Default imports keep all three:
 - A default import writes the same `$record` as any directory import: the
   importer id, sources, completed settings and a `DirectoryOrigin`. Once
   written, the bundle never consults the default table again: `reimport`,
-  watched re-import and `doctor`'s fixpoint read the record.
+  watched re-import and the doctor operation's fixpoint check read the record.
 - The default table only decides **first selection** of a file no authored
   rule or explicit import claims, the same role a rules bundle's `matches`
   plays. Its identity is stable and recorded (rule id, below), so a table
@@ -3044,7 +3033,7 @@ pre-key** plus a **discovered-trace bucket**. The pre-key (the import key,
 `digest(Domain::ImportKey, 1, entry AssetUuid ‖
 bundle uuid ‖ local_id ‖ entry type uuid ‖ the entry's terminal type
 uuid (pipeline map, §9) ‖ canonical bundle bytes ‖ the entry's current
-logical hash ‖ layout hash ‖ applied migrations (always empty as built) ‖ optional automatic
+logical hash ‖ layout hash ‖ applied migrations (always an empty sequence: no migration edges exist; it stays because dropping it would change every `ImportKey` digest) ‖ optional automatic
 migration (from, to, planner version, dylib hash; present iff the entry's schema hash is not current, `migration_key_inputs`) ‖ optional validator dylib hash ‖ artifact-format version)` in the
 one encoding (§5) — carries
 everything computable before work: the bundle
@@ -3730,11 +3719,10 @@ pub enum TraceOp {                         // the labeled, outcome-bearing trace
     /// then proceeds to RefCheck. Normal public queries still filter roles.
     RoleCheck { asset: AssetUuid,
                 observed: Observed<Option<EntryRole>> },
-    /// Coordinator-private control-plane query (§6, §10). It is canonical
-    /// trace data but its type cannot be constructed by pipeline/runtime code.
+    /// Coordinator-private control-plane query (§6, §10). Not built: the
+    /// daemon records no control traces (trace_source.rs answers no_trace).
     Control { query: ControlQuery, observed: Observed<[u8; 16]> },
-    /// Non-artifact control value read. The canonical subject plus observed
-    /// whole-bundle byte identity revalidates at the attempted basis.
+    /// Non-artifact control value read. Not built, as Control.
     ControlRead { subject: ControlSubject,
                   observed: Observed<BundleFileHash> },
 }
@@ -3776,7 +3764,10 @@ and every decoder MUST reject it. It has no payload grammar and can never be an
 alias for a ToolEpoch miss, a successful `Tool` observation, or a transient
 execution outcome.
 
-The control subgrammar is fixed rather than inheriting declaration order.
+Not built: the daemon records no control traces (§10). The control
+subgrammar below is what `distill-build/src/trace.rs` and `trace_decode.rs`
+encode and decode; only their tests exercise it. It is fixed rather than
+inheriting declaration order.
 `ControlQuery` is its tag as a `u32` with no payload
 (`DirectoryImportRuleSet` = 2; tag 1 retired). `ControlSubject` is its tag
 as a `u32` followed by `PackDefinition(asset:[u8;16])` = 2,
@@ -3909,14 +3900,22 @@ the cache cannot see what it was never told about. Every reproducibility
 claim in this document ("content hashes are determined by snapshot inputs",
 "checkout + rebuild is byte-identical") holds under this contract, not
 unconditionally. Mitigations, not enforcement: the optional double-run
-determinism check, `doctor verify` (rebuild-and-compare), and process
-isolation remaining available as future hardening (§22). `doctor verify`
-is a read-only report on one read snapshot: it holds no write lock,
-publishes no version and repairs nothing. It rescans every root against
-the published input, reruns every watched import against its bundle,
-rebuilds every runtime entry twice without a cache and compares both with
-each other and with the cached result, and checks every CAS extent's bytes
-against its hash; each difference is a finding.
+determinism check, the doctor operation (rebuild-and-compare), and process
+isolation remaining available as future hardening (§22). The doctor
+operation is `Hub.operation` with `LongRunningOp::Doctor`, whose one request
+is `DoctorRequest::Verify` (§17; `DoctorReport::verify` in
+`distill-daemon/src/operations.rs`). It is a read-only report on one read
+snapshot: it holds no write lock, publishes no version and repairs nothing.
+- Rescans every root and compares the result with the published input, plus
+  the scanner's diagnostic rows (directory cycles, aliases of daemon-owned
+  directories).
+- Reruns every watched import against its bundle (fixpoint check).
+- Rebuilds every runtime entry for every target twice without a cache and
+  compares both with each other and with the cached result
+  (`doctor_verify_builds`).
+- Reads every CAS extent and checks its bytes against its hash
+  (`verify_all_cas_extents`).
+- Each difference is a finding in the operation's report.
 
 ## 10. Dependency & Invalidation Model
 
@@ -3996,8 +3995,8 @@ runtime `Snapshot.query`, and pack-root validation reject it before evaluation;
 no ordinary dependency trace or shipping closure can opt authoring-only
 entries in. The coordinator-private `ControlQuery` above is not an
 `AssetQuery` mode and cannot be deserialized from any public surface; its one
-query, `DirectoryImportRuleSet`, has a `TraceOp::Control` encoding; no build or
-load trace records one as built (§6, §11).
+query, `DirectoryImportRuleSet`, has a `TraceOp::Control` encoding that no
+trace records (not built, §6).
 Direct UUID resolution is governed by the same role index even though it is
 not query syntax: runtime `Snapshot.resolve`, loader pulls, and closure
 expansion return `RoleIneligible` for an authoring-only UUID. Internal strong
@@ -4023,7 +4022,29 @@ pub struct AssetQuery {                    // present selectors AND together; �
 pub struct TagSelector { pub tag: String, pub value: Option<String> }
 // result: matching entry UUIDs, canonically sorted, recorded as
 // digest(Domain::AssetQuery, 1, count:u32 ‖ uuids)
+```
 
+Not built: the daemon records no control traces. The types below and the
+trace operations that carry them remain in code:
+- Types: `ControlQuery`, `ControlSubject`, `ControlFailureSubject`,
+  `ControlFailureCode`, `ControlFailureEntries`
+  (`distill-pipeline-api/src/failure.rs`); `ControlValue` and its payloads,
+  `TraceOp::Control`/`ControlRead`, `TraceSource::control`/`control_read`
+  (`distill-build/src/trace.rs`, decode in `trace_decode.rs`).
+- Daemon: `distill-daemon/src/build/trace_source.rs` answers `no_trace()` for
+  both `control` and `control_read`; `drifted_input` in
+  `distill-daemon/src/build.rs` matches the two operations.
+- Tests: `distill-build/tests/trace.rs`, `distill-build/tests/persist.rs`,
+  `distill-daemon/src/build/tests/eager_trace.rs`,
+  `distill-daemon/src/build/tests/lazy_trace.rs`.
+- Outside trace code only `PackDefinitionControlValue` is used: the pack
+  builder decodes pack definitions into it (`decode_pack_definition`,
+  `distill-pack-build/src/builder.rs`; `distill-daemon/src/pack_command.rs`).
+  Directory rules and import settings are decoded by the importer
+  (`decode_directory_rules`, `decode_import_record`,
+  `distill-daemon/src/importer/controls.rs`), untraced (§6).
+
+```rust
 /// Coordinator-private control queries (distill-pipeline-api/src/failure.rs).
 /// A separate vocabulary from AssetQuery, so an ordinary runtime/process
 /// query cannot opt authoring-only control entries into its result set.
@@ -4069,14 +4090,10 @@ pub enum ControlFailureCode {
 pub struct ControlFailureEntries(Vec<AssetUuid>);
 ```
 
-- A control query or read is recorded as `TraceOp::Control { query, observed }`
-  (the sorted-set hash) or `TraceOp::ControlRead { subject, observed }` (a
-  `ControlValueHash`), revalidated through `TraceSource::control` and
-  `control_read` (`distill-build/src/trace.rs`).
-- The daemon's build trace source answers neither
-  (`distill-daemon/src/build/trace_source.rs`): no build or load trace records
-  a control operation. Directory rules, pack definitions and import settings
-  are read by their own services.
+- Were the daemon to record them, a control query or read would be
+  `TraceOp::Control { query, observed }` (the sorted-set hash) or
+  `TraceOp::ControlRead { subject, observed }` (a `ControlValueHash`),
+  revalidated through `TraceSource::control` and `control_read`.
 
 Path rules are pinned, and **total**: a normalized path is a `/`-separated
 sequence of one or more components, each a non-empty NFC-normalized UTF-8
@@ -4091,8 +4108,8 @@ For a physical scan name rejected before this normalized String exists, the
 scanner publishes §7's `InvalidPhysicalPath` version poison using the complete lossless
 Unix-byte or Windows-UTF-16 arm and exact failure code; it never repairs the
 name or invents a lossy `normalized_path`.
-Comparison is byte-exact after NFC normalization (case-sensitive; `doctor`
-flags trees differing only by case — a hazard on case-insensitive
+Comparison is byte-exact after NFC normalization (case-sensitive; nothing
+flags trees differing only by case, a hazard on case-insensitive
 filesystems). Two physical directory entries in one root that normalize to
 the **same** NFC key publish §7's
 `SameRootNormalizedPathCollision` version poison with one root/key and at
@@ -4190,7 +4207,8 @@ discovered from what was actually read, so they are never wrong.
 - The **old** logical schema: the entry's snapshot, embedded in its bundle's
   `schemas` section (§6).
 - The **new** logical schema: the type's current projection in the schema file
-  (§5), with its `renamed_from` attributes.
+  (§5), with its `renamed_from` attributes (`ProjectTypeAuthority::renamed_from`,
+  `distill-schema/src/authority.rs`, from `ngp_schema::project_with_renames`).
 - **Migration functions**, registered in the pipeline module per exact
   conversion: `Registry::register_migration(key: MigrationKey, callback)`
   (`distill-pipeline-api/src/registration.rs`). The callback is any
@@ -4248,22 +4266,16 @@ exactly the identity the logical hash defines; the only nominal input is picking
 the root (the entry's `type_uuid` selects which current schema to diff
 against). `TypeDef`-level matching on stable type UUIDs (crate + name
 fallback) is the *engine* planner's business, where live `TypeDef`s
-exist on both sides. The disk-side default ops — legal only in
-automatic plans (below) — materialize values by
-calling into the
+exist on both sides. The disk-side default ops materialize values by calling into the
 pipeline module (the dylib hash joins the input hash when they run, §8).
 
 ```rust
 pub enum MigrationOp {                                 // path-addressed, value-level
     CopyField         { from: FieldPath, to: FieldPath },
     Widen             { from: FieldPath, to: FieldPath },
-    /// A literal — the only default-shaped op validate_plan
-    /// admits under EdgeKind::Custom (below).
-    WriteValue        { to: FieldPath, value: Value },
-    WriteFieldDefault { to: FieldPath },               // the field type's default —
-                                                       // automatic plans only (below)
-    WriteParentDefault{ to: FieldPath },               // from the parent type's Default —
-                                                       // automatic plans only (below)
+    WriteValue        { to: FieldPath, value: Value },  // a literal
+    WriteFieldDefault { to: FieldPath },               // the field type's default
+    WriteParentDefault{ to: FieldPath },               // from the parent type's Default
     WriteNone         { to: FieldPath },
     DropField         { at: FieldPath },
     MapVariant        { at: FieldPath, from: String, to: String,
@@ -4276,8 +4288,7 @@ pub enum MigrationOp {                                 // path-addressed, value-
                                                                      // the map-key collision rule
     GrowArray         { at: FieldPath, element: Vec<MigrationOp> },  // a fixed array grown: old elements
                                                                      // as MigrateElements, added slots
-                                                                     // the array default's tail —
-                                                                     // automatic plans only (below)
+                                                                     // the array default's tail
     MigrateMapKeys    { at: FieldPath, key: Vec<MigrationOp> },      // key collision = error
     MigrateInline     { at: FieldPath, ops: Vec<MigrationOp> },
 }
@@ -4293,9 +4304,8 @@ pub enum MigrationOp {                                 // path-addressed, value-
 registered defaults (`register_defaults`, `register_asset_defaults::<T>()`,
 §3), which describe only the *current* schema; the automatic diff always
 targets current, so the fields they fill exist in the module by construction.
-`validate_plan` with `EdgeKind::Custom` rejects default ops (a custom op list
-would have to carry literal `WriteValue`s), but the daemon builds no custom op
-lists: custom logic is a registered migration function.
+The daemon builds no custom op lists: custom logic is a registered migration
+function.
 
 **Execution semantics are normative, not executor-defined.** A plan
 executes value-to-value: ops **read from the immutable input value** (the
@@ -4333,7 +4343,7 @@ Selection is fixed, not heuristic (`load_current_entry`,
    present. The trace records its `CapabilityKey::MigrationFn` observation.
 4. Otherwise `plan_automatic_renamed` diffs the snapshot against the current
    projection, honoring the current schema's `renamed_from` attributes;
-   `validate_plan(…, EdgeKind::Automatic)` checks it. A refused plan (a rev
+   `validate_plan` checks it. A refused plan (a rev
    hard stop, an unmatched variant with data, a shrinking array) fails the
    load with a `MigrationPlan` failure naming the type and both hashes, and
    tells the author a migration function is needed.
@@ -4373,13 +4383,19 @@ Inputs and trace:
   trace is the sole dependency record (§9). `MIGRATION_PLANNER_VERSION` (1)
   joins the build's input identity.
 - `execute_ops` runs the plan over whole `Value`s; `execute_sparse` (the same
-  plan over a `Patch`) exists in `distill-migrate` and is not called by the
-  daemon.
+  plan over a `Patch`) is not called by the daemon; newgameplus calls it
+  (`prefab::migrate_embedded` in `newgameplus/src/prefab.rs`; `ngp-prefab-edit/src/migrate.rs`).
 
 Bundles on disk are never rewritten by the build and may lag indefinitely:
 self-description makes a mixed-schema tree consistent, every file
-individually interpretable. There is no disk-migration command; an authoring
-write (§17) stamps the current hash and snapshot on the entries it writes.
+individually interpretable. There is no disk-migration command. An authoring
+write (§17) stores each written entry under the schema hash and snapshot the
+writer sends (`AuthoringService`, `distill-daemon/src/authoring.rs`), which
+need not be current. Replacing an entry stored under another schema first
+passes `check_lossless`: every field the automatic plan (with the written
+schema's renames, when it is current) drops must hold its default, and a
+refused plan needs a registered migration function; otherwise the write
+fails `LossyWrite` unless forced.
 
 ### Integrity, not degradation
 
@@ -5134,9 +5150,9 @@ Each published input-version header stores either no global poison or the exact
 canonical `VersionPoisonV1` code/detail plus recomputed version-poison identity (§7).
 If validation discovers more than one global defect, this is §7's first
 canonical `(code, detail-bytes)` row after complete-set enumeration, never the
-first filesystem/scanner result; the remaining sorted rows are doctor-only
-diagnostics and have no persistence, snapshot, equality, healing, or RPC
-authority.
+first filesystem/scanner result; `MetadataHub.diagnostics` reports the whole
+sorted set (`namespace_errors`), and the remaining rows have no persistence,
+snapshot, equality, or healing authority.
 Startup rejects a noncanonical stored tuple rather than synthesizing a bundle
 row. Query/RPC projections decode that same record and never rebuild identity
 from presentation text.
@@ -5442,6 +5458,10 @@ pub struct MemoSeq(pub u64);        // advanced by build-result commits
 pub struct StoreInstanceId(pub [u8; 16]);
 pub struct SnapshotStamp { pub instance: StoreInstanceId, pub version: InputVersion }
 
+// As built there is no one daemon type with these methods: a read snapshot is
+// a `StoreReader` (distill-store) plus the `Compiled` state compiled at it
+// (`Coordinator::compiled_at`), which holds the `PipelineSnapshot`.
+// distill-rpc's `MetadataSnapshot` is the RPC capability of §17.
 impl MetadataSnapshot {             // immutable; taking/holding one is an Arc clone
     pub fn version(&self) -> InputVersion;
     /// Some(err) ⇔ this snapshot is a poisoned version (§7): `current`
@@ -5481,7 +5501,11 @@ impl MetadataSnapshot {             // immutable; taking/holding one is an Arc c
     /// receive the `PipelineFailure`; pure-metadata reads (path index,
     /// input versions, CAS reads, lease pinning) never call this and remain
     /// valid under poison. A resolve whose pinned epoch has been drained
-    /// returns Drifted(Dylib) (§15).
+    /// returns Drifted(Dylib) (§15). As built: `PipelineSnapshot::epoch`
+    /// (`distill-daemon/src/epoch.rs`); an unpublished snapshot fails too.
+    /// distill-store's infallible `ValidatedPipelineEpoch::epoch`
+    /// (`distill-store/src/pipeline.rs`) reads the sealed publication input,
+    /// the store's own `PipelineEpoch` record, not this.
     pub fn epoch(&self) -> Result<&PipelineEpoch, PipelineFailure>;
 }
 
@@ -5652,7 +5676,7 @@ One writer, many snapshot readers:
   callbacks must avoid large native-stack allocations. Results converge
   through the serialized CAS commit path. The queue has
   two priorities, FIFO within each: interactive resolves ahead of batch work
-  (pack builds, `doctor`) — with **bounded starvation**. Staging requires
+  (pack builds, the doctor operation) — with **bounded starvation**. Staging requires
   `parallelism >= 1` and
   `1 <= batch_reserved_workers <= max(1, parallelism - 1)`. For
   `parallelism >= 2`, whenever batch work is pending the reserved slots
@@ -5763,7 +5787,7 @@ submits or joins a cell, then awaits the ticket on its `LocalSet`; the
 build runs on the build workers, never on a connection thread. Inline
 builds (tag-index refinement) run on a writer inside an open input and
 are reachable only through an `OpenInput` proof; nothing that answers a
-resolve holds one. `doctor verify` builds at one read snapshot, without
+resolve holds one. The doctor operation builds at one read snapshot, without
 any cache, and writes nothing. A reconciliation pass refines the tag
 index in its one apply input (§14, one pass, one input version), never in
 its rolled-back plan. A complete refinement (a full rescan or a configuration
@@ -5839,7 +5863,7 @@ Modeled on v1's `FileTracker`, whose behavior is carried over:
 - **Incremental-workload invariant.** After a successful startup scan, ordinary
   filesystem activity never invokes the complete-root scanner. Complete scans
   are restricted to process startup, an accepted configured-root replacement,
-  explicit `doctor verify`, and recovery after the native backend explicitly
+  the doctor operation (`Doctor(Verify)`), and recovery after the native backend explicitly
   reports overflow or incomplete observation. Overflow recovery is exceptional;
   treating every ordinary event as an overflow/full-rescan request is
   nonconforming.
@@ -5867,8 +5891,8 @@ Modeled on v1's `FileTracker`, whose behavior is carried over:
   session's watermark. An offline replacement that preserves size
   necessarily carries an mtime at or after the daemon's last
   observation, so equal-metadata staleness cannot persist; a
-  deliberately backdated mtime is outside the contract, and `doctor
-  verify`'s full rehash is the net. The daemon may be off during arbitrary
+  deliberately backdated mtime is outside the contract, and the doctor
+  operation's full rehash is the net. The daemon may be off during arbitrary
   tree changes (git!) and converges. Enumeration is total: failure to open or
   enumerate a configured root or raw relative subtree publishes §7
   `UnreadableScanSubtree { Root|Subtree, PermissionDenied|NotFound|
@@ -5923,12 +5947,13 @@ v2 improvements over v1's tracker:
   depth: it canonicalizes the daemon-owned paths during configuration staging
   and rejects any overlap or alias with a configured asset root. The scanner
   skips the configured canonical paths during traversal and surfaces an overlap
-  as a named diagnostic, never scanning, querying, or publishing it. The per-root
-  **quarantine directories** (below) are the one deliberate exception
-  to the disjointness rule — they must live on their root's filesystem
-  to receive displaced inodes by rename — and are excluded by exactly
-  this canonical-path mechanism: never scanned, watched, queried, or
-  published, so nothing in them can advance an input version.
+  as a named diagnostic, never scanning, querying, or publishing it. The
+  per-tree **staging directories** (`.distill-staging`, below) are the one
+  deliberate exception to the disjointness rule — a temp must share its
+  target's filesystem for the rename to be atomic — and the scanner and
+  watcher ignore every path through a directory of that name
+  (`atomic_file::in_staging`), so nothing in them can advance an input
+  version.
 - **Symlinks are followed by canonical target path.** The scanner resolves a
   directory before traversing it and requires the canonical target to remain
   inside a configured root. It carries a per-recursion canonical-path ancestry
@@ -5957,136 +5982,35 @@ v2 improvements over v1's tracker:
   immediately before mutation and reject symlinked destination entries; drift
   fails or retries without publishing state. A Windows cook target does not by
   itself promise that the daemon is supported as a Windows host process.
-- **Journaled rename-aside publication.** Every daemon rewrite of an
-  authored file (adoption, watched imports, rename
-  fixups — and §20's generated source files) publishes by journaled
-  rename-aside, verification, and no-clobber install. A multi-file operation first records one
-  durable parent publication group and all child write intents in the
-  `Unarmed` state. While unarmed, no child filesystem mutation is legal;
-  startup may therefore abandon the complete group without executing even a
-  deletion child. The daemon writes and fsyncs every non-empty proposal temp,
-  then durably changes the parent to `Armed` before resuming any child. Each
-  child records terminal success or failure with its retirement, and the
-  parent retires only after every child is terminal. Operation-specific
-  metadata may advance only from the complete child result set (for example,
-  codegen installs the proposed ownership map only if every child succeeded).
-  This group gate closes the crash window between recording a multi-path plan
-  and producing all bytes needed to execute it.
-
-  Each child **write-intent journal** entry —
-  the target path, the temp path, the conflict path that would be used,
-  the expected pre-image hash, and the proposed content hash — is
-  written to daemon state and **fsynced before the first rename** of the
-  protocol. The daemon writes and fsyncs the proposal temp, then atomically
-  renames the user-visible target to the journal-reserved,
-  store-instance-and-intent-ID-derived aside path. That destination is private
-  to the journal under R37's trusted local-workspace boundary; an occupied
-  reserved path is classified and replanned rather than overwritten. The
-  daemon fsyncs the moved file and its directories, records the durable
-  transition, hashes the displaced bytes, and compares them against the
-  recorded pre-image. The aside is the
-  **quarantine entry for its filesystem** — the daemon
-  keeps one per watched root, and one beside each daemon-owned output
-  directory (`rs_mod_path`, §20), each daemon-owned, on the *same
-  filesystem* as the inodes it receives (a rename can carry a live
-  inode only within its filesystem; a cross-filesystem copy would
-  silently orphan an open writer's descriptor), and excluded from
-  scanning by the daemon-owned identity rule above — under a name
-  derived from the durable **store instance ID** and the journal entry's
-  **intent ID**. Intent counters may restart after disposable daemon state is
-  recreated, but the re-minted store instance prevents a retained quarantine
-  name from aliasing a new intent.
-  Content hashes are recorded as journal metadata, never used as
-  quarantine names: two displaced inodes with equal bytes are still two
-  inodes, each possibly held open by a different writer, and
-  hash-naming would alias them. The journal entry records the physical
-  quarantine location before the intent retires — `.distill/` keeps
-  only the journal and metadata — and the inode is retained for the
-  configured window
-  (`displaced_retention_days`, §18 — default 7 days), destroyed only by
-  journaled retention expiry or explicit `doctor clean`.
-
-  If the aside hash matches, the proposal temp is installed at the absent
-  target with an atomic no-clobber hard link; the daemon-owned temp name is
-  then removed and the file and directories are fsynced. A crash between link
-  and temp-name removal is recovered by recognizing the proposal at both names
-  and completing daemon-temp cleanup. If the target reappears first, it is
-  atomically renamed to a separately journal-reserved conflict path and never
-  overwritten. The verified pre-image is restored by an atomic no-clobber hard
-  link from its aside path to the absent target. The aside name remains in
-  quarantine, is marked restored, and remains covered by verification and
-  retention. A second reappearance wins and stops or retries restoration.
-  Quarantine is what extends the no-silent-loss
-  guarantee to **in-place writers holding open descriptors**: the
-  post-rename hash proves only what the inode held at that instant —
-  an editor writing through a descriptor it already holds can land bytes
-  after verification, and those late bytes land in the quarantined inode
-  and survive. Startup reconciliation re-hashes every quarantined file
-  and surfaces any that no longer matches its journal entry as a
-  **recovered-edit diagnostic** naming the origin path. Restoration re-verifies
-  the retained pre-image, and any unknown or reappeared bytes are preserved at
-  a named conflict path; nothing unverified is deleted. Target-to-aside and
-  target-to-conflict moves are one atomic `std::fs::rename` from a user-visible
-  name to a journal-reserved unique name. They are never implemented as
-  `hard_link(source, destination)` followed by `remove_file(source)`, because an
-  ordinary editor save could replace the source between those calls and be
-  unlinked. Hard-link-plus-remove is used only for daemon-owned proposal temps.
-  Stated precisely, the guarantee
-  is: **every displacement is journaled under its intent ID and
-  retained per policy** — nothing is ever destroyed silently or
-  anonymously; destruction happens only by journaled retention expiry
-  or explicit `doctor clean`, both of which name what they remove.
-  Within the retention window every raced edit is recoverable; after
-  it, the journal still records that — and what — was displaced. The durable
-  states are `Prepared`, `AsideJournaled`, `TargetAsideDurable`,
-  `PreimageVerifiedDurable`, `ConflictJournaled`, `ConflictPreservedDurable`,
-  `PreimageRestoredDurable`, and `ProposedInstalledDurable`. Each state journals
-  authority before its next filesystem mutation and records completion only
-  after the affected file and directories are flushed. This is the sole daemon
-  publication protocol on supported Unix hosts. Windows remains a cook target,
-  not a daemon host.
-
-  Startup recovery resumes solely from the durable state plus hashes of target,
-  temp, aside, conflict, and quarantine. In `Prepared` it either begins the
-  reserved aside or retires untouched; in the aside/verified states it
-  classifies any reappeared target before install; in `Installed` it verifies
-  target equals proposed bytes while retaining aside; and in every state an
-  unknown byte sequence is moved only through a journaled reserved conflict
-  transition. File flush precedes every publication that relies on file bytes;
-  directory flush follows every rename/link and precedes the next durable-state
-  advance. Thus crash recovery yields a named pre-image, proposal, and every
-  raced target without any conforming overwrite primitive. **Deletion** (Asset CRUD's bundle delete, §17, and any
-  daemon-initiated delete) is the same rename-aside-and-verify family,
-  never a bare unlink: a check-then-unlink would destroy an external
-  save landing between the operation's base-version check and the
-  unlink — precisely the TOCTOU the atomic rename-aside closes for rewrites. The
-  journal entry records the expected pre-image; the file is atomically
-  **renamed into its root's quarantine under the intent's ID**, the
-  displaced bytes are hashed and compared — match: the intent retires
-  and the deletion publishes, the quarantined inode retained per the
-  window above; mismatch: the displaced bytes are restored to the
-  original path by a no-clobber retained-aside link and the operation fails as a conflict, exactly like a
-  rewrite conflict. **Creation** (a new bundle from import or an editor) has no
-  target to move aside: it publishes by atomic no-replace linkage
-  (`O_CREAT | O_EXCL` semantics, temp linked into place) — if the
-  destination appeared externally in the meantime, both objects are
-  preserved under conflict naming and the operation stops or retries,
-  under the same invariant: the daemon only ever deletes bytes it
-  authored. **Crash recovery reconciles every unfinished intent at
-  startup**, before any other publication runs: each path the intent
-  names (target, temp, conflict, quarantine) is classified by hashing
-  what sits
-  there against the journaled pre-image and proposed hashes — the
-  daemon's own bytes may be deleted or reinstalled per the intent, the
-  expected pre-image is restored to the target if displaced, and an
-  **unclassified file is never deleted**: at worst it moves to a
-  quarantine location and is named in diagnostics, with the intent
-  retiring only once every named path is accounted for. Without the
-  journal, a crash between rename-aside and verify would leave displaced
-  user bytes at an anonymous temp path that any cleanup pass could
-  destroy — so **temp cleanup is journal-driven**: the daemon deletes
-  only temp files some retired intent names as its own, never "stray"
-  files by pattern.
+- **Atomic file publication** (`distill_store::atomic_file`, "the one way
+  Distill writes a file that is not a CAS segment"). Every daemon write of an
+  authored file (authoring writes, imports, rename fixups, §20's generated
+  source files) goes through it:
+  - **Staging.** Each tree Distill writes into (asset root, codegen output,
+    tool object store, pack output) owns one staging directory,
+    `.distill-staging`, directly inside it, so a temp shares the target's
+    filesystem. The scanner and watcher ignore every path through it.
+  - **Write** (`write`, `Staged::commit`): the bytes go to a temp in the
+    staging directory, which is synced; right before the rename the target
+    is re-hashed against the expected pre-image (`Expected::Hash`, `Absent`
+    or `Any`), then the temp is renamed over the target and the directory is
+    synced. A mismatch is `AtomicWriteError::Conflict`; the target is
+    unchanged.
+  - **Delete** (`remove`): the same pre-image check, then `remove_file`. A
+    missing target is not an error.
+  - **Move** (`move_file`): pre-image check on the source, `Absent` on the
+    destination, one rename.
+  - **Content-addressed outputs** (`Staged::commit_new`,
+    `StagedDir::publish_new`): a hard link or rename that never replaces an
+    existing name; an existing one is the caller's to verify.
+  - **Failure:** an `Err` means the target did not change. A failed
+    directory sync after the rename is logged, not returned.
+  - **Recovery:** opening a tree empties its staging directory
+    (`open_staging`); a temp there is uncommitted by definition. There is no
+    write-intent journal, no displaced-inode quarantine and no retention: a
+    rewrite or delete replaces the bytes it checked, and an editor writing
+    through a descriptor it already holds after the check can lose those
+    late bytes.
 
 ## 15. Loader & Runtime
 
@@ -7383,7 +7307,9 @@ descriptions, defaults or index, so editing them re-imports nothing.
   one JSON text, earlier ones the flattened `range`, `color`, `slider`,
   `hidden`); and (protocol 25)
   its renamed fields (`renames`: planner path → the name it was renamed
-  from, the schema file's `renames`), so an editor migrating a value
+  from, read from the type's schema file under the `types` root,
+  `ngp_schema::prefab_types::read_file`, which source-walk writes from
+  `#[asset(renamed_from)]`), so an editor migrating a value
   written under an older schema follows renames as the automatic planner
   does (`plan_automatic_renamed`). The default is an
   `AuthoringValue` under that schema (with the types it names), `absent` (no default file),
@@ -7560,6 +7486,18 @@ both paths. A crash or I/O failure part-way leaves a prefix of the steps,
 reported as Failed with what was applied; the same request, retried, plans
 exactly what remains.
 
+The **doctor operation** is the other `LongRunningOp` arm:
+`LongRunningOp::Doctor` carrying a `DoctorRequest`, whose only variant is
+`Verify` (`distill-protocol/src/rpc.rs`). There is no doctor command line.
+- It runs when the client consumes Completed, on a read snapshot of the
+  request's base; until then the progress stream can be cancelled without
+  starting any work.
+- It is a report (`DoctorReport::verify`,
+  `distill-daemon/src/operations.rs`): §9 lists what it checks. It writes
+  nothing, publishes no version and repairs nothing.
+- Every finding fails the operation with its description, joined into one
+  message; no finding completes it.
+
 Subscription, snapshot, and authoring capabilities are bounded and leased so abandoned clients cannot retain
 unbounded daemon state.
 
@@ -7649,12 +7587,6 @@ compatibility at the artifact actually being loaded.
 # design; remote access is a named open item, §22).
 address = "127.0.0.1:9999"
 state_path = ".distill/"
-# Displaced-inode quarantine retention (§14): every inode a rewrite,
-# deletion, or conflict restoration displaces is retained in its filesystem's
-# quarantine directory (per watched root / per daemon-owned output dir)
-# under the write-intent journal's intent ID for this window;
-# destruction is journaled retention expiry or explicit `doctor clean`.
-displaced_retention_days = 7
 
 [assets]
 # Named roots: the normalized name IS the root's persistent identity —
@@ -7698,7 +7630,7 @@ parallelism = 8
 # callback reads use native recursion on explicit 8 MiB build-worker stacks.
 max_dependency_depth = 32
 # Reserved batch capacity (§13): while batch-class work (pack builds,
-# doctor) is pending, this many worker slots are dedicated to the oldest
+# the doctor operation) is pending, this many worker slots are dedicated to the oldest
 # batch job — strict interactive priority elsewhere, bounded starvation.
 batch_reserved_workers = 1
 
@@ -7747,9 +7679,9 @@ nested inside — every asset root**, the codegen namespaces disjoint from each 
 error naming both paths: a daemon writing inside a watched root would
 advance input versions with its own outputs, an unbounded feedback
 loop; §14's scanner excludes daemon-owned directories by identity as
-defense in depth — the per-root quarantine directories, §14, are the
-one deliberate exception to disjointness: they must share their root's
-filesystem to receive live inodes by rename, and the same identity
+defense in depth — the per-tree staging directories, §14, are the
+one deliberate exception to disjointness: a temp must share its target's
+filesystem for an atomic rename, and the `.distill-staging` name
 exclusion keeps them out of scans and watches), target definitions complete
 with non-empty API sets (§9's match rule), `parallelism >= 1`, and
 `1 <= batch_reserved_workers <= max(1, parallelism - 1)` (§13's
@@ -7799,7 +7731,7 @@ new version (§13's exact classification).
 The configured source file itself remains a watched input. The native watcher
 also covers the exact active `assets.schema_path` and
 `modules.pipeline_dylib` paths; it watches their existing parent directories,
-filters sibling and daemon-quarantine events before queue admission, and arms
+filters sibling and staging-directory events before queue admission, and arms
 replacement paths before reading or publishing a candidate that names them.
 These files are re-read only after an admitted native event (or explicit
 overflow/incomplete-observation recovery), never by periodic hash polling. If
@@ -7828,10 +7760,9 @@ ships; an unclassified key is a spec defect:
 | `cas.segment_size` | operational-live | applies to newly rolled segments only |
 | `cas.cache_limit` | operational-live | eviction policy shifts; the observability rules (§13) are unaffected |
 | `watch.quiet_ms` | operational-live | optional, default 250, must be in `1..=5000`; the next wait for the filesystem to settle (§14) — reconciliation and `[[rebuild]]` jobs — uses the new window |
-| `daemon.displaced_retention_days` | operational-live | applies at the next retention sweep (§14) |
 | `daemon.state_path` | restart-only | daemon state is disposable (§2): relocation is stop, move-or-rebuild, start |
 | `daemon.address` | restart-only | rebinding requires a restart; loopback is validated at staging either way (above) |
-| `[[codegen.output]]` (`root`, `rs_mod_path`, `codegen`) | restart-only | the codegen service reconfigures at startup — retargeting an `rs_mod_path` mid-flight would orphan generated files and their journal pre-images (§20); staging requires each `root` to name a configured root and each `rs_mod_path` to be disjoint from every root and every other output; the restart key is `codegen.output` |
+| `[[codegen.output]]` (`root`, `rs_mod_path`, `codegen`) | restart-only | the codegen service reconfigures at startup — retargeting an `rs_mod_path` mid-flight would orphan generated files (§20); staging requires each `root` to name a configured root and each `rs_mod_path` to be disjoint from every root and every other output; the restart key is `codegen.output` |
 
 **Restart-only keys still stage and validate.** An edit to a
 restart-only key follows the same staged-candidate validation as every
@@ -8014,24 +7945,20 @@ publication over the whole namespace.
 Generated files are **daemon-owned, declared so**: `rs_mod_path` names a
 directory whose generated `<pipeline>.rs` files and `mod.rs` chain
 belong to the codegen service — a hand edit there is a conflict to
-surface, never content to merge. Every write publishes by §14's full
-protocol, generated sources being authored-tree files like any other:
-write-intent journal, then atomic rename-aside, then displaced-byte
-verification against the generated mark (the first line of every
-generated file, `// @generated by distill; do not edit. xxh3:` and the
-XXH3-128 of the rest as 32 hex characters (`GENERATED_MARK`,
-`distill-daemon/src/codegen.rs`): a file whose mark matches is
-distill's unedited output), the displaced inode quarantined in the
-output directory's
-same-filesystem quarantine under its journal-assigned intent ID (§14)
-for the retention window,
-with §14's crash recovery reconciling unfinished intents. A
-concurrent human or build-tool edit is therefore displaced, detected,
-restored, and reported as a named conflict — never silently overwritten
-by a check-then-write race the diff step alone could not close — and
-even an IDE still writing through an open descriptor loses nothing: its
-late bytes land in the quarantined inode and surface as a recovered-edit
-diagnostic (§14).
+surface, never content to merge. Publication (`publish_files`,
+`distill-daemon/src/codegen.rs`) runs inside one store write transaction
+whose input version must still be the basis:
+- Each generated name on disk must be absent or carry the generated mark
+  (the first line of every generated file, `// @generated by distill; do
+  not edit. xxh3:` and the XXH3-128 of the rest as 32 hex characters,
+  `GENERATED_MARK`): a file whose mark matches is distill's unedited output.
+  A marked file whose hash no longer matches fails publication as "edited
+  outside distill"; an unmarked file at a generated name fails as an unowned
+  path.
+- Each changed file is written or removed through §14's atomic file
+  publication with its observed hash as the pre-image, so a concurrent edit
+  between the check and the rename fails as a conflict instead of being
+  overwritten.
 
 Generated physical names have exactly one grammar and one authority:
 `sp_` followed by the asset's full 32-character lowercase `AssetUuid` hex
@@ -8145,6 +8072,11 @@ put production image codecs, mesh optimization, or shader compilers in core.
 > authority for every digest domain. Schema lineage (manifest, stamps,
 > acceptance, retirement, repair), Migration assets and migration chains are
 > not built: migration is §11's registered function or one automatic plan.
+> The write-intent journal, displaced-inode quarantine, retention and any
+> clean command are not built either: daemon file writes are §14's atomic
+> file publication. The doctor operation is `Doctor(Verify)` only (§17).
+> Control traces (`ControlSnapshot`, `TraceOp::Control`/`ControlRead`,
+> `ControlSubject::Migration`) are not built: the daemon records none (§10).
 
 ### Resolved
 
@@ -8459,7 +8391,7 @@ put production image codecs, mesh optimization, or shader compilers in core.
   a two-file commit. Import is a fold, `import(sources, settings,
   Option<prior bundle>)`: content from sources, identity and settings from
   the prior bundle, deterministic up to fresh UUID mints. Sync is therefore
-  a byte-identical fixpoint, verified by `doctor` and CI. The built-in
+  a byte-identical fixpoint, verified by the doctor operation (§17). The built-in
   `ImportRecord` entry is the provenance carrier — importer id, sources,
   watch, read-set — so re-import reconstructs from the file alone.
   Imports are requested by explicit `ImportRequest` (importer id, sources,
@@ -8479,7 +8411,7 @@ put production image codecs, mesh optimization, or shader compilers in core.
   across epochs or against a foreign snapshot.
 - **Determinism contract** (§9): pipeline code is trusted, not sandboxed —
   all inputs through the context; every reproducibility claim holds under
-  the contract; double-run and `doctor verify` are mitigations.
+  the contract; double-run and the doctor operation are mitigations.
 - **Logical-hash grammar** (§5): pinned normatively in this document —
   versioned, domain-prefixed binary AST encoding.
 - **Blob-in-pack** (§16): each blob ships as one contiguous, stored,
@@ -8491,7 +8423,7 @@ put production image codecs, mesh optimization, or shader compilers in core.
 - **Directory imports** (§8, §20): an authored rules bundle owns the
   listing; application is a batch of independent single-bundle folds; each
   `.glsl` include is owned by its own bundle — stem imports never copy
-  include text. Listing loss orphans a generated bundle (doctor-listed,
+  include text. Listing loss orphans a generated bundle (listed as a `DirectoryOrphan` import failure,
   user-deleted), never auto-deletes; output paths are deterministic and
   collisions are errors.
 - **CAS authority** (§13): SQLite is the authority on what committed and
@@ -9071,7 +9003,7 @@ put production image codecs, mesh optimization, or shader compilers in core.
   §20): after rename-aside + verify, the displaced pre-image is retained at
   `.distill/displaced/<content-hash>` (journal-recorded) for
   `displaced_retention_days` (default 7), removed only by retention
-  expiry or `doctor clean` — an in-place writer's post-verification
+  expiry or an explicit clean (neither built, §14) — an in-place writer's post-verification
   bytes land in the quarantined inode and survive, and startup
   reconciliation re-hashes quarantined files, surfacing mismatches as
   recovered-edit diagnostics. Generated-source writes (§20) inherit
@@ -9368,7 +9300,7 @@ put production image codecs, mesh optimization, or shader compilers in core.
   protocol; and the
   no-silent-loss claim is restated honestly: every displacement is
   journaled and retained per policy, destroyed only by journaled
-  retention expiry or explicit `doctor clean`.
+  retention expiry or an explicit clean (neither built, §14).
 - **Load policy is attested on every IO base** (§4, §5, §9, §13, §15,
   §16): `build_only` is deliberately absent from logical hash and native-layout digest, so
   layout attestation could never detect a same-identity, same-layout
@@ -9512,7 +9444,7 @@ put production image codecs, mesh optimization, or shader compilers in core.
   mount-refusing integrity failure.
 - **Batch work cannot starve** (§13, §18): strict two-class priority
   with FIFO let continuous interactive demand starve pack builds and
-  doctor runs forever. Strict interactive priority is retained, but
+  doctor operation runs forever. Strict interactive priority is retained, but
   whenever batch-class work is pending a reserved minimum capacity
   (`batch_reserved_workers`, default one slot, configurable) is
   dedicated to the oldest batch job — bounded starvation, unchanged
@@ -10143,7 +10075,7 @@ put production image codecs, mesh optimization, or shader compilers in core.
   13): the scanner completely enumerates, canonical-encodes, deduplicates, and
   sorts all candidate defects by `(code, detail bytes)` before selecting the
   first as the one persisted/snapshot/RPC `VersionPoison`. The remaining sorted
-  set is doctor-only diagnostics; scan or thread completion order never wins.
+  set is reported by `MetadataHub.diagnostics` only; scan or thread completion order never wins.
   (Refined in R30: unreadable root/subtree enumeration failures participate in
   this same complete set and authority ordering.)
 - **ToolEpoch misses are closed, memoizable capability failures** (§§9, 13):
@@ -10214,7 +10146,7 @@ put production image codecs, mesh optimization, or shader compilers in core.
 - **Simultaneous configuration defects have singular canonical authority**
   (§§5, 13, 17–18): staging enumerates, canonical-encodes, deduplicates, and
   sorts the complete configuration-error detail set by `(code, detail bytes)`; the first is the sole
-  persisted/snapshot/RPC poison and the rest are doctor-only. Lineage repair is
+  persisted/snapshot/RPC poison and the rest are dropped. Lineage repair is
   enabled only when its defect is that authoritative first row.
 - **Raw physical-path reasons are byte-exact** (§§7, 10, 17): Unix and Windows
   encoding, absolute-form, separator/component, dot/parent, and forbidden-unit

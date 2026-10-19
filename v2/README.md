@@ -31,8 +31,10 @@ A runtime reading packs only (the loader without `rpc`) links `distill-asset`,
 (its text codecs: cooked prefabs are parsed from text until newgameplus GAP 23
 §17.11 step 5).
 
-Schema-model code here is destined to merge into `newgameplus`'s
-`ngp-schema`/`source-walk` per §5 ("One model, split — not a second one");
-it is developed in this workspace first so distill's test suite drives it.
+The schema model (logical hash, snapshot codec; `SchemaNode`, `Value` and
+`Patch` from `ngp-value`, re-exported) lives in newgameplus's `ngp-schema`,
+shared with source-walk and the engine
+(§5, "One model, split — not a second one"). `distill-schema` holds only the
+daemon-side services over it.
 
 Build/test with `nix run nixpkgs#cargo -- test` from this directory.

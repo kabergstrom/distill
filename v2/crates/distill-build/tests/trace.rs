@@ -4,7 +4,7 @@ use distill_build::dslf::{DslfError, DslfV1};
 use distill_build::query::AssetQuery;
 use distill_build::trace::*;
 use distill_core::hash::{digest_prefix, Domain};
-use distill_core::id::{AssetUuid, BundleFileHash, ContentHash, LogicalHash, TypeUuid};
+use distill_core::id::{AssetUuid, BundleFileHash, ContentHash, TypeUuid};
 use distill_migrate::FieldPath;
 
 #[derive(Default)]
@@ -349,22 +349,8 @@ fn local_failure_processor_bytes_pin_class_width_field_order_and_framing() {
 }
 
 #[test]
-fn dslf_canonicalizes_declared_sets_but_retains_validator_multiplicity() {
+fn dslf_retains_validator_multiplicity() {
     let a = AssetUuid([1; 16]);
-    let b = AssetUuid([2; 16]);
-    let migration = |edges| DslfV1::MigrationPlan {
-        type_uuid: TypeUuid([3; 16]),
-        from: LogicalHash([4; 16]),
-        to: LogicalHash([5; 16]),
-        failure: distill_build::dslf::MigrationPlanFailureV1::AmbiguousEdge {
-            conflicting_edges: edges,
-        },
-    };
-    assert_eq!(
-        migration(vec![b, a, b]).digest().unwrap(),
-        migration(vec![a, b]).digest().unwrap()
-    );
-
     let validator = |paths| DslfV1::Validator {
         asset: a,
         type_uuid: TypeUuid([6; 16]),

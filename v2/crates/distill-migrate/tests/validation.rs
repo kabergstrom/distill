@@ -3,7 +3,7 @@
 
 mod common;
 use common::*;
-use distill_migrate::{validate_plan, EdgeKind, MigrationOp, PlanError};
+use distill_migrate::{validate_plan, MigrationOp, PlanError};
 use ngp_schema::SchemaNode;
 
 fn copy(fp: &[&str], tp: &[&str]) -> MigrationOp {
@@ -18,12 +18,11 @@ fn has_error(errs: &[PlanError], pred: impl Fn(&PlanError) -> bool) -> bool {
 }
 
 #[test]
-fn valid_plan_passes_both_edge_kinds() {
+fn valid_plan_passes() {
     let from = strct(0, &[("a", 0, p(PK::U32)), ("b", 0, SchemaNode::String)]);
     let to = from.clone();
     let ops = vec![copy(&["a"], &["a"]), copy(&["b"], &["b"])];
-    validate_plan(&ops, &from, &to, EdgeKind::Automatic).unwrap();
-    validate_plan(&ops, &from, &to, EdgeKind::Custom).unwrap();
+    validate_plan(&ops, &from, &to).unwrap();
 }
 
 #[test]
@@ -31,7 +30,7 @@ fn missing_from_path_is_error() {
     let from = strct(0, &[("a", 0, p(PK::U32))]);
     let to = from.clone();
     let ops = vec![copy(&["nope"], &["a"])];
-    let errs = validate_plan(&ops, &from, &to, EdgeKind::Custom).unwrap_err();
+    let errs = validate_plan(&ops, &from, &to).unwrap_err();
     assert!(has_error(&errs, |e| matches!(
         e,
         PlanError::MissingFromPath { path } if path.contains("nope")
@@ -43,7 +42,7 @@ fn missing_to_path_is_error() {
     let from = strct(0, &[("a", 0, p(PK::U32))]);
     let to = from.clone();
     let ops = vec![copy(&["a"], &["a"]), copy(&["a"], &["nope"])];
-    let errs = validate_plan(&ops, &from, &to, EdgeKind::Custom).unwrap_err();
+    let errs = validate_plan(&ops, &from, &to).unwrap_err();
     assert!(has_error(&errs, |e| matches!(
         e,
         PlanError::MissingToPath { path } if path.contains("nope")
@@ -66,7 +65,7 @@ fn missing_at_path_is_error_per_side() {
             }],
         },
     ];
-    let errs = validate_plan(&ops, &from, &to, EdgeKind::Custom).unwrap_err();
+    let errs = validate_plan(&ops, &from, &to).unwrap_err();
     assert!(has_error(&errs, |e| matches!(
         e,
         PlanError::MissingAtPath { path, .. } if path.contains("inner")
@@ -83,7 +82,7 @@ fn drop_field_at_resolves_in_from_schema() {
             at: path(&["ghost"]),
         },
     ];
-    let errs = validate_plan(&ops, &from, &to, EdgeKind::Custom).unwrap_err();
+    let errs = validate_plan(&ops, &from, &to).unwrap_err();
     assert!(has_error(&errs, |e| matches!(
         e,
         PlanError::MissingFromPath { path } if path.contains("ghost")
@@ -95,7 +94,7 @@ fn uncovered_leaf_is_error() {
     let from = strct(0, &[("a", 0, p(PK::U32)), ("b", 0, SchemaNode::String)]);
     let to = from.clone();
     let ops = vec![copy(&["a"], &["a"])]; // "b" never written
-    let errs = validate_plan(&ops, &from, &to, EdgeKind::Custom).unwrap_err();
+    let errs = validate_plan(&ops, &from, &to).unwrap_err();
     assert!(has_error(&errs, |e| matches!(
         e,
         PlanError::UncoveredLeaf { path } if path.contains("b")
@@ -107,7 +106,7 @@ fn double_covered_leaf_equal_paths_is_error() {
     let from = strct(0, &[("a", 0, p(PK::U32))]);
     let to = from.clone();
     let ops = vec![copy(&["a"], &["a"]), copy(&["a"], &["a"])];
-    let errs = validate_plan(&ops, &from, &to, EdgeKind::Custom).unwrap_err();
+    let errs = validate_plan(&ops, &from, &to).unwrap_err();
     assert!(has_error(&errs, |e| matches!(
         e,
         PlanError::DoubleCoveredLeaf { path } if path.contains("a")
@@ -127,7 +126,7 @@ fn double_covered_leaf_prefix_overlap_is_error() {
             value: Value::U32(1),
         },
     ];
-    let errs = validate_plan(&ops, &from, &to, EdgeKind::Custom).unwrap_err();
+    let errs = validate_plan(&ops, &from, &to).unwrap_err();
     assert!(has_error(&errs, |e| matches!(
         e,
         PlanError::DoubleCoveredLeaf { path } if path.contains("x")
@@ -135,46 +134,25 @@ fn double_covered_leaf_prefix_overlap_is_error() {
 }
 
 #[test]
-fn default_ops_rejected_in_custom_edge() {
-    // §11: edge authoring materializes literals; a violating edge is
-    // rejected naming it.
+fn default_ops_accepted() {
     let from = strct(0, &[("a", 0, p(PK::U32)), ("b", 0, p(PK::U32))]);
     let to = from.clone();
     let ops = vec![
         MigrationOp::WriteFieldDefault { to: path(&["a"]) },
         MigrationOp::WriteParentDefault { to: path(&["b"]) },
     ];
-    let errs = validate_plan(&ops, &from, &to, EdgeKind::Custom).unwrap_err();
-    assert!(has_error(&errs, |e| matches!(
-        e,
-        PlanError::DefaultOpInCustomEdge { op, .. } if *op == "WriteFieldDefault"
-    )));
-    assert!(has_error(&errs, |e| matches!(
-        e,
-        PlanError::DefaultOpInCustomEdge { op, .. } if *op == "WriteParentDefault"
-    )));
+    validate_plan(&ops, &from, &to).unwrap();
 }
 
 #[test]
-fn default_ops_accepted_in_automatic_segment() {
-    let from = strct(0, &[("a", 0, p(PK::U32)), ("b", 0, p(PK::U32))]);
-    let to = from.clone();
-    let ops = vec![
-        MigrationOp::WriteFieldDefault { to: path(&["a"]) },
-        MigrationOp::WriteParentDefault { to: path(&["b"]) },
-    ];
-    validate_plan(&ops, &from, &to, EdgeKind::Automatic).unwrap();
-}
-
-#[test]
-fn write_value_accepted_in_custom_edge() {
+fn write_value_accepted() {
     let from = strct(0, &[("a", 0, p(PK::U32))]);
     let to = from.clone();
     let ops = vec![MigrationOp::WriteValue {
         to: path(&["a"]),
         value: Value::U32(7),
     }];
-    validate_plan(&ops, &from, &to, EdgeKind::Custom).unwrap();
+    validate_plan(&ops, &from, &to).unwrap();
 }
 
 #[test]
@@ -189,7 +167,7 @@ fn duplicate_map_variant_from_is_error() {
         payload: vec![],
     };
     let ops = vec![mv("A"), mv("B")];
-    let errs = validate_plan(&ops, &from, &to, EdgeKind::Custom).unwrap_err();
+    let errs = validate_plan(&ops, &from, &to).unwrap_err();
     assert!(has_error(&errs, |e| matches!(
         e,
         PlanError::DuplicateMapVariantFrom { from, .. } if from == "A"
@@ -209,19 +187,15 @@ fn map_variant_group_is_one_writer() {
         to: f.to_string(),
         payload: vec![],
     };
-    validate_plan(&[mv("A"), mv("B")], &from, &to, EdgeKind::Custom).unwrap();
+    validate_plan(&[mv("A"), mv("B")], &from, &to).unwrap();
 }
-
-// NOTE: `MigrationOp::Custom` was removed from the vocabulary (R20/M21):
-// whole-edge `MigrationKind::Function` is the custom-logic carrier, so
-// there is no per-op escape hatch left to reject.
 
 #[test]
 fn write_none_target_must_be_option() {
     let from = strct(0, &[("a", 0, p(PK::U32))]);
     let to = from.clone();
     let ops = vec![MigrationOp::WriteNone { to: path(&["a"]) }];
-    let errs = validate_plan(&ops, &from, &to, EdgeKind::Custom).unwrap_err();
+    let errs = validate_plan(&ops, &from, &to).unwrap_err();
     assert!(has_error(&errs, |e| matches!(
         e,
         PlanError::WriteNoneTargetNotOption { path } if path.contains("a")
@@ -236,7 +210,7 @@ fn invalid_widen_pair_rejected() {
         from: path(&["a"]),
         to: path(&["a"]),
     }];
-    let errs = validate_plan(&ops, &from, &to, EdgeKind::Custom).unwrap_err();
+    let errs = validate_plan(&ops, &from, &to).unwrap_err();
     assert!(has_error(&errs, |e| matches!(
         e,
         PlanError::InvalidWiden { .. }
@@ -254,7 +228,7 @@ fn map_variant_unknown_variant_rejected() {
         to: "A".to_string(),
         payload: vec![],
     }];
-    let errs = validate_plan(&ops, &from, &to, EdgeKind::Custom).unwrap_err();
+    let errs = validate_plan(&ops, &from, &to).unwrap_err();
     assert!(has_error(&errs, |e| matches!(
         e,
         PlanError::UnknownVariant { variant, .. } if variant == "Nope"
@@ -272,7 +246,7 @@ fn nested_frame_coverage_enforced() {
         at: path(&["inner"]),
         ops: vec![copy(&["x"], &["x"])], // "y" uncovered in the inner frame
     }];
-    let errs = validate_plan(&ops, &from, &to, EdgeKind::Custom).unwrap_err();
+    let errs = validate_plan(&ops, &from, &to).unwrap_err();
     assert!(has_error(&errs, |e| matches!(
         e,
         PlanError::UncoveredLeaf { path } if path.contains("y")
@@ -290,7 +264,7 @@ fn migrate_elements_array_len_mismatch_rejected() {
             to: root(),
         }],
     }];
-    let errs = validate_plan(&ops, &from, &to, EdgeKind::Custom).unwrap_err();
+    let errs = validate_plan(&ops, &from, &to).unwrap_err();
     assert!(has_error(&errs, |e| matches!(
         e,
         PlanError::ContainerMismatch { .. }
@@ -303,5 +277,5 @@ fn zero_field_struct_is_trivially_covered() {
     let from = strct(0, &[]);
     let to = strct(0, &[]);
     let ops: Vec<MigrationOp> = vec![];
-    validate_plan(&ops, &from, &to, EdgeKind::Custom).unwrap();
+    validate_plan(&ops, &from, &to).unwrap();
 }

@@ -3,9 +3,7 @@
 
 mod common;
 use common::*;
-use distill_migrate::{
-    execute_edge, execute_ops, FieldPath, MigrationError, MigrationKind, MigrationOp,
-};
+use distill_migrate::{execute_ops, FieldPath, MigrationError, MigrationOp};
 use ngp_schema::SchemaNode;
 
 fn copy(fp: &[&str], tp: &[&str]) -> MigrationOp {
@@ -398,130 +396,6 @@ fn input_struct_of_the_wrong_arity_is_corrupt_input() {
     assert!(matches!(err, MigrationError::InputShape { .. }), "{err:?}");
 }
 
-// NOTE: `MigrationOp::Custom` was removed from the vocabulary (R20/M21);
-// custom logic is whole-edge only (`MigrationKind::Function`).
-
-// --- execute_edge ----------------------------------------------------------
-
-#[test]
-fn edge_ops_are_validated_before_execution() {
-    let from = strct(0, &[("a", 0, p(PK::U32))]);
-    let to = from.clone();
-    // Valid ops but a default-table op: rejected for a CUSTOM edge.
-    let kind = MigrationKind::Ops(vec![MigrationOp::WriteFieldDefault { to: path(&["a"]) }]);
-    let err = execute_edge(
-        &kind,
-        &val(&from, r#"{"a":1}"#),
-        &from,
-        &to,
-        &NoDefaults,
-        &Fns::default(),
-    )
-    .unwrap_err();
-    assert!(matches!(err, MigrationError::PlanInvalid(_)), "{err:?}");
-}
-
-#[test]
-fn edge_ops_happy_path_runs_and_conforms() {
-    let from = strct(0, &[("a", 0, p(PK::U16))]);
-    let to = strct(0, &[("a", 0, p(PK::U32))]);
-    let kind = MigrationKind::Ops(vec![MigrationOp::Widen {
-        from: path(&["a"]),
-        to: path(&["a"]),
-    }]);
-    let out = execute_edge(
-        &kind,
-        &val(&from, r#"{"a":9}"#),
-        &from,
-        &to,
-        &NoDefaults,
-        &Fns::default(),
-    )
-    .unwrap();
-    assert_eq!(txt(&to, &out.value), r#"{"a":9}"#);
-}
-
-#[test]
-fn function_edge_runs() {
-    let from = strct(0, &[("a", 0, p(PK::U32))]);
-    let to = strct(0, &[("a", 0, p(PK::U32))]);
-    let mut fns = Fns::default();
-    fns.table.insert("bump".to_string(), |v| {
-        let Value::Struct(fields) = v else {
-            return Err("not a struct".into());
-        };
-        let [Value::U32(n)] = *fields else {
-            return Err("a not u32".into());
-        };
-        Ok(Value::Struct(Box::new([Value::U32(n + 1)])))
-    });
-    let kind = MigrationKind::Function("bump".to_string());
-    let out = execute_edge(&kind, &val(&from, r#"{"a":1}"#), &from, &to, &NoDefaults, &fns).unwrap();
-    assert_eq!(txt(&to, &out.value), r#"{"a":2}"#);
-    assert!(out.defaulted.is_empty());
-}
-
-#[test]
-fn function_edge_bad_output_caught_by_conformance_naming_edge() {
-    let from = strct(0, &[("a", 0, p(PK::U32))]);
-    let to = strct(0, &[("a", 0, p(PK::U32))]);
-    let mut fns = Fns::default();
-    fns.table
-        .insert("bad".to_string(), |_| Ok(Value::String("nope".into())));
-    let kind = MigrationKind::Function("bad".to_string());
-    let err = execute_edge(&kind, &val(&from, r#"{"a":1}"#), &from, &to, &NoDefaults, &fns)
-        .unwrap_err();
-    let MigrationError::NonConforming { edge, .. } = &err else {
-        panic!("expected NonConforming, got {err:?}");
-    };
-    assert!(edge.contains("bad"), "edge name missing: {edge}");
-}
-
-#[test]
-fn ops_edge_bad_output_caught_by_conformance() {
-    // A validated plan can still produce a non-conforming value (a value
-    // of the wrong kind reaches a mismatched leaf via CopyField).
-    let from = strct(0, &[("a", 0, SchemaNode::String)]);
-    let to = strct(0, &[("a", 0, p(PK::U32))]);
-    let kind = MigrationKind::Ops(vec![MigrationOp::CopyField {
-        from: path(&["a"]),
-        to: path(&["a"]),
-    }]);
-    let err = execute_edge(
-        &kind,
-        &val(&from, r#"{"a":"not a number"}"#),
-        &from,
-        &to,
-        &NoDefaults,
-        &Fns::default(),
-    )
-    .unwrap_err();
-    assert!(
-        matches!(err, MigrationError::NonConforming { .. }),
-        "{err:?}"
-    );
-}
-
-#[test]
-fn unknown_fn_key_is_error() {
-    let from = strct(0, &[("a", 0, p(PK::U32))]);
-    let to = from.clone();
-    let kind = MigrationKind::Function("ghost".to_string());
-    let err = execute_edge(
-        &kind,
-        &val(&from, r#"{"a":1}"#),
-        &from,
-        &to,
-        &NoDefaults,
-        &Fns::default(),
-    )
-    .unwrap_err();
-    assert!(
-        matches!(&err, MigrationError::FunctionFailed { key, .. } if key == "ghost"),
-        "{err:?}"
-    );
-}
-
 #[test]
 fn grow_array_takes_the_added_slots_from_the_field_default() {
     let from = strct(0, &[("a", 0, arr(2, p(PK::U8)))]);
@@ -544,16 +418,11 @@ fn grow_array_without_a_default_fails_hard() {
 }
 
 #[test]
-fn grow_array_is_automatic_segment_only() {
+fn grow_array_plan_validates() {
     let from = strct(0, &[("a", 0, arr(2, p(PK::U8)))]);
     let to = strct(0, &[("a", 0, arr(3, p(PK::U8)))]);
     let ops = distill_migrate::plan_automatic(&from, &to).unwrap();
-    let errors = distill_migrate::validate_plan(&ops, &from, &to, distill_migrate::EdgeKind::Custom).unwrap_err();
-    assert!(
-        errors.iter().any(|e| matches!(e, distill_migrate::PlanError::DefaultOpInCustomEdge { op: "GrowArray", .. })),
-        "{errors:?}"
-    );
-    distill_migrate::validate_plan(&ops, &from, &to, distill_migrate::EdgeKind::Automatic).unwrap();
+    distill_migrate::validate_plan(&ops, &from, &to).unwrap();
 }
 
 #[test]
