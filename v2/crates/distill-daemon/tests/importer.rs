@@ -3628,6 +3628,7 @@ fn authorable_lists_the_authored_types_and_importers() {
         tags: BTreeMap::new(),
         value: default.clone(),
         root: "main".into(),
+        converted_from: None,
     };
     match connect(&coordinator).write(base, vec![AuthoringOp::Set(entry)], false) {
         RpcResult::Success(_) => {}

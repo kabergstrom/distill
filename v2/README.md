@@ -12,7 +12,7 @@ edge cases, and negatives), test-first.
 | `distill-json` | §6 canonical JSON, `AuthoredValue` |
 | `distill-schema` | §5 daemon-side schema services over `ngp-schema` (which holds the model, logical hash and snapshot codec): the schema file authority (`ProjectSchemaAuthority`), registry, tag extraction |
 | `distill-bundle` | §6 bundle file format |
-| `distill-migrate` | §11 automatic migration planner, plan validation and executor |
+| (`ngp-migrate`) | §11 automatic migration planner, plan validation and executor; lives in the newgameplus workspace (`newgameplus/ngp-migrate`, GAP 29 §8) |
 | `distill-wire` | §12 wire layout derivation and layout encoding, artifact image, `encode_value`, fixup plans and executor |
 | `distill-store` | §13 metadata store + log-structured CAS |
 | `distill-build` | §8 import, §9 processing, §10 dependencies |

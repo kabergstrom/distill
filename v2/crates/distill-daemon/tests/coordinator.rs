@@ -503,6 +503,7 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
     let logical_schema = Arc::new(parsed.schemas[&original.schema_hash].clone());
     let operation = AuthoringOp::Set(AuthoringEntry {
         root: String::new(),
+        converted_from: None,
         uuid: asset_uuid,
         bundle: bundle_uuid,
         local_id: "entry".into(),
@@ -606,6 +607,7 @@ fn a_write_naming_a_held_blob_by_reference_keeps_its_bytes() {
         assert!(held.is_empty(), "every blob by reference");
         AuthoringOp::Set(AuthoringEntry {
             root: String::new(),
+            converted_from: None,
             uuid: asset_uuid,
             bundle: bundle_uuid,
             local_id: "entry".into(),
@@ -662,6 +664,7 @@ fn a_new_bundle_is_created_in_the_root_it_names() {
     let entry = |uuid: AssetUuid, bundle: BundleUuid, path: &str, root: &str| {
         AuthoringOp::Set(AuthoringEntry {
             root: root.into(),
+            converted_from: None,
             uuid,
             bundle,
             local_id: "entry".into(),
@@ -1141,8 +1144,32 @@ fn rewrite_under_a_new_schema(
     written: (LogicalSchema, Value),
     force_lossy: bool,
 ) -> Result<Value, distill_rpc::RpcFailure> {
+    rewrite_with_edges(stored, written, force_lossy, false, None)
+}
+
+/// `edge`: the root holds type files whose edges file lists one from the
+/// stored schema to the written one (newgameplus GAP 29 §8). `converted_from`:
+/// what the write names as the stored value it converted.
+fn rewrite_with_edges(
+    stored: (LogicalSchema, Value),
+    written: (LogicalSchema, Value),
+    force_lossy: bool,
+    edge: bool,
+    converted_from: Option<[u8; 16]>,
+) -> Result<Value, distill_rpc::RpcFailure> {
+    use distill_schema::ngp_schema::prefab_types;
     let temp = tempfile::tempdir().unwrap();
     let coordinator = coordinator(&temp);
+    if edge {
+        let row = prefab_types::EdgeEntry {
+            from: "game::RunV1".into(),
+            to: "game::Run".into(),
+            from_hash: node_hash(&stored.0.root).unwrap(),
+            to_hash: node_hash(&written.0.root).unwrap(),
+        };
+        std::fs::write(temp.path().join("assets").join(prefab_types::MARKER), "types").unwrap();
+        std::fs::write(temp.path().join("assets").join(prefab_types::EDGES), prefab_types::write_edges(&[row])).unwrap();
+    }
     let mut writer = coordinator.open_writer().unwrap();
     let type_uuid = TypeUuid([71; 16]);
     let (bundle_uuid, asset_uuid) = (BundleUuid([73; 16]), AssetUuid([72; 16]));
@@ -1173,6 +1200,7 @@ fn rewrite_under_a_new_schema(
     let (schema, value) = written;
     let operation = AuthoringOp::Set(AuthoringEntry {
         root: String::new(),
+        converted_from,
         uuid: asset_uuid,
         bundle: bundle_uuid,
         local_id: "entry".into(),
@@ -1242,7 +1270,7 @@ fn a_write_that_drops_data_is_refused_unless_forced() {
 }
 
 #[test]
-fn a_write_the_planner_refuses_needs_a_migration_function() {
+fn a_write_the_planner_refuses_needs_an_edge() {
     let stored = (u8_struct(&["a"]), u8_object(&[("a", 1)]));
     let written = (
         LogicalSchema {
@@ -1254,9 +1282,33 @@ fn a_write_the_planner_refuses_needs_a_migration_function() {
         Value::Struct(Box::new([Value::String("one".into())])),
     );
     assert!(matches!(
-        rewrite_under_a_new_schema(stored, written, false),
+        rewrite_under_a_new_schema(stored.clone(), written.clone(), false),
         Err(distill_rpc::RpcFailure::LossyWrite { .. })
     ));
+    // The game's edge from the stored schema to the written one covers it,
+    // for a write that names the stored value it converted.
+    let stored_key = distill_rpc::content_key(
+        &stored.0,
+        &stored.1,
+        &distill_schema::ngp_schema::TypeTable::new(Vec::new()).unwrap(),
+    )
+    .unwrap();
+    let written_value = written.1.clone();
+    assert_eq!(
+        rewrite_with_edges(stored.clone(), written.clone(), false, true, Some(stored_key)).unwrap(),
+        written_value
+    );
+    // A blind write (a reset over the stored data) names nothing, or
+    // another value: refused, the edge never ran on what is stored.
+    for converted_from in [None, Some([9; 16])] {
+        match rewrite_with_edges(stored.clone(), written.clone(), false, true, converted_from) {
+            Err(distill_rpc::RpcFailure::LossyWrite { fields, detail, .. }) => {
+                assert_eq!(fields, ["$"]);
+                assert!(detail.contains("converted_from"), "{detail}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
 }
 
 #[test]
@@ -1342,6 +1394,7 @@ fn a_pending_scan_rejection_survives_an_authoring_write_and_a_rescan() {
         let logical_schema = Arc::new(parsed.schemas[&original.schema_hash].clone());
         let operation = AuthoringOp::Set(AuthoringEntry {
             root: String::new(),
+            converted_from: None,
             uuid: asset_uuid,
             bundle: bundle_uuid,
             local_id: "entry".into(),

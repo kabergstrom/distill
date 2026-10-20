@@ -1070,6 +1070,7 @@ fn bundle_entry(
         },
         // The caller knows the root when it needs it (an inspection).
         root: String::new(),
+        converted_from: None,
     })
 }
 

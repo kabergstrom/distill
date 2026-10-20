@@ -7,7 +7,7 @@ use distill_core::hash::digest;
 use distill_core::encoding::Encoder;
 use distill_core::hash::Domain;
 use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
-use distill_migrate::FieldPath;
+use ngp_migrate::FieldPath;
 
 use crate::query::RootedPath;
 use crate::trace::EntryRole;

@@ -998,6 +998,9 @@ is a spec defect, since that is how two meanings come to share bytes:
 | `TypeDefault` (33) | file format only: a newgameplus type-default file (`defaults/<path>.bin`, GAP 23 §6.1) |
 | `InputRecording` (34) | file format only: a newgameplus raw input recording (`record-input`, GAP 23 §18.4) |
 | `TypeDescription`, `TypeIndex`, `TypeSchema` (35–37) | file formats only: a newgameplus type-description tree's `descriptions/<path>.bin`, `type-index.bin` and `schemas/<path>.bin` (GAP 23 §6) |
+| `SaveFile`, `SaveSchema` (38–39) | file formats only: a newgameplus save slot file (`<slot>.a`, `.b`, `.prev`) and a shipped save schema (`saves/shipped/<type path>/<hash>.bin`, GAP 29 §5, §9); a save file's version is its body's `SaveFile` digest |
+| `SaveEdges` (40) | file format only: the edge list of a newgameplus type-description tree (`save-edges.bin`, GAP 29 §8), which the daemon's lossless-write check reads |
+| `WorldSave` (41) | file format only: a newgameplus world snapshot slot file (GAP 32 §5): a save slot file whose value is the snapshot body |
 
 **Shared file header** (`distill_core::header`, `HEADER_LEN` = 12): every
 standalone binary file starts with the 4 magic bytes `NGPF`, the `u32`
@@ -1856,7 +1859,7 @@ the value type `load_current_entry` yields (§11), migration functions transform
   (container chunk bytes), `NodeRef`, `Handle`, `Dynamic` (§5).
 - `Patch` is its sparse overlay (absent = inherited): `Replace`, `Struct`
   (per field `Option<Patch>`), `Enum`, `Some`, `Seq`, `Map { set, remove }`.
-  `distill_migrate::execute_sparse` migrates a patch between schemas.
+  `ngp_migrate::execute_sparse` migrates a patch between schemas.
 - Text: `ngp_schema::text` parses canonical JSON straight against the node
   (no untyped tree; errors name the schema path) and writes it back
   canonically; `distill-json` is only the lexer and the canonical scalar
@@ -4331,7 +4334,7 @@ no op ever observes another op's writes, so op order can never make two
 conforming executors produce different authored values, and `CopyField`
 **copies** — the source stays readable to later ops; a move is spelled copy
 plus an explicit `DropField`. Plans are validated before execution
-(`validate_plan`, `distill-migrate/src/validate.rs`) against both endpoint
+(`validate_plan`, `newgameplus/ngp-migrate/src/validate.rs`) against both endpoint
 schemas: every `from` path must resolve in the snapshot and every `to` path
 in the current schema — a missing path is a typed `PlanError` naming the path
 — and plans are **total and disjoint over the output**: every serializable
@@ -4410,9 +4413,15 @@ write (§17) stores each written entry under the schema hash and snapshot the
 writer sends (`AuthoringService`, `distill-daemon/src/authoring.rs`), which
 need not be current. Replacing an entry stored under another schema first
 passes `check_lossless`: every field the automatic plan (with the written
-schema's renames, when it is current) drops must hold its default, and a
-refused plan needs a registered migration function; otherwise the write
-fails `LossyWrite` unless forced.
+schema's renames, when it is current) drops must hold its default; a
+change the planner refuses needs a game module edge covering it, by
+value-projection hash pair (`save-edges.bin` in the type-files root,
+newgameplus GAP 29 §8); and a write whose plan uses an edge, for the entry
+or a dynamic type inside it, must name the content key of the value it
+converted from (`AuthoringEntry::converted_from`, protocol 34), equal to the
+stored value's. Otherwise the write fails `LossyWrite` unless forced. The
+daemon does not load game code: it checks which value an edge converted,
+not the conversion.
 
 ### Integrity, not degradation
 
@@ -7131,6 +7140,12 @@ pub struct PackDefinition {
   the topmost layer of a type (`RpcIo::status`, authoring calls);
   `layer_bound(index)`.
 - Patches stay within a layer: a new manifest plus missing blobs (above).
+- **Manifest diff**: `distilld pack-diff <old manifest> <new manifest>`
+  (`distill_pack::diff_manifests`) lists the assets the new manifest
+  removed (UUID, last path), whose content hash changed and whose path
+  changed. A game's dist build runs it against the manifest it shipped
+  last (newgameplus GAP 32 §12: saves hold asset UUIDs). Exit 2 when a
+  file does not read.
 
 ## 17. RPC Interface
 

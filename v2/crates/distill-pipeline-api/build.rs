@@ -16,7 +16,6 @@ fn main() {
     for crate_name in [
         "distill-core",
         "distill-json",
-        "distill-migrate",
         "distill-pipeline-api",
     ] {
         let root = v2.join("crates").join(crate_name);
@@ -32,7 +31,7 @@ fn main() {
         );
         collect_tree(&v2.join("crates"), &root.join("src"), &mut files).unwrap();
     }
-    for crate_name in ["ngp-schema", "ngp-source-hash"] {
+    for crate_name in ["ngp-migrate", "ngp-schema", "ngp-source-hash"] {
         let root = newgameplus.join(crate_name);
         collect_file(
             &root.join("Cargo.toml"),

@@ -1714,6 +1714,10 @@ fn decode_authoring_entry(
         tags,
         root: decode_text(value.get_root().map_err(authoring_decode_error)?, "authoringOp.root")
             .map_err(|error| error.message)?,
+        converted_from: match value.get_converted_from().map_err(authoring_decode_error)? {
+            [] => None,
+            bytes => Some(bytes.try_into().map_err(|_| "authoringOp.convertedFrom: not 16 bytes".to_owned())?),
+        },
     })
 }
 

@@ -141,14 +141,28 @@ pub enum Domain {
     /// A per-type schema file of a type-description tree (GAP 23 §6): the
     /// type's value projection and its renamed fields, or a redirect.
     TypeSchema = 37,
+    /// A save slot file (newgameplus GAP 29 §5): sequence, parent version,
+    /// origin, root type, the root's value projection and the value; its
+    /// digest is the file's version.
+    SaveFile = 38,
+    /// A shipped save schema file (newgameplus GAP 29 §9): a slot root
+    /// type's value projection as a save file embeds it.
+    SaveSchema = 39,
+    /// The edge list of a type-description tree (newgameplus GAP 29 §8):
+    /// each module edge by its from- and to-types and their value
+    /// projections' hashes.
+    SaveEdges = 40,
+    /// A world snapshot slot file (newgameplus GAP 32 §5): a save slot file
+    /// (as [`Domain::SaveFile`]) whose value is the engine's snapshot body.
+    WorldSave = 41,
     /// A kernel's access file of a type-description tree (newgameplus GAP
     /// 31 §5): its domain and the fields its `run` reads and writes.
-    KernelAccess = 38,
+    KernelAccess = 42,
 }
 
 impl Domain {
     /// Every domain, in discriminant order.
-    pub const ALL: [Domain; 38] = [
+    pub const ALL: [Domain; 42] = [
         Domain::Schema,
         Domain::Layout,
         Domain::ModuleInterface,
@@ -186,6 +200,10 @@ impl Domain {
         Domain::TypeDescription,
         Domain::TypeIndex,
         Domain::TypeSchema,
+        Domain::SaveFile,
+        Domain::SaveSchema,
+        Domain::SaveEdges,
+        Domain::WorldSave,
         Domain::KernelAccess,
     ];
 

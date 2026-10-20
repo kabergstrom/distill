@@ -46,7 +46,7 @@ use distill_build::trace::{
 use distill_bundle::{AssetEntry, Bundle};
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
 use distill_schema::ngp_schema::{AssetRefValue, TypeTable, Value};
-use distill_migrate::{
+use ngp_migrate::{
     conforms, execute_ops, plan_automatic_renamed, validate_plan, DefaultProvider,
     FieldPath, MigrationError, MigrationOp,
 };
@@ -3561,6 +3561,7 @@ fn migration_ops_use_defaults(ops: &[MigrationOp]) -> bool {
         MigrationOp::MigrateElements { element, .. } => migration_ops_use_defaults(element),
         MigrationOp::MigrateMapKeys { key, .. } => migration_ops_use_defaults(key),
         MigrationOp::MigrateInline { ops, .. } => migration_ops_use_defaults(ops),
+        MigrationOp::Edge { prepare, .. } => migration_ops_use_defaults(prepare),
         MigrationOp::CopyField { .. }
         | MigrationOp::Widen { .. }
         | MigrationOp::WriteValue { .. }
@@ -3619,6 +3620,7 @@ fn migration_execution_failure(error: &MigrationError) -> MigrationPlanFailureV1
         | MigrationError::DuplicateWrite { path }
         | MigrationError::MissingWrite { path }
         | MigrationError::PlanShape { path, .. }
+        | MigrationError::Edge { path, .. }
         | MigrationError::Unencodable { path } => field_path_from_display(path),
         MigrationError::DuplicateMapVariantFrom { at, .. } => field_path_from_display(at),
     };

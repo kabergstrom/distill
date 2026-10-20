@@ -184,7 +184,7 @@ impl RegisteredImporter {
         let settings_schema = importer.settings_schema().clone();
         let settings_hash = node_hash(&settings_schema.root).map_err(invalid)?;
         let default_settings = importer.default_settings();
-        distill_migrate::conforms(&default_settings, &settings_schema.root)
+        ngp_migrate::conforms(&default_settings, &settings_schema.root)
             .map_err(|error| invalid(format!("invalid importer default settings: {error}")))?;
         let version = importer.version();
         let capability_hash = distill_core::hash::digest(distill_core::hash::Domain::ImporterCapability, 1, |encoder| {

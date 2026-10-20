@@ -19,7 +19,8 @@ const USAGE: &str = "usage:
                   [--root <name>] [--target <name>] [--no-watch] [--if-missing | --if-changed] [--wait <seconds>]
   distilld engine-args <config-path> [target]
   distilld pack <config-path> <definition-uuid> <output-directory>
-  distilld codegen <config-path> [--check]";
+  distilld codegen <config-path> [--check]
+  distilld pack-diff <old-manifest> <new-manifest>";
 
 /// How long `import` waits for a starting daemon by default.
 const DEFAULT_IMPORT_WAIT: Duration = Duration::from_secs(120);
@@ -42,6 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("engine-args") => engine_args(rest),
         Some("pack") => pack(rest),
         Some("codegen") => codegen(rest),
+        Some("pack-diff") => pack_diff(rest),
         Some("-h" | "--help") => {
             println!("{USAGE}");
             Ok(())
@@ -192,4 +194,38 @@ fn utf8(value: &OsString) -> Result<&str, Box<dyn std::error::Error>> {
     value
         .to_str()
         .ok_or_else(|| format!("argument {value:?} is not UTF-8").into())
+}
+
+/// The assets a pack manifest removed, changed or moved against an older
+/// one (a game's dist build against the manifest it shipped last): one line
+/// each, UUID and path. A report: exit 0 whatever it lists; 2 when a file
+/// does not read.
+fn pack_diff(args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
+    let [old, new] = args.as_slice() else {
+        return Err(USAGE.into());
+    };
+    let read = |path: &OsString| -> Result<distill_pack::PackManifest, String> {
+        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.to_string_lossy()))?;
+        distill_pack::decode_manifest(&bytes).map_err(|e| format!("{}: {e:?}", path.to_string_lossy()))
+    };
+    let (old, new) = match (read(old), read(new)) {
+        (Ok(old), Ok(new)) => (old, new),
+        (Err(error), _) | (_, Err(error)) => {
+            eprintln!("distilld pack-diff: {error}");
+            std::process::exit(2);
+        }
+    };
+    let diff = distill_pack::diff_manifests(&old, &new);
+    let shown = |path: &Option<String>| path.clone().unwrap_or_else(|| "(no path)".into());
+    for (uuid, path) in &diff.removed {
+        println!("removed  {uuid}  {}", shown(path));
+    }
+    for (uuid, path) in &diff.changed {
+        println!("changed  {uuid}  {}", shown(path));
+    }
+    for (uuid, was, is) in &diff.moved {
+        println!("moved    {uuid}  {} -> {}", shown(was), shown(is));
+    }
+    println!("{} removed, {} changed, {} moved", diff.removed.len(), diff.changed.len(), diff.moved.len());
+    Ok(())
 }
